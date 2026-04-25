@@ -4,7 +4,10 @@
       "Bash(rustc --version)",
       "Bash(rustup --version)",
       "Bash(command -v rustc)",
-      "Bash(cargo run *)"
+      "Bash(cargo run *)",
+      "Bash(cargo search *)",
+      "WebSearch",
+      "Bash(cargo check *)"
     ]
   }
 }
