@@ -1,0 +1,58 @@
+name: Release Server to Remote Server
+
+# 当推送 tag 时触发，也可以手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    container:
+      image: debian:bookworm
+
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y curl build-essential git
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-gnu
+
+      - name: Build server
+        run: |
+          cargo build --release --bin rust-tunnel-server
+          strip target/release/rust-tunnel-server
+
+      - name: Deploy to remote server via SSH
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: "target/release/rust-tunnel-server"
+          target: ${{ secrets.DEPLOY_PATH }}
+
+      - name: Restart service on remote server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            cd ${{ secrets.DEPLOY_PATH }}
+            # 重启 systemd 服务，如果使用 systemd 管理的话
+            # 如果不用 systemd，可以改成自己的重启命令
+            sudo systemctl restart rust-tunnel-server

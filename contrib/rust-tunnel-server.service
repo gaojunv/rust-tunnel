@@ -1,0 +1,15 @@
+[Unit]
+Description=Rust Tunnel Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rust-tunnel
+ExecStart=/opt/rust-tunnel/rust-tunnel-server --bind 0.0.0.0:8080
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
