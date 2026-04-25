@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ArgAction};
 use std::net::SocketAddr;
 
 /// Client endpoint for rust-tunnel intranet penetration tool
@@ -10,7 +10,7 @@ pub struct ClientConfig {
 
     /// Forward rule: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT
     /// Example: 8080:localhost:80
-    #[clap(long = "forward", num_args = 1..)]
+    #[clap(long = "forward", action = ArgAction::Append)]
     pub forwards: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
