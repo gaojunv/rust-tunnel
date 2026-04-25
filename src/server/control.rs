@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
 
@@ -15,13 +15,13 @@ pub struct ClientInfo {
     /// Remote port that client wants to expose
     pub remote_port: u16,
     /// Sender half of the control channel for sending messages to client
-    pub control_stream: Arc<Mutex<TcpStream>>,
+    pub control_writer: Arc<Mutex<OwnedWriteHalf>>,
 }
 
 /// Information about an active connection between user and client
 #[derive(Debug)]
 struct ActiveConnection {
-    /// User TCP stream writer half
+    /// User TCP stream writer half connected to client
     user_writer: Arc<Mutex<OwnedWriteHalf>>,
 }
 
@@ -42,14 +42,14 @@ impl ServerState {
         }
     }
 
-    pub async fn register_client(&self, remote_port: u16, control_stream: Arc<Mutex<TcpStream>>) -> bool {
+    pub async fn register_client(&self, remote_port: u16, control_writer: Arc<Mutex<OwnedWriteHalf>>) -> bool {
         let mut clients = self.clients.lock().await;
         if clients.contains_key(&remote_port) {
             return false;
         }
         clients.insert(remote_port, ClientInfo {
             remote_port,
-            control_stream,
+            control_writer,
         });
         true
     }
@@ -97,11 +97,13 @@ impl ServerState {
 
 /// Handle a single control connection from client
 async fn handle_control_connection(state: ServerState, stream: TcpStream) -> TunnelResult<()> {
-    let stream_arc = Arc::new(Mutex::new(stream));
-    let mut stream_guard = stream_arc.lock().await;
+    // Split into read and write halves
+    let (reader, writer) = stream.into_split();
+    let writer_arc = Arc::new(Mutex::new(writer));
 
     // Read registration message
-    let msg = match ControlMessage::read_from_stream(&mut stream_guard).await {
+    let mut reader = reader;
+    let msg = match ControlMessage::read_from_stream(&mut reader).await {
         Ok(Some(msg)) => msg,
         Ok(None) => {
             return Err(TunnelError::Protocol("Connection closed before registration".into()));
@@ -112,35 +114,34 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
     let (remote_port, registered) = match msg {
         ControlMessage::Register { remote_port } => {
             info!("Received registration request for port {}", remote_port);
-            (remote_port, state.register_client(remote_port, stream_arc.clone()).await)
+            (remote_port, state.register_client(remote_port, writer_arc.clone()).await)
         }
         _ => {
+            let mut writer_guard = writer_arc.lock().await;
             let _ = ControlMessage::RegisterResponse {
                 success: false,
                 message: "Expected registration message".into(),
-            }.write_to_stream(&mut stream_guard).await;
+            }.write_to_split(&mut *writer_guard).await;
             return Err(TunnelError::Protocol("Expected registration message".into()));
         }
     };
 
-    drop(stream_guard);
-
     if !registered {
-        let mut stream_guard = stream_arc.lock().await;
+        let mut writer_guard = writer_arc.lock().await;
         let _ = ControlMessage::RegisterResponse {
             success: false,
             message: format!("Port {} already registered", remote_port),
-        }.write_to_stream(&mut stream_guard).await;
+        }.write_to_split(&mut *writer_guard).await;
         return Err(TunnelError::Protocol(format!("Port {} already registered", remote_port)));
     }
 
     // Send registration success
-    let mut stream_guard = stream_arc.lock().await;
+    let mut writer_guard = writer_arc.lock().await;
     ControlMessage::RegisterResponse {
         success: true,
         message: "Registered successfully".into(),
-    }.write_to_stream(&mut stream_guard).await?;
-    drop(stream_guard);
+    }.write_to_split(&mut *writer_guard).await?;
+    drop(writer_guard);
 
     info!("Client registered for port {}", remote_port);
 
@@ -156,17 +157,14 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
     });
 
     // Keep connection alive and process messages (heartbeats, data routing)
+    // Only reading happens here, writing goes through the shared writer_arc
     loop {
-        // Acquire lock before each read, release after reading one message
-        // This allows other tasks to use the control channel for sending messages
-        let mut stream_guard = stream_arc.lock().await;
-        match ControlMessage::read_from_stream(&mut stream_guard).await {
+        match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
-                drop(stream_guard);
                 match msg {
                     ControlMessage::Ping => {
-                        let mut stream_guard = stream_arc.lock().await;
-                        let _ = ControlMessage::Pong.write_to_stream(&mut stream_guard).await;
+                        let mut writer_guard = writer_arc.lock().await;
+                        let _ = ControlMessage::Pong.write_to_split(&mut *writer_guard).await;
                     }
                     ControlMessage::Pong => {
                         // Ignore, pong is only server -> client

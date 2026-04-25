@@ -15,8 +15,8 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         Some(r) => r.local_addr,
         None => {
             warn!("No forward rule found for remote port {}", remote_port);
-            let mut control_guard = state.control_stream.lock().await;
-            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+            let mut control_guard = state.control_writer.lock().await;
+            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
             return Err(TunnelError::Config(format!("No forward rule for remote port {}", remote_port)));
         }
     };
@@ -27,15 +27,15 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         Ok(stream) => stream,
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", local_addr, e);
-            let mut control_guard = state.control_stream.lock().await;
-            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+            let mut control_guard = state.control_writer.lock().await;
+            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
             return Err(e.into());
         }
     };
 
     // Notify server we're ready
-    let mut control_guard = state.control_stream.lock().await;
-    (ControlMessage::ConnectionReady { connection_id }).write_to_stream(&mut control_guard).await?;
+    let mut control_guard = state.control_writer.lock().await;
+    (ControlMessage::ConnectionReady { connection_id }).write_to_stream(&mut *control_guard).await?;
     drop(control_guard);
 
     // Split stream: reading in this task, writing done by control loop
@@ -56,11 +56,11 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
             }
             Ok(n) => {
                 // Send data from local to server via control channel
-                let mut control_guard = state.control_stream.lock().await;
+                let mut control_guard = state.control_writer.lock().await;
                 if let Err(e) = (ControlMessage::Data {
                     connection_id,
                     data: buf[..n].to_vec(),
-                }).write_to_stream(&mut control_guard).await {
+                }).write_to_stream(&mut *control_guard).await {
                     warn!("Failed to send data from local {} to server: {}", connection_id, e);
                     break;
                 }
@@ -73,8 +73,8 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
     }
 
     // Notify server connection is closed
-    let mut control_guard = state.control_stream.lock().await;
-    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+    let mut control_guard = state.control_writer.lock().await;
+    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
 
     // Remove from active connections
     state.remove_connection(connection_id).await;
