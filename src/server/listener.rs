@@ -49,7 +49,7 @@ async fn handle_inbound_connection(
 
     // Notify client about the new connection
     let mut control_guard = client_info.control_stream.lock().await;
-    ControlMessage::NewConnection { connection_id }.write_to_stream(&mut control_guard).await?;
+    ControlMessage::NewConnection { connection_id, remote_port }.write_to_stream(&mut control_guard).await?;
     drop(control_guard);
 
     // Wait for client to indicate it's ready
