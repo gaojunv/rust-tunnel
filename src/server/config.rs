@@ -4,7 +4,11 @@ use clap::Parser;
 #[derive(Parser, Debug, Clone)]
 pub struct ServerConfig {
     /// Address to listen for control connections from clients
-    /// Format: 0.0.0.0:8000
-    #[clap(long, default_value = "0.0.0.0:8000")]
+    /// Format: 0.0.0.0:8080
+    #[clap(long = "bind", default_value = "0.0.0.0:8080")]
     pub control_addr: String,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[clap(long, default_value = "info")]
+    pub log: String,
 }

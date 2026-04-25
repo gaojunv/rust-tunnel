@@ -22,14 +22,16 @@ struct ActiveLocalConnection {
 pub struct ClientState {
     pub config: ClientConfig,
     pub control_stream: Arc<Mutex<TcpStream>>,
+    pub forwards: Vec<ForwardRule>,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
 }
 
 impl ClientState {
-    fn new(config: ClientConfig, control_stream: TcpStream) -> Self {
+    fn new(config: ClientConfig, control_stream: TcpStream, forwards: Vec<ForwardRule>) -> Self {
         Self {
             config,
             control_stream: Arc::new(Mutex::new(control_stream)),
+            forwards,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -89,11 +91,11 @@ async fn process_control_messages(state: ClientState) -> TunnelResult<()> {
                     ControlMessage::Pong => {
                         debug!("Received heartbeat pong");
                     }
-                    ControlMessage::NewConnection { connection_id } => {
-                        info!("New connection request id {}", connection_id);
+                    ControlMessage::NewConnection { connection_id, remote_port } => {
+                        info!("New connection request id {} for remote port {}", connection_id, remote_port);
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy::handle_new_connection(state_clone, connection_id).await {
+                            if let Err(e) = proxy::handle_new_connection(state_clone, connection_id, remote_port).await {
                                 warn!("Failed to handle new connection {}: {}", connection_id, e);
                             }
                         });
@@ -126,38 +128,46 @@ async fn process_control_messages(state: ClientState) -> TunnelResult<()> {
     Ok(())
 }
 
+use crate::client::ForwardRule;
+
 /// Main client entry point
-pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
+pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> TunnelResult<()> {
     // Connect to server
-    let mut stream = TcpStream::connect(&config.server_addr).await?;
-    info!("Connected to server at {}", config.server_addr);
+    let mut stream = TcpStream::connect(&config.server).await?;
+    info!("Connected to server at {}", config.server);
 
-    // Send registration
-    ControlMessage::Register {
-        remote_port: config.remote_port,
-    }.write_to_stream(&mut stream).await?;
+    // Register all forward rules
+    for rule in &forwards {
+        ControlMessage::Register {
+            remote_port: rule.remote_port,
+        }.write_to_stream(&mut stream).await?;
 
-    // Read registration response
-    let resp = match ControlMessage::read_from_stream(&mut stream).await {
-        Ok(Some(ControlMessage::RegisterResponse { success, message })) => {
-            (success, message)
-        }
-        Ok(Some(_)) => {
-            return Err(TunnelError::Protocol("Expected registration response".into()));
-        }
-        Ok(None) => {
-            return Err(TunnelError::Protocol("Connection closed during registration".into()));
-        }
-        Err(e) => return Err(e),
-    };
+        // Read registration response
+        let resp = match ControlMessage::read_from_stream(&mut stream).await {
+            Ok(Some(ControlMessage::RegisterResponse { success, message })) => {
+                (success, message)
+            }
+            Ok(Some(_)) => {
+                return Err(TunnelError::Protocol("Expected registration response".into()));
+            }
+            Ok(None) => {
+                return Err(TunnelError::Protocol("Connection closed during registration".into()));
+            }
+            Err(e) => return Err(e),
+        };
 
-    if !resp.0 {
-        return Err(TunnelError::ControlChannel(format!("Registration failed: {}", resp.1)));
+        if !resp.0 {
+            return Err(TunnelError::ControlChannel(format!(
+                "Registration failed for port {}: {}",
+                rule.remote_port, resp.1
+            )));
+        }
+
+        info!("Registration successful for remote port {} -> {}",
+              rule.remote_port, rule.local_addr);
     }
 
-    info!("Registration successful: {}", resp.1);
-
-    let state = ClientState::new(config, stream);
+    let state = ClientState::new(config, stream, forwards);
 
     // Start heartbeat task
     let heartbeat_state = state.clone();

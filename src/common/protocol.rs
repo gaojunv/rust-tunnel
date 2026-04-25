@@ -11,7 +11,7 @@ pub enum ControlMessage {
     /// Server response to registration
     RegisterResponse { success: bool, message: String },
     /// Server notifies client of a new incoming connection
-    NewConnection { connection_id: u64 },
+    NewConnection { connection_id: u64, remote_port: u16 },
     /// Client notifies server it's connected to local target and ready
     ConnectionReady { connection_id: u64 },
     /// Data transfer for a specific connection

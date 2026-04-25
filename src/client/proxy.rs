@@ -8,10 +8,22 @@ use crate::common::{ControlMessage, TunnelResult};
 pub use crate::client::control::ClientState;
 
 /// Handle a new connection request from server
-pub async fn handle_new_connection(state: ClientState, connection_id: u64) -> TunnelResult<()> {
+pub async fn handle_new_connection(state: ClientState, connection_id: u64, remote_port: u16) -> TunnelResult<()> {
+    // Find the local address for this remote port
+    let forward_rule = state.forwards.iter().find(|r| r.remote_port == remote_port);
+    let local_addr = match forward_rule {
+        Some(r) => r.local_addr,
+        None => {
+            warn!("No forward rule found for remote port {}", remote_port);
+            let mut control_guard = state.control_stream.lock().await;
+            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+            return Err(format!("No forward rule for remote port {}", remote_port).into());
+        }
+    };
+
     // Connect to local target
-    debug!("Connecting to local target {}", state.config.local_addr);
-    let local_stream = match TcpStream::connect(&state.config.local_addr).await {
+    debug!("Connecting to local target {}", local_addr);
+    let local_stream = match TcpStream::connect(local_addr).await {
         Ok(stream) => stream,
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", state.config.local_addr, e);
