@@ -1,0 +1,71 @@
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use std::sync::Arc;
+use tracing::{debug, warn};
+
+use crate::common::{ControlMessage, TunnelResult};
+pub use crate::client::control::ClientState;
+
+/// Handle a new connection request from server
+pub async fn handle_new_connection(state: ClientState, connection_id: u64) -> TunnelResult<()> {
+    // Connect to local target
+    debug!("Connecting to local target {}", state.config.local_addr);
+    let local_stream = match TcpStream::connect(&state.config.local_addr).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("Failed to connect to local target {}: {}", state.config.local_addr, e);
+            let mut control_guard = state.control_stream.lock().await;
+            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+            return Err(e.into());
+        }
+    };
+
+    // Notify server we're ready
+    let mut control_guard = state.control_stream.lock().await;
+    (ControlMessage::ConnectionReady { connection_id }).write_to_stream(&mut control_guard).await?;
+    drop(control_guard);
+
+    // Split stream: reading in this task, writing done by control loop
+    let (mut local_reader, local_writer) = local_stream.into_split();
+    // Put writer half in Arc for sharing with control loop
+    let local_writer = Arc::new(Mutex::new(local_writer));
+
+    // Add to active connections so data from server can be delivered
+    state.add_connection(connection_id, local_writer.clone()).await;
+
+    let mut buf = vec![0u8; 8192];
+
+    loop {
+        match local_reader.read(&mut buf).await {
+            Ok(0) => {
+                debug!("Local connection {} closed", connection_id);
+                break;
+            }
+            Ok(n) => {
+                // Send data from local to server via control channel
+                let mut control_guard = state.control_stream.lock().await;
+                if let Err(e) = (ControlMessage::Data {
+                    connection_id,
+                    data: buf[..n].to_vec(),
+                }).write_to_stream(&mut control_guard).await {
+                    warn!("Failed to send data from local {} to server: {}", connection_id, e);
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("Error reading from local connection {}: {}", connection_id, e);
+                break;
+            }
+        }
+    }
+
+    // Notify server connection is closed
+    let mut control_guard = state.control_stream.lock().await;
+    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+
+    // Remove from active connections
+    state.remove_connection(connection_id).await;
+
+    Ok(())
+}
