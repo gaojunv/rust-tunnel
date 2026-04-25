@@ -34,6 +34,10 @@ jobs:
           cargo build --release --bin rust-tunnel-server
           strip target/release/rust-tunnel-server
 
+      - name: Copy binary to root directory for upload
+        run: |
+          cp target/release/rust-tunnel-server ./
+
       - name: Deploy to remote server via SSH
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -41,7 +45,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
-          source: "target/release/rust-tunnel-server"
+          source: "./rust-tunnel-server"
           target: ${{ secrets.DEPLOY_PATH }}
 
       - name: Restart service on remote server
