@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{info, debug, warn, error};
 
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
 use crate::client::{ClientConfig, proxy};
-
-use tokio::net::tcp::OwnedWriteHalf;
 
 /// Information about an active local connection
 struct ActiveLocalConnection {
@@ -21,16 +20,16 @@ struct ActiveLocalConnection {
 #[derive(Clone)]
 pub struct ClientState {
     pub config: ClientConfig,
-    pub control_stream: Arc<Mutex<TcpStream>>,
+    pub control_writer: Arc<Mutex<OwnedWriteHalf>>,
     pub forwards: Vec<ForwardRule>,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
 }
 
 impl ClientState {
-    fn new(config: ClientConfig, control_stream: TcpStream, forwards: Vec<ForwardRule>) -> Self {
+    fn new(config: ClientConfig, control_writer: Arc<Mutex<OwnedWriteHalf>>, forwards: Vec<ForwardRule>) -> Self {
         Self {
             config,
-            control_stream: Arc::new(Mutex::new(control_stream)),
+            control_writer,
             forwards,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -71,8 +70,8 @@ async fn start_heartbeat(state: ClientState) {
     let mut interval = time::interval(time::Duration::from_secs(30));
     loop {
         interval.tick().await;
-        let mut control_guard = state.control_stream.lock().await;
-        if let Err(e) = ControlMessage::Ping.write_to_stream(&mut control_guard).await {
+        let mut control_guard = state.control_writer.lock().await;
+        if let Err(e) = ControlMessage::Ping.write_to_stream(&mut *control_guard).await {
             warn!("Failed to send ping: {}", e);
             break;
         }
@@ -81,14 +80,10 @@ async fn start_heartbeat(state: ClientState) {
 }
 
 /// Process messages from server on control channel
-async fn process_control_messages(state: ClientState) -> TunnelResult<()> {
+async fn process_control_messages(reader: &mut OwnedReadHalf, state: ClientState) -> TunnelResult<()> {
     loop {
-        // Acquire lock before each read, release after reading one message
-        // This allows other tasks to use the control channel for sending messages
-        let mut control_guard = state.control_stream.lock().await;
-        match ControlMessage::read_from_stream(&mut control_guard).await {
+        match ControlMessage::read_from_stream(reader).await {
             Ok(Some(msg)) => {
-                drop(control_guard);
                 match msg {
                     ControlMessage::Pong => {
                         debug!("Received heartbeat pong");
@@ -137,7 +132,7 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
     let mut stream = TcpStream::connect(&config.server).await?;
     info!("Connected to server at {}", config.server);
 
-    // Register all forward rules
+    // Register all forward rules before splitting
     for rule in &forwards {
         ControlMessage::Register {
             remote_port: rule.remote_port,
@@ -168,14 +163,18 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
               rule.remote_port, rule.local_addr);
     }
 
-    let state = ClientState::new(config, stream, forwards);
+    // Split into read and write halves after registration is complete
+    let (mut reader, writer) = stream.into_split();
+    let writer_arc = Arc::new(Mutex::new(writer));
+
+    let state = ClientState::new(config, writer_arc.clone(), forwards);
 
     // Start heartbeat task
     let heartbeat_state = state.clone();
     tokio::spawn(start_heartbeat(heartbeat_state));
 
     // Process incoming messages from server
-    process_control_messages(state).await?;
+    process_control_messages(&mut reader, state).await?;
 
     warn!("Control connection terminated");
     Ok(())

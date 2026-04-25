@@ -33,11 +33,11 @@ pub async fn proxy_user_connection(
             }
             Ok(n) => {
                 // Send data from user to client via control channel
-                let mut control_guard = client_info.control_stream.lock().await;
+                let mut control_guard = client_info.control_writer.lock().await;
                 if let Err(e) = (ControlMessage::Data {
                     connection_id,
                     data: buf[..n].to_vec(),
-                }).write_to_stream(&mut control_guard).await {
+                }).write_to_stream(&mut *control_guard).await {
                     warn!("Failed to send data from user {} to client: {}", connection_id, e);
                     break;
                 }
@@ -50,8 +50,8 @@ pub async fn proxy_user_connection(
     }
 
     // Notify client the connection is closed
-    let mut control_guard = client_info.control_stream.lock().await;
-    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
+    let mut control_guard = client_info.control_writer.lock().await;
+    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
 
     // Remove from active connections
     state.remove_active_connection(connection_id).await;

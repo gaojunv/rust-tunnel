@@ -35,8 +35,8 @@ impl ControlMessage {
         Ok(result)
     }
 
-    /// Deserialize message from bytes
-    pub async fn read_from_stream(stream: &mut TcpStream) -> TunnelResult<Option<Self>> {
+    /// Deserialize message from stream
+    pub async fn read_from_stream<R: AsyncReadExt + Unpin>(stream: &mut R) -> TunnelResult<Option<Self>> {
         let mut len_buf = [0u8; 4];
         match stream.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -63,11 +63,16 @@ impl ControlMessage {
     }
 
     /// Write message to stream
-    pub async fn write_to_stream(&self, stream: &mut TcpStream) -> TunnelResult<()> {
+    pub async fn write_to_stream<W: AsyncWriteExt + Unpin>(&self, stream: &mut W) -> TunnelResult<()> {
         let bytes = self.serialize()?;
         stream.write_all(&bytes).await?;
         stream.flush().await?;
         Ok(())
+    }
+
+    /// Write message to a split stream half (alias for write_to_stream)
+    pub async fn write_to_split<W: AsyncWriteExt + Unpin>(&self, stream: &mut W) -> TunnelResult<()> {
+        self.write_to_stream(stream).await
     }
 }
 
