@@ -82,8 +82,10 @@ async fn start_heartbeat(state: ClientState) {
 
 /// Process messages from server on control channel
 async fn process_control_messages(state: ClientState) -> TunnelResult<()> {
-    let mut control_guard = state.control_stream.lock().await;
     loop {
+        // Acquire lock before each read, release after reading one message
+        // This allows other tasks to use the control channel for sending messages
+        let mut control_guard = state.control_stream.lock().await;
         match ControlMessage::read_from_stream(&mut control_guard).await {
             Ok(Some(msg)) => {
                 drop(control_guard);
@@ -113,7 +115,6 @@ async fn process_control_messages(state: ClientState) -> TunnelResult<()> {
                         warn!("Unexpected message from server: {:?}", msg);
                     }
                 }
-                control_guard = state.control_stream.lock().await;
             }
             Ok(None) => {
                 info!("Server closed control connection");

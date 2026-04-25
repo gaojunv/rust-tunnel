@@ -157,6 +157,8 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
 
     // Keep connection alive and process messages (heartbeats, data routing)
     loop {
+        // Acquire lock before each read, release after reading one message
+        // This allows other tasks to use the control channel for sending messages
         let mut stream_guard = stream_arc.lock().await;
         match ControlMessage::read_from_stream(&mut stream_guard).await {
             Ok(Some(msg)) => {
