@@ -11,32 +11,29 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
-    container:
-      image: debian:bookworm
-
     steps:
-      - name: Install system packages
-        run: |
-          apt-get update
-          apt-get install -y curl build-essential git
-
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust with musl target
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          target: x86_64-unknown-linux-gnu
+          target: x86_64-unknown-linux-musl
 
-      - name: Build server
+      - name: Install musl tools
         run: |
-          cargo build --release --bin rust-tunnel-server
-          strip target/release/rust-tunnel-server
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build server (static linking with musl)
+        run: |
+          cargo build --release --bin rust-tunnel-server --target x86_64-unknown-linux-musl
+          x86_64-linux-musl-strip target/x86_64-unknown-linux-musl/release/rust-tunnel-server
 
       - name: Copy binary to root directory for upload
         run: |
-          cp target/release/rust-tunnel-server ./
+          cp target/x86_64-unknown-linux-musl/release/rust-tunnel-server ./
 
       - name: Deploy to remote server via SSH
         uses: appleboy/scp-action@v0.1.7
