@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::common::{ControlMessage, TunnelResult};
+use crate::common::{ControlMessage, TunnelError, TunnelResult};
 pub use crate::client::control::ClientState;
 
 /// Handle a new connection request from server
@@ -17,7 +17,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
             warn!("No forward rule found for remote port {}", remote_port);
             let mut control_guard = state.control_stream.lock().await;
             let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
-            return Err(format!("No forward rule for remote port {}", remote_port).into());
+            return Err(TunnelError::Config(format!("No forward rule for remote port {}", remote_port)));
         }
     };
 
@@ -26,7 +26,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
     let local_stream = match TcpStream::connect(local_addr).await {
         Ok(stream) => stream,
         Err(e) => {
-            warn!("Failed to connect to local target {}: {}", state.config.local_addr, e);
+            warn!("Failed to connect to local target {}: {}", local_addr, e);
             let mut control_guard = state.control_stream.lock().await;
             let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut control_guard).await;
             return Err(e.into());
