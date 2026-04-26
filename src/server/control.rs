@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
 
@@ -24,6 +24,8 @@ pub struct ClientInfo {
 struct ActiveConnection {
     /// User TCP stream writer half connected to client
     user_writer: Arc<Mutex<OwnedWriteHalf>>,
+    /// Remote port this connection belongs to
+    remote_port: u16,
 }
 
 /// Global server state shared between all tasks
@@ -68,11 +70,21 @@ impl ServerState {
         clients.remove(&remote_port);
     }
 
-    pub async fn add_active_connection(&self, connection_id: u64, user_writer: Arc<Mutex<OwnedWriteHalf>>) {
+    pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<OwnedWriteHalf>>) {
         let mut active_connections = self.active_connections.lock().await;
         active_connections.insert(connection_id, ActiveConnection {
             user_writer,
+            remote_port,
         });
+    }
+
+    /// Get the number of active connections for a specific port
+    pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
+        let active_connections = self.active_connections.lock().await;
+        active_connections
+            .values()
+            .filter(|conn| conn.remote_port == remote_port)
+            .count()
     }
 
     pub async fn remove_active_connection(&self, connection_id: u64) {
@@ -85,18 +97,14 @@ impl ServerState {
         if let Some(conn) = active_connections.get(&connection_id) {
             let mut writer = conn.user_writer.lock().await;
             let bytes = data.len();
+            let remote_port = conn.remote_port;
             writer.write_all(&data).await?;
             writer.flush().await?;
             drop(writer);
             drop(active_connections);
 
-            // Find which port this connection belongs to and record traffic
-            let clients = self.clients.lock().await;
-            for (&port, _) in clients.iter() {
-                // We don't track which connection is on which port, so just record to all for now
-                // This is imperfect but better than nothing
-                self.traffic_store.record_bytes_out(port, bytes as u64).await;
-            }
+            // Record traffic to the correct port
+            self.traffic_store.record_bytes_out(remote_port, bytes as u64).await;
             Ok(())
         } else {
             debug!("No active connection found for id {}", connection_id);
@@ -155,10 +163,10 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         Err(e) => return Err(e),
     };
 
-    let (remote_port, registered) = match msg {
+    let remote_port = match msg {
         ControlMessage::Register { remote_port } => {
             info!("Received registration request for port {}", remote_port);
-            (remote_port, state.register_client(remote_port, writer_arc.clone()).await)
+            remote_port
         }
         _ => {
             let mut writer_guard = writer_arc.lock().await;
@@ -169,6 +177,12 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
             return Err(TunnelError::Protocol("Expected registration message".into()));
         }
     };
+
+    // First, remove any existing client on this port (cleanup from previous connection)
+    state.remove_client(remote_port).await;
+
+    // Now register the new client
+    let registered = state.register_client(remote_port, writer_arc.clone()).await;
 
     if !registered {
         let mut writer_guard = writer_arc.lock().await;
@@ -202,7 +216,7 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
 
     // Keep connection alive and process messages (heartbeats, data routing)
     // Only reading happens here, writing goes through the shared writer_arc
-    loop {
+    let result = loop {
         match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
                 match msg {
@@ -235,16 +249,20 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
             }
             Ok(None) => {
                 // Connection closed
-                break;
+                break Ok(());
             }
             Err(e) => {
                 error!("Error reading from control channel: {}", e);
-                break;
+                break Err(e);
             }
         }
-    }
+    };
 
-    Ok(())
+    // Cleanup: remove client registration when control connection closes
+    state.remove_client(remote_port).await;
+    info!("Client unregistered from port {} (control connection closed)", remote_port);
+
+    result
 }
 
 /// Start the main server

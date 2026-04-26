@@ -196,15 +196,15 @@ async fn logout(_auth: Auth) -> impl IntoResponse {
 // List all clients
 async fn list_clients(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<ClientResponse>> {
     let clients = state.server_state.get_all_clients().await;
-    Json(
-        clients
-            .into_iter()
-            .map(|(port, _info)| ClientResponse {
-                port,
-                connection_count: 0, // Will track later
-            })
-            .collect(),
-    )
+    let mut response = Vec::with_capacity(clients.len());
+    for (port, _info) in clients {
+        let connection_count = state.server_state.get_connection_count_for_port(port).await;
+        response.push(ClientResponse {
+            port,
+            connection_count,
+        });
+    }
+    Json(response)
 }
 
 // Disconnect client
