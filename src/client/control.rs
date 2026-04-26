@@ -137,10 +137,16 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
     let mut stream = TcpStream::connect(&config.server).await?;
     info!("Connected to server at {}", config.server);
 
+    // Get hostname
+    let hostname = gethostname::gethostname()
+        .into_string()
+        .ok();
+
     // Register all forward rules before splitting
     for rule in &forwards {
         ControlMessage::Register {
             remote_port: rule.remote_port,
+            hostname: hostname.clone(),
         }.write_to_stream(&mut stream).await?;
 
         // Read registration response

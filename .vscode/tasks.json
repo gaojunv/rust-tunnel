@@ -1,0 +1,96 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build",
+            "type": "cargo",
+            "command": "build",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "cargo check",
+            "type": "cargo",
+            "command": "check",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "cargo test",
+            "type": "cargo",
+            "command": "test",
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "cargo clippy",
+            "type": "cargo",
+            "command": "clippy",
+            "args": [
+                "--",
+                "-W",
+                "clippy::pedantic"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "cargo run server",
+            "type": "cargo",
+            "command": "run",
+            "args": [
+                "--bin",
+                "rust-tunnel-server",
+                "--",
+                "--bind",
+                "0.0.0.0:8080",
+                "--api-bind",
+                "0.0.0.0:3000"
+            ],
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "test",
+            "isBackground": true
+        },
+        {
+            "label": "frontend install",
+            "type": "npm",
+            "script": "install",
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            }
+        },
+        {
+            "label": "frontend dev",
+            "type": "npm",
+            "script": "dev",
+            "group": "test",
+            "isBackground": true,
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            }
+        },
+        {
+            "label": "frontend build",
+            "type": "npm",
+            "script": "build",
+            "group": "build",
+            "options": {
+                "cwd": "${workspaceFolder}/frontend"
+            }
+        }
+    ]
+}

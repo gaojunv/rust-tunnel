@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "source ~/.cargo/env 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

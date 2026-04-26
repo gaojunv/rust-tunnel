@@ -16,6 +16,8 @@ use crate::server::db::Database;
 pub struct ClientInfo {
     /// Remote port that client wants to expose
     pub remote_port: u16,
+    /// Hostname of the client machine (optional)
+    pub hostname: Option<String>,
     /// Sender half of the control channel for sending messages to client
     pub control_writer: Arc<Mutex<OwnedWriteHalf>>,
 }
@@ -63,13 +65,15 @@ impl ServerState {
         }
     }
 
-    pub async fn register_client(&self, remote_port: u16, control_writer: Arc<Mutex<OwnedWriteHalf>>) -> bool {
+    pub async fn register_client(&self, remote_port: u16, hostname: Option<String>, control_writer: Arc<Mutex<OwnedWriteHalf>>) -> bool {
+        let hostname_clone = hostname.clone();
         let mut clients = self.clients.lock().await;
         if clients.contains_key(&remote_port) {
             return false;
         }
         clients.insert(remote_port, ClientInfo {
             remote_port,
+            hostname,
             control_writer,
         });
 
@@ -77,7 +81,7 @@ impl ServerState {
         if let Some(db) = &self.db {
             let db = db.clone();
             tokio::spawn(async move {
-                let _ = db.record_client_connect(remote_port).await;
+                let _ = db.record_client_connect(remote_port, hostname_clone).await;
             });
         }
 
@@ -208,7 +212,7 @@ mod tests {
         let writer_arc = Arc::new(Mutex::new(writer));
 
         // Register client
-        let registered = state.register_client(8080, writer_arc.clone()).await;
+        let registered = state.register_client(8080, None, writer_arc.clone()).await;
         assert!(registered);
         assert_eq!(state.get_client_count().await, 1);
 
@@ -217,7 +221,7 @@ mod tests {
         assert!(client.is_some());
 
         // Register same port again should fail
-        let registered = state.register_client(8080, writer_arc).await;
+        let registered = state.register_client(8080, None, writer_arc).await;
         assert!(!registered);
     }
 
@@ -235,7 +239,7 @@ mod tests {
         let (_, writer) = stream.into_split();
         let writer_arc = Arc::new(Mutex::new(writer));
 
-        state.register_client(8080, writer_arc).await;
+        state.register_client(8080, None, writer_arc).await;
         assert_eq!(state.get_client_count().await, 1);
 
         state.remove_client(8080).await;
@@ -264,8 +268,8 @@ mod tests {
         let (_, writer) = stream.into_split();
         let writer_arc = Arc::new(Mutex::new(writer));
 
-        state.register_client(8080, writer_arc.clone()).await;
-        state.register_client(9000, writer_arc).await;
+        state.register_client(8080, None, writer_arc.clone()).await;
+        state.register_client(9000, None, writer_arc).await;
 
         let clients = state.get_all_clients().await;
         assert_eq!(clients.len(), 2);
@@ -317,7 +321,7 @@ mod tests {
         let (_, writer) = stream.into_split();
         let writer_arc = Arc::new(Mutex::new(writer));
 
-        state.register_client(8080, writer_arc).await;
+        state.register_client(8080, None, writer_arc).await;
 
         let cloned = state.clone();
         assert_eq!(cloned.get_client_count().await, 1);
@@ -373,14 +377,14 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         };
 
         match msg {
-            ControlMessage::Register { remote_port } => {
-                info!("Received registration request for port {}", remote_port);
+            ControlMessage::Register { remote_port, hostname } => {
+                info!("Received registration request for port {} from hostname {:?}", remote_port, hostname);
 
                 // First, remove any existing client on this port (cleanup from previous connection)
                 state.remove_client(remote_port).await;
 
                 // Now register the new client
-                let registered = state.register_client(remote_port, writer_arc.clone()).await;
+                let registered = state.register_client(remote_port, hostname.clone(), writer_arc.clone()).await;
 
                 if !registered {
                     let mut writer_guard = writer_arc.lock().await;
@@ -442,15 +446,15 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
                 match msg {
-                    ControlMessage::Register { remote_port } => {
+                    ControlMessage::Register { remote_port, hostname } => {
                         // Handle late registration (client might send more Register messages later)
-                        info!("Received late registration request for port {}", remote_port);
+                        info!("Received late registration request for port {} from hostname {:?}", remote_port, hostname);
 
                         // First, remove any existing client on this port
                         state.remove_client(remote_port).await;
 
                         // Now register the new client
-                        let registered = state.register_client(remote_port, writer_arc.clone()).await;
+                        let registered = state.register_client(remote_port, hostname.clone(), writer_arc.clone()).await;
 
                         if !registered {
                             let mut writer_guard = writer_arc.lock().await;

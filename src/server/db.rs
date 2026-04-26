@@ -82,6 +82,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS client_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 port INTEGER NOT NULL,
+                hostname TEXT,
                 connected_at DATETIME NOT NULL,
                 disconnected_at DATETIME,
                 duration_seconds INTEGER
@@ -165,16 +166,17 @@ impl Database {
     }
 
     /// Record client connection
-    pub async fn record_client_connect(&self, port: u16) -> Result<(), sqlx::Error> {
+    pub async fn record_client_connect(&self, port: u16, hostname: Option<String>) -> Result<(), sqlx::Error> {
         let now = Utc::now();
 
         sqlx::query(
             r#"
-            INSERT INTO client_sessions (port, connected_at, disconnected_at, duration_seconds)
-            VALUES (?, ?, NULL, NULL)
+            INSERT INTO client_sessions (port, hostname, connected_at, disconnected_at, duration_seconds)
+            VALUES (?, ?, ?, NULL, NULL)
             "#,
         )
         .bind(port as i32)
+        .bind(hostname)
         .bind(now)
         .execute(&self.pool)
         .await?;

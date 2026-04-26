@@ -337,6 +337,7 @@ pub struct LoginResponse {
 #[derive(Debug, Serialize)]
 pub struct ClientResponse {
     pub port: u16,
+    pub hostname: Option<String>,
     pub connection_count: usize,
 }
 
@@ -391,10 +392,11 @@ async fn logout(_auth: Auth) -> impl IntoResponse {
 async fn list_clients(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<ClientResponse>> {
     let clients = state.server_state.get_all_clients().await;
     let mut response = Vec::with_capacity(clients.len());
-    for (port, _info) in clients {
+    for (port, info) in clients {
         let connection_count = state.server_state.get_connection_count_for_port(port).await;
         response.push(ClientResponse {
             port,
+            hostname: info.hostname,
             connection_count,
         });
     }

@@ -24,7 +24,11 @@
       "Bash(cargo test *)",
       "Bash(~/.cargo/bin/cargo test *)",
       "Bash(cargo --version)",
-      "Bash(pkill -f rust-tunnel-server)"
+      "Bash(pkill -f rust-tunnel-server)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(curl -v http://127.0.0.1:3000/)",
+      "Bash(curl http://127.0.0.1:3000/api/status)"
     ]
   }
 }

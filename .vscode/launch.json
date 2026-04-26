@@ -1,0 +1,57 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug server",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=rust-tunnel-server",
+                    "--package=rust-tunnel"
+                ],
+                "filter": {
+                    "name": "rust-tunnel-server",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--bind",
+                "0.0.0.0:8080",
+                "--api-bind",
+                "0.0.0.0:3000"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug client",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=rust-tunnel-client",
+                    "--package=rust-tunnel"
+                ],
+                "filter": {
+                    "name": "rust-tunnel-client",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--server",
+                "localhost:8080",
+                "--forward",
+                "9000:localhost:80"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PATH": "${env:HOME}/.cargo/bin:${env:PATH}"
+            }
+        }
+    ]
+}

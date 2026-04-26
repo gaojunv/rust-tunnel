@@ -1,6 +1,12 @@
 export interface ClientResponse {
   port: number;
+  hostname?: string;
   connection_count: number;
+}
+
+export interface ClientGroup {
+  hostname: string;
+  clients: ClientResponse[];
 }
 
 export interface TrafficBucket {
