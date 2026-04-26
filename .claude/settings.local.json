@@ -18,7 +18,9 @@
       "Read(//Users/gaojun/.cargo/bin/**)",
       "Read(//usr/local/bin/**)",
       "Read(//opt/**)",
-      "Bash(export PATH=\"$HOME/.cargo/bin:$PATH\")"
+      "Bash(export PATH=\"$HOME/.cargo/bin:$PATH\")",
+      "Bash(rm -rf frontend-dist)",
+      "Bash(cp -r frontend/dist frontend-dist)"
     ]
   }
 }

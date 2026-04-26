@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import { useQuery } from 'react-query';
 import { Navbar } from './Navbar';
 import { ClientList } from './ClientList';
 import { TrafficChart } from './TrafficChart';
+import { ClientDetail } from './ClientDetail';
 import { getMetrics, getTraffic } from '../api/client';
 
 interface DashboardProps {
@@ -17,6 +19,8 @@ const formatBytes = (bytes: number): string => {
 };
 
 export const Dashboard = ({ onLogout }: DashboardProps) => {
+  const [selectedPort, setSelectedPort] = useState<number | null>(null);
+
   const { data: metrics } = useQuery('metrics', getMetrics, {
     refetchInterval: 5000,
   });
@@ -97,10 +101,17 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
         </div>
 
         <div className="space-y-6">
-          <ClientList />
+          <ClientList onSelectClient={setSelectedPort} />
           <TrafficChart traffic={traffic} />
         </div>
       </main>
+
+      {selectedPort !== null && (
+        <ClientDetail
+          port={selectedPort}
+          onClose={() => setSelectedPort(null)}
+        />
+      )}
     </div>
   );
 };

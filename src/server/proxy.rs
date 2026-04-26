@@ -22,7 +22,7 @@ pub async fn proxy_user_connection(
     let user_writer = Arc::new(Mutex::new(user_writer));
 
     // Add this connection to active connections map so data from client can be delivered
-    state.add_active_connection(connection_id, user_writer.clone()).await;
+    state.add_active_connection(connection_id, remote_port, user_writer.clone()).await;
 
     let mut buf = vec![0u8; 8192];
 
