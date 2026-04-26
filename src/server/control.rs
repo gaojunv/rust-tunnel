@@ -8,6 +8,7 @@ use tracing::{info, warn, error, debug};
 
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
 use crate::server::{ServerConfig, listener};
+use crate::server::api::TrafficStore;
 
 /// Information about a connected client
 #[derive(Debug, Clone)]
@@ -32,6 +33,8 @@ pub struct ServerState {
     clients: Arc<Mutex<HashMap<u16, ClientInfo>>>,
     /// Map from connection_id to active connection info
     active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
+    /// Traffic statistics store
+    pub traffic_store: TrafficStore,
 }
 
 impl ServerState {
@@ -39,6 +42,7 @@ impl ServerState {
         Self {
             clients: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            traffic_store: TrafficStore::new(),
         }
     }
 
@@ -80,8 +84,19 @@ impl ServerState {
         let active_connections = self.active_connections.lock().await;
         if let Some(conn) = active_connections.get(&connection_id) {
             let mut writer = conn.user_writer.lock().await;
+            let bytes = data.len();
             writer.write_all(&data).await?;
             writer.flush().await?;
+            drop(writer);
+            drop(active_connections);
+
+            // Find which port this connection belongs to and record traffic
+            let clients = self.clients.lock().await;
+            for (&port, _) in clients.iter() {
+                // We don't track which connection is on which port, so just record to all for now
+                // This is imperfect but better than nothing
+                self.traffic_store.record_bytes_out(port, bytes as u64).await;
+            }
             Ok(())
         } else {
             debug!("No active connection found for id {}", connection_id);
@@ -92,6 +107,35 @@ impl ServerState {
     pub async fn close_connection(&self, connection_id: u64) {
         let mut active_connections = self.active_connections.lock().await;
         active_connections.remove(&connection_id);
+    }
+
+    // API helper methods
+    pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
+        let clients = self.clients.lock().await;
+        clients.iter().map(|(port, info)| (*port, info.clone())).collect()
+    }
+
+    pub async fn get_client_count(&self) -> usize {
+        let clients = self.clients.lock().await;
+        clients.len()
+    }
+
+    pub async fn get_active_connection_count(&self) -> usize {
+        let active_connections = self.active_connections.lock().await;
+        active_connections.len()
+    }
+
+    pub async fn disconnect_client(&self, remote_port: u16) -> bool {
+        let clients = self.clients.lock().await;
+        if let Some(client) = clients.get(&remote_port) {
+            // Send Disconnect message to client
+            let mut writer = client.control_writer.lock().await;
+            // We'll let the connection drop naturally after sending
+            let _ = ControlMessage::Disconnect.write_to_split(&mut *writer).await;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -204,8 +248,7 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
 }
 
 /// Start the main server
-pub async fn run_server(config: ServerConfig) -> TunnelResult<()> {
-    let state = ServerState::new();
+pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResult<()> {
     let listener = TcpListener::bind(&config.control_addr).await?;
     info!("Control server listening on {}", config.control_addr);
 

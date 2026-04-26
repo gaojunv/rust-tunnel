@@ -11,6 +11,7 @@ use crate::server::control::{ClientInfo, ServerState};
 /// Data from client is handled by the main control loop which writes directly to user stream.
 pub async fn proxy_user_connection(
     connection_id: u64,
+    remote_port: u16,
     user_stream: TcpStream,
     client_info: ClientInfo,
     state: ServerState,
@@ -32,6 +33,9 @@ pub async fn proxy_user_connection(
                 break;
             }
             Ok(n) => {
+                // Record incoming traffic (from user to server)
+                state.traffic_store.record_bytes_in(remote_port, n as u64).await;
+
                 // Send data from user to client via control channel
                 let mut control_guard = client_info.control_writer.lock().await;
                 if let Err(e) = (ControlMessage::Data {

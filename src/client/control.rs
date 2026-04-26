@@ -106,6 +106,11 @@ async fn process_control_messages(reader: &mut OwnedReadHalf, state: ClientState
                         info!("Connection {} closed by server", connection_id);
                         state.close_connection(connection_id).await;
                     }
+                    ControlMessage::Disconnect => {
+                        info!("Server requested disconnect. Shutting down...");
+                        // This will cause the process to exit
+                        return Err(TunnelError::Protocol("Server requested disconnect".into()));
+                    }
                     _ => {
                         warn!("Unexpected message from server: {:?}", msg);
                     }

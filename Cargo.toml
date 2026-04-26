@@ -44,6 +44,18 @@ rand = "0.8"
 # Get network interface addresses for workaround
 get_if_addrs = "0.5.3"
 
+# Web framework
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Authentication
+jsonwebtoken = "9.0"
+
+# Time and serialization
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+
 [[bin]]
 name = "test_connect"
 path = "test_connect.rs"

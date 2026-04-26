@@ -62,6 +62,6 @@ async fn handle_inbound_connection(
 
     // Start proxying: user stream -> control channel -> client -> local service
     // Data from client -> control channel -> main control loop -> user stream
-    proxy::proxy_user_connection(connection_id, user_stream, client_info, state).await;
+    proxy::proxy_user_connection(connection_id, remote_port, user_stream, client_info, state).await;
     Ok(())
 }

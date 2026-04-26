@@ -22,6 +22,8 @@ pub enum ControlMessage {
     Ping,
     /// Heartbeat pong (server -> client)
     Pong,
+    /// Server requests client to disconnect (web interface admin action)
+    Disconnect,
 }
 
 impl ControlMessage {
