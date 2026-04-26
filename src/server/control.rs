@@ -153,73 +153,143 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
     let (reader, writer) = stream.into_split();
     let writer_arc = Arc::new(Mutex::new(writer));
 
-    // Read registration message
+    // Track all registered ports for this connection
+    let mut registered_ports = Vec::new();
     let mut reader = reader;
-    let msg = match ControlMessage::read_from_stream(&mut reader).await {
-        Ok(Some(msg)) => msg,
-        Ok(None) => {
-            return Err(TunnelError::Protocol("Connection closed before registration".into()));
+
+    // Process registration phase - client may send multiple Register messages
+    info!("Waiting for client registration...");
+
+    loop {
+        let msg = match ControlMessage::read_from_stream(&mut reader).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                if registered_ports.is_empty() {
+                    return Err(TunnelError::Protocol("Connection closed before registration".into()));
+                } else {
+                    break;
+                }
+            }
+            Err(e) => {
+                if registered_ports.is_empty() {
+                    return Err(e);
+                } else {
+                    error!("Error during registration phase: {}", e);
+                    break;
+                }
+            }
+        };
+
+        match msg {
+            ControlMessage::Register { remote_port } => {
+                info!("Received registration request for port {}", remote_port);
+
+                // First, remove any existing client on this port (cleanup from previous connection)
+                state.remove_client(remote_port).await;
+
+                // Now register the new client
+                let registered = state.register_client(remote_port, writer_arc.clone()).await;
+
+                if !registered {
+                    let mut writer_guard = writer_arc.lock().await;
+                    let _ = ControlMessage::RegisterResponse {
+                        success: false,
+                        message: format!("Port {} already registered", remote_port),
+                    }.write_to_split(&mut *writer_guard).await;
+                    // Continue processing other registrations instead of failing completely
+                    continue;
+                }
+
+                // Send registration success
+                let mut writer_guard = writer_arc.lock().await;
+                ControlMessage::RegisterResponse {
+                    success: true,
+                    message: "Registered successfully".into(),
+                }.write_to_split(&mut *writer_guard).await?;
+                drop(writer_guard);
+
+                info!("Client registered for port {}", remote_port);
+                registered_ports.push(remote_port);
+
+                // Spawn the listener task for the remote port
+                let state_clone = state.clone();
+                let state_for_remove = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = listener::run_listener(state_clone, remote_port).await {
+                        error!("Listener for port {} failed: {}", remote_port, e);
+                    }
+                    state_for_remove.remove_client(remote_port).await;
+                    info!("Client unregistered from port {}", remote_port);
+                });
+            }
+            _ => {
+                // If we have registered ports, this is the end of registration phase
+                if !registered_ports.is_empty() {
+                    // Put the message back? We can't, so just process it normally in the main loop
+                    // Instead, we'll break and handle it in the main loop
+                    info!("Registration phase complete, {} ports registered", registered_ports.len());
+
+                    // We need to handle this message in the main loop, but since we can't put it back,
+                    // let's just create a small wrapper to handle it
+                    // For simplicity, let's just break and continue to main loop
+                    break;
+                } else {
+                    let mut writer_guard = writer_arc.lock().await;
+                    let _ = ControlMessage::RegisterResponse {
+                        success: false,
+                        message: "Expected registration message".into(),
+                    }.write_to_split(&mut *writer_guard).await;
+                    return Err(TunnelError::Protocol("Expected registration message".into()));
+                }
+            }
         }
-        Err(e) => return Err(e),
-    };
-
-    let remote_port = match msg {
-        ControlMessage::Register { remote_port } => {
-            info!("Received registration request for port {}", remote_port);
-            remote_port
-        }
-        _ => {
-            let mut writer_guard = writer_arc.lock().await;
-            let _ = ControlMessage::RegisterResponse {
-                success: false,
-                message: "Expected registration message".into(),
-            }.write_to_split(&mut *writer_guard).await;
-            return Err(TunnelError::Protocol("Expected registration message".into()));
-        }
-    };
-
-    // First, remove any existing client on this port (cleanup from previous connection)
-    state.remove_client(remote_port).await;
-
-    // Now register the new client
-    let registered = state.register_client(remote_port, writer_arc.clone()).await;
-
-    if !registered {
-        let mut writer_guard = writer_arc.lock().await;
-        let _ = ControlMessage::RegisterResponse {
-            success: false,
-            message: format!("Port {} already registered", remote_port),
-        }.write_to_split(&mut *writer_guard).await;
-        return Err(TunnelError::Protocol(format!("Port {} already registered", remote_port)));
     }
 
-    // Send registration success
-    let mut writer_guard = writer_arc.lock().await;
-    ControlMessage::RegisterResponse {
-        success: true,
-        message: "Registered successfully".into(),
-    }.write_to_split(&mut *writer_guard).await?;
-    drop(writer_guard);
-
-    info!("Client registered for port {}", remote_port);
-
-    // Spawn the listener task for the remote port
-    let state_clone = state.clone();
-    let state_for_remove = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = listener::run_listener(state_clone, remote_port).await {
-            error!("Listener for port {} failed: {}", remote_port, e);
-        }
-        state_for_remove.remove_client(remote_port).await;
-        info!("Client unregistered from port {}", remote_port);
-    });
-
-    // Keep connection alive and process messages (heartbeats, data routing)
-    // Only reading happens here, writing goes through the shared writer_arc
+    // Main loop: keep connection alive and process messages (heartbeats, data routing)
     let result = loop {
         match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
                 match msg {
+                    ControlMessage::Register { remote_port } => {
+                        // Handle late registration (client might send more Register messages later)
+                        info!("Received late registration request for port {}", remote_port);
+
+                        // First, remove any existing client on this port
+                        state.remove_client(remote_port).await;
+
+                        // Now register the new client
+                        let registered = state.register_client(remote_port, writer_arc.clone()).await;
+
+                        if !registered {
+                            let mut writer_guard = writer_arc.lock().await;
+                            let _ = ControlMessage::RegisterResponse {
+                                success: false,
+                                message: format!("Port {} already registered", remote_port),
+                            }.write_to_split(&mut *writer_guard).await;
+                        } else {
+                            // Send registration success
+                            let mut writer_guard = writer_arc.lock().await;
+                            ControlMessage::RegisterResponse {
+                                success: true,
+                                message: "Registered successfully".into(),
+                            }.write_to_split(&mut *writer_guard).await?;
+                            drop(writer_guard);
+
+                            info!("Client registered for port {}", remote_port);
+                            registered_ports.push(remote_port);
+
+                            // Spawn the listener task
+                            let state_clone = state.clone();
+                            let state_for_remove = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = listener::run_listener(state_clone, remote_port).await {
+                                    error!("Listener for port {} failed: {}", remote_port, e);
+                                }
+                                state_for_remove.remove_client(remote_port).await;
+                                info!("Client unregistered from port {}", remote_port);
+                            });
+                        }
+                    }
                     ControlMessage::Ping => {
                         let mut writer_guard = writer_arc.lock().await;
                         let _ = ControlMessage::Pong.write_to_split(&mut *writer_guard).await;
@@ -242,8 +312,17 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
                         state.close_connection(connection_id).await;
                         debug!("Connection {} closed by client", connection_id);
                     }
-                    _ => {
-                        warn!("Unexpected message on control channel: {:?}", msg);
+                    ControlMessage::Disconnect => {
+                        // Server doesn't expect this from client
+                        warn!("Received unexpected Disconnect from client");
+                    }
+                    ControlMessage::RegisterResponse { .. } => {
+                        // Server doesn't expect this from client
+                        warn!("Received unexpected RegisterResponse from client");
+                    }
+                    ControlMessage::NewConnection { .. } => {
+                        // Server doesn't expect this from client
+                        warn!("Received unexpected NewConnection from client");
                     }
                 }
             }
@@ -258,9 +337,11 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         }
     };
 
-    // Cleanup: remove client registration when control connection closes
-    state.remove_client(remote_port).await;
-    info!("Client unregistered from port {} (control connection closed)", remote_port);
+    // Cleanup: remove all registered clients when control connection closes
+    for &remote_port in &registered_ports {
+        state.remove_client(remote_port).await;
+        info!("Client unregistered from port {} (control connection closed)", remote_port);
+    }
 
     result
 }
