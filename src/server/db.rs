@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, Sqlite, Pool};
+use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Sqlite, Pool};
 use std::path::Path;
+use std::str::FromStr;
 
 /// Database wrapper for persistence
 #[derive(Clone)]
@@ -22,11 +23,18 @@ impl Database {
             }
         }
 
-        let database_url = format!("sqlite://{}", path.to_str().unwrap_or(":memory:"));
+        // Use SqliteConnectOptions instead of URL to avoid issues
+        let options = if path == Path::new(":memory:") {
+            SqliteConnectOptions::from_str("sqlite::memory:")?
+        } else {
+            SqliteConnectOptions::new()
+                .filename(path)
+                .create_if_missing(true)
+        };
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&database_url)
+            .connect_with(options)
             .await?;
 
         // Initialize schema

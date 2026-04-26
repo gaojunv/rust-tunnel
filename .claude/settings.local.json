@@ -23,7 +23,8 @@
       "Bash(cp -r frontend/dist frontend-dist)",
       "Bash(cargo test *)",
       "Bash(~/.cargo/bin/cargo test *)",
-      "Bash(cargo --version)"
+      "Bash(cargo --version)",
+      "Bash(pkill -f rust-tunnel-server)"
     ]
   }
 }
