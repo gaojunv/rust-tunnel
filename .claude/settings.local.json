@@ -22,7 +22,8 @@
       "Bash(rm -rf frontend-dist)",
       "Bash(cp -r frontend/dist frontend-dist)",
       "Bash(cargo test *)",
-      "Bash(~/.cargo/bin/cargo test *)"
+      "Bash(~/.cargo/bin/cargo test *)",
+      "Bash(cargo --version)"
     ]
   }
 }

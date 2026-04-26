@@ -1,6 +1,6 @@
 use clap::Parser;
 use rust_tunnel::common::{init_logging_with_level, TunnelResult};
-use rust_tunnel::server::{ServerConfig, control, api, auth};
+use rust_tunnel::server::{ServerConfig, control, api, auth, Database};
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
@@ -8,8 +8,19 @@ async fn main() -> TunnelResult<()> {
     init_logging_with_level(&config.log);
     tracing::info!("Starting rust-tunnel server on {}", config.control_addr);
 
-    // Create shared state
-    let state = control::ServerState::new();
+    // Initialize database
+    tracing::info!("Initializing database at {}", config.db_path);
+    let db = Database::new(&config.db_path).await?;
+
+    // Create shared state with database
+    let state = control::ServerState::with_db(db.clone());
+
+    // Load historical data from database
+    if let Err(e) = state.traffic_store.load_from_db().await {
+        tracing::warn!("Failed to load historical data from database: {}", e);
+    } else {
+        tracing::info!("Loaded historical traffic data from database");
+    }
 
     // Create auth config
     let auth_config = auth::AuthConfig::new(
