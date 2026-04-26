@@ -16,6 +16,7 @@ use tower_http::services::ServeDir;
 
 use crate::server::auth::{auth_middleware, Auth, AuthConfig, create_token};
 use crate::server::control::ServerState;
+use crate::server::db::Database;
 
 /// Traffic record for a single time bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,42 +39,120 @@ pub struct PortTraffic {
 #[derive(Clone)]
 pub struct TrafficStore {
     inner: Arc<Mutex<std::collections::HashMap<u16, PortTraffic>>>,
+    db: Option<Database>,
 }
 
 impl TrafficStore {
+    /// Create a new traffic store without database (for backwards compatibility)
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db: None,
         }
+    }
+
+    /// Create a new traffic store with database persistence
+    pub fn with_db(db: Database) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db: Some(db),
+        }
+    }
+
+    /// Load traffic data from database
+    pub async fn load_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(db) = &self.db {
+            let mut store = self.inner.lock().await;
+
+            // Load port traffic aggregates
+            let port_records = db.load_port_traffic().await?;
+            let bucket_records = db.load_recent_buckets(24).await?;
+
+            // Build port traffic entries
+            for record in port_records {
+                let port = record.port as u16;
+                let port_traffic = PortTraffic {
+                    port,
+                    total_bytes_in: record.total_bytes_in as u64,
+                    total_bytes_out: record.total_bytes_out as u64,
+                    buckets: VecDeque::new(),
+                };
+                store.insert(port, port_traffic);
+            }
+
+            // Add buckets to respective ports
+            for bucket in bucket_records {
+                let port = bucket.port as u16;
+                if let Some(port_traffic) = store.get_mut(&port) {
+                    port_traffic.buckets.push_back(TrafficBucket {
+                        timestamp: bucket.timestamp,
+                        bytes_in: bucket.bytes_in as u64,
+                        bytes_out: bucket.bytes_out as u64,
+                    });
+                }
+            }
+
+            // Ensure buckets are within 24h limit for each port
+            for port_traffic in store.values_mut() {
+                while port_traffic.buckets.len() > 1440 {
+                    port_traffic.buckets.pop_front();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Record incoming bytes (from user to server)
     pub async fn record_bytes_in(&self, port: u16, bytes: u64) {
-        let mut store = self.inner.lock().await;
-        let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
-            port,
-            total_bytes_in: 0,
-            total_bytes_out: 0,
-            buckets: VecDeque::new(),
-        });
-        port_traffic.total_bytes_in += bytes;
-        self.add_to_bucket(port_traffic, bytes, 0).await;
+        let bucket_time;
+        {
+            let mut store = self.inner.lock().await;
+            let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
+                port,
+                total_bytes_in: 0,
+                total_bytes_out: 0,
+                buckets: VecDeque::new(),
+            });
+            port_traffic.total_bytes_in += bytes;
+            bucket_time = Self::add_to_bucket(port_traffic, bytes, 0);
+        }
+
+        // Persist to database asynchronously
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let _ = db.upsert_port_traffic(port, bytes, 0).await;
+                let _ = db.upsert_traffic_bucket(port, bucket_time, bytes, 0).await;
+            });
+        }
     }
 
     /// Record outgoing bytes (from server to user)
     pub async fn record_bytes_out(&self, port: u16, bytes: u64) {
-        let mut store = self.inner.lock().await;
-        let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
-            port,
-            total_bytes_in: 0,
-            total_bytes_out: 0,
-            buckets: VecDeque::new(),
-        });
-        port_traffic.total_bytes_out += bytes;
-        self.add_to_bucket(port_traffic, 0, bytes).await;
+        let bucket_time;
+        {
+            let mut store = self.inner.lock().await;
+            let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
+                port,
+                total_bytes_in: 0,
+                total_bytes_out: 0,
+                buckets: VecDeque::new(),
+            });
+            port_traffic.total_bytes_out += bytes;
+            bucket_time = Self::add_to_bucket(port_traffic, 0, bytes);
+        }
+
+        // Persist to database asynchronously
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let _ = db.upsert_port_traffic(port, 0, bytes).await;
+                let _ = db.upsert_traffic_bucket(port, bucket_time, 0, bytes).await;
+            });
+        }
     }
 
-    async fn add_to_bucket(&self, port_traffic: &mut PortTraffic, bytes_in: u64, bytes_out: u64) {
+    fn add_to_bucket(port_traffic: &mut PortTraffic, bytes_in: u64, bytes_out: u64) -> DateTime<Utc> {
         let now = Utc::now();
         // Truncate to minute
         let bucket_time = now - chrono::Duration::seconds(now.second() as i64);
@@ -83,7 +162,7 @@ impl TrafficStore {
             if last.timestamp == bucket_time {
                 last.bytes_in += bytes_in;
                 last.bytes_out += bytes_out;
-                return;
+                return bucket_time;
             }
         }
 
@@ -98,6 +177,8 @@ impl TrafficStore {
         while port_traffic.buckets.len() > 1440 {
             port_traffic.buckets.pop_front();
         }
+
+        bucket_time
     }
 
     /// Get traffic for all ports
@@ -113,6 +194,7 @@ impl TrafficStore {
     }
 
     /// Remove traffic data for a port (when client disconnects)
+    /// Note: This only removes from in-memory cache, database history is preserved
     pub async fn remove_port(&self, port: u16) {
         let mut store = self.inner.lock().await;
         store.remove(&port);

@@ -24,6 +24,10 @@ pub struct ServerConfig {
     /// Log level (trace, debug, info, warn, error)
     #[clap(long, default_value = "info")]
     pub log: String,
+
+    /// Path to SQLite database file (default: rust-tunnel.db)
+    #[clap(long = "db-path", default_value = "rust-tunnel.db")]
+    pub db_path: String,
 }
 
 #[cfg(test)]

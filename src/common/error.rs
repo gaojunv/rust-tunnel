@@ -8,6 +8,9 @@ pub enum TunnelError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
 
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 

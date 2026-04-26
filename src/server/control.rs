@@ -9,6 +9,7 @@ use tracing::{info, warn, error, debug};
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
 use crate::server::{ServerConfig, listener};
 use crate::server::api::TrafficStore;
+use crate::server::db::Database;
 
 /// Information about a connected client
 #[derive(Debug, Clone)]
@@ -37,14 +38,28 @@ pub struct ServerState {
     active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
     /// Traffic statistics store
     pub traffic_store: TrafficStore,
+    /// Database connection (optional)
+    db: Option<Database>,
 }
 
 impl ServerState {
+    /// Create a new server state without database (for backwards compatibility)
     pub fn new() -> Self {
         Self {
             clients: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
+            db: None,
+        }
+    }
+
+    /// Create a new server state with database
+    pub fn with_db(db: Database) -> Self {
+        Self {
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
+            traffic_store: TrafficStore::with_db(db.clone()),
+            db: Some(db),
         }
     }
 
@@ -57,6 +72,15 @@ impl ServerState {
             remote_port,
             control_writer,
         });
+
+        // Record client connection in database
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let _ = db.record_client_connect(remote_port).await;
+            });
+        }
+
         true
     }
 
@@ -68,6 +92,14 @@ impl ServerState {
     pub async fn remove_client(&self, remote_port: u16) {
         let mut clients = self.clients.lock().await;
         clients.remove(&remote_port);
+
+        // Record client disconnection in database
+        if let Some(db) = &self.db {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let _ = db.record_client_disconnect(remote_port).await;
+            });
+        }
     }
 
     pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<OwnedWriteHalf>>) {
