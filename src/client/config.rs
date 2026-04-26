@@ -1,5 +1,4 @@
 use clap::{Parser, ArgAction};
-use std::net::SocketAddr;
 
 /// Client endpoint for rust-tunnel intranet penetration tool
 #[derive(Parser, Debug, Clone)]
