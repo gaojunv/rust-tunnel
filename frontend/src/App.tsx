@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { QueryClient, QueryClientProvider } from 'react-query';
 import { Login } from './components/Login';
 import { Dashboard } from './components/Dashboard';
-import { isAuthenticated, checkHealth } from './api/client';
+import { checkHealth } from './api/client';
 import './index.css';
 
 // Create a client
