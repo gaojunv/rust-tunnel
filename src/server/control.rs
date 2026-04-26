@@ -147,6 +147,166 @@ impl ServerState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn test_server_state_new() {
+        let state = ServerState::new();
+        assert_eq!(state.get_client_count().await, 0);
+        assert_eq!(state.get_active_connection_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_and_get_client() {
+        let state = ServerState::new();
+
+        // Create a mock stream (we just need the split for the test)
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Connect to ourselves to get a stream
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, writer) = stream.into_split();
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        // Register client
+        let registered = state.register_client(8080, writer_arc.clone()).await;
+        assert!(registered);
+        assert_eq!(state.get_client_count().await, 1);
+
+        // Get client
+        let client = state.get_client(8080).await;
+        assert!(client.is_some());
+
+        // Register same port again should fail
+        let registered = state.register_client(8080, writer_arc).await;
+        assert!(!registered);
+    }
+
+    #[tokio::test]
+    async fn test_remove_client() {
+        let state = ServerState::new();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, writer) = stream.into_split();
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        state.register_client(8080, writer_arc).await;
+        assert_eq!(state.get_client_count().await, 1);
+
+        state.remove_client(8080).await;
+        assert_eq!(state.get_client_count().await, 0);
+        assert!(state.get_client(8080).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_client() {
+        let state = ServerState::new();
+        // Should not panic
+        state.remove_client(9999).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_all_clients() {
+        let state = ServerState::new();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, writer) = stream.into_split();
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        state.register_client(8080, writer_arc.clone()).await;
+        state.register_client(9000, writer_arc).await;
+
+        let clients = state.get_all_clients().await;
+        assert_eq!(clients.len(), 2);
+        let ports: Vec<u16> = clients.iter().map(|(p, _)| *p).collect();
+        assert!(ports.contains(&8080));
+        assert!(ports.contains(&9000));
+    }
+
+    #[tokio::test]
+    async fn test_active_connections() {
+        let state = ServerState::new();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, writer) = stream.into_split();
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        state.add_active_connection(42, 8080, writer_arc).await;
+        assert_eq!(state.get_active_connection_count().await, 1);
+        assert_eq!(state.get_connection_count_for_port(8080).await, 1);
+
+        state.remove_active_connection(42).await;
+        assert_eq!(state.get_active_connection_count().await, 0);
+        assert_eq!(state.get_connection_count_for_port(8080).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_connection_count_for_nonexistent_port() {
+        let state = ServerState::new();
+        assert_eq!(state.get_connection_count_for_port(9999).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_state_clone() {
+        let state = ServerState::new();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_, writer) = stream.into_split();
+        let writer_arc = Arc::new(Mutex::new(writer));
+
+        state.register_client(8080, writer_arc).await;
+
+        let cloned = state.clone();
+        assert_eq!(cloned.get_client_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_connection() {
+        let state = ServerState::new();
+        // Should not panic
+        state.remove_active_connection(9999).await;
+        state.close_connection(9999).await;
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_nonexistent_client() {
+        let state = ServerState::new();
+        let result = state.disconnect_client(9999).await;
+        assert!(!result);
+    }
+}
+
 /// Handle a single control connection from client
 async fn handle_control_connection(state: ServerState, stream: TcpStream) -> TunnelResult<()> {
     // Split into read and write halves

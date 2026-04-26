@@ -119,6 +119,118 @@ impl TrafficStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_traffic_store_new() {
+        let store = TrafficStore::new();
+        let traffic = store.get_all_traffic().await;
+        assert!(traffic.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_record_bytes_in() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.port, 8080);
+        assert_eq!(traffic.total_bytes_in, 100);
+        assert_eq!(traffic.total_bytes_out, 0);
+        assert_eq!(traffic.buckets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_record_bytes_out() {
+        let store = TrafficStore::new();
+        store.record_bytes_out(8080, 200).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.port, 8080);
+        assert_eq!(traffic.total_bytes_in, 0);
+        assert_eq!(traffic.total_bytes_out, 200);
+        assert_eq!(traffic.buckets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_record_multiple_ports() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+        store.record_bytes_out(9000, 200).await;
+
+        let all_traffic = store.get_all_traffic().await;
+        assert_eq!(all_traffic.len(), 2);
+
+        let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic_8080.total_bytes_in, 100);
+
+        let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
+        assert_eq!(traffic_9000.total_bytes_out, 200);
+    }
+
+    #[tokio::test]
+    async fn test_record_accumulates() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+        store.record_bytes_in(8080, 200).await;
+        store.record_bytes_out(8080, 50).await;
+        store.record_bytes_out(8080, 75).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.total_bytes_in, 300);
+        assert_eq!(traffic.total_bytes_out, 125);
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_port() {
+        let store = TrafficStore::new();
+        let traffic = store.get_port_traffic(9999).await;
+        assert!(traffic.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_port() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+        assert!(store.get_port_traffic(8080).await.is_some());
+
+        store.remove_port(8080).await;
+        assert!(store.get_port_traffic(8080).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_port() {
+        let store = TrafficStore::new();
+        // Should not panic
+        store.remove_port(9999).await;
+    }
+
+    #[tokio::test]
+    async fn test_bucket_creation() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.buckets.len(), 1);
+
+        let bucket = &traffic.buckets[0];
+        assert_eq!(bucket.bytes_in, 100);
+        assert_eq!(bucket.bytes_out, 0);
+    }
+
+    #[tokio::test]
+    async fn test_traffic_store_clone() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+
+        let cloned = store.clone();
+        let traffic = cloned.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.total_bytes_in, 100);
+    }
+}
+
 /// API state shared across all handlers
 #[derive(Clone)]
 pub struct ApiState {

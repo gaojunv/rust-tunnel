@@ -87,4 +87,91 @@ mod tests {
         let bytes = msg.serialize().unwrap();
         assert!(bytes.len() > 4);
     }
+
+    #[test]
+    fn test_message_variants_serialization() {
+        // Test all message variants can be serialized
+        let messages = vec![
+            ControlMessage::Register { remote_port: 8080 },
+            ControlMessage::RegisterResponse { success: true, message: "ok".into() },
+            ControlMessage::NewConnection { connection_id: 12345, remote_port: 9000 },
+            ControlMessage::ConnectionReady { connection_id: 12345 },
+            ControlMessage::Data { connection_id: 12345, data: vec![1, 2, 3, 4] },
+            ControlMessage::Close { connection_id: 12345 },
+            ControlMessage::Ping,
+            ControlMessage::Pong,
+            ControlMessage::Disconnect,
+        ];
+
+        for msg in messages {
+            let bytes = msg.serialize().unwrap();
+            assert!(bytes.len() > 4);
+            // Verify length prefix
+            let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            assert_eq!(len, bytes.len() - 4);
+        }
+    }
+
+    #[test]
+    fn test_max_message_size() {
+        // Create a message that would exceed max size when serialized
+        let large_data = vec![0u8; 2 * 1024 * 1024]; // 2MB
+        let msg = ControlMessage::Data { connection_id: 1, data: large_data };
+        let result = msg.serialize();
+        // The serialization itself works, but read_from_stream will reject it
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_write_and_read_from_stream() {
+        // Create an in-memory buffer to simulate a stream
+        let mut buffer = Vec::new();
+
+        // Write a message
+        let original_msg = ControlMessage::Data {
+            connection_id: 42,
+            data: vec![10, 20, 30, 40, 50],
+        };
+        original_msg.write_to_stream(&mut buffer).await.unwrap();
+
+        // Read it back
+        let mut reader = &buffer[..];
+        let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap();
+
+        assert!(read_msg.is_some());
+        match read_msg.unwrap() {
+            ControlMessage::Data { connection_id, data } => {
+                assert_eq!(connection_id, 42);
+                assert_eq!(data, vec![10, 20, 30, 40, 50]);
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_from_stream_eof() {
+        // Empty buffer
+        let mut buffer = &[] as &[u8];
+        let result = ControlMessage::read_from_stream(&mut buffer).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_from_stream_partial_length() {
+        // Only 2 bytes of length prefix - should return Ok(None) for EOF
+        let buffer = [0x00, 0x01];
+        let mut reader = &buffer[..];
+        let result = ControlMessage::read_from_stream(&mut reader).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_to_split_alias() {
+        let mut buffer = Vec::new();
+        let msg = ControlMessage::Ping;
+        // write_to_split is just an alias for write_to_stream
+        msg.write_to_split(&mut buffer).await.unwrap();
+        assert!(!buffer.is_empty());
+    }
 }
