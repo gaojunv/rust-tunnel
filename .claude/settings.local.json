@@ -8,7 +8,9 @@
       "Bash(cargo search *)",
       "WebSearch",
       "Bash(cargo check *)",
-      "Bash(xargs ls *)"
+      "Bash(xargs ls *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'fix: add package-lock.json and update .gitignore for frontend *)"
     ]
   }
 }
