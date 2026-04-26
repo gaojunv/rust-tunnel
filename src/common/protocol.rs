@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use crate::common::{TunnelError, TunnelResult};
 

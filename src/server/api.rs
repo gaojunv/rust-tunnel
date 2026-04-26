@@ -6,7 +6,7 @@ use axum::{
     routing::{get, post, delete},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 
 use crate::server::auth::{auth_middleware, Auth, AuthConfig, create_token};
-use crate::server::control::{ClientInfo, ServerState};
+use crate::server::control::ServerState;
 
 /// Traffic record for a single time bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +172,7 @@ async fn login(
         return Json(LoginResponse {
             token,
             auth_required: false,
-        });
+        }).into_response();
     }
 
     if state.auth_config.verify_password(&request.password) {
@@ -180,7 +180,7 @@ async fn login(
             Ok(token) => Json(LoginResponse {
                 token,
                 auth_required: true,
-            }),
+            }).into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create token").into_response(),
         }
     } else {

@@ -2,7 +2,6 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use std::sync::Arc;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing::{debug, warn};
 
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
