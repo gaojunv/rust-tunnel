@@ -1,6 +1,6 @@
 # Rust Tunnel
 
-一个基于 Rust 的内网穿透工具，采用客户端-服务器架构。
+一个基于 Rust 的内网穿透工具，采用客户端-服务器架构，配有 React/TypeScript 前端管理界面。
 
 ## 功能特性
 
@@ -8,34 +8,10 @@
 - 基于 Tokio 的异步 IO
 - 心跳检测保持连接
 - 简洁的协议设计
-
-## 项目结构
-
-```
-.
-├── Cargo.toml
-└── src/
-    ├── lib.rs
-    ├── bin/
-    │   ├── client.rs    # 客户端入口
-    │   └── server.rs    # 服务器入口
-    ├── client/          # 客户端实现
-    │   ├── config.rs    # 配置解析
-    │   ├── control.rs   # 控制连接处理
-    │   ├── mod.rs
-    │   └── proxy.rs     # 代理连接处理
-    ├── server/          # 服务器实现
-    │   ├── config.rs    # 配置解析
-    │   ├── control.rs   # 控制连接处理
-    │   ├── listener.rs  # 本地端口监听
-    │   ├── mod.rs
-    │   └── proxy.rs     # 代理连接处理
-    └── common/          # 公共模块
-        ├── error.rs     # 错误定义
-        ├── logging.rs   # 日志配置
-        ├── mod.rs
-        └── protocol.rs  # 通信协议
-```
+- Web 管理界面（支持连接监控、流量统计、客户端管理）
+- JWT 身份认证（可选）
+- 实时流量图表
+- 支持客户端断开后自动重连
 
 ## 安装 Rust
 
@@ -76,6 +52,9 @@ cargo build --release
 
 参数说明：
 - `--bind <ADDR>` - 控制连接监听地址 (默认: 0.0.0.0:8080)
+- `--api-bind <ADDR>` - API/前端管理界面监听地址 (默认: 0.0.0.0:3000)
+- `--admin-password <PASSWORD>` - Web UI 管理员密码（可选，启用认证）
+- `--jwt-secret <SECRET>` - JWT 签名密钥（可选，未指定时自动生成）
 - `--log <LEVEL>` - 日志级别 (default: info)
 
 ### 客户端
@@ -120,6 +99,8 @@ cargo build --release
 
 ## 开发
 
+### 后端开发
+
 ```bash
 # 检查代码错误
 cargo check
@@ -134,13 +115,54 @@ cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
 cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 8080:localhost:80
 ```
 
+### 前端开发
+
+```bash
+cd frontend
+
+# 安装依赖
+npm install
+
+# 开发模式运行（支持热重载）
+npm run dev
+
+# 构建前端
+npm run build
+
+# 构建并部署到 frontend-dist
+npm run build && rm -rf ../frontend-dist && cp -r dist ../frontend-dist
+```
+
+### Web 管理界面
+
+启动服务器后，可以通过浏览器访问 `http://<服务器IP>:3000` 打开管理界面，功能包括：
+
+- 查看已连接的客户端
+- 实时连接数统计
+- 流量监控图表
+- 客户端详情查看
+- 断开客户端连接
+
 ## 依赖
+
+### 后端
 
 - `tokio` - 异步运行时
 - `clap` - 命令行参数解析
 - `thiserror` - 错误处理
 - `tracing` - 日志
 - `serde` - 序列化
+- `axum` - Web 框架
+- `jsonwebtoken` - JWT 认证
+
+### 前端
+
+- `React` - UI 框架
+- `TypeScript` - 类型安全
+- `Vite` - 构建工具
+- `React Query` - 数据获取
+- `Recharts` - 图表库
+- `Tailwind CSS` - 样式框架
 
 ## License
 
