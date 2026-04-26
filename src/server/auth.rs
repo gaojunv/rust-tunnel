@@ -154,3 +154,98 @@ pub async fn auth_middleware(
         Err(_) => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_claims_new() {
+        let claims = Claims::new();
+        assert_eq!(claims.sub, "admin");
+        assert!(claims.exp > claims.iat);
+        assert!(!claims.jti.is_empty());
+    }
+
+    #[test]
+    fn test_auth_config_new() {
+        // With password and secret
+        let config = AuthConfig::new(Some("password".into()), Some("secret".into()));
+        assert_eq!(config.admin_password, Some("password".into()));
+        assert_eq!(config.jwt_secret, "secret");
+
+        // Without password and secret
+        let config = AuthConfig::new(None, None);
+        assert!(config.admin_password.is_none());
+        assert!(!config.jwt_secret.is_empty());
+
+        // With password only
+        let config = AuthConfig::new(Some("password".into()), None);
+        assert_eq!(config.admin_password, Some("password".into()));
+        assert!(!config.jwt_secret.is_empty());
+
+        // With secret only
+        let config = AuthConfig::new(None, Some("secret".into()));
+        assert!(config.admin_password.is_none());
+        assert_eq!(config.jwt_secret, "secret");
+    }
+
+    #[test]
+    fn test_auth_config_is_enabled() {
+        let config = AuthConfig::new(Some("password".into()), None);
+        assert!(config.is_enabled());
+
+        let config = AuthConfig::new(None, None);
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn test_auth_config_verify_password() {
+        let config = AuthConfig::new(Some("correct_password".into()), None);
+        assert!(config.verify_password("correct_password"));
+        assert!(!config.verify_password("wrong_password"));
+
+        // Auth disabled - any password works
+        let config = AuthConfig::new(None, None);
+        assert!(config.verify_password("any_password"));
+        assert!(config.verify_password(""));
+    }
+
+    #[test]
+    fn test_create_and_validate_token() {
+        let secret = "test-secret-key";
+
+        // Create token
+        let token_result = create_token(secret);
+        assert!(token_result.is_ok());
+        let token = token_result.unwrap();
+        assert!(!token.is_empty());
+
+        // Validate token
+        let validate_result = validate_token(&token, secret);
+        assert!(validate_result.is_ok());
+        let claims = validate_result.unwrap();
+        assert_eq!(claims.sub, "admin");
+    }
+
+    #[test]
+    fn test_validate_token_invalid_secret() {
+        let token = create_token("correct-secret").unwrap();
+        let result = validate_token(&token, "wrong-secret");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_token_invalid_token() {
+        let result = validate_token("invalid-token", "secret");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auth_config_clone() {
+        let config = AuthConfig::new(Some("password".into()), Some("secret".into()));
+        let cloned = config.clone();
+        assert_eq!(config.admin_password, cloned.admin_password);
+        assert_eq!(config.jwt_secret, cloned.jwt_secret);
+    }
+}

@@ -25,3 +25,54 @@ pub struct ServerConfig {
     #[clap(long, default_value = "info")]
     pub log: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        // Test that defaults work by parsing empty args
+        let config = ServerConfig::try_parse_from(vec!["rust-tunnel-server"]);
+        assert!(config.is_ok());
+
+        let config = config.unwrap();
+        assert_eq!(config.control_addr, "0.0.0.0:8080");
+        assert_eq!(config.api_addr, "0.0.0.0:3000");
+        assert_eq!(config.log, "info");
+        assert!(config.admin_password.is_none());
+        assert!(config.jwt_secret.is_none());
+    }
+
+    #[test]
+    fn test_custom_config() {
+        let config = ServerConfig::try_parse_from(vec![
+            "rust-tunnel-server",
+            "--bind", "127.0.0.1:9000",
+            "--api-bind", "127.0.0.1:9001",
+            "--admin-password", "secret123",
+            "--jwt-secret", "test-secret",
+            "--log", "debug",
+        ]);
+        assert!(config.is_ok());
+
+        let config = config.unwrap();
+        assert_eq!(config.control_addr, "127.0.0.1:9000");
+        assert_eq!(config.api_addr, "127.0.0.1:9001");
+        assert_eq!(config.admin_password, Some("secret123".into()));
+        assert_eq!(config.jwt_secret, Some("test-secret".into()));
+        assert_eq!(config.log, "debug");
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = ServerConfig::try_parse_from(vec![
+            "rust-tunnel-server",
+            "--bind", "127.0.0.1:9000",
+        ]).unwrap();
+
+        let cloned = config.clone();
+        assert_eq!(config.control_addr, cloned.control_addr);
+        assert_eq!(config.api_addr, cloned.api_addr);
+    }
+}

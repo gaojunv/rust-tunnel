@@ -53,3 +53,141 @@ impl ClientConfig {
         Ok(rules)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_forwards_single() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["8080:localhost:80".into()],
+            log: "info".into(),
+        };
+
+        let rules = config.parse_forwards().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].remote_port, 8080);
+        assert_eq!(rules[0].local_addr, "localhost:80");
+    }
+
+    #[test]
+    fn test_parse_forwards_multiple() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec![
+                "8080:localhost:80".into(),
+                "9000:127.0.0.1:3000".into(),
+            ],
+            log: "info".into(),
+        };
+
+        let rules = config.parse_forwards().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].remote_port, 8080);
+        assert_eq!(rules[0].local_addr, "localhost:80");
+        assert_eq!(rules[1].remote_port, 9000);
+        assert_eq!(rules[1].local_addr, "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn test_parse_forwards_empty() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec![],
+            log: "info".into(),
+        };
+
+        let rules = config.parse_forwards().unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn test_parse_forwards_ipv6() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["8080:::1:80".into()],
+            log: "info".into(),
+        };
+
+        let rules = config.parse_forwards().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].remote_port, 8080);
+        assert_eq!(rules[0].local_addr, "::1:80");
+    }
+
+    #[test]
+    fn test_parse_forwards_invalid_format() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["invalid".into()],
+            log: "info".into(),
+        };
+
+        let result = config.parse_forwards();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_forwards_invalid_remote_port() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["not_a_port:localhost:80".into()],
+            log: "info".into(),
+        };
+
+        let result = config.parse_forwards();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_forwards_invalid_local_port() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["8080:localhost:not_a_port".into()],
+            log: "info".into(),
+        };
+
+        let result = config.parse_forwards();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_forwards_port_out_of_range() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["70000:localhost:80".into()], // 70000 > 65535
+            log: "info".into(),
+        };
+
+        let result = config.parse_forwards();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_config_clone() {
+        let config = ClientConfig {
+            server: "localhost:8080".into(),
+            forwards: vec!["8080:localhost:80".into()],
+            log: "debug".into(),
+        };
+
+        let cloned = config.clone();
+        assert_eq!(config.server, cloned.server);
+        assert_eq!(config.forwards, cloned.forwards);
+        assert_eq!(config.log, cloned.log);
+    }
+
+    #[test]
+    fn test_forward_rule_clone() {
+        let rule = ForwardRule {
+            remote_port: 8080,
+            local_addr: "localhost:80".into(),
+        };
+
+        let cloned = rule.clone();
+        assert_eq!(rule.remote_port, cloned.remote_port);
+        assert_eq!(rule.local_addr, cloned.local_addr);
+    }
+}
