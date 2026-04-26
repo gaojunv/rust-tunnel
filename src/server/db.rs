@@ -11,7 +11,18 @@ pub struct Database {
 impl Database {
     /// Create a new database instance and initialize schema
     pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self, sqlx::Error> {
-        let database_url = format!("sqlite://{}", path.as_ref().to_str().unwrap_or(":memory:"));
+        let path = path.as_ref();
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = path.parent() {
+            if !parent.exists() && parent != Path::new("") {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Err(sqlx::Error::Io(e));
+                }
+            }
+        }
+
+        let database_url = format!("sqlite://{}", path.to_str().unwrap_or(":memory:"));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)

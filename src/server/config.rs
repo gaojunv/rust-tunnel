@@ -25,8 +25,8 @@ pub struct ServerConfig {
     #[clap(long, default_value = "info")]
     pub log: String,
 
-    /// Path to SQLite database file (default: rust-tunnel.db)
-    #[clap(long = "db-path", default_value = "rust-tunnel.db")]
+    /// Path to SQLite database file (default: ./data/rust-tunnel.db)
+    #[clap(long = "db-path", default_value = "./data/rust-tunnel.db")]
     pub db_path: String,
 }
 
