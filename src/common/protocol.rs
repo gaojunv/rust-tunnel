@@ -6,7 +6,11 @@ use crate::common::{TunnelError, TunnelResult};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
     /// Client requests registration to expose a remote port
-    Register { remote_port: u16 },
+    Register {
+        remote_port: u16,
+        /// Hostname of the client machine (optional for backward compatibility)
+        hostname: Option<String>,
+    },
     /// Server response to registration
     RegisterResponse { success: bool, message: String },
     /// Server notifies client of a new incoming connection
@@ -83,7 +87,10 @@ mod tests {
 
     #[test]
     fn test_serialize_deserialize() {
-        let msg = ControlMessage::Register { remote_port: 8080 };
+        let msg = ControlMessage::Register {
+            remote_port: 8080,
+            hostname: Some("test-host".into())
+        };
         let bytes = msg.serialize().unwrap();
         assert!(bytes.len() > 4);
     }
@@ -92,7 +99,7 @@ mod tests {
     fn test_message_variants_serialization() {
         // Test all message variants can be serialized
         let messages = vec![
-            ControlMessage::Register { remote_port: 8080 },
+            ControlMessage::Register { remote_port: 8080, hostname: None },
             ControlMessage::RegisterResponse { success: true, message: "ok".into() },
             ControlMessage::NewConnection { connection_id: 12345, remote_port: 9000 },
             ControlMessage::ConnectionReady { connection_id: 12345 },

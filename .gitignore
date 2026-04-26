@@ -3,3 +3,6 @@ frontend/node_modules
 frontend/dist
 frontend-dist
 data/rust-tunnel.db
+.env
+.vscode/.DS_Store
+

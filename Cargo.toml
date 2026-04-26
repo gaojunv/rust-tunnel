@@ -59,6 +59,9 @@ uuid = { version = "1.0", features = ["v4"] }
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 
+# Get hostname
+gethostname = "0.4"
+
 [[bin]]
 name = "test_connect"
 path = "test_connect.rs"
