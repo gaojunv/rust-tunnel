@@ -26,9 +26,12 @@ rust-tunnel is a client-server intranet penetration tool written in Rust, with a
     - `proxy.rs` - Handles per-connection proxy traffic and traffic accounting
     - `api.rs` - Axum web API and `TrafficStore` for metrics
     - `auth.rs` - JWT‑based authentication for the web interface
+    - `db.rs` - SQLite database for persistent traffic and client session storage
+    - `config.rs` - Server configuration with Clap
   - `src/client/` - Client implementation
     - `control.rs` - Establishes control connection and manages local forwards
     - `proxy.rs` - Connects to local services and proxies traffic
+    - `config.rs` - Client configuration with Clap
 
 ### Frontend (React + TypeScript + Vite)
 - Located in `frontend/`
@@ -36,10 +39,17 @@ rust-tunnel is a client-server intranet penetration tool written in Rust, with a
 - Uses Tailwind CSS, React Query, and Recharts
 - Key components:
   - `Dashboard.tsx` - Main dashboard with metrics
-  - `ClientList.tsx` - Connected clients table
+  - `ClientList.tsx` - Connected clients table (groups clients by hostname)
   - `ClientDetail.tsx` - Client traffic details modal
   - `TrafficChart.tsx` - Real-time traffic charts
   - `Navbar.tsx` - Top navigation bar
+
+### Database (SQLite)
+- **Tables**:
+  - `port_traffic` - Aggregate traffic statistics per port
+  - `traffic_buckets` - Minute-level granular traffic data (last 24 hours retained)
+  - `client_sessions` - Client connection/disconnection history with hostname tracking
+- **Location**: Configurable via `--db-path` (default: `./data/rust-tunnel.db`)
 
 ## Common Development Commands
 
@@ -49,6 +59,7 @@ cargo build                    # Debug build
 cargo build --release          # Release build
 cargo check                    # Fast compile check
 cargo test                     # Run tests
+cargo test -- --nocapture      # Run tests with output
 cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
 cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 9000:localhost:80
 ```
@@ -58,8 +69,16 @@ cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 9000:loc
 cd frontend
 npm install                    # Install dependencies
 npm run dev                    # Dev server (hot reload)
-npm run build                  # Build to dist/ (then copy to frontend-dist/)
+npm run build                  # Build to dist/
 npm run lint                   # Lint with ESLint
+```
+
+### Deploy Frontend
+```bash
+cd frontend
+npm run build
+rm -rf ../frontend-dist
+cp -r dist ../frontend-dist
 ```
 
 ## Server Configuration (Clap)
@@ -67,11 +86,12 @@ npm run lint                   # Lint with ESLint
 - `--api-bind` - API/frontend listen address (default 0.0.0.0:3000)
 - `--admin-password` - Web UI admin password (optional; enables auth)
 - `--jwt-secret` - JWT signing secret (auto-generated if not provided)
+- `--db-path` - SQLite database path (default: `./data/rust-tunnel.db`)
 - `--log` - Log level (trace/debug/info/warn/error)
 
 ## Client Configuration (Clap)
 - `--server` / `SERVER_ADDR` - Server control address (e.g., example.com:8080)
-- `--forward` / `FORWARD` - Forward rules (repeatable); format `REMOTE_PORT:LOCAL_HOST:LOCAL_PORT`
+- `--forward` / `FORWARD` - Forward rules (repeatable); format `REMOTE_PORT:LOCAL_HOST:LOCAL_PORT` (supports IPv6)
 - `--log` - Log level
 
 ## Code Patterns
@@ -81,8 +101,27 @@ npm run lint                   # Lint with ESLint
 - Serialization: `bincode` for control messages, `serde_json` for API
 - Web framework: Axum
 - State sharing: `Arc<Mutex<T>>`
+- Database: sqlx with SQLite
 
 ## Recent Fixes & Improvements
+
+### Database Persistence (April 2026)
+- Added SQLite database for persistent traffic statistics
+- Tables: `port_traffic` (aggregates), `traffic_buckets` (minute-level), `client_sessions` (history)
+- Traffic data retained across server restarts
+- Historical data loaded on server startup
+
+### Configuration Refactoring (April 2026)
+- Moved server config to `src/server/config.rs`
+- Moved client config to `src/client/config.rs`
+- Added proper IPv6 support in forward rule parsing
+- Full test coverage for configuration modules
+
+### Hostname Tracking (April 2026)
+- Clients now report hostname to server
+- `ControlMessage::Register` includes optional hostname field (backward compatible)
+- Frontend groups clients by hostname with collapsible sections
+- Database tracks client hostnames in session history
 
 ### Multi-port Registration (April 2026)
 - Fixed issue where only the first port registration was processed
@@ -103,44 +142,3 @@ npm run lint                   # Lint with ESLint
 - Added `ClientDetail` modal showing detailed traffic per port
 - Fixed logout redirect from `/login` to `/`
 - Dashboard now shows real-time metrics and traffic charts
-
-## Common Development Commands
-
-### Backend
-```bash
-cargo build                    # Debug build
-cargo build --release          # Release build
-cargo check                    # Fast compile check
-cargo test                     # Run tests
-cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
-cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 9000:localhost:80
-```
-
-### Frontend
-```bash
-cd frontend
-npm install                    # Install dependencies
-npm run dev                    # Dev server (hot reload)
-npm run build                  # Build to dist/ (then copy to frontend-dist/)
-npm run lint                   # Lint with ESLint
-```
-
-### Deploy Frontend
-```bash
-cd frontend
-npm run build
-rm -rf ../frontend-dist
-cp -r dist ../frontend-dist
-```
-
-## Server Configuration (Clap)
-- `--bind` - Control plane listen address (default 0.0.0.0:8080)
-- `--api-bind` - API/frontend listen address (default 0.0.0.0:3000)
-- `--admin-password` - Web UI admin password (optional; enables auth)
-- `--jwt-secret` - JWT signing secret (auto-generated if not provided)
-- `--log` - Log level (trace/debug/info/warn/error)
-
-## Client Configuration (Clap)
-- `--server` / `SERVER_ADDR` - Server control address (e.g., example.com:8080)
-- `--forward` / `FORWARD` - Forward rules (repeatable); format `REMOTE_PORT:LOCAL_HOST:LOCAL_PORT`
-- `--log` - Log level
