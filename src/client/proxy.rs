@@ -2,6 +2,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing::{debug, warn};
 
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
@@ -12,7 +13,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
     // Find the local address for this remote port
     let forward_rule = state.forwards.iter().find(|r| r.remote_port == remote_port);
     let local_addr = match forward_rule {
-        Some(r) => r.local_addr,
+        Some(r) => &r.local_addr,
         None => {
             warn!("No forward rule found for remote port {}", remote_port);
             let mut control_guard = state.control_writer.lock().await;
@@ -21,10 +22,29 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         }
     };
 
-    // Connect to local target
+    // Connect to local target using blocking std connect (same behavior as curl/nc)
+    // This avoids macOS-specific "No route to host" issue when connecting to gateway
     debug!("Connecting to local target {}", local_addr);
-    let local_stream = match TcpStream::connect(local_addr).await {
-        Ok(stream) => stream,
+
+    // Use std::net::TcpStream to connect - this has the same behavior as curl
+    let std_stream = std::net::TcpStream::connect(local_addr);
+    let local_stream = match std_stream {
+        Ok(std_stream) => {
+            // Set non-blocking and convert to tokio TcpStream
+            std_stream.set_nonblocking(true)?;
+            match TcpStream::from_std(std_stream) {
+                Ok(stream) => {
+                    debug!("Successfully connected to {}", local_addr);
+                    stream
+                }
+                Err(e) => {
+                    warn!("Failed to convert to async stream: {}", e);
+                    let mut control_guard = state.control_writer.lock().await;
+                    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+                    return Err(e.into());
+                }
+            }
+        }
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", local_addr, e);
             let mut control_guard = state.control_writer.lock().await;

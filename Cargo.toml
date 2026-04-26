@@ -40,3 +40,14 @@ tokio-util = { version = "0.7", features = ["time"] }
 
 # Random generation for connection IDs
 rand = "0.8"
+
+# Get network interface addresses for workaround
+get_if_addrs = "0.5.3"
+
+[[bin]]
+name = "test_connect"
+path = "test_connect.rs"
+
+[[bin]]
+name = "test_connect2"
+path = "test_connect2.rs"
