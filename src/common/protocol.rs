@@ -10,6 +10,8 @@ pub enum ControlMessage {
         remote_port: u16,
         /// Hostname of the client machine (optional for backward compatibility)
         hostname: Option<String>,
+        /// Authentication token (optional for backward compatibility, required if server enables auth)
+        auth_token: Option<String>,
     },
     /// Server response to registration
     RegisterResponse { success: bool, message: String },
@@ -89,7 +91,8 @@ mod tests {
     fn test_serialize_deserialize() {
         let msg = ControlMessage::Register {
             remote_port: 8080,
-            hostname: Some("test-host".into())
+            hostname: Some("test-host".into()),
+            auth_token: Some("secret-token".into()),
         };
         let bytes = msg.serialize().unwrap();
         assert!(bytes.len() > 4);
@@ -99,7 +102,7 @@ mod tests {
     fn test_message_variants_serialization() {
         // Test all message variants can be serialized
         let messages = vec![
-            ControlMessage::Register { remote_port: 8080, hostname: None },
+            ControlMessage::Register { remote_port: 8080, hostname: None, auth_token: None },
             ControlMessage::RegisterResponse { success: true, message: "ok".into() },
             ControlMessage::NewConnection { connection_id: 12345, remote_port: 9000 },
             ControlMessage::ConnectionReady { connection_id: 12345 },

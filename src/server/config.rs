@@ -28,6 +28,11 @@ pub struct ServerCli {
     #[clap(long = "jwt-secret")]
     pub jwt_secret: Option<String>,
 
+    /// Authentication token for client connections (optional but recommended)
+    /// If set, clients must provide this token to register
+    #[clap(long = "client-auth-token")]
+    pub client_auth_token: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -43,6 +48,7 @@ pub struct ServerConfigFile {
     pub api_addr: Option<String>,
     pub admin_password: Option<String>,
     pub jwt_secret: Option<String>,
+    pub client_auth_token: Option<String>,
     pub log: Option<String>,
     pub db_path: Option<String>,
 }
@@ -53,6 +59,9 @@ pub struct ServerConfig {
     pub api_addr: String,
     pub admin_password: Option<String>,
     pub jwt_secret: Option<String>,
+    /// Authentication token for client connections
+    /// If Some, clients must provide this token to register
+    pub client_auth_token: Option<String>,
     pub log: String,
     pub db_path: String,
 }
@@ -64,6 +73,7 @@ impl Default for ServerConfig {
             api_addr: "0.0.0.0:3000".to_string(),
             admin_password: None,
             jwt_secret: None,
+            client_auth_token: None,
             log: "info".to_string(),
             db_path: "./data/rust-tunnel.db".to_string(),
         }
@@ -99,6 +109,9 @@ impl ServerConfig {
                 if let Some(v) = file_config.jwt_secret {
                     config.jwt_secret = Some(v);
                 }
+                if let Some(v) = file_config.client_auth_token {
+                    config.client_auth_token = Some(v);
+                }
                 if let Some(v) = file_config.log {
                     config.log = v;
                 }
@@ -123,6 +136,9 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("JWT_SECRET") {
             config.jwt_secret = Some(v);
         }
+        if let Ok(v) = std::env::var("CLIENT_AUTH_TOKEN") {
+            config.client_auth_token = Some(v);
+        }
         if let Ok(v) = std::env::var("LOG_LEVEL") {
             config.log = v;
         }
@@ -142,6 +158,9 @@ impl ServerConfig {
         }
         if let Some(v) = cli.jwt_secret {
             config.jwt_secret = Some(v);
+        }
+        if let Some(v) = cli.client_auth_token {
+            config.client_auth_token = Some(v);
         }
         if let Some(v) = cli.log {
             config.log = v;
@@ -166,6 +185,7 @@ mod tests {
         assert_eq!(config.log, "info");
         assert!(config.admin_password.is_none());
         assert!(config.jwt_secret.is_none());
+        assert!(config.client_auth_token.is_none());
     }
 
     #[test]
@@ -176,6 +196,7 @@ mod tests {
             api_addr: Some("127.0.0.1:9001".to_string()),
             admin_password: Some("secret123".to_string()),
             jwt_secret: Some("test-secret".to_string()),
+            client_auth_token: Some("client-secret".to_string()),
             log: Some("debug".to_string()),
             db_path: Some("./test.db".to_string()),
         };
@@ -185,6 +206,7 @@ mod tests {
         assert_eq!(config.api_addr, "127.0.0.1:9001");
         assert_eq!(config.admin_password, Some("secret123".into()));
         assert_eq!(config.jwt_secret, Some("test-secret".into()));
+        assert_eq!(config.client_auth_token, Some("client-secret".into()));
         assert_eq!(config.log, "debug");
         assert_eq!(config.db_path, "./test.db");
     }
@@ -196,6 +218,7 @@ mod tests {
             api_addr: "127.0.0.1:9001".to_string(),
             admin_password: Some("test".to_string()),
             jwt_secret: Some("secret".to_string()),
+            client_auth_token: Some("client-token".to_string()),
             log: "debug".to_string(),
             db_path: "./test.db".to_string(),
         };
@@ -205,6 +228,7 @@ mod tests {
         assert_eq!(config.api_addr, cloned.api_addr);
         assert_eq!(config.admin_password, cloned.admin_password);
         assert_eq!(config.jwt_secret, cloned.jwt_secret);
+        assert_eq!(config.client_auth_token, cloned.client_auth_token);
         assert_eq!(config.log, cloned.log);
         assert_eq!(config.db_path, cloned.db_path);
     }
@@ -217,6 +241,7 @@ mod tests {
             api_addr: None,
             admin_password: None,
             jwt_secret: None,
+            client_auth_token: None,
             log: None,
             db_path: None,
         };

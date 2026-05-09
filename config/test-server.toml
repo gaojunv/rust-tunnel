@@ -1,7 +1,0 @@
-# Test server config
-control_addr = "127.0.0.1:9000"
-api_addr = "127.0.0.1:9001"
-admin_password = "test123"
-jwt_secret = "test_secret_key"
-log = "debug"
-db_path = "./test.db"

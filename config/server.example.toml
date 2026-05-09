@@ -4,21 +4,23 @@
 # 配置优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
 #
 # 环境变量映射：
-#   CONTROL_ADDR   -> control_addr
-#   API_BIND       -> api_addr
-#   ADMIN_PASSWORD -> admin_password
-#   JWT_SECRET     -> jwt_secret
-#   LOG_LEVEL      -> log
-#   DB_PATH        -> db_path
+#   CONTROL_ADDR       -> control_addr
+#   API_BIND           -> api_addr
+#   ADMIN_PASSWORD     -> admin_password
+#   JWT_SECRET         -> jwt_secret
+#   CLIENT_AUTH_TOKEN  -> client_auth_token
+#   LOG_LEVEL          -> log
+#   DB_PATH            -> db_path
 #
 # 命令行参数：
-#   --config       指定配置文件路径
-#   --bind         控制通道监听地址
-#   --api-bind     API/Web 界面监听地址
-#   --admin-password Web 管理密码
-#   --jwt-secret   JWT 签名密钥
-#   --log          日志级别
-#   --db-path      SQLite 数据库路径
+#   --config               指定配置文件路径
+#   --bind                 控制通道监听地址
+#   --api-bind             API/Web 界面监听地址
+#   --admin-password       Web 管理密码
+#   --jwt-secret           JWT 签名密钥
+#   --client-auth-token    客户端认证令牌
+#   --log                  日志级别
+#   --db-path              SQLite 数据库路径
 # ========================================
 
 # --------------------
@@ -67,6 +69,19 @@ log = "info"
 # 用于存储：流量统计、客户端连接历史、流量 Buckets
 # 默认值：./data/rust-tunnel.db
 db_path = "./data/rust-tunnel.db"
+
+# --------------------
+# 客户端认证配置
+# --------------------
+
+# 客户端认证令牌（可选但推荐）
+# 如果设置了此值，客户端连接时必须提供匹配的认证令牌
+# 这可以防止未授权的客户端注册端口转发
+# 建议使用高强度的随机字符串
+# client_auth_token = "your_secure_auth_token_here"
+
+# 环境变量：CLIENT_AUTH_TOKEN
+# 命令行参数：--client-auth-token <TOKEN>
 
 # ========================================
 # 生产环境推荐配置（取消注释使用）
