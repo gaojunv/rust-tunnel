@@ -1,10 +1,8 @@
-use tokio::io::{AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::common::{ControlMessage};
+use crate::common::ControlMessage;
 use crate::server::control::{ClientInfo, ServerState};
 
 /// Proxy data from user connection to client over control channel.
@@ -17,9 +15,10 @@ pub async fn proxy_user_connection(
     state: ServerState,
 ) {
     // Split: read from user in this task, write handled by main control loop
-    let (mut user_reader, user_writer) = user_stream.into_split();
-    // Put writer half in Arc for sharing with control loop
-    let user_writer = Arc::new(Mutex::new(user_writer));
+    let (mut user_reader, user_writer) = tokio::io::split(user_stream);
+    // Box and wrap writer for trait object
+    let boxed_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(user_writer);
+    let user_writer = std::sync::Arc::new(tokio::sync::Mutex::new(boxed_writer));
 
     // Add this connection to active connections map so data from client can be delivered
     state.add_active_connection(connection_id, remote_port, user_writer.clone()).await;
@@ -37,11 +36,10 @@ pub async fn proxy_user_connection(
                 state.traffic_store.record_bytes_in(remote_port, n as u64).await;
 
                 // Send data from user to client via control channel
-                let mut control_guard = client_info.control_writer.lock().await;
-                if let Err(e) = (ControlMessage::Data {
+                if let Err(e) = client_info.control_sender.send(ControlMessage::Data {
                     connection_id,
                     data: buf[..n].to_vec(),
-                }).write_to_stream(&mut *control_guard).await {
+                }).await {
                     warn!("Failed to send data from user {} to client: {}", connection_id, e);
                     break;
                 }
@@ -54,8 +52,7 @@ pub async fn proxy_user_connection(
     }
 
     // Notify client the connection is closed
-    let mut control_guard = client_info.control_writer.lock().await;
-    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+    let _ = client_info.control_sender.send(ControlMessage::Close { connection_id }).await;
 
     // Remove from active connections
     state.remove_active_connection(connection_id).await;

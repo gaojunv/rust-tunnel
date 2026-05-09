@@ -9,6 +9,9 @@
 #   ADMIN_PASSWORD     -> admin_password
 #   JWT_SECRET         -> jwt_secret
 #   CLIENT_AUTH_TOKEN  -> client_auth_token
+#   TLS                -> tls
+#   TLS_CERT           -> tls_cert
+#   TLS_KEY            -> tls_key
 #   LOG_LEVEL          -> log
 #   DB_PATH            -> db_path
 #
@@ -19,6 +22,9 @@
 #   --admin-password       Web 管理密码
 #   --jwt-secret           JWT 签名密钥
 #   --client-auth-token    客户端认证令牌
+#   --tls / --no-tls      启用/禁用 TLS 加密
+#   --tls-cert             TLS 证书文件路径
+#   --tls-key              TLS 私钥文件路径
 #   --log                  日志级别
 #   --db-path              SQLite 数据库路径
 # ========================================
@@ -36,6 +42,25 @@ control_addr = "0.0.0.0:8080"
 # 访问此地址可打开 Web 管理界面和 REST API
 # 默认值：0.0.0.0:3000
 api_addr = "0.0.0.0:3000"
+
+# --------------------
+# TLS 加密配置
+# --------------------
+
+# 启用 TLS 加密控制通道
+# 启用后，客户端必须使用 TLS 连接
+# 默认值：true
+tls = true
+
+# TLS 证书文件路径（PEM 格式）
+# 如果未设置且 TLS 启用，服务器会自动生成自签名证书
+# 默认值：./data/tls/cert.pem
+tls_cert = "./data/tls/cert.pem"
+
+# TLS 私钥文件路径（PEM 格式）
+# 如果未设置且 TLS 启用，服务器会自动生成私钥
+# 默认值：./data/tls/key.pem
+tls_key = "./data/tls/key.pem"
 
 # --------------------
 # 安全配置
@@ -89,8 +114,12 @@ db_path = "./data/rust-tunnel.db"
 # [production]
 # control_addr = "0.0.0.0:8080"
 # api_addr = "0.0.0.0:3000"
+# tls = true
+# tls_cert = "/etc/rust-tunnel/tls/cert.pem"
+# tls_key = "/etc/rust-tunnel/tls/key.pem"
 # admin_password = "change_this_to_strong_password"
 # jwt_secret = "generate_a_random_32_byte_string_here"
+# client_auth_token = "your_secure_client_auth_token"
 # log = "warn"
 # db_path = "/var/lib/rust-tunnel/rust-tunnel.db"
 
@@ -100,6 +129,17 @@ db_path = "./data/rust-tunnel.db"
 # [development]
 # control_addr = "127.0.0.1:8080"
 # api_addr = "127.0.0.1:3000"
+# tls = true
 # admin_password = "dev123"
+# log = "debug"
+# db_path = "./dev-data/rust-tunnel.db"
+
+# ========================================
+# 无 TLS 兼容模式（不推荐，仅用于测试）
+# ========================================
+# [no-tls]
+# control_addr = "127.0.0.1:8080"
+# api_addr = "127.0.0.1:3000"
+# tls = false
 # log = "debug"
 # db_path = "./dev-data/rust-tunnel.db"

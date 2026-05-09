@@ -1,44 +1,48 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, debug, warn, error};
 
-use crate::common::{ControlMessage, TunnelError, TunnelResult};
+use crate::common::{ControlMessage, TunnelError, TunnelResult, connect_tls_insecure};
 use crate::client::{ClientConfig, proxy};
+
+/// Type alias for the control message sender
+pub type ControlSender = mpsc::Sender<ControlMessage>;
 
 /// Information about an active local connection
 struct ActiveLocalConnection {
     /// Local TCP stream writer half connected to target service
-    local_writer: Arc<Mutex<OwnedWriteHalf>>,
+    local_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
 }
 
 /// Client state shared between all tasks
 #[derive(Clone)]
 pub struct ClientState {
     pub config: ClientConfig,
-    pub control_writer: Arc<Mutex<OwnedWriteHalf>>,
+    /// Sender for control messages to server
+    pub control_sender: ControlSender,
     pub forwards: Vec<ForwardRule>,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
 }
 
 impl ClientState {
-    fn new(config: ClientConfig, control_writer: Arc<Mutex<OwnedWriteHalf>>, forwards: Vec<ForwardRule>) -> Self {
+    fn new(config: ClientConfig, control_sender: ControlSender, forwards: Vec<ForwardRule>) -> Self {
         Self {
             config,
-            control_writer,
+            control_sender,
             forwards,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn add_connection(&self, connection_id: u64, stream: Arc<Mutex<OwnedWriteHalf>>) {
+    pub async fn add_connection(&self, connection_id: u64, stream: Box<dyn AsyncWrite + Unpin + Send>) {
         let mut conns = self.active_connections.lock().await;
         conns.insert(connection_id, ActiveLocalConnection {
-            local_writer: stream,
+            local_writer: Arc::new(Mutex::new(stream)),
         });
     }
 
@@ -66,12 +70,11 @@ impl ClientState {
 }
 
 /// Start the heartbeat task that sends periodic ping to keep connection alive
-async fn start_heartbeat(state: ClientState) {
+async fn start_heartbeat(sender: ControlSender) {
     let mut interval = time::interval(time::Duration::from_secs(30));
     loop {
         interval.tick().await;
-        let mut control_guard = state.control_writer.lock().await;
-        if let Err(e) = ControlMessage::Ping.write_to_stream(&mut *control_guard).await {
+        if let Err(e) = sender.send(ControlMessage::Ping).await {
             warn!("Failed to send ping: {}", e);
             break;
         }
@@ -80,7 +83,7 @@ async fn start_heartbeat(state: ClientState) {
 }
 
 /// Process messages from server on control channel
-async fn process_control_messages(reader: &mut OwnedReadHalf, state: ClientState) -> TunnelResult<()> {
+async fn process_control_messages<R: AsyncRead + Unpin>(reader: &mut R, state: ClientState) -> TunnelResult<()> {
     loop {
         match ControlMessage::read_from_stream(reader).await {
             Ok(Some(msg)) => {
@@ -108,7 +111,6 @@ async fn process_control_messages(reader: &mut OwnedReadHalf, state: ClientState
                     }
                     ControlMessage::Disconnect => {
                         info!("Server requested disconnect. Shutting down...");
-                        // This will cause the process to exit
                         return Err(TunnelError::Protocol("Server requested disconnect".into()));
                     }
                     _ => {
@@ -133,25 +135,44 @@ use crate::client::ForwardRule;
 
 /// Main client entry point
 pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> TunnelResult<()> {
-    // Connect to server
-    let mut stream = TcpStream::connect(&config.server).await?;
-    info!("Connected to server at {}", config.server);
+    // Connect to server with or without TLS
+    let (mut reader, mut writer): (Box<dyn AsyncRead + Unpin + Send>, Box<dyn AsyncWrite + Unpin + Send>) = if config.tls {
+        info!("Connecting to server {} with TLS (insecure mode - accepting self-signed certs)", config.server);
+
+        // Extract hostname for TLS SNI
+        let tls_server_name = config.tls_server_name.as_ref()
+            .unwrap_or(&config.server)
+            .split(':')
+            .next()
+            .unwrap_or("localhost");
+
+        let tls_stream = connect_tls_insecure(&config.server, tls_server_name).await?;
+        info!("TLS connection established successfully");
+        let (r, w) = tokio::io::split(tls_stream);
+        (Box::new(r), Box::new(w))
+    } else {
+        info!("Connecting to server {} without TLS", config.server);
+        let stream = TcpStream::connect(&config.server).await?;
+        info!("TCP connection established");
+        let (r, w) = tokio::io::split(stream);
+        (Box::new(r), Box::new(w))
+    };
 
     // Get hostname
     let hostname = gethostname::gethostname()
         .into_string()
         .ok();
 
-    // Register all forward rules before splitting
+    // Register all forward rules
     for rule in &forwards {
         ControlMessage::Register {
             remote_port: rule.remote_port,
             hostname: hostname.clone(),
             auth_token: config.auth_token.clone(),
-        }.write_to_stream(&mut stream).await?;
+        }.write_to_stream(&mut writer).await?;
 
         // Read registration response
-        let resp = match ControlMessage::read_from_stream(&mut stream).await {
+        let resp = match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(ControlMessage::RegisterResponse { success, message })) => {
                 (success, message)
             }
@@ -175,15 +196,23 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
               rule.remote_port, rule.local_addr);
     }
 
-    // Split into read and write halves after registration is complete
-    let (mut reader, writer) = stream.into_split();
-    let writer_arc = Arc::new(Mutex::new(writer));
+    // Create message channel for sending messages to server
+    let (sender, mut receiver) = mpsc::channel::<ControlMessage>(32);
 
-    let state = ClientState::new(config, writer_arc.clone(), forwards);
+    // Spawn writer task
+    tokio::spawn(async move {
+        while let Some(msg) = receiver.recv().await {
+            if let Err(e) = msg.write_to_stream(&mut writer).await {
+                debug!("Failed to write control message: {}", e);
+                break;
+            }
+        }
+    });
+
+    let state = ClientState::new(config, sender.clone(), forwards);
 
     // Start heartbeat task
-    let heartbeat_state = state.clone();
-    tokio::spawn(start_heartbeat(heartbeat_state));
+    tokio::spawn(start_heartbeat(sender));
 
     // Process incoming messages from server
     process_control_messages(&mut reader, state).await?;
