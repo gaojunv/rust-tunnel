@@ -1,0 +1,7 @@
+# Test client config
+server = "test-server.com:8080"
+forwards = [
+  "8080:localhost:80",
+  "9000:127.0.0.1:3000",
+]
+log = "debug"

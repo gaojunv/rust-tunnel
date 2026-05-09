@@ -66,6 +66,10 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macr
 # Get hostname
 gethostname = "0.4"
 
+# Configuration file support
+toml = "0.8"
+figment = { version = "0.10", features = ["env", "toml"] }
+
 [[bin]]
 name = "test_connect"
 path = "test_connect.rs"

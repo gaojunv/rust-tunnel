@@ -1,10 +1,10 @@
-use clap::Parser;
 use rust_tunnel::common::{init_logging_with_level, TunnelResult};
 use rust_tunnel::server::{ServerConfig, control, api, auth, Database};
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
-    let config = ServerConfig::parse();
+    let config = ServerConfig::load()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     init_logging_with_level(&config.log);
     tracing::info!("Starting rust-tunnel server on {}", config.control_addr);
 

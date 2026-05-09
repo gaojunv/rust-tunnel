@@ -34,7 +34,14 @@
       "Bash(curl -s -o /dev/null -w \"Metrics: %{http_code}\\\\n\" http://127.0.0.1:3000/api/metrics)",
       "Bash(curl -s -o /dev/null -w \"Clients: %{http_code}\\\\n\" http://127.0.0.1:3000/api/clients)",
       "Bash(curl -s -o /dev/null -w \"Health: %{http_code}\\\\n\" http://127.0.0.1:3000/api/health)",
-      "Bash(git config *)"
+      "Bash(git config *)",
+      "Bash(ps aux *)",
+      "Bash(grep -E \"\\\\.rs$\")",
+      "Bash(CONTROL_ADDR=\"0.0.0.0:7777\" LOG_LEVEL=\"warn\" timeout 1 cargo run --bin rust-tunnel-server -- --config config/test-server.toml)",
+      "Bash(LOG_LEVEL=\"warn\" timeout 1.5 cargo run --bin rust-tunnel-server -- --bind 127.0.0.1:7777)",
+      "Bash(LOG_LEVEL=\"warn\" timeout 1.5 cargo run --bin rust-tunnel-server -- --bind 127.0.0.1:7777 --api-bind 127.0.0.1:8777)",
+      "Bash(rm src/bin/test_env_config.rs /tmp/test_config.rs /tmp/test_env_config.rs test.db)",
+      "Bash(pkill -f rust-tunnel)"
     ]
   }
 }

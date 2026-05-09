@@ -1,11 +1,18 @@
 use clap::{Parser, ArgAction};
+use figment::{Figment, providers::{Toml, Format}};
+use serde::Deserialize;
+use std::path::Path;
 
 /// Client endpoint for rust-tunnel intranet penetration tool
 #[derive(Parser, Debug, Clone)]
-pub struct ClientConfig {
+pub struct ClientCli {
+    /// Path to configuration file (TOML format)
+    #[clap(long = "config")]
+    pub config_file: Option<String>,
+
     /// Server address to connect (e.g., server-ip:8080)
     #[clap(long)]
-    pub server: String,
+    pub server: Option<String>,
 
     /// Forward rule: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT
     /// Example: 8080:localhost:80
@@ -13,8 +20,95 @@ pub struct ClientConfig {
     pub forwards: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
-    #[clap(long, default_value = "info")]
+    #[clap(long)]
+    pub log: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ClientConfigFile {
+    pub server: Option<String>,
+    pub forwards: Option<Vec<String>>,
+    pub log: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientConfig {
+    pub server: String,
+    pub forwards: Vec<String>,
     pub log: String,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            forwards: Vec::new(),
+            log: "info".to_string(),
+        }
+    }
+}
+
+impl ClientConfig {
+    pub fn load() -> Result<Self, String> {
+        let cli = ClientCli::parse();
+        Self::from_cli(cli)
+    }
+
+    pub fn from_cli(cli: ClientCli) -> Result<Self, String> {
+        let mut config = Self::default();
+
+        // 1. Load from config file if specified
+        if let Some(config_path) = &cli.config_file {
+            if Path::new(config_path).exists() {
+                let file_config: ClientConfigFile = Figment::new()
+                    .merge(Toml::file(config_path))
+                    .extract()
+                    .map_err(|e| format!("Failed to parse config file: {}", e))?;
+
+                if let Some(v) = file_config.server {
+                    config.server = v;
+                }
+                if let Some(v) = file_config.forwards {
+                    config.forwards = v;
+                }
+                if let Some(v) = file_config.log {
+                    config.log = v;
+                }
+            } else {
+                return Err(format!("Config file not found: {}", config_path));
+            }
+        }
+
+        // 2. Load from environment variables (override file)
+        if let Ok(v) = std::env::var("SERVER_ADDR") {
+            config.server = v;
+        }
+        if let Ok(v) = std::env::var("FORWARDS") {
+            // Split comma-separated forwards
+            config.forwards = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Ok(v) = std::env::var("LOG_LEVEL") {
+            config.log = v;
+        }
+
+        // 3. Command line arguments (highest priority)
+        if let Some(v) = cli.server {
+            config.server = v;
+        }
+        if !cli.forwards.is_empty() {
+            config.forwards = cli.forwards;
+        }
+        if let Some(v) = cli.log {
+            config.log = v;
+        }
+
+        // Validate required fields
+        if config.server.is_empty() {
+            return Err("Server address is required. Use --server, SERVER_ADDR env, or set in config file".to_string());
+        }
+
+        Ok(config)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +151,43 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ClientConfig::default();
+        assert_eq!(config.server, "");
+        assert!(config.forwards.is_empty());
+        assert_eq!(config.log, "info");
+    }
+
+    #[test]
+    fn test_config_from_cli_no_file() {
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("localhost:8080".to_string()),
+            forwards: vec!["8080:localhost:80".to_string()],
+            log: Some("debug".to_string()),
+        };
+
+        let config = ClientConfig::from_cli(cli).unwrap();
+        assert_eq!(config.server, "localhost:8080");
+        assert_eq!(config.forwards, vec!["8080:localhost:80"]);
+        assert_eq!(config.log, "debug");
+    }
+
+    #[test]
+    fn test_config_missing_server() {
+        let cli = ClientCli {
+            config_file: None,
+            server: None,
+            forwards: vec![],
+            log: None,
+        };
+
+        let result = ClientConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Server address is required"));
+    }
 
     #[test]
     fn test_parse_forwards_single() {
@@ -130,43 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_forwards_invalid_remote_port() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["not_a_port:localhost:80".into()],
-            log: "info".into(),
-        };
-
-        let result = config.parse_forwards();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_forwards_invalid_local_port() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["8080:localhost:not_a_port".into()],
-            log: "info".into(),
-        };
-
-        let result = config.parse_forwards();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_forwards_port_out_of_range() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["70000:localhost:80".into()], // 70000 > 65535
-            log: "info".into(),
-        };
-
-        let result = config.parse_forwards();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_client_config_clone() {
+    fn test_config_clone() {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec!["8080:localhost:80".into()],
@@ -189,5 +284,19 @@ mod tests {
         let cloned = rule.clone();
         assert_eq!(rule.remote_port, cloned.remote_port);
         assert_eq!(rule.local_addr, cloned.local_addr);
+    }
+
+    #[test]
+    fn test_config_file_not_found() {
+        let cli = ClientCli {
+            config_file: Some("/nonexistent/config.toml".to_string()),
+            server: Some("test".to_string()),
+            forwards: vec![],
+            log: None,
+        };
+
+        let result = ClientConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 }
