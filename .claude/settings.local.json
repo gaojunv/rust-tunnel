@@ -33,7 +33,8 @@
       "Bash(curl -s -o /dev/null -w \"Home page: %{http_code}\\\\n\" http://127.0.0.1:3000/)",
       "Bash(curl -s -o /dev/null -w \"Metrics: %{http_code}\\\\n\" http://127.0.0.1:3000/api/metrics)",
       "Bash(curl -s -o /dev/null -w \"Clients: %{http_code}\\\\n\" http://127.0.0.1:3000/api/clients)",
-      "Bash(curl -s -o /dev/null -w \"Health: %{http_code}\\\\n\" http://127.0.0.1:3000/api/health)"
+      "Bash(curl -s -o /dev/null -w \"Health: %{http_code}\\\\n\" http://127.0.0.1:3000/api/health)",
+      "Bash(git config *)"
     ]
   }
 }
