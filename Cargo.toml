@@ -48,6 +48,10 @@ get_if_addrs = "0.5.3"
 axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 
+# Embed frontend assets
+rust-embed = { version = "8.0", features = ["axum"] }
+mime_guess = "2.0"
+
 # Authentication
 jsonwebtoken = "9.0"
 

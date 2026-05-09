@@ -1,22 +1,28 @@
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, Response, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post, delete},
     Json, Router,
 };
 use chrono::{DateTime, Utc, Timelike};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
 
-use crate::server::auth::{auth_middleware, Auth, AuthConfig, create_token};
+use crate::server::auth::{auth_middleware, AuthConfig, create_token};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
+
+/// Embedded frontend assets
+#[derive(RustEmbed)]
+#[folder = "frontend-dist/"]
+struct FrontendAssets;
 
 /// Traffic record for a single time bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,12 +390,12 @@ async fn login(
 }
 
 // Logout handler (client just discards token)
-async fn logout(_auth: Auth) -> impl IntoResponse {
+async fn logout() -> impl IntoResponse {
     StatusCode::OK
 }
 
 // List all clients
-async fn list_clients(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<ClientResponse>> {
+async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>> {
     let clients = state.server_state.get_all_clients().await;
     let mut response = Vec::with_capacity(clients.len());
     for (port, info) in clients {
@@ -407,7 +413,6 @@ async fn list_clients(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<Cl
 async fn disconnect_client(
     State(state): State<ApiState>,
     Path(port): Path<u16>,
-    _auth: Auth,
 ) -> impl IntoResponse {
     let success = state.server_state.disconnect_client(port).await;
     if success {
@@ -419,7 +424,7 @@ async fn disconnect_client(
 }
 
 // Get traffic for all clients
-async fn get_traffic(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<PortTraffic>> {
+async fn get_traffic(State(state): State<ApiState>) -> Json<Vec<PortTraffic>> {
     Json(state.server_state.traffic_store.get_all_traffic().await)
 }
 
@@ -427,7 +432,6 @@ async fn get_traffic(State(state): State<ApiState>, _auth: Auth) -> Json<Vec<Por
 async fn get_port_traffic(
     State(state): State<ApiState>,
     Path(port): Path<u16>,
-    _auth: Auth,
 ) -> impl IntoResponse {
     match state.server_state.traffic_store.get_port_traffic(port).await {
         Some(traffic) => Json(traffic).into_response(),
@@ -441,7 +445,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 // Get server metrics
-async fn get_metrics(State(state): State<ApiState>, _auth: Auth) -> Json<ServerMetrics> {
+async fn get_metrics(State(state): State<ApiState>) -> Json<ServerMetrics> {
     let client_count = state.server_state.get_client_count().await;
     let active_connection_count = state.server_state.get_active_connection_count().await;
 
@@ -455,6 +459,35 @@ async fn get_metrics(State(state): State<ApiState>, _auth: Auth) -> Json<ServerM
         total_bytes_in,
         total_bytes_out,
     })
+}
+
+/// Serve embedded static files for frontend
+async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
+    let path = if path.is_empty() { "index.html" } else { &path };
+
+    match FrontendAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(content.data))
+                .unwrap()
+        }
+        None => {
+            // Fallback to index.html for SPA routing
+            if let Some(index) = FrontendAssets::get("index.html") {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .body(Body::from(index.data))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("Not found"))
+                    .unwrap()
+            }
+        }
+    }
 }
 
 /// Create and run the API server
@@ -481,26 +514,32 @@ pub async fn run_api_server(
         .route("/api/login", post(login))
         .route("/api/health", get(health));
 
-    // Protected routes (require auth)
-    let protected_routes = Router::new()
+    // Protected routes (require auth only when password is set)
+    let mut protected_routes = Router::new()
         .route("/api/logout", post(logout))
         .route("/api/clients", get(list_clients))
         .route("/api/clients/:port", delete(disconnect_client))
         .route("/api/traffic", get(get_traffic))
         .route("/api/traffic/:port", get(get_port_traffic))
-        .route("/api/metrics", get(get_metrics))
-        .layer(middleware::from_fn_with_state(
+        .route("/api/metrics", get(get_metrics));
+
+    // Only apply auth middleware if password is set
+    if auth_config.is_enabled() {
+        protected_routes = protected_routes.layer(middleware::from_fn_with_state(
             auth_config.clone(),
             auth_middleware,
         ));
+    }
 
-    // Static file service for frontend
-    let serve_dir = ServeDir::new("frontend-dist");
+    // Static file service for frontend (embedded)
+    let static_routes = Router::new()
+        .route("/", get(|| async { serve_static(Path("".to_string())).await }))
+        .route("/*path", get(serve_static));
 
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
-        .fallback_service(serve_dir)
+        .merge(static_routes)
         .layer(cors)
         .with_state(state);
 
