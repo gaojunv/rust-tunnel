@@ -25,6 +25,9 @@ pub enum TunnelError {
 
     #[error("Control channel error: {0}")]
     ControlChannel(String),
+
+    #[error("TLS error: {0}")]
+    Tls(String),
 }
 
 pub type TunnelResult<T> = Result<T, TunnelError>;

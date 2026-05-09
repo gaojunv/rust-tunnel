@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn, error, debug};
 
-use crate::common::{ControlMessage, TunnelError, TunnelResult};
+use crate::common::{ControlMessage, TunnelError, TunnelResult, load_or_generate_cert, create_server_config};
 use crate::server::{ServerConfig, listener};
 use crate::server::api::TrafficStore;
 use crate::server::db::Database;
+
+/// Sender for control messages - can be shared across tasks
+pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 
 /// Information about a connected client
 #[derive(Debug, Clone)]
@@ -18,15 +22,14 @@ pub struct ClientInfo {
     pub remote_port: u16,
     /// Hostname of the client machine (optional)
     pub hostname: Option<String>,
-    /// Sender half of the control channel for sending messages to client
-    pub control_writer: Arc<Mutex<OwnedWriteHalf>>,
+    /// Sender for sending messages to client via control channel
+    pub control_sender: ControlMessageSender,
 }
 
 /// Information about an active connection between user and client
-#[derive(Debug)]
 struct ActiveConnection {
     /// User TCP stream writer half connected to client
-    user_writer: Arc<Mutex<OwnedWriteHalf>>,
+    user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
     /// Remote port this connection belongs to
     remote_port: u16,
 }
@@ -65,7 +68,7 @@ impl ServerState {
         }
     }
 
-    pub async fn register_client(&self, remote_port: u16, hostname: Option<String>, control_writer: Arc<Mutex<OwnedWriteHalf>>) -> bool {
+    pub async fn register_client(&self, remote_port: u16, hostname: Option<String>, control_sender: ControlMessageSender) -> bool {
         let hostname_clone = hostname.clone();
         let mut clients = self.clients.lock().await;
         if clients.contains_key(&remote_port) {
@@ -74,7 +77,7 @@ impl ServerState {
         clients.insert(remote_port, ClientInfo {
             remote_port,
             hostname,
-            control_writer,
+            control_sender,
         });
 
         // Record client connection in database
@@ -106,7 +109,7 @@ impl ServerState {
         }
     }
 
-    pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<OwnedWriteHalf>>) {
+    pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>) {
         let mut active_connections = self.active_connections.lock().await;
         active_connections.insert(connection_id, ActiveConnection {
             user_writer,
@@ -172,10 +175,8 @@ impl ServerState {
     pub async fn disconnect_client(&self, remote_port: u16) -> bool {
         let clients = self.clients.lock().await;
         if let Some(client) = clients.get(&remote_port) {
-            // Send Disconnect message to client
-            let mut writer = client.control_writer.lock().await;
-            // We'll let the connection drop naturally after sending
-            let _ = ControlMessage::Disconnect.write_to_split(&mut *writer).await;
+            // Send Disconnect message to client via the channel
+            let _ = client.control_sender.send(ControlMessage::Disconnect).await;
             true
         } else {
             false
@@ -186,7 +187,7 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_server_state_new() {
@@ -195,24 +196,20 @@ mod tests {
         assert_eq!(state.get_active_connection_count().await, 0);
     }
 
+    // Helper to create a test message sender
+    fn create_test_sender() -> ControlMessageSender {
+        let (sender, _) = mpsc::channel(32);
+        sender
+    }
+
     #[tokio::test]
     async fn test_register_and_get_client() {
         let state = ServerState::new();
 
-        // Create a mock stream (we just need the split for the test)
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Connect to ourselves to get a stream
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        let writer_arc = Arc::new(Mutex::new(writer));
+        let sender = create_test_sender();
 
         // Register client
-        let registered = state.register_client(8080, None, writer_arc.clone()).await;
+        let registered = state.register_client(8080, None, sender.clone()).await;
         assert!(registered);
         assert_eq!(state.get_client_count().await, 1);
 
@@ -221,7 +218,7 @@ mod tests {
         assert!(client.is_some());
 
         // Register same port again should fail
-        let registered = state.register_client(8080, None, writer_arc).await;
+        let registered = state.register_client(8080, None, sender).await;
         assert!(!registered);
     }
 
@@ -229,17 +226,8 @@ mod tests {
     async fn test_remove_client() {
         let state = ServerState::new();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        let writer_arc = Arc::new(Mutex::new(writer));
-
-        state.register_client(8080, None, writer_arc).await;
+        let sender = create_test_sender();
+        state.register_client(8080, None, sender).await;
         assert_eq!(state.get_client_count().await, 1);
 
         state.remove_client(8080).await;
@@ -258,18 +246,10 @@ mod tests {
     async fn test_get_all_clients() {
         let state = ServerState::new();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let sender = create_test_sender();
 
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        let writer_arc = Arc::new(Mutex::new(writer));
-
-        state.register_client(8080, None, writer_arc.clone()).await;
-        state.register_client(9000, None, writer_arc).await;
+        state.register_client(8080, None, sender.clone()).await;
+        state.register_client(9000, None, sender).await;
 
         let clients = state.get_all_clients().await;
         assert_eq!(clients.len(), 2);
@@ -282,15 +262,9 @@ mod tests {
     async fn test_active_connections() {
         let state = ServerState::new();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        let writer_arc = Arc::new(Mutex::new(writer));
+        // For active connections, we still need a boxed writer - use a vec as mock
+        let mock_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        let writer_arc = Arc::new(Mutex::new(mock_writer));
 
         state.add_active_connection(42, 8080, writer_arc).await;
         assert_eq!(state.get_active_connection_count().await, 1);
@@ -311,17 +285,8 @@ mod tests {
     async fn test_server_state_clone() {
         let state = ServerState::new();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-        });
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let (_, writer) = stream.into_split();
-        let writer_arc = Arc::new(Mutex::new(writer));
-
-        state.register_client(8080, None, writer_arc).await;
+        let sender = create_test_sender();
+        state.register_client(8080, None, sender).await;
 
         let cloned = state.clone();
         assert_eq!(cloned.get_client_count().await, 1);
@@ -343,15 +308,31 @@ mod tests {
     }
 }
 
-/// Handle a single control connection from client
-async fn handle_control_connection(config: ServerConfig, state: ServerState, stream: TcpStream) -> TunnelResult<()> {
+/// Handle a single control connection from client (supports both plain TCP and TLS)
+async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    config: ServerConfig,
+    state: ServerState,
+    stream: S,
+) -> TunnelResult<()> {
     // Split into read and write halves
-    let (reader, writer) = stream.into_split();
-    let writer_arc = Arc::new(Mutex::new(writer));
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    // Create message channel for sending messages to client
+    // The writer task receives messages and writes them to the stream
+    let (sender, mut receiver) = mpsc::channel::<ControlMessage>(32);
+
+    // Spawn writer task - handles all message sending
+    tokio::spawn(async move {
+        while let Some(msg) = receiver.recv().await {
+            if let Err(e) = msg.write_to_stream(&mut writer).await {
+                debug!("Failed to write control message: {}", e);
+                break;
+            }
+        }
+    });
 
     // Track all registered ports for this connection
     let mut registered_ports = Vec::new();
-    let mut reader = reader;
 
     // Process registration phase - client may send multiple Register messages
     info!("Waiting for client registration...");
@@ -388,20 +369,18 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                         }
                         Some(_) => {
                             warn!("Client authentication failed: invalid token");
-                            let mut writer_guard = writer_arc.lock().await;
-                            let _ = ControlMessage::RegisterResponse {
+                            let _ = sender.send(ControlMessage::RegisterResponse {
                                 success: false,
                                 message: "Invalid authentication token".into(),
-                            }.write_to_split(&mut *writer_guard).await;
+                            }).await;
                             continue;
                         }
                         None => {
                             warn!("Client authentication failed: token required but not provided");
-                            let mut writer_guard = writer_arc.lock().await;
-                            let _ = ControlMessage::RegisterResponse {
+                            let _ = sender.send(ControlMessage::RegisterResponse {
                                 success: false,
                                 message: "Authentication token required".into(),
-                            }.write_to_split(&mut *writer_guard).await;
+                            }).await;
                             continue;
                         }
                     }
@@ -410,26 +389,22 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                 // First, remove any existing client on this port (cleanup from previous connection)
                 state.remove_client(remote_port).await;
 
-                // Now register the new client
-                let registered = state.register_client(remote_port, hostname.clone(), writer_arc.clone()).await;
+                // Now register the new client (clone sender for each registration)
+                let registered = state.register_client(remote_port, hostname.clone(), sender.clone()).await;
 
                 if !registered {
-                    let mut writer_guard = writer_arc.lock().await;
-                    let _ = ControlMessage::RegisterResponse {
+                    let _ = sender.send(ControlMessage::RegisterResponse {
                         success: false,
                         message: format!("Port {} already registered", remote_port),
-                    }.write_to_split(&mut *writer_guard).await;
-                    // Continue processing other registrations instead of failing completely
+                    }).await;
                     continue;
                 }
 
                 // Send registration success
-                let mut writer_guard = writer_arc.lock().await;
-                ControlMessage::RegisterResponse {
+                sender.send(ControlMessage::RegisterResponse {
                     success: true,
                     message: "Registered successfully".into(),
-                }.write_to_split(&mut *writer_guard).await?;
-                drop(writer_guard);
+                }).await.map_err(|_| TunnelError::Protocol("Failed to send registration response".into()))?;
 
                 info!("Client registered for port {}", remote_port);
                 registered_ports.push(remote_port);
@@ -448,20 +423,13 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
             _ => {
                 // If we have registered ports, this is the end of registration phase
                 if !registered_ports.is_empty() {
-                    // Put the message back? We can't, so just process it normally in the main loop
-                    // Instead, we'll break and handle it in the main loop
                     info!("Registration phase complete, {} ports registered", registered_ports.len());
-
-                    // We need to handle this message in the main loop, but since we can't put it back,
-                    // let's just create a small wrapper to handle it
-                    // For simplicity, let's just break and continue to main loop
                     break;
                 } else {
-                    let mut writer_guard = writer_arc.lock().await;
-                    let _ = ControlMessage::RegisterResponse {
+                    let _ = sender.send(ControlMessage::RegisterResponse {
                         success: false,
                         message: "Expected registration message".into(),
-                    }.write_to_split(&mut *writer_guard).await;
+                    }).await;
                     return Err(TunnelError::Protocol("Expected registration message".into()));
                 }
             }
@@ -485,20 +453,18 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                                 }
                                 Some(_) => {
                                     warn!("Client authentication failed: invalid token");
-                                    let mut writer_guard = writer_arc.lock().await;
-                                    let _ = ControlMessage::RegisterResponse {
+                                    let _ = sender.send(ControlMessage::RegisterResponse {
                                         success: false,
                                         message: "Invalid authentication token".into(),
-                                    }.write_to_split(&mut *writer_guard).await;
+                                    }).await;
                                     continue;
                                 }
                                 None => {
                                     warn!("Client authentication failed: token required but not provided");
-                                    let mut writer_guard = writer_arc.lock().await;
-                                    let _ = ControlMessage::RegisterResponse {
+                                    let _ = sender.send(ControlMessage::RegisterResponse {
                                         success: false,
                                         message: "Authentication token required".into(),
-                                    }.write_to_split(&mut *writer_guard).await;
+                                    }).await;
                                     continue;
                                 }
                             }
@@ -508,22 +474,19 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                         state.remove_client(remote_port).await;
 
                         // Now register the new client
-                        let registered = state.register_client(remote_port, hostname.clone(), writer_arc.clone()).await;
+                        let registered = state.register_client(remote_port, hostname.clone(), sender.clone()).await;
 
                         if !registered {
-                            let mut writer_guard = writer_arc.lock().await;
-                            let _ = ControlMessage::RegisterResponse {
+                            let _ = sender.send(ControlMessage::RegisterResponse {
                                 success: false,
                                 message: format!("Port {} already registered", remote_port),
-                            }.write_to_split(&mut *writer_guard).await;
+                            }).await;
                         } else {
                             // Send registration success
-                            let mut writer_guard = writer_arc.lock().await;
-                            ControlMessage::RegisterResponse {
+                            sender.send(ControlMessage::RegisterResponse {
                                 success: true,
                                 message: "Registered successfully".into(),
-                            }.write_to_split(&mut *writer_guard).await?;
-                            drop(writer_guard);
+                            }).await.map_err(|_| TunnelError::Protocol("Failed to send registration response".into()))?;
 
                             info!("Client registered for port {}", remote_port);
                             registered_ports.push(remote_port);
@@ -541,8 +504,8 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                         }
                     }
                     ControlMessage::Ping => {
-                        let mut writer_guard = writer_arc.lock().await;
-                        let _ = ControlMessage::Pong.write_to_split(&mut *writer_guard).await;
+                        // Send pong response
+                        let _ = sender.send(ControlMessage::Pong).await;
                     }
                     ControlMessage::Pong => {
                         // Ignore, pong is only server -> client
@@ -554,24 +517,19 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
                         }
                     }
                     ControlMessage::ConnectionReady { .. } => {
-                        // Client is ready, data can flow
                         debug!("Connection ready");
                     }
                     ControlMessage::Close { connection_id } => {
-                        // Close the user connection
                         state.close_connection(connection_id).await;
                         debug!("Connection {} closed by client", connection_id);
                     }
                     ControlMessage::Disconnect => {
-                        // Server doesn't expect this from client
                         warn!("Received unexpected Disconnect from client");
                     }
                     ControlMessage::RegisterResponse { .. } => {
-                        // Server doesn't expect this from client
                         warn!("Received unexpected RegisterResponse from client");
                     }
                     ControlMessage::NewConnection { .. } => {
-                        // Server doesn't expect this from client
                         warn!("Received unexpected NewConnection from client");
                     }
                 }
@@ -598,6 +556,19 @@ async fn handle_control_connection(config: ServerConfig, state: ServerState, str
 
 /// Start the main server
 pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResult<()> {
+    // Set up TLS if enabled
+    let tls_acceptor = if config.tls {
+        info!("TLS ENABLED - generating/loading TLS certificates");
+        let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key)
+            .map_err(|e| TunnelError::Tls(format!("Failed to load TLS certificates: {}", e)))?;
+        let tls_config = create_server_config(cert_pair)
+            .map_err(|e| TunnelError::Tls(format!("Failed to create TLS config: {}", e)))?;
+        Some(TlsAcceptor::from(tls_config))
+    } else {
+        info!("TLS DISABLED - using plain TCP connections");
+        None
+    };
+
     let listener = TcpListener::bind(&config.control_addr).await?;
     info!("Control server listening on {}", config.control_addr);
 
@@ -612,9 +583,32 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
         let (stream, addr) = listener.accept().await?;
         let config_clone = config.clone();
         let state_clone = state.clone();
+        let tls_acceptor_clone = tls_acceptor.clone();
+
         tracing::debug!("New control connection from {}", addr);
+
         tokio::spawn(async move {
-            if let Err(e) = handle_control_connection(config_clone, state_clone, stream).await {
+            // Wrap TCP stream with TLS if enabled
+            let result = match tls_acceptor_clone {
+                Some(acceptor) => {
+                    debug!("Performing TLS handshake with {}", addr);
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            debug!("TLS handshake successful with {}", addr);
+                            handle_control_connection(config_clone, state_clone, tls_stream).await
+                        }
+                        Err(e) => {
+                            warn!("TLS handshake failed with {}: {}", addr, e);
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    handle_control_connection(config_clone, state_clone, stream).await
+                }
+            };
+
+            if let Err(e) = result {
                 warn!("Control connection error: {}", e);
             }
         });

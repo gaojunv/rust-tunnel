@@ -48,9 +48,8 @@ async fn handle_inbound_connection(
     };
 
     // Notify client about the new connection
-    let mut control_guard = client_info.control_writer.lock().await;
-    ControlMessage::NewConnection { connection_id, remote_port }.write_to_stream(&mut *control_guard).await?;
-    drop(control_guard);
+    client_info.control_sender.send(ControlMessage::NewConnection { connection_id, remote_port }).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to send message: {}", e)))?;
 
     // Wait for client to indicate it's ready
     // Client will send ConnectionReady, then we start proxying

@@ -33,6 +33,21 @@ pub struct ServerCli {
     #[clap(long = "client-auth-token")]
     pub client_auth_token: Option<String>,
 
+    /// Enable TLS encryption for control channel
+    /// If true, clients must connect using TLS
+    #[clap(long = "tls")]
+    pub tls: Option<bool>,
+
+    /// Path to TLS certificate file (PEM format)
+    /// If not provided and TLS is enabled, a self-signed cert will be generated
+    #[clap(long = "tls-cert")]
+    pub tls_cert: Option<String>,
+
+    /// Path to TLS private key file (PEM format)
+    /// If not provided and TLS is enabled, a self-signed key will be generated
+    #[clap(long = "tls-key")]
+    pub tls_key: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -49,6 +64,9 @@ pub struct ServerConfigFile {
     pub admin_password: Option<String>,
     pub jwt_secret: Option<String>,
     pub client_auth_token: Option<String>,
+    pub tls: Option<bool>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
     pub log: Option<String>,
     pub db_path: Option<String>,
 }
@@ -62,6 +80,12 @@ pub struct ServerConfig {
     /// Authentication token for client connections
     /// If Some, clients must provide this token to register
     pub client_auth_token: Option<String>,
+    /// Enable TLS encryption for control channel
+    pub tls: bool,
+    /// Path to TLS certificate file (PEM format)
+    pub tls_cert: String,
+    /// Path to TLS private key file (PEM format)
+    pub tls_key: String,
     pub log: String,
     pub db_path: String,
 }
@@ -74,6 +98,9 @@ impl Default for ServerConfig {
             admin_password: None,
             jwt_secret: None,
             client_auth_token: None,
+            tls: true,  // TLS enabled by default for security
+            tls_cert: "./data/tls/cert.pem".to_string(),
+            tls_key: "./data/tls/key.pem".to_string(),
             log: "info".to_string(),
             db_path: "./data/rust-tunnel.db".to_string(),
         }
@@ -112,6 +139,15 @@ impl ServerConfig {
                 if let Some(v) = file_config.client_auth_token {
                     config.client_auth_token = Some(v);
                 }
+                if let Some(v) = file_config.tls {
+                    config.tls = v;
+                }
+                if let Some(v) = file_config.tls_cert {
+                    config.tls_cert = v;
+                }
+                if let Some(v) = file_config.tls_key {
+                    config.tls_key = v;
+                }
                 if let Some(v) = file_config.log {
                     config.log = v;
                 }
@@ -139,6 +175,15 @@ impl ServerConfig {
         if let Ok(v) = std::env::var("CLIENT_AUTH_TOKEN") {
             config.client_auth_token = Some(v);
         }
+        if let Ok(v) = std::env::var("TLS") {
+            config.tls = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("TLS_CERT") {
+            config.tls_cert = v;
+        }
+        if let Ok(v) = std::env::var("TLS_KEY") {
+            config.tls_key = v;
+        }
         if let Ok(v) = std::env::var("LOG_LEVEL") {
             config.log = v;
         }
@@ -161,6 +206,15 @@ impl ServerConfig {
         }
         if let Some(v) = cli.client_auth_token {
             config.client_auth_token = Some(v);
+        }
+        if let Some(v) = cli.tls {
+            config.tls = v;
+        }
+        if let Some(v) = cli.tls_cert {
+            config.tls_cert = v;
+        }
+        if let Some(v) = cli.tls_key {
+            config.tls_key = v;
         }
         if let Some(v) = cli.log {
             config.log = v;
@@ -186,6 +240,9 @@ mod tests {
         assert!(config.admin_password.is_none());
         assert!(config.jwt_secret.is_none());
         assert!(config.client_auth_token.is_none());
+        assert!(config.tls);  // TLS enabled by default
+        assert_eq!(config.tls_cert, "./data/tls/cert.pem");
+        assert_eq!(config.tls_key, "./data/tls/key.pem");
     }
 
     #[test]
@@ -197,6 +254,9 @@ mod tests {
             admin_password: Some("secret123".to_string()),
             jwt_secret: Some("test-secret".to_string()),
             client_auth_token: Some("client-secret".to_string()),
+            tls: Some(false),
+            tls_cert: Some("/custom/cert.pem".to_string()),
+            tls_key: Some("/custom/key.pem".to_string()),
             log: Some("debug".to_string()),
             db_path: Some("./test.db".to_string()),
         };
@@ -207,6 +267,9 @@ mod tests {
         assert_eq!(config.admin_password, Some("secret123".into()));
         assert_eq!(config.jwt_secret, Some("test-secret".into()));
         assert_eq!(config.client_auth_token, Some("client-secret".into()));
+        assert_eq!(config.tls, false);
+        assert_eq!(config.tls_cert, "/custom/cert.pem");
+        assert_eq!(config.tls_key, "/custom/key.pem");
         assert_eq!(config.log, "debug");
         assert_eq!(config.db_path, "./test.db");
     }
@@ -219,6 +282,9 @@ mod tests {
             admin_password: Some("test".to_string()),
             jwt_secret: Some("secret".to_string()),
             client_auth_token: Some("client-token".to_string()),
+            tls: true,
+            tls_cert: "./test-cert.pem".to_string(),
+            tls_key: "./test-key.pem".to_string(),
             log: "debug".to_string(),
             db_path: "./test.db".to_string(),
         };
@@ -229,6 +295,9 @@ mod tests {
         assert_eq!(config.admin_password, cloned.admin_password);
         assert_eq!(config.jwt_secret, cloned.jwt_secret);
         assert_eq!(config.client_auth_token, cloned.client_auth_token);
+        assert_eq!(config.tls, cloned.tls);
+        assert_eq!(config.tls_cert, cloned.tls_cert);
+        assert_eq!(config.tls_key, cloned.tls_key);
         assert_eq!(config.log, cloned.log);
         assert_eq!(config.db_path, cloned.db_path);
     }
@@ -242,6 +311,9 @@ mod tests {
             admin_password: None,
             jwt_secret: None,
             client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
             log: None,
             db_path: None,
         };

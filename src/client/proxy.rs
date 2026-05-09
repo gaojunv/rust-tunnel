@@ -1,7 +1,5 @@
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::common::{ControlMessage, TunnelError, TunnelResult};
@@ -15,8 +13,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         Some(r) => &r.local_addr,
         None => {
             warn!("No forward rule found for remote port {}", remote_port);
-            let mut control_guard = state.control_writer.lock().await;
-            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+            let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
             return Err(TunnelError::Config(format!("No forward rule for remote port {}", remote_port)));
         }
     };
@@ -38,32 +35,29 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
                 }
                 Err(e) => {
                     warn!("Failed to convert to async stream: {}", e);
-                    let mut control_guard = state.control_writer.lock().await;
-                    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+                    let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
                     return Err(e.into());
                 }
             }
         }
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", local_addr, e);
-            let mut control_guard = state.control_writer.lock().await;
-            let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+            let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
             return Err(e.into());
         }
     };
 
     // Notify server we're ready
-    let mut control_guard = state.control_writer.lock().await;
-    (ControlMessage::ConnectionReady { connection_id }).write_to_stream(&mut *control_guard).await?;
-    drop(control_guard);
+    state.control_sender.send(ControlMessage::ConnectionReady { connection_id }).await
+        .map_err(|_| TunnelError::Protocol("Failed to send connection ready".into()))?;
 
     // Split stream: reading in this task, writing done by control loop
-    let (mut local_reader, local_writer) = local_stream.into_split();
-    // Put writer half in Arc for sharing with control loop
-    let local_writer = Arc::new(Mutex::new(local_writer));
+    let (mut local_reader, local_writer) = tokio::io::split(local_stream);
+    // Box the writer for trait object
+    let boxed_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(local_writer);
 
     // Add to active connections so data from server can be delivered
-    state.add_connection(connection_id, local_writer.clone()).await;
+    state.add_connection(connection_id, boxed_writer).await;
 
     let mut buf = vec![0u8; 8192];
 
@@ -75,11 +69,10 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
             }
             Ok(n) => {
                 // Send data from local to server via control channel
-                let mut control_guard = state.control_writer.lock().await;
-                if let Err(e) = (ControlMessage::Data {
+                if let Err(e) = state.control_sender.send(ControlMessage::Data {
                     connection_id,
                     data: buf[..n].to_vec(),
-                }).write_to_stream(&mut *control_guard).await {
+                }).await {
                     warn!("Failed to send data from local {} to server: {}", connection_id, e);
                     break;
                 }
@@ -92,8 +85,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
     }
 
     // Notify server connection is closed
-    let mut control_guard = state.control_writer.lock().await;
-    let _ = (ControlMessage::Close { connection_id }).write_to_stream(&mut *control_guard).await;
+    let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
 
     // Remove from active connections
     state.remove_connection(connection_id).await;

@@ -4,17 +4,23 @@
 # 配置优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
 #
 # 环境变量映射：
-#   SERVER_ADDR  -> server
-#   FORWARDS     -> forwards (逗号分隔)
-#   AUTH_TOKEN    -> auth_token
-#   LOG_LEVEL    -> log
+#   SERVER_ADDR     -> server
+#   FORWARDS        -> forwards (逗号分隔)
+#   AUTH_TOKEN      -> auth_token
+#   TLS             -> tls
+#   TLS_SERVER_NAME -> tls_server_name
+#   TLS_INSECURE    -> tls_insecure
+#   LOG_LEVEL       -> log
 #
 # 命令行参数：
-#   --config       指定配置文件路径
-#   --server       服务器地址
-#   --forward      转发规则（可多次指定）
-#   --auth-token   认证令牌
-#   --log          日志级别
+#   --config                指定配置文件路径
+#   --server                服务器地址
+#   --forward               转发规则（可多次指定）
+#   --auth-token            认证令牌
+#   --tls / --no-tls       启用/禁用 TLS 加密
+#   --tls-server-name       TLS 服务器名称（SNI）
+#   --tls-insecure          接受自签名证书（不安全）
+#   --log                   日志级别
 # ========================================
 
 # --------------------
@@ -25,6 +31,27 @@
 # 格式：服务器IP:端口 或 域名:端口
 # 必填项
 server = "your-server.com:8080"
+
+# --------------------
+# TLS 加密配置
+# --------------------
+
+# 启用 TLS 加密控制通道
+# 必须与服务器配置匹配
+# 默认值：true
+tls = true
+
+# TLS 服务器名称（SNI，可选）
+# 如果服务器证书中的域名与连接地址不同，需要设置此项
+# 用于证书验证和服务器名称指示
+# tls_server_name = "your-server.com"
+
+# 接受自签名证书（不安全模式）
+# 设置为 true 时，客户端将接受任何证书（包括自签名证书）
+# 适用于服务器使用自签名证书的场景
+# 生产环境建议使用 CA 签发的证书并关闭此选项
+# 默认值：true
+tls_insecure = true
 
 # --------------------
 # 端口转发规则
@@ -73,6 +100,8 @@ log = "info"
 # ========================================
 # [web-server]
 # server = "tunnel.example.com:8080"
+# tls = true
+# tls_insecure = true
 # forwards = [
 #   "80:localhost:80",      # HTTP
 #   "443:localhost:443",    # HTTPS
@@ -84,6 +113,8 @@ log = "info"
 # ========================================
 # [development]
 # server = "localhost:8080"
+# tls = true
+# tls_insecure = true
 # forwards = [
 #   "3001:localhost:3000",   # Web 开发服务
 #   "8081:localhost:8080",   # API 服务
@@ -95,6 +126,8 @@ log = "info"
 # ========================================
 # [multi-service]
 # server = "tunnel.yourdomain.com:8080"
+# tls = true
+# tls_insecure = true
 # forwards = [
 #   "8080:localhost:80",     # Nginx
 #   "9000:localhost:9000",   # PHP-FPM
@@ -102,3 +135,14 @@ log = "info"
 #   "6380:localhost:6379",   # Redis
 # ]
 # log = "info"
+
+# ========================================
+# 无 TLS 兼容模式（不推荐，仅用于测试）
+# ========================================
+# [no-tls]
+# server = "localhost:8080"
+# tls = false
+# forwards = [
+#   "3001:localhost:3000",
+# ]
+# log = "debug"

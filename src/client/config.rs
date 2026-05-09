@@ -23,6 +23,20 @@ pub struct ClientCli {
     #[clap(long = "auth-token")]
     pub auth_token: Option<String>,
 
+    /// Enable TLS encryption for control channel (should match server setting)
+    #[clap(long = "tls")]
+    pub tls: Option<bool>,
+
+    /// TLS server name for SNI (Server Name Indication)
+    /// If not provided, the hostname from server address will be used
+    #[clap(long = "tls-server-name")]
+    pub tls_server_name: Option<String>,
+
+    /// Skip TLS certificate verification (insecure, for self-signed certs)
+    /// This enables TOFU (Trust On First Use) mode for self-signed certificates
+    #[clap(long = "tls-insecure")]
+    pub tls_insecure: Option<bool>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -33,6 +47,9 @@ pub struct ClientConfigFile {
     pub server: Option<String>,
     pub forwards: Option<Vec<String>>,
     pub auth_token: Option<String>,
+    pub tls: Option<bool>,
+    pub tls_server_name: Option<String>,
+    pub tls_insecure: Option<bool>,
     pub log: Option<String>,
 }
 
@@ -42,6 +59,12 @@ pub struct ClientConfig {
     pub forwards: Vec<String>,
     /// Authentication token for server (required if server enables client auth)
     pub auth_token: Option<String>,
+    /// Enable TLS encryption for control channel
+    pub tls: bool,
+    /// TLS server name for SNI
+    pub tls_server_name: Option<String>,
+    /// Skip TLS certificate verification (insecure, for self-signed certs)
+    pub tls_insecure: bool,
     pub log: String,
 }
 
@@ -51,6 +74,9 @@ impl Default for ClientConfig {
             server: String::new(),
             forwards: Vec::new(),
             auth_token: None,
+            tls: true,  // TLS enabled by default for security
+            tls_server_name: None,
+            tls_insecure: true,  // Accept self-signed certs by default (TOFU mode)
             log: "info".to_string(),
         }
     }
@@ -82,6 +108,15 @@ impl ClientConfig {
                 if let Some(v) = file_config.auth_token {
                     config.auth_token = Some(v);
                 }
+                if let Some(v) = file_config.tls {
+                    config.tls = v;
+                }
+                if let Some(v) = file_config.tls_server_name {
+                    config.tls_server_name = Some(v);
+                }
+                if let Some(v) = file_config.tls_insecure {
+                    config.tls_insecure = v;
+                }
                 if let Some(v) = file_config.log {
                     config.log = v;
                 }
@@ -101,6 +136,15 @@ impl ClientConfig {
         if let Ok(v) = std::env::var("AUTH_TOKEN") {
             config.auth_token = Some(v);
         }
+        if let Ok(v) = std::env::var("TLS") {
+            config.tls = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("TLS_SERVER_NAME") {
+            config.tls_server_name = Some(v);
+        }
+        if let Ok(v) = std::env::var("TLS_INSECURE") {
+            config.tls_insecure = v.to_lowercase() == "true" || v == "1";
+        }
         if let Ok(v) = std::env::var("LOG_LEVEL") {
             config.log = v;
         }
@@ -114,6 +158,15 @@ impl ClientConfig {
         }
         if let Some(v) = cli.auth_token {
             config.auth_token = Some(v);
+        }
+        if let Some(v) = cli.tls {
+            config.tls = v;
+        }
+        if let Some(v) = cli.tls_server_name {
+            config.tls_server_name = Some(v);
+        }
+        if let Some(v) = cli.tls_insecure {
+            config.tls_insecure = v;
         }
         if let Some(v) = cli.log {
             config.log = v;
@@ -175,6 +228,8 @@ mod tests {
         assert_eq!(config.server, "");
         assert!(config.forwards.is_empty());
         assert!(config.auth_token.is_none());
+        assert!(config.tls);  // TLS enabled by default
+        assert!(config.tls_insecure);  // Accept self-signed certs by default
         assert_eq!(config.log, "info");
     }
 
@@ -185,6 +240,9 @@ mod tests {
             server: Some("localhost:8080".to_string()),
             forwards: vec!["8080:localhost:80".to_string()],
             auth_token: Some("secret-token".to_string()),
+            tls: Some(true),
+            tls_server_name: Some("tunnel.example.com".to_string()),
+            tls_insecure: Some(true),
             log: Some("debug".to_string()),
         };
 
@@ -192,6 +250,9 @@ mod tests {
         assert_eq!(config.server, "localhost:8080");
         assert_eq!(config.forwards, vec!["8080:localhost:80"]);
         assert_eq!(config.auth_token, Some("secret-token".to_string()));
+        assert!(config.tls);
+        assert_eq!(config.tls_server_name, Some("tunnel.example.com".to_string()));
+        assert!(config.tls_insecure);
         assert_eq!(config.log, "debug");
     }
 
@@ -202,6 +263,9 @@ mod tests {
             server: None,
             forwards: vec![],
             auth_token: None,
+            tls: None,
+            tls_server_name: None,
+            tls_insecure: None,
             log: None,
         };
 
@@ -216,6 +280,9 @@ mod tests {
             server: "localhost:8080".into(),
             forwards: vec!["8080:localhost:80".into()],
             auth_token: None,
+            tls: true,
+            tls_server_name: None,
+            tls_insecure: true,
             log: "info".into(),
         };
 
@@ -234,6 +301,9 @@ mod tests {
                 "9000:127.0.0.1:3000".into(),
             ],
             auth_token: None,
+            tls: true,
+            tls_server_name: None,
+            tls_insecure: true,
             log: "info".into(),
         };
 
@@ -251,6 +321,9 @@ mod tests {
             server: "localhost:8080".into(),
             forwards: vec![],
             auth_token: None,
+            tls: true,
+            tls_server_name: None,
+            tls_insecure: true,
             log: "info".into(),
         };
 
@@ -264,6 +337,9 @@ mod tests {
             server: "localhost:8080".into(),
             forwards: vec!["8080:::1:80".into()],
             auth_token: None,
+            tls: true,
+            tls_server_name: None,
+            tls_insecure: true,
             log: "info".into(),
         };
 
@@ -279,6 +355,9 @@ mod tests {
             server: "localhost:8080".into(),
             forwards: vec!["invalid".into()],
             auth_token: None,
+            tls: true,
+            tls_server_name: None,
+            tls_insecure: true,
             log: "info".into(),
         };
 
@@ -292,6 +371,9 @@ mod tests {
             server: "localhost:8080".into(),
             forwards: vec!["8080:localhost:80".into()],
             auth_token: Some("secret".to_string()),
+            tls: true,
+            tls_server_name: Some("test-server".to_string()),
+            tls_insecure: true,
             log: "debug".into(),
         };
 
@@ -299,6 +381,9 @@ mod tests {
         assert_eq!(config.server, cloned.server);
         assert_eq!(config.forwards, cloned.forwards);
         assert_eq!(config.auth_token, cloned.auth_token);
+        assert_eq!(config.tls, cloned.tls);
+        assert_eq!(config.tls_server_name, cloned.tls_server_name);
+        assert_eq!(config.tls_insecure, cloned.tls_insecure);
         assert_eq!(config.log, cloned.log);
     }
 
@@ -321,6 +406,9 @@ mod tests {
             server: Some("test".to_string()),
             forwards: vec![],
             auth_token: None,
+            tls: None,
+            tls_server_name: None,
+            tls_insecure: None,
             log: None,
         };
 
