@@ -147,6 +147,7 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
         ControlMessage::Register {
             remote_port: rule.remote_port,
             hostname: hostname.clone(),
+            auth_token: config.auth_token.clone(),
         }.write_to_stream(&mut stream).await?;
 
         // Read registration response

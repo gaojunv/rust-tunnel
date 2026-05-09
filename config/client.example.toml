@@ -6,12 +6,14 @@
 # 环境变量映射：
 #   SERVER_ADDR  -> server
 #   FORWARDS     -> forwards (逗号分隔)
+#   AUTH_TOKEN    -> auth_token
 #   LOG_LEVEL    -> log
 #
 # 命令行参数：
 #   --config       指定配置文件路径
 #   --server       服务器地址
 #   --forward      转发规则（可多次指定）
+#   --auth-token   认证令牌
 #   --log          日志级别
 # ========================================
 
@@ -54,6 +56,17 @@ forwards = [
 # 可选值：trace, debug, info, warn, error
 # 默认值：info
 log = "info"
+
+# --------------------
+# 认证配置
+# --------------------
+
+# 服务器认证令牌（如果服务器启用了客户端认证则必需）
+# 必须与服务器配置中的 client_auth_token 完全匹配
+# auth_token = "your_secure_auth_token_here"
+
+# 环境变量：AUTH_TOKEN
+# 命令行参数：--auth-token <TOKEN>
 
 # ========================================
 # Web 服务转发配置示例

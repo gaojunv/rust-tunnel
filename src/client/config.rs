@@ -19,6 +19,10 @@ pub struct ClientCli {
     #[clap(long = "forward", action = ArgAction::Append)]
     pub forwards: Vec<String>,
 
+    /// Authentication token for server (required if server enables client auth)
+    #[clap(long = "auth-token")]
+    pub auth_token: Option<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -28,6 +32,7 @@ pub struct ClientCli {
 pub struct ClientConfigFile {
     pub server: Option<String>,
     pub forwards: Option<Vec<String>>,
+    pub auth_token: Option<String>,
     pub log: Option<String>,
 }
 
@@ -35,6 +40,8 @@ pub struct ClientConfigFile {
 pub struct ClientConfig {
     pub server: String,
     pub forwards: Vec<String>,
+    /// Authentication token for server (required if server enables client auth)
+    pub auth_token: Option<String>,
     pub log: String,
 }
 
@@ -43,6 +50,7 @@ impl Default for ClientConfig {
         Self {
             server: String::new(),
             forwards: Vec::new(),
+            auth_token: None,
             log: "info".to_string(),
         }
     }
@@ -71,6 +79,9 @@ impl ClientConfig {
                 if let Some(v) = file_config.forwards {
                     config.forwards = v;
                 }
+                if let Some(v) = file_config.auth_token {
+                    config.auth_token = Some(v);
+                }
                 if let Some(v) = file_config.log {
                     config.log = v;
                 }
@@ -87,6 +98,9 @@ impl ClientConfig {
             // Split comma-separated forwards
             config.forwards = v.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Ok(v) = std::env::var("AUTH_TOKEN") {
+            config.auth_token = Some(v);
+        }
         if let Ok(v) = std::env::var("LOG_LEVEL") {
             config.log = v;
         }
@@ -97,6 +111,9 @@ impl ClientConfig {
         }
         if !cli.forwards.is_empty() {
             config.forwards = cli.forwards;
+        }
+        if let Some(v) = cli.auth_token {
+            config.auth_token = Some(v);
         }
         if let Some(v) = cli.log {
             config.log = v;
@@ -157,6 +174,7 @@ mod tests {
         let config = ClientConfig::default();
         assert_eq!(config.server, "");
         assert!(config.forwards.is_empty());
+        assert!(config.auth_token.is_none());
         assert_eq!(config.log, "info");
     }
 
@@ -166,12 +184,14 @@ mod tests {
             config_file: None,
             server: Some("localhost:8080".to_string()),
             forwards: vec!["8080:localhost:80".to_string()],
+            auth_token: Some("secret-token".to_string()),
             log: Some("debug".to_string()),
         };
 
         let config = ClientConfig::from_cli(cli).unwrap();
         assert_eq!(config.server, "localhost:8080");
         assert_eq!(config.forwards, vec!["8080:localhost:80"]);
+        assert_eq!(config.auth_token, Some("secret-token".to_string()));
         assert_eq!(config.log, "debug");
     }
 
@@ -181,6 +201,7 @@ mod tests {
             config_file: None,
             server: None,
             forwards: vec![],
+            auth_token: None,
             log: None,
         };
 
@@ -194,6 +215,7 @@ mod tests {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec!["8080:localhost:80".into()],
+            auth_token: None,
             log: "info".into(),
         };
 
@@ -211,6 +233,7 @@ mod tests {
                 "8080:localhost:80".into(),
                 "9000:127.0.0.1:3000".into(),
             ],
+            auth_token: None,
             log: "info".into(),
         };
 
@@ -227,6 +250,7 @@ mod tests {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec![],
+            auth_token: None,
             log: "info".into(),
         };
 
@@ -239,6 +263,7 @@ mod tests {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec!["8080:::1:80".into()],
+            auth_token: None,
             log: "info".into(),
         };
 
@@ -253,6 +278,7 @@ mod tests {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec!["invalid".into()],
+            auth_token: None,
             log: "info".into(),
         };
 
@@ -265,12 +291,14 @@ mod tests {
         let config = ClientConfig {
             server: "localhost:8080".into(),
             forwards: vec!["8080:localhost:80".into()],
+            auth_token: Some("secret".to_string()),
             log: "debug".into(),
         };
 
         let cloned = config.clone();
         assert_eq!(config.server, cloned.server);
         assert_eq!(config.forwards, cloned.forwards);
+        assert_eq!(config.auth_token, cloned.auth_token);
         assert_eq!(config.log, cloned.log);
     }
 
@@ -292,6 +320,7 @@ mod tests {
             config_file: Some("/nonexistent/config.toml".to_string()),
             server: Some("test".to_string()),
             forwards: vec![],
+            auth_token: None,
             log: None,
         };
 

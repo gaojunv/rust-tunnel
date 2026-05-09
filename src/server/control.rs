@@ -344,7 +344,7 @@ mod tests {
 }
 
 /// Handle a single control connection from client
-async fn handle_control_connection(state: ServerState, stream: TcpStream) -> TunnelResult<()> {
+async fn handle_control_connection(config: ServerConfig, state: ServerState, stream: TcpStream) -> TunnelResult<()> {
     // Split into read and write halves
     let (reader, writer) = stream.into_split();
     let writer_arc = Arc::new(Mutex::new(writer));
@@ -377,8 +377,35 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         };
 
         match msg {
-            ControlMessage::Register { remote_port, hostname } => {
+            ControlMessage::Register { remote_port, hostname, auth_token: client_auth_token } => {
                 info!("Received registration request for port {} from hostname {:?}", remote_port, hostname);
+
+                // Validate authentication token if server requires it
+                if let Some(ref expected_token) = config.client_auth_token {
+                    match client_auth_token {
+                        Some(ref token) if token == expected_token => {
+                            debug!("Client authentication successful");
+                        }
+                        Some(_) => {
+                            warn!("Client authentication failed: invalid token");
+                            let mut writer_guard = writer_arc.lock().await;
+                            let _ = ControlMessage::RegisterResponse {
+                                success: false,
+                                message: "Invalid authentication token".into(),
+                            }.write_to_split(&mut *writer_guard).await;
+                            continue;
+                        }
+                        None => {
+                            warn!("Client authentication failed: token required but not provided");
+                            let mut writer_guard = writer_arc.lock().await;
+                            let _ = ControlMessage::RegisterResponse {
+                                success: false,
+                                message: "Authentication token required".into(),
+                            }.write_to_split(&mut *writer_guard).await;
+                            continue;
+                        }
+                    }
+                }
 
                 // First, remove any existing client on this port (cleanup from previous connection)
                 state.remove_client(remote_port).await;
@@ -446,9 +473,36 @@ async fn handle_control_connection(state: ServerState, stream: TcpStream) -> Tun
         match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
                 match msg {
-                    ControlMessage::Register { remote_port, hostname } => {
+                    ControlMessage::Register { remote_port, hostname, auth_token: client_auth_token } => {
                         // Handle late registration (client might send more Register messages later)
                         info!("Received late registration request for port {} from hostname {:?}", remote_port, hostname);
+
+                        // Validate authentication token if server requires it
+                        if let Some(ref expected_token) = config.client_auth_token {
+                            match client_auth_token {
+                                Some(ref token) if token == expected_token => {
+                                    debug!("Client authentication successful");
+                                }
+                                Some(_) => {
+                                    warn!("Client authentication failed: invalid token");
+                                    let mut writer_guard = writer_arc.lock().await;
+                                    let _ = ControlMessage::RegisterResponse {
+                                        success: false,
+                                        message: "Invalid authentication token".into(),
+                                    }.write_to_split(&mut *writer_guard).await;
+                                    continue;
+                                }
+                                None => {
+                                    warn!("Client authentication failed: token required but not provided");
+                                    let mut writer_guard = writer_arc.lock().await;
+                                    let _ = ControlMessage::RegisterResponse {
+                                        success: false,
+                                        message: "Authentication token required".into(),
+                                    }.write_to_split(&mut *writer_guard).await;
+                                    continue;
+                                }
+                            }
+                        }
 
                         // First, remove any existing client on this port
                         state.remove_client(remote_port).await;
@@ -547,12 +601,20 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
     let listener = TcpListener::bind(&config.control_addr).await?;
     info!("Control server listening on {}", config.control_addr);
 
+    // Log whether client authentication is enabled
+    if config.client_auth_token.is_some() {
+        info!("Client authentication ENABLED - clients must provide valid tokens");
+    } else {
+        info!("Client authentication DISABLED - any client can connect");
+    }
+
     loop {
         let (stream, addr) = listener.accept().await?;
+        let config_clone = config.clone();
         let state_clone = state.clone();
         tracing::debug!("New control connection from {}", addr);
         tokio::spawn(async move {
-            if let Err(e) = handle_control_connection(state_clone, stream).await {
+            if let Err(e) = handle_control_connection(config_clone, state_clone, stream).await {
                 warn!("Control connection error: {}", e);
             }
         });
