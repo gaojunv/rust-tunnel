@@ -1,10 +1,10 @@
-use clap::Parser;
 use rust_tunnel::common::{init_logging_with_level, TunnelResult};
 use rust_tunnel::client::{ClientConfig, control};
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
-    let config = ClientConfig::parse();
+    let config = ClientConfig::load()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     init_logging_with_level(&config.log);
     let forwards = config.parse_forwards()
         .expect("Invalid forward configuration");

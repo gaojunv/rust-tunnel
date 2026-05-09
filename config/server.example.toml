@@ -1,0 +1,90 @@
+# ========================================
+# Rust-Tunnel 服务器配置参考文件
+# ========================================
+# 配置优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
+#
+# 环境变量映射：
+#   CONTROL_ADDR   -> control_addr
+#   API_BIND       -> api_addr
+#   ADMIN_PASSWORD -> admin_password
+#   JWT_SECRET     -> jwt_secret
+#   LOG_LEVEL      -> log
+#   DB_PATH        -> db_path
+#
+# 命令行参数：
+#   --config       指定配置文件路径
+#   --bind         控制通道监听地址
+#   --api-bind     API/Web 界面监听地址
+#   --admin-password Web 管理密码
+#   --jwt-secret   JWT 签名密钥
+#   --log          日志级别
+#   --db-path      SQLite 数据库路径
+# ========================================
+
+# --------------------
+# 网络配置
+# --------------------
+
+# 控制通道监听地址
+# 客户端将连接到此地址进行端口注册和控制通信
+# 默认值：0.0.0.0:8080
+control_addr = "0.0.0.0:8080"
+
+# API/Web 界面监听地址
+# 访问此地址可打开 Web 管理界面和 REST API
+# 默认值：0.0.0.0:3000
+api_addr = "0.0.0.0:3000"
+
+# --------------------
+# 安全配置
+# --------------------
+
+# Web 管理界面管理员密码（可选）
+# 如果设置，访问 Web 界面需要登录
+# 建议：设置强密码，生产环境必须启用
+# admin_password = "your_secure_password_here"
+
+# JWT 签名密钥（可选）
+# 用于签署 Web 认证的 JWT Token
+# 如果未设置，服务器启动时会自动生成随机密钥
+# 建议：生产环境手动设置固定密钥，避免重启后所有用户被登出
+# jwt_secret = "your_jwt_secret_key_here_min_32_chars"
+
+# --------------------
+# 日志配置
+# --------------------
+
+# 日志级别
+# 可选值：trace, debug, info, warn, error
+# 默认值：info
+log = "info"
+
+# --------------------
+# 数据库配置
+# --------------------
+
+# SQLite 数据库文件路径
+# 用于存储：流量统计、客户端连接历史、流量 Buckets
+# 默认值：./data/rust-tunnel.db
+db_path = "./data/rust-tunnel.db"
+
+# ========================================
+# 生产环境推荐配置（取消注释使用）
+# ========================================
+# [production]
+# control_addr = "0.0.0.0:8080"
+# api_addr = "0.0.0.0:3000"
+# admin_password = "change_this_to_strong_password"
+# jwt_secret = "generate_a_random_32_byte_string_here"
+# log = "warn"
+# db_path = "/var/lib/rust-tunnel/rust-tunnel.db"
+
+# ========================================
+# 开发环境配置示例
+# ========================================
+# [development]
+# control_addr = "127.0.0.1:8080"
+# api_addr = "127.0.0.1:3000"
+# admin_password = "dev123"
+# log = "debug"
+# db_path = "./dev-data/rust-tunnel.db"
