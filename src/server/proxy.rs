@@ -1,3 +1,4 @@
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, warn, error};
@@ -124,6 +125,49 @@ pub async fn copy_bidirectional_with_stats(
     Ok((uploaded, downloaded))
 }
 
+/// Update quality metrics for SS connection
+async fn update_ss_quality(
+    state: &ServerState,
+    port: u16,
+    connect_time_ms: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    elapsed_secs: f64,
+) {
+    use crate::server::quality::{ConnectionQuality, calculate_quality_score, check_warnings, QualityThresholds};
+    use chrono::Utc;
+
+    let mut quality = ConnectionQuality::default();
+
+    // Use connect time as RTT estimate
+    quality.last_rtt_ms = connect_time_ms as f32;
+    quality.avg_rtt_ms = connect_time_ms as f32;
+    quality.min_rtt_ms = connect_time_ms as f32;
+    quality.max_rtt_ms = connect_time_ms as f32;
+
+    // Calculate throughput
+    if elapsed_secs > 0.0 {
+        quality.bytes_in_per_sec = bytes_in as f64 / elapsed_secs;
+        quality.bytes_out_per_sec = bytes_out as f64 / elapsed_secs;
+    }
+
+    // For SS, loss rate is 0 (we don't measure it directly)
+    // But we can infer from connection errors
+    quality.loss_rate = 0.0;
+
+    // Calculate quality score
+    quality.quality_score = calculate_quality_score(quality.avg_rtt_ms, quality.loss_rate);
+
+    // Check warnings
+    let thresholds = QualityThresholds::default();
+    let (is_warning, is_critical) = check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
+    quality.is_warning = is_warning;
+    quality.is_critical = is_critical;
+    quality.last_update = Utc::now();
+
+    state.quality_store.update_quality(port, quality).await;
+}
+
 /// Proxy a Shadowsocks connection to target
 pub async fn proxy_ss_connection(
     connection_id: u64,
@@ -135,6 +179,9 @@ pub async fn proxy_ss_connection(
 ) {
     debug!("Starting SS proxy for connection {}, target {}", connection_id, ss_ctx.target_addr);
 
+    // Record start time for measuring connection setup time (RTT estimate)
+    let start = Instant::now();
+
     // Connect to target server
     let target_stream = match TcpStream::connect(&ss_ctx.target_addr).await {
         Ok(s) => s,
@@ -144,7 +191,10 @@ pub async fn proxy_ss_connection(
         }
     };
 
-    debug!("Connected to target {} for SS connection {}", ss_ctx.target_addr, connection_id);
+    // Calculate connection establishment time as RTT estimate
+    let connect_time_ms = start.elapsed().as_millis() as u64;
+    debug!("Connected to target {} for SS connection {} in {}ms",
+           ss_ctx.target_addr, connection_id, connect_time_ms);
 
     // NOTE: Actual Shadowsocks implementation would:
     // 1. Decrypt data from user_stream before sending to target_stream
@@ -153,10 +203,17 @@ pub async fn proxy_ss_connection(
     // For now, we're doing plain pass-through (placeholder for encryption layer)
     // The cipher wrapper will be integrated in the future
 
-    match copy_bidirectional_with_stats(connection_id, ss_port, user_stream, target_stream, state).await {
+    let proxy_start = Instant::now();
+    match copy_bidirectional_with_stats(connection_id, ss_port, user_stream, target_stream, state.clone()).await {
         Ok((uploaded, downloaded)) => {
-            debug!("SS connection {} completed: uploaded {} bytes, downloaded {} bytes",
-                   connection_id, uploaded, downloaded);
+            let elapsed = proxy_start.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+
+            debug!("SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
+                   connection_id, uploaded, downloaded, elapsed_secs);
+
+            // Update quality metrics
+            update_ss_quality(&state, ss_port, connect_time_ms, uploaded, downloaded, elapsed_secs).await;
         }
         Err(e) => {
             warn!("SS connection {} error: {}", connection_id, e);
