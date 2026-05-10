@@ -284,6 +284,23 @@ impl ServerState {
         let mut trackers = self.quality_trackers.lock().await;
         trackers.remove(&port);
     }
+
+    /// Get all Shadowsocks ports
+    pub async fn get_shadowsocks_ports(&self) -> Vec<u16> {
+        let ports = self.ports.lock().await;
+        ports.iter()
+            .filter_map(|(port, info)| match info {
+                PortInfo::Shadowsocks { .. } => Some(*port),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check if a port is a Shadowsocks port
+    pub async fn is_shadowsocks_port(&self, port: u16) -> bool {
+        let ports = self.ports.lock().await;
+        matches!(ports.get(&port), Some(PortInfo::Shadowsocks { .. }))
+    }
 }
 
 #[cfg(test)]

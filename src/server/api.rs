@@ -395,6 +395,32 @@ pub struct QualityHistoryQuery {
     pub end: Option<String>,
 }
 
+/// Shadowsocks configuration
+#[derive(Debug, Serialize)]
+pub struct ShadowsocksConfig {
+    pub enabled: bool,
+    pub port: Option<u16>,
+    pub cipher: Option<String>,
+}
+
+/// Shadowsocks statistics
+#[derive(Debug, Serialize)]
+pub struct ShadowsocksStats {
+    pub enabled: bool,
+    pub port: Option<u16>,
+    pub total_bytes_in: u64,
+    pub total_bytes_out: u64,
+    pub active_connections: usize,
+}
+
+/// Shadowsocks quality response
+#[derive(Debug, Serialize)]
+pub struct ShadowsocksQuality {
+    pub port: u16,
+    pub quality: ConnectionQuality,
+    pub history: Vec<QualitySample>,
+}
+
 // Login handler
 async fn login(
     State(state): State<ApiState>,
@@ -598,6 +624,79 @@ async fn get_quality_warnings(State(state): State<ApiState>) -> Json<Vec<Quality
     Json(warnings)
 }
 
+// Get Shadowsocks configuration
+async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<ShadowsocksConfig> {
+    // Get all SS ports
+    let ss_ports = state.server_state.get_shadowsocks_ports().await;
+
+    let (port, cipher) = if !ss_ports.is_empty() {
+        // For now, return the first SS port info with default cipher
+        // In future multi-port support, this would return all
+        (Some(ss_ports[0]), Some("aes-256-gcm".to_string()))
+    } else {
+        (None, None)
+    };
+
+    Json(ShadowsocksConfig {
+        enabled: !ss_ports.is_empty(),
+        port,
+        cipher,
+    })
+}
+
+// Get Shadowsocks traffic statistics
+async fn get_shadowsocks_stats(State(state): State<ApiState>) -> Json<ShadowsocksStats> {
+    let ss_ports = state.server_state.get_shadowsocks_ports().await;
+
+    let mut total_bytes_in = 0;
+    let mut total_bytes_out = 0;
+    let mut active_connections = 0;
+
+    for &port in &ss_ports {
+        if let Some(traffic) = state.server_state.traffic_store.get_port_traffic(port).await {
+            total_bytes_in += traffic.total_bytes_in;
+            total_bytes_out += traffic.total_bytes_out;
+        }
+        active_connections += state.server_state.get_connection_count_for_port(port).await;
+    }
+
+    Json(ShadowsocksStats {
+        enabled: !ss_ports.is_empty(),
+        port: ss_ports.first().copied(),
+        total_bytes_in,
+        total_bytes_out,
+        active_connections,
+    })
+}
+
+// Get Shadowsocks quality data
+async fn get_shadowsocks_quality(State(state): State<ApiState>) -> Json<Vec<ShadowsocksQuality>> {
+    let ss_ports = state.server_state.get_shadowsocks_ports().await;
+    let mut result = Vec::with_capacity(ss_ports.len());
+
+    for port in ss_ports {
+        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
+            let history = state.server_state.quality_store.get_samples(port).await;
+            result.push(ShadowsocksQuality {
+                port,
+                quality,
+                history,
+            });
+        }
+    }
+
+    Json(result)
+}
+
+// Update Shadowsocks configuration (placeholder for dynamic config)
+async fn update_shadowsocks_config(
+    State(_state): State<ApiState>,
+) -> impl IntoResponse {
+    // For now, return not implemented since we don't support dynamic reconfiguration yet
+    // In future: support enabling/disabling SS, changing port/cipher/password
+    (StatusCode::NOT_IMPLEMENTED, "Dynamic configuration not implemented yet")
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -634,7 +733,11 @@ pub async fn run_api_server(
         .route("/api/quality/all", get(get_all_quality))
         .route("/api/quality/:port", get(get_port_quality))
         .route("/api/quality/:port/history", get(get_quality_history))
-        .route("/api/quality/warnings", get(get_quality_warnings));
+        .route("/api/quality/warnings", get(get_quality_warnings))
+        // Shadowsocks management endpoints
+        .route("/api/shadowsocks", get(get_shadowsocks_config).post(update_shadowsocks_config))
+        .route("/api/shadowsocks/stats", get(get_shadowsocks_stats))
+        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality));
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {
