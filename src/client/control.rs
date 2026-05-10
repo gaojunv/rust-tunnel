@@ -72,13 +72,19 @@ impl ClientState {
 /// Start the heartbeat task that sends periodic ping to keep connection alive
 async fn start_heartbeat(sender: ControlSender) {
     let mut interval = time::interval(time::Duration::from_secs(30));
+    let mut seq = 0u32;
     loop {
         interval.tick().await;
-        if let Err(e) = sender.send(ControlMessage::Ping).await {
+        let timestamp_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        seq = seq.wrapping_add(1);
+        if let Err(e) = sender.send(ControlMessage::Ping { seq, timestamp_micros }).await {
             warn!("Failed to send ping: {}", e);
             break;
         }
-        debug!("Sent heartbeat ping");
+        debug!("Sent heartbeat ping seq={}", seq);
     }
 }
 
@@ -88,8 +94,15 @@ async fn process_control_messages<R: AsyncRead + Unpin>(reader: &mut R, state: C
         match ControlMessage::read_from_stream(reader).await {
             Ok(Some(msg)) => {
                 match msg {
-                    ControlMessage::Pong => {
-                        debug!("Received heartbeat pong");
+                    ControlMessage::Pong { seq, ping_timestamp_micros, pong_timestamp_micros } => {
+                        let client_rtt_micros = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64)
+                            .unwrap_or(0)
+                            .wrapping_sub(ping_timestamp_micros);
+                        let server_processing_time = pong_timestamp_micros.wrapping_sub(ping_timestamp_micros);
+                        debug!("Received heartbeat pong seq={} rtt={}us server_processing={}us",
+                               seq, client_rtt_micros, server_processing_time);
                     }
                     ControlMessage::NewConnection { connection_id, remote_port } => {
                         info!("New connection request id {} for remote port {}", connection_id, remote_port);
