@@ -1,7 +1,9 @@
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Sqlite, Pool};
 use std::path::Path;
 use std::str::FromStr;
+use crate::server::quality::QualitySample;
 
 /// Database wrapper for persistence
 #[derive(Clone)]
@@ -92,6 +94,28 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Connection quality history
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS connection_quality_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                avg_rtt_ms REAL NOT NULL,
+                min_rtt_ms REAL NOT NULL,
+                max_rtt_ms REAL NOT NULL,
+                loss_rate REAL NOT NULL,
+                bytes_in_per_sec REAL NOT NULL,
+                bytes_out_per_sec REAL NOT NULL,
+                quality_score INTEGER NOT NULL,
+                is_warning INTEGER NOT NULL,
+                is_critical INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         // Create indexes
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_traffic_buckets_port ON traffic_buckets(port)")
             .execute(pool)
@@ -104,6 +128,14 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_client_sessions_port ON client_sessions(port)")
             .execute(pool)
             .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_quality_port ON connection_quality_history(port)")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_quality_timestamp ON connection_quality_history(timestamp)",
+        )
+        .execute(pool)
+        .await?;
 
         Ok(())
     }
@@ -262,6 +294,107 @@ impl Database {
 
         Ok(record.map(|r| (r.total_bytes_in as u64, r.total_bytes_out as u64)))
     }
+
+    /// Insert quality history record
+    pub async fn insert_quality_history(
+        &self,
+        port: u16,
+        timestamp: DateTime<Utc>,
+        avg_rtt_ms: f32,
+        min_rtt_ms: f32,
+        max_rtt_ms: f32,
+        loss_rate: f32,
+        bytes_in_per_sec: f64,
+        bytes_out_per_sec: f64,
+        quality_score: u8,
+        is_warning: bool,
+        is_critical: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO connection_quality_history (
+                port, timestamp, avg_rtt_ms, min_rtt_ms, max_rtt_ms,
+                loss_rate, bytes_in_per_sec, bytes_out_per_sec,
+                quality_score, is_warning, is_critical
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(port as i32)
+        .bind(timestamp.to_rfc3339())
+        .bind(avg_rtt_ms)
+        .bind(min_rtt_ms)
+        .bind(max_rtt_ms)
+        .bind(loss_rate)
+        .bind(bytes_in_per_sec)
+        .bind(bytes_out_per_sec)
+        .bind(quality_score as i32)
+        .bind(is_warning as i32)
+        .bind(is_critical as i32)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get quality history for a port within time range
+    pub async fn get_quality_history(
+        &self,
+        port: u16,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<Vec<QualitySample>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, QualityHistoryRow>(
+            r#"
+            SELECT timestamp, avg_rtt_ms, loss_rate,
+                   bytes_in_per_sec, bytes_out_per_sec, quality_score
+            FROM connection_quality_history
+            WHERE port = ? AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(port as i32)
+        .bind(start_time.to_rfc3339())
+        .bind(end_time.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let samples = rows
+            .into_iter()
+            .filter_map(|row| {
+                DateTime::parse_from_rfc3339(&row.timestamp)
+                    .ok()
+                    .map(|dt| QualitySample {
+                        timestamp: dt.with_timezone(&Utc),
+                        avg_rtt_ms: row.avg_rtt_ms,
+                        loss_rate: row.loss_rate,
+                        bytes_in_per_sec: row.bytes_in_per_sec,
+                        bytes_out_per_sec: row.bytes_out_per_sec,
+                        quality_score: row.quality_score as u8,
+                    })
+            })
+            .collect();
+
+        Ok(samples)
+    }
+
+    /// Clean up old quality history records older than the given time
+    pub async fn cleanup_old_quality_history(
+        &self,
+        older_than: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            DELETE FROM connection_quality_history
+            WHERE timestamp < ?
+            "#,
+        )
+        .bind(older_than.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 /// Port traffic record from database
@@ -281,4 +414,15 @@ pub struct TrafficBucketRecord {
     pub timestamp: DateTime<Utc>,
     pub bytes_in: i64,
     pub bytes_out: i64,
+}
+
+/// Quality history record from database
+#[derive(FromRow)]
+struct QualityHistoryRow {
+    pub timestamp: String,
+    pub avg_rtt_ms: f32,
+    pub loss_rate: f32,
+    pub bytes_in_per_sec: f64,
+    pub bytes_out_per_sec: f64,
+    pub quality_score: i32,
 }
