@@ -5,6 +5,7 @@ import { ClientList } from './ClientList';
 import { TrafficChart } from './TrafficChart';
 import { ClientDetail } from './ClientDetail';
 import { QualityPage } from './QualityPage';
+import { ShadowsocksPage } from './ShadowsocksPage';
 import { getMetrics, getTraffic } from '../api/client';
 
 interface DashboardProps {
@@ -21,7 +22,7 @@ const formatBytes = (bytes: number): string => {
 
 export const Dashboard = ({ onLogout }: DashboardProps) => {
   const [selectedPort, setSelectedPort] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'quality'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'quality' | 'shadowsocks'>('dashboard');
 
   const { data: metrics } = useQuery('metrics', getMetrics, {
     refetchInterval: 5000,
@@ -113,8 +114,10 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
               <TrafficChart traffic={traffic} />
             </div>
           </>
-        ) : (
+        ) : activeTab === 'quality' ? (
           <QualityPage onSelectClient={handleSelectClient} />
+        ) : (
+          <ShadowsocksPage />
         )}
       </main>
 
