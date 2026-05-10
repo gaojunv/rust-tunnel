@@ -81,11 +81,13 @@ async fn handle_inbound_connection(
             // New Shadowsocks proxy logic
             debug!("Handling Shadowsocks connection on port {}", remote_port);
 
-            // Handle SS handshake
-            let mut stream_mut = user_stream;
-            match handle_ss_handshake(&mut stream_mut, &cipher, &password, connection_id, remote_port).await {
-                Ok((ss_ctx, ss_cipher)) => {
-                    proxy_ss_connection(connection_id, remote_port, stream_mut, ss_ctx, ss_cipher, state).await;
+            // Create SS context and handle handshake
+            use crate::server::shadowsocks::create_shared_context;
+            let ss_context = create_shared_context();
+
+            match handle_ss_handshake(user_stream, &cipher, &password, connection_id, remote_port, ss_context).await {
+                Ok((ss_ctx, proxy_stream)) => {
+                    proxy_ss_connection(connection_id, remote_port, proxy_stream, ss_ctx, state).await;
                 }
                 Err(e) => {
                     warn!("SS handshake failed for connection {}: {}", connection_id, e);

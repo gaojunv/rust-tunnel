@@ -79,3 +79,6 @@ webpki-roots = "0.26"
 rustls-native-certs = "0.7"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
+md-5 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"

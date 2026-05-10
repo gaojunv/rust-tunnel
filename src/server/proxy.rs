@@ -5,7 +5,7 @@ use tracing::{debug, warn, error};
 
 use crate::common::{ControlMessage, TunnelResult};
 use crate::server::control::{ClientInfo, ServerState};
-use crate::server::shadowsocks::{SSConnectionContext, SSCipher};
+use crate::server::shadowsocks::{SSConnectionContext, ProxyServerStream};
 
 /// Proxy data from user connection to client over control channel.
 /// Data from client is handled by the main control loop which writes directly to user stream.
@@ -168,16 +168,67 @@ async fn update_ss_quality(
     state.quality_store.update_quality(port, quality).await;
 }
 
+/// Bidirectional copy with Shadowsocks encryption/decryption using ProxyServerStream
+async fn copy_bidirectional_with_ss_crypto(
+    _connection_id: u64,
+    port: u16,
+    proxy_stream: ProxyServerStream<TcpStream>,
+    mut target_stream: TcpStream,
+    state: ServerState,
+) -> TunnelResult<(u64, u64)> {
+    use crate::server::shadowsocks::{copy_from_encrypted, copy_to_encrypted, CipherKind};
+
+    // Split the streams
+    let (mut proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
+    let (mut target_read, mut target_write) = target_stream.split();
+
+    // Use the cipher kind - for simplicity we just need it for buffer size
+    let method = CipherKind::AES_256_GCM;
+
+    // Client -> Target: copy from encrypted proxy stream to plain target
+    let upload_stat = async {
+        match copy_from_encrypted(method, &mut proxy_read, &mut target_write).await {
+            Ok(n) => {
+                state.traffic_store.record_bytes_in(port, n).await;
+                n
+            }
+            Err(e) => {
+                debug!("Upload copy error: {}", e);
+                0
+            }
+        }
+    };
+
+    // Target -> Client: copy from plain target to encrypted proxy stream
+    let download_stat = async {
+        match copy_to_encrypted(method, &mut target_read, &mut proxy_write).await {
+            Ok(n) => {
+                state.traffic_store.record_bytes_out(port, n).await;
+                n
+            }
+            Err(e) => {
+                debug!("Download copy error: {}", e);
+                0
+            }
+        }
+    };
+
+    let (uploaded, downloaded) = tokio::join!(upload_stat, download_stat);
+    Ok((uploaded, downloaded))
+}
+
 /// Proxy a Shadowsocks connection to target
 pub async fn proxy_ss_connection(
     connection_id: u64,
     ss_port: u16,
-    user_stream: TcpStream,
+    proxy_stream: ProxyServerStream<TcpStream>,
     ss_ctx: SSConnectionContext,
-    _cipher: Box<dyn SSCipher>,
     state: ServerState,
 ) {
     debug!("Starting SS proxy for connection {}, target {}", connection_id, ss_ctx.target_addr);
+
+    // Increment active SS connection count
+    state.increment_ss_connections(ss_port).await;
 
     // Record start time for measuring connection setup time (RTT estimate)
     let start = Instant::now();
@@ -187,6 +238,7 @@ pub async fn proxy_ss_connection(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to connect to target {}: {}", ss_ctx.target_addr, e);
+            state.decrement_ss_connections(ss_port).await;
             return;
         }
     };
@@ -196,15 +248,13 @@ pub async fn proxy_ss_connection(
     debug!("Connected to target {} for SS connection {} in {}ms",
            ss_ctx.target_addr, connection_id, connect_time_ms);
 
-    // NOTE: Actual Shadowsocks implementation would:
-    // 1. Decrypt data from user_stream before sending to target_stream
-    // 2. Encrypt data from target_stream before sending to user_stream
-    //
-    // For now, we're doing plain pass-through (placeholder for encryption layer)
-    // The cipher wrapper will be integrated in the future
-
     let proxy_start = Instant::now();
-    match copy_bidirectional_with_stats(connection_id, ss_port, user_stream, target_stream, state.clone()).await {
+    let result = copy_bidirectional_with_ss_crypto(connection_id, ss_port, proxy_stream, target_stream, state.clone()).await;
+
+    // Decrement active SS connection count (always run)
+    state.decrement_ss_connections(ss_port).await;
+
+    match result {
         Ok((uploaded, downloaded)) => {
             let elapsed = proxy_start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
