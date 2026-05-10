@@ -60,7 +60,11 @@ pub async fn proxy_user_connection(
     state.remove_active_connection(connection_id).await;
 }
 
-/// Bidirectional copy between two streams with traffic accounting
+/// Bidirectional copy between two streams with traffic accounting.
+///
+/// Uses `copy_bidirectional` which properly handles TCP shutdown: when one direction
+/// observes EOF, it calls `shutdown()` on the opposing writer so the other direction
+/// unblocks instead of hanging indefinitely.
 pub async fn copy_bidirectional_with_stats(
     _connection_id: u64,
     port: u16,
@@ -68,61 +72,15 @@ pub async fn copy_bidirectional_with_stats(
     mut target_stream: TcpStream,
     state: ServerState,
 ) -> TunnelResult<(u64, u64)> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::server::shadowsocks::copy_bidirectional;
 
-    let (mut client_read, mut client_write) = client_stream.split();
-    let (mut target_read, mut target_write) = target_stream.split();
+    let (client_to_target, target_to_client) =
+        copy_bidirectional(&mut client_stream, &mut target_stream).await?;
 
-    // Client -> Target upload (for SS: client is user, target is destination)
-    let upload = async {
-        let mut buf = [0u8; 8192];
-        let mut total = 0u64;
-        loop {
-            let n = match client_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    debug!("Upload read error: {}", e);
-                    break;
-                }
-            };
+    state.traffic_store.record_bytes_in(port, client_to_target).await;
+    state.traffic_store.record_bytes_out(port, target_to_client).await;
 
-            if target_write.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-
-            total += n as u64;
-            state.traffic_store.record_bytes_in(port, n as u64).await;
-        }
-        total
-    };
-
-    // Target -> Client download
-    let download = async {
-        let mut buf = [0u8; 8192];
-        let mut total = 0u64;
-        loop {
-            let n = match target_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    debug!("Download read error: {}", e);
-                    break;
-                }
-            };
-
-            if client_write.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-
-            total += n as u64;
-            state.traffic_store.record_bytes_out(port, n as u64).await;
-        }
-        total
-    };
-
-    let (uploaded, downloaded) = tokio::join!(upload, download);
-    Ok((uploaded, downloaded))
+    Ok((client_to_target, target_to_client))
 }
 
 /// Update quality metrics for SS connection
@@ -168,53 +126,32 @@ async fn update_ss_quality(
     state.quality_store.update_quality(port, quality).await;
 }
 
-/// Bidirectional copy with Shadowsocks encryption/decryption using ProxyServerStream
+/// Bidirectional copy with Shadowsocks encryption/decryption using ProxyServerStream.
+///
+/// Uses `copy_encrypted_bidirectional` which properly handles TCP shutdown: when one
+/// direction observes EOF, it calls `shutdown()` on the opposing writer so the other
+/// direction unblocks instead of hanging indefinitely.
 async fn copy_bidirectional_with_ss_crypto(
     _connection_id: u64,
     port: u16,
-    proxy_stream: ProxyServerStream<TcpStream>,
+    mut proxy_stream: ProxyServerStream<TcpStream>,
     mut target_stream: TcpStream,
     state: ServerState,
 ) -> TunnelResult<(u64, u64)> {
-    use crate::server::shadowsocks::{copy_from_encrypted, copy_to_encrypted, CipherKind};
+    use crate::server::shadowsocks::{copy_encrypted_bidirectional, CipherKind};
 
-    // Split the streams
-    let (mut proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
-    let (mut target_read, mut target_write) = target_stream.split();
+    // encrypted_to_plain: client → target (upload), plain_to_encrypted: target → client (download)
+    let (encrypted_to_plain, plain_to_encrypted) = copy_encrypted_bidirectional(
+        CipherKind::AES_256_GCM,
+        &mut proxy_stream,
+        &mut target_stream,
+    )
+    .await?;
 
-    // Use the cipher kind - for simplicity we just need it for buffer size
-    let method = CipherKind::AES_256_GCM;
+    state.traffic_store.record_bytes_in(port, encrypted_to_plain).await;
+    state.traffic_store.record_bytes_out(port, plain_to_encrypted).await;
 
-    // Client -> Target: copy from encrypted proxy stream to plain target
-    let upload_stat = async {
-        match copy_from_encrypted(method, &mut proxy_read, &mut target_write).await {
-            Ok(n) => {
-                state.traffic_store.record_bytes_in(port, n).await;
-                n
-            }
-            Err(e) => {
-                debug!("Upload copy error: {}", e);
-                0
-            }
-        }
-    };
-
-    // Target -> Client: copy from plain target to encrypted proxy stream
-    let download_stat = async {
-        match copy_to_encrypted(method, &mut target_read, &mut proxy_write).await {
-            Ok(n) => {
-                state.traffic_store.record_bytes_out(port, n).await;
-                n
-            }
-            Err(e) => {
-                debug!("Download copy error: {}", e);
-                0
-            }
-        }
-    };
-
-    let (uploaded, downloaded) = tokio::join!(upload_stat, download_stat);
-    Ok((uploaded, downloaded))
+    Ok((encrypted_to_plain, plain_to_encrypted))
 }
 
 /// Proxy a Shadowsocks connection to target
