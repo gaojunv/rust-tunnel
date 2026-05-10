@@ -1,7 +1,55 @@
+// Connection quality data
+export interface ConnectionQuality {
+  last_rtt_ms: number;
+  avg_rtt_ms: number;
+  min_rtt_ms: number;
+  max_rtt_ms: number;
+  loss_rate: number;
+  consecutive_losses: number;
+  bytes_in_per_sec: number;
+  bytes_out_per_sec: number;
+  quality_score: number;
+  last_update: string;
+  is_warning: boolean;
+  is_critical: boolean;
+}
+
+// Historical quality sample
+export interface QualitySample {
+  timestamp: string;
+  avg_rtt_ms: number;
+  loss_rate: number;
+  bytes_in_per_sec: number;
+  bytes_out_per_sec: number;
+  quality_score: number;
+}
+
+// Client with quality data
+export interface ClientWithQuality {
+  port: number;
+  hostname?: string;
+  quality: ConnectionQuality;
+}
+
+// Port quality response with history
+export interface PortQualityResponse {
+  current: ConnectionQuality;
+  history: QualitySample[];
+}
+
+// Quality warning
+export interface QualityWarning {
+  port: number;
+  hostname?: string;
+  quality: ConnectionQuality;
+  warning_type: string;
+}
+
 export interface ClientResponse {
   port: number;
   hostname?: string;
   connection_count: number;
+  quality?: ConnectionQuality;
 }
 
 export interface ClientGroup {

@@ -5,6 +5,10 @@ import type {
   ServerMetrics,
   LoginRequest,
   LoginResponse,
+  QualitySample,
+  ClientWithQuality,
+  PortQualityResponse,
+  QualityWarning,
 } from '../types';
 
 const API_BASE = '/api';
@@ -79,6 +83,27 @@ export const getMetrics = async (): Promise<ServerMetrics> => {
 // Health check
 export const checkHealth = async (): Promise<{ status: string }> => {
   const response = await api.get('/health');
+  return response.data;
+};
+
+// Quality API
+export const getAllQuality = async (): Promise<ClientWithQuality[]> => {
+  const response = await api.get<ClientWithQuality[]>('/quality/all');
+  return response.data;
+};
+
+export const getPortQuality = async (port: number): Promise<PortQualityResponse> => {
+  const response = await api.get<PortQualityResponse>(`/quality/${port}`);
+  return response.data;
+};
+
+export const getQualityHistory = async (port: number): Promise<QualitySample[]> => {
+  const response = await api.get<QualitySample[]>(`/quality/${port}/history`);
+  return response.data;
+};
+
+export const getQualityWarnings = async (): Promise<QualityWarning[]> => {
+  const response = await api.get<QualityWarning[]>('/quality/warnings');
   return response.data;
 };
 
