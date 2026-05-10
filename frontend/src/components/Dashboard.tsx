@@ -33,10 +33,6 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
 
   const handleSelectClient = (port: number) => {
     setSelectedPort(port);
-    // Switch to dashboard tab when selecting a client from quality page
-    if (activeTab === 'quality') {
-      setActiveTab('dashboard');
-    }
   };
 
   return (
