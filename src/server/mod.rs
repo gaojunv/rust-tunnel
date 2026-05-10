@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod db;
 pub mod quality;
+pub mod shadowsocks;
 
 pub use config::*;
 pub use api::TrafficStore;
