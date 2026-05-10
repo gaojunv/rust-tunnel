@@ -1,5 +1,4 @@
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Sqlite, Pool};
 use std::path::Path;
 use std::str::FromStr;
