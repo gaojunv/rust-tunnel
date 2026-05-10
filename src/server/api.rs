@@ -456,7 +456,9 @@ async fn logout() -> impl IntoResponse {
 // List all clients
 async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>> {
     let clients = state.server_state.get_all_clients().await;
-    let mut response = Vec::with_capacity(clients.len());
+    let mut response = Vec::with_capacity(clients.len() + 1);
+
+    // Tunnel clients
     for (port, info) in clients {
         let connection_count = state.server_state.get_connection_count_for_port(port).await;
         let quality = state.server_state.quality_store.get_quality(port).await;
@@ -467,6 +469,20 @@ async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>
             quality,
         });
     }
+
+    // Shadowsocks ports — show them in the client list so SS activity is visible
+    let ss_ports = state.server_state.get_shadowsocks_ports().await;
+    for port in ss_ports {
+        let connection_count = state.server_state.get_connection_count_for_port(port).await;
+        let quality = state.server_state.quality_store.get_quality(port).await;
+        response.push(ClientResponse {
+            port,
+            hostname: Some("[Shadowsocks]".to_string()),
+            connection_count,
+            quality,
+        });
+    }
+
     Json(response)
 }
 

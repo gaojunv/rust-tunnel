@@ -12,7 +12,7 @@ pub use shadowsocks::{
         socks5::Address,
         tcprelay::{
             proxy_stream::server::ProxyServerStream,
-            utils::{copy_from_encrypted, copy_to_encrypted},
+            utils::{copy_bidirectional, copy_encrypted_bidirectional, copy_from_encrypted, copy_to_encrypted},
         },
     },
 };

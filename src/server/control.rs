@@ -279,7 +279,8 @@ impl ServerState {
 
     pub async fn get_active_connection_count(&self) -> usize {
         let active_connections = self.active_connections.lock().await;
-        active_connections.len()
+        let ss_connections = self.ss_active_connections.lock().await;
+        active_connections.len() + ss_connections.values().sum::<usize>()
     }
 
     pub async fn disconnect_client(&self, remote_port: u16) -> bool {
