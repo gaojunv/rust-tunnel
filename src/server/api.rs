@@ -1,12 +1,13 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, Response, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post, delete},
     Json, Router,
 };
+use crate::server::quality::{ConnectionQuality, QualitySample};
 use chrono::{DateTime, Utc, Timelike};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -345,6 +346,7 @@ pub struct ClientResponse {
     pub port: u16,
     pub hostname: Option<String>,
     pub connection_count: usize,
+    pub quality: Option<ConnectionQuality>,
 }
 
 /// Server metrics
@@ -360,6 +362,37 @@ pub struct ServerMetrics {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+}
+
+/// Client with quality data
+#[derive(Debug, Serialize)]
+pub struct ClientWithQuality {
+    pub port: u16,
+    pub hostname: Option<String>,
+    pub quality: ConnectionQuality,
+}
+
+/// Port quality response with history
+#[derive(Debug, Serialize)]
+pub struct PortQualityResponse {
+    pub current: ConnectionQuality,
+    pub history: Vec<QualitySample>,
+}
+
+/// Quality warning
+#[derive(Debug, Serialize)]
+pub struct QualityWarning {
+    pub port: u16,
+    pub hostname: Option<String>,
+    pub quality: ConnectionQuality,
+    pub warning_type: String,
+}
+
+/// Query parameters for history
+#[derive(Debug, Deserialize)]
+pub struct QualityHistoryQuery {
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 // Login handler
@@ -400,10 +433,12 @@ async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>
     let mut response = Vec::with_capacity(clients.len());
     for (port, info) in clients {
         let connection_count = state.server_state.get_connection_count_for_port(port).await;
+        let quality = state.server_state.quality_store.get_quality(port).await;
         response.push(ClientResponse {
             port,
             hostname: info.hostname,
             connection_count,
+            quality,
         });
     }
     Json(response)
@@ -490,6 +525,79 @@ async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
     }
 }
 
+// Get all clients with quality data
+async fn get_all_quality(State(state): State<ApiState>) -> Json<Vec<ClientWithQuality>> {
+    let clients = state.server_state.get_all_clients().await;
+    let mut result = Vec::with_capacity(clients.len());
+
+    for (port, info) in clients {
+        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
+            result.push(ClientWithQuality {
+                port,
+                hostname: info.hostname,
+                quality,
+            });
+        }
+    }
+
+    Json(result)
+}
+
+// Get quality data for a single port
+async fn get_port_quality(
+    State(state): State<ApiState>,
+    Path(port): Path<u16>,
+) -> impl IntoResponse {
+    let current = state.server_state.quality_store.get_quality(port).await;
+    let history = state.server_state.quality_store.get_samples(port).await;
+
+    match current {
+        Some(current) => Json(PortQualityResponse { current, history }).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// Get quality history for a port (with optional time range)
+async fn get_quality_history(
+    State(state): State<ApiState>,
+    Path(port): Path<u16>,
+    Query(_params): Query<QualityHistoryQuery>,
+) -> Json<Vec<QualitySample>> {
+    // For now, just return in-memory samples (last 60 minutes)
+    // Future: support database queries for longer time ranges
+    let samples = state.server_state.quality_store.get_samples(port).await;
+    Json(samples)
+}
+
+// Get current quality warnings
+async fn get_quality_warnings(State(state): State<ApiState>) -> Json<Vec<QualityWarning>> {
+    let clients = state.server_state.get_all_clients().await;
+    let mut warnings = Vec::new();
+
+    for (port, info) in clients {
+        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
+            let warning_type = if quality.is_critical {
+                Some("critical".to_string())
+            } else if quality.is_warning {
+                Some("warning".to_string())
+            } else {
+                None
+            };
+
+            if let Some(warning_type) = warning_type {
+                warnings.push(QualityWarning {
+                    port,
+                    hostname: info.hostname,
+                    quality,
+                    warning_type,
+                });
+            }
+        }
+    }
+
+    Json(warnings)
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -521,7 +629,12 @@ pub async fn run_api_server(
         .route("/api/clients/:port", delete(disconnect_client))
         .route("/api/traffic", get(get_traffic))
         .route("/api/traffic/:port", get(get_port_traffic))
-        .route("/api/metrics", get(get_metrics));
+        .route("/api/metrics", get(get_metrics))
+        // Quality monitoring endpoints
+        .route("/api/quality/all", get(get_all_quality))
+        .route("/api/quality/:port", get(get_port_quality))
+        .route("/api/quality/:port/history", get(get_quality_history))
+        .route("/api/quality/warnings", get(get_quality_warnings));
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {
