@@ -315,9 +315,7 @@ impl QualityStore {
 
     pub async fn remove_port(&self, port: u16) {
         let mut current = self.current.lock().await;
-        let mut samples = self.samples.lock().await;
         current.remove(&port);
-        samples.remove(&port);
     }
 }
 

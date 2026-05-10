@@ -703,8 +703,6 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     // Cleanup: remove all registered clients when control connection closes
     for &remote_port in &registered_ports {
         state.remove_client(remote_port).await;
-        // Also clean up quality data
-        state.quality_store.remove_port(remote_port).await;
         state.remove_quality_tracker(remote_port).await;
         info!("Client unregistered from port {} (control connection closed)", remote_port);
     }
