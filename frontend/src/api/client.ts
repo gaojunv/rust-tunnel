@@ -9,6 +9,9 @@ import type {
   ClientWithQuality,
   PortQualityResponse,
   QualityWarning,
+  ShadowsocksConfig,
+  ShadowsocksStats,
+  ShadowsocksQuality,
 } from '../types';
 
 const API_BASE = '/api';
@@ -110,4 +113,25 @@ export const getQualityWarnings = async (): Promise<QualityWarning[]> => {
 // Check if we have a token
 export const isAuthenticated = (): boolean => {
   return !!localStorage.getItem('auth_token');
+};
+
+// Shadowsocks API
+export const getShadowsocksConfig = async (): Promise<ShadowsocksConfig> => {
+  const response = await api.get<ShadowsocksConfig>('/shadowsocks');
+  return response.data;
+};
+
+export const updateShadowsocksConfig = async (config: Partial<ShadowsocksConfig>): Promise<ShadowsocksConfig> => {
+  const response = await api.post<ShadowsocksConfig>('/shadowsocks', config);
+  return response.data;
+};
+
+export const getShadowsocksStats = async (): Promise<ShadowsocksStats> => {
+  const response = await api.get<ShadowsocksStats>('/shadowsocks/stats');
+  return response.data;
+};
+
+export const getShadowsocksQuality = async (): Promise<ShadowsocksQuality[]> => {
+  const response = await api.get<ShadowsocksQuality[]>('/shadowsocks/quality');
+  return response.data;
 };

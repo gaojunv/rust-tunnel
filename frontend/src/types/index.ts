@@ -85,3 +85,26 @@ export interface LoginResponse {
   token: string;
   auth_required: boolean;
 }
+
+// Shadowsocks configuration
+export interface ShadowsocksConfig {
+  enabled: boolean;
+  port?: number;
+  cipher?: string;
+}
+
+// Shadowsocks statistics
+export interface ShadowsocksStats {
+  enabled: boolean;
+  port?: number;
+  total_bytes_in: number;
+  total_bytes_out: number;
+  active_connections: number;
+}
+
+// Shadowsocks quality data with history
+export interface ShadowsocksQuality {
+  port: number;
+  quality: ConnectionQuality;
+  history: QualitySample[];
+}
