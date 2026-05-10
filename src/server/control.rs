@@ -503,11 +503,19 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             });
                         }
                     }
-                    ControlMessage::Ping => {
+                    ControlMessage::Ping { seq, timestamp_micros } => {
                         // Send pong response
-                        let _ = sender.send(ControlMessage::Pong).await;
+                        let pong_timestamp_micros = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64)
+                            .unwrap_or(0);
+                        let _ = sender.send(ControlMessage::Pong {
+                            seq,
+                            ping_timestamp_micros: timestamp_micros,
+                            pong_timestamp_micros,
+                        }).await;
                     }
-                    ControlMessage::Pong => {
+                    ControlMessage::Pong { .. } => {
                         // Ignore, pong is only server -> client
                     }
                     ControlMessage::Data { connection_id, data } => {

@@ -24,9 +24,21 @@ pub enum ControlMessage {
     /// Close a specific connection
     Close { connection_id: u64 },
     /// Heartbeat ping (client -> server)
-    Ping,
+    Ping {
+        /// Heartbeat sequence number (client increments)
+        seq: u32,
+        /// Send timestamp (microseconds, client time)
+        timestamp_micros: u64,
+    },
     /// Heartbeat pong (server -> client)
-    Pong,
+    Pong {
+        /// Corresponding Ping's sequence number
+        seq: u32,
+        /// Ping timestamp (echoed back)
+        ping_timestamp_micros: u64,
+        /// Pong send timestamp (server time)
+        pong_timestamp_micros: u64,
+    },
     /// Server requests client to disconnect (web interface admin action)
     Disconnect,
 }
@@ -108,8 +120,8 @@ mod tests {
             ControlMessage::ConnectionReady { connection_id: 12345 },
             ControlMessage::Data { connection_id: 12345, data: vec![1, 2, 3, 4] },
             ControlMessage::Close { connection_id: 12345 },
-            ControlMessage::Ping,
-            ControlMessage::Pong,
+            ControlMessage::Ping { seq: 1, timestamp_micros: 123456789 },
+            ControlMessage::Pong { seq: 1, ping_timestamp_micros: 123456789, pong_timestamp_micros: 123456795 },
             ControlMessage::Disconnect,
         ];
 
@@ -179,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_to_split_alias() {
         let mut buffer = Vec::new();
-        let msg = ControlMessage::Ping;
+        let msg = ControlMessage::Ping { seq: 1, timestamp_micros: 123456789 };
         // write_to_split is just an alias for write_to_stream
         msg.write_to_split(&mut buffer).await.unwrap();
         assert!(!buffer.is_empty());
