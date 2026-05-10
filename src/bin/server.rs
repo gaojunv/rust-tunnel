@@ -17,9 +17,16 @@ async fn main() -> TunnelResult<()> {
 
     // Load historical data from database
     if let Err(e) = state.traffic_store.load_from_db().await {
-        tracing::warn!("Failed to load historical data from database: {}", e);
+        tracing::warn!("Failed to load historical traffic data from database: {}", e);
     } else {
         tracing::info!("Loaded historical traffic data from database");
+    }
+
+    // Load quality history data from database
+    if let Err(e) = state.quality_store.load_from_db().await {
+        tracing::warn!("Failed to load quality history data from database: {}", e);
+    } else {
+        tracing::info!("Loaded quality history data from database");
     }
 
     // Create auth config

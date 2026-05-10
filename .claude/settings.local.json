@@ -41,7 +41,16 @@
       "Bash(LOG_LEVEL=\"warn\" timeout 1.5 cargo run --bin rust-tunnel-server -- --bind 127.0.0.1:7777)",
       "Bash(LOG_LEVEL=\"warn\" timeout 1.5 cargo run --bin rust-tunnel-server -- --bind 127.0.0.1:7777 --api-bind 127.0.0.1:8777)",
       "Bash(rm src/bin/test_env_config.rs /tmp/test_config.rs /tmp/test_env_config.rs test.db)",
-      "Bash(pkill -f rust-tunnel)"
+      "Bash(pkill -f rust-tunnel)",
+      "Bash(git commit *)",
+      "Bash(npx tsc *)",
+      "Bash(curl -s http://localhost:3000/api/quality/all)",
+      "Bash(curl -s http://localhost:3000/api/clients)",
+      "Bash(pkill -f \"rust-tunnel-server\")",
+      "Bash(./target/debug/rust-tunnel-server --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000 --log info)",
+      "Bash(./target/debug/rust-tunnel-client --server localhost:8080 --forward 9000:localhost:22 --log info)",
+      "Bash(python3 -m json.tool)",
+      "Bash(./target/debug/rust-tunnel-server --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000 --log debug)"
     ]
   }
 }

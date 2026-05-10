@@ -1,8 +1,9 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use crate::server::db::Database;
 
 /// Connection quality alert thresholds
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ pub struct QualityTracker {
     total_pings: u64,
     lost_pings: u64,
     recent_losses: VecDeque<bool>,
+    pub last_sample_minute: u32,
 }
 
 impl Default for QualityTracker {
@@ -98,6 +100,7 @@ impl Default for QualityTracker {
             total_pings: 0,
             lost_pings: 0,
             recent_losses: VecDeque::with_capacity(60),
+            last_sample_minute: u32::MAX,
         }
     }
 }
@@ -106,6 +109,15 @@ impl QualityTracker {
     /// Record a received Ping, calculate packet loss
     pub fn record_ping(&mut self, seq: u32) -> (u32, f32) {
         self.total_pings += 1;
+
+
+        // Handle sequence number reset (client likely restarted)
+        // If seq is significantly behind expected, reset the tracker to avoid
+        // incorrectly calculating packet loss
+        if seq < self.expected_seq && (seq <= 2 || self.expected_seq - seq > 5) {
+            self.expected_seq = seq;
+            self.recent_losses.clear();
+        }
 
         // Calculate lost packets
         let lost = if seq > self.expected_seq {
@@ -121,7 +133,7 @@ impl QualityTracker {
             }
         }
 
-        // Record whether the current packet
+        // Record current packet as received
         self.recent_losses.push_back(false);
 
         // Keep only last 60 samples
@@ -189,11 +201,12 @@ pub fn check_warnings(
     (is_warning, is_critical)
 }
 
-/// In-memory quality store
+/// In-memory quality store with database persistence
 #[derive(Clone)]
 pub struct QualityStore {
     current: Arc<Mutex<HashMap<u16, ConnectionQuality>>>,
     samples: Arc<Mutex<HashMap<u16, VecDeque<QualitySample>>>>,
+    db: Option<Database>,
 }
 
 impl Default for QualityStore {
@@ -203,11 +216,52 @@ impl Default for QualityStore {
 }
 
 impl QualityStore {
+    /// Create a new quality store without database (for backwards compatibility)
     pub fn new() -> Self {
         Self {
             current: Arc::new(Mutex::new(HashMap::new())),
             samples: Arc::new(Mutex::new(HashMap::new())),
+            db: None,
         }
+    }
+
+    /// Create a new quality store with database persistence
+    pub fn with_db(db: Database) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(HashMap::new())),
+            samples: Arc::new(Mutex::new(HashMap::new())),
+            db: Some(db),
+        }
+    }
+
+    /// Load quality history data from database (last 24 hours)
+    pub async fn load_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(db) = &self.db {
+            let mut samples = self.samples.lock().await;
+
+            // Get all distinct ports from quality history (last 24 hours)
+            let ports = db.get_quality_ports(24).await?;
+
+            // For each port, load last 60 minutes of history
+            for port in ports {
+                let history = db.get_quality_history(
+                    port,
+                    Utc::now() - Duration::hours(24),
+                    Utc::now(),
+                ).await?;
+
+                let mut port_samples = VecDeque::with_capacity(60);
+                for sample in history {
+                    port_samples.push_back(sample);
+                    if port_samples.len() >= 60 {
+                        break;
+                    }
+                }
+
+                samples.insert(port, port_samples);
+            }
+        }
+        Ok(())
     }
 
     pub async fn update_quality(&self, port: u16, quality: ConnectionQuality) {
@@ -216,12 +270,31 @@ impl QualityStore {
     }
 
     pub async fn add_sample(&self, port: u16, sample: QualitySample) {
+        // Add to in-memory store
         let mut samples = self.samples.lock().await;
         let port_samples = samples.entry(port).or_insert_with(|| VecDeque::with_capacity(60));
-        port_samples.push_back(sample);
+        port_samples.push_back(sample.clone());
 
         while port_samples.len() > 60 {
             port_samples.pop_front();
+        }
+        drop(samples);
+
+        // Persist to database if available
+        if let Some(db) = &self.db {
+            let _ = db.insert_quality_history(
+                port,
+                sample.timestamp,
+                sample.avg_rtt_ms,
+                sample.avg_rtt_ms, // min_rtt_ms (use same as avg for history)
+                sample.avg_rtt_ms, // max_rtt_ms (use same as avg for history)
+                sample.loss_rate,
+                sample.bytes_in_per_sec,
+                sample.bytes_out_per_sec,
+                sample.quality_score,
+                false, // is_warning
+                false, // is_critical
+            ).await;
         }
     }
 
@@ -287,6 +360,25 @@ mod tests {
         tracker.record_rtt(60.0);
         tracker.record_rtt(70.0);
         assert_eq!(tracker.get_avg_rtt(), 60.0);
+    }
+
+    #[test]
+    fn test_quality_tracker_seq_reset() {
+        let mut tracker = QualityTracker::default();
+        // Normal sequence
+        tracker.record_ping(1);
+        tracker.record_ping(2);
+        tracker.record_ping(3);
+
+        // Client restarted, sequence jumps back to 1
+        let (lost, loss_rate) = tracker.record_ping(1);
+        assert_eq!(lost, 0); // Should not count as loss when restart detected
+        assert_eq!(loss_rate, 0.0); // Should be 0% after reset (only 1 packet received)
+
+        // Continue with normal sequence after reset
+        let (lost, loss_rate) = tracker.record_ping(2);
+        assert_eq!(lost, 0);
+        assert_eq!(loss_rate, 0.0); // Still 0% with 2 packets
     }
 
     #[tokio::test]
