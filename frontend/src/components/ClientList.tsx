@@ -1,6 +1,62 @@
 import { useQuery, useMutation, useQueryClient } from 'react-query';
 import { getClients, disconnectClient } from '../api/client';
-import type { ClientResponse, ClientGroup } from '../types';
+import type { ClientResponse, ClientGroup, ConnectionQuality } from '../types';
+
+// Get quality score color
+export const getQualityColor = (score: number): string => {
+  if (score >= 90) return '#22c55e'; // Green
+  if (score >= 70) return '#eab308'; // Yellow
+  if (score >= 50) return '#f97316'; // Orange
+  return '#ef4444'; // Red
+};
+
+// Get quality text description
+export const getQualityText = (score: number): string => {
+  if (score >= 90) return 'Excellent';
+  if (score >= 70) return 'Good';
+  if (score >= 50) return 'Fair';
+  return 'Poor';
+};
+
+// Format RTT for display
+const formatRtt = (rttMs: number): string => {
+  if (rttMs < 10) return rttMs.toFixed(1);
+  if (rttMs < 100) return rttMs.toFixed(0);
+  return Math.round(rttMs).toString();
+};
+
+// Format loss rate for display
+const formatLossRate = (lossRate: number): string => {
+  return (lossRate * 100).toFixed(1);
+};
+
+// Quality score indicator component
+const QualityIndicator = ({ quality }: { quality: ConnectionQuality | undefined }) => {
+  if (!quality) {
+    return (
+      <span className="inline-flex items-center">
+        <span className="w-3 h-3 rounded-full bg-gray-300 mr-2"></span>
+        <span className="text-gray-400 text-sm">N/A</span>
+      </span>
+    );
+  }
+
+  const color = getQualityColor(quality.quality_score);
+  const text = getQualityText(quality.quality_score);
+  const blinkClass = quality.is_critical ? 'animate-pulse' : quality.is_warning ? '' : '';
+
+  return (
+    <span className="inline-flex items-center">
+      <span
+        className={`w-3 h-3 rounded-full mr-2 ${blinkClass}`}
+        style={{ backgroundColor: color }}
+      ></span>
+      <span className="text-sm font-medium" style={{ color }}>
+        {text} ({quality.quality_score})
+      </span>
+    </span>
+  );
+};
 
 interface ClientListProps {
   onSelectClient?: (port: number) => void;
@@ -84,13 +140,22 @@ export const ClientList = ({ onSelectClient }: ClientListProps) => {
                 <table className="min-w-full divide-y divide-gray-200">
                   <thead className="bg-gray-50">
                     <tr>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Port
                       </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Quality
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        RTT (ms)
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Loss (%)
+                      </th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Connections
                       </th>
-                      <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                      <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                         Actions
                       </th>
                     </tr>
@@ -98,13 +163,26 @@ export const ClientList = ({ onSelectClient }: ClientListProps) => {
                   <tbody className="bg-white divide-y divide-gray-200">
                     {group.clients.map((client) => (
                       <tr key={client.port} className="hover:bg-gray-50">
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        <td className="px-4 py-4 whitespace-nowrap">
                           <span className="text-sm font-medium text-gray-900">{client.port}</span>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
+                        <td className="px-4 py-4 whitespace-nowrap">
+                          <QualityIndicator quality={client.quality} />
+                        </td>
+                        <td className="px-4 py-4 whitespace-nowrap">
+                          <span className="text-sm text-gray-500">
+                            {client.quality ? formatRtt(client.quality.avg_rtt_ms) : 'N/A'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4 whitespace-nowrap">
+                          <span className="text-sm text-gray-500">
+                            {client.quality ? formatLossRate(client.quality.loss_rate) : 'N/A'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4 whitespace-nowrap">
                           <span className="text-sm text-gray-500">{client.connection_count}</span>
                         </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                        <td className="px-4 py-4 whitespace-nowrap text-right text-sm font-medium">
                           <button
                             onClick={() => onSelectClient?.(client.port)}
                             className="text-blue-600 hover:text-blue-900 mr-4"
