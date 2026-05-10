@@ -78,3 +78,4 @@ rcgen = "0.12"
 webpki-roots = "0.26"
 rustls-native-certs = "0.7"
 time = "0.3"
+shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
