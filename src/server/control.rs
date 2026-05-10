@@ -11,6 +11,11 @@ use crate::common::{ControlMessage, TunnelError, TunnelResult, load_or_generate_
 use crate::server::{ServerConfig, listener};
 use crate::server::api::TrafficStore;
 use crate::server::db::Database;
+use crate::server::quality::{
+    QualityStore, QualityTracker, ConnectionQuality, QualitySample,
+    calculate_quality_score, check_warnings, QualityThresholds,
+};
+use chrono::{Utc, Timelike};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -45,6 +50,10 @@ pub struct ServerState {
     pub traffic_store: TrafficStore,
     /// Database connection (optional)
     db: Option<Database>,
+    /// Connection quality store
+    pub quality_store: QualityStore,
+    /// Quality trackers per port
+    quality_trackers: Arc<Mutex<HashMap<u16, QualityTracker>>>,
 }
 
 impl ServerState {
@@ -54,6 +63,8 @@ impl ServerState {
             clients: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
+            quality_store: QualityStore::new(),
+            quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: None,
         }
     }
@@ -64,6 +75,8 @@ impl ServerState {
             clients: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
+            quality_store: QualityStore::new(),
+            quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db),
         }
     }
@@ -181,6 +194,24 @@ impl ServerState {
         } else {
             false
         }
+    }
+
+    /// Get or create quality tracker for a port
+    pub async fn get_or_create_quality_tracker(&self, port: u16) -> QualityTracker {
+        let mut trackers = self.quality_trackers.lock().await;
+        trackers.entry(port).or_default().clone()
+    }
+
+    /// Update quality tracker for a port
+    pub async fn update_quality_tracker(&self, port: u16, tracker: QualityTracker) {
+        let mut trackers = self.quality_trackers.lock().await;
+        trackers.insert(port, tracker);
+    }
+
+    /// Remove quality tracker for a port (client disconnect)
+    pub async fn remove_quality_tracker(&self, port: u16) {
+        let mut trackers = self.quality_trackers.lock().await;
+        trackers.remove(&port);
     }
 }
 
@@ -504,6 +535,78 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         }
                     }
                     ControlMessage::Ping { seq, timestamp_micros } => {
+                        // Calculate RTT using server time
+                        let now = Utc::now();
+                        let now_micros = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64)
+                            .unwrap_or(0);
+                        let rtt_ms = if now_micros > timestamp_micros {
+                            (now_micros - timestamp_micros) as f32 / 1000.0
+                        } else {
+                            0.0 // Clock went backwards, ignore
+                        };
+
+                        // Iterate all registered ports for this connection and update quality
+                        for &port in &registered_ports {
+                            // Get or create quality tracker
+                            let mut tracker = state.get_or_create_quality_tracker(port).await;
+
+                            // Record ping and calculate loss
+                            let (lost, loss_rate) = tracker.record_ping(seq);
+
+                            // Record RTT
+                            tracker.record_rtt(rtt_ms);
+
+                            // Calculate statistics
+                            let avg_rtt = tracker.get_avg_rtt();
+                            let min_rtt = tracker.get_min_rtt();
+                            let max_rtt = tracker.get_max_rtt();
+
+                            // Calculate quality score
+                            let quality_score = calculate_quality_score(avg_rtt, loss_rate);
+
+                            // Check warnings
+                            let thresholds = QualityThresholds::default();
+                            let (is_warning, is_critical) = check_warnings(avg_rtt, loss_rate, &thresholds);
+
+                            // Get throughput from TrafficStore (simplified)
+                            // For now we use 0 since we don't have per-second calculation yet
+                            let (bytes_in_per_sec, bytes_out_per_sec) = (0.0, 0.0);
+
+                            // Update real-time quality data
+                            let quality = ConnectionQuality {
+                                last_rtt_ms: rtt_ms,
+                                avg_rtt_ms: avg_rtt,
+                                min_rtt_ms: min_rtt,
+                                max_rtt_ms: max_rtt,
+                                loss_rate,
+                                consecutive_losses: lost,
+                                bytes_in_per_sec,
+                                bytes_out_per_sec,
+                                quality_score,
+                                last_update: now,
+                                is_warning,
+                                is_critical,
+                            };
+
+                            state.quality_store.update_quality(port, quality).await;
+                            state.update_quality_tracker(port, tracker).await;
+
+                            // Add historical sample once per minute (when seconds is < 10)
+                            if now.second() < 10 {
+                                let sample = QualitySample {
+                                    timestamp: now,
+                                    avg_rtt_ms: avg_rtt,
+                                    loss_rate,
+                                    bytes_in_per_sec,
+                                    bytes_out_per_sec,
+                                    quality_score,
+                                };
+                                state.quality_store.add_sample(port, sample).await;
+                            }
+                        }
+
                         // Send pong response
                         let pong_timestamp_micros = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -556,6 +659,9 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     // Cleanup: remove all registered clients when control connection closes
     for &remote_port in &registered_ports {
         state.remove_client(remote_port).await;
+        // Also clean up quality data
+        state.quality_store.remove_port(remote_port).await;
+        state.remove_quality_tracker(remote_port).await;
         info!("Client unregistered from port {} (control connection closed)", remote_port);
     }
 
