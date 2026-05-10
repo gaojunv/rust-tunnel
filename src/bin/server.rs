@@ -1,5 +1,5 @@
 use rust_tunnel::common::{init_logging_with_level, TunnelResult};
-use rust_tunnel::server::{ServerConfig, control, api, auth, Database};
+use rust_tunnel::server::{ServerConfig, control, api, auth, listener, Database};
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
@@ -47,6 +47,22 @@ async fn main() -> TunnelResult<()> {
             tracing::error!("Control server error: {}", e);
         }
     });
+
+    // Start Shadowsocks listener if enabled
+    if config.ss_enabled {
+        let ss_port = config.ss_port.expect("ss_port should be set when ss_enabled is true");
+        let ss_cipher = config.ss_cipher.expect("ss_cipher should be set when ss_enabled is true");
+        let ss_password = config.ss_password.expect("ss_password should be set when ss_enabled is true");
+
+        tracing::info!("Starting Shadowsocks listener on port {}, cipher {}", ss_port, ss_cipher);
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = listener::start_shadowsocks_listener(state_clone, ss_port, ss_cipher, ss_password).await {
+                tracing::error!("Shadowsocks listener failed: {}", e);
+            }
+        });
+    }
 
     // Spawn API server
     tokio::spawn(async move {
