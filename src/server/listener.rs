@@ -3,8 +3,10 @@ use tracing::{info, debug, warn};
 use rand::Rng;
 
 use crate::common::{ControlMessage, TunnelResult};
-use crate::server::control::ServerState;
+use crate::server::shadowsocks::handle_ss_handshake;
 use crate::server::proxy;
+use crate::server::proxy::proxy_ss_connection;
+use crate::server::control::{ServerState, PortInfo};
 
 /// Generate a unique connection ID
 fn generate_connection_id() -> u64 {
@@ -32,35 +34,65 @@ pub async fn run_listener(state: ServerState, remote_port: u16) -> TunnelResult<
     }
 }
 
+/// Start Shadowsocks listener if enabled
+pub async fn start_shadowsocks_listener(
+    state: ServerState,
+    port: u16,
+    cipher: String,
+    password: String,
+) -> TunnelResult<()> {
+    // Register SS port in ServerState
+    if !state.register_shadowsocks(port, cipher, password).await {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("Port {} already in use", port),
+        ).into());
+    }
+
+    // Start the listener (reuses existing run_listener logic)
+    run_listener(state, port).await
+}
+
 async fn handle_inbound_connection(
     state: ServerState,
     remote_port: u16,
     connection_id: u64,
     user_stream: TcpStream,
 ) -> TunnelResult<()> {
-    // Get the client info for this port
-    let client_info = match state.get_client(remote_port).await {
+    // Get port info
+    let port_info = match state.get_port(remote_port).await {
         Some(info) => info,
         None => {
-            warn!("No client registered for port {}, closing connection", remote_port);
+            warn!("No port registered for {}, closing connection", remote_port);
             return Ok(());
         }
     };
 
-    // Notify client about the new connection
-    client_info.control_sender.send(ControlMessage::NewConnection { connection_id, remote_port }).await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to send message: {}", e)))?;
+    match port_info {
+        PortInfo::Tunnel(client_info) => {
+            // Existing tunnel proxy logic
+            debug!("Handling Tunnel connection on port {}", remote_port);
+            // Notify client about the new connection
+            client_info.control_sender.send(ControlMessage::NewConnection { connection_id, remote_port }).await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to send message: {}", e)))?;
+            proxy::proxy_user_connection(connection_id, remote_port, user_stream, client_info, state).await;
+        }
+        PortInfo::Shadowsocks { cipher, password, .. } => {
+            // New Shadowsocks proxy logic
+            debug!("Handling Shadowsocks connection on port {}", remote_port);
 
-    // Wait for client to indicate it's ready
-    // Client will send ConnectionReady, then we start proxying
-    // The message will be read by the main control loop, which will wake us up?
-    // Actually, we just wait for the client to send data through the channel.
-    // We need to wait for the ConnectionReady message. Let's just give client some time.
-    // Wait, actually the main control loop handles all messages. We need a different approach.
-    // Let's just directly proxy and expect that client connects and we start getting data.
+            // Handle SS handshake
+            let mut stream_mut = user_stream;
+            match handle_ss_handshake(&mut stream_mut, &cipher, &password, connection_id, remote_port).await {
+                Ok((ss_ctx, ss_cipher)) => {
+                    proxy_ss_connection(connection_id, remote_port, stream_mut, ss_ctx, ss_cipher, state).await;
+                }
+                Err(e) => {
+                    warn!("SS handshake failed for connection {}: {}", connection_id, e);
+                }
+            }
+        }
+    }
 
-    // Start proxying: user stream -> control channel -> client -> local service
-    // Data from client -> control channel -> main control loop -> user stream
-    proxy::proxy_user_connection(connection_id, remote_port, user_stream, client_info, state).await;
     Ok(())
 }
