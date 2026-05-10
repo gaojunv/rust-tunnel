@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Sqlite, Pool};
+use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Row, Sqlite, Pool};
 use std::path::Path;
 use std::str::FromStr;
 use crate::server::quality::QualitySample;
@@ -393,6 +393,23 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Get all distinct ports that have quality history within the last N hours
+    pub async fn get_quality_ports(&self, hours: u32) -> Result<Vec<u16>, sqlx::Error> {
+        let since = Utc::now() - Duration::hours(hours as i64);
+
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT port FROM connection_quality_history
+            WHERE timestamp >= ?
+            "#,
+        )
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(|row| row.get::<i32, _>("port") as u16).collect())
     }
 }
 

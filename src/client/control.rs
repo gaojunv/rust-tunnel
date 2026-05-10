@@ -74,7 +74,10 @@ async fn start_heartbeat(sender: ControlSender) {
     let mut interval = time::interval(time::Duration::from_secs(30));
     let mut seq = 0u32;
     loop {
-        interval.tick().await;
+        // Skip first tick - send ping immediately on connection
+        if seq > 0 {
+            interval.tick().await;
+        }
         let timestamp_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)

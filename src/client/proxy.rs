@@ -18,27 +18,13 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         }
     };
 
-    // Connect to local target using blocking std connect (same behavior as curl/nc)
-    // This avoids macOS-specific "No route to host" issue when connecting to gateway
+    // Connect to local target using async Tokio TcpStream
     debug!("Connecting to local target {}", local_addr);
 
-    // Use std::net::TcpStream to connect - this has the same behavior as curl
-    let std_stream = std::net::TcpStream::connect(local_addr);
-    let local_stream = match std_stream {
-        Ok(std_stream) => {
-            // Set non-blocking and convert to tokio TcpStream
-            std_stream.set_nonblocking(true)?;
-            match TcpStream::from_std(std_stream) {
-                Ok(stream) => {
-                    debug!("Successfully connected to {}", local_addr);
-                    stream
-                }
-                Err(e) => {
-                    warn!("Failed to convert to async stream: {}", e);
-                    let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
-                    return Err(e.into());
-                }
-            }
+    let local_stream = match TcpStream::connect(local_addr).await {
+        Ok(stream) => {
+            debug!("Successfully connected to {}", local_addr);
+            stream
         }
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", local_addr, e);

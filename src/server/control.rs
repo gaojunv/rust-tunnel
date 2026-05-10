@@ -75,7 +75,7 @@ impl ServerState {
             clients: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
-            quality_store: QualityStore::new(),
+            quality_store: QualityStore::with_db(db.clone()),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db),
         }
@@ -112,6 +112,10 @@ impl ServerState {
     pub async fn remove_client(&self, remote_port: u16) {
         let mut clients = self.clients.lock().await;
         clients.remove(&remote_port);
+
+        // Also clean up quality data when client is removed
+        self.quality_store.remove_port(remote_port).await;
+        self.remove_quality_tracker(remote_port).await;
 
         // Record client disconnection in database
         if let Some(db) = &self.db {
@@ -451,6 +455,42 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     info!("Client unregistered from port {}", remote_port);
                 });
             }
+            ControlMessage::Ping { seq, timestamp_micros } => {
+                // Ping received during registration phase
+                if !registered_ports.is_empty() {
+                    // Process quality update
+                    let now_micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64)
+                        .unwrap_or(0);
+                    let rtt_ms = if now_micros > timestamp_micros {
+                        (now_micros - timestamp_micros) as f32 / 1000.0
+                    } else {
+                        0.0
+                    };
+
+                    for &port in &registered_ports {
+                        let mut tracker = state.get_or_create_quality_tracker(port).await;
+                        let (_, _) = tracker.record_ping(seq);
+                        tracker.record_rtt(rtt_ms);
+                        state.update_quality_tracker(port, tracker).await;
+                    }
+
+                    // Send pong response
+                    let pong_timestamp_micros = now_micros;
+                    let _ = sender.send(ControlMessage::Pong {
+                        seq,
+                        ping_timestamp_micros: timestamp_micros,
+                        pong_timestamp_micros,
+                    }).await;
+
+                    info!("Registration phase complete (received Ping), {} ports registered", registered_ports.len());
+                    break;
+                } else {
+                    // No ports registered yet, just ignore and continue waiting
+                    continue;
+                }
+            }
             _ => {
                 // If we have registered ports, this is the end of registration phase
                 if !registered_ports.is_empty() {
@@ -547,6 +587,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             0.0 // Clock went backwards, ignore
                         };
 
+
                         // Iterate all registered ports for this connection and update quality
                         for &port in &registered_ports {
                             // Get or create quality tracker
@@ -591,10 +632,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             };
 
                             state.quality_store.update_quality(port, quality).await;
-                            state.update_quality_tracker(port, tracker).await;
 
-                            // Add historical sample once per minute (when seconds is < 10)
-                            if now.second() < 10 {
+                            // Add historical sample once per minute
+                            let current_minute = now.minute();
+                            if tracker.last_sample_minute != current_minute {
                                 let sample = QualitySample {
                                     timestamp: now,
                                     avg_rtt_ms: avg_rtt,
@@ -604,7 +645,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                                     quality_score,
                                 };
                                 state.quality_store.add_sample(port, sample).await;
+                                tracker.last_sample_minute = current_minute;
                             }
+
+                            state.update_quality_tracker(port, tracker).await;
                         }
 
                         // Send pong response
