@@ -220,3 +220,60 @@ pub async fn proxy_ss_connection(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::server::control::ServerState;
+
+    #[tokio::test]
+    async fn test_ss_traffic_statistics() {
+        let state = ServerState::new();
+
+        // Register a shadowsocks port
+        assert!(state.register_shadowsocks(8388, "aes-256-gcm".into(), "password".into()).await);
+
+        // Check initial traffic doesn't exist (zero effective)
+        assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
+
+        // Record some traffic manually (this is what copy_bidirectional_with_stats does)
+        state.traffic_store.record_bytes_in(8388, 1000).await;
+        state.traffic_store.record_bytes_out(8388, 2000).await;
+
+        // Check stats are updated
+        let traffic = state.traffic_store.get_port_traffic(8388).await.unwrap();
+        assert_eq!(traffic.total_bytes_in, 1000);
+        assert_eq!(traffic.total_bytes_out, 2000);
+
+        // Remove the port
+        assert!(state.unregister_port(8388).await);
+        state.traffic_store.remove_port(8388).await;
+
+        // After removal, port should be gone
+        assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mixed_traffic_statistics() {
+        let state = ServerState::new();
+
+        // Register both tunnel and SS
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        state.register_client(8080, None, sender).await;
+        state.register_shadowsocks(8388, "aes-256-gcm".into(), "password".into()).await;
+
+        // Record traffic to both
+        state.traffic_store.record_bytes_in(8080, 1234).await;
+        state.traffic_store.record_bytes_out(8080, 5678).await;
+        state.traffic_store.record_bytes_in(8388, 10000).await;
+        state.traffic_store.record_bytes_out(8388, 20000).await;
+
+        // Check each port has correct stats
+        let tunnel_traffic = state.traffic_store.get_port_traffic(8080).await.unwrap();
+        let ss_traffic = state.traffic_store.get_port_traffic(8388).await.unwrap();
+
+        assert_eq!(tunnel_traffic.total_bytes_in, 1234);
+        assert_eq!(tunnel_traffic.total_bytes_out, 5678);
+        assert_eq!(ss_traffic.total_bytes_in, 10000);
+        assert_eq!(ss_traffic.total_bytes_out, 20000);
+    }
+}

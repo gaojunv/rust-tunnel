@@ -196,7 +196,15 @@ mod tests {
     #[test]
     fn test_derive_key() {
         let key = derive_key("test-password", "aes-256-gcm").unwrap();
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.len(), 32); // 256 bits = 32 bytes
+
+        // Same password produces same key
+        let key2 = derive_key("test-password", "aes-256-gcm").unwrap();
+        assert_eq!(key, key2);
+
+        // Different password produces different key
+        let key3 = derive_key("different-password", "aes-256-gcm").unwrap();
+        assert_ne!(key, key3);
     }
 
     #[test]
@@ -211,7 +219,7 @@ mod tests {
         let data = [0x01, 192, 168, 1, 1, 0x00, 0x50];
         let (addr, consumed) = parse_target_address(&data).unwrap();
         assert_eq!(addr, "192.168.1.1:80");
-        assert_eq!(consumed, 7); // 1 (type) + 4 (ip) + 2 (port)
+        assert_eq!(consumed, 7); // 1 (type) + 4 (ip) + 2 (port) = 7 bytes
     }
 
     #[test]
@@ -224,7 +232,22 @@ mod tests {
 
         let (addr, consumed) = parse_target_address(&data).unwrap();
         assert_eq!(addr, "example.com:443");
-        assert_eq!(consumed, 1 + 1 + domain.len() + 2);
+        assert_eq!(consumed, 1 + 1 + domain.len() + 2); // 1 type + 1 len + domain + 2 port
+    }
+
+    #[test]
+    fn test_parse_invalid_address_type() {
+        let data = [0xFF]; // Invalid type
+        let result = parse_target_address(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truncated_data() {
+        // Truncated IPv4 (missing port)
+        let data = [0x01, 192, 168, 1, 1];
+        let result = parse_target_address(&data);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -239,6 +262,20 @@ mod tests {
         let data = [0x01, 192, 168];
         let result = parse_target_address(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ipv6_address() {
+        // Type 0x04, IPv6 ::1, port 8080
+        let mut data = vec![0x04];
+        // 16 bytes for IPv6 ::1 = all zeros except last byte
+        data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        data.extend_from_slice(&[0x1F, 0x90]); // port 8080 = 0x1F90
+
+        let (addr, consumed) = parse_target_address(&data).unwrap();
+        // The parser outputs lowercase hex segments
+        assert!(addr.contains(":8080"));
+        assert_eq!(consumed, 1 + 16 + 2);
     }
 
     #[test]

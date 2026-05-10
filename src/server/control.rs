@@ -427,6 +427,99 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod ss_integration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_can_register_both_tunnel_and_shadowsocks() {
+        let state = ServerState::new();
+
+        // Register a tunnel port
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        assert!(state.register_client(8080, Some("test-host".to_string()), sender.clone()).await);
+
+        // Register a shadowsocks port
+        assert!(state.register_shadowsocks(8388, "aes-256-gcm".to_string(), "test-pass".to_string()).await);
+
+        // Verify both are registered
+        let clients = state.get_all_clients().await;
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].0, 8080);
+
+        let ss_ports = state.get_shadowsocks_ports().await;
+        assert_eq!(ss_ports.len(), 1);
+        assert_eq!(ss_ports[0], 8388);
+
+        // Can get port info for both
+        assert!(state.get_port(8080).await.is_some());
+        assert!(state.get_port(8388).await.is_some());
+
+        // Check port types
+        assert!(!state.is_shadowsocks_port(8080).await);
+        assert!(state.is_shadowsocks_port(8388).await);
+    }
+
+    #[tokio::test]
+    async fn test_port_type_detection() {
+        let state = ServerState::new();
+
+        // Test empty
+        assert!(!state.is_shadowsocks_port(9999).await);
+
+        // Register tunnel
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        state.register_client(9000, None, sender.clone()).await;
+        assert!(!state.is_shadowsocks_port(9000).await);
+
+        // Register SS
+        state.register_shadowsocks(9001, "aes-256-gcm".to_string(), "pass".to_string()).await;
+        assert!(state.is_shadowsocks_port(9001).await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_port() {
+        let state = ServerState::new();
+
+        // Register both
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+        state.register_client(9002, None, sender.clone()).await;
+        state.register_shadowsocks(9003, "aes-256-gcm".to_string(), "pass".to_string()).await;
+
+        // Both exist
+        assert!(state.get_port(9002).await.is_some());
+        assert!(state.get_port(9003).await.is_some());
+
+        // Unregister tunnel
+        assert!(state.unregister_port(9002).await);
+        assert!(state.get_port(9002).await.is_none());
+
+        // Unregister SS
+        assert!(state.unregister_port(9003).await);
+        assert!(state.get_port(9003).await.is_none());
+
+        // Unregister non-existent
+        assert!(!state.unregister_port(9999).await);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_register_duplicate_port_both_types() {
+        let state = ServerState::new();
+        let (sender, _) = tokio::sync::mpsc::channel(1);
+
+        // Register tunnel first
+        assert!(state.register_client(8080, None, sender.clone()).await);
+        // Cannot register SS on same port
+        assert!(!state.register_shadowsocks(8080, "aes-256-gcm".into(), "pass".into()).await);
+
+        // Create new state, reverse order
+        let state2 = ServerState::new();
+        assert!(state2.register_shadowsocks(8081, "aes-256-gcm".into(), "pass".into()).await);
+        // Cannot register tunnel on same port
+        assert!(!state2.register_client(8081, None, sender.clone()).await);
+    }
+}
+
 /// Handle a single control connection from client (supports both plain TCP and TLS)
 async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: ServerConfig,
