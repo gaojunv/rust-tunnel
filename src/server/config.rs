@@ -55,6 +55,22 @@ pub struct ServerCli {
     /// Path to SQLite database file
     #[clap(long = "db-path")]
     pub db_path: Option<String>,
+
+    /// Enable Shadowsocks proxy service
+    #[clap(long = "ss-enabled")]
+    pub ss_enabled: Option<bool>,
+
+    /// Shadowsocks listen port
+    #[clap(long = "ss-port")]
+    pub ss_port: Option<u16>,
+
+    /// Shadowsocks encryption method (aes-256-gcm, chacha20-ietf-poly1305)
+    #[clap(long = "ss-cipher")]
+    pub ss_cipher: Option<String>,
+
+    /// Shadowsocks password
+    #[clap(long = "ss-password")]
+    pub ss_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -69,6 +85,10 @@ pub struct ServerConfigFile {
     pub tls_key: Option<String>,
     pub log: Option<String>,
     pub db_path: Option<String>,
+    pub ss_enabled: Option<bool>,
+    pub ss_port: Option<u16>,
+    pub ss_cipher: Option<String>,
+    pub ss_password: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +108,10 @@ pub struct ServerConfig {
     pub tls_key: String,
     pub log: String,
     pub db_path: String,
+    pub ss_enabled: bool,
+    pub ss_port: Option<u16>,
+    pub ss_cipher: Option<String>,
+    pub ss_password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -103,6 +127,10 @@ impl Default for ServerConfig {
             tls_key: "./data/tls/key.pem".to_string(),
             log: "info".to_string(),
             db_path: "./data/rust-tunnel.db".to_string(),
+            ss_enabled: false,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
         }
     }
 }
@@ -154,6 +182,18 @@ impl ServerConfig {
                 if let Some(v) = file_config.db_path {
                     config.db_path = v;
                 }
+                if let Some(v) = file_config.ss_enabled {
+                    config.ss_enabled = v;
+                }
+                if let Some(v) = file_config.ss_port {
+                    config.ss_port = Some(v);
+                }
+                if let Some(v) = file_config.ss_cipher {
+                    config.ss_cipher = Some(v);
+                }
+                if let Some(v) = file_config.ss_password {
+                    config.ss_password = Some(v);
+                }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
             }
@@ -191,6 +231,22 @@ impl ServerConfig {
             config.db_path = v;
         }
 
+        // Environment variables for Shadowsocks
+        if let Ok(v) = std::env::var("SS_ENABLED") {
+            config.ss_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("SS_PORT") {
+            if let Ok(port) = v.parse::<u16>() {
+                config.ss_port = Some(port);
+            }
+        }
+        if let Ok(v) = std::env::var("SS_CIPHER") {
+            config.ss_cipher = Some(v);
+        }
+        if let Ok(v) = std::env::var("SS_PASSWORD") {
+            config.ss_password = Some(v);
+        }
+
         // 3. Command line arguments (highest priority)
         if let Some(v) = cli.control_addr {
             config.control_addr = v;
@@ -222,6 +278,36 @@ impl ServerConfig {
         if let Some(v) = cli.db_path {
             config.db_path = v;
         }
+        if let Some(v) = cli.ss_enabled {
+            config.ss_enabled = v;
+        }
+        if let Some(v) = cli.ss_port {
+            config.ss_port = Some(v);
+        }
+        if let Some(v) = cli.ss_cipher {
+            config.ss_cipher = Some(v);
+        }
+        if let Some(v) = cli.ss_password {
+            config.ss_password = Some(v);
+        }
+
+        // Validate Shadowsocks configuration
+        if config.ss_enabled {
+            if config.ss_port.is_none() {
+                return Err("ss_port is required when ss_enabled is true".to_string());
+            }
+            if config.ss_cipher.is_none() {
+                return Err("ss_cipher is required when ss_enabled is true".to_string());
+            }
+            if config.ss_password.is_none() {
+                return Err("ss_password is required when ss_enabled is true".to_string());
+            }
+            // Validate cipher method
+            let cipher = config.ss_cipher.as_ref().unwrap();
+            if cipher != "aes-256-gcm" && cipher != "chacha20-ietf-poly1305" {
+                return Err(format!("Unsupported cipher: {}. Supported: aes-256-gcm, chacha20-ietf-poly1305", cipher));
+            }
+        }
 
         Ok(config)
     }
@@ -243,6 +329,10 @@ mod tests {
         assert!(config.tls);  // TLS enabled by default
         assert_eq!(config.tls_cert, "./data/tls/cert.pem");
         assert_eq!(config.tls_key, "./data/tls/key.pem");
+        assert!(!config.ss_enabled);
+        assert!(config.ss_port.is_none());
+        assert!(config.ss_cipher.is_none());
+        assert!(config.ss_password.is_none());
     }
 
     #[test]
@@ -259,6 +349,10 @@ mod tests {
             tls_key: Some("/custom/key.pem".to_string()),
             log: Some("debug".to_string()),
             db_path: Some("./test.db".to_string()),
+            ss_enabled: Some(true),
+            ss_port: Some(8388),
+            ss_cipher: Some("aes-256-gcm".to_string()),
+            ss_password: Some("ss-password".to_string()),
         };
 
         let config = ServerConfig::from_cli(cli).unwrap();
@@ -272,6 +366,10 @@ mod tests {
         assert_eq!(config.tls_key, "/custom/key.pem");
         assert_eq!(config.log, "debug");
         assert_eq!(config.db_path, "./test.db");
+        assert!(config.ss_enabled);
+        assert_eq!(config.ss_port, Some(8388));
+        assert_eq!(config.ss_cipher, Some("aes-256-gcm".into()));
+        assert_eq!(config.ss_password, Some("ss-password".into()));
     }
 
     #[test]
@@ -287,6 +385,10 @@ mod tests {
             tls_key: "./test-key.pem".to_string(),
             log: "debug".to_string(),
             db_path: "./test.db".to_string(),
+            ss_enabled: true,
+            ss_port: Some(8388),
+            ss_cipher: Some("aes-256-gcm".to_string()),
+            ss_password: Some("test".to_string()),
         };
 
         let cloned = config.clone();
@@ -300,6 +402,10 @@ mod tests {
         assert_eq!(config.tls_key, cloned.tls_key);
         assert_eq!(config.log, cloned.log);
         assert_eq!(config.db_path, cloned.db_path);
+        assert_eq!(config.ss_enabled, cloned.ss_enabled);
+        assert_eq!(config.ss_port, cloned.ss_port);
+        assert_eq!(config.ss_cipher, cloned.ss_cipher);
+        assert_eq!(config.ss_password, cloned.ss_password);
     }
 
     #[test]
@@ -316,10 +422,64 @@ mod tests {
             tls_key: None,
             log: None,
             db_path: None,
+            ss_enabled: None,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
         };
 
         let result = ServerConfig::from_cli(cli);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_ss_config_validation_missing_port() {
+        let cli = ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            ss_enabled: Some(true),
+            ss_port: None,
+            ss_cipher: Some("aes-256-gcm".to_string()),
+            ss_password: Some("password".to_string()),
+        };
+
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ss_port is required"));
+    }
+
+    #[test]
+    fn test_ss_config_validation_invalid_cipher() {
+        let cli = ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            ss_enabled: Some(true),
+            ss_port: Some(8388),
+            ss_cipher: Some("invalid-cipher".to_string()),
+            ss_password: Some("password".to_string()),
+        };
+
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported cipher"));
     }
 }
