@@ -3,9 +3,11 @@ import { logout } from '../api/client';
 
 interface NavbarProps {
   onLogout: () => void;
+  activeTab: 'dashboard' | 'quality';
+  onTabChange: (tab: 'dashboard' | 'quality') => void;
 }
 
-export const Navbar = ({ onLogout }: NavbarProps) => {
+export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
   const logoutMutation = useMutation(logout, {
     onSuccess: () => {
       onLogout();
@@ -24,11 +26,34 @@ export const Navbar = ({ onLogout }: NavbarProps) => {
             <div className="flex-shrink-0">
               <h1 className="text-white text-xl font-bold">Rust Tunnel</h1>
             </div>
+            <div className="ml-10 flex space-x-4">
+              <button
+                onClick={() => onTabChange('dashboard')}
+                className={`px-3 py-2 rounded-md text-sm font-medium ${
+                  activeTab === 'dashboard'
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                Dashboard
+              </button>
+              <button
+                onClick={() => onTabChange('quality')}
+                className={`px-3 py-2 rounded-md text-sm font-medium ${
+                  activeTab === 'quality'
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                Quality
+              </button>
+            </div>
           </div>
           <div className="ml-4 flex items-center md:ml-6">
             <button
               onClick={handleLogout}
-              className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium"
+              disabled={logoutMutation.isLoading}
+              className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50"
             >
               Logout
             </button>
