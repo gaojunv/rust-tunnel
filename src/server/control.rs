@@ -20,6 +20,12 @@ use chrono::{Utc, Timelike};
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortType {
+    Tunnel,
+    Shadowsocks,
+}
+
 /// Information about a connected client
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -29,6 +35,34 @@ pub struct ClientInfo {
     pub hostname: Option<String>,
     /// Sender for sending messages to client via control channel
     pub control_sender: ControlMessageSender,
+}
+
+#[derive(Debug, Clone)]
+pub enum PortInfo {
+    Tunnel(ClientInfo),
+    Shadowsocks {
+        port: u16,
+        cipher: String,
+        password: String,
+        enabled: bool,
+        created_at: i64,
+    },
+}
+
+impl PortInfo {
+    pub fn port_type(&self) -> PortType {
+        match self {
+            PortInfo::Tunnel(_) => PortType::Tunnel,
+            PortInfo::Shadowsocks { .. } => PortType::Shadowsocks,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            PortInfo::Tunnel(info) => info.remote_port,
+            PortInfo::Shadowsocks { port, .. } => *port,
+        }
+    }
 }
 
 /// Information about an active connection between user and client
@@ -42,8 +76,8 @@ struct ActiveConnection {
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
-    /// Map from remote port to client info
-    clients: Arc<Mutex<HashMap<u16, ClientInfo>>>,
+    /// Map from port to port info (Tunnel or Shadowsocks)
+    ports: Arc<Mutex<HashMap<u16, PortInfo>>>,
     /// Map from connection_id to active connection info
     active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
     /// Traffic statistics store
@@ -60,7 +94,7 @@ impl ServerState {
     /// Create a new server state without database (for backwards compatibility)
     pub fn new() -> Self {
         Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
             quality_store: QualityStore::new(),
@@ -72,7 +106,7 @@ impl ServerState {
     /// Create a new server state with database
     pub fn with_db(db: Database) -> Self {
         Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
+            ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
             quality_store: QualityStore::with_db(db.clone()),
@@ -83,15 +117,15 @@ impl ServerState {
 
     pub async fn register_client(&self, remote_port: u16, hostname: Option<String>, control_sender: ControlMessageSender) -> bool {
         let hostname_clone = hostname.clone();
-        let mut clients = self.clients.lock().await;
-        if clients.contains_key(&remote_port) {
+        let mut ports = self.ports.lock().await;
+        if ports.contains_key(&remote_port) {
             return false;
         }
-        clients.insert(remote_port, ClientInfo {
+        ports.insert(remote_port, PortInfo::Tunnel(ClientInfo {
             remote_port,
             hostname,
             control_sender,
-        });
+        }));
 
         // Record client connection in database
         if let Some(db) = &self.db {
@@ -105,13 +139,16 @@ impl ServerState {
     }
 
     pub async fn get_client(&self, remote_port: u16) -> Option<ClientInfo> {
-        let clients = self.clients.lock().await;
-        clients.get(&remote_port).cloned()
+        let ports = self.ports.lock().await;
+        match ports.get(&remote_port) {
+            Some(PortInfo::Tunnel(info)) => Some(info.clone()),
+            _ => None,
+        }
     }
 
     pub async fn remove_client(&self, remote_port: u16) {
-        let mut clients = self.clients.lock().await;
-        clients.remove(&remote_port);
+        let mut ports = self.ports.lock().await;
+        ports.remove(&remote_port);
 
         // Also clean up quality data when client is removed
         self.quality_store.remove_port(remote_port).await;
@@ -124,6 +161,31 @@ impl ServerState {
                 let _ = db.record_client_disconnect(remote_port).await;
             });
         }
+    }
+
+    pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
+        let mut ports = self.ports.lock().await;
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(port, PortInfo::Shadowsocks {
+            port,
+            cipher,
+            password,
+            enabled: true,
+            created_at: chrono::Utc::now().timestamp(),
+        });
+        true
+    }
+
+    pub async fn get_port(&self, port: u16) -> Option<PortInfo> {
+        let ports = self.ports.lock().await;
+        ports.get(&port).cloned()
+    }
+
+    pub async fn unregister_port(&self, port: u16) -> bool {
+        let mut ports = self.ports.lock().await;
+        ports.remove(&port).is_some()
     }
 
     pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>) {
@@ -175,13 +237,18 @@ impl ServerState {
 
     // API helper methods
     pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
-        let clients = self.clients.lock().await;
-        clients.iter().map(|(port, info)| (*port, info.clone())).collect()
+        let ports = self.ports.lock().await;
+        ports.iter()
+            .filter_map(|(port, info)| match info {
+                PortInfo::Tunnel(client_info) => Some((*port, client_info.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     pub async fn get_client_count(&self) -> usize {
-        let clients = self.clients.lock().await;
-        clients.len()
+        let ports = self.ports.lock().await;
+        ports.values().filter(|p| matches!(p, PortInfo::Tunnel(_))).count()
     }
 
     pub async fn get_active_connection_count(&self) -> usize {
@@ -190,8 +257,8 @@ impl ServerState {
     }
 
     pub async fn disconnect_client(&self, remote_port: u16) -> bool {
-        let clients = self.clients.lock().await;
-        if let Some(client) = clients.get(&remote_port) {
+        let ports = self.ports.lock().await;
+        if let Some(PortInfo::Tunnel(client)) = ports.get(&remote_port) {
             // Send Disconnect message to client via the channel
             let _ = client.control_sender.send(ControlMessage::Disconnect).await;
             true
