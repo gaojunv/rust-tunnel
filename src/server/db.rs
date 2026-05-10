@@ -136,6 +136,23 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Shadowsocks configuration table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS shadowsocks_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port INTEGER NOT NULL UNIQUE,
+                cipher TEXT NOT NULL,
+                password TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -411,6 +428,101 @@ impl Database {
 
         Ok(rows.iter().map(|row| row.get::<i32, _>("port") as u16).collect())
     }
+
+    /// Save or update Shadowsocks configuration
+    pub async fn save_shadowsocks_config(
+        &self,
+        port: u16,
+        cipher: &str,
+        password: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO shadowsocks_config (port, cipher, password, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(port) DO UPDATE SET
+                cipher = excluded.cipher,
+                password = excluded.password,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(port as i32)
+        .bind(cipher)
+        .bind(password)
+        .bind(enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Load all Shadowsocks configurations
+    pub async fn load_shadowsocks_configs(&self) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
+        let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
+            r#"
+            SELECT id, port, cipher, password, enabled, created_at, updated_at
+            FROM shadowsocks_config
+            ORDER BY port
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Load enabled Shadowsocks configurations
+    pub async fn load_enabled_shadowsocks_configs(&self) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
+        let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
+            r#"
+            SELECT id, port, cipher, password, enabled, created_at, updated_at
+            FROM shadowsocks_config
+            WHERE enabled = 1
+            ORDER BY port
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Get Shadowsocks config for a specific port
+    pub async fn get_shadowsocks_config(&self, port: u16) -> Result<Option<ShadowsocksConfigRecord>, sqlx::Error> {
+        let record = sqlx::query_as::<_, ShadowsocksConfigRecord>(
+            r#"
+            SELECT id, port, cipher, password, enabled, created_at, updated_at
+            FROM shadowsocks_config
+            WHERE port = ?
+            "#,
+        )
+        .bind(port as i32)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
+    /// Delete Shadowsocks configuration
+    pub async fn delete_shadowsocks_config(&self, port: u16) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            DELETE FROM shadowsocks_config
+            WHERE port = ?
+            "#,
+        )
+        .bind(port as i32)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 /// Port traffic record from database
@@ -441,4 +553,16 @@ struct QualityHistoryRow {
     pub bytes_in_per_sec: f64,
     pub bytes_out_per_sec: f64,
     pub quality_score: i32,
+}
+
+/// Shadowsocks config record from database
+#[derive(FromRow, Debug)]
+pub struct ShadowsocksConfigRecord {
+    pub id: i32,
+    pub port: i32,
+    pub cipher: String,
+    pub password: String,
+    pub enabled: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
