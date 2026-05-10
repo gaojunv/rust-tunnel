@@ -1,7 +1,9 @@
 import { useQuery } from 'react-query';
-import { getPortTraffic } from '../api/client';
-import type { PortTraffic } from '../types';
+import { getPortTraffic, getPortQuality } from '../api/client';
+import type { PortTraffic, PortQualityResponse, QualitySample } from '../types';
 import { TrafficChart } from './TrafficChart';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { getQualityColor, getQualityText } from './ClientList';
 
 interface ClientDetailProps {
   port: number;
@@ -16,13 +18,122 @@ const formatBytes = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
-const formatTime = (timestamp: string): string => {
-  const date = new Date(timestamp);
-  return date.toLocaleTimeString();
+const formatMs = (value: number): string => `${value.toFixed(1)} ms`;
+
+const formatPercent = (value: number): string => `${(value * 100).toFixed(1)}%`;
+
+// Quality gauge component
+const QualityGauge = ({ score }: { score: number }) => {
+  const color = getQualityColor(score);
+  const circumference = 2 * Math.PI * 45;
+  const strokeDashoffset = circumference - (score / 100) * circumference;
+
+  return (
+    <div className="flex flex-col items-center">
+      <div className="relative">
+        <svg width="120" height="120" className="transform -rotate-90">
+          <circle
+            cx="60"
+            cy="60"
+            r="45"
+            stroke="#e5e7eb"
+            strokeWidth="10"
+            fill="none"
+          />
+          <circle
+            cx="60"
+            cy="60"
+            r="45"
+            stroke={color}
+            strokeWidth="10"
+            fill="none"
+            strokeDasharray={circumference}
+            strokeDashoffset={strokeDashoffset}
+            strokeLinecap="round"
+            style={{ transition: 'stroke-dashoffset 0.5s ease' }}
+          />
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center">
+          <span className="text-2xl font-bold" style={{ color }}>
+            {score}
+          </span>
+          <span className="text-xs text-gray-500">
+            {getQualityText(score)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// RTT chart component
+const RTTChart = ({ samples }: { samples: QualitySample[] }) => {
+  const chartData = samples.map(sample => ({
+    time: new Date(sample.timestamp).toLocaleTimeString(),
+    avg_rtt_ms: sample.avg_rtt_ms,
+  }));
+
+  return (
+    <div>
+      <h4 className="text-sm font-medium text-gray-700 mb-2">RTT History (Last 60 min)</h4>
+      {chartData.length > 0 ? (
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={chartData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
+            <YAxis tick={{ fontSize: 10 }} />
+            <Tooltip formatter={(value: number) => formatMs(value)} />
+            <Line
+              type="monotone"
+              dataKey="avg_rtt_ms"
+              name="Avg RTT"
+              stroke="#3b82f6"
+              dot={false}
+              strokeWidth={2}
+            />
+          </LineChart>
+        </ResponsiveContainer>
+      ) : (
+        <p className="text-gray-500 text-center py-4 text-sm">No RTT data available</p>
+      )}
+    </div>
+  );
+};
+
+// Loss rate chart component
+const LossChart = ({ samples }: { samples: QualitySample[] }) => {
+  const chartData = samples.map(sample => ({
+    time: new Date(sample.timestamp).toLocaleTimeString(),
+    loss_rate: sample.loss_rate * 100,
+  }));
+
+  return (
+    <div>
+      <h4 className="text-sm font-medium text-gray-700 mb-2">Packet Loss History (Last 60 min)</h4>
+      {chartData.length > 0 ? (
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={chartData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
+            <YAxis tick={{ fontSize: 10 }} unit="%" />
+            <Tooltip formatter={(value: number) => `${value.toFixed(2)}%`} />
+            <Bar
+              dataKey="loss_rate"
+              name="Loss Rate"
+              fill="#ef4444"
+              radius={[2, 2, 0, 0]}
+            />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <p className="text-gray-500 text-center py-4 text-sm">No loss data available</p>
+      )}
+    </div>
+  );
 };
 
 export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
-  const { data: traffic, isLoading } = useQuery<PortTraffic>(
+  const { data: traffic, isLoading: isLoadingTraffic } = useQuery<PortTraffic>(
     ['portTraffic', port],
     () => getPortTraffic(port),
     {
@@ -30,7 +141,16 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
     }
   );
 
+  const { data: quality, isLoading: isLoadingQuality } = useQuery<PortQualityResponse>(
+    ['portQuality', port],
+    () => getPortQuality(port),
+    {
+      refetchInterval: 5000,
+    }
+  );
+
   const singlePortTraffic = traffic ? [traffic] : [];
+  const isLoading = isLoadingTraffic && isLoadingQuality;
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
@@ -52,71 +172,83 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
         <div className="p-6 overflow-y-auto max-h-[calc(90vh-80px)]">
           {isLoading ? (
             <p className="text-gray-500 text-center py-8">Loading...</p>
-          ) : traffic ? (
+          ) : (
             <div className="space-y-6">
-              {/* Traffic summary */}
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-purple-50 p-4 rounded-lg">
-                  <dt className="text-sm font-medium text-purple-600">Total Bytes In</dt>
-                  <dd className="text-2xl font-semibold text-purple-900">
-                    {formatBytes(traffic.total_bytes_in)}
-                  </dd>
-                </div>
-                <div className="bg-orange-50 p-4 rounded-lg">
-                  <dt className="text-sm font-medium text-orange-600">Total Bytes Out</dt>
-                  <dd className="text-2xl font-semibold text-orange-900">
-                    {formatBytes(traffic.total_bytes_out)}
-                  </dd>
-                </div>
-              </div>
-
-              {/* Traffic chart */}
-              <div>
-                <h3 className="text-lg font-medium text-gray-900 mb-4">Traffic History</h3>
-                <TrafficChart traffic={singlePortTraffic} />
-              </div>
-
-              {/* Recent buckets */}
-              {traffic.buckets.length > 0 && (
+              {/* Quality Summary */}
+              {quality && (
                 <div>
-                  <h3 className="text-lg font-medium text-gray-900 mb-4">Recent Activity</h3>
-                  <div className="bg-gray-50 rounded-lg overflow-hidden">
-                    <table className="min-w-full divide-y divide-gray-200">
-                      <thead className="bg-gray-100">
-                        <tr>
-                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
-                            Time
-                          </th>
-                          <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">
-                            Bytes In
-                          </th>
-                          <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">
-                            Bytes Out
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-200">
-                        {traffic.buckets.slice(-10).reverse().map((bucket, index) => (
-                          <tr key={index} className="bg-white">
-                            <td className="px-4 py-2 text-sm text-gray-900">
-                              {formatTime(bucket.timestamp)}
-                            </td>
-                            <td className="px-4 py-2 text-sm text-gray-500 text-right">
-                              {formatBytes(bucket.bytes_in)}
-                            </td>
-                            <td className="px-4 py-2 text-sm text-gray-500 text-right">
-                              {formatBytes(bucket.bytes_out)}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                  <h3 className="text-lg font-medium text-gray-900 mb-4">Connection Quality</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-gray-50 p-4 rounded-lg flex items-center justify-center">
+                      <QualityGauge score={quality.current.quality_score} />
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="bg-blue-50 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-blue-600">Avg RTT</dt>
+                        <dd className="text-lg font-semibold text-blue-900">
+                          {formatMs(quality.current.avg_rtt_ms)}
+                        </dd>
+                      </div>
+                      <div className="bg-red-50 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-red-600">Loss Rate</dt>
+                        <dd className="text-lg font-semibold text-red-900">
+                          {formatPercent(quality.current.loss_rate)}
+                        </dd>
+                      </div>
+                      <div className="bg-green-50 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-green-600">Min RTT</dt>
+                        <dd className="text-lg font-semibold text-green-900">
+                          {formatMs(quality.current.min_rtt_ms)}
+                        </dd>
+                      </div>
+                      <div className="bg-orange-50 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-orange-600">Max RTT</dt>
+                        <dd className="text-lg font-semibold text-orange-900">
+                          {formatMs(quality.current.max_rtt_ms)}
+                        </dd>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Quality Charts */}
+                  <div className="grid grid-cols-1 gap-4 mt-4">
+                    <div className="bg-gray-50 p-4 rounded-lg">
+                      <RTTChart samples={quality.history} />
+                    </div>
+                    <div className="bg-gray-50 p-4 rounded-lg">
+                      <LossChart samples={quality.history} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Traffic summary */}
+              {traffic && (
+                <div>
+                  <h3 className="text-lg font-medium text-gray-900 mb-4">Traffic Summary</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="bg-purple-50 p-4 rounded-lg">
+                      <dt className="text-sm font-medium text-purple-600">Total Bytes In</dt>
+                      <dd className="text-2xl font-semibold text-purple-900">
+                        {formatBytes(traffic.total_bytes_in)}
+                      </dd>
+                    </div>
+                    <div className="bg-orange-50 p-4 rounded-lg">
+                      <dt className="text-sm font-medium text-orange-600">Total Bytes Out</dt>
+                      <dd className="text-2xl font-semibold text-orange-900">
+                        {formatBytes(traffic.total_bytes_out)}
+                      </dd>
+                    </div>
+                  </div>
+
+                  {/* Traffic chart */}
+                  <div className="mt-4">
+                    <h4 className="text-sm font-medium text-gray-700 mb-2">Traffic History</h4>
+                    <TrafficChart traffic={singlePortTraffic} />
                   </div>
                 </div>
               )}
             </div>
-          ) : (
-            <p className="text-gray-500 text-center py-8">No traffic data available</p>
           )}
         </div>
       </div>
