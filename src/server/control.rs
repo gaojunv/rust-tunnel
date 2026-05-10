@@ -78,8 +78,10 @@ struct ActiveConnection {
 pub struct ServerState {
     /// Map from port to port info (Tunnel or Shadowsocks)
     ports: Arc<Mutex<HashMap<u16, PortInfo>>>,
-    /// Map from connection_id to active connection info
+    /// Map from connection_id to active tunnel connection info
     active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
+    /// Active Shadowsocks connections per port
+    ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Traffic statistics store
     pub traffic_store: TrafficStore,
     /// Database connection (optional)
@@ -96,6 +98,7 @@ impl ServerState {
         Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
             quality_store: QualityStore::new(),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
@@ -108,6 +111,7 @@ impl ServerState {
         Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
             quality_store: QualityStore::with_db(db.clone()),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
@@ -199,10 +203,32 @@ impl ServerState {
     /// Get the number of active connections for a specific port
     pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
         let active_connections = self.active_connections.lock().await;
-        active_connections
+        let tunnel_count = active_connections
             .values()
             .filter(|conn| conn.remote_port == remote_port)
-            .count()
+            .count();
+
+        // Add Shadowsocks connection count if it's an SS port
+        let ss_connections = self.ss_active_connections.lock().await;
+        let ss_count = ss_connections.get(&remote_port).copied().unwrap_or(0);
+
+        tunnel_count + ss_count
+    }
+
+    /// Increment active Shadowsocks connections for a port
+    pub async fn increment_ss_connections(&self, port: u16) {
+        let mut ss_connections = self.ss_active_connections.lock().await;
+        *ss_connections.entry(port).or_insert(0) += 1;
+    }
+
+    /// Decrement active Shadowsocks connections for a port
+    pub async fn decrement_ss_connections(&self, port: u16) {
+        let mut ss_connections = self.ss_active_connections.lock().await;
+        if let Some(count) = ss_connections.get_mut(&port) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
     }
 
     pub async fn remove_active_connection(&self, connection_id: u64) {
