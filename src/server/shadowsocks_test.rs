@@ -181,6 +181,7 @@ mod integration_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Requires ss-local from shadowsocks-libev
     async fn test_ss_echo_aes256gcm_via_ss_local() {
         // 1. echo server
         let (echo_port, echo_handle) = start_echo_server().await;
@@ -218,6 +219,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires ss-local from shadowsocks-libev
     async fn test_ss_chacha20_poly1305_via_ss_local() {
         let (echo_port, echo_handle) = start_echo_server().await;
 
@@ -249,6 +251,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires ss-local from shadowsocks-libev
     async fn test_ss_large_data_transfer() {
         let (echo_port, echo_handle) = start_echo_server().await;
 
@@ -282,6 +285,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires ss-local from shadowsocks-libev
     async fn test_ss_active_connection_count() {
         let (echo_port, echo_handle) = start_echo_server().await;
 

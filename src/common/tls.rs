@@ -249,3 +249,153 @@ pub async fn connect_tls_secure(addr: &str, server_name: &str) -> TunnelResult<t
     debug!("TLS connection established successfully");
     Ok(tls_stream)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_generate_self_signed_cert() {
+        let result = generate_self_signed_cert();
+        assert!(result.is_ok(), "Failed to generate self-signed cert: {:?}", result.err());
+
+        let (cert, key_pair) = result.unwrap();
+
+        // Verify the cert can be serialized to PEM
+        let cert_pem = cert.serialize_pem();
+        assert!(cert_pem.is_ok(), "Failed to serialize cert to PEM");
+
+        // Verify the key can be serialized to PEM
+        let key_pem = key_pair.serialize_pem();
+        assert!(!key_pem.is_empty(), "Key PEM is empty");
+    }
+
+    #[test]
+    fn test_load_or_generate_cert_new_files() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("cert.pem");
+        let key_path = tmp_dir.path().join("key.pem");
+
+        let result = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        );
+        assert!(result.is_ok(), "Failed to generate cert: {:?}", result.err());
+
+        // Verify files were created
+        assert!(cert_path.exists(), "Cert file not created");
+        assert!(key_path.exists(), "Key file not created");
+
+        let cert_pair = result.unwrap();
+        assert!(!cert_pair.certs.is_empty(), "No certificates loaded");
+    }
+
+    #[test]
+    fn test_load_or_generate_cert_existing_files() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("cert.pem");
+        let key_path = tmp_dir.path().join("key.pem");
+
+        // First call generates the files
+        let result1 = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        );
+        assert!(result1.is_ok());
+
+        // Second call should load existing files
+        let result2 = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        );
+        assert!(result2.is_ok(), "Failed to load existing cert: {:?}", result2.err());
+
+        let cert_pair = result2.unwrap();
+        assert!(!cert_pair.certs.is_empty(), "No certificates loaded from existing files");
+    }
+
+    #[test]
+    fn test_load_cert_from_nonexistent_files() {
+        let result = load_cert_from_files(
+            Path::new("/nonexistent/cert.pem"),
+            Path::new("/nonexistent/key.pem"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_cert_from_empty_files() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("cert.pem");
+        let key_path = tmp_dir.path().join("key.pem");
+
+        // Create empty files
+        fs::write(&cert_path, "").unwrap();
+        fs::write(&key_path, "").unwrap();
+
+        let result = load_cert_from_files(&cert_path, &key_path);
+        assert!(result.is_err(), "Should fail loading empty cert files");
+    }
+
+    #[test]
+    fn test_create_server_config() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("cert.pem");
+        let key_path = tmp_dir.path().join("key.pem");
+
+        let cert_pair = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        ).unwrap();
+
+        let result = create_server_config(cert_pair);
+        assert!(result.is_ok(), "Failed to create server config: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_create_insecure_client_config() {
+        let result = create_insecure_client_config();
+        assert!(result.is_ok(), "Failed to create insecure client config: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_load_or_generate_cert_creates_parent_dirs() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("deep").join("nested").join("cert.pem");
+        let key_path = tmp_dir.path().join("deep").join("nested").join("key.pem");
+
+        let result = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        );
+        assert!(result.is_ok(), "Failed to generate cert with nested dirs: {:?}", result.err());
+        assert!(cert_path.exists(), "Cert file not created in nested dir");
+        assert!(key_path.exists(), "Key file not created in nested dir");
+    }
+
+    #[test]
+    fn test_tls_cert_pair_fields() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("cert.pem");
+        let key_path = tmp_dir.path().join("key.pem");
+
+        let cert_pair = load_or_generate_cert(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        ).unwrap();
+
+        // Should have at least one certificate
+        assert!(!cert_pair.certs.is_empty());
+
+        // Key should be valid (non-zero length when serialized)
+        // PrivateKeyDer variants wrap Der<'a> which can be checked via secret_pkcs8_der/secret_pkcs1_der
+        let key_bytes: &[u8] = match &cert_pair.key {
+            PrivateKeyDer::Pkcs8(data) => data.secret_pkcs8_der(),
+            PrivateKeyDer::Pkcs1(data) => data.secret_pkcs1_der(),
+            PrivateKeyDer::Sec1(data) => data.secret_sec1_der(),
+            _ => panic!("Unexpected key type"),
+        };
+        assert!(!key_bytes.is_empty(), "Key data is empty");
+    }
+}

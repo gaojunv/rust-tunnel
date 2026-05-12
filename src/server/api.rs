@@ -318,6 +318,131 @@ mod tests {
         let traffic = cloned.get_port_traffic(8080).await.unwrap();
         assert_eq!(traffic.total_bytes_in, 100);
     }
+
+    #[tokio::test]
+    async fn test_traffic_store_with_db() {
+        let db = Database::new(":memory:").await.unwrap();
+        let store = TrafficStore::with_db(db);
+
+        store.record_bytes_in(8080, 100).await;
+        store.record_bytes_out(8080, 200).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.total_bytes_in, 100);
+        assert_eq!(traffic.total_bytes_out, 200);
+    }
+
+    #[tokio::test]
+    async fn test_traffic_store_load_from_db() {
+        let db = Database::new(":memory:").await.unwrap();
+
+        // Pre-populate database
+        db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
+        db.upsert_port_traffic(9000, 200, 400).await.unwrap();
+
+        // Create store and load from DB
+        let store = TrafficStore::with_db(db);
+        store.load_from_db().await.unwrap();
+
+        let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic_8080.total_bytes_in, 500);
+        assert_eq!(traffic_8080.total_bytes_out, 1000);
+
+        let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
+        assert_eq!(traffic_9000.total_bytes_in, 200);
+        assert_eq!(traffic_9000.total_bytes_out, 400);
+    }
+
+    #[tokio::test]
+    async fn test_traffic_store_bucket_time_truncation() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 100).await;
+        store.record_bytes_in(8080, 50).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        // Both should typically be in the same minute bucket
+        // Total should always be correct regardless
+        assert_eq!(traffic.total_bytes_in, 150);
+        // If both landed in the same bucket, there should be 1 bucket with 150 bytes
+        // If they landed in different buckets (second boundary), there could be 2
+        let total_bucket_bytes: u64 = traffic.buckets.iter().map(|b| b.bytes_in).sum();
+        assert_eq!(total_bucket_bytes, 150);
+    }
+
+    #[tokio::test]
+    async fn test_traffic_store_zero_bytes() {
+        let store = TrafficStore::new();
+        store.record_bytes_in(8080, 0).await;
+
+        let traffic = store.get_port_traffic(8080).await.unwrap();
+        assert_eq!(traffic.total_bytes_in, 0);
+        assert_eq!(traffic.buckets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_health_response() {
+        let response = HealthResponse { status: "ok" };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("ok"));
+    }
+
+    #[test]
+    fn test_login_request_deserialize() {
+        let json = r#"{"password":"secret"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.password, "secret");
+    }
+
+    #[test]
+    fn test_server_metrics_serialize() {
+        let metrics = ServerMetrics {
+            client_count: 5,
+            active_connection_count: 10,
+            total_bytes_in: 1000,
+            total_bytes_out: 2000,
+        };
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(json.contains("client_count"));
+        assert!(json.contains("1000"));
+    }
+
+    #[test]
+    fn test_client_response_serialize() {
+        let response = ClientResponse {
+            port: 8080,
+            hostname: Some("test-host".into()),
+            connection_count: 3,
+            quality: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("8080"));
+        assert!(json.contains("test-host"));
+    }
+
+    #[test]
+    fn test_shadowsocks_config_serialize() {
+        let config = ShadowsocksConfig {
+            enabled: true,
+            port: Some(8388),
+            cipher: Some("aes-256-gcm".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("8388"));
+        assert!(json.contains("aes-256-gcm"));
+    }
+
+    #[test]
+    fn test_shadowsocks_stats_serialize() {
+        let stats = ShadowsocksStats {
+            enabled: true,
+            port: Some(8388),
+            total_bytes_in: 1000,
+            total_bytes_out: 2000,
+            active_connections: 5,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        assert!(json.contains("active_connections"));
+    }
 }
 
 /// API state shared across all handlers
