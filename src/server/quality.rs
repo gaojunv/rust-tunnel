@@ -392,4 +392,294 @@ mod tests {
         let result = store.get_quality(8080).await;
         assert!(result.is_none());
     }
+
+    #[tokio::test]
+    async fn test_quality_store_with_db() {
+        let db = Database::new(":memory:").await.unwrap();
+        let store = QualityStore::with_db(db);
+
+        let quality = ConnectionQuality {
+            last_rtt_ms: 50.0,
+            avg_rtt_ms: 55.0,
+            min_rtt_ms: 30.0,
+            max_rtt_ms: 100.0,
+            loss_rate: 0.01,
+            consecutive_losses: 0,
+            bytes_in_per_sec: 1024.0,
+            bytes_out_per_sec: 2048.0,
+            quality_score: 95,
+            last_update: Utc::now(),
+            is_warning: false,
+            is_critical: false,
+        };
+
+        store.update_quality(8080, quality.clone()).await;
+        let result = store.get_quality(8080).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().avg_rtt_ms, 55.0);
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_add_samples() {
+        let store = QualityStore::new();
+
+        let sample1 = QualitySample {
+            timestamp: Utc::now(),
+            avg_rtt_ms: 50.0,
+            loss_rate: 0.01,
+            bytes_in_per_sec: 1024.0,
+            bytes_out_per_sec: 2048.0,
+            quality_score: 95,
+        };
+        let sample2 = QualitySample {
+            timestamp: Utc::now(),
+            avg_rtt_ms: 60.0,
+            loss_rate: 0.05,
+            bytes_in_per_sec: 512.0,
+            bytes_out_per_sec: 1024.0,
+            quality_score: 85,
+        };
+
+        store.add_sample(8080, sample1).await;
+        store.add_sample(8080, sample2).await;
+
+        let samples = store.get_samples(8080).await;
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].avg_rtt_ms, 50.0);
+        assert_eq!(samples[1].avg_rtt_ms, 60.0);
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_samples_max_60() {
+        let store = QualityStore::new();
+
+        for i in 0..65 {
+            let sample = QualitySample {
+                timestamp: Utc::now(),
+                avg_rtt_ms: i as f32,
+                loss_rate: 0.0,
+                bytes_in_per_sec: 0.0,
+                bytes_out_per_sec: 0.0,
+                quality_score: 100,
+            };
+            store.add_sample(8080, sample).await;
+        }
+
+        let samples = store.get_samples(8080).await;
+        assert_eq!(samples.len(), 60);
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_get_samples_nonexistent_port() {
+        let store = QualityStore::new();
+        let samples = store.get_samples(9999).await;
+        assert!(samples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_remove_nonexistent_port() {
+        let store = QualityStore::new();
+        // Should not panic
+        store.remove_port(9999).await;
+    }
+
+    #[test]
+    fn test_quality_tracker_rtt_stats() {
+        let mut tracker = QualityTracker::default();
+
+        tracker.record_rtt(10.0);
+        tracker.record_rtt(20.0);
+        tracker.record_rtt(30.0);
+        tracker.record_rtt(40.0);
+        tracker.record_rtt(50.0);
+
+        assert_eq!(tracker.get_avg_rtt(), 30.0);
+        assert_eq!(tracker.get_min_rtt(), 10.0);
+        assert_eq!(tracker.get_max_rtt(), 50.0);
+    }
+
+    #[test]
+    fn test_quality_tracker_rtt_max_samples() {
+        let mut tracker = QualityTracker::default();
+
+        for i in 0..25 {
+            tracker.record_rtt(i as f32);
+        }
+
+        // Should only keep last 20 samples
+        assert_eq!(tracker.get_avg_rtt(), (5..25).map(|i| i as f32).sum::<f32>() / 20.0);
+    }
+
+    #[test]
+    fn test_quality_tracker_empty_rtt() {
+        let tracker = QualityTracker::default();
+        assert_eq!(tracker.get_avg_rtt(), 0.0);
+        assert_eq!(tracker.get_min_rtt(), f32::MAX);
+        assert_eq!(tracker.get_max_rtt(), 0.0);
+    }
+
+    #[test]
+    fn test_quality_tracker_packet_loss_calculation() {
+        let mut tracker = QualityTracker::default();
+
+        // seq 1: expected 1, no loss
+        let (lost, loss_rate) = tracker.record_ping(1);
+        assert_eq!(lost, 0);
+        assert_eq!(loss_rate, 0.0);
+
+        // seq 2: expected 2, no loss
+        let (lost, loss_rate) = tracker.record_ping(2);
+        assert_eq!(lost, 0);
+        assert_eq!(loss_rate, 0.0);
+
+        // seq 5: expected 3, lost 2 packets (3, 4)
+        let (lost, loss_rate) = tracker.record_ping(5);
+        assert_eq!(lost, 2);
+        assert!(loss_rate > 0.0);
+    }
+
+    #[test]
+    fn test_quality_tracker_seq_reset_mid_range() {
+        let mut tracker = QualityTracker::default();
+        tracker.record_ping(10);
+        tracker.record_ping(11);
+
+        // seq 5 - within 5 of expected (12), should NOT trigger reset
+        let (lost, _) = tracker.record_ping(5);
+        // 5 < 12, and 12 - 5 = 7 > 5, so this triggers reset
+        // Actually let me re-read the logic: seq < expected_seq && (seq <= 2 || expected_seq - seq > 5)
+        // seq = 5, expected = 12, 5 < 12 is true, (5 <= 2 is false, 12-5=7 > 5 is true) -> reset
+        assert_eq!(lost, 0); // After reset, no loss
+    }
+
+    #[test]
+    fn test_connection_quality_default() {
+        let quality = ConnectionQuality::default();
+        assert_eq!(quality.last_rtt_ms, 0.0);
+        assert_eq!(quality.avg_rtt_ms, 0.0);
+        assert_eq!(quality.min_rtt_ms, f32::MAX);
+        assert_eq!(quality.max_rtt_ms, 0.0);
+        assert_eq!(quality.loss_rate, 0.0);
+        assert_eq!(quality.consecutive_losses, 0);
+        assert_eq!(quality.bytes_in_per_sec, 0.0);
+        assert_eq!(quality.bytes_out_per_sec, 0.0);
+        assert_eq!(quality.quality_score, 100);
+        assert!(!quality.is_warning);
+        assert!(!quality.is_critical);
+    }
+
+    #[test]
+    fn test_quality_thresholds_default() {
+        let thresholds = QualityThresholds::default();
+        assert_eq!(thresholds.warning_rtt_ms, 200.0);
+        assert_eq!(thresholds.critical_rtt_ms, 500.0);
+        assert!((thresholds.warning_loss_rate - 0.05).abs() < f32::EPSILON);
+        assert!((thresholds.critical_loss_rate - 0.15).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_calculate_quality_score_boundary() {
+        // At exactly 500ms, penalty = 500/500*30 = 30
+        let score = calculate_quality_score(500.0, 0.0);
+        assert_eq!(score, 70);
+
+        // At exactly 0 loss and 0 RTT, score = 100
+        let score = calculate_quality_score(0.0, 0.0);
+        assert_eq!(score, 100);
+    }
+
+    #[test]
+    fn test_check_warnings_boundary() {
+        let thresholds = QualityThresholds::default();
+
+        // Exactly at warning RTT boundary
+        let (is_warning, is_critical) = check_warnings(200.0, 0.0, &thresholds);
+        assert!(is_warning);
+        assert!(!is_critical);
+
+        // Exactly at critical RTT boundary
+        let (is_warning, is_critical) = check_warnings(500.0, 0.0, &thresholds);
+        assert!(!is_warning);
+        assert!(is_critical);
+
+        // Just below warning RTT
+        let (is_warning, is_critical) = check_warnings(199.9, 0.0, &thresholds);
+        assert!(!is_warning);
+        assert!(!is_critical);
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_load_from_db() {
+        let db = Database::new(":memory:").await.unwrap();
+
+        // Pre-populate with quality history
+        let now = Utc::now();
+        db.insert_quality_history(
+            8080,
+            now,
+            50.0,
+            30.0,
+            100.0,
+            0.02,
+            1024.0,
+            2048.0,
+            95,
+            false,
+            false,
+        ).await.unwrap();
+
+        let store = QualityStore::with_db(db);
+        store.load_from_db().await.unwrap();
+
+        let samples = store.get_samples(8080).await;
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].avg_rtt_ms, 50.0);
+    }
+
+    #[tokio::test]
+    async fn test_quality_store_add_sample_persists_to_db() {
+        let db = Database::new(":memory:").await.unwrap();
+        let store = QualityStore::with_db(db.clone());
+
+        let sample = QualitySample {
+            timestamp: Utc::now(),
+            avg_rtt_ms: 45.0,
+            loss_rate: 0.01,
+            bytes_in_per_sec: 1024.0,
+            bytes_out_per_sec: 2048.0,
+            quality_score: 95,
+        };
+
+        store.add_sample(8080, sample).await;
+
+        // Give DB a moment to persist
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify data was persisted
+        let ports = db.get_quality_ports(24).await.unwrap();
+        assert!(ports.contains(&8080));
+    }
+
+    #[test]
+    fn test_quality_sample_clone() {
+        let sample = QualitySample {
+            timestamp: Utc::now(),
+            avg_rtt_ms: 50.0,
+            loss_rate: 0.02,
+            bytes_in_per_sec: 1024.0,
+            bytes_out_per_sec: 2048.0,
+            quality_score: 95,
+        };
+        let cloned = sample.clone();
+        assert_eq!(sample.avg_rtt_ms, cloned.avg_rtt_ms);
+        assert_eq!(sample.loss_rate, cloned.loss_rate);
+        assert_eq!(sample.quality_score, cloned.quality_score);
+    }
+
+    #[test]
+    fn test_connection_quality_serialize() {
+        let quality = ConnectionQuality::default();
+        let json = serde_json::to_string(&quality);
+        assert!(json.is_ok());
+    }
 }

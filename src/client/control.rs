@@ -236,3 +236,176 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
     warn!("Control connection terminated");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ForwardRule;
+    use crate::common::ControlMessage;
+
+    fn create_test_state() -> ClientState {
+        let config = ClientConfig {
+            server: "localhost:8080".to_string(),
+            forwards: vec!["8080:localhost:80".to_string()],
+            auth_token: None,
+            tls: false,
+            tls_server_name: None,
+            tls_insecure: true,
+            log: "info".to_string(),
+        };
+        let (sender, _) = mpsc::channel(32);
+        let forwards = vec![ForwardRule {
+            remote_port: 8080,
+            local_addr: "localhost:80".to_string(),
+        }];
+        ClientState::new(config, sender, forwards)
+    }
+
+    #[tokio::test]
+    async fn test_client_state_add_and_remove_connection() {
+        let state = create_test_state();
+
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        state.add_connection(42, mock_writer).await;
+
+        // Connection should exist - verify by trying to deliver data
+        let result = state.deliver_data(42, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+
+        state.remove_connection(42).await;
+
+        // After removal, deliver_data should still return Ok (just no-op)
+        let result = state.deliver_data(42, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_client_state_deliver_data_nonexistent() {
+        let state = create_test_state();
+
+        // Delivering to a non-existent connection should return Ok (no-op)
+        let result = state.deliver_data(9999, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_client_state_close_connection() {
+        let state = create_test_state();
+
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        state.add_connection(42, mock_writer).await;
+
+        state.close_connection(42).await;
+
+        // After close, deliver_data should return Ok (no-op)
+        let result = state.deliver_data(42, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_client_state_close_nonexistent_connection() {
+        let state = create_test_state();
+        // Should not panic
+        state.close_connection(9999).await;
+    }
+
+    #[tokio::test]
+    async fn test_client_state_clone() {
+        let state = create_test_state();
+        let cloned = state.clone();
+
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        cloned.add_connection(100, mock_writer).await;
+
+        // Should be visible from original (shared state)
+        let result = state.deliver_data(100, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_client_state_multiple_connections() {
+        let state = create_test_state();
+
+        for i in 0..5 {
+            let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+            state.add_connection(i, mock_writer).await;
+        }
+
+        // All should be deliverable
+        for i in 0..5 {
+            let result = state.deliver_data(i, vec![1]).await;
+            assert!(result.is_ok());
+        }
+
+        // Remove one
+        state.remove_connection(2).await;
+        let result = state.deliver_data(2, vec![1]).await;
+        assert!(result.is_ok()); // Returns Ok but no-op
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_close() {
+        let state = create_test_state();
+
+        // Simulate server sending Close message
+        let mut buffer = Vec::new();
+        ControlMessage::Close { connection_id: 42 }
+            .write_to_stream(&mut buffer)
+            .await
+            .unwrap();
+
+        // Add connection first so close has something to close
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        state.add_connection(42, mock_writer).await;
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state.clone()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_disconnect() {
+        let state = create_test_state();
+
+        let mut buffer = Vec::new();
+        ControlMessage::Disconnect
+            .write_to_stream(&mut buffer)
+            .await
+            .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TunnelError::Protocol(msg) => assert!(msg.contains("disconnect")),
+            _ => panic!("Expected Protocol error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_eof() {
+        let state = create_test_state();
+        let mut reader = &[] as &[u8];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_pong() {
+        let state = create_test_state();
+
+        let mut buffer = Vec::new();
+        ControlMessage::Pong {
+            seq: 1,
+            ping_timestamp_micros: 1000,
+            pong_timestamp_micros: 2000,
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+    }
+}

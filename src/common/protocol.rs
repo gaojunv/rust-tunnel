@@ -196,4 +196,183 @@ mod tests {
         msg.write_to_split(&mut buffer).await.unwrap();
         assert!(!buffer.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_roundtrip_all_message_types() {
+        let messages = vec![
+            ControlMessage::Register {
+                remote_port: 8080,
+                hostname: Some("test-host".into()),
+                auth_token: Some("token".into()),
+            },
+            ControlMessage::RegisterResponse {
+                success: true,
+                message: "ok".into(),
+            },
+            ControlMessage::RegisterResponse {
+                success: false,
+                message: "port in use".into(),
+            },
+            ControlMessage::NewConnection {
+                connection_id: 12345,
+                remote_port: 9000,
+            },
+            ControlMessage::ConnectionReady {
+                connection_id: 12345,
+            },
+            ControlMessage::Data {
+                connection_id: 12345,
+                data: vec![1, 2, 3, 4],
+            },
+            ControlMessage::Data {
+                connection_id: 0,
+                data: vec![],
+            },
+            ControlMessage::Close {
+                connection_id: 12345,
+            },
+            ControlMessage::Ping {
+                seq: 42,
+                timestamp_micros: 123456789,
+            },
+            ControlMessage::Pong {
+                seq: 42,
+                ping_timestamp_micros: 123456789,
+                pong_timestamp_micros: 123456795,
+            },
+            ControlMessage::Disconnect,
+        ];
+
+        for msg in messages {
+            let mut buffer = Vec::new();
+            msg.write_to_stream(&mut buffer).await.unwrap();
+
+            let mut reader = &buffer[..];
+            let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap();
+            assert!(read_msg.is_some(), "Failed to roundtrip {:?}", msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_messages_on_stream() {
+        let mut buffer = Vec::new();
+
+        let msg1 = ControlMessage::Register {
+            remote_port: 8080,
+            hostname: None,
+            auth_token: None,
+        };
+        let msg2 = ControlMessage::RegisterResponse {
+            success: true,
+            message: "ok".into(),
+        };
+        let msg3 = ControlMessage::Ping {
+            seq: 1,
+            timestamp_micros: 100,
+        };
+
+        msg1.write_to_stream(&mut buffer).await.unwrap();
+        msg2.write_to_stream(&mut buffer).await.unwrap();
+        msg3.write_to_stream(&mut buffer).await.unwrap();
+
+        let mut reader = &buffer[..];
+        let r1 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+        let r2 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+        let r3 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+        let r4 = ControlMessage::read_from_stream(&mut reader).await.unwrap();
+
+        assert!(matches!(r1, ControlMessage::Register { .. }));
+        assert!(matches!(r2, ControlMessage::RegisterResponse { .. }));
+        assert!(matches!(r3, ControlMessage::Ping { .. }));
+        assert!(r4.is_none()); // No more messages
+    }
+
+    #[tokio::test]
+    async fn test_large_data_message() {
+        let large_data = vec![0xAB; 100_000]; // 100KB
+        let msg = ControlMessage::Data {
+            connection_id: 1,
+            data: large_data.clone(),
+        };
+
+        let mut buffer = Vec::new();
+        msg.write_to_stream(&mut buffer).await.unwrap();
+
+        let mut reader = &buffer[..];
+        let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+
+        match read_msg {
+            ControlMessage::Data { connection_id, data } => {
+                assert_eq!(connection_id, 1);
+                assert_eq!(data, large_data);
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_length_prefix_correct() {
+        let msg = ControlMessage::Disconnect;
+        let bytes = msg.serialize().unwrap();
+
+        // Length prefix should match payload length
+        let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        assert_eq!(len, bytes.len() - 4);
+    }
+
+    #[test]
+    fn test_serialize_register_with_all_fields() {
+        let msg = ControlMessage::Register {
+            remote_port: 65535,
+            hostname: Some("a-very-long-hostname-with-special-chars-!@#$%".into()),
+            auth_token: Some("bearer-token-12345".into()),
+        };
+        let bytes = msg.serialize().unwrap();
+        assert!(bytes.len() > 4);
+
+        // Verify deserialization works
+        let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let payload = &bytes[4..4 + len];
+        let deserialized: ControlMessage = bincode::deserialize(payload).unwrap();
+        assert!(matches!(deserialized, ControlMessage::Register { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_read_from_stream_corrupted_length() {
+        // Create a message with length prefix pointing to more data than available
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&100000u32.to_be_bytes()); // Claims 100KB payload
+        buffer.extend_from_slice(&[1, 2, 3]); // Only 3 bytes
+
+        let mut reader = &buffer[..];
+        let result = ControlMessage::read_from_stream(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_from_stream_zero_length() {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&0u32.to_be_bytes()); // 0 length
+
+        let mut reader = &buffer[..];
+        let result = ControlMessage::read_from_stream(&mut reader).await;
+        // Zero length means empty payload, bincode may fail to deserialize
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_message_clone() {
+        let msg = ControlMessage::Data {
+            connection_id: 42,
+            data: vec![1, 2, 3],
+        };
+        let cloned = msg.clone();
+        match cloned {
+            ControlMessage::Data { connection_id, data } => {
+                assert_eq!(connection_id, 42);
+                assert_eq!(data, vec![1, 2, 3]);
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
 }
