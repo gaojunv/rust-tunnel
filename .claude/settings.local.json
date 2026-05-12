@@ -50,7 +50,10 @@
       "Bash(./target/debug/rust-tunnel-server --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000 --log info)",
       "Bash(./target/debug/rust-tunnel-client --server localhost:8080 --forward 9000:localhost:22 --log info)",
       "Bash(python3 -m json.tool)",
-      "Bash(./target/debug/rust-tunnel-server --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000 --log debug)"
+      "Bash(./target/debug/rust-tunnel-server --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000 --log debug)",
+      "Bash(pkill -9 -f rust-tunnel)",
+      "Bash(pkill -9 -f \"python3 -m http.server\")",
+      "Bash(pkill -9 -f curl)"
     ]
   }
 }
