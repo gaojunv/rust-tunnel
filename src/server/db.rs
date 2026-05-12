@@ -213,6 +213,65 @@ impl Database {
         Ok(())
     }
 
+    /// Set port traffic aggregate to absolute values (replaces, does not increment).
+    /// Used by the periodic batch flush which writes the in-memory snapshot.
+    pub async fn replace_port_traffic(
+        &self,
+        port: u16,
+        total_bytes_in: u64,
+        total_bytes_out: u64,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO port_traffic (port, total_bytes_in, total_bytes_out, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(port) DO UPDATE SET
+                total_bytes_in = excluded.total_bytes_in,
+                total_bytes_out = excluded.total_bytes_out,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(port as i32)
+        .bind(total_bytes_in as i64)
+        .bind(total_bytes_out as i64)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Set traffic bucket to absolute values (replaces, does not increment).
+    /// Used by the periodic batch flush which writes the in-memory snapshot.
+    pub async fn replace_traffic_bucket(
+        &self,
+        port: u16,
+        timestamp: DateTime<Utc>,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO traffic_buckets (port, timestamp, bytes_in, bytes_out)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(port, timestamp) DO UPDATE SET
+                bytes_in = excluded.bytes_in,
+                bytes_out = excluded.bytes_out
+            "#,
+        )
+        .bind(port as i32)
+        .bind(timestamp)
+        .bind(bytes_in as i64)
+        .bind(bytes_out as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Record client connection
     pub async fn record_client_connect(&self, port: u16, hostname: Option<String>) -> Result<(), sqlx::Error> {
         let now = Utc::now();
