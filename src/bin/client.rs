@@ -25,9 +25,12 @@ async fn main() -> TunnelResult<()> {
         match control::run_client(config.clone(), forwards.clone()).await {
             Ok(()) => {
                 tracing::warn!("Control connection closed.");
+                // Connection was established successfully before dropping — reset backoff
+                backoff_secs = INITIAL_BACKOFF_SECS;
             }
             Err(e) => {
                 tracing::warn!("Connection error: {}.", e);
+                // Connection never established — backoff will keep doubling
             }
         }
 
@@ -42,11 +45,5 @@ async fn main() -> TunnelResult<()> {
                 return Ok(());
             }
         }
-
-        // After a successful reconnection, reset backoff for next disconnect
-        // This is tracked by observing whether run_client ran for a meaningful time:
-        // if the next run_client succeeds and stays connected, the backoff value
-        // set here will be overwritten by the reset after that connection ends.
-        backoff_secs = INITIAL_BACKOFF_SECS;
     }
 }
