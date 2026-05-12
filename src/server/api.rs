@@ -47,6 +47,8 @@ pub struct PortTraffic {
 pub struct TrafficStore {
     inner: Arc<Mutex<std::collections::HashMap<u16, PortTraffic>>>,
     db: Option<Database>,
+    /// Ports that have been updated since the last DB flush
+    dirty_ports: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
 }
 
 impl TrafficStore {
@@ -55,6 +57,7 @@ impl TrafficStore {
         Self {
             inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db: None,
+            dirty_ports: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -63,6 +66,7 @@ impl TrafficStore {
         Self {
             inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db: Some(db),
+            dirty_ports: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -111,7 +115,6 @@ impl TrafficStore {
 
     /// Record incoming bytes (from user to server)
     pub async fn record_bytes_in(&self, port: u16, bytes: u64) {
-        let bucket_time;
         {
             let mut store = self.inner.lock().await;
             let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
@@ -121,22 +124,16 @@ impl TrafficStore {
                 buckets: VecDeque::new(),
             });
             port_traffic.total_bytes_in += bytes;
-            bucket_time = Self::add_to_bucket(port_traffic, bytes, 0);
+            Self::add_to_bucket(port_traffic, bytes, 0);
         }
-
-        // Persist to database asynchronously
-        if let Some(db) = &self.db {
-            let db = db.clone();
-            tokio::spawn(async move {
-                let _ = db.upsert_port_traffic(port, bytes, 0).await;
-                let _ = db.upsert_traffic_bucket(port, bucket_time, bytes, 0).await;
-            });
+        // Mark port as dirty for periodic batch flush (no immediate DB write)
+        if let Ok(mut dirty) = self.dirty_ports.lock() {
+            dirty.insert(port);
         }
     }
 
     /// Record outgoing bytes (from server to user)
     pub async fn record_bytes_out(&self, port: u16, bytes: u64) {
-        let bucket_time;
         {
             let mut store = self.inner.lock().await;
             let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
@@ -146,17 +143,67 @@ impl TrafficStore {
                 buckets: VecDeque::new(),
             });
             port_traffic.total_bytes_out += bytes;
-            bucket_time = Self::add_to_bucket(port_traffic, 0, bytes);
+            Self::add_to_bucket(port_traffic, 0, bytes);
+        }
+        // Mark port as dirty for periodic batch flush
+        if let Ok(mut dirty) = self.dirty_ports.lock() {
+            dirty.insert(port);
+        }
+    }
+
+    /// Flush dirty traffic data to the database.
+    /// Called periodically by the background flush task and on graceful shutdown.
+    pub async fn flush_to_db(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = match &self.db {
+            Some(db) => db.clone(),
+            None => return Ok(()),
+        };
+
+        // Atomically take the set of dirty ports
+        let dirty_ports: std::collections::HashSet<u16> = {
+            let mut dirty = self.dirty_ports.lock().unwrap();
+            std::mem::take(&mut *dirty)
+        };
+
+        if dirty_ports.is_empty() {
+            return Ok(());
         }
 
-        // Persist to database asynchronously
-        if let Some(db) = &self.db {
-            let db = db.clone();
-            tokio::spawn(async move {
-                let _ = db.upsert_port_traffic(port, 0, bytes).await;
-                let _ = db.upsert_traffic_bucket(port, bucket_time, 0, bytes).await;
-            });
+        // Snapshot in-memory data for dirty ports (brief lock)
+        let snapshots: Vec<(u16, PortTraffic)> = {
+            let store = self.inner.lock().await;
+            dirty_ports.iter()
+                .filter_map(|&port| store.get(&port).map(|pt| (port, pt.clone())))
+                .collect()
+        };
+
+        // Write snapshots to DB without holding the in-memory lock
+        for (port, port_traffic) in snapshots {
+            if let Err(e) = db.replace_port_traffic(port, port_traffic.total_bytes_in, port_traffic.total_bytes_out).await {
+                tracing::warn!("Failed to flush port_traffic for port {}: {}", port, e);
+            }
+            for bucket in &port_traffic.buckets {
+                if let Err(e) = db.replace_traffic_bucket(port, bucket.timestamp, bucket.bytes_in, bucket.bytes_out).await {
+                    tracing::warn!("Failed to flush traffic_bucket for port {}: {}", port, e);
+                }
+            }
         }
+
+        Ok(())
+    }
+
+    /// Start the background task that periodically flushes traffic data to the database.
+    pub fn start_flush_task(&self) {
+        let store = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = store.flush_to_db().await {
+                    tracing::warn!("Failed to flush traffic data to DB: {}", e);
+                }
+            }
+        });
     }
 
     fn add_to_bucket(port_traffic: &mut PortTraffic, bytes_in: u64, bytes_out: u64) -> DateTime<Utc> {

@@ -13,10 +13,17 @@ use crate::client::{ClientConfig, proxy};
 /// Type alias for the control message sender
 pub type ControlSender = mpsc::Sender<ControlMessage>;
 
-/// Information about an active local connection
+/// State of a local connection being established
+enum LocalConnectionState {
+    /// Waiting for local connection to be established; incoming data is buffered
+    Pending(Vec<Vec<u8>>),
+    /// Active connection with a writer to the local service
+    Active(Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>),
+}
+
+/// Information about a local connection (pending or active)
 struct ActiveLocalConnection {
-    /// Local TCP stream writer half connected to target service
-    local_writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    state: LocalConnectionState,
 }
 
 /// Client state shared between all tasks
@@ -39,11 +46,43 @@ impl ClientState {
         }
     }
 
-    pub async fn add_connection(&self, connection_id: u64, stream: Box<dyn AsyncWrite + Unpin + Send>) {
+    pub async fn add_pending_connection(&self, connection_id: u64) {
         let mut conns = self.active_connections.lock().await;
         conns.insert(connection_id, ActiveLocalConnection {
-            local_writer: Arc::new(Mutex::new(stream)),
+            state: LocalConnectionState::Pending(Vec::new()),
         });
+    }
+
+    /// Transition a pending connection to active, flushing any buffered data.
+    /// Returns false if the connection was removed (e.g., Close received while connecting).
+    pub async fn activate_connection(&self, connection_id: u64, stream: Box<dyn AsyncWrite + Unpin + Send>) -> bool {
+        let mut conns = self.active_connections.lock().await;
+        match conns.get_mut(&connection_id) {
+            Some(conn) => {
+                match std::mem::replace(&mut conn.state, LocalConnectionState::Active(Arc::new(Mutex::new(stream)))) {
+                    LocalConnectionState::Pending(buffered) => {
+                        if !buffered.is_empty() {
+                            if let LocalConnectionState::Active(writer) = &conn.state {
+                                let mut writer = writer.lock().await;
+                                for data in buffered {
+                                    let _ = writer.write_all(&data).await;
+                                }
+                                let _ = writer.flush().await;
+                            }
+                        }
+                        true
+                    }
+                    LocalConnectionState::Active(_) => {
+                        debug!("Connection {} already active, ignoring duplicate activation", connection_id);
+                        false
+                    }
+                }
+            }
+            None => {
+                debug!("Connection {} not found during activation (may have been closed)", connection_id);
+                false
+            }
+        }
     }
 
     pub async fn remove_connection(&self, connection_id: u64) {
@@ -52,12 +91,20 @@ impl ClientState {
     }
 
     pub async fn deliver_data(&self, connection_id: u64, data: Vec<u8>) -> TunnelResult<()> {
-        let conns = self.active_connections.lock().await;
-        if let Some(conn) = conns.get(&connection_id) {
-            let mut writer = conn.local_writer.lock().await;
-            writer.write_all(&data).await?;
-            writer.flush().await?;
-            Ok(())
+        let mut conns = self.active_connections.lock().await;
+        if let Some(conn) = conns.get_mut(&connection_id) {
+            match &mut conn.state {
+                LocalConnectionState::Pending(buffer) => {
+                    buffer.push(data);
+                    Ok(())
+                }
+                LocalConnectionState::Active(writer) => {
+                    let mut writer = writer.lock().await;
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                    Ok(())
+                }
+            }
         } else {
             debug!("No active local connection found for id {}", connection_id);
             Ok(())
@@ -109,6 +156,8 @@ async fn process_control_messages<R: AsyncRead + Unpin>(reader: &mut R, state: C
                     }
                     ControlMessage::NewConnection { connection_id, remote_port } => {
                         info!("New connection request id {} for remote port {}", connection_id, remote_port);
+                        // Pre-register as pending so Data messages are buffered instead of dropped
+                        state.add_pending_connection(connection_id).await;
                         let state_clone = state.clone();
                         tokio::spawn(async move {
                             if let Err(e) = proxy::handle_new_connection(state_clone, connection_id, remote_port).await {
@@ -265,8 +314,9 @@ mod tests {
     async fn test_client_state_add_and_remove_connection() {
         let state = create_test_state();
 
+        state.add_pending_connection(42).await;
         let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-        state.add_connection(42, mock_writer).await;
+        assert!(state.activate_connection(42, mock_writer).await);
 
         // Connection should exist - verify by trying to deliver data
         let result = state.deliver_data(42, vec![1, 2, 3]).await;
@@ -292,8 +342,9 @@ mod tests {
     async fn test_client_state_close_connection() {
         let state = create_test_state();
 
+        state.add_pending_connection(42).await;
         let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-        state.add_connection(42, mock_writer).await;
+        assert!(state.activate_connection(42, mock_writer).await);
 
         state.close_connection(42).await;
 
@@ -314,8 +365,9 @@ mod tests {
         let state = create_test_state();
         let cloned = state.clone();
 
+        cloned.add_pending_connection(100).await;
         let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-        cloned.add_connection(100, mock_writer).await;
+        assert!(cloned.activate_connection(100, mock_writer).await);
 
         // Should be visible from original (shared state)
         let result = state.deliver_data(100, vec![1, 2, 3]).await;
@@ -327,8 +379,9 @@ mod tests {
         let state = create_test_state();
 
         for i in 0..5 {
+            state.add_pending_connection(i).await;
             let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-            state.add_connection(i, mock_writer).await;
+            assert!(state.activate_connection(i, mock_writer).await);
         }
 
         // All should be deliverable
@@ -344,6 +397,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pending_connection_buffers_data() {
+        let state = create_test_state();
+
+        // Add pending connection
+        state.add_pending_connection(42).await;
+
+        // Deliver data while pending - should buffer, not error
+        let result = state.deliver_data(42, vec![1, 2, 3]).await;
+        assert!(result.is_ok());
+        let result = state.deliver_data(42, vec![4, 5, 6]).await;
+        assert!(result.is_ok());
+
+        // Activate - buffered data should be flushed
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        assert!(state.activate_connection(42, mock_writer).await);
+
+        // Now data should go directly to writer
+        let result = state.deliver_data(42, vec![7, 8, 9]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_activate_removed_connection() {
+        let state = create_test_state();
+
+        state.add_pending_connection(42).await;
+        state.remove_connection(42).await;
+
+        let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
+        assert!(!state.activate_connection(42, mock_writer).await);
+    }
+
+    #[tokio::test]
     async fn test_process_control_messages_close() {
         let state = create_test_state();
 
@@ -355,8 +441,9 @@ mod tests {
             .unwrap();
 
         // Add connection first so close has something to close
+        state.add_pending_connection(42).await;
         let mock_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-        state.add_connection(42, mock_writer).await;
+        assert!(state.activate_connection(42, mock_writer).await);
 
         let mut reader = &buffer[..];
         let result = process_control_messages(&mut reader, state.clone()).await;

@@ -13,6 +13,7 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         Some(r) => &r.local_addr,
         None => {
             warn!("No forward rule found for remote port {}", remote_port);
+            state.remove_connection(connection_id).await;
             let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
             return Err(TunnelError::Config(format!("No forward rule for remote port {}", remote_port)));
         }
@@ -28,22 +29,28 @@ pub async fn handle_new_connection(state: ClientState, connection_id: u64, remot
         }
         Err(e) => {
             warn!("Failed to connect to local target {}: {}", local_addr, e);
+            state.remove_connection(connection_id).await;
             let _ = state.control_sender.send(ControlMessage::Close { connection_id }).await;
             return Err(e.into());
         }
     };
-
-    // Notify server we're ready
-    state.control_sender.send(ControlMessage::ConnectionReady { connection_id }).await
-        .map_err(|_| TunnelError::Protocol("Failed to send connection ready".into()))?;
 
     // Split stream: reading in this task, writing done by control loop
     let (mut local_reader, local_writer) = tokio::io::split(local_stream);
     // Box the writer for trait object
     let boxed_writer: Box<dyn AsyncWrite + Unpin + Send> = Box::new(local_writer);
 
-    // Add to active connections so data from server can be delivered
-    state.add_connection(connection_id, boxed_writer).await;
+    // Activate the pending connection (flushes any buffered data received
+    // while we were connecting). If activation fails, the connection was
+    // closed while we were connecting.
+    if !state.activate_connection(connection_id, boxed_writer).await {
+        debug!("Connection {} was closed while connecting to local target", connection_id);
+        return Ok(());
+    }
+
+    // Notify server we're ready
+    state.control_sender.send(ControlMessage::ConnectionReady { connection_id }).await
+        .map_err(|_| TunnelError::Protocol("Failed to send connection ready".into()))?;
 
     let mut buf = vec![0u8; 8192];
 

@@ -71,9 +71,17 @@ async fn main() -> TunnelResult<()> {
         }
     });
 
+    // Start periodic DB flush for traffic data (every 30 seconds)
+    state.traffic_store.start_flush_task();
+
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down...");
+
+    // Final flush of traffic data to ensure persistence
+    if let Err(e) = state.traffic_store.flush_to_db().await {
+        tracing::warn!("Failed to flush traffic data during shutdown: {}", e);
+    }
 
     Ok(())
 }
