@@ -5,7 +5,7 @@
 control_addr = "0.0.0.0:8080"
 
 # API/前端监听地址
-api_addr = "0.0.0.0:3000"
+api_addr = "0.0.0.0:8081"
 
 # Web 管理界面密码 (部署时替换)
 admin_password = "${ADMIN_PASSWORD}"
