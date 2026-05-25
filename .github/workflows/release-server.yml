@@ -58,27 +58,17 @@ jobs:
             -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
             contrib/config.toml.template > config.toml
 
-      - name: Deploy binary to remote server
+      - name: Deploy files to remote server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
-          source: "./rust-tunnel-server"
+          source: "./rust-tunnel-server,./contrib/rust-tunnel-server.service,./config.toml"
           target: ${{ secrets.DEPLOY_PATH }}
 
-      - name: Deploy config to remote server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          port: ${{ secrets.SERVER_PORT }}
-          source: "./config.toml"
-          target: "/tmp/rust-tunnel-deploy"
-
-      - name: Deploy service file and restart
+      - name: Install config, service and restart
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -88,8 +78,7 @@ jobs:
           script: |
             # 安装配置文件
             sudo mkdir -p /etc/rust-tunnel
-            sudo cp /tmp/rust-tunnel-deploy/config.toml /etc/rust-tunnel/config.toml
-            rm -f /tmp/rust-tunnel-deploy/config.toml
+            sudo cp ${{ secrets.DEPLOY_PATH }}/config.toml /etc/rust-tunnel/config.toml
 
             # 安装 systemd service 文件
             sudo cp ${{ secrets.DEPLOY_PATH }}/contrib/rust-tunnel-server.service /etc/systemd/system/rust-tunnel-server.service
