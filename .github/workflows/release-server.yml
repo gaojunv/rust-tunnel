@@ -50,7 +50,15 @@ jobs:
         run: |
           cp target/x86_64-unknown-linux-musl/release/rust-tunnel-server ./
 
-      - name: Deploy to remote server via SSH
+      - name: Generate config from template
+        run: |
+          sed \
+            -e "s|\${ADMIN_PASSWORD}|${{ secrets.ADMIN_PASSWORD }}|g" \
+            -e "s|\${CLIENT_AUTH_TOKEN}|${{ secrets.CLIENT_AUTH_TOKEN }}|g" \
+            -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
+            contrib/config.toml.template > config.toml
+
+      - name: Deploy binary to remote server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -60,7 +68,17 @@ jobs:
           source: "./rust-tunnel-server"
           target: ${{ secrets.DEPLOY_PATH }}
 
-      - name: Restart service on remote server
+      - name: Deploy config to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: "./config.toml"
+          target: "/tmp/rust-tunnel-deploy"
+
+      - name: Deploy service file and restart
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
@@ -68,7 +86,14 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
           script: |
-            cd ${{ secrets.DEPLOY_PATH }}
-            # 重启 systemd 服务，如果使用 systemd 管理的话
-            # 如果不用 systemd，可以改成自己的重启命令
+            # 安装配置文件
+            sudo mkdir -p /etc/rust-tunnel
+            sudo cp /tmp/rust-tunnel-deploy/config.toml /etc/rust-tunnel/config.toml
+            rm -f /tmp/rust-tunnel-deploy/config.toml
+
+            # 安装 systemd service 文件
+            sudo cp ${{ secrets.DEPLOY_PATH }}/contrib/rust-tunnel-server.service /etc/systemd/system/rust-tunnel-server.service
+            sudo systemctl daemon-reload
+
+            # 重启服务
             sudo systemctl restart rust-tunnel-server
