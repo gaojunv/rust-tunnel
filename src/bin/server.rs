@@ -1,12 +1,12 @@
 use rust_tunnel::common::{
-    create_server_config, init_logging_with_level, load_or_generate_cert, TunnelResult,
+    create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert, TunnelResult,
 };
 use rust_tunnel::server::{api, auth, control, listener, Database, ServerConfig};
+use rust_tunnel::server::logs::LogLayer;
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
     let config = ServerConfig::load().map_err(std::io::Error::other)?;
-    init_logging_with_level(&config.log);
     tracing::info!("Starting rust-tunnel server on {}", config.control_addr);
 
     // Initialize database
@@ -15,6 +15,14 @@ async fn main() -> TunnelResult<()> {
 
     // Create shared state with database
     let state = control::ServerState::with_db(db.clone());
+
+    // Initialize logging with LogStore capture (after state creation so LogStore is available)
+    let log_store = state.log_store.clone();
+    if let Some(store) = log_store {
+        init_logging_with_layer(&config.log, LogLayer::new(store));
+    } else {
+        init_logging_with_level(&config.log);
+    }
 
     // Load historical data from database
     if let Err(e) = state.traffic_store.load_from_db().await {
@@ -129,6 +137,23 @@ async fn main() -> TunnelResult<()> {
 
     // Start periodic DB flush for traffic data (every 30 seconds)
     state.traffic_store.start_flush_task();
+
+    // Start periodic cleanup of old log entries (every hour, removes 7+ day old logs)
+    let db_for_cleanup = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let seven_days_ago = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0)
+                - 7 * 24 * 3600 * 1_000_000i64;
+            if let Err(e) = db_for_cleanup.cleanup_old_logs(seven_days_ago).await {
+                tracing::warn!("Failed to cleanup old logs: {}", e);
+            }
+        }
+    });
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
