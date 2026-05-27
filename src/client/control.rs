@@ -7,8 +7,16 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
+use crate::client::logs::{spawn_log_forwarder, ClientLogLayer};
 use crate::client::{proxy, ClientConfig};
-use crate::common::{connect_tls_insecure, ControlMessage, TunnelError, TunnelResult};
+use crate::common::{
+    connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, TunnelError,
+    TunnelResult,
+};
+
+/// Stores the global log layer so it can be reused across reconnections.
+/// On reconnect the inner sender is hot-swapped via [`ClientLogLayer::set_sender`].
+static LOG_LAYER: std::sync::OnceLock<ClientLogLayer> = std::sync::OnceLock::new();
 
 /// Type alias for the control message sender
 pub type ControlSender = mpsc::Sender<ControlMessage>;
@@ -339,6 +347,23 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
             }
         }
     });
+
+    // --- Client log capture setup ---
+    let log_ctrl_sender = sender.clone();
+    let (log_tx, log_rx) = mpsc::unbounded_channel::<ClientLogEntry>();
+
+    let layer = ClientLogLayer::new();
+    if LOG_LAYER.set(layer).is_ok() {
+        // First connection: the layer was stored; now initialise logging with it.
+        let stored = LOG_LAYER.get().unwrap();
+        init_logging_with_layer(&config.log, stored.clone());
+    }
+
+    if let Some(stored) = LOG_LAYER.get() {
+        stored.set_sender(log_tx);
+        spawn_log_forwarder(log_rx, log_ctrl_sender);
+    }
+    // --- End log capture setup ---
 
     let state = ClientState::new(config, sender.clone(), forwards);
 

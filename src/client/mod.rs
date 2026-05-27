@@ -1,5 +1,6 @@
 pub mod config;
 pub mod control;
+pub mod logs;
 pub mod proxy;
 
 pub use config::*;
