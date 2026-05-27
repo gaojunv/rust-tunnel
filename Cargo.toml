@@ -37,7 +37,6 @@ bytes = "1.0"
 
 # Timeout utilities
 tokio-util = { version = "0.7", features = ["time"] }
-tokio-stream = "0.1"
 
 # Random generation for connection IDs
 rand = "0.8"

@@ -176,6 +176,44 @@ impl LogStore {
             .rev()
             .collect()
     }
+
+    /// Query logs from the database.
+    /// Used for pagination (before_id) and when in-memory buffer is insufficient.
+    pub async fn query_db(
+        &self,
+        level: Option<&str>,
+        source: Option<&str>,
+        search: Option<&str>,
+        limit: u32,
+        before_id: Option<i64>,
+    ) -> Vec<LogEntry> {
+        let guard = self.inner.lock().await;
+        if let Some(ref db) = guard.db {
+            match db
+                .query_logs(level, source, search, limit, before_id)
+                .await
+            {
+                Ok(rows) => {
+                    rows.into_iter()
+                        .map(|r| LogEntry {
+                            id: r.id,
+                            timestamp: r.timestamp,
+                            level: r.level,
+                            source: r.source,
+                            target: r.target,
+                            message: r.message,
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to query logs from DB: {}", e);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        }
+    }
 }
 
 fn level_to_u8(level: Level) -> u8 {
@@ -195,7 +233,7 @@ fn level_to_u8_str(level: &str) -> u8 {
         "INFO" => 2,
         "WARN" => 3,
         "ERROR" => 4,
-        _ => 0,
+        _ => 2, // Default to INFO for unknown levels
     }
 }
 
@@ -426,6 +464,6 @@ mod tests {
         assert_eq!(level_to_u8_str("TRACE"), 0);
         assert_eq!(level_to_u8_str("DEBUG"), 1);
         assert_eq!(level_to_u8_str("WARN"), 3);
-        assert_eq!(level_to_u8_str("UNKNOWN"), 0);
+        assert_eq!(level_to_u8_str("UNKNOWN"), 2); // Default to INFO for unknown levels
     }
 }

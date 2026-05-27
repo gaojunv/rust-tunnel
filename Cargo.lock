@@ -2080,7 +2080,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tokio-util",
  "toml",
  "tower-http",
