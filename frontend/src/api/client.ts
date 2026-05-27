@@ -12,6 +12,9 @@ import type {
   ShadowsocksConfig,
   ShadowsocksStats,
   ShadowsocksQuality,
+  TrojanConfig,
+  TrojanStats,
+  TrojanQuality,
 } from '../types';
 
 const API_BASE = '/api';
@@ -133,5 +136,26 @@ export const getShadowsocksStats = async (): Promise<ShadowsocksStats> => {
 
 export const getShadowsocksQuality = async (): Promise<ShadowsocksQuality[]> => {
   const response = await api.get<ShadowsocksQuality[]>('/shadowsocks/quality');
+  return response.data;
+};
+
+// Trojan API
+export const getTrojanConfig = async (): Promise<TrojanConfig> => {
+  const response = await api.get<TrojanConfig>('/trojan');
+  return response.data;
+};
+
+export const updateTrojanConfig = async (config: Partial<TrojanConfig>): Promise<TrojanConfig> => {
+  const response = await api.post<TrojanConfig>('/trojan', config);
+  return response.data;
+};
+
+export const getTrojanStats = async (): Promise<TrojanStats> => {
+  const response = await api.get<TrojanStats>('/trojan/stats');
+  return response.data;
+};
+
+export const getTrojanQuality = async (): Promise<TrojanQuality[]> => {
+  const response = await api.get<TrojanQuality[]>('/trojan/quality');
   return response.data;
 };

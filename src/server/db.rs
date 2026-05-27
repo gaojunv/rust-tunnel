@@ -1,8 +1,11 @@
+use crate::server::quality::QualitySample;
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, FromRow, Row, Sqlite, Pool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    FromRow, Pool, Row, Sqlite,
+};
 use std::path::Path;
 use std::str::FromStr;
-use crate::server::quality::QualitySample;
 
 /// Database wrapper for persistence
 #[derive(Clone)]
@@ -127,9 +130,11 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_client_sessions_port ON client_sessions(port)")
             .execute(pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_quality_port ON connection_quality_history(port)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_quality_port ON connection_quality_history(port)",
+        )
+        .execute(pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_quality_timestamp ON connection_quality_history(timestamp)",
         )
@@ -144,6 +149,23 @@ impl Database {
                 port INTEGER NOT NULL UNIQUE,
                 cipher TEXT NOT NULL,
                 password TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // Trojan configuration table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS trojan_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port INTEGER NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                fallback TEXT NOT NULL DEFAULT '127.0.0.1:80',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
@@ -273,7 +295,11 @@ impl Database {
     }
 
     /// Record client connection
-    pub async fn record_client_connect(&self, port: u16, hostname: Option<String>) -> Result<(), sqlx::Error> {
+    pub async fn record_client_connect(
+        &self,
+        port: u16,
+        hostname: Option<String>,
+    ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
 
         sqlx::query(
@@ -335,7 +361,10 @@ impl Database {
     }
 
     /// Load recent buckets (last N hours)
-    pub async fn load_recent_buckets(&self, hours: u32) -> Result<Vec<TrafficBucketRecord>, sqlx::Error> {
+    pub async fn load_recent_buckets(
+        &self,
+        hours: u32,
+    ) -> Result<Vec<TrafficBucketRecord>, sqlx::Error> {
         let since = Utc::now() - Duration::hours(hours as i64);
 
         let records = sqlx::query_as::<_, TrafficBucketRecord>(
@@ -376,6 +405,7 @@ impl Database {
     }
 
     /// Insert quality history record
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_quality_history(
         &self,
         port: u16,
@@ -490,7 +520,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.iter().map(|row| row.get::<i32, _>("port") as u16).collect())
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<i32, _>("port") as u16)
+            .collect())
     }
 
     /// Save or update Shadowsocks configuration
@@ -527,7 +560,9 @@ impl Database {
     }
 
     /// Load all Shadowsocks configurations
-    pub async fn load_shadowsocks_configs(&self) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
+    pub async fn load_shadowsocks_configs(
+        &self,
+    ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
             r#"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
@@ -542,7 +577,9 @@ impl Database {
     }
 
     /// Load enabled Shadowsocks configurations
-    pub async fn load_enabled_shadowsocks_configs(&self) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
+    pub async fn load_enabled_shadowsocks_configs(
+        &self,
+    ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
             r#"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
@@ -558,7 +595,10 @@ impl Database {
     }
 
     /// Get Shadowsocks config for a specific port
-    pub async fn get_shadowsocks_config(&self, port: u16) -> Result<Option<ShadowsocksConfigRecord>, sqlx::Error> {
+    pub async fn get_shadowsocks_config(
+        &self,
+        port: u16,
+    ) -> Result<Option<ShadowsocksConfigRecord>, sqlx::Error> {
         let record = sqlx::query_as::<_, ShadowsocksConfigRecord>(
             r#"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
@@ -578,6 +618,106 @@ impl Database {
         sqlx::query(
             r#"
             DELETE FROM shadowsocks_config
+            WHERE port = ?
+            "#,
+        )
+        .bind(port as i32)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Save or update Trojan configuration
+    pub async fn save_trojan_config(
+        &self,
+        port: u16,
+        password: &str,
+        fallback: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO trojan_config (port, password, fallback, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(port) DO UPDATE SET
+                password = excluded.password,
+                fallback = excluded.fallback,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(port as i32)
+        .bind(password)
+        .bind(fallback)
+        .bind(enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Load all Trojan configurations
+    pub async fn load_trojan_configs(&self) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
+        let records = sqlx::query_as::<_, TrojanConfigRecord>(
+            r#"
+            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            FROM trojan_config
+            ORDER BY port
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Load enabled Trojan configurations
+    pub async fn load_enabled_trojan_configs(
+        &self,
+    ) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
+        let records = sqlx::query_as::<_, TrojanConfigRecord>(
+            r#"
+            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            FROM trojan_config
+            WHERE enabled = 1
+            ORDER BY port
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Get Trojan config for a specific port
+    pub async fn get_trojan_config(
+        &self,
+        port: u16,
+    ) -> Result<Option<TrojanConfigRecord>, sqlx::Error> {
+        let record = sqlx::query_as::<_, TrojanConfigRecord>(
+            r#"
+            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            FROM trojan_config
+            WHERE port = ?
+            "#,
+        )
+        .bind(port as i32)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
+    /// Delete Trojan configuration
+    pub async fn delete_trojan_config(&self, port: u16) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            DELETE FROM trojan_config
             WHERE port = ?
             "#,
         )
@@ -631,12 +771,26 @@ pub struct ShadowsocksConfigRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Trojan config record from database
+#[derive(FromRow, Debug)]
+pub struct TrojanConfigRecord {
+    pub id: i32,
+    pub port: i32,
+    pub password: String,
+    pub fallback: String,
+    pub enabled: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     async fn create_test_db() -> Database {
-        Database::new(":memory:").await.expect("Failed to create in-memory database")
+        Database::new(":memory:")
+            .await
+            .expect("Failed to create in-memory database")
     }
 
     #[tokio::test]
@@ -731,7 +885,9 @@ mod tests {
     async fn test_record_client_connect_and_disconnect() {
         let db = create_test_db().await;
 
-        db.record_client_connect(8080, Some("test-host".to_string())).await.unwrap();
+        db.record_client_connect(8080, Some("test-host".to_string()))
+            .await
+            .unwrap();
 
         // Give a small delay so duration > 0
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -768,18 +924,18 @@ mod tests {
 
         let now = Utc::now();
         db.insert_quality_history(
-            8080,
-            now,
-            50.0,  // avg_rtt_ms
-            30.0,  // min_rtt_ms
-            100.0, // max_rtt_ms
-            0.02,  // loss_rate
-            1024.0,  // bytes_in_per_sec
-            2048.0,  // bytes_out_per_sec
-            95,    // quality_score
-            false, // is_warning
-            false, // is_critical
-        ).await.unwrap();
+            8080, now, 50.0,   // avg_rtt_ms
+            30.0,   // min_rtt_ms
+            100.0,  // max_rtt_ms
+            0.02,   // loss_rate
+            1024.0, // bytes_in_per_sec
+            2048.0, // bytes_out_per_sec
+            95,     // quality_score
+            false,  // is_warning
+            false,  // is_critical
+        )
+        .await
+        .unwrap();
 
         let start = now - chrono::Duration::hours(1);
         let end = now + chrono::Duration::hours(1);
@@ -795,7 +951,10 @@ mod tests {
         let db = create_test_db().await;
 
         let now = Utc::now();
-        let samples = db.get_quality_history(8080, now - chrono::Duration::hours(1), now).await.unwrap();
+        let samples = db
+            .get_quality_history(8080, now - chrono::Duration::hours(1), now)
+            .await
+            .unwrap();
         assert!(samples.is_empty());
     }
 
@@ -804,8 +963,16 @@ mod tests {
         let db = create_test_db().await;
 
         let now = Utc::now();
-        db.insert_quality_history(8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false).await.unwrap();
-        db.insert_quality_history(9000, now, 60.0, 40.0, 120.0, 0.05, 2048.0, 4096.0, 90, true, false).await.unwrap();
+        db.insert_quality_history(
+            8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+        )
+        .await
+        .unwrap();
+        db.insert_quality_history(
+            9000, now, 60.0, 40.0, 120.0, 0.05, 2048.0, 4096.0, 90, true, false,
+        )
+        .await
+        .unwrap();
 
         let ports = db.get_quality_ports(24).await.unwrap();
         assert_eq!(ports.len(), 2);
@@ -820,8 +987,26 @@ mod tests {
         let old_time = Utc::now() - chrono::Duration::hours(48);
         let recent_time = Utc::now();
 
-        db.insert_quality_history(8080, old_time, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false).await.unwrap();
-        db.insert_quality_history(8080, recent_time, 60.0, 40.0, 120.0, 0.05, 2048.0, 4096.0, 90, true, false).await.unwrap();
+        db.insert_quality_history(
+            8080, old_time, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+        )
+        .await
+        .unwrap();
+        db.insert_quality_history(
+            8080,
+            recent_time,
+            60.0,
+            40.0,
+            120.0,
+            0.05,
+            2048.0,
+            4096.0,
+            90,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
 
         // Cleanup records older than 24 hours
         let cutoff = Utc::now() - chrono::Duration::hours(24);
@@ -838,7 +1023,9 @@ mod tests {
         let db = create_test_db().await;
 
         // Create
-        db.save_shadowsocks_config(8388, "aes-256-gcm", "password123", true).await.unwrap();
+        db.save_shadowsocks_config(8388, "aes-256-gcm", "password123", true)
+            .await
+            .unwrap();
 
         // Read
         let config = db.get_shadowsocks_config(8388).await.unwrap();
@@ -850,7 +1037,9 @@ mod tests {
         assert_eq!(config.enabled, 1);
 
         // Update
-        db.save_shadowsocks_config(8388, "chacha20-ietf-poly1305", "newpass", false).await.unwrap();
+        db.save_shadowsocks_config(8388, "chacha20-ietf-poly1305", "newpass", false)
+            .await
+            .unwrap();
         let config = db.get_shadowsocks_config(8388).await.unwrap().unwrap();
         assert_eq!(config.cipher, "chacha20-ietf-poly1305");
         assert_eq!(config.password, "newpass");
@@ -866,9 +1055,15 @@ mod tests {
     async fn test_load_shadowsocks_configs() {
         let db = create_test_db().await;
 
-        db.save_shadowsocks_config(8388, "aes-256-gcm", "pass1", true).await.unwrap();
-        db.save_shadowsocks_config(8389, "chacha20-ietf-poly1305", "pass2", true).await.unwrap();
-        db.save_shadowsocks_config(8390, "aes-256-gcm", "pass3", false).await.unwrap();
+        db.save_shadowsocks_config(8388, "aes-256-gcm", "pass1", true)
+            .await
+            .unwrap();
+        db.save_shadowsocks_config(8389, "chacha20-ietf-poly1305", "pass2", true)
+            .await
+            .unwrap();
+        db.save_shadowsocks_config(8390, "aes-256-gcm", "pass3", false)
+            .await
+            .unwrap();
 
         let all_configs = db.load_shadowsocks_configs().await.unwrap();
         assert_eq!(all_configs.len(), 3);
@@ -881,9 +1076,13 @@ mod tests {
     async fn test_shadowsocks_config_unique_port() {
         let db = create_test_db().await;
 
-        db.save_shadowsocks_config(8388, "aes-256-gcm", "pass1", true).await.unwrap();
+        db.save_shadowsocks_config(8388, "aes-256-gcm", "pass1", true)
+            .await
+            .unwrap();
         // Upsert on same port should update, not duplicate
-        db.save_shadowsocks_config(8388, "chacha20-ietf-poly1305", "pass2", true).await.unwrap();
+        db.save_shadowsocks_config(8388, "chacha20-ietf-poly1305", "pass2", true)
+            .await
+            .unwrap();
 
         let configs = db.load_shadowsocks_configs().await.unwrap();
         assert_eq!(configs.len(), 1);

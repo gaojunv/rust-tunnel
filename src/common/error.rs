@@ -28,6 +28,9 @@ pub enum TunnelError {
 
     #[error("TLS error: {0}")]
     Tls(String),
+
+    #[error("Trojan authentication failed")]
+    TrojanAuthFailed(Vec<u8>),
 }
 
 pub type TunnelResult<T> = Result<T, TunnelError>;
@@ -126,18 +129,48 @@ mod tests {
         // Verify all variants produce non-empty display output
         let variants: Vec<TunnelError> = vec![
             TunnelError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
-            TunnelError::Database(sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "db"))),
+            TunnelError::Database(sqlx::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "db",
+            ))),
             TunnelError::Protocol("proto".into()),
             TunnelError::ConnectionClosed,
             TunnelError::Timeout,
             TunnelError::Config("config".into()),
             TunnelError::ControlChannel("channel".into()),
             TunnelError::Tls("tls".into()),
+            TunnelError::TrojanAuthFailed(vec![1, 2, 3]),
         ];
 
         for err in variants {
             let display = format!("{}", err);
             assert!(!display.is_empty(), "Empty display for {:?}", err);
+        }
+    }
+
+    #[test]
+    fn test_trojan_auth_failed_display() {
+        let err = TunnelError::TrojanAuthFailed(vec![1, 2, 3]);
+        let display = format!("{}", err);
+        assert!(display.contains("Trojan authentication failed"));
+    }
+
+    #[test]
+    fn test_trojan_auth_failed_empty_data() {
+        let err = TunnelError::TrojanAuthFailed(vec![]);
+        assert!(matches!(err, TunnelError::TrojanAuthFailed(_)));
+        let display = format!("{}", err);
+        assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn test_trojan_auth_failed_with_data() {
+        let data = vec![0u8; 100];
+        let err = TunnelError::TrojanAuthFailed(data);
+        if let TunnelError::TrojanAuthFailed(recovered) = err {
+            assert_eq!(recovered.len(), 100);
+        } else {
+            panic!("Expected TrojanAuthFailed variant");
         }
     }
 }

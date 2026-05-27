@@ -16,7 +16,10 @@ pub enum ControlMessage {
     /// Server response to registration
     RegisterResponse { success: bool, message: String },
     /// Server notifies client of a new incoming connection
-    NewConnection { connection_id: u64, remote_port: u16 },
+    NewConnection {
+        connection_id: u64,
+        remote_port: u16,
+    },
     /// Client notifies server it's connected to local target and ready
     ConnectionReady { connection_id: u64 },
     /// Data transfer for a specific connection
@@ -55,7 +58,9 @@ impl ControlMessage {
     }
 
     /// Deserialize message from stream
-    pub async fn read_from_stream<R: AsyncReadExt + Unpin>(stream: &mut R) -> TunnelResult<Option<Self>> {
+    pub async fn read_from_stream<R: AsyncReadExt + Unpin>(
+        stream: &mut R,
+    ) -> TunnelResult<Option<Self>> {
         let mut len_buf = [0u8; 4];
         match stream.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -82,7 +87,10 @@ impl ControlMessage {
     }
 
     /// Write message to stream
-    pub async fn write_to_stream<W: AsyncWriteExt + Unpin>(&self, stream: &mut W) -> TunnelResult<()> {
+    pub async fn write_to_stream<W: AsyncWriteExt + Unpin>(
+        &self,
+        stream: &mut W,
+    ) -> TunnelResult<()> {
         let bytes = self.serialize()?;
         stream.write_all(&bytes).await?;
         stream.flush().await?;
@@ -90,7 +98,10 @@ impl ControlMessage {
     }
 
     /// Write message to a split stream half (alias for write_to_stream)
-    pub async fn write_to_split<W: AsyncWriteExt + Unpin>(&self, stream: &mut W) -> TunnelResult<()> {
+    pub async fn write_to_split<W: AsyncWriteExt + Unpin>(
+        &self,
+        stream: &mut W,
+    ) -> TunnelResult<()> {
         self.write_to_stream(stream).await
     }
 }
@@ -114,14 +125,38 @@ mod tests {
     fn test_message_variants_serialization() {
         // Test all message variants can be serialized
         let messages = vec![
-            ControlMessage::Register { remote_port: 8080, hostname: None, auth_token: None },
-            ControlMessage::RegisterResponse { success: true, message: "ok".into() },
-            ControlMessage::NewConnection { connection_id: 12345, remote_port: 9000 },
-            ControlMessage::ConnectionReady { connection_id: 12345 },
-            ControlMessage::Data { connection_id: 12345, data: vec![1, 2, 3, 4] },
-            ControlMessage::Close { connection_id: 12345 },
-            ControlMessage::Ping { seq: 1, timestamp_micros: 123456789 },
-            ControlMessage::Pong { seq: 1, ping_timestamp_micros: 123456789, pong_timestamp_micros: 123456795 },
+            ControlMessage::Register {
+                remote_port: 8080,
+                hostname: None,
+                auth_token: None,
+            },
+            ControlMessage::RegisterResponse {
+                success: true,
+                message: "ok".into(),
+            },
+            ControlMessage::NewConnection {
+                connection_id: 12345,
+                remote_port: 9000,
+            },
+            ControlMessage::ConnectionReady {
+                connection_id: 12345,
+            },
+            ControlMessage::Data {
+                connection_id: 12345,
+                data: vec![1, 2, 3, 4],
+            },
+            ControlMessage::Close {
+                connection_id: 12345,
+            },
+            ControlMessage::Ping {
+                seq: 1,
+                timestamp_micros: 123456789,
+            },
+            ControlMessage::Pong {
+                seq: 1,
+                ping_timestamp_micros: 123456789,
+                pong_timestamp_micros: 123456795,
+            },
             ControlMessage::Disconnect,
         ];
 
@@ -138,7 +173,10 @@ mod tests {
     fn test_max_message_size() {
         // Create a message that would exceed max size when serialized
         let large_data = vec![0u8; 2 * 1024 * 1024]; // 2MB
-        let msg = ControlMessage::Data { connection_id: 1, data: large_data };
+        let msg = ControlMessage::Data {
+            connection_id: 1,
+            data: large_data,
+        };
         let result = msg.serialize();
         // The serialization itself works, but read_from_stream will reject it
         assert!(result.is_ok());
@@ -162,7 +200,10 @@ mod tests {
 
         assert!(read_msg.is_some());
         match read_msg.unwrap() {
-            ControlMessage::Data { connection_id, data } => {
+            ControlMessage::Data {
+                connection_id,
+                data,
+            } => {
                 assert_eq!(connection_id, 42);
                 assert_eq!(data, vec![10, 20, 30, 40, 50]);
             }
@@ -191,7 +232,10 @@ mod tests {
     #[tokio::test]
     async fn test_write_to_split_alias() {
         let mut buffer = Vec::new();
-        let msg = ControlMessage::Ping { seq: 1, timestamp_micros: 123456789 };
+        let msg = ControlMessage::Ping {
+            seq: 1,
+            timestamp_micros: 123456789,
+        };
         // write_to_split is just an alias for write_to_stream
         msg.write_to_split(&mut buffer).await.unwrap();
         assert!(!buffer.is_empty());
@@ -276,9 +320,18 @@ mod tests {
         msg3.write_to_stream(&mut buffer).await.unwrap();
 
         let mut reader = &buffer[..];
-        let r1 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
-        let r2 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
-        let r3 = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+        let r1 = ControlMessage::read_from_stream(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let r2 = ControlMessage::read_from_stream(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let r3 = ControlMessage::read_from_stream(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
         let r4 = ControlMessage::read_from_stream(&mut reader).await.unwrap();
 
         assert!(matches!(r1, ControlMessage::Register { .. }));
@@ -299,10 +352,16 @@ mod tests {
         msg.write_to_stream(&mut buffer).await.unwrap();
 
         let mut reader = &buffer[..];
-        let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap().unwrap();
+        let read_msg = ControlMessage::read_from_stream(&mut reader)
+            .await
+            .unwrap()
+            .unwrap();
 
         match read_msg {
-            ControlMessage::Data { connection_id, data } => {
+            ControlMessage::Data {
+                connection_id,
+                data,
+            } => {
                 assert_eq!(connection_id, 1);
                 assert_eq!(data, large_data);
             }
@@ -368,7 +427,10 @@ mod tests {
         };
         let cloned = msg.clone();
         match cloned {
-            ControlMessage::Data { connection_id, data } => {
+            ControlMessage::Data {
+                connection_id,
+                data,
+            } => {
                 assert_eq!(connection_id, 42);
                 assert_eq!(data, vec![1, 2, 3]);
             }

@@ -59,11 +59,16 @@ async fn start_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
 fn start_ss_local(ss_server_port: u16, socks5_port: u16, cipher: &str, password: &str) -> Child {
     Command::new("ss-local")
         .args([
-            "-s", "127.0.0.1",
-            "-p", &ss_server_port.to_string(),
-            "-l", &socks5_port.to_string(),
-            "-k", password,
-            "-m", cipher,
+            "-s",
+            "127.0.0.1",
+            "-p",
+            &ss_server_port.to_string(),
+            "-l",
+            &socks5_port.to_string(),
+            "-k",
+            password,
+            "-m",
+            cipher,
         ])
         .stderr(Stdio::null())
         .stdout(Stdio::null())
@@ -87,11 +92,7 @@ async fn wait_for_port(port: u16, dur: Duration) {
 
 /// Perform a minimal SOCKS5 CONNECT handshake through `proxy_port`, then
 /// send `data` to `target_addr` and return the echoed response.
-async fn socks5_send_recv(
-    proxy_port: u16,
-    target_addr: SocketAddr,
-    data: &[u8],
-) -> Vec<u8> {
+async fn socks5_send_recv(proxy_port: u16, target_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("Failed to connect to SOCKS5 proxy");
@@ -125,7 +126,7 @@ async fn socks5_send_recv(
     assert_eq!(reply[1], 0x00, "SOCKS5 REP error: {:02x}", reply[1]);
 
     let bind_addr_len = match reply[3] {
-        0x01 => 4, // IPv4
+        0x01 => 4,  // IPv4
         0x04 => 16, // IPv6
         other => panic!("Unexpected ATYP: {}", other),
     };
@@ -270,8 +271,7 @@ mod integration_tests {
         wait_for_port(ss_port, Duration::from_secs(3)).await;
 
         let socks5_port = find_available_port().await;
-        let mut ss_local =
-            start_ss_local(ss_port, socks5_port, "aes-256-gcm", "testpass");
+        let mut ss_local = start_ss_local(ss_port, socks5_port, "aes-256-gcm", "testpass");
         wait_for_port(socks5_port, Duration::from_secs(5)).await;
 
         // 64 KB payload
@@ -311,8 +311,7 @@ mod integration_tests {
         );
 
         let socks5_port = find_available_port().await;
-        let mut ss_local =
-            start_ss_local(ss_port, socks5_port, "aes-256-gcm", "testpass");
+        let mut ss_local = start_ss_local(ss_port, socks5_port, "aes-256-gcm", "testpass");
         wait_for_port(socks5_port, Duration::from_secs(5)).await;
 
         // Open a connection through the SS tunnel

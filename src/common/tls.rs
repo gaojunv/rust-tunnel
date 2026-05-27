@@ -10,14 +10,14 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ServerConfig;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use rcgen::{CertificateParams, KeyPair, DistinguishedName, DnType, Certificate};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::common::{TunnelError, TunnelResult};
 
@@ -37,7 +37,9 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
         "rust-tunnel-server".to_string(),
     ]);
     params.distinguished_name = DistinguishedName::new();
-    params.distinguished_name.push(DnType::CommonName, "rust-tunnel-server");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "rust-tunnel-server");
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
 
@@ -62,24 +64,30 @@ pub fn load_or_generate_cert(cert_path: &str, key_path: &str) -> TunnelResult<Tl
 
     // Generate new certificate
     info!("Generating new self-signed TLS certificate...");
-    let (cert, key_pair) = generate_self_signed_cert()
-        .map_err(|e| TunnelError::Tls(e))?;
+    let (cert, key_pair) = generate_self_signed_cert().map_err(TunnelError::Tls)?;
 
     // Ensure parent directories exist
     if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| TunnelError::Io(e))?;
+        fs::create_dir_all(parent).map_err(TunnelError::Io)?;
     }
     if let Some(parent) = key_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| TunnelError::Io(e))?;
+        fs::create_dir_all(parent).map_err(TunnelError::Io)?;
     }
 
     // Save certificate and key
-    let mut cert_file = fs::File::create(cert_path).map_err(|e| TunnelError::Io(e))?;
-    cert_file.write_all(cert.serialize_pem().map_err(|e| TunnelError::Tls(format!("Failed to serialize cert: {}", e)))?.as_bytes())
-        .map_err(|e| TunnelError::Io(e))?;
+    let mut cert_file = fs::File::create(cert_path).map_err(TunnelError::Io)?;
+    cert_file
+        .write_all(
+            cert.serialize_pem()
+                .map_err(|e| TunnelError::Tls(format!("Failed to serialize cert: {}", e)))?
+                .as_bytes(),
+        )
+        .map_err(TunnelError::Io)?;
 
-    let mut key_file = fs::File::create(key_path).map_err(|e| TunnelError::Io(e))?;
-    key_file.write_all(key_pair.serialize_pem().as_bytes()).map_err(|e| TunnelError::Io(e))?;
+    let mut key_file = fs::File::create(key_path).map_err(TunnelError::Io)?;
+    key_file
+        .write_all(key_pair.serialize_pem().as_bytes())
+        .map_err(TunnelError::Io)?;
 
     info!("TLS certificate saved to: {}", cert_path.display());
     info!("TLS private key saved to: {}", key_path.display());
@@ -90,7 +98,7 @@ pub fn load_or_generate_cert(cert_path: &str, key_path: &str) -> TunnelResult<Tl
 /// Load certificate and key from PEM files
 pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<TlsCertPair> {
     // Load certificates
-    let cert_file = fs::File::open(cert_path).map_err(|e| TunnelError::Io(e))?;
+    let cert_file = fs::File::open(cert_path).map_err(TunnelError::Io)?;
     let mut cert_reader = BufReader::new(cert_file);
     let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .collect::<Result<_, _>>()
@@ -101,7 +109,7 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
     }
 
     // Load private key
-    let key_file = fs::File::open(key_path).map_err(|e| TunnelError::Io(e))?;
+    let key_file = fs::File::open(key_path).map_err(TunnelError::Io)?;
     let mut key_reader = BufReader::new(key_file);
     let keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
         .collect::<Result<_, _>>()
@@ -192,10 +200,12 @@ pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
     let mut root_store = RootCertStore::empty();
 
     // Add system root certificates
-    for cert in rustls_native_certs::load_native_certs().map_err(|e|
-        TunnelError::Tls(format!("Failed to load system certificates: {}", e)))? {
-        root_store.add(cert).map_err(|e|
-            TunnelError::Tls(format!("Failed to add root certificate: {}", e)))?;
+    for cert in rustls_native_certs::load_native_certs()
+        .map_err(|e| TunnelError::Tls(format!("Failed to load system certificates: {}", e)))?
+    {
+        root_store
+            .add(cert)
+            .map_err(|e| TunnelError::Tls(format!("Failed to add root certificate: {}", e)))?;
     }
 
     let config = ClientConfig::builder()
@@ -207,11 +217,13 @@ pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
 
 /// Establish a TLS connection to the server (insecure/TOFU mode)
 /// This will automatically accept any server certificate (for self-signed certs)
-pub async fn connect_tls_insecure(addr: &str, server_name: &str) -> TunnelResult<tokio_rustls::client::TlsStream<TcpStream>> {
+pub async fn connect_tls_insecure(
+    addr: &str,
+    server_name: &str,
+) -> TunnelResult<tokio_rustls::client::TlsStream<TcpStream>> {
     debug!("Connecting to {} with TLS (insecure mode)", addr);
 
-    let stream = TcpStream::connect(addr).await
-        .map_err(|e| TunnelError::Io(e))?;
+    let stream = TcpStream::connect(addr).await.map_err(TunnelError::Io)?;
 
     let config = create_insecure_client_config()?;
     let connector = TlsConnector::from(config);
@@ -221,7 +233,9 @@ pub async fn connect_tls_insecure(addr: &str, server_name: &str) -> TunnelResult
     let server_name = ServerName::try_from(server_name_owned)
         .map_err(|_| TunnelError::Tls(format!("Invalid server name: {}", server_name)))?;
 
-    let tls_stream = connector.connect(server_name, stream).await
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
         .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
 
     debug!("TLS connection established successfully");
@@ -229,11 +243,13 @@ pub async fn connect_tls_insecure(addr: &str, server_name: &str) -> TunnelResult
 }
 
 /// Establish a TLS connection to the server (secure mode with CA verification)
-pub async fn connect_tls_secure(addr: &str, server_name: &str) -> TunnelResult<tokio_rustls::client::TlsStream<TcpStream>> {
+pub async fn connect_tls_secure(
+    addr: &str,
+    server_name: &str,
+) -> TunnelResult<tokio_rustls::client::TlsStream<TcpStream>> {
     debug!("Connecting to {} with TLS (secure mode)", addr);
 
-    let stream = TcpStream::connect(addr).await
-        .map_err(|e| TunnelError::Io(e))?;
+    let stream = TcpStream::connect(addr).await.map_err(TunnelError::Io)?;
 
     let config = create_secure_client_config()?;
     let connector = TlsConnector::from(config);
@@ -243,7 +259,9 @@ pub async fn connect_tls_secure(addr: &str, server_name: &str) -> TunnelResult<t
     let server_name = ServerName::try_from(server_name_owned)
         .map_err(|_| TunnelError::Tls(format!("Invalid server name: {}", server_name)))?;
 
-    let tls_stream = connector.connect(server_name, stream).await
+    let tls_stream = connector
+        .connect(server_name, stream)
+        .await
         .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {}", e)))?;
 
     debug!("TLS connection established successfully");
@@ -258,7 +276,11 @@ mod tests {
     #[test]
     fn test_generate_self_signed_cert() {
         let result = generate_self_signed_cert();
-        assert!(result.is_ok(), "Failed to generate self-signed cert: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate self-signed cert: {:?}",
+            result.err()
+        );
 
         let (cert, key_pair) = result.unwrap();
 
@@ -277,11 +299,12 @@ mod tests {
         let cert_path = tmp_dir.path().join("cert.pem");
         let key_path = tmp_dir.path().join("key.pem");
 
-        let result = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
+        let result = load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "Failed to generate cert: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Failed to generate cert: {:?}", result.err());
 
         // Verify files were created
         assert!(cert_path.exists(), "Cert file not created");
@@ -298,21 +321,24 @@ mod tests {
         let key_path = tmp_dir.path().join("key.pem");
 
         // First call generates the files
-        let result1 = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        );
+        let result1 =
+            load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
         assert!(result1.is_ok());
 
         // Second call should load existing files
-        let result2 = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
+        let result2 =
+            load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+        assert!(
+            result2.is_ok(),
+            "Failed to load existing cert: {:?}",
+            result2.err()
         );
-        assert!(result2.is_ok(), "Failed to load existing cert: {:?}", result2.err());
 
         let cert_pair = result2.unwrap();
-        assert!(!cert_pair.certs.is_empty(), "No certificates loaded from existing files");
+        assert!(
+            !cert_pair.certs.is_empty(),
+            "No certificates loaded from existing files"
+        );
     }
 
     #[test]
@@ -344,19 +370,25 @@ mod tests {
         let cert_path = tmp_dir.path().join("cert.pem");
         let key_path = tmp_dir.path().join("key.pem");
 
-        let cert_pair = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        ).unwrap();
+        let cert_pair =
+            load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
 
         let result = create_server_config(cert_pair);
-        assert!(result.is_ok(), "Failed to create server config: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create server config: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_create_insecure_client_config() {
         let result = create_insecure_client_config();
-        assert!(result.is_ok(), "Failed to create insecure client config: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create insecure client config: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -365,11 +397,12 @@ mod tests {
         let cert_path = tmp_dir.path().join("deep").join("nested").join("cert.pem");
         let key_path = tmp_dir.path().join("deep").join("nested").join("key.pem");
 
-        let result = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
+        let result = load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+        assert!(
+            result.is_ok(),
+            "Failed to generate cert with nested dirs: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "Failed to generate cert with nested dirs: {:?}", result.err());
         assert!(cert_path.exists(), "Cert file not created in nested dir");
         assert!(key_path.exists(), "Key file not created in nested dir");
     }
@@ -380,10 +413,8 @@ mod tests {
         let cert_path = tmp_dir.path().join("cert.pem");
         let key_path = tmp_dir.path().join("key.pem");
 
-        let cert_pair = load_or_generate_cert(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        ).unwrap();
+        let cert_pair =
+            load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
 
         // Should have at least one certificate
         assert!(!cert_pair.certs.is_empty());

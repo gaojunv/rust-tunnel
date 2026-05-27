@@ -1,11 +1,13 @@
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tracing::{debug, warn, error};
+use tokio_rustls::server::TlsStream;
+use tracing::{debug, error, warn};
 
 use crate::common::{ControlMessage, TunnelResult};
 use crate::server::control::{ClientInfo, ServerState};
-use crate::server::shadowsocks::{SSConnectionContext, ProxyServerStream};
+use crate::server::shadowsocks::{ProxyServerStream, SSConnectionContext};
+use crate::server::trojan::{TrojanCommand, TrojanConnectionContext};
 
 /// Proxy data from user connection to client over control channel.
 /// Data from client is handled by the main control loop which writes directly to user stream.
@@ -23,7 +25,9 @@ pub async fn proxy_user_connection(
     let user_writer = std::sync::Arc::new(tokio::sync::Mutex::new(boxed_writer));
 
     // Add this connection to active connections map so data from client can be delivered
-    state.add_active_connection(connection_id, remote_port, user_writer.clone()).await;
+    state
+        .add_active_connection(connection_id, remote_port, user_writer.clone())
+        .await;
 
     let mut buf = vec![0u8; 8192];
 
@@ -35,26 +39,42 @@ pub async fn proxy_user_connection(
             }
             Ok(n) => {
                 // Record incoming traffic (from user to server)
-                state.traffic_store.record_bytes_in(remote_port, n as u64).await;
+                state
+                    .traffic_store
+                    .record_bytes_in(remote_port, n as u64)
+                    .await;
 
                 // Send data from user to client via control channel
-                if let Err(e) = client_info.control_sender.send(ControlMessage::Data {
-                    connection_id,
-                    data: buf[..n].to_vec(),
-                }).await {
-                    warn!("Failed to send data from user {} to client: {}", connection_id, e);
+                if let Err(e) = client_info
+                    .control_sender
+                    .send(ControlMessage::Data {
+                        connection_id,
+                        data: buf[..n].to_vec(),
+                    })
+                    .await
+                {
+                    warn!(
+                        "Failed to send data from user {} to client: {}",
+                        connection_id, e
+                    );
                     break;
                 }
             }
             Err(e) => {
-                warn!("Error reading from user connection {}: {}", connection_id, e);
+                warn!(
+                    "Error reading from user connection {}: {}",
+                    connection_id, e
+                );
                 break;
             }
         }
     }
 
     // Notify client the connection is closed
-    let _ = client_info.control_sender.send(ControlMessage::Close { connection_id }).await;
+    let _ = client_info
+        .control_sender
+        .send(ControlMessage::Close { connection_id })
+        .await;
 
     // Remove from active connections
     state.remove_active_connection(connection_id).await;
@@ -77,8 +97,14 @@ pub async fn copy_bidirectional_with_stats(
     let (client_to_target, target_to_client) =
         copy_bidirectional(&mut client_stream, &mut target_stream).await?;
 
-    state.traffic_store.record_bytes_in(port, client_to_target).await;
-    state.traffic_store.record_bytes_out(port, target_to_client).await;
+    state
+        .traffic_store
+        .record_bytes_in(port, client_to_target)
+        .await;
+    state
+        .traffic_store
+        .record_bytes_out(port, target_to_client)
+        .await;
 
     Ok((client_to_target, target_to_client))
 }
@@ -92,16 +118,18 @@ async fn update_ss_quality(
     bytes_out: u64,
     elapsed_secs: f64,
 ) {
-    use crate::server::quality::{ConnectionQuality, calculate_quality_score, check_warnings, QualityThresholds};
+    use crate::server::quality::{
+        calculate_quality_score, check_warnings, ConnectionQuality, QualityThresholds,
+    };
     use chrono::Utc;
 
-    let mut quality = ConnectionQuality::default();
-
-    // Use connect time as RTT estimate
-    quality.last_rtt_ms = connect_time_ms as f32;
-    quality.avg_rtt_ms = connect_time_ms as f32;
-    quality.min_rtt_ms = connect_time_ms as f32;
-    quality.max_rtt_ms = connect_time_ms as f32;
+    let mut quality = ConnectionQuality {
+        last_rtt_ms: connect_time_ms as f32,
+        avg_rtt_ms: connect_time_ms as f32,
+        min_rtt_ms: connect_time_ms as f32,
+        max_rtt_ms: connect_time_ms as f32,
+        ..Default::default()
+    };
 
     // Calculate throughput
     if elapsed_secs > 0.0 {
@@ -109,16 +137,13 @@ async fn update_ss_quality(
         quality.bytes_out_per_sec = bytes_out as f64 / elapsed_secs;
     }
 
-    // For SS, loss rate is 0 (we don't measure it directly)
-    // But we can infer from connection errors
-    quality.loss_rate = 0.0;
-
     // Calculate quality score
     quality.quality_score = calculate_quality_score(quality.avg_rtt_ms, quality.loss_rate);
 
     // Check warnings
     let thresholds = QualityThresholds::default();
-    let (is_warning, is_critical) = check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
+    let (is_warning, is_critical) =
+        check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
     quality.is_warning = is_warning;
     quality.is_critical = is_critical;
     quality.last_update = Utc::now();
@@ -148,8 +173,14 @@ async fn copy_bidirectional_with_ss_crypto(
     )
     .await?;
 
-    state.traffic_store.record_bytes_in(port, encrypted_to_plain).await;
-    state.traffic_store.record_bytes_out(port, plain_to_encrypted).await;
+    state
+        .traffic_store
+        .record_bytes_in(port, encrypted_to_plain)
+        .await;
+    state
+        .traffic_store
+        .record_bytes_out(port, plain_to_encrypted)
+        .await;
 
     Ok((encrypted_to_plain, plain_to_encrypted))
 }
@@ -162,7 +193,10 @@ pub async fn proxy_ss_connection(
     ss_ctx: SSConnectionContext,
     state: ServerState,
 ) {
-    debug!("Starting SS proxy for connection {}, target {}", connection_id, ss_ctx.target_addr);
+    debug!(
+        "Starting SS proxy for connection {}, target {}",
+        connection_id, ss_ctx.target_addr
+    );
 
     // Increment active SS connection count
     state.increment_ss_connections(ss_port).await;
@@ -182,11 +216,20 @@ pub async fn proxy_ss_connection(
 
     // Calculate connection establishment time as RTT estimate
     let connect_time_ms = start.elapsed().as_millis() as u64;
-    debug!("Connected to target {} for SS connection {} in {}ms",
-           ss_ctx.target_addr, connection_id, connect_time_ms);
+    debug!(
+        "Connected to target {} for SS connection {} in {}ms",
+        ss_ctx.target_addr, connection_id, connect_time_ms
+    );
 
     let proxy_start = Instant::now();
-    let result = copy_bidirectional_with_ss_crypto(connection_id, ss_port, proxy_stream, target_stream, state.clone()).await;
+    let result = copy_bidirectional_with_ss_crypto(
+        connection_id,
+        ss_port,
+        proxy_stream,
+        target_stream,
+        state.clone(),
+    )
+    .await;
 
     // Decrement active SS connection count (always run)
     state.decrement_ss_connections(ss_port).await;
@@ -196,16 +239,172 @@ pub async fn proxy_ss_connection(
             let elapsed = proxy_start.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
 
-            debug!("SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
-                   connection_id, uploaded, downloaded, elapsed_secs);
+            debug!(
+                "SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
+                connection_id, uploaded, downloaded, elapsed_secs
+            );
 
             // Update quality metrics
-            update_ss_quality(&state, ss_port, connect_time_ms, uploaded, downloaded, elapsed_secs).await;
+            update_ss_quality(
+                &state,
+                ss_port,
+                connect_time_ms,
+                uploaded,
+                downloaded,
+                elapsed_secs,
+            )
+            .await;
         }
         Err(e) => {
             warn!("SS connection {} error: {}", connection_id, e);
         }
     }
+}
+
+/// Proxy a Trojan connection to target.
+/// Trojan data is already decrypted by TLS, so we just do raw TCP bidirectional copy.
+pub async fn proxy_trojan_connection(
+    connection_id: u64,
+    trojan_port: u16,
+    mut tls_stream: TlsStream<TcpStream>,
+    trojan_ctx: TrojanConnectionContext,
+    initial_payload: Vec<u8>,
+    state: ServerState,
+) {
+    debug!(
+        "Starting Trojan proxy for connection {}, target {}",
+        connection_id, trojan_ctx.target_addr
+    );
+
+    // Reject UDP ASSOCIATE — only CONNECT is supported
+    if trojan_ctx.command == TrojanCommand::UdpAssociate {
+        warn!(
+            "Trojan UDP ASSOCIATE is not supported for connection {}",
+            connection_id
+        );
+        return;
+    }
+
+    // Increment active Trojan connection count
+    state.increment_trojan_connections(trojan_port).await;
+
+    // Record start time for measuring connection setup time (RTT estimate)
+    let start = Instant::now();
+
+    // Connect to target server
+    let mut target_stream = match TcpStream::connect(&trojan_ctx.target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                "Failed to connect to target {}: {}",
+                trojan_ctx.target_addr, e
+            );
+            state.decrement_trojan_connections(trojan_port).await;
+            return;
+        }
+    };
+
+    let connect_time_ms = start.elapsed().as_millis() as u64;
+    debug!(
+        "Connected to target {} for Trojan connection {} in {}ms",
+        trojan_ctx.target_addr, connection_id, connect_time_ms
+    );
+
+    // Write any initial payload from the Trojan handshake
+    if !initial_payload.is_empty() {
+        if let Err(e) =
+            tokio::io::AsyncWriteExt::write_all(&mut target_stream, &initial_payload).await
+        {
+            warn!(
+                "Failed to write initial payload for Trojan connection {}: {}",
+                connection_id, e
+            );
+            state.decrement_trojan_connections(trojan_port).await;
+            return;
+        }
+    }
+
+    let proxy_start = Instant::now();
+
+    // Bidirectional copy: TLS stream (already decrypted) <-> target TCP stream
+    let result = tokio::io::copy_bidirectional(&mut tls_stream, &mut target_stream).await;
+
+    // Decrement active Trojan connection count
+    state.decrement_trojan_connections(trojan_port).await;
+
+    match result {
+        Ok((client_to_target, target_to_client)) => {
+            let elapsed = proxy_start.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+
+            debug!(
+                "Trojan connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
+                connection_id, client_to_target, target_to_client, elapsed_secs
+            );
+
+            state
+                .traffic_store
+                .record_bytes_in(trojan_port, client_to_target)
+                .await;
+            state
+                .traffic_store
+                .record_bytes_out(trojan_port, target_to_client)
+                .await;
+
+            // Update quality metrics
+            update_trojan_quality(
+                &state,
+                trojan_port,
+                connect_time_ms,
+                client_to_target,
+                target_to_client,
+                elapsed_secs,
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!("Trojan connection {} error: {}", connection_id, e);
+        }
+    }
+}
+
+/// Update quality metrics for Trojan connection
+async fn update_trojan_quality(
+    state: &ServerState,
+    port: u16,
+    connect_time_ms: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    elapsed_secs: f64,
+) {
+    use crate::server::quality::{
+        calculate_quality_score, check_warnings, ConnectionQuality, QualityThresholds,
+    };
+    use chrono::Utc;
+
+    let mut quality = ConnectionQuality {
+        last_rtt_ms: connect_time_ms as f32,
+        avg_rtt_ms: connect_time_ms as f32,
+        min_rtt_ms: connect_time_ms as f32,
+        max_rtt_ms: connect_time_ms as f32,
+        ..Default::default()
+    };
+
+    if elapsed_secs > 0.0 {
+        quality.bytes_in_per_sec = bytes_in as f64 / elapsed_secs;
+        quality.bytes_out_per_sec = bytes_out as f64 / elapsed_secs;
+    }
+
+    quality.quality_score = calculate_quality_score(quality.avg_rtt_ms, quality.loss_rate);
+
+    let thresholds = QualityThresholds::default();
+    let (is_warning, is_critical) =
+        check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
+    quality.is_warning = is_warning;
+    quality.is_critical = is_critical;
+    quality.last_update = Utc::now();
+
+    state.quality_store.update_quality(port, quality).await;
 }
 
 #[cfg(test)]
@@ -217,7 +416,11 @@ mod tests {
         let state = ServerState::new();
 
         // Register a shadowsocks port
-        assert!(state.register_shadowsocks(8388, "aes-256-gcm".into(), "password".into()).await);
+        assert!(
+            state
+                .register_shadowsocks(8388, "aes-256-gcm".into(), "password".into())
+                .await
+        );
 
         // Check initial traffic doesn't exist (zero effective)
         assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
@@ -246,7 +449,9 @@ mod tests {
         // Register both tunnel and SS
         let (sender, _) = tokio::sync::mpsc::channel(1);
         state.register_client(8080, None, sender).await;
-        state.register_shadowsocks(8388, "aes-256-gcm".into(), "password".into()).await;
+        state
+            .register_shadowsocks(8388, "aes-256-gcm".into(), "password".into())
+            .await;
 
         // Record traffic to both
         state.traffic_store.record_bytes_in(8080, 1234).await;

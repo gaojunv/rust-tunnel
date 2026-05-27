@@ -14,6 +14,10 @@
 #   TLS_KEY            -> tls_key
 #   LOG_LEVEL          -> log
 #   DB_PATH            -> db_path
+#   TROJAN_ENABLED     -> trojan_enabled
+#   TROJAN_PORT        -> trojan_port
+#   TROJAN_PASSWORD    -> trojan_password
+#   TROJAN_FALLBACK    -> trojan_fallback
 #
 # 命令行参数：
 #   --config               指定配置文件路径
@@ -108,6 +112,30 @@ db_path = "./data/rust-tunnel.db"
 # 环境变量：CLIENT_AUTH_TOKEN
 # 命令行参数：--client-auth-token <TOKEN>
 
+# --------------------
+# Trojan 代理配置
+# --------------------
+
+# 启用 Trojan 代理服务器
+# Trojan 协议需要 TLS 加密，使用独立的 TLS 监听端口
+# 默认值：false
+trojan_enabled = false
+
+# Trojan 监听端口（启用 Trojan 时必填）
+# 客户端将连接此端口进行 TLS 握手和 Trojan 协议通信
+# trojan_port = 443
+
+# Trojan 认证密码（启用 Trojan 时必填）
+# 客户端使用此密码的 SHA-224 哈希进行认证
+# 建议：使用高强度随机字符串
+# trojan_password = "your_trojan_password_here"
+
+# Trojan 认证失败时的回退地址
+# 当客户端发送的密码哈希不匹配时，流量将被转发到此地址
+# 格式：host:port，例如 "127.0.0.1:80" 转发到本地 Web 服务器
+# 这使得 Trojan 端口看起来像一个普通的 HTTPS 站点
+# trojan_fallback = "127.0.0.1:80"
+
 # ========================================
 # 生产环境推荐配置（取消注释使用）
 # ========================================
@@ -120,6 +148,10 @@ db_path = "./data/rust-tunnel.db"
 # admin_password = "change_this_to_strong_password"
 # jwt_secret = "generate_a_random_32_byte_string_here"
 # client_auth_token = "your_secure_client_auth_token"
+# trojan_enabled = true
+# trojan_port = 443
+# trojan_password = "your_trojan_password_here"
+# trojan_fallback = "127.0.0.1:80"
 # log = "warn"
 # db_path = "/var/lib/rust-tunnel/rust-tunnel.db"
 

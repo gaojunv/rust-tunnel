@@ -3,8 +3,8 @@ import { logout } from '../api/client';
 
 interface NavbarProps {
   onLogout: () => void;
-  activeTab: 'dashboard' | 'quality' | 'shadowsocks';
-  onTabChange: (tab: 'dashboard' | 'quality' | 'shadowsocks') => void;
+  activeTab: 'dashboard' | 'quality' | 'shadowsocks' | 'trojan';
+  onTabChange: (tab: 'dashboard' | 'quality' | 'shadowsocks' | 'trojan') => void;
 }
 
 export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
@@ -56,6 +56,16 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 }`}
               >
                 Shadowsocks
+              </button>
+              <button
+                onClick={() => onTabChange('trojan')}
+                className={`px-3 py-2 rounded-md text-sm font-medium ${
+                  activeTab === 'trojan'
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                Trojan
               </button>
             </div>
           </div>

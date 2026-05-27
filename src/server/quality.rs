@@ -1,9 +1,9 @@
+use crate::server::db::Database;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::server::db::Database;
 
 /// Connection quality alert thresholds
 #[derive(Debug, Clone)]
@@ -110,7 +110,6 @@ impl QualityTracker {
     pub fn record_ping(&mut self, seq: u32) -> (u32, f32) {
         self.total_pings += 1;
 
-
         // Handle sequence number reset (client likely restarted)
         // If seq is significantly behind expected, reset the tracker to avoid
         // incorrectly calculating packet loss
@@ -120,11 +119,7 @@ impl QualityTracker {
         }
 
         // Calculate lost packets
-        let lost = if seq > self.expected_seq {
-            seq - self.expected_seq
-        } else {
-            0
-        };
+        let lost = seq.saturating_sub(self.expected_seq);
 
         if lost > 0 {
             self.lost_pings += lost as u64;
@@ -187,7 +182,7 @@ pub fn calculate_quality_score(avg_rtt_ms: f32, loss_rate: f32) -> u8 {
     let latency_penalty = (avg_rtt_ms / 500.0 * 30.0).min(30.0);
     let loss_penalty = (loss_rate * 70.0).min(70.0);
     let score = 100.0 - latency_penalty - loss_penalty;
-    score.max(0.0).min(100.0).round() as u8
+    score.clamp(0.0, 100.0).round() as u8
 }
 
 /// Check if quality thresholds
@@ -196,8 +191,10 @@ pub fn check_warnings(
     loss_rate: f32,
     thresholds: &QualityThresholds,
 ) -> (bool, bool) {
-    let is_critical = avg_rtt_ms >= thresholds.critical_rtt_ms || loss_rate >= thresholds.critical_loss_rate;
-    let is_warning = !is_critical && (avg_rtt_ms >= thresholds.warning_rtt_ms || loss_rate >= thresholds.warning_loss_rate);
+    let is_critical =
+        avg_rtt_ms >= thresholds.critical_rtt_ms || loss_rate >= thresholds.critical_loss_rate;
+    let is_warning = !is_critical
+        && (avg_rtt_ms >= thresholds.warning_rtt_ms || loss_rate >= thresholds.warning_loss_rate);
     (is_warning, is_critical)
 }
 
@@ -244,11 +241,9 @@ impl QualityStore {
 
             // For each port, load last 60 minutes of history
             for port in ports {
-                let history = db.get_quality_history(
-                    port,
-                    Utc::now() - Duration::hours(24),
-                    Utc::now(),
-                ).await?;
+                let history = db
+                    .get_quality_history(port, Utc::now() - Duration::hours(24), Utc::now())
+                    .await?;
 
                 let mut port_samples = VecDeque::with_capacity(60);
                 for sample in history {
@@ -272,7 +267,9 @@ impl QualityStore {
     pub async fn add_sample(&self, port: u16, sample: QualitySample) {
         // Add to in-memory store
         let mut samples = self.samples.lock().await;
-        let port_samples = samples.entry(port).or_insert_with(|| VecDeque::with_capacity(60));
+        let port_samples = samples
+            .entry(port)
+            .or_insert_with(|| VecDeque::with_capacity(60));
         port_samples.push_back(sample.clone());
 
         while port_samples.len() > 60 {
@@ -282,19 +279,21 @@ impl QualityStore {
 
         // Persist to database if available
         if let Some(db) = &self.db {
-            let _ = db.insert_quality_history(
-                port,
-                sample.timestamp,
-                sample.avg_rtt_ms,
-                sample.avg_rtt_ms, // min_rtt_ms (use same as avg for history)
-                sample.avg_rtt_ms, // max_rtt_ms (use same as avg for history)
-                sample.loss_rate,
-                sample.bytes_in_per_sec,
-                sample.bytes_out_per_sec,
-                sample.quality_score,
-                false, // is_warning
-                false, // is_critical
-            ).await;
+            let _ = db
+                .insert_quality_history(
+                    port,
+                    sample.timestamp,
+                    sample.avg_rtt_ms,
+                    sample.avg_rtt_ms, // min_rtt_ms (use same as avg for history)
+                    sample.avg_rtt_ms, // max_rtt_ms (use same as avg for history)
+                    sample.loss_rate,
+                    sample.bytes_in_per_sec,
+                    sample.bytes_out_per_sec,
+                    sample.quality_score,
+                    false, // is_warning
+                    false, // is_critical
+                )
+                .await;
         }
     }
 
@@ -310,7 +309,10 @@ impl QualityStore {
 
     pub async fn get_samples(&self, port: u16) -> Vec<QualitySample> {
         let samples = self.samples.lock().await;
-        samples.get(&port).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+        samples
+            .get(&port)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub async fn remove_port(&self, port: u16) {
@@ -507,7 +509,10 @@ mod tests {
         }
 
         // Should only keep last 20 samples
-        assert_eq!(tracker.get_avg_rtt(), (5..25).map(|i| i as f32).sum::<f32>() / 20.0);
+        assert_eq!(
+            tracker.get_avg_rtt(),
+            (5..25).map(|i| i as f32).sum::<f32>() / 20.0
+        );
     }
 
     #[test]
@@ -615,18 +620,10 @@ mod tests {
         // Pre-populate with quality history
         let now = Utc::now();
         db.insert_quality_history(
-            8080,
-            now,
-            50.0,
-            30.0,
-            100.0,
-            0.02,
-            1024.0,
-            2048.0,
-            95,
-            false,
-            false,
-        ).await.unwrap();
+            8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+        )
+        .await
+        .unwrap();
 
         let store = QualityStore::with_db(db);
         store.load_from_db().await.unwrap();

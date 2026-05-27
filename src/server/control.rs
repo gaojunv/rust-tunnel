@@ -2,20 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
-use crate::common::{ControlMessage, TunnelError, TunnelResult, load_or_generate_cert, create_server_config};
-use crate::server::{ServerConfig, listener};
+use crate::common::{
+    create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
+};
 use crate::server::api::TrafficStore;
 use crate::server::db::Database;
 use crate::server::quality::{
-    QualityStore, QualityTracker, ConnectionQuality, QualitySample,
-    calculate_quality_score, check_warnings, QualityThresholds,
+    calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
+    QualityThresholds, QualityTracker,
 };
-use chrono::{Utc, Timelike};
+use crate::server::{listener, ServerConfig};
+use chrono::{Timelike, Utc};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -24,6 +26,7 @@ pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 pub enum PortType {
     Tunnel,
     Shadowsocks,
+    Trojan,
 }
 
 /// Information about a connected client
@@ -47,6 +50,13 @@ pub enum PortInfo {
         enabled: bool,
         created_at: i64,
     },
+    Trojan {
+        port: u16,
+        password: String,
+        fallback: String,
+        enabled: bool,
+        created_at: i64,
+    },
 }
 
 impl PortInfo {
@@ -54,6 +64,7 @@ impl PortInfo {
         match self {
             PortInfo::Tunnel(_) => PortType::Tunnel,
             PortInfo::Shadowsocks { .. } => PortType::Shadowsocks,
+            PortInfo::Trojan { .. } => PortType::Trojan,
         }
     }
 
@@ -61,6 +72,7 @@ impl PortInfo {
         match self {
             PortInfo::Tunnel(info) => info.remote_port,
             PortInfo::Shadowsocks { port, .. } => *port,
+            PortInfo::Trojan { port, .. } => *port,
         }
     }
 }
@@ -82,6 +94,8 @@ pub struct ServerState {
     active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
     /// Active Shadowsocks connections per port
     ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
+    /// Active Trojan connections per port
+    trojan_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Traffic statistics store
     pub traffic_store: TrafficStore,
     /// Database connection (optional)
@@ -92,6 +106,12 @@ pub struct ServerState {
     quality_trackers: Arc<Mutex<HashMap<u16, QualityTracker>>>,
 }
 
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServerState {
     /// Create a new server state without database (for backwards compatibility)
     pub fn new() -> Self {
@@ -99,6 +119,7 @@ impl ServerState {
             ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
+            trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
             quality_store: QualityStore::new(),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
@@ -112,6 +133,7 @@ impl ServerState {
             ports: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
+            trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
             quality_store: QualityStore::with_db(db.clone()),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
@@ -119,17 +141,25 @@ impl ServerState {
         }
     }
 
-    pub async fn register_client(&self, remote_port: u16, hostname: Option<String>, control_sender: ControlMessageSender) -> bool {
+    pub async fn register_client(
+        &self,
+        remote_port: u16,
+        hostname: Option<String>,
+        control_sender: ControlMessageSender,
+    ) -> bool {
         let hostname_clone = hostname.clone();
         let mut ports = self.ports.lock().await;
         if ports.contains_key(&remote_port) {
             return false;
         }
-        ports.insert(remote_port, PortInfo::Tunnel(ClientInfo {
+        ports.insert(
             remote_port,
-            hostname,
-            control_sender,
-        }));
+            PortInfo::Tunnel(ClientInfo {
+                remote_port,
+                hostname,
+                control_sender,
+            }),
+        );
 
         // Record client connection in database
         if let Some(db) = &self.db {
@@ -172,13 +202,16 @@ impl ServerState {
         if ports.contains_key(&port) {
             return false;
         }
-        ports.insert(port, PortInfo::Shadowsocks {
+        ports.insert(
             port,
-            cipher,
-            password,
-            enabled: true,
-            created_at: chrono::Utc::now().timestamp(),
-        });
+            PortInfo::Shadowsocks {
+                port,
+                cipher,
+                password,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
         true
     }
 
@@ -192,12 +225,20 @@ impl ServerState {
         ports.remove(&port).is_some()
     }
 
-    pub async fn add_active_connection(&self, connection_id: u64, remote_port: u16, user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>) {
+    pub async fn add_active_connection(
+        &self,
+        connection_id: u64,
+        remote_port: u16,
+        user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
+    ) {
         let mut active_connections = self.active_connections.lock().await;
-        active_connections.insert(connection_id, ActiveConnection {
-            user_writer,
-            remote_port,
-        });
+        active_connections.insert(
+            connection_id,
+            ActiveConnection {
+                user_writer,
+                remote_port,
+            },
+        );
     }
 
     /// Get the number of active connections for a specific port
@@ -208,11 +249,13 @@ impl ServerState {
             .filter(|conn| conn.remote_port == remote_port)
             .count();
 
-        // Add Shadowsocks connection count if it's an SS port
         let ss_connections = self.ss_active_connections.lock().await;
         let ss_count = ss_connections.get(&remote_port).copied().unwrap_or(0);
 
-        tunnel_count + ss_count
+        let trojan_connections = self.trojan_active_connections.lock().await;
+        let trojan_count = trojan_connections.get(&remote_port).copied().unwrap_or(0);
+
+        tunnel_count + ss_count + trojan_count
     }
 
     /// Increment active Shadowsocks connections for a port
@@ -225,6 +268,58 @@ impl ServerState {
     pub async fn decrement_ss_connections(&self, port: u16) {
         let mut ss_connections = self.ss_active_connections.lock().await;
         if let Some(count) = ss_connections.get_mut(&port) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+    }
+
+    pub async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
+        let mut ports = self.ports.lock().await;
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(
+            port,
+            PortInfo::Trojan {
+                port,
+                password,
+                fallback,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
+        true
+    }
+
+    /// Get all Trojan ports
+    pub async fn get_trojan_ports(&self) -> Vec<u16> {
+        let ports = self.ports.lock().await;
+        ports
+            .iter()
+            .filter_map(|(port, info)| match info {
+                PortInfo::Trojan { .. } => Some(*port),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check if a port is a Trojan port
+    pub async fn is_trojan_port(&self, port: u16) -> bool {
+        let ports = self.ports.lock().await;
+        matches!(ports.get(&port), Some(PortInfo::Trojan { .. }))
+    }
+
+    /// Increment active Trojan connections for a port
+    pub async fn increment_trojan_connections(&self, port: u16) {
+        let mut trojan_connections = self.trojan_active_connections.lock().await;
+        *trojan_connections.entry(port).or_insert(0) += 1;
+    }
+
+    /// Decrement active Trojan connections for a port
+    pub async fn decrement_trojan_connections(&self, port: u16) {
+        let mut trojan_connections = self.trojan_active_connections.lock().await;
+        if let Some(count) = trojan_connections.get_mut(&port) {
             if *count > 0 {
                 *count -= 1;
             }
@@ -248,7 +343,9 @@ impl ServerState {
             drop(active_connections);
 
             // Record traffic to the correct port
-            self.traffic_store.record_bytes_out(remote_port, bytes as u64).await;
+            self.traffic_store
+                .record_bytes_out(remote_port, bytes as u64)
+                .await;
             Ok(())
         } else {
             debug!("No active connection found for id {}", connection_id);
@@ -264,7 +361,8 @@ impl ServerState {
     // API helper methods
     pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
         let ports = self.ports.lock().await;
-        ports.iter()
+        ports
+            .iter()
             .filter_map(|(port, info)| match info {
                 PortInfo::Tunnel(client_info) => Some((*port, client_info.clone())),
                 _ => None,
@@ -274,13 +372,19 @@ impl ServerState {
 
     pub async fn get_client_count(&self) -> usize {
         let ports = self.ports.lock().await;
-        ports.values().filter(|p| matches!(p, PortInfo::Tunnel(_))).count()
+        ports
+            .values()
+            .filter(|p| matches!(p, PortInfo::Tunnel(_)))
+            .count()
     }
 
     pub async fn get_active_connection_count(&self) -> usize {
         let active_connections = self.active_connections.lock().await;
         let ss_connections = self.ss_active_connections.lock().await;
-        active_connections.len() + ss_connections.values().sum::<usize>()
+        let trojan_connections = self.trojan_active_connections.lock().await;
+        active_connections.len()
+            + ss_connections.values().sum::<usize>()
+            + trojan_connections.values().sum::<usize>()
     }
 
     pub async fn disconnect_client(&self, remote_port: u16) -> bool {
@@ -315,7 +419,8 @@ impl ServerState {
     /// Get all Shadowsocks ports
     pub async fn get_shadowsocks_ports(&self) -> Vec<u16> {
         let ports = self.ports.lock().await;
-        ports.iter()
+        ports
+            .iter()
             .filter_map(|(port, info)| match info {
                 PortInfo::Shadowsocks { .. } => Some(*port),
                 _ => None,
@@ -464,10 +569,18 @@ mod ss_integration_tests {
 
         // Register a tunnel port
         let (sender, _) = tokio::sync::mpsc::channel(1);
-        assert!(state.register_client(8080, Some("test-host".to_string()), sender.clone()).await);
+        assert!(
+            state
+                .register_client(8080, Some("test-host".to_string()), sender.clone())
+                .await
+        );
 
         // Register a shadowsocks port
-        assert!(state.register_shadowsocks(8388, "aes-256-gcm".to_string(), "test-pass".to_string()).await);
+        assert!(
+            state
+                .register_shadowsocks(8388, "aes-256-gcm".to_string(), "test-pass".to_string())
+                .await
+        );
 
         // Verify both are registered
         let clients = state.get_all_clients().await;
@@ -500,7 +613,9 @@ mod ss_integration_tests {
         assert!(!state.is_shadowsocks_port(9000).await);
 
         // Register SS
-        state.register_shadowsocks(9001, "aes-256-gcm".to_string(), "pass".to_string()).await;
+        state
+            .register_shadowsocks(9001, "aes-256-gcm".to_string(), "pass".to_string())
+            .await;
         assert!(state.is_shadowsocks_port(9001).await);
     }
 
@@ -511,7 +626,9 @@ mod ss_integration_tests {
         // Register both
         let (sender, _) = tokio::sync::mpsc::channel(1);
         state.register_client(9002, None, sender.clone()).await;
-        state.register_shadowsocks(9003, "aes-256-gcm".to_string(), "pass".to_string()).await;
+        state
+            .register_shadowsocks(9003, "aes-256-gcm".to_string(), "pass".to_string())
+            .await;
 
         // Both exist
         assert!(state.get_port(9002).await.is_some());
@@ -537,11 +654,19 @@ mod ss_integration_tests {
         // Register tunnel first
         assert!(state.register_client(8080, None, sender.clone()).await);
         // Cannot register SS on same port
-        assert!(!state.register_shadowsocks(8080, "aes-256-gcm".into(), "pass".into()).await);
+        assert!(
+            !state
+                .register_shadowsocks(8080, "aes-256-gcm".into(), "pass".into())
+                .await
+        );
 
         // Create new state, reverse order
         let state2 = ServerState::new();
-        assert!(state2.register_shadowsocks(8081, "aes-256-gcm".into(), "pass".into()).await);
+        assert!(
+            state2
+                .register_shadowsocks(8081, "aes-256-gcm".into(), "pass".into())
+                .await
+        );
         // Cannot register tunnel on same port
         assert!(!state2.register_client(8081, None, sender.clone()).await);
     }
@@ -581,7 +706,9 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             Ok(Some(msg)) => msg,
             Ok(None) => {
                 if registered_ports.is_empty() {
-                    return Err(TunnelError::Protocol("Connection closed before registration".into()));
+                    return Err(TunnelError::Protocol(
+                        "Connection closed before registration".into(),
+                    ));
                 } else {
                     break;
                 }
@@ -597,8 +724,15 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         };
 
         match msg {
-            ControlMessage::Register { remote_port, hostname, auth_token: client_auth_token } => {
-                info!("Received registration request for port {} from hostname {:?}", remote_port, hostname);
+            ControlMessage::Register {
+                remote_port,
+                hostname,
+                auth_token: client_auth_token,
+            } => {
+                info!(
+                    "Received registration request for port {} from hostname {:?}",
+                    remote_port, hostname
+                );
 
                 // Validate authentication token if server requires it
                 if let Some(ref expected_token) = config.client_auth_token {
@@ -608,18 +742,22 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         }
                         Some(_) => {
                             warn!("Client authentication failed: invalid token");
-                            let _ = sender.send(ControlMessage::RegisterResponse {
-                                success: false,
-                                message: "Invalid authentication token".into(),
-                            }).await;
+                            let _ = sender
+                                .send(ControlMessage::RegisterResponse {
+                                    success: false,
+                                    message: "Invalid authentication token".into(),
+                                })
+                                .await;
                             continue;
                         }
                         None => {
                             warn!("Client authentication failed: token required but not provided");
-                            let _ = sender.send(ControlMessage::RegisterResponse {
-                                success: false,
-                                message: "Authentication token required".into(),
-                            }).await;
+                            let _ = sender
+                                .send(ControlMessage::RegisterResponse {
+                                    success: false,
+                                    message: "Authentication token required".into(),
+                                })
+                                .await;
                             continue;
                         }
                     }
@@ -629,21 +767,30 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 state.remove_client(remote_port).await;
 
                 // Now register the new client (clone sender for each registration)
-                let registered = state.register_client(remote_port, hostname.clone(), sender.clone()).await;
+                let registered = state
+                    .register_client(remote_port, hostname.clone(), sender.clone())
+                    .await;
 
                 if !registered {
-                    let _ = sender.send(ControlMessage::RegisterResponse {
-                        success: false,
-                        message: format!("Port {} already registered", remote_port),
-                    }).await;
+                    let _ = sender
+                        .send(ControlMessage::RegisterResponse {
+                            success: false,
+                            message: format!("Port {} already registered", remote_port),
+                        })
+                        .await;
                     continue;
                 }
 
                 // Send registration success
-                sender.send(ControlMessage::RegisterResponse {
-                    success: true,
-                    message: "Registered successfully".into(),
-                }).await.map_err(|_| TunnelError::Protocol("Failed to send registration response".into()))?;
+                sender
+                    .send(ControlMessage::RegisterResponse {
+                        success: true,
+                        message: "Registered successfully".into(),
+                    })
+                    .await
+                    .map_err(|_| {
+                        TunnelError::Protocol("Failed to send registration response".into())
+                    })?;
 
                 info!("Client registered for port {}", remote_port);
                 registered_ports.push(remote_port);
@@ -659,7 +806,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     info!("Client unregistered from port {}", remote_port);
                 });
             }
-            ControlMessage::Ping { seq, timestamp_micros } => {
+            ControlMessage::Ping {
+                seq,
+                timestamp_micros,
+            } => {
                 // Ping received during registration phase
                 if !registered_ports.is_empty() {
                     // Process quality update
@@ -682,13 +832,18 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
                     // Send pong response
                     let pong_timestamp_micros = now_micros;
-                    let _ = sender.send(ControlMessage::Pong {
-                        seq,
-                        ping_timestamp_micros: timestamp_micros,
-                        pong_timestamp_micros,
-                    }).await;
+                    let _ = sender
+                        .send(ControlMessage::Pong {
+                            seq,
+                            ping_timestamp_micros: timestamp_micros,
+                            pong_timestamp_micros,
+                        })
+                        .await;
 
-                    info!("Registration phase complete (received Ping), {} ports registered", registered_ports.len());
+                    info!(
+                        "Registration phase complete (received Ping), {} ports registered",
+                        registered_ports.len()
+                    );
                     break;
                 } else {
                     // No ports registered yet, just ignore and continue waiting
@@ -698,14 +853,21 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             _ => {
                 // If we have registered ports, this is the end of registration phase
                 if !registered_ports.is_empty() {
-                    info!("Registration phase complete, {} ports registered", registered_ports.len());
+                    info!(
+                        "Registration phase complete, {} ports registered",
+                        registered_ports.len()
+                    );
                     break;
                 } else {
-                    let _ = sender.send(ControlMessage::RegisterResponse {
-                        success: false,
-                        message: "Expected registration message".into(),
-                    }).await;
-                    return Err(TunnelError::Protocol("Expected registration message".into()));
+                    let _ = sender
+                        .send(ControlMessage::RegisterResponse {
+                            success: false,
+                            message: "Expected registration message".into(),
+                        })
+                        .await;
+                    return Err(TunnelError::Protocol(
+                        "Expected registration message".into(),
+                    ));
                 }
             }
         }
@@ -716,9 +878,16 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         match ControlMessage::read_from_stream(&mut reader).await {
             Ok(Some(msg)) => {
                 match msg {
-                    ControlMessage::Register { remote_port, hostname, auth_token: client_auth_token } => {
+                    ControlMessage::Register {
+                        remote_port,
+                        hostname,
+                        auth_token: client_auth_token,
+                    } => {
                         // Handle late registration (client might send more Register messages later)
-                        info!("Received late registration request for port {} from hostname {:?}", remote_port, hostname);
+                        info!(
+                            "Received late registration request for port {} from hostname {:?}",
+                            remote_port, hostname
+                        );
 
                         // Validate authentication token if server requires it
                         if let Some(ref expected_token) = config.client_auth_token {
@@ -728,18 +897,22 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                                 }
                                 Some(_) => {
                                     warn!("Client authentication failed: invalid token");
-                                    let _ = sender.send(ControlMessage::RegisterResponse {
-                                        success: false,
-                                        message: "Invalid authentication token".into(),
-                                    }).await;
+                                    let _ = sender
+                                        .send(ControlMessage::RegisterResponse {
+                                            success: false,
+                                            message: "Invalid authentication token".into(),
+                                        })
+                                        .await;
                                     continue;
                                 }
                                 None => {
                                     warn!("Client authentication failed: token required but not provided");
-                                    let _ = sender.send(ControlMessage::RegisterResponse {
-                                        success: false,
-                                        message: "Authentication token required".into(),
-                                    }).await;
+                                    let _ = sender
+                                        .send(ControlMessage::RegisterResponse {
+                                            success: false,
+                                            message: "Authentication token required".into(),
+                                        })
+                                        .await;
                                     continue;
                                 }
                             }
@@ -749,19 +922,30 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         state.remove_client(remote_port).await;
 
                         // Now register the new client
-                        let registered = state.register_client(remote_port, hostname.clone(), sender.clone()).await;
+                        let registered = state
+                            .register_client(remote_port, hostname.clone(), sender.clone())
+                            .await;
 
                         if !registered {
-                            let _ = sender.send(ControlMessage::RegisterResponse {
-                                success: false,
-                                message: format!("Port {} already registered", remote_port),
-                            }).await;
+                            let _ = sender
+                                .send(ControlMessage::RegisterResponse {
+                                    success: false,
+                                    message: format!("Port {} already registered", remote_port),
+                                })
+                                .await;
                         } else {
                             // Send registration success
-                            sender.send(ControlMessage::RegisterResponse {
-                                success: true,
-                                message: "Registered successfully".into(),
-                            }).await.map_err(|_| TunnelError::Protocol("Failed to send registration response".into()))?;
+                            sender
+                                .send(ControlMessage::RegisterResponse {
+                                    success: true,
+                                    message: "Registered successfully".into(),
+                                })
+                                .await
+                                .map_err(|_| {
+                                    TunnelError::Protocol(
+                                        "Failed to send registration response".into(),
+                                    )
+                                })?;
 
                             info!("Client registered for port {}", remote_port);
                             registered_ports.push(remote_port);
@@ -770,7 +954,9 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             let state_clone = state.clone();
                             let state_for_remove = state.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = listener::run_listener(state_clone, remote_port).await {
+                                if let Err(e) =
+                                    listener::run_listener(state_clone, remote_port).await
+                                {
                                     error!("Listener for port {} failed: {}", remote_port, e);
                                 }
                                 state_for_remove.remove_client(remote_port).await;
@@ -778,7 +964,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             });
                         }
                     }
-                    ControlMessage::Ping { seq, timestamp_micros } => {
+                    ControlMessage::Ping {
+                        seq,
+                        timestamp_micros,
+                    } => {
                         // Calculate RTT using server time
                         let now = Utc::now();
                         let now_micros = std::time::SystemTime::now()
@@ -790,7 +979,6 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         } else {
                             0.0 // Clock went backwards, ignore
                         };
-
 
                         // Iterate all registered ports for this connection and update quality
                         for &port in &registered_ports {
@@ -813,7 +1001,8 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
                             // Check warnings
                             let thresholds = QualityThresholds::default();
-                            let (is_warning, is_critical) = check_warnings(avg_rtt, loss_rate, &thresholds);
+                            let (is_warning, is_critical) =
+                                check_warnings(avg_rtt, loss_rate, &thresholds);
 
                             // Get throughput from TrafficStore (simplified)
                             // For now we use 0 since we don't have per-second calculation yet
@@ -860,19 +1049,27 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
                             .unwrap_or(0);
-                        let _ = sender.send(ControlMessage::Pong {
-                            seq,
-                            ping_timestamp_micros: timestamp_micros,
-                            pong_timestamp_micros,
-                        }).await;
+                        let _ = sender
+                            .send(ControlMessage::Pong {
+                                seq,
+                                ping_timestamp_micros: timestamp_micros,
+                                pong_timestamp_micros,
+                            })
+                            .await;
                     }
                     ControlMessage::Pong { .. } => {
                         // Ignore, pong is only server -> client
                     }
-                    ControlMessage::Data { connection_id, data } => {
+                    ControlMessage::Data {
+                        connection_id,
+                        data,
+                    } => {
                         // Deliver data from client to user connection
                         if let Err(e) = state.deliver_data(connection_id, data).await {
-                            warn!("Failed to deliver data to connection {}: {}", connection_id, e);
+                            warn!(
+                                "Failed to deliver data to connection {}: {}",
+                                connection_id, e
+                            );
                         }
                     }
                     ControlMessage::ConnectionReady { .. } => {
@@ -908,7 +1105,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     for &remote_port in &registered_ports {
         state.remove_client(remote_port).await;
         state.remove_quality_tracker(remote_port).await;
-        info!("Client unregistered from port {} (control connection closed)", remote_port);
+        info!(
+            "Client unregistered from port {} (control connection closed)",
+            remote_port
+        );
     }
 
     result
@@ -963,9 +1163,7 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
                         }
                     }
                 }
-                None => {
-                    handle_control_connection(config_clone, state_clone, stream).await
-                }
+                None => handle_control_connection(config_clone, state_clone, stream).await,
             };
 
             if let Err(e) = result {
