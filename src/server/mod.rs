@@ -4,6 +4,7 @@ pub mod config;
 pub mod control;
 pub mod db;
 pub mod listener;
+pub mod logs;
 pub mod proxy;
 pub mod quality;
 pub mod shadowsocks;
