@@ -7,6 +7,7 @@ import { ClientDetail } from './ClientDetail';
 import { QualityPage } from './QualityPage';
 import { ShadowsocksPage } from './ShadowsocksPage';
 import { TrojanPage } from './TrojanPage';
+import { LogsPage } from './LogsPage';
 import { getMetrics, getTraffic } from '../api/client';
 
 interface DashboardProps {
@@ -23,7 +24,7 @@ const formatBytes = (bytes: number): string => {
 
 export const Dashboard = ({ onLogout }: DashboardProps) => {
   const [selectedPort, setSelectedPort] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'quality' | 'shadowsocks' | 'trojan'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs'>('dashboard');
 
   const { data: metrics } = useQuery('metrics', getMetrics, {
     refetchInterval: 5000,
@@ -119,8 +120,10 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
           <QualityPage onSelectClient={handleSelectClient} />
         ) : activeTab === 'shadowsocks' ? (
           <ShadowsocksPage />
-        ) : (
+        ) : activeTab === 'trojan' ? (
           <TrojanPage />
+        ) : (
+          <LogsPage />
         )}
       </main>
 

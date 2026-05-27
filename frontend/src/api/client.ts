@@ -15,6 +15,7 @@ import type {
   TrojanConfig,
   TrojanStats,
   TrojanQuality,
+  LogEntry,
 } from '../types';
 
 const API_BASE = '/api';
@@ -157,5 +158,27 @@ export const getTrojanStats = async (): Promise<TrojanStats> => {
 
 export const getTrojanQuality = async (): Promise<TrojanQuality[]> => {
   const response = await api.get<TrojanQuality[]>('/trojan/quality');
+  return response.data;
+};
+
+// Logs API
+export const getLogs = async (params?: {
+  level?: string;
+  source?: string;
+  search?: string;
+  limit?: number;
+  before_id?: number;
+}): Promise<LogEntry[]> => {
+  const response = await api.get<LogEntry[]>('/logs', { params });
+  return response.data;
+};
+
+export const getLogsLevel = async (): Promise<{ level: string }> => {
+  const response = await api.get<{ level: string }>('/logs/level');
+  return response.data;
+};
+
+export const setLogsLevel = async (level: string): Promise<{ level: string }> => {
+  const response = await api.put<{ level: string }>('/logs/level', { level });
   return response.data;
 };
