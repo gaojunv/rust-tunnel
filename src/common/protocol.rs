@@ -3,6 +3,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::common::{TunnelError, TunnelResult};
 
+/// A log entry from a connected client
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClientLogEntry {
+    /// Microsecond timestamp
+    pub timestamp: i64,
+    /// TRACE/DEBUG/INFO/WARN/ERROR
+    pub level: String,
+    /// tracing target (module path)
+    pub target: String,
+    /// Log message content
+    pub message: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
     /// Client requests registration to expose a remote port
@@ -44,6 +57,10 @@ pub enum ControlMessage {
     },
     /// Server requests client to disconnect (web interface admin action)
     Disconnect,
+    /// Client sends a batch of log entries
+    LogBatch {
+        entries: Vec<ClientLogEntry>,
+    },
 }
 
 impl ControlMessage {
@@ -295,6 +312,28 @@ mod tests {
             let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap();
             assert!(read_msg.is_some(), "Failed to roundtrip {:?}", msg);
         }
+    }
+
+    #[test]
+    fn test_log_batch_serialization() {
+        let msg = ControlMessage::LogBatch {
+            entries: vec![
+                ClientLogEntry {
+                    timestamp: 1234567890,
+                    level: "INFO".into(),
+                    target: "client::proxy".into(),
+                    message: "Connection established".into(),
+                },
+                ClientLogEntry {
+                    timestamp: 1234567891,
+                    level: "ERROR".into(),
+                    target: "client::control".into(),
+                    message: "Heartbeat timeout".into(),
+                },
+            ],
+        };
+        let bytes = msg.serialize().unwrap();
+        assert!(bytes.len() > 4);
     }
 
     #[tokio::test]
