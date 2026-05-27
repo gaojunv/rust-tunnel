@@ -104,6 +104,8 @@ pub struct ServerState {
     pub quality_store: QualityStore,
     /// Quality trackers per port
     quality_trackers: Arc<Mutex<HashMap<u16, QualityTracker>>>,
+    /// Log store for capturing and broadcasting logs
+    pub log_store: Option<crate::server::logs::LogStore>,
 }
 
 impl Default for ServerState {
@@ -124,6 +126,7 @@ impl ServerState {
             quality_store: QualityStore::new(),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: None,
+            log_store: None,
         }
     }
 
@@ -137,7 +140,8 @@ impl ServerState {
             traffic_store: TrafficStore::with_db(db.clone()),
             quality_store: QualityStore::with_db(db.clone()),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
-            db: Some(db),
+            db: Some(db.clone()),
+            log_store: Some(crate::server::logs::LogStore::new(Some(db))),
         }
     }
 
@@ -850,6 +854,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     continue;
                 }
             }
+            ControlMessage::LogBatch { .. } => {
+                // Log batches during registration phase are silently dropped
+                // (no ports registered yet, so no source context)
+            }
             _ => {
                 // If we have registered ports, this is the end of registration phase
                 if !registered_ports.is_empty() {
@@ -1059,6 +1067,32 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     }
                     ControlMessage::Pong { .. } => {
                         // Ignore, pong is only server -> client
+                    }
+                    ControlMessage::LogBatch { entries } => {
+                        if let Some(ref log_store) = state.log_store {
+                            // Find hostname from first registered port
+                            let hostname = if let Some(&port) = registered_ports.first() {
+                                state.get_client(port).await.map(|c| c.hostname).flatten()
+                            } else {
+                                None
+                            };
+                            let source_prefix = format!(
+                                "client:{}:{}",
+                                hostname.as_deref().unwrap_or("unknown"),
+                                registered_ports.first().copied().unwrap_or(0)
+                            );
+
+                            for entry in entries {
+                                log_store.send(crate::server::logs::LogEntry {
+                                    id: 0,
+                                    timestamp: entry.timestamp,
+                                    level: entry.level,
+                                    source: source_prefix.clone(),
+                                    target: entry.target,
+                                    message: entry.message,
+                                });
+                            }
+                        }
                     }
                     ControlMessage::Data {
                         connection_id,
