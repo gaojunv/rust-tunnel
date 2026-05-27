@@ -14,7 +14,7 @@ use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ServerConfig;
 use rustls::{ClientConfig, RootCertStore};
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls_pemfile::certs;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info};
@@ -43,7 +43,7 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
 
-    let key_pair = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)
+    let key_pair = KeyPair::generate(&rcgen::PKCS_ED25519)
         .map_err(|e| format!("Failed to generate key pair: {}", e))?;
     let cert = Certificate::from_params(params)
         .map_err(|e| format!("Failed to generate certificate: {}", e))?;
@@ -108,20 +108,27 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
         return Err(TunnelError::Tls("No certificates found in file".into()));
     }
 
-    // Load private key
+    // Load private key (supports PKCS#8, PKCS#1 RSA, and SEC1 EC formats)
     let key_file = fs::File::open(key_path).map_err(TunnelError::Io)?;
     let mut key_reader = BufReader::new(key_file);
-    let keys: Vec<_> = pkcs8_private_keys(&mut key_reader)
-        .collect::<Result<_, _>>()
-        .map_err(|e| TunnelError::Tls(format!("Failed to load private key: {}", e)))?;
+    let item = rustls_pemfile::read_one(&mut key_reader)
+        .map_err(|e| TunnelError::Tls(format!("Failed to read private key: {}", e)))?
+        .ok_or_else(|| TunnelError::Tls("No private key found in file".into()))?;
 
-    if keys.is_empty() {
-        return Err(TunnelError::Tls("No private keys found in file".into()));
-    }
+    let key = match item {
+        rustls_pemfile::Item::Pkcs8Key(key) => PrivateKeyDer::Pkcs8(key),
+        rustls_pemfile::Item::Pkcs1Key(key) => PrivateKeyDer::Pkcs1(key),
+        rustls_pemfile::Item::Sec1Key(key) => PrivateKeyDer::Sec1(key),
+        _ => {
+            return Err(TunnelError::Tls(
+                "Unsupported private key format in file".into(),
+            ))
+        }
+    };
 
     Ok(TlsCertPair {
         certs,
-        key: PrivateKeyDer::from(keys.into_iter().next().unwrap()),
+        key,
     })
 }
 

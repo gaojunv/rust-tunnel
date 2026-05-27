@@ -17,8 +17,8 @@ client_auth_token = "${CLIENT_AUTH_TOKEN}"
 tls = true
 
 # 自签名证书路径 (自动生成，无需手动配置)
-tls_cert = "./data/tls/cert.pem"
-tls_key = "./data/tls/key.pem"
+tls_cert = "./data/tls/fullchain.pem"
+tls_key = "./data/tls/privkey.key"
 
 # 日志级别
 log = "info"
