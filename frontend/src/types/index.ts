@@ -108,3 +108,26 @@ export interface ShadowsocksQuality {
   quality: ConnectionQuality;
   history: QualitySample[];
 }
+
+// Trojan configuration
+export interface TrojanConfig {
+  enabled: boolean;
+  port?: number;
+  fallback?: string;
+}
+
+// Trojan statistics
+export interface TrojanStats {
+  enabled: boolean;
+  port?: number;
+  total_bytes_in: number;
+  total_bytes_out: number;
+  active_connections: number;
+}
+
+// Trojan quality data with history
+export interface TrojanQuality {
+  port: number;
+  quality: ConnectionQuality;
+  history: QualitySample[];
+}

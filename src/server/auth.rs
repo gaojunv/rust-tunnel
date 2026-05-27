@@ -20,6 +20,12 @@ pub struct Claims {
     pub jti: String,
 }
 
+impl Default for Claims {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Claims {
     pub fn new() -> Self {
         let now = SystemTime::now()
@@ -76,7 +82,10 @@ pub fn create_token(jwt_secret: &str) -> Result<String, jsonwebtoken::errors::Er
 }
 
 /// Validate JWT token
-pub fn validate_token(token: &str, jwt_secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+pub fn validate_token(
+    token: &str,
+    jwt_secret: &str,
+) -> Result<Claims, jsonwebtoken::errors::Error> {
     decode::<Claims>(
         token,
         &DecodingKey::from_secret(jwt_secret.as_bytes()),
@@ -131,11 +140,7 @@ pub async fn auth_middleware(
                 .and_then(|cookies| {
                     cookies.split(';').find_map(|cookie| {
                         let cookie = cookie.trim();
-                        if cookie.starts_with("token=") {
-                            Some(&cookie[6..])
-                        } else {
-                            None
-                        }
+                        cookie.strip_prefix("token=")
                     })
                 })
                 .unwrap_or("")

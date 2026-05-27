@@ -1,5 +1,8 @@
 use clap::Parser;
-use figment::{Figment, providers::{Toml, Format}};
+use figment::{
+    providers::{Format, Toml},
+    Figment,
+};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -71,6 +74,22 @@ pub struct ServerCli {
     /// Shadowsocks password
     #[clap(long = "ss-password")]
     pub ss_password: Option<String>,
+
+    /// Enable Trojan proxy service
+    #[clap(long = "trojan-enabled")]
+    pub trojan_enabled: Option<bool>,
+
+    /// Trojan listen port
+    #[clap(long = "trojan-port")]
+    pub trojan_port: Option<u16>,
+
+    /// Trojan password
+    #[clap(long = "trojan-password")]
+    pub trojan_password: Option<String>,
+
+    /// Trojan fallback address for non-Trojan traffic (default: 127.0.0.1:80)
+    #[clap(long = "trojan-fallback")]
+    pub trojan_fallback: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -89,6 +108,10 @@ pub struct ServerConfigFile {
     pub ss_port: Option<u16>,
     pub ss_cipher: Option<String>,
     pub ss_password: Option<String>,
+    pub trojan_enabled: Option<bool>,
+    pub trojan_port: Option<u16>,
+    pub trojan_password: Option<String>,
+    pub trojan_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +135,10 @@ pub struct ServerConfig {
     pub ss_port: Option<u16>,
     pub ss_cipher: Option<String>,
     pub ss_password: Option<String>,
+    pub trojan_enabled: bool,
+    pub trojan_port: Option<u16>,
+    pub trojan_password: Option<String>,
+    pub trojan_fallback: String,
 }
 
 impl Default for ServerConfig {
@@ -122,7 +149,7 @@ impl Default for ServerConfig {
             admin_password: None,
             jwt_secret: None,
             client_auth_token: None,
-            tls: true,  // TLS enabled by default for security
+            tls: true, // TLS enabled by default for security
             tls_cert: "./data/tls/cert.pem".to_string(),
             tls_key: "./data/tls/key.pem".to_string(),
             log: "info".to_string(),
@@ -131,6 +158,10 @@ impl Default for ServerConfig {
             ss_port: None,
             ss_cipher: None,
             ss_password: None,
+            trojan_enabled: false,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: "127.0.0.1:80".to_string(),
         }
     }
 }
@@ -194,6 +225,18 @@ impl ServerConfig {
                 if let Some(v) = file_config.ss_password {
                     config.ss_password = Some(v);
                 }
+                if let Some(v) = file_config.trojan_enabled {
+                    config.trojan_enabled = v;
+                }
+                if let Some(v) = file_config.trojan_port {
+                    config.trojan_port = Some(v);
+                }
+                if let Some(v) = file_config.trojan_password {
+                    config.trojan_password = Some(v);
+                }
+                if let Some(v) = file_config.trojan_fallback {
+                    config.trojan_fallback = v;
+                }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
             }
@@ -247,6 +290,22 @@ impl ServerConfig {
             config.ss_password = Some(v);
         }
 
+        // Environment variables for Trojan
+        if let Ok(v) = std::env::var("TROJAN_ENABLED") {
+            config.trojan_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("TROJAN_PORT") {
+            if let Ok(port) = v.parse::<u16>() {
+                config.trojan_port = Some(port);
+            }
+        }
+        if let Ok(v) = std::env::var("TROJAN_PASSWORD") {
+            config.trojan_password = Some(v);
+        }
+        if let Ok(v) = std::env::var("TROJAN_FALLBACK") {
+            config.trojan_fallback = v;
+        }
+
         // 3. Command line arguments (highest priority)
         if let Some(v) = cli.control_addr {
             config.control_addr = v;
@@ -290,6 +349,18 @@ impl ServerConfig {
         if let Some(v) = cli.ss_password {
             config.ss_password = Some(v);
         }
+        if let Some(v) = cli.trojan_enabled {
+            config.trojan_enabled = v;
+        }
+        if let Some(v) = cli.trojan_port {
+            config.trojan_port = Some(v);
+        }
+        if let Some(v) = cli.trojan_password {
+            config.trojan_password = Some(v);
+        }
+        if let Some(v) = cli.trojan_fallback {
+            config.trojan_fallback = v;
+        }
 
         // Validate Shadowsocks configuration
         if config.ss_enabled {
@@ -305,7 +376,27 @@ impl ServerConfig {
             // Validate cipher method
             let cipher = config.ss_cipher.as_ref().unwrap();
             if cipher != "aes-256-gcm" && cipher != "chacha20-ietf-poly1305" {
-                return Err(format!("Unsupported cipher: {}. Supported: aes-256-gcm, chacha20-ietf-poly1305", cipher));
+                return Err(format!(
+                    "Unsupported cipher: {}. Supported: aes-256-gcm, chacha20-ietf-poly1305",
+                    cipher
+                ));
+            }
+        }
+
+        // Validate Trojan configuration
+        if config.trojan_enabled {
+            if config.trojan_port.is_none() {
+                return Err("trojan_port is required when trojan_enabled is true".to_string());
+            }
+            if config.trojan_password.is_none() {
+                return Err("trojan_password is required when trojan_enabled is true".to_string());
+            }
+            // Trojan requires TLS
+            if !config.tls {
+                return Err(
+                    "TLS must be enabled for Trojan protocol (trojan requires TLS transport)"
+                        .to_string(),
+                );
             }
         }
 
@@ -326,13 +417,17 @@ mod tests {
         assert!(config.admin_password.is_none());
         assert!(config.jwt_secret.is_none());
         assert!(config.client_auth_token.is_none());
-        assert!(config.tls);  // TLS enabled by default
+        assert!(config.tls); // TLS enabled by default
         assert_eq!(config.tls_cert, "./data/tls/cert.pem");
         assert_eq!(config.tls_key, "./data/tls/key.pem");
         assert!(!config.ss_enabled);
         assert!(config.ss_port.is_none());
         assert!(config.ss_cipher.is_none());
         assert!(config.ss_password.is_none());
+        assert!(!config.trojan_enabled);
+        assert!(config.trojan_port.is_none());
+        assert!(config.trojan_password.is_none());
+        assert_eq!(config.trojan_fallback, "127.0.0.1:80");
     }
 
     #[test]
@@ -353,6 +448,10 @@ mod tests {
             ss_port: Some(8388),
             ss_cipher: Some("aes-256-gcm".to_string()),
             ss_password: Some("ss-password".to_string()),
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
         };
 
         let config = ServerConfig::from_cli(cli).unwrap();
@@ -389,6 +488,10 @@ mod tests {
             ss_port: Some(8388),
             ss_cipher: Some("aes-256-gcm".to_string()),
             ss_password: Some("test".to_string()),
+            trojan_enabled: true,
+            trojan_port: Some(443),
+            trojan_password: Some("trojan-pass".to_string()),
+            trojan_fallback: "127.0.0.1:8080".to_string(),
         };
 
         let cloned = config.clone();
@@ -406,6 +509,10 @@ mod tests {
         assert_eq!(config.ss_port, cloned.ss_port);
         assert_eq!(config.ss_cipher, cloned.ss_cipher);
         assert_eq!(config.ss_password, cloned.ss_password);
+        assert_eq!(config.trojan_enabled, cloned.trojan_enabled);
+        assert_eq!(config.trojan_port, cloned.trojan_port);
+        assert_eq!(config.trojan_password, cloned.trojan_password);
+        assert_eq!(config.trojan_fallback, cloned.trojan_fallback);
     }
 
     #[test]
@@ -426,6 +533,10 @@ mod tests {
             ss_port: None,
             ss_cipher: None,
             ss_password: None,
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -451,6 +562,10 @@ mod tests {
             ss_port: None,
             ss_cipher: Some("aes-256-gcm".to_string()),
             ss_password: Some("password".to_string()),
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -476,10 +591,72 @@ mod tests {
             ss_port: Some(8388),
             ss_cipher: Some("invalid-cipher".to_string()),
             ss_password: Some("password".to_string()),
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
         };
 
         let result = ServerConfig::from_cli(cli);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported cipher"));
+    }
+
+    #[test]
+    fn test_trojan_config_validation_missing_port() {
+        let cli = ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            ss_enabled: None,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
+            trojan_enabled: Some(true),
+            trojan_port: None,
+            trojan_password: Some("password".to_string()),
+            trojan_fallback: None,
+        };
+
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("trojan_port is required"));
+    }
+
+    #[test]
+    fn test_trojan_config_validation_missing_password() {
+        let cli = ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            ss_enabled: None,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
+            trojan_enabled: Some(true),
+            trojan_port: Some(443),
+            trojan_password: None,
+            trojan_fallback: None,
+        };
+
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("trojan_password is required"));
     }
 }

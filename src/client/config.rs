@@ -1,5 +1,8 @@
-use clap::{Parser, ArgAction};
-use figment::{Figment, providers::{Toml, Format}};
+use clap::{ArgAction, Parser};
+use figment::{
+    providers::{Format, Toml},
+    Figment,
+};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -74,9 +77,9 @@ impl Default for ClientConfig {
             server: String::new(),
             forwards: Vec::new(),
             auth_token: None,
-            tls: true,  // TLS enabled by default for security
+            tls: true, // TLS enabled by default for security
             tls_server_name: None,
-            tls_insecure: true,  // Accept self-signed certs by default (TOFU mode)
+            tls_insecure: true, // Accept self-signed certs by default (TOFU mode)
             log: "info".to_string(),
         }
     }
@@ -174,7 +177,10 @@ impl ClientConfig {
 
         // Validate required fields
         if config.server.is_empty() {
-            return Err("Server address is required. Use --server, SERVER_ADDR env, or set in config file".to_string());
+            return Err(
+                "Server address is required. Use --server, SERVER_ADDR env, or set in config file"
+                    .to_string(),
+            );
         }
 
         Ok(config)
@@ -194,19 +200,33 @@ impl ClientConfig {
             // Use rsplitn to split from the end: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT
             // This allows LOCAL_HOST to contain colons (IPv6)
             let mut parts = forward.rsplitn(2, ':');
-            let local_port_str = parts.next().ok_or_else(||
-                format!("Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT", forward))?;
-            let remaining = parts.next().ok_or_else(||
-                format!("Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT", forward))?;
+            let local_port_str = parts.next().ok_or_else(|| {
+                format!(
+                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
+                    forward
+                )
+            })?;
+            let remaining = parts.next().ok_or_else(|| {
+                format!(
+                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
+                    forward
+                )
+            })?;
 
             let mut parts2 = remaining.splitn(2, ':');
             let remote_port_str = parts2.next().unwrap();
-            let local_host = parts2.next().ok_or_else(||
-                format!("Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT", forward))?;
+            let local_host = parts2.next().ok_or_else(|| {
+                format!(
+                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
+                    forward
+                )
+            })?;
 
-            let remote_port = remote_port_str.parse::<u16>()
+            let remote_port = remote_port_str
+                .parse::<u16>()
                 .map_err(|e| format!("Invalid remote port: {}", e))?;
-            let local_port = local_port_str.parse::<u16>()
+            let local_port = local_port_str
+                .parse::<u16>()
                 .map_err(|e| format!("Invalid local port: {}", e))?;
             let local_addr = format!("{}:{}", local_host, local_port);
             rules.push(ForwardRule {
@@ -228,8 +248,8 @@ mod tests {
         assert_eq!(config.server, "");
         assert!(config.forwards.is_empty());
         assert!(config.auth_token.is_none());
-        assert!(config.tls);  // TLS enabled by default
-        assert!(config.tls_insecure);  // Accept self-signed certs by default
+        assert!(config.tls); // TLS enabled by default
+        assert!(config.tls_insecure); // Accept self-signed certs by default
         assert_eq!(config.log, "info");
     }
 
@@ -251,7 +271,10 @@ mod tests {
         assert_eq!(config.forwards, vec!["8080:localhost:80"]);
         assert_eq!(config.auth_token, Some("secret-token".to_string()));
         assert!(config.tls);
-        assert_eq!(config.tls_server_name, Some("tunnel.example.com".to_string()));
+        assert_eq!(
+            config.tls_server_name,
+            Some("tunnel.example.com".to_string())
+        );
         assert!(config.tls_insecure);
         assert_eq!(config.log, "debug");
     }
@@ -296,10 +319,7 @@ mod tests {
     fn test_parse_forwards_multiple() {
         let config = ClientConfig {
             server: "localhost:8080".into(),
-            forwards: vec![
-                "8080:localhost:80".into(),
-                "9000:127.0.0.1:3000".into(),
-            ],
+            forwards: vec!["8080:localhost:80".into(), "9000:127.0.0.1:3000".into()],
             auth_token: None,
             tls: true,
             tls_server_name: None,

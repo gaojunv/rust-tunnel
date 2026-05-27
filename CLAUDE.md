@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配有 React/TypeScript 前端管理界面。服务器运行在公网，暴露端口将流量通过加密控制通道转发到内网客户端。同时内置 Shadowsocks 代理服务器和实时连接质量监控。
+rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配有 React/TypeScript 前端管理界面。服务器运行在公网，暴露端口将流量通过加密控制通道转发到内网客户端。同时内置 Shadowsocks 和 Trojan 代理服务器和实时连接质量监控。
 
 ## 架构
 
@@ -33,12 +33,14 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
       - 追踪每个端口的活跃连接数
       - 通过心跳 RTT/丢包追踪进行质量监控
       - Shadowsocks 端口追踪
+      - Trojan 端口追踪
     - `listener.rs` - 监听暴露端口，通知客户端新连接
     - `proxy.rs` - 处理每连接代理流量和流量统计
     - `api.rs` - Axum Web API 和 `TrafficStore` 指标
       - 通过 `rust-embed` 嵌入前端资源
       - 质量监控 API 端点
       - Shadowsocks 管理 API 端点
+      - Trojan 管理 API 端点
     - `auth.rs` - Web 界面的 JWT 认证
     - `db.rs` - SQLite 数据库，用于持久化流量、质量和客户端会话数据
     - `config.rs` - 服务器配置，使用 Clap、figment（TOML 配置文件）和环境变量
@@ -55,6 +57,15 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
       - 使用 EVP_BytesToKey 进行密钥派生（基于 MD5）
       - 通过 `ProxyServerStream` 处理 SS 握手
       - 连接上下文追踪（`SSConnectionContext`）
+    - `trojan.rs` - 内置 Trojan 代理服务器
+      - TLS 必需协议：独立的 TLS 监听端口
+      - SHA-224 密码哈希认证（56 字符十六进制）
+      - Trojan 请求格式：`hex(SHA224(password)) + CRLF + CMD + ATYP + DST.ADDR + DST.PORT + CRLF + payload`
+      - 支持 CONNECT（0x01）和 UDP ASSOCIATE（0x03）命令
+      - 支持 IPv4（0x01）、域名（0x03）和 IPv6（0x04）地址类型
+      - 认证失败时回退到配置的回退地址（防探测）
+      - 增量解析处理部分 TLS 读取（`ParseResult`：Complete/Incomplete/Invalid）
+      - 双向 TCP 转发（`copy_bidirectional`）
   - `src/client/` - 客户端实现
     - `control.rs` - 建立控制连接并管理本地转发
       - TLS 连接支持（自签名证书的不安全/TOFU 模式）
@@ -76,6 +87,7 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
   - `Navbar.tsx` - 顶部导航栏
   - `QualityPage.tsx` - 连接质量监控页面
   - `ShadowsocksPage.tsx` - Shadowsocks 代理管理页面
+  - `TrojanPage.tsx` - Trojan 代理管理页面
   - `Login.tsx` - 登录页面
 
 ### 数据库 (SQLite)
@@ -85,6 +97,7 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
   - `client_sessions` - 客户端连接/断开历史，含主机名追踪
   - `connection_quality_history` - 历史质量数据（RTT、丢包、吞吐量、评分）
   - `shadowsocks_config` - Shadowsocks 配置持久化（端口、加密方式、密码、启用状态）
+  - `trojan_config` - Trojan 配置持久化（端口、密码、回退地址、启用状态）
 - **位置**：通过 `--db-path` 配置（默认：`./data/rust-tunnel.db`）
 - **索引**：流量和质量表的端口、时间戳索引
 
@@ -94,7 +107,7 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
   - `GET /api/health` - 健康检查
 - **受保护**（设置密码时需要认证）：
   - `POST /api/logout` - 登出
-  - `GET /api/clients` - 列出所有客户端（隧道 + Shadowsocks）
+  - `GET /api/clients` - 列出所有客户端（隧道 + Shadowsocks + Trojan）
   - `DELETE /api/clients/:port` - 断开客户端
   - `GET /api/traffic` - 获取所有流量数据
   - `GET /api/traffic/:port` - 获取指定端口流量
@@ -107,6 +120,10 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
   - `POST /api/shadowsocks` - 更新 Shadowsocks 配置（尚未实现）
   - `GET /api/shadowsocks/stats` - Shadowsocks 流量统计
   - `GET /api/shadowsocks/quality` - Shadowsocks 质量数据
+  - `GET /api/trojan` - Trojan 配置
+  - `POST /api/trojan` - 更新 Trojan 配置（尚未实现）
+  - `GET /api/trojan/stats` - Trojan 流量统计
+  - `GET /api/trojan/quality` - Trojan 质量数据
 
 ## 常用开发命令
 
@@ -157,6 +174,10 @@ cp -r dist ../frontend-dist
 - `--ss-port <PORT>` - Shadowsocks 监听端口（启用 SS 时必填）
 - `--ss-cipher <CIPHER>` - Shadowsocks 加密方式（aes-256-gcm, chacha20-ietf-poly1305；启用 SS 时必填）
 - `--ss-password <PASSWORD>` - Shadowsocks 密码（启用 SS 时必填）
+- `--trojan-enabled <BOOL>` - 启用 Trojan 代理（默认：false）
+- `--trojan-port <PORT>` - Trojan 监听端口（启用 Trojan 时必填）
+- `--trojan-password <PASSWORD>` - Trojan 认证密码（启用 Trojan 时必填）
+- `--trojan-fallback <ADDR>` - Trojan 认证失败回退地址（可选；格式 host:port）
 - `--log <LEVEL>` - 日志级别（trace/debug/info/warn/error）
 
 ### 环境变量
@@ -174,6 +195,10 @@ cp -r dist ../frontend-dist
 - `SS_PORT` - Shadowsocks 端口
 - `SS_CIPHER` - Shadowsocks 加密方式
 - `SS_PASSWORD` - Shadowsocks 密码
+- `TROJAN_ENABLED` - 启用 Trojan（"true"/"1"）
+- `TROJAN_PORT` - Trojan 端口
+- `TROJAN_PASSWORD` - Trojan 认证密码
+- `TROJAN_FALLBACK` - Trojan 认证失败回退地址
 
 ## 客户端配置
 
@@ -211,6 +236,20 @@ cp -r dist ../frontend-dist
 - 质量监控：基于心跳的 RTT 测量，通过序列号追踪丢包
 
 ## 近期功能与改进
+
+### Trojan 代理（2026 年 5 月）
+- 内置 Trojan 协议代理服务器
+- TLS 必需：使用独立的 TLS 监听端口，复用控制通道证书
+- SHA-224 密码哈希认证（56 字符十六进制），符合 Trojan 协议标准
+- Trojan 请求解析：支持 CONNECT/UDP ASSOCIATE 命令，IPv4/域名/IPv6 地址类型
+- 认证失败回退：将流量转发到配置的回退地址（防探测，伪装为 HTTPS 站点）
+- 增量解析（`ParseResult`）处理部分 TLS 读取
+- 连接追踪和流量统计
+- Trojan 连接的质量监控
+- 前端管理页面（`TrojanPage.tsx`）
+- Trojan 配置的数据库持久化
+- API 端点：`/api/trojan`、`/api/trojan/stats`、`/api/trojan/quality`
+- 依赖：`sha2`（SHA-224 哈希）、`hex`（十六进制编码）
 
 ### TLS 加密（2026 年 5 月）
 - 通过 rustls 支持控制通道的完整 TLS 1.3
@@ -285,5 +324,6 @@ cp -r dist ../frontend-dist
 - 新增 `ClientDetail` 弹窗，显示每端口详细流量
 - 新增 `QualityPage` 实时质量监控页面
 - 新增 `ShadowsocksPage` Shadowsocks 代理管理页面
+- 新增 `TrojanPage` Trojan 代理管理页面
 - 修复登出重定向从 `/login` 到 `/` 的问题
 - 仪表盘现在显示实时指标和流量图表

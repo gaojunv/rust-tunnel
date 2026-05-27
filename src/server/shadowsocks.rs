@@ -1,7 +1,7 @@
+use crate::common::{TunnelError, TunnelResult};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::debug;
-use crate::common::{TunnelError, TunnelResult};
 
 // Re-export shadowsocks types
 pub use shadowsocks::{
@@ -12,7 +12,10 @@ pub use shadowsocks::{
         socks5::Address,
         tcprelay::{
             proxy_stream::server::ProxyServerStream,
-            utils::{copy_bidirectional, copy_encrypted_bidirectional, copy_from_encrypted, copy_to_encrypted},
+            utils::{
+                copy_bidirectional, copy_encrypted_bidirectional, copy_from_encrypted,
+                copy_to_encrypted,
+            },
         },
     },
 };
@@ -40,7 +43,10 @@ pub fn parse_cipher_kind(cipher: &str) -> TunnelResult<CipherKind> {
     match cipher {
         "aes-256-gcm" => Ok(CipherKind::AES_256_GCM),
         "chacha20-ietf-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
-        _ => Err(TunnelError::Protocol(format!("Unsupported cipher: {}", cipher))),
+        _ => Err(TunnelError::Protocol(format!(
+            "Unsupported cipher: {}",
+            cipher
+        ))),
     }
 }
 
@@ -63,7 +69,7 @@ fn openssl_bytes_to_key(password: &[u8], key: &mut [u8]) {
     while offset < key_len {
         let mut m = Md5::new();
         if let Some(digest) = last_digest {
-            m.update(&digest);
+            m.update(digest);
         }
         m.update(password);
         let digest = m.finalize();
@@ -85,26 +91,26 @@ pub async fn handle_ss_handshake(
     port: u16,
     ss_context: Arc<Context>,
 ) -> TunnelResult<(SSConnectionContext, ProxyServerStream<TcpStream>)> {
-    debug!("Starting SS handshake for connection {}, port {}", connection_id, port);
+    debug!(
+        "Starting SS handshake for connection {}, port {}",
+        connection_id, port
+    );
 
     let kind = parse_cipher_kind(cipher)?;
 
     // Use ServerConfig to derive the key correctly to match shadowsocks-rust expectations
-    let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port as u16));
+    let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let svr_cfg = ServerConfig::new(dummy_addr, password, kind)
         .map_err(|e| TunnelError::Protocol(format!("Failed to create server config: {}", e)))?;
     let key = svr_cfg.key().to_vec();
 
     // Create proxy server stream that handles encryption/decryption
-    let mut proxy_stream = ProxyServerStream::from_stream(
-        ss_context,
-        stream,
-        kind,
-        &key,
-    );
+    let mut proxy_stream = ProxyServerStream::from_stream(ss_context, stream, kind, &key);
 
     // Perform handshake and get target address
-    let target_addr = proxy_stream.handshake().await
+    let target_addr = proxy_stream
+        .handshake()
+        .await
         .map_err(|e| TunnelError::Protocol(format!("Handshake failed: {}", e)))?;
 
     let target_addr_str = target_addr.to_string();
@@ -184,7 +190,10 @@ mod unit_tests {
     fn test_derive_key_different_passwords() {
         let key1 = derive_key("password1", "aes-256-gcm").unwrap();
         let key2 = derive_key("password2", "aes-256-gcm").unwrap();
-        assert_ne!(key1, key2, "Different passwords should produce different keys");
+        assert_ne!(
+            key1, key2,
+            "Different passwords should produce different keys"
+        );
     }
 
     #[test]

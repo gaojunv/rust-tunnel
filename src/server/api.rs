@@ -1,14 +1,14 @@
+use crate::server::quality::{ConnectionQuality, QualitySample};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, Response, StatusCode},
     middleware,
     response::IntoResponse,
-    routing::{get, post, delete},
+    routing::{delete, get, post},
     Json, Router,
 };
-use crate::server::quality::{ConnectionQuality, QualitySample};
-use chrono::{DateTime, Utc, Timelike};
+use chrono::{DateTime, Timelike, Utc};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::server::auth::{auth_middleware, AuthConfig, create_token};
+use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
 
@@ -49,6 +49,12 @@ pub struct TrafficStore {
     db: Option<Database>,
     /// Ports that have been updated since the last DB flush
     dirty_ports: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
+}
+
+impl Default for TrafficStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrafficStore {
@@ -172,18 +178,34 @@ impl TrafficStore {
         // Snapshot in-memory data for dirty ports (brief lock)
         let snapshots: Vec<(u16, PortTraffic)> = {
             let store = self.inner.lock().await;
-            dirty_ports.iter()
+            dirty_ports
+                .iter()
                 .filter_map(|&port| store.get(&port).map(|pt| (port, pt.clone())))
                 .collect()
         };
 
         // Write snapshots to DB without holding the in-memory lock
         for (port, port_traffic) in snapshots {
-            if let Err(e) = db.replace_port_traffic(port, port_traffic.total_bytes_in, port_traffic.total_bytes_out).await {
+            if let Err(e) = db
+                .replace_port_traffic(
+                    port,
+                    port_traffic.total_bytes_in,
+                    port_traffic.total_bytes_out,
+                )
+                .await
+            {
                 tracing::warn!("Failed to flush port_traffic for port {}: {}", port, e);
             }
             for bucket in &port_traffic.buckets {
-                if let Err(e) = db.replace_traffic_bucket(port, bucket.timestamp, bucket.bytes_in, bucket.bytes_out).await {
+                if let Err(e) = db
+                    .replace_traffic_bucket(
+                        port,
+                        bucket.timestamp,
+                        bucket.bytes_in,
+                        bucket.bytes_out,
+                    )
+                    .await
+                {
                     tracing::warn!("Failed to flush traffic_bucket for port {}: {}", port, e);
                 }
             }
@@ -206,7 +228,11 @@ impl TrafficStore {
         });
     }
 
-    fn add_to_bucket(port_traffic: &mut PortTraffic, bytes_in: u64, bytes_out: u64) -> DateTime<Utc> {
+    fn add_to_bucket(
+        port_traffic: &mut PortTraffic,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DateTime<Utc> {
         let now = Utc::now();
         // Truncate to minute
         let bucket_time = now - chrono::Duration::seconds(now.second() as i64);
@@ -593,6 +619,32 @@ pub struct ShadowsocksQuality {
     pub history: Vec<QualitySample>,
 }
 
+/// Trojan configuration
+#[derive(Debug, Serialize)]
+pub struct TrojanConfig {
+    pub enabled: bool,
+    pub port: Option<u16>,
+    pub fallback: Option<String>,
+}
+
+/// Trojan statistics
+#[derive(Debug, Serialize)]
+pub struct TrojanStats {
+    pub enabled: bool,
+    pub port: Option<u16>,
+    pub total_bytes_in: u64,
+    pub total_bytes_out: u64,
+    pub active_connections: usize,
+}
+
+/// Trojan quality response
+#[derive(Debug, Serialize)]
+pub struct TrojanQuality {
+    pub port: u16,
+    pub quality: ConnectionQuality,
+    pub history: Vec<QualitySample>,
+}
+
 // Login handler
 async fn login(
     State(state): State<ApiState>,
@@ -604,7 +656,8 @@ async fn login(
         return Json(LoginResponse {
             token,
             auth_required: false,
-        }).into_response();
+        })
+        .into_response();
     }
 
     if state.auth_config.verify_password(&request.password) {
@@ -612,7 +665,8 @@ async fn login(
             Ok(token) => Json(LoginResponse {
                 token,
                 auth_required: true,
-            }).into_response(),
+            })
+            .into_response(),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create token").into_response(),
         }
     } else {
@@ -655,6 +709,19 @@ async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>
         });
     }
 
+    // Trojan ports — show them in the client list
+    let trojan_ports = state.server_state.get_trojan_ports().await;
+    for port in trojan_ports {
+        let connection_count = state.server_state.get_connection_count_for_port(port).await;
+        let quality = state.server_state.quality_store.get_quality(port).await;
+        response.push(ClientResponse {
+            port,
+            hostname: Some("[Trojan]".to_string()),
+            connection_count,
+            quality,
+        });
+    }
+
     Json(response)
 }
 
@@ -682,7 +749,12 @@ async fn get_port_traffic(
     State(state): State<ApiState>,
     Path(port): Path<u16>,
 ) -> impl IntoResponse {
-    match state.server_state.traffic_store.get_port_traffic(port).await {
+    match state
+        .server_state
+        .traffic_store
+        .get_port_traffic(port)
+        .await
+    {
         Some(traffic) => Json(traffic).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -841,7 +913,12 @@ async fn get_shadowsocks_stats(State(state): State<ApiState>) -> Json<Shadowsock
     let mut active_connections = 0;
 
     for &port in &ss_ports {
-        if let Some(traffic) = state.server_state.traffic_store.get_port_traffic(port).await {
+        if let Some(traffic) = state
+            .server_state
+            .traffic_store
+            .get_port_traffic(port)
+            .await
+        {
             total_bytes_in += traffic.total_bytes_in;
             total_bytes_out += traffic.total_bytes_out;
         }
@@ -877,12 +954,96 @@ async fn get_shadowsocks_quality(State(state): State<ApiState>) -> Json<Vec<Shad
 }
 
 // Update Shadowsocks configuration (placeholder for dynamic config)
-async fn update_shadowsocks_config(
-    State(_state): State<ApiState>,
-) -> impl IntoResponse {
+async fn update_shadowsocks_config(State(_state): State<ApiState>) -> impl IntoResponse {
     // For now, return not implemented since we don't support dynamic reconfiguration yet
     // In future: support enabling/disabling SS, changing port/cipher/password
-    (StatusCode::NOT_IMPLEMENTED, "Dynamic configuration not implemented yet")
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Dynamic configuration not implemented yet",
+    )
+}
+
+// Get Trojan configuration
+async fn get_trojan_config(State(state): State<ApiState>) -> Json<TrojanConfig> {
+    let trojan_ports = state.server_state.get_trojan_ports().await;
+
+    let (port, fallback) = if !trojan_ports.is_empty() {
+        // Get fallback from port info
+        let port_info = state.server_state.get_port(trojan_ports[0]).await;
+        let fallback = port_info.and_then(|info| {
+            if let crate::server::control::PortInfo::Trojan { fallback, .. } = info {
+                Some(fallback)
+            } else {
+                None
+            }
+        });
+        (Some(trojan_ports[0]), fallback)
+    } else {
+        (None, None)
+    };
+
+    Json(TrojanConfig {
+        enabled: !trojan_ports.is_empty(),
+        port,
+        fallback,
+    })
+}
+
+// Get Trojan traffic statistics
+async fn get_trojan_stats(State(state): State<ApiState>) -> Json<TrojanStats> {
+    let trojan_ports = state.server_state.get_trojan_ports().await;
+
+    let mut total_bytes_in = 0;
+    let mut total_bytes_out = 0;
+    let mut active_connections = 0;
+
+    for &port in &trojan_ports {
+        if let Some(traffic) = state
+            .server_state
+            .traffic_store
+            .get_port_traffic(port)
+            .await
+        {
+            total_bytes_in += traffic.total_bytes_in;
+            total_bytes_out += traffic.total_bytes_out;
+        }
+        active_connections += state.server_state.get_connection_count_for_port(port).await;
+    }
+
+    Json(TrojanStats {
+        enabled: !trojan_ports.is_empty(),
+        port: trojan_ports.first().copied(),
+        total_bytes_in,
+        total_bytes_out,
+        active_connections,
+    })
+}
+
+// Get Trojan quality data
+async fn get_trojan_quality(State(state): State<ApiState>) -> Json<Vec<TrojanQuality>> {
+    let trojan_ports = state.server_state.get_trojan_ports().await;
+    let mut result = Vec::with_capacity(trojan_ports.len());
+
+    for port in trojan_ports {
+        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
+            let history = state.server_state.quality_store.get_samples(port).await;
+            result.push(TrojanQuality {
+                port,
+                quality,
+                history,
+            });
+        }
+    }
+
+    Json(result)
+}
+
+// Update Trojan configuration (placeholder for dynamic config)
+async fn update_trojan_config(State(_state): State<ApiState>) -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Dynamic configuration not implemented yet",
+    )
 }
 
 /// Create and run the API server
@@ -923,9 +1084,19 @@ pub async fn run_api_server(
         .route("/api/quality/:port/history", get(get_quality_history))
         .route("/api/quality/warnings", get(get_quality_warnings))
         // Shadowsocks management endpoints
-        .route("/api/shadowsocks", get(get_shadowsocks_config).post(update_shadowsocks_config))
+        .route(
+            "/api/shadowsocks",
+            get(get_shadowsocks_config).post(update_shadowsocks_config),
+        )
         .route("/api/shadowsocks/stats", get(get_shadowsocks_stats))
-        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality));
+        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality))
+        // Trojan management endpoints
+        .route(
+            "/api/trojan",
+            get(get_trojan_config).post(update_trojan_config),
+        )
+        .route("/api/trojan/stats", get(get_trojan_stats))
+        .route("/api/trojan/quality", get(get_trojan_quality));
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {
@@ -937,7 +1108,10 @@ pub async fn run_api_server(
 
     // Static file service for frontend (embedded)
     let static_routes = Router::new()
-        .route("/", get(|| async { serve_static(Path("".to_string())).await }))
+        .route(
+            "/",
+            get(|| async { serve_static(Path("".to_string())).await }),
+        )
         .route("/*path", get(serve_static));
 
     let app = Router::new()
