@@ -19,6 +19,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use std::time::Duration;
 
 /// Embedded frontend assets
 #[derive(RustEmbed)]
@@ -518,11 +520,47 @@ mod tests {
     }
 }
 
+/// Log entry response
+#[derive(Debug, Serialize)]
+pub struct LogEntryResponse {
+    pub id: i64,
+    pub timestamp: i64,
+    pub level: String,
+    pub source: String,
+    pub target: String,
+    pub message: String,
+}
+
+/// Query parameters for GET /api/logs
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    pub level: Option<String>,
+    pub source: Option<String>,
+    pub search: Option<String>,
+    pub limit: Option<u32>,
+    pub before_id: Option<i64>,
+}
+
+/// Request body for PUT /api/logs/level
+#[derive(Debug, Deserialize)]
+pub struct SetLevelRequest {
+    pub level: String,
+}
+
+/// SSE query params (for token-based auth)
+#[derive(Debug, Deserialize)]
+pub struct SseQuery {
+    pub level: Option<String>,
+    pub source: Option<String>,
+    pub token: Option<String>,
+}
+
 /// API state shared across all handlers
 #[derive(Clone)]
 pub struct ApiState {
     pub server_state: ServerState,
     pub auth_config: Arc<AuthConfig>,
+    pub log_store: Option<crate::server::logs::LogStore>,
 }
 
 /// Login request
@@ -1046,6 +1084,207 @@ async fn update_trojan_config(State(_state): State<ApiState>) -> impl IntoRespon
     )
 }
 
+// ── Log Viewer Endpoints ──────────────────────────────────────────
+
+async fn sse_log_stream(
+    State(state): State<ApiState>,
+    Query(params): Query<SseQuery>,
+) -> impl IntoResponse {
+    // Check auth for SSE
+    if state.auth_config.is_enabled() {
+        let token = params.token.as_deref().unwrap_or("");
+
+        let is_valid = if !token.is_empty() {
+            crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok()
+        } else {
+            false
+        };
+
+        if !is_valid {
+            return axum::response::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("Unauthorized"))
+                .unwrap();
+        }
+    }
+
+    let log_store = match &state.log_store {
+        Some(store) => store.clone(),
+        None => {
+            return axum::response::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("Log store not initialized"))
+                .unwrap();
+        }
+    };
+
+    let min_level = params.level.as_deref().unwrap_or("info");
+    let min_level_u8 = match min_level {
+        "error" => 4u8,
+        "warn" => 3,
+        "info" => 2,
+        "debug" => 1,
+        "trace" => 0,
+        _ => 2,
+    };
+    let source_filter = params.source.clone();
+
+    let mut rx = log_store.tx.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Ok(entry)) => {
+                    // Apply filters
+                    let entry_level = match entry.level.as_str() {
+                        "TRACE" => 0, "DEBUG" => 1, "INFO" => 2, "WARN" => 3, "ERROR" => 4,
+                        _ => 2,
+                    };
+                    if entry_level < min_level_u8 {
+                        continue;
+                    }
+                    if let Some(ref src) = source_filter {
+                        if !entry.source.starts_with(src) {
+                            continue;
+                        }
+                    }
+
+                    let json = serde_json::to_string(&LogEntryResponse {
+                        id: entry.id,
+                        timestamp: entry.timestamp,
+                        level: entry.level.clone(),
+                        source: entry.source.clone(),
+                        target: entry.target.clone(),
+                        message: entry.message.clone(),
+                    })
+                    .unwrap_or_default();
+
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default().event("log").data(json),
+                    );
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default()
+                            .event("sync")
+                            .data(format!(r#"{{"lagged":{}}}"#, n)),
+                    );
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — send ping to keep connection alive
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default().event("ping").data(""),
+                    );
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))).into_response()
+}
+
+async fn get_logs(
+    State(state): State<ApiState>,
+    Query(params): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let log_store = match &state.log_store {
+        Some(store) => store,
+        None => {
+            return axum::response::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("Log store not initialized"))
+                .unwrap();
+        }
+    };
+
+    let limit = params.limit.unwrap_or(200).min(1000) as usize;
+
+    let entries = log_store
+        .query(
+            params.level.as_deref(),
+            params.source.as_deref(),
+            params.search.as_deref(),
+            limit,
+        )
+        .await;
+
+    let response: Vec<LogEntryResponse> = entries
+        .into_iter()
+        .map(|e| LogEntryResponse {
+            id: e.id,
+            timestamp: e.timestamp,
+            level: e.level,
+            source: e.source,
+            target: e.target,
+            message: e.message,
+        })
+        .collect();
+
+    Json(response).into_response()
+}
+
+async fn get_logs_level(
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    let log_store = match &state.log_store {
+        Some(store) => store,
+        None => {
+            return axum::response::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("Log store not initialized"))
+                .unwrap();
+        }
+    };
+
+    let level_u8 = log_store.level.load(std::sync::atomic::Ordering::Relaxed);
+    let level_str = match level_u8 {
+        0 => "trace",
+        1 => "debug",
+        2 => "info",
+        3 => "warn",
+        4 => "error",
+        _ => "info",
+    };
+
+    Json(serde_json::json!({ "level": level_str })).into_response()
+}
+
+async fn put_logs_level(
+    State(state): State<ApiState>,
+    Json(body): Json<SetLevelRequest>,
+) -> impl IntoResponse {
+    let log_store = match &state.log_store {
+        Some(store) => store,
+        None => {
+            return axum::response::Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("Log store not initialized"))
+                .unwrap();
+        }
+    };
+
+    let level_u8 = match body.level.to_lowercase().as_str() {
+        "trace" => 0,
+        "debug" => 1,
+        "info" => 2,
+        "warn" => 3,
+        "error" => 4,
+        _ => {
+            return axum::response::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("Invalid level. Use: trace, debug, info, warn, error"))
+                .unwrap();
+        }
+    };
+
+    log_store.level.store(level_u8, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!("Log level changed to {}", body.level.to_lowercase());
+
+    Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -1054,9 +1293,12 @@ pub async fn run_api_server(
 ) -> Result<(), std::io::Error> {
     let auth_config = Arc::new(auth_config);
 
+    let log_store = server_state.log_store.clone();
+
     let state = ApiState {
         server_state,
         auth_config: auth_config.clone(),
+        log_store,
     };
 
     // CORS layer
@@ -1065,10 +1307,11 @@ pub async fn run_api_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Public routes (no auth required)
+    // Public routes (no auth required) — SSE uses ?token= query param for auth
     let public_routes = Router::new()
         .route("/api/login", post(login))
-        .route("/api/health", get(health));
+        .route("/api/health", get(health))
+        .route("/api/logs/stream", get(sse_log_stream));
 
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
@@ -1096,7 +1339,10 @@ pub async fn run_api_server(
             get(get_trojan_config).post(update_trojan_config),
         )
         .route("/api/trojan/stats", get(get_trojan_stats))
-        .route("/api/trojan/quality", get(get_trojan_quality));
+        .route("/api/trojan/quality", get(get_trojan_quality))
+        // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
+        .route("/api/logs", get(get_logs))
+        .route("/api/logs/level", get(get_logs_level).put(put_logs_level));
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {
