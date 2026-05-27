@@ -131,3 +131,13 @@ export interface TrojanQuality {
   quality: ConnectionQuality;
   history: QualitySample[];
 }
+
+// Log entry
+export interface LogEntry {
+  id: number;
+  timestamp: number;       // microsecond timestamp
+  level: string;           // TRACE/DEBUG/INFO/WARN/ERROR
+  source: string;          // "server" or "client:{hostname}:{port}"
+  target: string;          // tracing target (module path)
+  message: string;         // log message content
+}
