@@ -37,6 +37,7 @@ bytes = "1.0"
 
 # Timeout utilities
 tokio-util = { version = "0.7", features = ["time"] }
+tokio-stream = "0.1"
 
 # Random generation for connection IDs
 rand = "0.8"
@@ -47,6 +48,7 @@ get_if_addrs = "0.5.3"
 # Web framework
 axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
+async-stream = "0.3"
 
 # Embed frontend assets
 rust-embed = { version = "8.0", features = ["axum"] }
