@@ -1201,7 +1201,36 @@ async fn get_logs(
 
     let limit = params.limit.unwrap_or(200).min(1000) as usize;
 
-    let entries = log_store
+    // When before_id is specified, query DB directly for correct pagination
+    // (in-memory entries have id=0, so DB pagination is the only correct path)
+    if params.before_id.is_some() {
+        let db_entries = log_store
+            .query_db(
+                params.level.as_deref(),
+                params.source.as_deref(),
+                params.search.as_deref(),
+                limit as u32,
+                params.before_id,
+            )
+            .await;
+
+        let response: Vec<LogEntryResponse> = db_entries
+            .into_iter()
+            .map(|e| LogEntryResponse {
+                id: e.id,
+                timestamp: e.timestamp,
+                level: e.level,
+                source: e.source,
+                target: e.target,
+                message: e.message,
+            })
+            .collect();
+
+        return Json(response).into_response();
+    }
+
+    // Query in-memory buffer first (fast path, no DB round-trip)
+    let mem_entries = log_store
         .query(
             params.level.as_deref(),
             params.source.as_deref(),
@@ -1210,7 +1239,50 @@ async fn get_logs(
         )
         .await;
 
-    let response: Vec<LogEntryResponse> = entries
+    // If in-memory buffer doesn't have enough entries, supplement from DB
+    if mem_entries.len() < limit {
+        let db_limit = (limit - mem_entries.len()) as u32;
+        let db_entries = log_store
+            .query_db(
+                params.level.as_deref(),
+                params.source.as_deref(),
+                params.search.as_deref(),
+                db_limit,
+                None,
+            )
+            .await;
+
+        // Merge: DB entries (older) first, then in-memory (newer)
+        // Deduplicate by id for entries that were flushed to DB
+        let mem_ids: std::collections::HashSet<i64> =
+            mem_entries.iter().filter_map(|e| if e.id > 0 { Some(e.id) } else { None }).collect();
+
+        let mut all_entries: Vec<LogEntryResponse> = db_entries
+            .into_iter()
+            .filter(|e| !mem_ids.contains(&e.id))
+            .map(|e| LogEntryResponse {
+                id: e.id,
+                timestamp: e.timestamp,
+                level: e.level,
+                source: e.source,
+                target: e.target,
+                message: e.message,
+            })
+            .collect();
+
+        all_entries.extend(mem_entries.into_iter().map(|e| LogEntryResponse {
+            id: e.id,
+            timestamp: e.timestamp,
+            level: e.level,
+            source: e.source,
+            target: e.target,
+            message: e.message,
+        }));
+
+        return Json(all_entries).into_response();
+    }
+
+    let response: Vec<LogEntryResponse> = mem_entries
         .into_iter()
         .map(|e| LogEntryResponse {
             id: e.id,

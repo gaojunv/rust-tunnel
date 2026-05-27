@@ -159,12 +159,11 @@ export const LogsPage = () => {
     }
   }, [logs, autoScroll]);
 
-  // Set level handler
+  // Set server-side log level (does NOT change display filter)
   const handleSetLevel = async (level: string) => {
     try {
       await setLogsLevel(level);
       setCurrentLevel(level);
-      setLevelFilter(level);
     } catch (err) {
       console.error('Failed to set log level:', err);
     }
