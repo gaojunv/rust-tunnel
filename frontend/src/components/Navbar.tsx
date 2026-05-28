@@ -26,7 +26,7 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
             <div className="flex-shrink-0">
               <h1 className="text-white text-xl font-bold">Rust Tunnel</h1>
             </div>
-            <div className="ml-10 flex space-x-4">
+            <div className="hidden md:flex ml-10 space-x-4">
               <button
                 onClick={() => onTabChange('dashboard')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
