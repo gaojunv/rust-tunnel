@@ -1,5 +1,3 @@
-import React from 'react';
-
 type Tab = 'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs';
 
 interface MobileBottomNavProps {
