@@ -148,12 +148,13 @@ async fn main() -> TunnelResult<()> {
         }
     });
 
-    // Start periodic cleanup of old log entries (every hour, removes 7+ day old logs)
+    // Start periodic cleanup of old data (every hour)
     let db_for_cleanup = db.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
+            // Remove logs older than 7 days
             let seven_days_ago = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as i64)
@@ -161,6 +162,15 @@ async fn main() -> TunnelResult<()> {
                 - 7 * 24 * 3600 * 1_000_000i64;
             if let Err(e) = db_for_cleanup.cleanup_old_logs(seven_days_ago).await {
                 tracing::warn!("Failed to cleanup old logs: {}", e);
+            }
+            // Remove quality history older than 24 hours
+            let twenty_four_hours_ago =
+                chrono::Utc::now() - chrono::Duration::hours(24);
+            if let Err(e) = db_for_cleanup
+                .cleanup_old_quality_history(twenty_four_hours_ago)
+                .await
+            {
+                tracing::warn!("Failed to cleanup old quality history: {}", e);
             }
         }
     });
