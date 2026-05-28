@@ -2,10 +2,9 @@ import { useQuery } from 'react-query';
 import { getAllQuality, getQualityWarnings } from '../api/client';
 import type { ClientWithQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
-
-const formatMs = (value: number): string => `${value.toFixed(1)} ms`;
-
-const formatPercent = (value: number): string => `${(value * 100).toFixed(1)}%`;
+import { formatMs, formatPercent } from '../utils/format';
+import { StatCard } from './shared/StatCard';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 
 // Quality heatmap cell
 const QualityHeatmapCell = ({ client }: { client: ClientWithQuality }) => {
@@ -43,12 +42,39 @@ const WorstConnectionsTable = ({ clients }: { clients: ClientWithQuality[] }) =>
   const worstClients = [...clients]
     .sort((a, b) => a.quality.quality_score - b.quality.quality_score)
     .slice(0, 10);
+  const isSmallScreen = useMediaQuery('(max-width: 639px)');
 
   return (
     <div className="bg-white rounded-lg shadow overflow-hidden">
       <div className="px-6 py-4 border-b border-gray-200">
         <h3 className="text-lg font-medium text-gray-900">Worst Connections (by Quality Score)</h3>
       </div>
+      {isSmallScreen ? (
+        <div className="p-4 grid grid-cols-1 gap-3">
+          {worstClients.map((client, index) => {
+            const color = getQualityColor(client.quality.quality_score);
+            const statusBadge = client.quality.is_critical
+              ? 'bg-red-100 text-red-800'
+              : client.quality.is_warning
+              ? 'bg-yellow-100 text-yellow-800'
+              : 'bg-green-100 text-green-800';
+            const statusLabel = client.quality.is_critical ? 'Critical' : client.quality.is_warning ? 'Warning' : 'Healthy';
+            return (
+              <div key={client.port} className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm font-semibold text-gray-900">#{index + 1} Port {client.port}</span>
+                  <span className={`px-2 py-0.5 text-xs font-semibold rounded-full ${statusBadge}`}>{statusLabel}</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs text-gray-600">
+                  <span>Score: <b style={{color}}>{client.quality.quality_score}</b></span>
+                  <span>RTT: {formatMs(client.quality.avg_rtt_ms)}</span>
+                  <span>Loss: {formatPercent(client.quality.loss_rate)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
       <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50">
@@ -105,6 +131,7 @@ const WorstConnectionsTable = ({ clients }: { clients: ClientWithQuality[] }) =>
           </tbody>
         </table>
       </div>
+      )}
     </div>
   );
 };
@@ -119,71 +146,49 @@ const QualityMetrics = ({ clients }: { clients: ClientWithQuality[] }) => {
 
   return (
     <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4 mb-6">
-      <div className="bg-white overflow-hidden shadow rounded-lg p-6">
-        <div className="flex items-center">
-          <div className="flex-shrink-0 rounded-md p-3" style={{ backgroundColor: `${getQualityColor(avgScore)}30` }}>
-            <svg className="h-6 w-6" style={{ color: getQualityColor(avgScore) }} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-            </svg>
-          </div>
-          <div className="ml-5 w-0 flex-1">
-            <dl>
-              <dt className="text-sm font-medium text-gray-500 truncate">Avg Quality Score</dt>
-              <dd className="text-lg font-semibold" style={{ color: getQualityColor(avgScore) }}>
-                {avgScore} ({getQualityText(avgScore)})
-              </dd>
-            </dl>
-          </div>
-        </div>
-      </div>
-
-      <div className="bg-white overflow-hidden shadow rounded-lg p-6">
-        <div className="flex items-center">
-          <div className="flex-shrink-0 bg-blue-500 rounded-md p-3">
-            <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-          </div>
-          <div className="ml-5 w-0 flex-1">
-            <dl>
-              <dt className="text-sm font-medium text-gray-500 truncate">Clients Monitored</dt>
-              <dd className="text-lg font-semibold text-gray-900">{clients.length}</dd>
-            </dl>
-          </div>
-        </div>
-      </div>
-
-      <div className="bg-white overflow-hidden shadow rounded-lg p-6">
-        <div className="flex items-center">
-          <div className="flex-shrink-0 bg-yellow-500 rounded-md p-3">
-            <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-            </svg>
-          </div>
-          <div className="ml-5 w-0 flex-1">
-            <dl>
-              <dt className="text-sm font-medium text-gray-500 truncate">Warnings</dt>
-              <dd className="text-lg font-semibold text-yellow-600">{warningCount}</dd>
-            </dl>
-          </div>
-        </div>
-      </div>
-
-      <div className="bg-white overflow-hidden shadow rounded-lg p-6">
-        <div className="flex items-center">
-          <div className="flex-shrink-0 bg-red-500 rounded-md p-3">
-            <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          </div>
-          <div className="ml-5 w-0 flex-1">
-            <dl>
-              <dt className="text-sm font-medium text-gray-500 truncate">Critical</dt>
-              <dd className="text-lg font-semibold text-red-600">{criticalCount}</dd>
-            </dl>
-          </div>
-        </div>
-      </div>
+      <StatCard
+        label="Avg Quality Score"
+        value={`${avgScore} (${getQualityText(avgScore)})`}
+        color="blue"
+        valueColor={getQualityColor(avgScore)}
+        icon={
+          <svg className="h-6 w-6" style={{ color: getQualityColor(avgScore) }} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        }
+      />
+      <StatCard
+        label="Clients Monitored"
+        value={`${clients.length}`}
+        color="blue"
+        icon={
+          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+          </svg>
+        }
+      />
+      <StatCard
+        label="Warnings"
+        value={`${warningCount}`}
+        color="yellow"
+        valueColor="text-yellow-600"
+        icon={
+          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+        }
+      />
+      <StatCard
+        label="Critical"
+        value={`${criticalCount}`}
+        color="red"
+        valueColor="text-red-600"
+        icon={
+          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        }
+      />
     </div>
   );
 };
@@ -238,7 +243,7 @@ export const QualityPage = ({ onSelectClient }: QualityPageProps) => {
           <h3 className="text-lg font-medium text-gray-900 mb-4">
             {hostname} ({clients.length} {clients.length === 1 ? 'connection' : 'connections'})
           </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {clients.map(client => (
               <div key={client.port} onClick={() => onSelectClient?.(client.port)}>
                 <QualityHeatmapCell client={client} />
