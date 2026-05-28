@@ -49,6 +49,15 @@ impl Database {
 
     /// Initialize database tables
     async fn initialize_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        // Enable WAL mode for concurrent reads/writes and set synchronous to NORMAL
+        // (NORMAL is safe in WAL mode and avoids extra fsync on every write)
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(pool)
+            .await?;
+
         // Port traffic aggregate table
         sqlx::query(
             r#"
