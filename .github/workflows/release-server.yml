@@ -8,9 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  build-frontend:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,9 +33,17 @@ jobs:
           npm ci
           npm run build
 
-      - name: Copy frontend dist
-        run: |
-          cp -r frontend/dist ./frontend-dist
+      - name: Upload frontend dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+  build-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Install Rust with musl target
         uses: dtolnay/rust-toolchain@stable
@@ -50,35 +57,43 @@ jobs:
           cache-targets: true
           cache-on-failure: true
 
-      - name: Install musl tools and mold linker
+      - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mold
-
-      - name: Setup mold linker wrapper for musl
-        run: |
-          sudo tee /usr/local/bin/musl-mold << 'ENDOFSCRIPT'
-          #!/bin/sh
-          # mold does not accept -m64/-m32, which Rust passes for musl targets
-          for arg; do
-            case "$arg" in
-              -m64|-m32) ;;
-              *) set -- "$@" "$arg" ;;
-            esac
-            shift
-          done
-          exec mold "$@"
-          ENDOFSCRIPT
-          sudo chmod +x /usr/local/bin/musl-mold
+          sudo apt-get install -y musl-tools
 
       - name: Build server (static linking with musl)
         run: |
-          cargo build --release --bin rust-tunnel-server --target x86_64-unknown-linux-musl --config target.x86_64-unknown-linux-musl.linker=\"musl-mold\"
+          cargo build --release --bin rust-tunnel-server --target x86_64-unknown-linux-musl
           strip target/x86_64-unknown-linux-musl/release/rust-tunnel-server
 
-      - name: Copy binary to root directory for upload
-        run: |
-          cp target/x86_64-unknown-linux-musl/release/rust-tunnel-server ./
+      - name: Upload server binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-tunnel-server
+          path: target/x86_64-unknown-linux-musl/release/rust-tunnel-server
+
+  deploy:
+    needs: [build-frontend, build-server]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist/
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-tunnel-server
+          path: ./
+
+      - name: Make binary executable
+        run: chmod +x ./rust-tunnel-server
 
       - name: Generate config from template
         run: |
