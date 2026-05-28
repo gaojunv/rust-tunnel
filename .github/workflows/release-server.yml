@@ -40,10 +40,17 @@ jobs:
           path: frontend/dist/
 
   build-server:
+    needs: [build-frontend]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist/
 
       - name: Install Rust with musl target
         uses: dtolnay/rust-toolchain@stable
@@ -74,17 +81,11 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/rust-tunnel-server
 
   deploy:
-    needs: [build-frontend, build-server]
+    needs: [build-server]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend-dist/
 
       - name: Download server binary
         uses: actions/download-artifact@v4
