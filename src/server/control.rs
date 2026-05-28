@@ -816,7 +816,8 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             } => {
                 // Ping received during registration phase
                 if !registered_ports.is_empty() {
-                    // Process quality update
+                    // Process quality update (same as main-loop Ping handling)
+                    let now = Utc::now();
                     let now_micros = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_micros() as u64)
@@ -829,8 +830,49 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
                     for &port in &registered_ports {
                         let mut tracker = state.get_or_create_quality_tracker(port).await;
-                        let (_, _) = tracker.record_ping(seq);
+                        let (lost, loss_rate) = tracker.record_ping(seq);
                         tracker.record_rtt(rtt_ms);
+
+                        let avg_rtt = tracker.get_avg_rtt();
+                        let min_rtt = tracker.get_min_rtt();
+                        let max_rtt = tracker.get_max_rtt();
+                        let quality_score = calculate_quality_score(avg_rtt, loss_rate);
+                        let thresholds = QualityThresholds::default();
+                        let (is_warning, is_critical) =
+                            check_warnings(avg_rtt, loss_rate, &thresholds);
+
+                        let quality = ConnectionQuality {
+                            last_rtt_ms: rtt_ms,
+                            avg_rtt_ms: avg_rtt,
+                            min_rtt_ms: min_rtt,
+                            max_rtt_ms: max_rtt,
+                            loss_rate,
+                            consecutive_losses: lost,
+                            bytes_in_per_sec: 0.0,
+                            bytes_out_per_sec: 0.0,
+                            quality_score,
+                            last_update: now,
+                            is_warning,
+                            is_critical,
+                        };
+
+                        state.quality_store.update_quality(port, quality).await;
+
+                        // Add historical sample on first ping (minute boundary check)
+                        let current_minute = now.minute();
+                        if tracker.last_sample_minute != current_minute {
+                            let sample = QualitySample {
+                                timestamp: now,
+                                avg_rtt_ms: avg_rtt,
+                                loss_rate,
+                                bytes_in_per_sec: 0.0,
+                                bytes_out_per_sec: 0.0,
+                                quality_score,
+                            };
+                            state.quality_store.add_sample(port, sample).await;
+                            tracker.last_sample_minute = current_minute;
+                        }
+
                         state.update_quality_tracker(port, tracker).await;
                     }
 

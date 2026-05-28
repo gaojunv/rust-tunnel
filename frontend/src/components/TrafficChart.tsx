@@ -14,28 +14,41 @@ const formatBytes = (bytes: number): string => {
 };
 
 export const TrafficChart = ({ traffic }: TrafficChartProps) => {
-  // Combine all traffic data
-  const chartData = traffic.flatMap(portTraffic =>
-    portTraffic.buckets.map(bucket => ({
-      time: new Date(bucket.timestamp).toLocaleTimeString(),
-      [`In (Port ${portTraffic.port})`]: bucket.bytes_in,
-      [`Out (Port ${portTraffic.port})`]: bucket.bytes_out,
-    }))
-  );
+  // Merge data from all ports by timestamp, then sort chronologically.
+  // Each unique timestamp becomes one data point that carries every port's in/out series.
+  const timeMap = new Map<number, Record<string, number | string>>();
 
-  // Remove duplicates by time (simplified)
-  const uniqueData = Array.from(new Map(chartData.map(d => [d.time, d])).values());
+  for (const portTraffic of traffic) {
+    for (const bucket of portTraffic.buckets) {
+      const ts = new Date(bucket.timestamp).getTime();
+      if (!timeMap.has(ts)) {
+        timeMap.set(ts, { time: ts });
+      }
+      const point = timeMap.get(ts)!;
+      point[`In (Port ${portTraffic.port})`] = bucket.bytes_in;
+      point[`Out (Port ${portTraffic.port})`] = bucket.bytes_out;
+    }
+  }
+
+  const chartData = Array.from(timeMap.values())
+    .sort((a, b) => (a.time as number) - (b.time as number));
 
   return (
     <div className="bg-white p-6 rounded-lg shadow">
       <h3 className="text-lg font-medium text-gray-900 mb-4">Network Traffic</h3>
-      {uniqueData.length > 0 ? (
+      {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={300}>
-          <LineChart data={uniqueData}>
+          <LineChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" />
+            <XAxis
+              dataKey="time"
+              tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
+            />
             <YAxis tickFormatter={formatBytes} />
-            <Tooltip formatter={(value: number) => formatBytes(value)} />
+            <Tooltip
+              formatter={(value: number) => formatBytes(value)}
+              labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
+            />
             <Legend />
             {traffic.map(portTraffic => (
               <>
