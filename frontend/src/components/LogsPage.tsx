@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { getLogs, getLogsLevel, setLogsLevel } from '../api/client';
 import type { LogEntry } from '../types';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 
 const MAX_LOGS = 1000;
 const LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
@@ -37,6 +38,7 @@ export const LogsPage = () => {
   const [currentLevel, setCurrentLevel] = useState<string>('info');
   const [loading, setLoading] = useState<boolean>(false);
   const [hasMore, setHasMore] = useState<boolean>(true);
+  const isMobile = useMediaQuery('(max-width: 767px)');
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -246,7 +248,7 @@ export const LogsPage = () => {
         ref={scrollRef}
         onScroll={handleScroll}
         className="bg-white shadow rounded-lg overflow-y-auto font-mono text-sm"
-        style={{ height: '600px' }}
+        style={{ height: isMobile ? 'calc(100vh - 280px)' : '600px' }}
       >
         {/* Load More Button */}
         {hasMore && logs.length > 0 && (
