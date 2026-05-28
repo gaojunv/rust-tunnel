@@ -4,23 +4,13 @@ import type { PortTraffic, PortQualityResponse, QualitySample } from '../types';
 import { TrafficChart } from './TrafficChart';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import { getQualityColor, getQualityText } from './ClientList';
+import { formatBytes, formatMs, formatPercent } from '../utils/format';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 
 interface ClientDetailProps {
   port: number;
   onClose: () => void;
 }
-
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
-
-const formatMs = (value: number): string => `${value.toFixed(1)} ms`;
-
-const formatPercent = (value: number): string => `${(value * 100).toFixed(1)}%`;
 
 // Quality gauge component
 const QualityGauge = ({ score }: { score: number }) => {
@@ -67,7 +57,7 @@ const QualityGauge = ({ score }: { score: number }) => {
 };
 
 // RTT chart component
-const RTTChart = ({ samples }: { samples: QualitySample[] }) => {
+const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     avg_rtt_ms: sample.avg_rtt_ms,
@@ -77,7 +67,7 @@ const RTTChart = ({ samples }: { samples: QualitySample[] }) => {
     <div>
       <h4 className="text-sm font-medium text-gray-700 mb-2">RTT History (Last 60 min)</h4>
       {chartData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={200}>
+        <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <LineChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="time" tick={{ fontSize: 10 }} />
@@ -101,7 +91,7 @@ const RTTChart = ({ samples }: { samples: QualitySample[] }) => {
 };
 
 // Loss rate chart component
-const LossChart = ({ samples }: { samples: QualitySample[] }) => {
+const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     loss_rate: sample.loss_rate * 100,
@@ -111,7 +101,7 @@ const LossChart = ({ samples }: { samples: QualitySample[] }) => {
     <div>
       <h4 className="text-sm font-medium text-gray-700 mb-2">Packet Loss History (Last 60 min)</h4>
       {chartData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={200}>
+        <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <BarChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="time" tick={{ fontSize: 10 }} />
@@ -133,6 +123,8 @@ const LossChart = ({ samples }: { samples: QualitySample[] }) => {
 };
 
 export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
+  const isSmallScreen = useMediaQuery('(max-width: 639px)');
+
   const { data: traffic, isLoading: isLoadingTraffic } = useQuery<PortTraffic>(
     ['portTraffic', port],
     () => getPortTraffic(port),
@@ -154,7 +146,11 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-      <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-hidden">
+      <div className={`bg-white shadow-xl w-full overflow-hidden
+          ${isSmallScreen
+            ? 'rounded-none max-w-full h-full'
+            : 'rounded-lg max-w-2xl max-h-[90vh]'
+          }`}>
         <div className="flex items-center justify-between p-6 border-b">
           <h2 className="text-xl font-semibold text-gray-900">
             Client Details - Port {port}
@@ -169,7 +165,7 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
           </button>
         </div>
 
-        <div className="p-6 overflow-y-auto max-h-[calc(90vh-80px)]">
+        <div className={`overflow-y-auto ${isSmallScreen ? 'h-full' : 'max-h-[calc(90vh-80px)]'} p-6`}>
           {isLoading ? (
             <p className="text-gray-500 text-center py-8">Loading...</p>
           ) : (
@@ -213,10 +209,10 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
                   {/* Quality Charts */}
                   <div className="grid grid-cols-1 gap-4 mt-4">
                     <div className="bg-gray-50 p-4 rounded-lg">
-                      <RTTChart samples={quality.history} />
+                      <RTTChart samples={quality.history} isSmallScreen={isSmallScreen} />
                     </div>
                     <div className="bg-gray-50 p-4 rounded-lg">
-                      <LossChart samples={quality.history} />
+                      <LossChart samples={quality.history} isSmallScreen={isSmallScreen} />
                     </div>
                   </div>
                 </div>
