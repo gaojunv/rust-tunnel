@@ -20,6 +20,14 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
       - name: Build frontend
         run: |
           cd frontend
@@ -36,14 +44,20 @@ jobs:
           toolchain: stable
           target: x86_64-unknown-linux-musl
 
-      - name: Install musl tools
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Install musl tools and mold linker
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools mold
 
       - name: Build server (static linking with musl)
         run: |
-          cargo build --release --bin rust-tunnel-server --target x86_64-unknown-linux-musl
+          cargo build --release --bin rust-tunnel-server --target x86_64-unknown-linux-musl --config target.x86_64-unknown-linux-musl.linker=\"mold\"
           strip target/x86_64-unknown-linux-musl/release/rust-tunnel-server
 
       - name: Copy binary to root directory for upload
