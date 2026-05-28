@@ -1,25 +1,23 @@
 import { useQuery } from 'react-query';
+import { useState, useCallback } from 'react';
 import { getShadowsocksConfig, getShadowsocksStats, getShadowsocksQuality } from '../api/client';
 import type { ShadowsocksQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { formatBytes, formatBps } from '../utils/format';
+import { ChartContainer } from './shared/ChartContainer';
+import type { ChartTimeRange } from './shared/ChartContainer';
 
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
-
-const formatBps = (bytesPerSec: number): string => formatBytes(bytesPerSec) + '/s';
-
-const ThroughputHistory = ({ qualityList }: { qualityList: ShadowsocksQuality[] }) => {
+const ThroughputHistory = ({ qualityList, timeRange }: {
+  qualityList: ShadowsocksQuality[];
+  timeRange: ChartTimeRange;
+}) => {
   // Merge samples by timestamp (milliseconds) to avoid the old string-key dedup bug
   const timeMap = new Map<number, Record<string, number | string>>();
   for (const q of qualityList) {
     for (const s of q.history) {
       const ts = new Date(s.timestamp).getTime();
+      if (ts < timeRange.startMs || ts > timeRange.endMs) continue;
       if (!timeMap.has(ts)) timeMap.set(ts, { time: ts });
       const pt = timeMap.get(ts)!;
       pt[`In (Port ${q.port}) B/s`] = s.bytes_in_per_sec;
@@ -72,6 +70,16 @@ export const ShadowsocksPage = () => {
     getShadowsocksQuality,
     { refetchInterval: 5000 }
   );
+
+  const [timeRange, setTimeRange] = useState<ChartTimeRange>({
+    preset: '1h',
+    startMs: Date.now() - 3600000,
+    endMs: Date.now(),
+  });
+
+  const handleTimeRangeChange = useCallback((range: ChartTimeRange) => {
+    setTimeRange(range);
+  }, []);
 
   if (configLoading || statsLoading) {
     return (
@@ -167,10 +175,14 @@ export const ShadowsocksPage = () => {
               );
             })}
           </div>
-          <div className="bg-gray-50 p-4 rounded-lg">
-            <h4 className="text-sm font-medium text-gray-700 mb-2">Throughput History (Last 60 min)</h4>
-            <ThroughputHistory qualityList={qualityList} />
-          </div>
+          <ChartContainer
+            title="Throughput History"
+            timeRange={timeRange}
+            onTimeRangeChange={handleTimeRangeChange}
+            isEmpty={qualityList.every(q => q.history.length === 0)}
+          >
+            <ThroughputHistory qualityList={qualityList} timeRange={timeRange} />
+          </ChartContainer>
         </div>
       )}
     </div>
