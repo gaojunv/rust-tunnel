@@ -1,78 +1,98 @@
+import React, { useState, useMemo, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import type { PortTraffic } from '../types';
+import { ChartContainer } from './shared/ChartContainer';
+import type { ChartTimeRange } from './shared/ChartContainer';
+import { formatBytes } from '../utils/format';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 
 interface TrafficChartProps {
   traffic: PortTraffic[];
 }
 
-const formatBytes = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
+const colorPool = ['#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#ef4444', '#06b6d4'];
 
 export const TrafficChart = ({ traffic }: TrafficChartProps) => {
-  // Merge data from all ports by timestamp, then sort chronologically.
-  // Each unique timestamp becomes one data point that carries every port's in/out series.
-  const timeMap = new Map<number, Record<string, number | string>>();
+  const [timeRange, setTimeRange] = useState<ChartTimeRange>({
+    preset: '1h',
+    startMs: Date.now() - 3600000,
+    endMs: Date.now(),
+  });
+  const isSmallScreen = useMediaQuery('(max-width: 639px)');
 
-  for (const portTraffic of traffic) {
-    for (const bucket of portTraffic.buckets) {
-      const ts = new Date(bucket.timestamp).getTime();
-      if (!timeMap.has(ts)) {
-        timeMap.set(ts, { time: ts });
+  const handleTimeRangeChange = useCallback((range: ChartTimeRange) => {
+    setTimeRange(range);
+  }, []);
+
+  const chartData = useMemo(() => {
+    const timeMap = new Map<number, Record<string, number | string>>();
+
+    for (const portTraffic of traffic) {
+      for (const bucket of portTraffic.buckets) {
+        const ts = new Date(bucket.timestamp).getTime();
+        if (ts < timeRange.startMs || ts > timeRange.endMs) continue;
+        if (!timeMap.has(ts)) {
+          timeMap.set(ts, { time: ts });
+        }
+        const point = timeMap.get(ts)!;
+        point[`in_${portTraffic.port}`] = bucket.bytes_in;
+        point[`out_${portTraffic.port}`] = bucket.bytes_out;
       }
-      const point = timeMap.get(ts)!;
-      point[`In (Port ${portTraffic.port})`] = bucket.bytes_in;
-      point[`Out (Port ${portTraffic.port})`] = bucket.bytes_out;
     }
-  }
 
-  const chartData = Array.from(timeMap.values())
-    .sort((a, b) => (a.time as number) - (b.time as number));
+    return Array.from(timeMap.values())
+      .sort((a, b) => (a.time as number) - (b.time as number));
+  }, [traffic, timeRange]);
 
   return (
-    <div className="bg-white p-6 rounded-lg shadow">
-      <h3 className="text-lg font-medium text-gray-900 mb-4">Network Traffic</h3>
-      {chartData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={300}>
-          <LineChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis
-              dataKey="time"
-              tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
-            />
-            <YAxis tickFormatter={formatBytes} />
-            <Tooltip
-              formatter={(value: number) => formatBytes(value)}
-              labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
-            />
-            <Legend />
-            {traffic.map(portTraffic => (
-              <>
-                <Line
-                  key={`in-${portTraffic.port}`}
-                  type="monotone"
-                  dataKey={`In (Port ${portTraffic.port})`}
-                  stroke="#3b82f6"
-                  dot={false}
-                />
-                <Line
-                  key={`out-${portTraffic.port}`}
-                  type="monotone"
-                  dataKey={`Out (Port ${portTraffic.port})`}
-                  stroke="#10b981"
-                  dot={false}
-                />
-              </>
-            ))}
-          </LineChart>
-        </ResponsiveContainer>
-      ) : (
-        <p className="text-gray-500 text-center py-8">No traffic data available</p>
-      )}
-    </div>
+    <ChartContainer
+      title="Network Traffic"
+      timeRange={timeRange}
+      onTimeRangeChange={handleTimeRangeChange}
+      isEmpty={chartData.length === 0}
+    >
+      <ResponsiveContainer width="100%" height={isSmallScreen ? 250 : 300}>
+        <LineChart data={chartData}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis
+            dataKey="time"
+            tick={{ fontSize: isSmallScreen ? 9 : 12 }}
+            tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
+          />
+          <YAxis
+            tick={{ fontSize: isSmallScreen ? 9 : 12 }}
+            tickFormatter={formatBytes}
+            width={70}
+          />
+          <Tooltip
+            formatter={(value: number) => formatBytes(value)}
+            labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
+          />
+          <Legend
+            wrapperStyle={{ fontSize: isSmallScreen ? '10px' : '12px' }}
+          />
+          {traffic.map((portTraffic, idx) => (
+            <React.Fragment key={portTraffic.port}>
+              <Line
+                type="monotone"
+                dataKey={`in_${portTraffic.port}`}
+                name={`In (Port ${portTraffic.port})`}
+                stroke={colorPool[idx * 2 % colorPool.length]}
+                dot={false}
+                strokeWidth={2}
+              />
+              <Line
+                type="monotone"
+                dataKey={`out_${portTraffic.port}`}
+                name={`Out (Port ${portTraffic.port})`}
+                stroke={colorPool[(idx * 2 + 1) % colorPool.length]}
+                dot={false}
+                strokeWidth={2}
+              />
+            </React.Fragment>
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    </ChartContainer>
   );
 };
