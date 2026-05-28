@@ -437,6 +437,62 @@ impl ServerState {
         let ports = self.ports.lock().await;
         matches!(ports.get(&port), Some(PortInfo::Shadowsocks { .. }))
     }
+
+    /// Sample quality for proxy ports (Shadowsocks / Trojan) based on traffic throughput.
+    /// Called periodically — reads recent traffic buckets and generates quality samples.
+    pub async fn sample_proxy_quality(&self) {
+        let now = Utc::now();
+        let ss_ports = self.get_shadowsocks_ports().await;
+        let trojan_ports = self.get_trojan_ports().await;
+
+        for port in ss_ports.iter().chain(trojan_ports.iter()) {
+            let (bytes_in_per_sec, bytes_out_per_sec) =
+                if let Some(traffic) = self.traffic_store.get_port_traffic(*port).await {
+                    // Compute throughput from the most recent bucket
+                    let (recent_in, recent_out) = traffic
+                        .buckets
+                        .back()
+                        .map(|b| (b.bytes_in as f64, b.bytes_out as f64))
+                        .unwrap_or((0.0, 0.0));
+                    // Approximate per-second rate: bucket covers ~60 seconds
+                    (recent_in / 60.0, recent_out / 60.0)
+                } else {
+                    (0.0, 0.0)
+                };
+
+            // Quality score: based on whether there's active traffic
+            let active = bytes_in_per_sec > 0.0 || bytes_out_per_sec > 0.0;
+            let quality_score: u8 = if active { 100 } else { 50 };
+
+            let quality = ConnectionQuality {
+                last_rtt_ms: 0.0,
+                avg_rtt_ms: 0.0,
+                min_rtt_ms: 0.0,
+                max_rtt_ms: 0.0,
+                loss_rate: 0.0,
+                consecutive_losses: 0,
+                bytes_in_per_sec,
+                bytes_out_per_sec,
+                quality_score,
+                last_update: now,
+                is_warning: false,
+                is_critical: false,
+            };
+
+            self.quality_store.update_quality(*port, quality).await;
+
+            // Add historical sample once per minute
+            let sample = QualitySample {
+                timestamp: now,
+                avg_rtt_ms: 0.0,
+                loss_rate: 0.0,
+                bytes_in_per_sec,
+                bytes_out_per_sec,
+                quality_score,
+            };
+            self.quality_store.add_sample(*port, sample).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1030,6 +1086,14 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             0.0 // Clock went backwards, ignore
                         };
 
+                        tracing::debug!(
+                            "Processing Ping seq={} for {} ports, rtt={:.1}ms, minute={}",
+                            seq,
+                            registered_ports.len(),
+                            rtt_ms,
+                            now.minute()
+                        );
+
                         // Iterate all registered ports for this connection and update quality
                         for &port in &registered_ports {
                             // Get or create quality tracker
@@ -1079,6 +1143,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             // Add historical sample once per minute
                             let current_minute = now.minute();
                             if tracker.last_sample_minute != current_minute {
+                                tracing::info!(
+                                    "Adding quality sample for port {}: last_sample_minute={}, current_minute={}",
+                                    port, tracker.last_sample_minute, current_minute
+                                );
                                 let sample = QualitySample {
                                     timestamp: now,
                                     avg_rtt_ms: avg_rtt,
