@@ -19,10 +19,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Cache node_modules
+      - name: Cache node_modules and npm
         uses: actions/cache@v4
         with:
-          path: frontend/node_modules
+          path: |
+            frontend/node_modules
+            ~/.npm
           key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
@@ -65,9 +67,10 @@ jobs:
           cache-on-failure: true
 
       - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: musl-tools
+          version: 1.0
 
       - name: Build server (static linking with musl)
         run: |
