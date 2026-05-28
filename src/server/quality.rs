@@ -272,6 +272,15 @@ impl QualityStore {
             .or_insert_with(|| VecDeque::with_capacity(60));
         port_samples.push_back(sample.clone());
 
+        tracing::info!(
+            "Quality sample added for port {}: avg_rtt={:.1}ms, loss={:.3}, score={}, total_samples={}",
+            port,
+            sample.avg_rtt_ms,
+            sample.loss_rate,
+            sample.quality_score,
+            port_samples.len()
+        );
+
         while port_samples.len() > 60 {
             port_samples.pop_front();
         }
@@ -309,10 +318,16 @@ impl QualityStore {
 
     pub async fn get_samples(&self, port: u16) -> Vec<QualitySample> {
         let samples = self.samples.lock().await;
-        samples
+        let result: Vec<QualitySample> = samples
             .get(&port)
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        tracing::debug!(
+            "get_samples for port {}: {} samples returned",
+            port,
+            result.len()
+        );
+        result
     }
 
     pub async fn remove_port(&self, port: u16) {
