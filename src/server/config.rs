@@ -468,6 +468,12 @@ impl ServerConfig {
             }
         }
 
+        // Validate DNS configuration
+        if config.dns_enabled {
+            config.dns_bind.parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("Invalid dns_bind '{}': {}", config.dns_bind, e))?;
+        }
+
         Ok(config)
     }
 }
@@ -762,5 +768,38 @@ mod tests {
         let result = ServerConfig::from_cli(cli);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("trojan_password is required"));
+    }
+
+    #[test]
+    fn test_dns_config_validation_invalid_bind() {
+        let cli = ServerCli {
+            config_file: None,
+            control_addr: None,
+            api_addr: None,
+            admin_password: None,
+            jwt_secret: None,
+            client_auth_token: None,
+            tls: None,
+            tls_cert: None,
+            tls_key: None,
+            log: None,
+            db_path: None,
+            ss_enabled: None,
+            ss_port: None,
+            ss_cipher: None,
+            ss_password: None,
+            trojan_enabled: None,
+            trojan_port: None,
+            trojan_password: None,
+            trojan_fallback: None,
+            dns_enabled: Some(true),
+            dns_bind: Some("not-an-address".to_string()),
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
+        };
+
+        let result = ServerConfig::from_cli(cli);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid dns_bind"));
     }
 }
