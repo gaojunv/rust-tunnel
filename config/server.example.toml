@@ -14,6 +14,10 @@
 #   TLS_KEY            -> tls_key
 #   LOG_LEVEL          -> log
 #   DB_PATH            -> db_path
+#   DNS_ENABLED        -> dns_enabled
+#   DNS_BIND           -> dns_bind
+#   DNS_TUNNEL_DOMAIN  -> dns_tunnel_domain
+#   DNS_MESH_DOMAIN    -> dns_mesh_domain
 #   TROJAN_ENABLED     -> trojan_enabled
 #   TROJAN_PORT        -> trojan_port
 #   TROJAN_PASSWORD    -> trojan_password
@@ -31,6 +35,18 @@
 #   --tls-key              TLS 私钥文件路径
 #   --log                  日志级别
 #   --db-path              SQLite 数据库路径
+#   --dns-enabled          启用嵌入式 DNS 服务器
+#   --dns-bind             DNS 服务器监听地址
+#   --dns-tunnel-domain    Tunnel 域名后缀
+#   --dns-mesh-domain      Mesh 域名后缀
+#   --ss-enabled           启用 Shadowsocks 代理
+#   --ss-port              Shadowsocks 监听端口
+#   --ss-cipher            Shadowsocks 加密方式
+#   --ss-password          Shadowsocks 密码
+#   --trojan-enabled       启用 Trojan 代理
+#   --trojan-port          Trojan 监听端口
+#   --trojan-password      Trojan 密码
+#   --trojan-fallback      Trojan 回退地址
 # ========================================
 
 # --------------------
@@ -113,6 +129,29 @@ db_path = "./data/rust-tunnel.db"
 # 命令行参数：--client-auth-token <TOKEN>
 
 # --------------------
+# DNS 服务器配置
+# --------------------
+
+# 启用嵌入式 DNS 权威服务器
+# 监听 UDP 53 端口，为 *.tunnel.local 和 *.mesh.local 提供域名解析
+# 默认值：false（需要 root 权限监听 53 端口）
+dns_enabled = false
+
+# DNS 服务器监听地址
+# 默认值：0.0.0.0:53
+dns_bind = "0.0.0.0:53"
+
+# Tunnel 端口域名后缀
+# 客户端注册转发规则时自动注册为 <name>.tunnel.local
+# 默认值：tunnel.local
+dns_tunnel_domain = "tunnel.local"
+
+# Mesh 服务发现域名后缀
+# Mesh 内服务自动注册为 <service>.<mesh-id>.mesh.local
+# 默认值：mesh.local
+dns_mesh_domain = "mesh.local"
+
+# --------------------
 # Trojan 代理配置
 # --------------------
 
@@ -152,6 +191,10 @@ trojan_enabled = false
 # trojan_port = 443
 # trojan_password = "your_trojan_password_here"
 # trojan_fallback = "127.0.0.1:80"
+# dns_enabled = true
+# dns_bind = "0.0.0.0:53"
+# dns_tunnel_domain = "tunnel.local"
+# dns_mesh_domain = "mesh.local"
 # log = "warn"
 # db_path = "/var/lib/rust-tunnel/rust-tunnel.db"
 
