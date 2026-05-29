@@ -50,7 +50,7 @@ tower-http = { version = "0.5", features = ["cors", "fs"] }
 async-stream = "0.3"
 
 # Embed frontend assets
-rust-embed = { version = "8.0", features = ["axum"] }
+rust-embed = { version = "8.0", features = ["axum"], optional = true }
 mime_guess = "2.0"
 
 # Authentication
@@ -88,6 +88,9 @@ hex = "0.4"
 
 # DNS protocol types
 hickory-proto = "0.24"
+
+[features]
+embed-frontend = ["rust-embed"]
 
 [dev-dependencies]
 tempfile = "3.0"

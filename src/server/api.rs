@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Timelike, Utc};
+#[cfg(feature = "embed-frontend")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -24,6 +25,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use std::time::Duration;
 
 /// Embedded frontend assets
+#[cfg(feature = "embed-frontend")]
 #[derive(RustEmbed)]
 #[folder = "frontend-dist/"]
 struct FrontendAssets;
@@ -863,6 +865,7 @@ async fn get_metrics(State(state): State<ApiState>) -> Json<ServerMetrics> {
 }
 
 /// Serve embedded static files for frontend
+#[cfg(feature = "embed-frontend")]
 async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
     let path = if path.is_empty() { "index.html" } else { &path };
 
@@ -1647,6 +1650,7 @@ pub async fn run_api_server(
     }
 
     // Static file service for frontend (embedded)
+    #[cfg(feature = "embed-frontend")]
     let static_routes = Router::new()
         .route(
             "/",
@@ -1656,10 +1660,12 @@ pub async fn run_api_server(
 
     let app = Router::new()
         .merge(public_routes)
-        .merge(protected_routes)
-        .merge(static_routes)
-        .layer(cors)
-        .with_state(state);
+        .merge(protected_routes);
+
+    #[cfg(feature = "embed-frontend")]
+    let app = app.merge(static_routes);
+
+    let app = app.layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&api_addr).await?;
     tracing::info!("API server listening on {}", api_addr);
