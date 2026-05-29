@@ -16,6 +16,22 @@ pub struct ClientLogEntry {
     pub message: String,
 }
 
+/// A member of a mesh network
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MeshMember {
+    pub client_name: String,
+    pub public_addr: Option<String>,
+    pub online: bool,
+}
+
+/// A service exposed by a mesh client (used in protocol messages)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MeshServiceDef {
+    pub name: String,
+    pub protocol: String,
+    pub local_addr: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
     /// Client requests registration to expose a remote port
@@ -57,6 +73,50 @@ pub enum ControlMessage {
     },
     /// Server requests client to disconnect (web interface admin action)
     Disconnect,
+    /// Mesh network registration (client -> server)
+    MeshJoin {
+        mesh_id: String,
+        client_name: String,
+    },
+    /// Leave a mesh network (client -> server)
+    MeshLeave {
+        mesh_id: String,
+    },
+    /// Server sends mesh member list to clients (server -> client)
+    MeshMemberList {
+        mesh_id: String,
+        members: Vec<MeshMember>,
+    },
+    /// Request to connect to a service on another mesh client (client -> server)
+    MeshConnect {
+        target_client: String,
+        service_name: String,
+    },
+    /// Request P2P hole punch with target (client -> server, contains own public address)
+    P2PRequest {
+        target_client: String,
+        local_addr: String,
+    },
+    /// Forward P2P response with remote address info (server -> client)
+    P2PResponse {
+        target_client: String,
+        remote_addr: String,
+    },
+    /// Report P2P hole punch result (client -> server)
+    P2PResult {
+        target_client: String,
+        success: bool,
+    },
+    /// Relay data through server when P2P fails (client <-> server)
+    MeshRelay {
+        target_client: String,
+        data: Vec<u8>,
+    },
+    /// Client registers mesh services (client -> server, sent after MeshJoin)
+    MeshRegisterServices {
+        mesh_id: String,
+        services: Vec<MeshServiceDef>,
+    },
     /// Client sends a batch of log entries
     LogBatch {
         entries: Vec<ClientLogEntry>,
@@ -175,6 +235,49 @@ mod tests {
                 pong_timestamp_micros: 123456795,
             },
             ControlMessage::Disconnect,
+            ControlMessage::MeshJoin {
+                mesh_id: "test-mesh".into(),
+                client_name: "client-a".into(),
+            },
+            ControlMessage::MeshLeave {
+                mesh_id: "test-mesh".into(),
+            },
+            ControlMessage::MeshMemberList {
+                mesh_id: "test-mesh".into(),
+                members: vec![MeshMember {
+                    client_name: "client-a".into(),
+                    public_addr: Some("1.2.3.4:12345".into()),
+                    online: true,
+                }],
+            },
+            ControlMessage::MeshConnect {
+                target_client: "client-b".into(),
+                service_name: "db".into(),
+            },
+            ControlMessage::P2PRequest {
+                target_client: "client-b".into(),
+                local_addr: "1.2.3.4:12345".into(),
+            },
+            ControlMessage::P2PResponse {
+                target_client: "client-b".into(),
+                remote_addr: "5.6.7.8:54321".into(),
+            },
+            ControlMessage::P2PResult {
+                target_client: "client-b".into(),
+                success: true,
+            },
+            ControlMessage::MeshRelay {
+                target_client: "client-b".into(),
+                data: vec![1, 2, 3],
+            },
+            ControlMessage::MeshRegisterServices {
+                mesh_id: "test-mesh".into(),
+                services: vec![MeshServiceDef {
+                    name: "db".into(),
+                    protocol: "mysql".into(),
+                    local_addr: "localhost:3306".into(),
+                }],
+            },
         ];
 
         for msg in messages {
@@ -302,6 +405,49 @@ mod tests {
                 pong_timestamp_micros: 123456795,
             },
             ControlMessage::Disconnect,
+            ControlMessage::MeshJoin {
+                mesh_id: "test-mesh".into(),
+                client_name: "client-a".into(),
+            },
+            ControlMessage::MeshLeave {
+                mesh_id: "test-mesh".into(),
+            },
+            ControlMessage::MeshMemberList {
+                mesh_id: "test-mesh".into(),
+                members: vec![MeshMember {
+                    client_name: "client-a".into(),
+                    public_addr: Some("1.2.3.4:12345".into()),
+                    online: true,
+                }],
+            },
+            ControlMessage::MeshConnect {
+                target_client: "client-b".into(),
+                service_name: "db".into(),
+            },
+            ControlMessage::P2PRequest {
+                target_client: "client-b".into(),
+                local_addr: "1.2.3.4:12345".into(),
+            },
+            ControlMessage::P2PResponse {
+                target_client: "client-b".into(),
+                remote_addr: "5.6.7.8:54321".into(),
+            },
+            ControlMessage::P2PResult {
+                target_client: "client-b".into(),
+                success: true,
+            },
+            ControlMessage::MeshRelay {
+                target_client: "client-b".into(),
+                data: vec![1, 2, 3],
+            },
+            ControlMessage::MeshRegisterServices {
+                mesh_id: "test-mesh".into(),
+                services: vec![MeshServiceDef {
+                    name: "db".into(),
+                    protocol: "mysql".into(),
+                    local_addr: "localhost:3306".into(),
+                }],
+            },
         ];
 
         for msg in messages {

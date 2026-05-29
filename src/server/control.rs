@@ -1226,6 +1226,33 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     ControlMessage::Disconnect => {
                         warn!("Received unexpected Disconnect from client");
                     }
+                    ControlMessage::MeshJoin { .. } => {
+                        warn!("Mesh networking not yet implemented");
+                    }
+                    ControlMessage::MeshLeave { .. } => {
+                        warn!("Mesh networking not yet implemented");
+                    }
+                    ControlMessage::MeshMemberList { .. } => {
+                        warn!("Received unexpected MeshMemberList from client");
+                    }
+                    ControlMessage::MeshConnect { .. } => {
+                        warn!("Mesh networking not yet implemented");
+                    }
+                    ControlMessage::P2PRequest { .. } => {
+                        warn!("P2P networking not yet implemented");
+                    }
+                    ControlMessage::P2PResponse { .. } => {
+                        warn!("Received unexpected P2PResponse from client");
+                    }
+                    ControlMessage::P2PResult { .. } => {
+                        warn!("P2P networking not yet implemented");
+                    }
+                    ControlMessage::MeshRelay { .. } => {
+                        warn!("Mesh relay not yet implemented");
+                    }
+                    ControlMessage::MeshRegisterServices { .. } => {
+                        warn!("Mesh networking not yet implemented");
+                    }
                     ControlMessage::RegisterResponse { .. } => {
                         warn!("Received unexpected RegisterResponse from client");
                     }
