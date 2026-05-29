@@ -93,7 +93,7 @@ pub fn parse_binding_response(data: &[u8], expected_tid: &[u8; 12]) -> Option<St
                 }
             }
             ATTR_MAPPED_ADDRESS => {
-                if attr_len >= 8 {
+                if mapped_address.is_none() && attr_len >= 8 {
                     if let Some(addr) = parse_mapped_address(&data[pos..pos + attr_len]) {
                         mapped_address = Some(addr);
                     }
@@ -123,7 +123,7 @@ fn parse_xor_mapped_address(data: &[u8]) -> Option<String> {
         return None; // Only IPv4 supported
     }
     let port_xor = u16::from_be_bytes([data[2], data[3]]);
-    let port = port_xor ^ (STUN_MAGIC_COOKIE as u16);
+    let port = port_xor ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
     let ip_xor = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     let ip = ip_xor ^ STUN_MAGIC_COOKIE;
     let ip_str = format!(
@@ -199,7 +199,7 @@ mod tests {
         let ip: u32 = 0x01020304; // 1.2.3.4
         let port: u16 = 12345;
         let xor_ip = ip ^ STUN_MAGIC_COOKIE;
-        let xor_port = port ^ (STUN_MAGIC_COOKIE as u16);
+        let xor_port = port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
 
         let mut attr = Vec::new();
         attr.push(0x00); // reserved
