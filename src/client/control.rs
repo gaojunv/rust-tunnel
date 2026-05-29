@@ -240,6 +240,34 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         info!("Server requested disconnect. Shutting down...");
                         return Err(TunnelError::Protocol("Server requested disconnect".into()));
                     }
+                    ControlMessage::MeshMemberList { mesh_id, members } => {
+                        debug!(
+                            "Mesh '{}' member list updated: {} member(s)",
+                            mesh_id,
+                            members.len()
+                        );
+                    }
+                    ControlMessage::MeshConnect {
+                        target_client: _,
+                        service_name,
+                    } => {
+                        info!(
+                            "Mesh connect request for service '{}' (not yet implemented)",
+                            service_name
+                        );
+                    }
+                    ControlMessage::P2PResponse {
+                        target_client: _,
+                        remote_addr,
+                    } => {
+                        debug!("P2P response with remote addr: {}", remote_addr);
+                    }
+                    ControlMessage::MeshRelay {
+                        target_client: _,
+                        data: _,
+                    } => {
+                        debug!("Received mesh relay data");
+                    }
                     _ => {
                         warn!("Unexpected message from server: {:?}", msg);
                     }

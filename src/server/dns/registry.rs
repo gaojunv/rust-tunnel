@@ -30,6 +30,9 @@ impl DnsRegistry {
         let ip = self.server_ip.lock().await.clone();
         let mut zone = self.zone.lock().await;
 
+        // Remove existing records for this name to prevent duplicates on reconnect
+        zone.remove_records(&a_name);
+
         zone.add_record(DnsRecord::TunnelA {
             name: a_name.clone(),
             target_ip: ip.clone(),
@@ -38,6 +41,7 @@ impl DnsRegistry {
 
         if let Some(proto) = protocol {
             let srv_name = format!("_{}._tcp.{}.{}", proto, dns_name, self.tunnel_domain);
+            zone.remove_records(&srv_name);
             zone.add_record(DnsRecord::TunnelSrv {
                 name: srv_name,
                 target: a_name,
@@ -76,17 +80,21 @@ impl DnsRegistry {
         port: u16,
     ) {
         let name = format!("{}.{}.{}", service_name, mesh_id, self.mesh_domain);
+        let srv_name = format!(
+            "_{}._tcp.{}.{}.{}",
+            protocol, service_name, mesh_id, self.mesh_domain
+        );
         let mut zone = self.zone.lock().await;
+
+        // Remove existing records to prevent duplicates on reconnect
+        zone.remove_records(&name);
+        zone.remove_records(&srv_name);
 
         zone.add_record(DnsRecord::MeshA {
             name: name.clone(),
             target_ip: target_ip.to_string(),
         });
 
-        let srv_name = format!(
-            "_{}._tcp.{}.{}.{}",
-            protocol, service_name, mesh_id, self.mesh_domain
-        );
         zone.add_record(DnsRecord::MeshSrv {
             name: srv_name,
             target: name,

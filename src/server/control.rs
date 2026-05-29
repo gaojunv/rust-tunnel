@@ -1037,6 +1037,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     } else {
         "unknown".to_string()
     };
+    let mut mesh_client_name = client_name.clone();
 
     // Main loop: keep connection alive and process messages (heartbeats, data routing)
     let result = loop {
@@ -1311,16 +1312,20 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             }
             ControlMessage::MeshJoin {
                 mesh_id,
-                client_name,
+                client_name: msg_client_name,
             } => {
-                info!("Client '{}' joining mesh '{}'", client_name, mesh_id);
+                mesh_client_name = msg_client_name;
+                info!("Client '{}' joining mesh '{}'", mesh_client_name, mesh_id);
                 // Register client for relay
                 state
                     .mesh_manager
-                    .register_client(&client_name, sender.clone())
+                    .register_client(&mesh_client_name, sender.clone())
                     .await;
                 // Join the mesh
-                let members = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                let members = state
+                    .mesh_manager
+                    .join_mesh(&mesh_id, &mesh_client_name)
+                    .await;
                 // Send member list back to requester
                 let _ = sender
                     .send(ControlMessage::MeshMemberList {
@@ -1329,19 +1334,25 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     })
                     .await;
                 // Notify other members of new joiner (re-fetch updated list)
-                let updated = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                let updated = state
+                    .mesh_manager
+                    .join_mesh(&mesh_id, &mesh_client_name)
+                    .await;
                 let notify_msg = ControlMessage::MeshMemberList {
                     mesh_id: mesh_id.clone(),
                     members: updated,
                 };
                 state
                     .mesh_manager
-                    .broadcast_to_mesh(&mesh_id, notify_msg, Some(&client_name))
+                    .broadcast_to_mesh(&mesh_id, notify_msg, Some(&mesh_client_name))
                     .await;
             }
             ControlMessage::MeshLeave { mesh_id } => {
-                info!("Client '{}' leaving mesh '{}'", client_name, mesh_id);
-                let members = state.mesh_manager.leave_mesh(&mesh_id, &client_name).await;
+                info!("Client '{}' leaving mesh '{}'", mesh_client_name, mesh_id);
+                let members = state
+                    .mesh_manager
+                    .leave_mesh(&mesh_id, &mesh_client_name)
+                    .await;
                 // Notify remaining members
                 let notify_msg = ControlMessage::MeshMemberList {
                     mesh_id: mesh_id.clone(),
@@ -1351,6 +1362,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     .mesh_manager
                     .broadcast_to_mesh(&mesh_id, notify_msg, None)
                     .await;
+                // Cleanup DNS records for this mesh
+                if let Some(ref dns_registry) = state.dns_registry {
+                    dns_registry.unregister_mesh_client(&mesh_id).await;
+                }
             }
             ControlMessage::MeshConnect {
                 target_client,
@@ -1358,7 +1373,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             } => {
                 debug!(
                     "Mesh connect request: {} -> {} (service: {})",
-                    client_name, target_client, service_name
+                    mesh_client_name, target_client, service_name
                 );
                 // Forward to target
                 if state
@@ -1366,7 +1381,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     .send_to_client(
                         &target_client,
                         ControlMessage::MeshConnect {
-                            target_client: client_name.clone(),
+                            target_client: mesh_client_name.clone(),
                             service_name: service_name.clone(),
                         },
                     )
@@ -1383,7 +1398,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             ControlMessage::MeshMemberList { .. } => {
                 warn!(
                     "Received unexpected MeshMemberList from client '{}' (server->client message)",
-                    client_name
+                    mesh_client_name
                 );
             }
             ControlMessage::P2PRequest {
@@ -1392,7 +1407,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             } => {
                 debug!(
                     "P2P request: {} -> {} (addr: {})",
-                    client_name, target_client, local_addr
+                    mesh_client_name, target_client, local_addr
                 );
                 // Forward P2P request to target with requester's address
                 state
@@ -1400,7 +1415,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     .send_to_client(
                         &target_client,
                         ControlMessage::P2PResponse {
-                            target_client: client_name.clone(),
+                            target_client: mesh_client_name.clone(),
                             remote_addr: local_addr,
                         },
                     )
@@ -1409,7 +1424,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             ControlMessage::P2PResponse { .. } => {
                 warn!(
                     "Received unexpected P2PResponse from client '{}' (server->client message)",
-                    client_name
+                    mesh_client_name
                 );
             }
             ControlMessage::P2PResult {
@@ -1419,12 +1434,12 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 if success {
                     info!(
                         "P2P connection established between '{}' and '{}'",
-                        client_name, target_client
+                        mesh_client_name, target_client
                     );
                 } else {
                     info!(
                         "P2P hole punch failed between '{}' and '{}', will use relay",
-                        client_name, target_client
+                        mesh_client_name, target_client
                     );
                 }
             }
@@ -1435,12 +1450,12 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 if let Err(e) = state
                     .mesh_manager
                     .relay
-                    .relay_data(&client_name, &target_client, data)
+                    .relay_data(&mesh_client_name, &target_client, data)
                     .await
                 {
                     warn!(
                         "Mesh relay failed from '{}' to '{}': {}",
-                        client_name, target_client, e
+                        mesh_client_name, target_client, e
                     );
                 }
             }
@@ -1448,7 +1463,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 info!(
                     "Registering {} services for client '{}' in mesh '{}'",
                     services.len(),
-                    client_name,
+                    mesh_client_name,
                     mesh_id
                 );
                 let mesh_services: Vec<crate::common::MeshService> = services
@@ -1461,7 +1476,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     .collect();
                 state
                     .mesh_manager
-                    .register_services(&mesh_id, &client_name, mesh_services)
+                    .register_services(&mesh_id, &mesh_client_name, mesh_services)
                     .await;
 
                 // Auto-register DNS records for mesh services if DNS is enabled
@@ -1503,25 +1518,47 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         );
     }
 
-    // Cleanup DNS records for this client
+    // Cleanup mesh: leave each mesh with broadcast to remaining members
+    let meshes = state
+        .mesh_manager
+        .router
+        .lock()
+        .await
+        .get_client_meshes(&mesh_client_name);
+    for mesh_id in &meshes {
+        let members = state
+            .mesh_manager
+            .leave_mesh(mesh_id, &mesh_client_name)
+            .await;
+        // Notify remaining members of the departure
+        let notify_msg = ControlMessage::MeshMemberList {
+            mesh_id: mesh_id.clone(),
+            members,
+        };
+        state
+            .mesh_manager
+            .broadcast_to_mesh(mesh_id, notify_msg, None)
+            .await;
+        info!(
+            "Client '{}' removed from mesh '{}' (disconnected)",
+            mesh_client_name, mesh_id
+        );
+    }
+    // Unregister from relay and clients map (router already cleaned by leave_mesh above)
+    state
+        .mesh_manager
+        .unregister_client(&mesh_client_name)
+        .await;
+
+    // Cleanup DNS records
     if let Some(ref dns_registry) = state.dns_registry {
         for &remote_port in &registered_ports {
             let dns_name = format!("port-{}", remote_port);
             dns_registry.unregister_tunnel(&dns_name, remote_port).await;
         }
-        // Collect mesh IDs before unregistering (unregister removes client from router)
-        let meshes = state
-            .mesh_manager
-            .router
-            .lock()
-            .await
-            .get_client_meshes(&client_name);
-        state.mesh_manager.unregister_client(&client_name).await;
         for mesh_id in &meshes {
             dns_registry.unregister_mesh_client(mesh_id).await;
         }
-    } else {
-        state.mesh_manager.unregister_client(&client_name).await;
     }
 
     result
