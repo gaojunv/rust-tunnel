@@ -37,7 +37,7 @@ ss_password = "${SS_PASSWORD}"
 trojan_enabled = true
 trojan_port = 8443
 # Trojan 认证密码 (部署时替换)
-trojan_password = "${SS_PASSWORD}"
+trojan_password = "${TROJAN_PASSWORD}"
 # 认证失败时回退地址 (伪装为 HTTPS 站点)
 trojan_fallback = "127.0.0.1:80"
 

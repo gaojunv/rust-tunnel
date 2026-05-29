@@ -105,7 +105,7 @@ jobs:
             -e "s|\${ADMIN_PASSWORD}|${{ secrets.ADMIN_PASSWORD }}|g" \
             -e "s|\${CLIENT_AUTH_TOKEN}|${{ secrets.CLIENT_AUTH_TOKEN }}|g" \
             -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
-            -e "s|\${TROJAN_PASSWORD}|${{ secrets.TROJAN_PASSWORD }}|g" \
+            -e "s|\${TROJAN_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
             contrib/config.toml.template > config.toml
 
       - name: Deploy files to remote server
