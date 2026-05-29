@@ -8,6 +8,8 @@ import { QualityPage } from './QualityPage';
 import { ShadowsocksPage } from './ShadowsocksPage';
 import { TrojanPage } from './TrojanPage';
 import { LogsPage } from './LogsPage';
+import { MeshPage } from './MeshPage';
+import { DnsPage } from './DnsPage';
 import { MobileBottomNav } from './shared/MobileBottomNav';
 import { StatCard } from './shared/StatCard';
 import { useMediaQuery } from '../hooks/useMediaQuery';
@@ -20,7 +22,7 @@ interface DashboardProps {
 
 export const Dashboard = ({ onLogout }: DashboardProps) => {
   const [selectedPort, setSelectedPort] = useState<number | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'mesh' | 'dns' | 'quality' | 'shadowsocks' | 'trojan' | 'logs'>('dashboard');
   const isMobile = useMediaQuery('(max-width: 767px)');
 
   const { data: metrics } = useQuery('metrics', getMetrics, {
@@ -91,6 +93,10 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
           </>
         ) : activeTab === 'quality' ? (
           <QualityPage onSelectClient={handleSelectClient} />
+        ) : activeTab === 'mesh' ? (
+          <MeshPage />
+        ) : activeTab === 'dns' ? (
+          <DnsPage />
         ) : activeTab === 'shadowsocks' ? (
           <ShadowsocksPage />
         ) : activeTab === 'trojan' ? (

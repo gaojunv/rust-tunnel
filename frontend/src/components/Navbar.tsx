@@ -3,8 +3,8 @@ import { logout } from '../api/client';
 
 interface NavbarProps {
   onLogout: () => void;
-  activeTab: 'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs';
-  onTabChange: (tab: 'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs') => void;
+  activeTab: 'dashboard' | 'mesh' | 'dns' | 'quality' | 'shadowsocks' | 'trojan' | 'logs';
+  onTabChange: (tab: 'dashboard' | 'mesh' | 'dns' | 'quality' | 'shadowsocks' | 'trojan' | 'logs') => void;
 }
 
 export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
@@ -36,6 +36,26 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 }`}
               >
                 Dashboard
+              </button>
+              <button
+                onClick={() => onTabChange('mesh')}
+                className={`px-3 py-2 rounded-md text-sm font-medium ${
+                  activeTab === 'mesh'
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                Mesh
+              </button>
+              <button
+                onClick={() => onTabChange('dns')}
+                className={`px-3 py-2 rounded-md text-sm font-medium ${
+                  activeTab === 'dns'
+                    ? 'bg-gray-900 text-white'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                }`}
+              >
+                DNS
               </button>
               <button
                 onClick={() => onTabChange('quality')}

@@ -1,4 +1,4 @@
-type Tab = 'dashboard' | 'quality' | 'shadowsocks' | 'trojan' | 'logs';
+type Tab = 'dashboard' | 'mesh' | 'dns' | 'quality' | 'shadowsocks' | 'trojan' | 'logs';
 
 interface MobileBottomNavProps {
   activeTab: Tab;
@@ -15,6 +15,16 @@ const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     id: 'quality',
     label: 'Quality',
     icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />,
+  },
+  {
+    id: 'mesh',
+    label: 'Mesh',
+    icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />,
+  },
+  {
+    id: 'dns',
+    label: 'DNS',
+    icon: <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />,
   },
   {
     id: 'shadowsocks',
