@@ -31,6 +31,9 @@ pub enum TunnelError {
 
     #[error("Trojan authentication failed")]
     TrojanAuthFailed(Vec<u8>),
+
+    #[error("Mesh relay error: {0}")]
+    MeshRelay(String),
 }
 
 pub type TunnelResult<T> = Result<T, TunnelError>;
