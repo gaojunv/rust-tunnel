@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod control;
 pub mod db;
+pub mod dns;
 pub mod listener;
 pub mod mesh;
 pub mod logs;
