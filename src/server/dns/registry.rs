@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::common::DnsRecord;
 use crate::server::dns::zone::DnsZone;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Central DNS registry that ties tunnel ports and mesh services to DNS records.
 /// Thread-safe wrapper around DnsZone.
@@ -25,12 +25,7 @@ impl DnsRegistry {
     }
 
     /// Register a tunnel port with a custom DNS name
-    pub async fn register_tunnel(
-        &self,
-        dns_name: &str,
-        port: u16,
-        protocol: Option<&str>,
-    ) {
+    pub async fn register_tunnel(&self, dns_name: &str, port: u16, protocol: Option<&str>) {
         let a_name = format!("{}.{}", dns_name, self.tunnel_domain);
         let ip = self.server_ip.lock().await.clone();
         let mut zone = self.zone.lock().await;

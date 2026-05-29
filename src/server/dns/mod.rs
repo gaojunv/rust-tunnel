@@ -133,7 +133,10 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
                             record.set_record_type(RecordType::SRV);
                             record.set_ttl(300);
                             record.set_data(Some(RData::SRV(hickory_proto::rr::rdata::SRV::new(
-                                0, 0, *port, target_name,
+                                0,
+                                0,
+                                *port,
+                                target_name,
                             ))));
                             response.add_answer(record);
                         }

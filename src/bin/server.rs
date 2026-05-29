@@ -1,8 +1,9 @@
 use rust_tunnel::common::{
-    create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert, TunnelResult,
+    create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert,
+    TunnelResult,
 };
-use rust_tunnel::server::{api, auth, control, listener, Database, ServerConfig};
 use rust_tunnel::server::logs::LogLayer;
+use rust_tunnel::server::{api, auth, control, listener, Database, ServerConfig};
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
@@ -187,8 +188,7 @@ async fn main() -> TunnelResult<()> {
                 tracing::warn!("Failed to cleanup old logs: {}", e);
             }
             // Remove quality history older than 24 hours
-            let twenty_four_hours_ago =
-                chrono::Utc::now() - chrono::Duration::hours(24);
+            let twenty_four_hours_ago = chrono::Utc::now() - chrono::Duration::hours(24);
             if let Err(e) = db_for_cleanup
                 .cleanup_old_quality_history(twenty_four_hours_ago)
                 .await

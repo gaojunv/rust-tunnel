@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
 use crate::common::ControlMessage;
 use crate::common::TunnelError;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 /// Relay tunnel between two mesh clients via the server.
 /// Bi-directional: data from A is forwarded to B and vice versa.
@@ -49,9 +49,9 @@ impl MeshRelay {
             data,
         };
 
-        tx.send(msg).await.map_err(|_| {
-            TunnelError::MeshRelay("Failed to send relay message".to_string())
-        })?;
+        tx.send(msg)
+            .await
+            .map_err(|_| TunnelError::MeshRelay("Failed to send relay message".to_string()))?;
         Ok(())
     }
 }
@@ -81,7 +81,9 @@ mod tests {
     #[tokio::test]
     async fn test_relay_data_target_not_found() {
         let relay = MeshRelay::new();
-        let result = relay.relay_data("client-a", "client-b", vec![1, 2, 3]).await;
+        let result = relay
+            .relay_data("client-a", "client-b", vec![1, 2, 3])
+            .await;
         assert!(result.is_err());
     }
 
@@ -98,7 +100,10 @@ mod tests {
 
         let msg = rx.recv().await.unwrap();
         match msg {
-            ControlMessage::MeshRelay { target_client, data } => {
+            ControlMessage::MeshRelay {
+                target_client,
+                data,
+            } => {
                 assert_eq!(target_client, "client-a");
                 assert_eq!(data, vec![1, 2, 3]);
             }

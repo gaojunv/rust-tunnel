@@ -126,10 +126,7 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
         }
     };
 
-    Ok(TlsCertPair {
-        certs,
-        key,
-    })
+    Ok(TlsCertPair { certs, key })
 }
 
 /// Create a server TLS config for the control channel
@@ -187,6 +184,9 @@ pub fn create_insecure_client_config() -> TunnelResult<Arc<ClientConfig>> {
                 rustls::SignatureScheme::RSA_PKCS1_SHA256,
                 rustls::SignatureScheme::RSA_PKCS1_SHA384,
                 rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
                 rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
                 rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
             ]

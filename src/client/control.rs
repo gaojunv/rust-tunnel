@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 use crate::client::logs::{spawn_log_forwarder, ClientLogLayer};
 use crate::client::{proxy, ClientConfig};
 use crate::common::{
-    connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, TunnelError,
-    TunnelResult,
+    connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, MeshServiceDef,
+    TunnelError, TunnelResult,
 };
 
 /// Stores the global log layer so it can be reused across reconnections.
@@ -333,6 +333,48 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
             "Registration successful for remote port {} -> {}",
             rule.remote_port, rule.local_addr
         );
+    }
+
+    // Mesh network registration
+    if let Some(ref mesh_id) = config.mesh {
+        let mesh_name = config
+            .mesh_name
+            .clone()
+            .unwrap_or_else(|| hostname.clone().unwrap_or_else(|| "unknown".into()));
+
+        ControlMessage::MeshJoin {
+            mesh_id: mesh_id.clone(),
+            client_name: mesh_name,
+        }
+        .write_to_stream(&mut writer)
+        .await?;
+
+        info!("Joined mesh network: {}", mesh_id);
+
+        // Register mesh services
+        let services: Vec<MeshServiceDef> = config
+            .mesh_services
+            .iter()
+            .filter_map(|s| {
+                let mut parts = s.splitn(3, ':');
+                Some(MeshServiceDef {
+                    name: parts.next()?.to_string(),
+                    protocol: parts.next()?.to_string(),
+                    local_addr: parts.next()?.to_string(),
+                })
+            })
+            .collect();
+
+        if !services.is_empty() {
+            ControlMessage::MeshRegisterServices {
+                mesh_id: mesh_id.clone(),
+                services,
+            }
+            .write_to_stream(&mut writer)
+            .await?;
+
+            info!("Registered {} mesh service(s)", config.mesh_services.len());
+        }
     }
 
     // Create message channel for sending messages to server

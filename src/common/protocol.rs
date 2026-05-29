@@ -79,9 +79,7 @@ pub enum ControlMessage {
         client_name: String,
     },
     /// Leave a mesh network (client -> server)
-    MeshLeave {
-        mesh_id: String,
-    },
+    MeshLeave { mesh_id: String },
     /// Server sends mesh member list to clients (server -> client)
     MeshMemberList {
         mesh_id: String,
@@ -118,9 +116,7 @@ pub enum ControlMessage {
         services: Vec<MeshServiceDef>,
     },
     /// Client sends a batch of log entries
-    LogBatch {
-        entries: Vec<ClientLogEntry>,
-    },
+    LogBatch { entries: Vec<ClientLogEntry> },
 }
 
 impl ControlMessage {
