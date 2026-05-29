@@ -984,6 +984,17 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         }
     }
 
+    // Derive client name from the first registered port's hostname
+    let client_name = if let Some(&port) = registered_ports.first() {
+        state
+            .get_client(port)
+            .await
+            .and_then(|c| c.hostname)
+            .unwrap_or_else(|| format!("port-{}", port))
+    } else {
+        "unknown".to_string()
+    };
+
     // Main loop: keep connection alive and process messages (heartbeats, data routing)
     let result = loop {
         match ControlMessage::read_from_stream(&mut reader).await {
@@ -1231,32 +1242,157 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     ControlMessage::Disconnect => {
                         warn!("Received unexpected Disconnect from client");
                     }
-                    ControlMessage::MeshJoin { .. } => {
-                        warn!("Mesh networking not yet implemented");
+                    ControlMessage::MeshJoin { mesh_id, client_name } => {
+                        info!("Client '{}' joining mesh '{}'", client_name, mesh_id);
+                        // Register client for relay
+                        state.mesh_manager.register_client(&client_name, sender.clone()).await;
+                        // Join the mesh
+                        let members = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                        // Send member list back to requester
+                        let _ = sender
+                            .send(ControlMessage::MeshMemberList {
+                                mesh_id: mesh_id.clone(),
+                                members,
+                            })
+                            .await;
+                        // Notify other members of new joiner (re-fetch updated list)
+                        let updated = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                        let notify_msg = ControlMessage::MeshMemberList {
+                            mesh_id: mesh_id.clone(),
+                            members: updated,
+                        };
+                        state
+                            .mesh_manager
+                            .broadcast_to_mesh(&mesh_id, notify_msg, Some(&client_name))
+                            .await;
                     }
-                    ControlMessage::MeshLeave { .. } => {
-                        warn!("Mesh networking not yet implemented");
+                    ControlMessage::MeshLeave { mesh_id } => {
+                        info!(
+                            "Client '{}' leaving mesh '{}'",
+                            client_name, mesh_id
+                        );
+                        let members = state.mesh_manager.leave_mesh(&mesh_id, &client_name).await;
+                        // Notify remaining members
+                        let notify_msg = ControlMessage::MeshMemberList {
+                            mesh_id: mesh_id.clone(),
+                            members,
+                        };
+                        state
+                            .mesh_manager
+                            .broadcast_to_mesh(&mesh_id, notify_msg, None)
+                            .await;
+                    }
+                    ControlMessage::MeshConnect {
+                        target_client,
+                        service_name,
+                    } => {
+                        debug!(
+                            "Mesh connect request: {} -> {} (service: {})",
+                            client_name, target_client, service_name
+                        );
+                        // Forward to target
+                        if state
+                            .mesh_manager
+                            .send_to_client(
+                                &target_client,
+                                ControlMessage::MeshConnect {
+                                    target_client: client_name.clone(),
+                                    service_name: service_name.clone(),
+                                },
+                            )
+                            .await
+                        {
+                            debug!("Forwarded mesh connect request to {}", target_client);
+                        } else {
+                            warn!(
+                                "Target client '{}' not reachable for mesh connect",
+                                target_client
+                            );
+                        }
                     }
                     ControlMessage::MeshMemberList { .. } => {
-                        warn!("Received unexpected MeshMemberList from client");
+                        warn!(
+                            "Received unexpected MeshMemberList from client '{}' (server->client message)",
+                            client_name
+                        );
                     }
-                    ControlMessage::MeshConnect { .. } => {
-                        warn!("Mesh networking not yet implemented");
-                    }
-                    ControlMessage::P2PRequest { .. } => {
-                        warn!("P2P networking not yet implemented");
+                    ControlMessage::P2PRequest {
+                        target_client,
+                        local_addr,
+                    } => {
+                        debug!(
+                            "P2P request: {} -> {} (addr: {})",
+                            client_name, target_client, local_addr
+                        );
+                        // Forward P2P request to target with requester's address
+                        state
+                            .mesh_manager
+                            .send_to_client(
+                                &target_client,
+                                ControlMessage::P2PResponse {
+                                    target_client: client_name.clone(),
+                                    remote_addr: local_addr,
+                                },
+                            )
+                            .await;
                     }
                     ControlMessage::P2PResponse { .. } => {
-                        warn!("Received unexpected P2PResponse from client");
+                        warn!(
+                            "Received unexpected P2PResponse from client '{}' (server->client message)",
+                            client_name
+                        );
                     }
-                    ControlMessage::P2PResult { .. } => {
-                        warn!("P2P networking not yet implemented");
+                    ControlMessage::P2PResult {
+                        target_client,
+                        success,
+                    } => {
+                        if success {
+                            info!(
+                                "P2P connection established between '{}' and '{}'",
+                                client_name, target_client
+                            );
+                        } else {
+                            info!(
+                                "P2P hole punch failed between '{}' and '{}', will use relay",
+                                client_name, target_client
+                            );
+                        }
                     }
-                    ControlMessage::MeshRelay { .. } => {
-                        warn!("Mesh relay not yet implemented");
+                    ControlMessage::MeshRelay {
+                        target_client,
+                        data,
+                    } => {
+                        if let Err(e) = state
+                            .mesh_manager
+                            .relay
+                            .relay_data(&client_name, &target_client, data)
+                            .await
+                        {
+                            warn!(
+                                "Mesh relay failed from '{}' to '{}': {}",
+                                client_name, target_client, e
+                            );
+                        }
                     }
-                    ControlMessage::MeshRegisterServices { .. } => {
-                        warn!("Mesh networking not yet implemented");
+                    ControlMessage::MeshRegisterServices { mesh_id, services } => {
+                        info!(
+                            "Registering {} services for client '{}' in mesh '{}'",
+                            services.len(),
+                            client_name,
+                            mesh_id
+                        );
+                        let mesh_services: Vec<crate::common::MeshService> = services
+                            .into_iter()
+                            .map(|s| crate::common::MeshService {
+                                name: s.name,
+                                protocol: s.protocol,
+                                local_addr: s.local_addr,
+                            })
+                            .collect();
+                        state
+                            .mesh_manager
+                            .register_services(&mesh_id, &client_name, mesh_services)
+                            .await;
                     }
                     ControlMessage::RegisterResponse { .. } => {
                         warn!("Received unexpected RegisterResponse from client");
