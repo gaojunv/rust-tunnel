@@ -1,4 +1,4 @@
-name: Release
+name: Release Server
 
 # 当推送 tag 时触发，也可以手动触发
 on:
@@ -82,64 +82,6 @@ jobs:
         with:
           name: rust-tunnel-server
           path: target/x86_64-unknown-linux-musl/release/rust-tunnel-server
-
-  build-client:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            artifact: rust-tunnel-client-linux-x86_64
-            binary: rust-tunnel-client
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: rust-tunnel-client-macos-x86_64
-            binary: rust-tunnel-client
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: rust-tunnel-client-macos-aarch64
-            binary: rust-tunnel-client
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: rust-tunnel-client-windows-x86_64
-            binary: rust-tunnel-client.exe
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust with target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-          cache-on-failure: true
-
-      - name: Install musl tools (Linux only)
-        if: runner.os == 'Linux'
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: musl-tools
-          version: 1.0
-
-      - name: Build client
-        run: cargo build --release --bin rust-tunnel-client --target ${{ matrix.target }}
-
-      - name: Strip binary (non-Windows)
-        if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
-
-      - name: Upload client binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
 
   deploy:
     needs: [build-server]
