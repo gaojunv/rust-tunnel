@@ -3,8 +3,8 @@ pub mod router;
 pub mod stun;
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::common::{ControlMessage, MeshMember, MeshRoute, MeshService};
 
@@ -30,13 +30,12 @@ impl MeshManager {
     }
 
     /// Register a client's control channel for mesh and relay communication
-    pub async fn register_client(
-        &self,
-        client_name: &str,
-        tx: mpsc::Sender<ControlMessage>,
-    ) {
+    pub async fn register_client(&self, client_name: &str, tx: mpsc::Sender<ControlMessage>) {
         self.relay.register(client_name, tx.clone()).await;
-        self.clients.lock().await.insert(client_name.to_string(), tx);
+        self.clients
+            .lock()
+            .await
+            .insert(client_name.to_string(), tx);
     }
 
     /// Unregister a client from all meshes and relay
@@ -65,7 +64,10 @@ impl MeshManager {
         client_name: &str,
         services: Vec<MeshService>,
     ) {
-        self.router.lock().await.register_services(mesh_id, client_name, services);
+        self.router
+            .lock()
+            .await
+            .register_services(mesh_id, client_name, services);
     }
 
     /// Build member list for broadcast (all members including requester)

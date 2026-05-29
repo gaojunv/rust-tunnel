@@ -51,9 +51,7 @@ impl Database {
     async fn initialize_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         // Enable WAL mode for concurrent reads/writes and set synchronous to NORMAL
         // (NORMAL is safe in WAL mode and avoids extra fsync on every write)
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(pool)
-            .await?;
+        sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await?;
         sqlx::query("PRAGMA synchronous=NORMAL")
             .execute(pool)
             .await?;
@@ -796,7 +794,10 @@ impl Database {
     }
 
     /// Insert a log entry into the database
-    pub async fn insert_log(&self, entry: &crate::server::logs::LogEntry) -> Result<i64, sqlx::Error> {
+    pub async fn insert_log(
+        &self,
+        entry: &crate::server::logs::LogEntry,
+    ) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO server_logs (timestamp, level, source, target, message)
@@ -855,7 +856,7 @@ impl Database {
         before_id: Option<i64>,
     ) -> Result<Vec<DbLogEntry>, sqlx::Error> {
         let mut query_str = String::from(
-            "SELECT id, timestamp, level, source, target, message FROM server_logs WHERE 1=1"
+            "SELECT id, timestamp, level, source, target, message FROM server_logs WHERE 1=1",
         );
         let mut params: Vec<String> = Vec::new();
 
@@ -868,7 +869,11 @@ impl Database {
                 "trace" => vec!["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
                 _ => vec!["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
             };
-            let placeholders: Vec<String> = levels.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let placeholders: Vec<String> = levels
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
             query_str.push_str(&format!(" AND level IN ({})", placeholders.join(",")));
             for l in levels {
                 params.push(l.to_string());
@@ -945,7 +950,7 @@ impl Database {
     /// Load all mesh networks
     pub async fn load_mesh_networks(&self) -> Result<Vec<MeshNetworkRecord>, sqlx::Error> {
         sqlx::query_as::<_, MeshNetworkRecord>(
-            "SELECT id, created_at, description FROM mesh_networks ORDER BY id"
+            "SELECT id, created_at, description FROM mesh_networks ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await
@@ -990,7 +995,7 @@ impl Database {
     ) -> Result<Vec<MeshServiceRecord>, sqlx::Error> {
         sqlx::query_as::<_, MeshServiceRecord>(
             "SELECT id, mesh_id, client_name, service_name, protocol, local_addr, dns_record \
-             FROM mesh_services WHERE mesh_id = ? ORDER BY service_name"
+             FROM mesh_services WHERE mesh_id = ? ORDER BY service_name",
         )
         .bind(mesh_id)
         .fetch_all(&self.pool)
@@ -1414,10 +1419,7 @@ mod tests {
     async fn test_server_logs_table_creation() {
         let db = create_test_db().await;
         // Just verify the table exists by doing an insert+query
-        let result = db
-            .query_logs(None, None, None, 10, None)
-            .await
-            .unwrap();
+        let result = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -1434,10 +1436,7 @@ mod tests {
         };
         db.insert_log(&entry).await.unwrap();
 
-        let results = db
-            .query_logs(None, None, None, 10, None)
-            .await
-            .unwrap();
+        let results = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].level, "INFO");
         assert_eq!(results[0].message, "test message");
@@ -1491,10 +1490,7 @@ mod tests {
         let deleted = db.cleanup_old_logs(2000000).await.unwrap();
         assert_eq!(deleted, 1);
 
-        let results = db
-            .query_logs(None, None, None, 10, None)
-            .await
-            .unwrap();
+        let results = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1513,10 +1509,7 @@ mod tests {
             .collect();
         db.insert_logs_batch(&entries).await.unwrap();
 
-        let results = db
-            .query_logs(None, None, None, 10, None)
-            .await
-            .unwrap();
+        let results = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert_eq!(results.len(), 3);
     }
 }

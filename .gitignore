@@ -6,3 +6,5 @@ data/rust-tunnel.db
 .env
 .vscode/.DS_Store
 
+server.toml
+client.toml

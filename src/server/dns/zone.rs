@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::common::DnsRecord;
+use std::collections::HashMap;
 
 /// In-memory DNS zone for tunnel.local and mesh.local domains.
 pub struct DnsZone {
@@ -22,7 +22,10 @@ impl DnsZone {
 
     /// Remove all records for a given name. Returns count removed.
     pub fn remove_records(&mut self, name: &str) -> usize {
-        self.records.remove(&name.to_lowercase()).map(|v| v.len()).unwrap_or(0)
+        self.records
+            .remove(&name.to_lowercase())
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     /// Remove records matching a predicate. Returns count removed.
@@ -81,7 +84,10 @@ impl DnsZone {
 
     /// List all records (returns clones)
     pub fn list_all(&self) -> Vec<DnsRecord> {
-        self.records.values().flat_map(|v| v.iter().cloned()).collect()
+        self.records
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect()
     }
 }
 
@@ -132,9 +138,8 @@ mod tests {
         zone.add_record(make_tunnel_a("a.tunnel.local", "10.0.0.1", 9000));
         zone.add_record(make_tunnel_a("b.tunnel.local", "10.0.0.2", 9001));
 
-        let removed = zone.remove_by_predicate(|r| {
-            matches!(r, DnsRecord::TunnelA { port, .. } if *port == 9000)
-        });
+        let removed = zone
+            .remove_by_predicate(|r| matches!(r, DnsRecord::TunnelA { port, .. } if *port == 9000));
         assert_eq!(removed, 1);
         assert_eq!(zone.list_names().len(), 1);
     }

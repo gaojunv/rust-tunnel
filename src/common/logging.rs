@@ -11,7 +11,8 @@ pub fn init_logging_with_level(default_level: &str) {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_target(true))
         .with(filter)
-        .init();
+        .try_init()
+        .ok();
 }
 
 /// Initialize logging with an additional custom layer (e.g., LogLayer for log capture).
@@ -29,5 +30,6 @@ where
         .with(extra_layer)
         .with(tracing_subscriber::fmt::layer().with_target(true))
         .with(filter)
-        .init();
+        .try_init()
+        .ok();
 }

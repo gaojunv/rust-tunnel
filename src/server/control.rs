@@ -12,12 +12,12 @@ use crate::common::{
 };
 use crate::server::api::TrafficStore;
 use crate::server::db::Database;
+use crate::server::dns::registry::DnsRegistry;
+use crate::server::mesh::MeshManager;
 use crate::server::quality::{
     calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
     QualityThresholds, QualityTracker,
 };
-use crate::server::mesh::MeshManager;
-use crate::server::dns::registry::DnsRegistry;
 use crate::server::{listener, ServerConfig};
 use chrono::{Timelike, Utc};
 
@@ -112,6 +112,8 @@ pub struct ServerState {
     pub mesh_manager: MeshManager,
     /// DNS registry (set when DNS server is enabled)
     pub dns_registry: Option<DnsRegistry>,
+    /// Active listener tasks (keyed by port) — aborted on client disconnect
+    listener_tasks: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>>,
 }
 
 impl Default for ServerState {
@@ -135,6 +137,7 @@ impl ServerState {
             log_store: None,
             mesh_manager: MeshManager::new(),
             dns_registry: None,
+            listener_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,6 +145,7 @@ impl ServerState {
     pub fn with_db(db: Database) -> Self {
         Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
+            listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -195,6 +199,16 @@ impl ServerState {
     }
 
     pub async fn remove_client(&self, remote_port: u16) {
+        // Abort the listener task so the port is freed
+        let task = {
+            let mut tasks = self.listener_tasks.lock().await;
+            tasks.remove(&remote_port)
+        };
+        if let Some(handle) = task {
+            handle.abort();
+            info!("Aborted listener task for port {}", remote_port);
+        }
+
         let mut ports = self.ports.lock().await;
         ports.remove(&remote_port);
 
@@ -752,6 +766,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     config: ServerConfig,
     state: ServerState,
     stream: S,
+    peer_addr: std::net::SocketAddr,
 ) -> TunnelResult<()> {
     // Split into read and write halves
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -772,6 +787,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
     // Track all registered ports for this connection
     let mut registered_ports = Vec::new();
+    let mut deferred_msg: Option<ControlMessage> = None;
 
     // Process registration phase - client may send multiple Register messages
     info!("Waiting for client registration...");
@@ -816,7 +832,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             debug!("Client authentication successful");
                         }
                         Some(_) => {
-                            warn!("Client authentication failed: invalid token");
+                            warn!(
+                                "Client authentication failed from {}: invalid token",
+                                peer_addr
+                            );
                             let _ = sender
                                 .send(ControlMessage::RegisterResponse {
                                     success: false,
@@ -826,7 +845,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             continue;
                         }
                         None => {
-                            warn!("Client authentication failed: token required but not provided");
+                            warn!("Client authentication failed from {}: token required but not provided", peer_addr);
                             let _ = sender
                                 .send(ControlMessage::RegisterResponse {
                                     success: false,
@@ -870,16 +889,29 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 info!("Client registered for port {}", remote_port);
                 registered_ports.push(remote_port);
 
+                // Auto-register DNS record for tunnel port if DNS is enabled
+                if let Some(ref dns_registry) = state.dns_registry {
+                    let fqdn = dns_registry
+                        .register_tunnel_default(remote_port, None)
+                        .await;
+                    info!("DNS auto-registered: {}", fqdn);
+                }
+
                 // Spawn the listener task for the remote port
                 let state_clone = state.clone();
                 let state_for_remove = state.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = listener::run_listener(state_clone, remote_port).await {
                         error!("Listener for port {} failed: {}", remote_port, e);
                     }
                     state_for_remove.remove_client(remote_port).await;
                     info!("Client unregistered from port {}", remote_port);
                 });
+                // Store the handle so we can abort it on disconnect
+                {
+                    let mut tasks = state.listener_tasks.lock().await;
+                    tasks.insert(remote_port, handle);
+                }
             }
             ControlMessage::Ping {
                 seq,
@@ -978,6 +1010,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         "Registration phase complete, {} ports registered",
                         registered_ports.len()
                     );
+                    deferred_msg = Some(msg);
                     break;
                 } else {
                     let _ = sender
@@ -1007,418 +1040,455 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
     // Main loop: keep connection alive and process messages (heartbeats, data routing)
     let result = loop {
-        match ControlMessage::read_from_stream(&mut reader).await {
-            Ok(Some(msg)) => {
-                match msg {
-                    ControlMessage::Register {
-                        remote_port,
-                        hostname,
-                        auth_token: client_auth_token,
-                    } => {
-                        // Handle late registration (client might send more Register messages later)
-                        info!(
-                            "Received late registration request for port {} from hostname {:?}",
-                            remote_port, hostname
-                        );
+        let msg = if let Some(deferred) = deferred_msg.take() {
+            deferred
+        } else {
+            match ControlMessage::read_from_stream(&mut reader).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => {
+                    break Ok(());
+                }
+                Err(e) => {
+                    error!("Error reading from control channel: {}", e);
+                    break Err(e);
+                }
+            }
+        };
 
-                        // Validate authentication token if server requires it
-                        if let Some(ref expected_token) = config.client_auth_token {
-                            match client_auth_token {
-                                Some(ref token) if token == expected_token => {
-                                    debug!("Client authentication successful");
-                                }
-                                Some(_) => {
-                                    warn!("Client authentication failed: invalid token");
-                                    let _ = sender
-                                        .send(ControlMessage::RegisterResponse {
-                                            success: false,
-                                            message: "Invalid authentication token".into(),
-                                        })
-                                        .await;
-                                    continue;
-                                }
-                                None => {
-                                    warn!("Client authentication failed: token required but not provided");
-                                    let _ = sender
-                                        .send(ControlMessage::RegisterResponse {
-                                            success: false,
-                                            message: "Authentication token required".into(),
-                                        })
-                                        .await;
-                                    continue;
-                                }
-                            }
+        match msg {
+            ControlMessage::Register {
+                remote_port,
+                hostname,
+                auth_token: client_auth_token,
+            } => {
+                // Handle late registration (client might send more Register messages later)
+                info!(
+                    "Received late registration request for port {} from hostname {:?}",
+                    remote_port, hostname
+                );
+
+                // Validate authentication token if server requires it
+                if let Some(ref expected_token) = config.client_auth_token {
+                    match client_auth_token {
+                        Some(ref token) if token == expected_token => {
+                            debug!("Client authentication successful");
                         }
-
-                        // First, remove any existing client on this port
-                        state.remove_client(remote_port).await;
-
-                        // Now register the new client
-                        let registered = state
-                            .register_client(remote_port, hostname.clone(), sender.clone())
-                            .await;
-
-                        if !registered {
+                        Some(_) => {
+                            warn!(
+                                "Client authentication failed from {}: invalid token",
+                                peer_addr
+                            );
                             let _ = sender
                                 .send(ControlMessage::RegisterResponse {
                                     success: false,
-                                    message: format!("Port {} already registered", remote_port),
+                                    message: "Invalid authentication token".into(),
                                 })
                                 .await;
-                        } else {
-                            // Send registration success
-                            sender
+                            continue;
+                        }
+                        None => {
+                            warn!("Client authentication failed from {}: token required but not provided", peer_addr);
+                            let _ = sender
                                 .send(ControlMessage::RegisterResponse {
-                                    success: true,
-                                    message: "Registered successfully".into(),
+                                    success: false,
+                                    message: "Authentication token required".into(),
                                 })
-                                .await
-                                .map_err(|_| {
-                                    TunnelError::Protocol(
-                                        "Failed to send registration response".into(),
-                                    )
-                                })?;
-
-                            info!("Client registered for port {}", remote_port);
-                            registered_ports.push(remote_port);
-
-                            // Spawn the listener task
-                            let state_clone = state.clone();
-                            let state_for_remove = state.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    listener::run_listener(state_clone, remote_port).await
-                                {
-                                    error!("Listener for port {} failed: {}", remote_port, e);
-                                }
-                                state_for_remove.remove_client(remote_port).await;
-                                info!("Client unregistered from port {}", remote_port);
-                            });
+                                .await;
+                            continue;
                         }
                     }
-                    ControlMessage::Ping {
-                        seq,
-                        timestamp_micros,
-                    } => {
-                        // Calculate RTT using server time
-                        let now = Utc::now();
-                        let now_micros = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0);
-                        let rtt_ms = if now_micros > timestamp_micros {
-                            (now_micros - timestamp_micros) as f32 / 1000.0
-                        } else {
-                            0.0 // Clock went backwards, ignore
-                        };
+                }
 
-                        tracing::debug!(
-                            "Processing Ping seq={} for {} ports, rtt={:.1}ms, minute={}",
-                            seq,
-                            registered_ports.len(),
-                            rtt_ms,
-                            now.minute()
-                        );
+                // First, remove any existing client on this port
+                state.remove_client(remote_port).await;
 
-                        // Iterate all registered ports for this connection and update quality
-                        for &port in &registered_ports {
-                            // Get or create quality tracker
-                            let mut tracker = state.get_or_create_quality_tracker(port).await;
+                // Now register the new client
+                let registered = state
+                    .register_client(remote_port, hostname.clone(), sender.clone())
+                    .await;
 
-                            // Record ping and calculate loss
-                            let (lost, loss_rate) = tracker.record_ping(seq);
+                if !registered {
+                    let _ = sender
+                        .send(ControlMessage::RegisterResponse {
+                            success: false,
+                            message: format!("Port {} already registered", remote_port),
+                        })
+                        .await;
+                } else {
+                    // Send registration success
+                    sender
+                        .send(ControlMessage::RegisterResponse {
+                            success: true,
+                            message: "Registered successfully".into(),
+                        })
+                        .await
+                        .map_err(|_| {
+                            TunnelError::Protocol("Failed to send registration response".into())
+                        })?;
 
-                            // Record RTT
-                            tracker.record_rtt(rtt_ms);
+                    info!("Client registered for port {}", remote_port);
+                    registered_ports.push(remote_port);
 
-                            // Calculate statistics
-                            let avg_rtt = tracker.get_avg_rtt();
-                            let min_rtt = tracker.get_min_rtt();
-                            let max_rtt = tracker.get_max_rtt();
-
-                            // Calculate quality score
-                            let quality_score = calculate_quality_score(avg_rtt, loss_rate);
-
-                            // Check warnings
-                            let thresholds = QualityThresholds::default();
-                            let (is_warning, is_critical) =
-                                check_warnings(avg_rtt, loss_rate, &thresholds);
-
-                            // Get throughput from TrafficStore (simplified)
-                            // For now we use 0 since we don't have per-second calculation yet
-                            let (bytes_in_per_sec, bytes_out_per_sec) = (0.0, 0.0);
-
-                            // Update real-time quality data
-                            let quality = ConnectionQuality {
-                                last_rtt_ms: rtt_ms,
-                                avg_rtt_ms: avg_rtt,
-                                min_rtt_ms: min_rtt,
-                                max_rtt_ms: max_rtt,
-                                loss_rate,
-                                consecutive_losses: lost,
-                                bytes_in_per_sec,
-                                bytes_out_per_sec,
-                                quality_score,
-                                last_update: now,
-                                is_warning,
-                                is_critical,
-                            };
-
-                            state.quality_store.update_quality(port, quality).await;
-
-                            // Add historical sample once per minute
-                            let current_minute = now.minute();
-                            if tracker.last_sample_minute != current_minute {
-                                tracing::info!(
-                                    "Adding quality sample for port {}: last_sample_minute={}, current_minute={}",
-                                    port, tracker.last_sample_minute, current_minute
-                                );
-                                let sample = QualitySample {
-                                    timestamp: now,
-                                    avg_rtt_ms: avg_rtt,
-                                    loss_rate,
-                                    bytes_in_per_sec,
-                                    bytes_out_per_sec,
-                                    quality_score,
-                                };
-                                state.quality_store.add_sample(port, sample).await;
-                                tracker.last_sample_minute = current_minute;
-                            }
-
-                            state.update_quality_tracker(port, tracker).await;
-                        }
-
-                        // Send pong response
-                        let pong_timestamp_micros = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0);
-                        let _ = sender
-                            .send(ControlMessage::Pong {
-                                seq,
-                                ping_timestamp_micros: timestamp_micros,
-                                pong_timestamp_micros,
-                            })
+                    // Auto-register DNS record for tunnel port if DNS is enabled
+                    if let Some(ref dns_registry) = state.dns_registry {
+                        let fqdn = dns_registry
+                            .register_tunnel_default(remote_port, None)
                             .await;
+                        info!("DNS auto-registered: {}", fqdn);
                     }
-                    ControlMessage::Pong { .. } => {
-                        // Ignore, pong is only server -> client
-                    }
-                    ControlMessage::LogBatch { entries } => {
-                        if let Some(ref log_store) = state.log_store {
-                            // Find hostname from first registered port
-                            let hostname = if let Some(&port) = registered_ports.first() {
-                                state.get_client(port).await.map(|c| c.hostname).flatten()
-                            } else {
-                                None
-                            };
-                            let source_prefix = format!(
-                                "client:{}:{}",
-                                hostname.as_deref().unwrap_or("unknown"),
-                                registered_ports.first().copied().unwrap_or(0)
-                            );
 
-                            for entry in entries {
-                                log_store.send(crate::server::logs::LogEntry {
-                                    id: 0,
-                                    timestamp: entry.timestamp,
-                                    level: entry.level,
-                                    source: source_prefix.clone(),
-                                    target: entry.target,
-                                    message: entry.message,
-                                });
-                            }
+                    // Spawn the listener task
+                    let state_clone = state.clone();
+                    let state_for_remove = state.clone();
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = listener::run_listener(state_clone, remote_port).await {
+                            error!("Listener for port {} failed: {}", remote_port, e);
                         }
-                    }
-                    ControlMessage::Data {
-                        connection_id,
-                        data,
-                    } => {
-                        // Deliver data from client to user connection
-                        if let Err(e) = state.deliver_data(connection_id, data).await {
-                            warn!(
-                                "Failed to deliver data to connection {}: {}",
-                                connection_id, e
-                            );
-                        }
-                    }
-                    ControlMessage::ConnectionReady { .. } => {
-                        debug!("Connection ready");
-                    }
-                    ControlMessage::Close { connection_id } => {
-                        state.close_connection(connection_id).await;
-                        debug!("Connection {} closed by client", connection_id);
-                    }
-                    ControlMessage::Disconnect => {
-                        warn!("Received unexpected Disconnect from client");
-                    }
-                    ControlMessage::MeshJoin { mesh_id, client_name } => {
-                        info!("Client '{}' joining mesh '{}'", client_name, mesh_id);
-                        // Register client for relay
-                        state.mesh_manager.register_client(&client_name, sender.clone()).await;
-                        // Join the mesh
-                        let members = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
-                        // Send member list back to requester
-                        let _ = sender
-                            .send(ControlMessage::MeshMemberList {
-                                mesh_id: mesh_id.clone(),
-                                members,
-                            })
-                            .await;
-                        // Notify other members of new joiner (re-fetch updated list)
-                        let updated = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
-                        let notify_msg = ControlMessage::MeshMemberList {
-                            mesh_id: mesh_id.clone(),
-                            members: updated,
-                        };
-                        state
-                            .mesh_manager
-                            .broadcast_to_mesh(&mesh_id, notify_msg, Some(&client_name))
-                            .await;
-                    }
-                    ControlMessage::MeshLeave { mesh_id } => {
-                        info!(
-                            "Client '{}' leaving mesh '{}'",
-                            client_name, mesh_id
-                        );
-                        let members = state.mesh_manager.leave_mesh(&mesh_id, &client_name).await;
-                        // Notify remaining members
-                        let notify_msg = ControlMessage::MeshMemberList {
-                            mesh_id: mesh_id.clone(),
-                            members,
-                        };
-                        state
-                            .mesh_manager
-                            .broadcast_to_mesh(&mesh_id, notify_msg, None)
-                            .await;
-                    }
-                    ControlMessage::MeshConnect {
-                        target_client,
-                        service_name,
-                    } => {
-                        debug!(
-                            "Mesh connect request: {} -> {} (service: {})",
-                            client_name, target_client, service_name
-                        );
-                        // Forward to target
-                        if state
-                            .mesh_manager
-                            .send_to_client(
-                                &target_client,
-                                ControlMessage::MeshConnect {
-                                    target_client: client_name.clone(),
-                                    service_name: service_name.clone(),
-                                },
-                            )
-                            .await
-                        {
-                            debug!("Forwarded mesh connect request to {}", target_client);
-                        } else {
-                            warn!(
-                                "Target client '{}' not reachable for mesh connect",
-                                target_client
-                            );
-                        }
-                    }
-                    ControlMessage::MeshMemberList { .. } => {
-                        warn!(
-                            "Received unexpected MeshMemberList from client '{}' (server->client message)",
-                            client_name
-                        );
-                    }
-                    ControlMessage::P2PRequest {
-                        target_client,
-                        local_addr,
-                    } => {
-                        debug!(
-                            "P2P request: {} -> {} (addr: {})",
-                            client_name, target_client, local_addr
-                        );
-                        // Forward P2P request to target with requester's address
-                        state
-                            .mesh_manager
-                            .send_to_client(
-                                &target_client,
-                                ControlMessage::P2PResponse {
-                                    target_client: client_name.clone(),
-                                    remote_addr: local_addr,
-                                },
-                            )
-                            .await;
-                    }
-                    ControlMessage::P2PResponse { .. } => {
-                        warn!(
-                            "Received unexpected P2PResponse from client '{}' (server->client message)",
-                            client_name
-                        );
-                    }
-                    ControlMessage::P2PResult {
-                        target_client,
-                        success,
-                    } => {
-                        if success {
-                            info!(
-                                "P2P connection established between '{}' and '{}'",
-                                client_name, target_client
-                            );
-                        } else {
-                            info!(
-                                "P2P hole punch failed between '{}' and '{}', will use relay",
-                                client_name, target_client
-                            );
-                        }
-                    }
-                    ControlMessage::MeshRelay {
-                        target_client,
-                        data,
-                    } => {
-                        if let Err(e) = state
-                            .mesh_manager
-                            .relay
-                            .relay_data(&client_name, &target_client, data)
-                            .await
-                        {
-                            warn!(
-                                "Mesh relay failed from '{}' to '{}': {}",
-                                client_name, target_client, e
-                            );
-                        }
-                    }
-                    ControlMessage::MeshRegisterServices { mesh_id, services } => {
-                        info!(
-                            "Registering {} services for client '{}' in mesh '{}'",
-                            services.len(),
-                            client_name,
-                            mesh_id
-                        );
-                        let mesh_services: Vec<crate::common::MeshService> = services
-                            .into_iter()
-                            .map(|s| crate::common::MeshService {
-                                name: s.name,
-                                protocol: s.protocol,
-                                local_addr: s.local_addr,
-                            })
-                            .collect();
-                        state
-                            .mesh_manager
-                            .register_services(&mesh_id, &client_name, mesh_services)
-                            .await;
-                    }
-                    ControlMessage::RegisterResponse { .. } => {
-                        warn!("Received unexpected RegisterResponse from client");
-                    }
-                    ControlMessage::NewConnection { .. } => {
-                        warn!("Received unexpected NewConnection from client");
+                        state_for_remove.remove_client(remote_port).await;
+                        info!("Client unregistered from port {}", remote_port);
+                    });
+                    // Store handle to allow abort on disconnect
+                    {
+                        let mut tasks = state.listener_tasks.lock().await;
+                        tasks.insert(remote_port, handle);
                     }
                 }
             }
-            Ok(None) => {
-                // Connection closed
-                break Ok(());
+            ControlMessage::Ping {
+                seq,
+                timestamp_micros,
+            } => {
+                // Calculate RTT using server time
+                let now = Utc::now();
+                let now_micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as u64)
+                    .unwrap_or(0);
+                let rtt_ms = if now_micros > timestamp_micros {
+                    (now_micros - timestamp_micros) as f32 / 1000.0
+                } else {
+                    0.0 // Clock went backwards, ignore
+                };
+
+                tracing::debug!(
+                    "Processing Ping seq={} for {} ports, rtt={:.1}ms, minute={}",
+                    seq,
+                    registered_ports.len(),
+                    rtt_ms,
+                    now.minute()
+                );
+
+                // Iterate all registered ports for this connection and update quality
+                for &port in &registered_ports {
+                    // Get or create quality tracker
+                    let mut tracker = state.get_or_create_quality_tracker(port).await;
+
+                    // Record ping and calculate loss
+                    let (lost, loss_rate) = tracker.record_ping(seq);
+
+                    // Record RTT
+                    tracker.record_rtt(rtt_ms);
+
+                    // Calculate statistics
+                    let avg_rtt = tracker.get_avg_rtt();
+                    let min_rtt = tracker.get_min_rtt();
+                    let max_rtt = tracker.get_max_rtt();
+
+                    // Calculate quality score
+                    let quality_score = calculate_quality_score(avg_rtt, loss_rate);
+
+                    // Check warnings
+                    let thresholds = QualityThresholds::default();
+                    let (is_warning, is_critical) = check_warnings(avg_rtt, loss_rate, &thresholds);
+
+                    // Get throughput from TrafficStore (simplified)
+                    // For now we use 0 since we don't have per-second calculation yet
+                    let (bytes_in_per_sec, bytes_out_per_sec) = (0.0, 0.0);
+
+                    // Update real-time quality data
+                    let quality = ConnectionQuality {
+                        last_rtt_ms: rtt_ms,
+                        avg_rtt_ms: avg_rtt,
+                        min_rtt_ms: min_rtt,
+                        max_rtt_ms: max_rtt,
+                        loss_rate,
+                        consecutive_losses: lost,
+                        bytes_in_per_sec,
+                        bytes_out_per_sec,
+                        quality_score,
+                        last_update: now,
+                        is_warning,
+                        is_critical,
+                    };
+
+                    state.quality_store.update_quality(port, quality).await;
+
+                    // Add historical sample once per minute
+                    let current_minute = now.minute();
+                    if tracker.last_sample_minute != current_minute {
+                        tracing::info!(
+                                    "Adding quality sample for port {}: last_sample_minute={}, current_minute={}",
+                                    port, tracker.last_sample_minute, current_minute
+                                );
+                        let sample = QualitySample {
+                            timestamp: now,
+                            avg_rtt_ms: avg_rtt,
+                            loss_rate,
+                            bytes_in_per_sec,
+                            bytes_out_per_sec,
+                            quality_score,
+                        };
+                        state.quality_store.add_sample(port, sample).await;
+                        tracker.last_sample_minute = current_minute;
+                    }
+
+                    state.update_quality_tracker(port, tracker).await;
+                }
+
+                // Send pong response
+                let pong_timestamp_micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros() as u64)
+                    .unwrap_or(0);
+                let _ = sender
+                    .send(ControlMessage::Pong {
+                        seq,
+                        ping_timestamp_micros: timestamp_micros,
+                        pong_timestamp_micros,
+                    })
+                    .await;
             }
-            Err(e) => {
-                error!("Error reading from control channel: {}", e);
-                break Err(e);
+            ControlMessage::Pong { .. } => {
+                // Ignore, pong is only server -> client
+            }
+            ControlMessage::LogBatch { entries } => {
+                if let Some(ref log_store) = state.log_store {
+                    // Find hostname from first registered port
+                    let hostname = if let Some(&port) = registered_ports.first() {
+                        state.get_client(port).await.map(|c| c.hostname).flatten()
+                    } else {
+                        None
+                    };
+                    let source_prefix = format!(
+                        "client:{}:{}",
+                        hostname.as_deref().unwrap_or("unknown"),
+                        registered_ports.first().copied().unwrap_or(0)
+                    );
+
+                    for entry in entries {
+                        log_store.send(crate::server::logs::LogEntry {
+                            id: 0,
+                            timestamp: entry.timestamp,
+                            level: entry.level,
+                            source: source_prefix.clone(),
+                            target: entry.target,
+                            message: entry.message,
+                        });
+                    }
+                }
+            }
+            ControlMessage::Data {
+                connection_id,
+                data,
+            } => {
+                // Deliver data from client to user connection
+                if let Err(e) = state.deliver_data(connection_id, data).await {
+                    warn!(
+                        "Failed to deliver data to connection {}: {}",
+                        connection_id, e
+                    );
+                }
+            }
+            ControlMessage::ConnectionReady { .. } => {
+                debug!("Connection ready");
+            }
+            ControlMessage::Close { connection_id } => {
+                state.close_connection(connection_id).await;
+                debug!("Connection {} closed by client", connection_id);
+            }
+            ControlMessage::Disconnect => {
+                warn!("Received unexpected Disconnect from client");
+            }
+            ControlMessage::MeshJoin {
+                mesh_id,
+                client_name,
+            } => {
+                info!("Client '{}' joining mesh '{}'", client_name, mesh_id);
+                // Register client for relay
+                state
+                    .mesh_manager
+                    .register_client(&client_name, sender.clone())
+                    .await;
+                // Join the mesh
+                let members = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                // Send member list back to requester
+                let _ = sender
+                    .send(ControlMessage::MeshMemberList {
+                        mesh_id: mesh_id.clone(),
+                        members,
+                    })
+                    .await;
+                // Notify other members of new joiner (re-fetch updated list)
+                let updated = state.mesh_manager.join_mesh(&mesh_id, &client_name).await;
+                let notify_msg = ControlMessage::MeshMemberList {
+                    mesh_id: mesh_id.clone(),
+                    members: updated,
+                };
+                state
+                    .mesh_manager
+                    .broadcast_to_mesh(&mesh_id, notify_msg, Some(&client_name))
+                    .await;
+            }
+            ControlMessage::MeshLeave { mesh_id } => {
+                info!("Client '{}' leaving mesh '{}'", client_name, mesh_id);
+                let members = state.mesh_manager.leave_mesh(&mesh_id, &client_name).await;
+                // Notify remaining members
+                let notify_msg = ControlMessage::MeshMemberList {
+                    mesh_id: mesh_id.clone(),
+                    members,
+                };
+                state
+                    .mesh_manager
+                    .broadcast_to_mesh(&mesh_id, notify_msg, None)
+                    .await;
+            }
+            ControlMessage::MeshConnect {
+                target_client,
+                service_name,
+            } => {
+                debug!(
+                    "Mesh connect request: {} -> {} (service: {})",
+                    client_name, target_client, service_name
+                );
+                // Forward to target
+                if state
+                    .mesh_manager
+                    .send_to_client(
+                        &target_client,
+                        ControlMessage::MeshConnect {
+                            target_client: client_name.clone(),
+                            service_name: service_name.clone(),
+                        },
+                    )
+                    .await
+                {
+                    debug!("Forwarded mesh connect request to {}", target_client);
+                } else {
+                    warn!(
+                        "Target client '{}' not reachable for mesh connect",
+                        target_client
+                    );
+                }
+            }
+            ControlMessage::MeshMemberList { .. } => {
+                warn!(
+                    "Received unexpected MeshMemberList from client '{}' (server->client message)",
+                    client_name
+                );
+            }
+            ControlMessage::P2PRequest {
+                target_client,
+                local_addr,
+            } => {
+                debug!(
+                    "P2P request: {} -> {} (addr: {})",
+                    client_name, target_client, local_addr
+                );
+                // Forward P2P request to target with requester's address
+                state
+                    .mesh_manager
+                    .send_to_client(
+                        &target_client,
+                        ControlMessage::P2PResponse {
+                            target_client: client_name.clone(),
+                            remote_addr: local_addr,
+                        },
+                    )
+                    .await;
+            }
+            ControlMessage::P2PResponse { .. } => {
+                warn!(
+                    "Received unexpected P2PResponse from client '{}' (server->client message)",
+                    client_name
+                );
+            }
+            ControlMessage::P2PResult {
+                target_client,
+                success,
+            } => {
+                if success {
+                    info!(
+                        "P2P connection established between '{}' and '{}'",
+                        client_name, target_client
+                    );
+                } else {
+                    info!(
+                        "P2P hole punch failed between '{}' and '{}', will use relay",
+                        client_name, target_client
+                    );
+                }
+            }
+            ControlMessage::MeshRelay {
+                target_client,
+                data,
+            } => {
+                if let Err(e) = state
+                    .mesh_manager
+                    .relay
+                    .relay_data(&client_name, &target_client, data)
+                    .await
+                {
+                    warn!(
+                        "Mesh relay failed from '{}' to '{}': {}",
+                        client_name, target_client, e
+                    );
+                }
+            }
+            ControlMessage::MeshRegisterServices { mesh_id, services } => {
+                info!(
+                    "Registering {} services for client '{}' in mesh '{}'",
+                    services.len(),
+                    client_name,
+                    mesh_id
+                );
+                let mesh_services: Vec<crate::common::MeshService> = services
+                    .iter()
+                    .map(|s| crate::common::MeshService {
+                        name: s.name.clone(),
+                        protocol: s.protocol.clone(),
+                        local_addr: s.local_addr.clone(),
+                    })
+                    .collect();
+                state
+                    .mesh_manager
+                    .register_services(&mesh_id, &client_name, mesh_services)
+                    .await;
+
+                // Auto-register DNS records for mesh services if DNS is enabled
+                if let Some(ref dns_registry) = state.dns_registry {
+                    for s in &services {
+                        // Parse port from local_addr (e.g., "localhost:3306" → 3306)
+                        if let Some(port_str) = s.local_addr.rsplit(':').next() {
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                dns_registry
+                                    .register_mesh_service(
+                                        &mesh_id,
+                                        &s.name,
+                                        &s.protocol,
+                                        &peer_addr.ip().to_string(),
+                                        port,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+            ControlMessage::RegisterResponse { .. } => {
+                warn!("Received unexpected RegisterResponse from client");
+            }
+            ControlMessage::NewConnection { .. } => {
+                warn!("Received unexpected NewConnection from client");
             }
         }
     };
@@ -1431,6 +1501,27 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             "Client unregistered from port {} (control connection closed)",
             remote_port
         );
+    }
+
+    // Cleanup DNS records for this client
+    if let Some(ref dns_registry) = state.dns_registry {
+        for &remote_port in &registered_ports {
+            let dns_name = format!("port-{}", remote_port);
+            dns_registry.unregister_tunnel(&dns_name, remote_port).await;
+        }
+        // Collect mesh IDs before unregistering (unregister removes client from router)
+        let meshes = state
+            .mesh_manager
+            .router
+            .lock()
+            .await
+            .get_client_meshes(&client_name);
+        state.mesh_manager.unregister_client(&client_name).await;
+        for mesh_id in &meshes {
+            dns_registry.unregister_mesh_client(mesh_id).await;
+        }
+    } else {
+        state.mesh_manager.unregister_client(&client_name).await;
     }
 
     result
@@ -1477,7 +1568,8 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
                             debug!("TLS handshake successful with {}", addr);
-                            handle_control_connection(config_clone, state_clone, tls_stream).await
+                            handle_control_connection(config_clone, state_clone, tls_stream, addr)
+                                .await
                         }
                         Err(e) => {
                             warn!("TLS handshake failed with {}: {}", addr, e);
@@ -1485,11 +1577,11 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
                         }
                     }
                 }
-                None => handle_control_connection(config_clone, state_clone, stream).await,
+                None => handle_control_connection(config_clone, state_clone, stream, addr).await,
             };
 
             if let Err(e) = result {
-                warn!("Control connection error: {}", e);
+                warn!("Control connection error from {}: {}", addr, e);
             }
         });
     }

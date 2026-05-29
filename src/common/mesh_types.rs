@@ -37,10 +37,7 @@ pub enum DnsRecord {
         port: u16,
     },
     /// A record for mesh service -> mesh client IP
-    MeshA {
-        name: String,
-        target_ip: String,
-    },
+    MeshA { name: String, target_ip: String },
     /// SRV record for mesh service
     MeshSrv {
         name: String,
@@ -48,10 +45,7 @@ pub enum DnsRecord {
         port: u16,
     },
     /// TXT metadata record
-    Txt {
-        name: String,
-        text: String,
-    },
+    Txt { name: String, text: String },
 }
 
 impl DnsRecord {

@@ -470,7 +470,9 @@ impl ServerConfig {
 
         // Validate DNS configuration
         if config.dns_enabled {
-            config.dns_bind.parse::<std::net::SocketAddr>()
+            config
+                .dns_bind
+                .parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("Invalid dns_bind '{}': {}", config.dns_bind, e))?;
         }
 

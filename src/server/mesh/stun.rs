@@ -1,8 +1,6 @@
+use crate::common::{ATTR_XOR_MAPPED_ADDRESS, STUN_MAGIC_COOKIE};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
-use crate::common::{
-    STUN_MAGIC_COOKIE, ATTR_XOR_MAPPED_ADDRESS,
-};
 
 /// Lightweight STUN server that responds to Binding Requests
 /// with the client's observed public address (XOR-MAPPED-ADDRESS).
@@ -84,8 +82,8 @@ impl StunServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
     use crate::common::build_binding_request;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn test_handle_binding_request_valid() {

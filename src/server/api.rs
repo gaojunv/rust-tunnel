@@ -1148,12 +1148,15 @@ async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
 
             MeshNetworkResponse {
                 id,
-                members: members.iter().map(|m| MeshMemberResponse {
-                    client_name: m.client_name.clone(),
-                    public_addr: m.public_addr.clone(),
-                    p2p_available: m.p2p_available,
-                    online: true,
-                }).collect(),
+                members: members
+                    .iter()
+                    .map(|m| MeshMemberResponse {
+                        client_name: m.client_name.clone(),
+                        public_addr: m.public_addr.clone(),
+                        p2p_available: m.p2p_available,
+                        online: true,
+                    })
+                    .collect(),
                 services,
             }
         })
@@ -1162,10 +1165,7 @@ async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 // GET /api/mesh/:id — mesh detail
-async fn get_mesh(
-    State(state): State<ApiState>,
-    Path(mesh_id): Path<String>,
-) -> impl IntoResponse {
+async fn get_mesh(State(state): State<ApiState>, Path(mesh_id): Path<String>) -> impl IntoResponse {
     match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
         Some(members) => {
             let services: Vec<MeshServiceResponse> = members
@@ -1182,12 +1182,15 @@ async fn get_mesh(
 
             Json(MeshNetworkResponse {
                 id: mesh_id,
-                members: members.iter().map(|m| MeshMemberResponse {
-                    client_name: m.client_name.clone(),
-                    public_addr: m.public_addr.clone(),
-                    p2p_available: m.p2p_available,
-                    online: true,
-                }).collect(),
+                members: members
+                    .iter()
+                    .map(|m| MeshMemberResponse {
+                        client_name: m.client_name.clone(),
+                        public_addr: m.public_addr.clone(),
+                        p2p_available: m.p2p_available,
+                        online: true,
+                    })
+                    .collect(),
                 services,
             })
             .into_response()
@@ -1236,13 +1239,12 @@ async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse {
             name: r.name().to_string(),
             record_type: r.record_type().to_string(),
             value: match r {
-                DnsRecord::TunnelA { target_ip, port, .. } =>
-                    format!("{} (port {})", target_ip, port),
+                DnsRecord::TunnelA {
+                    target_ip, port, ..
+                } => format!("{} (port {})", target_ip, port),
                 DnsRecord::MeshA { target_ip, .. } => target_ip.clone(),
-                DnsRecord::TunnelSrv { target, port, .. } =>
-                    format!("{}:{}", target, port),
-                DnsRecord::MeshSrv { target, port, .. } =>
-                    format!("{}:{}", target, port),
+                DnsRecord::TunnelSrv { target, port, .. } => format!("{}:{}", target, port),
+                DnsRecord::MeshSrv { target, port, .. } => format!("{}:{}", target, port),
                 DnsRecord::Txt { text, .. } => text.clone(),
             },
         })
@@ -1386,7 +1388,9 @@ async fn sse_log_stream(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .into_response()
 }
 
 async fn get_logs(
@@ -1458,8 +1462,10 @@ async fn get_logs(
 
         // Merge: DB entries (older) first, then in-memory (newer)
         // Deduplicate by id for entries that were flushed to DB
-        let mem_ids: std::collections::HashSet<i64> =
-            mem_entries.iter().filter_map(|e| if e.id > 0 { Some(e.id) } else { None }).collect();
+        let mem_ids: std::collections::HashSet<i64> = mem_entries
+            .iter()
+            .filter_map(|e| if e.id > 0 { Some(e.id) } else { None })
+            .collect();
 
         let mut all_entries: Vec<LogEntryResponse> = db_entries
             .into_iter()
@@ -1501,9 +1507,7 @@ async fn get_logs(
     Json(response).into_response()
 }
 
-async fn get_logs_level(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+async fn get_logs_level(State(state): State<ApiState>) -> impl IntoResponse {
     let log_store = match &state.log_store {
         Some(store) => store,
         None => {
@@ -1550,12 +1554,16 @@ async fn put_logs_level(
         _ => {
             return axum::response::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("Invalid level. Use: trace, debug, info, warn, error"))
+                .body(Body::from(
+                    "Invalid level. Use: trace, debug, info, warn, error",
+                ))
                 .unwrap();
         }
     };
 
-    log_store.level.store(level_u8, std::sync::atomic::Ordering::Relaxed);
+    log_store
+        .level
+        .store(level_u8, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("Log level changed to {}", body.level.to_lowercase());
 
     Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
@@ -1621,7 +1629,10 @@ pub async fn run_api_server(
         .route("/api/mesh/:id", get(get_mesh))
         .route("/api/mesh/:id/services", get(get_mesh_services))
         // DNS management endpoints
-        .route("/api/dns/records", get(get_dns_records).post(add_dns_record))
+        .route(
+            "/api/dns/records",
+            get(get_dns_records).post(add_dns_record),
+        )
         .route("/api/dns/records/:name", delete(delete_dns_record))
         // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/logs", get(get_logs))

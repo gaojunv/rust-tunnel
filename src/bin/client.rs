@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rust_tunnel::client::{control, ClientConfig};
-use rust_tunnel::common::TunnelResult;
+use rust_tunnel::common::{init_logging_with_level, TunnelResult};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 30;
@@ -9,6 +9,7 @@ const MAX_BACKOFF_SECS: u64 = 30;
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
     let config = ClientConfig::load().map_err(std::io::Error::other)?;
+    init_logging_with_level(&config.log);
     let forwards = config
         .parse_forwards()
         .expect("Invalid forward configuration");

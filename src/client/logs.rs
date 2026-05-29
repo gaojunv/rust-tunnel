@@ -44,7 +44,11 @@ impl<S> Layer<S> for ClientLogLayer
 where
     S: tracing::Subscriber,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let metadata = event.metadata();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -56,16 +60,11 @@ where
         }
 
         impl tracing::field::Visit for ClientFieldVisitor {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     self.message = format!("{:?}", value);
                     if self.message.starts_with('"') && self.message.ends_with('"') {
-                        self.message =
-                            self.message[1..self.message.len() - 1].to_string();
+                        self.message = self.message[1..self.message.len() - 1].to_string();
                     }
                 }
             }
@@ -77,7 +76,8 @@ where
                     if !self.message.is_empty() {
                         self.message.push(' ');
                     }
-                    self.message.push_str(&format!("{}={}", field.name(), value));
+                    self.message
+                        .push_str(&format!("{}={}", field.name(), value));
                 }
             }
         }
@@ -114,8 +114,7 @@ pub fn spawn_log_forwarder(
 ) {
     tokio::spawn(async move {
         let mut buffer: Vec<ClientLogEntry> = Vec::with_capacity(50);
-        let mut flush_interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(2));
+        let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
 
         loop {
             tokio::select! {
@@ -205,13 +204,14 @@ mod tests {
 
         // Send a single entry -- buffer is not full, so it will wait for the
         // 2-second timer.
-        log_tx.send(ClientLogEntry {
-            timestamp: 1000,
-            level: "INFO".into(),
-            target: "test".into(),
-            message: "flush me".into(),
-        })
-        .ok();
+        log_tx
+            .send(ClientLogEntry {
+                timestamp: 1000,
+                level: "INFO".into(),
+                target: "test".into(),
+                message: "flush me".into(),
+            })
+            .ok();
 
         // The flush interval fires every 2 s, so we should receive a batch
         // within 3 s.
@@ -221,10 +221,7 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].message, "flush me");
             }
-            other => panic!(
-                "expected Some(LogBatch) within timeout, got {:?}",
-                other
-            ),
+            other => panic!("expected Some(LogBatch) within timeout, got {:?}", other),
         }
     }
 
@@ -253,10 +250,7 @@ mod tests {
             Ok(Some(ControlMessage::LogBatch { entries })) => {
                 assert_eq!(entries.len(), 50);
             }
-            other => panic!(
-                "expected Some(LogBatch) within timeout, got {:?}",
-                other
-            ),
+            other => panic!("expected Some(LogBatch) within timeout, got {:?}", other),
         }
     }
 

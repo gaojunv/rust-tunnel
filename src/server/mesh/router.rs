@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::common::MeshRoute;
+use std::collections::HashMap;
 
 /// Mesh routing table tracking all mesh networks and their members.
 pub struct MeshRouter {
@@ -175,13 +175,15 @@ mod tests {
     fn test_register_services() {
         let mut router = MeshRouter::new();
         router.join("mesh1", "client-a");
-        router.register_services("mesh1", "client-a", vec![
-            crate::common::MeshService {
+        router.register_services(
+            "mesh1",
+            "client-a",
+            vec![crate::common::MeshService {
                 name: "db".into(),
                 protocol: "mysql".into(),
                 local_addr: "localhost:3306".into(),
-            },
-        ]);
+            }],
+        );
         let member = router.get_member("mesh1", "client-a").unwrap();
         assert_eq!(member.services.len(), 1);
         assert_eq!(member.services[0].name, "db");

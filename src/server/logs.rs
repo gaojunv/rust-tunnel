@@ -64,9 +64,8 @@ impl LogStore {
         let inner = store.inner.clone();
         let tx = store.tx.clone();
         tokio::spawn(async move {
-            let mut db_flush_interval = tokio::time::interval(
-                tokio::time::Duration::from_millis(500),
-            );
+            let mut db_flush_interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(500));
 
             loop {
                 tokio::select! {
@@ -189,22 +188,18 @@ impl LogStore {
     ) -> Vec<LogEntry> {
         let guard = self.inner.lock().await;
         if let Some(ref db) = guard.db {
-            match db
-                .query_logs(level, source, search, limit, before_id)
-                .await
-            {
-                Ok(rows) => {
-                    rows.into_iter()
-                        .map(|r| LogEntry {
-                            id: r.id,
-                            timestamp: r.timestamp,
-                            level: r.level,
-                            source: r.source,
-                            target: r.target,
-                            message: r.message,
-                        })
-                        .collect()
-                }
+            match db.query_logs(level, source, search, limit, before_id).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|r| LogEntry {
+                        id: r.id,
+                        timestamp: r.timestamp,
+                        level: r.level,
+                        source: r.source,
+                        target: r.target,
+                        message: r.message,
+                    })
+                    .collect(),
                 Err(e) => {
                     tracing::warn!("Failed to query logs from DB: {}", e);
                     vec![]
@@ -289,7 +284,7 @@ where
                     self.message = format!("{:?}", value);
                     // Strip surrounding quotes if present
                     if self.message.starts_with('"') && self.message.ends_with('"') {
-                        self.message = self.message[1..self.message.len()-1].to_string();
+                        self.message = self.message[1..self.message.len() - 1].to_string();
                     }
                 }
             }
@@ -301,7 +296,8 @@ where
                     if !self.message.is_empty() {
                         self.message.push(' ');
                     }
-                    self.message.push_str(&format!("{}={}", field.name(), value));
+                    self.message
+                        .push_str(&format!("{}={}", field.name(), value));
                 }
             }
         }
@@ -443,13 +439,10 @@ mod tests {
             message: "broadcast test".into(),
         });
 
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received = tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received.message, "broadcast test");
     }
 
