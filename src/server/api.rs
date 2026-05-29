@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::common::DnsRecord;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
@@ -683,6 +684,47 @@ pub struct TrojanQuality {
     pub history: Vec<QualitySample>,
 }
 
+/// Mesh network info response
+#[derive(Debug, Serialize)]
+pub struct MeshNetworkResponse {
+    pub id: String,
+    pub members: Vec<MeshMemberResponse>,
+    pub services: Vec<MeshServiceResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeshMemberResponse {
+    pub client_name: String,
+    pub public_addr: Option<String>,
+    pub p2p_available: bool,
+    pub online: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeshServiceResponse {
+    pub service_name: String,
+    pub protocol: String,
+    pub local_addr: String,
+    pub client_name: String,
+}
+
+/// DNS record response
+#[derive(Debug, Serialize)]
+pub struct DnsRecordResponse {
+    pub name: String,
+    pub record_type: String,
+    pub value: String,
+}
+
+/// Request to add a manual DNS record
+#[derive(Debug, Deserialize)]
+pub struct AddDnsRecordRequest {
+    pub name: String,
+    pub record_type: String,
+    pub value: String,
+    pub port: Option<u16>,
+}
+
 // Login handler
 async fn login(
     State(state): State<ApiState>,
@@ -1084,6 +1126,168 @@ async fn update_trojan_config(State(_state): State<ApiState>) -> impl IntoRespon
     )
 }
 
+// ── Mesh Network Endpoints ─────────────────────────────────────────
+
+// GET /api/mesh — list all meshes
+async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
+    let networks = state.server_state.mesh_manager.list_networks().await;
+    let response: Vec<MeshNetworkResponse> = networks
+        .into_iter()
+        .map(|(id, members)| {
+            let services: Vec<MeshServiceResponse> = members
+                .iter()
+                .flat_map(|m| {
+                    m.services.iter().map(|s| MeshServiceResponse {
+                        service_name: s.name.clone(),
+                        protocol: s.protocol.clone(),
+                        local_addr: s.local_addr.clone(),
+                        client_name: m.client_name.clone(),
+                    })
+                })
+                .collect();
+
+            MeshNetworkResponse {
+                id,
+                members: members.iter().map(|m| MeshMemberResponse {
+                    client_name: m.client_name.clone(),
+                    public_addr: m.public_addr.clone(),
+                    p2p_available: m.p2p_available,
+                    online: true,
+                }).collect(),
+                services,
+            }
+        })
+        .collect();
+    Json(response)
+}
+
+// GET /api/mesh/:id — mesh detail
+async fn get_mesh(
+    State(state): State<ApiState>,
+    Path(mesh_id): Path<String>,
+) -> impl IntoResponse {
+    match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
+        Some(members) => {
+            let services: Vec<MeshServiceResponse> = members
+                .iter()
+                .flat_map(|m| {
+                    m.services.iter().map(|s| MeshServiceResponse {
+                        service_name: s.name.clone(),
+                        protocol: s.protocol.clone(),
+                        local_addr: s.local_addr.clone(),
+                        client_name: m.client_name.clone(),
+                    })
+                })
+                .collect();
+
+            Json(MeshNetworkResponse {
+                id: mesh_id,
+                members: members.iter().map(|m| MeshMemberResponse {
+                    client_name: m.client_name.clone(),
+                    public_addr: m.public_addr.clone(),
+                    p2p_available: m.p2p_available,
+                    online: true,
+                }).collect(),
+                services,
+            })
+            .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// GET /api/mesh/:id/services — mesh services
+async fn get_mesh_services(
+    State(state): State<ApiState>,
+    Path(mesh_id): Path<String>,
+) -> impl IntoResponse {
+    match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
+        Some(members) => {
+            let services: Vec<MeshServiceResponse> = members
+                .iter()
+                .flat_map(|m| {
+                    m.services.iter().map(|s| MeshServiceResponse {
+                        service_name: s.name.clone(),
+                        protocol: s.protocol.clone(),
+                        local_addr: s.local_addr.clone(),
+                        client_name: m.client_name.clone(),
+                    })
+                })
+                .collect();
+            Json(services).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ── DNS Management Endpoints ───────────────────────────────────────
+
+// GET /api/dns/records — list all DNS records
+async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse {
+    let dns_registry = match &state.server_state.dns_registry {
+        Some(r) => r,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    };
+
+    let records = dns_registry.list_records().await;
+    let response: Vec<DnsRecordResponse> = records
+        .iter()
+        .map(|r| DnsRecordResponse {
+            name: r.name().to_string(),
+            record_type: r.record_type().to_string(),
+            value: match r {
+                DnsRecord::TunnelA { target_ip, port, .. } =>
+                    format!("{} (port {})", target_ip, port),
+                DnsRecord::MeshA { target_ip, .. } => target_ip.clone(),
+                DnsRecord::TunnelSrv { target, port, .. } =>
+                    format!("{}:{}", target, port),
+                DnsRecord::MeshSrv { target, port, .. } =>
+                    format!("{}:{}", target, port),
+                DnsRecord::Txt { text, .. } => text.clone(),
+            },
+        })
+        .collect();
+
+    Json(response).into_response()
+}
+
+// POST /api/dns/records — add manual DNS record
+async fn add_dns_record(
+    State(state): State<ApiState>,
+    Json(body): Json<AddDnsRecordRequest>,
+) -> impl IntoResponse {
+    let dns_registry = match &state.server_state.dns_registry {
+        Some(r) => r,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    };
+
+    let record = match body.record_type.as_str() {
+        "A" => DnsRecord::TunnelA {
+            name: body.name.clone(),
+            target_ip: body.value.clone(),
+            port: body.port.unwrap_or(80),
+        },
+        _ => return (StatusCode::BAD_REQUEST, "Unsupported record type").into_response(),
+    };
+
+    dns_registry.add_manual_record(record).await;
+    StatusCode::CREATED.into_response()
+}
+
+// DELETE /api/dns/records/:name — delete DNS record
+async fn delete_dns_record(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let dns_registry = match &state.server_state.dns_registry {
+        Some(r) => r,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "DNS not enabled").into_response(),
+    };
+
+    dns_registry.remove_record(&name).await;
+    StatusCode::OK.into_response()
+}
+
 // ── Log Viewer Endpoints ──────────────────────────────────────────
 
 async fn sse_log_stream(
@@ -1412,6 +1616,13 @@ pub async fn run_api_server(
         )
         .route("/api/trojan/stats", get(get_trojan_stats))
         .route("/api/trojan/quality", get(get_trojan_quality))
+        // Mesh network endpoints
+        .route("/api/mesh", get(list_meshes))
+        .route("/api/mesh/:id", get(get_mesh))
+        .route("/api/mesh/:id/services", get(get_mesh_services))
+        // DNS management endpoints
+        .route("/api/dns/records", get(get_dns_records).post(add_dns_record))
+        .route("/api/dns/records/:name", delete(delete_dns_record))
         // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/logs", get(get_logs))
         .route("/api/logs/level", get(get_logs_level).put(put_logs_level));

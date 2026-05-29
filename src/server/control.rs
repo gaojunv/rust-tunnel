@@ -17,6 +17,7 @@ use crate::server::quality::{
     QualityThresholds, QualityTracker,
 };
 use crate::server::mesh::MeshManager;
+use crate::server::dns::registry::DnsRegistry;
 use crate::server::{listener, ServerConfig};
 use chrono::{Timelike, Utc};
 
@@ -109,6 +110,8 @@ pub struct ServerState {
     pub log_store: Option<crate::server::logs::LogStore>,
     /// Mesh network manager
     pub mesh_manager: MeshManager,
+    /// DNS registry (set when DNS server is enabled)
+    pub dns_registry: Option<DnsRegistry>,
 }
 
 impl Default for ServerState {
@@ -131,6 +134,7 @@ impl ServerState {
             db: None,
             log_store: None,
             mesh_manager: MeshManager::new(),
+            dns_registry: None,
         }
     }
 
@@ -147,6 +151,7 @@ impl ServerState {
             db: Some(db.clone()),
             log_store: Some(crate::server::logs::LogStore::new(Some(db))),
             mesh_manager: MeshManager::new(),
+            dns_registry: None,
         }
     }
 
@@ -497,6 +502,11 @@ impl ServerState {
             };
             self.quality_store.add_sample(*port, sample).await;
         }
+    }
+
+    /// Set the DNS registry for this server state
+    pub fn set_dns_registry(&mut self, registry: DnsRegistry) {
+        self.dns_registry = Some(registry);
     }
 }
 
