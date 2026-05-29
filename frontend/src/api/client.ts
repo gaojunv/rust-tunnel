@@ -16,6 +16,10 @@ import type {
   TrojanStats,
   TrojanQuality,
   LogEntry,
+  MeshNetworkResponse,
+  MeshServiceResponse,
+  DnsRecordResponse,
+  AddDnsRecordRequest,
 } from '../types';
 
 const API_BASE = '/api';
@@ -181,4 +185,34 @@ export const getLogsLevel = async (): Promise<{ level: string }> => {
 export const setLogsLevel = async (level: string): Promise<{ level: string }> => {
   const response = await api.put<{ level: string }>('/logs/level', { level });
   return response.data;
+};
+
+// Mesh API
+export const getMeshes = async (): Promise<MeshNetworkResponse[]> => {
+  const response = await api.get<MeshNetworkResponse[]>('/mesh');
+  return response.data;
+};
+
+export const getMesh = async (id: string): Promise<MeshNetworkResponse> => {
+  const response = await api.get<MeshNetworkResponse>(`/mesh/${id}`);
+  return response.data;
+};
+
+export const getMeshServices = async (id: string): Promise<MeshServiceResponse[]> => {
+  const response = await api.get<MeshServiceResponse[]>(`/mesh/${id}/services`);
+  return response.data;
+};
+
+// DNS API
+export const getDnsRecords = async (): Promise<DnsRecordResponse[]> => {
+  const response = await api.get<DnsRecordResponse[]>('/dns/records');
+  return response.data;
+};
+
+export const addDnsRecord = async (record: AddDnsRecordRequest): Promise<void> => {
+  await api.post('/dns/records', record);
+};
+
+export const deleteDnsRecord = async (name: string): Promise<void> => {
+  await api.delete(`/dns/records/${encodeURIComponent(name)}`);
 };

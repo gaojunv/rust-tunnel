@@ -141,3 +141,38 @@ export interface LogEntry {
   target: string;          // tracing target (module path)
   message: string;         // log message content
 }
+
+// Mesh network types
+export interface MeshMemberResponse {
+  client_name: string;
+  public_addr?: string;
+  p2p_available: boolean;
+  online: boolean;
+}
+
+export interface MeshServiceResponse {
+  service_name: string;
+  protocol: string;
+  local_addr: string;
+  client_name: string;
+}
+
+export interface MeshNetworkResponse {
+  id: string;
+  members: MeshMemberResponse[];
+  services: MeshServiceResponse[];
+}
+
+// DNS types
+export interface DnsRecordResponse {
+  name: string;
+  record_type: string;
+  value: string;
+}
+
+export interface AddDnsRecordRequest {
+  name: string;
+  record_type: string;
+  value: string;
+  port?: number;
+}
