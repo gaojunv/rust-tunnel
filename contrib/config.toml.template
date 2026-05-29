@@ -40,3 +40,9 @@ trojan_port = 8443
 trojan_password = "${SS_PASSWORD}"
 # 认证失败时回退地址 (伪装为 HTTPS 站点)
 trojan_fallback = "127.0.0.1:80"
+
+# DNS 服务器配置
+dns_enabled = true
+dns_bind = "0.0.0.0:53"
+dns_tunnel_domain = "tunnel.local"
+dns_mesh_domain = "mesh.local"

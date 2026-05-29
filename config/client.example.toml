@@ -11,6 +11,9 @@
 #   TLS_SERVER_NAME -> tls_server_name
 #   TLS_INSECURE    -> tls_insecure
 #   LOG_LEVEL       -> log
+#   MESH_ID         -> mesh
+#   MESH_NAME       -> mesh_name
+#   MESH_SERVICES   -> mesh_services (逗号分隔)
 #
 # 命令行参数：
 #   --config                指定配置文件路径
@@ -21,6 +24,9 @@
 #   --tls-server-name       TLS 服务器名称（SNI）
 #   --tls-insecure          接受自签名证书（不安全）
 #   --log                   日志级别
+#   --mesh                  Mesh 网络 ID
+#   --mesh-name             Mesh 客户端名称
+#   --mesh-service          Mesh 服务定义（可多次指定）
 # ========================================
 
 # --------------------
@@ -95,6 +101,34 @@ log = "info"
 # 环境变量：AUTH_TOKEN
 # 命令行参数：--auth-token <TOKEN>
 
+# --------------------
+# Mesh 组网配置
+# --------------------
+
+# Mesh 网络 ID
+# 加入指定名称的 Mesh 网络，同一 Mesh 内的客户端可以相互访问
+# mesh = "my-network"
+
+# Mesh 客户端名称
+# 在 Mesh 网络中的显示名称，未设置时使用主机名
+# mesh_name = "client-a"
+
+# Mesh 服务定义列表
+# 格式：NAME:PROTOCOL:LOCAL_ADDR
+#   NAME       - 服务名称（Mesh 内唯一）
+#   PROTOCOL   - 协议类型（用于 SRV 记录和 DNS 解析）
+#   LOCAL_ADDR - 本地服务地址（host:port）
+#
+# 示例：
+#   - "db:mysql:localhost:3306"    暴露本地 MySQL 服务
+#   - "api:http:localhost:8080"    暴露本地 HTTP API 服务
+#   - "redis:tcp:localhost:6379"   暴露本地 Redis 服务
+#
+# mesh_services = [
+#   "db:mysql:localhost:3306",
+#   "api:http:localhost:8080",
+# ]
+
 # ========================================
 # Web 服务转发配置示例
 # ========================================
@@ -133,6 +167,24 @@ log = "info"
 #   "9000:localhost:9000",   # PHP-FPM
 #   "3307:localhost:3306",   # MySQL
 #   "6380:localhost:6379",   # Redis
+# ]
+# log = "info"
+
+# ========================================
+# Mesh 组网配置示例
+# ========================================
+# [mesh-client]
+# server = "tunnel.example.com:8080"
+# tls = true
+# tls_insecure = true
+# forwards = [
+#   "8080:localhost:80",
+# ]
+# mesh = "my-network"
+# mesh_name = "office-gateway"
+# mesh_services = [
+#   "db:mysql:localhost:3306",
+#   "api:http:localhost:8080",
 # ]
 # log = "info"
 
