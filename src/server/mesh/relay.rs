@@ -7,6 +7,7 @@ use crate::common::TunnelError;
 
 /// Relay tunnel between two mesh clients via the server.
 /// Bi-directional: data from A is forwarded to B and vice versa.
+#[derive(Clone)]
 pub struct MeshRelay {
     /// Maps client_name -> mpsc Sender for delivering MeshRelay messages
     tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
