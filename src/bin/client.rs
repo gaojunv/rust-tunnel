@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use rust_tunnel::client::{control, ClientConfig};
@@ -6,8 +7,24 @@ use rust_tunnel::common::{init_logging_with_level, TunnelResult};
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 30;
 
+fn wait_for_exit() {
+    if std::io::stdout().is_terminal() {
+        eprintln!("按 Enter 键退出...");
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+    }
+}
+
 #[tokio::main]
-async fn main() -> TunnelResult<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("启动失败: {}", e);
+        wait_for_exit();
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> TunnelResult<()> {
     let config = ClientConfig::load().map_err(std::io::Error::other)?;
     init_logging_with_level(&config.log);
     let forwards = config

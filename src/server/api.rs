@@ -2,7 +2,7 @@ use crate::server::quality::{ConnectionQuality, QualitySample};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, Response, StatusCode},
+    http::StatusCode,
     middleware,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -872,20 +872,20 @@ async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
     match FrontendAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            Response::builder()
-                .header(header::CONTENT_TYPE, mime.as_ref())
+            axum::http::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
                 .body(Body::from(content.data))
                 .unwrap()
         }
         None => {
             // Fallback to index.html for SPA routing
             if let Some(index) = FrontendAssets::get("index.html") {
-                Response::builder()
-                    .header(header::CONTENT_TYPE, "text/html")
+                axum::http::Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/html")
                     .body(Body::from(index.data))
                     .unwrap()
             } else {
-                Response::builder()
+                axum::http::Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Body::from("Not found"))
                     .unwrap()
