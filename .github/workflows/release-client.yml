@@ -54,6 +54,8 @@ jobs:
           version: 1.0
 
       - name: Build client
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C target-feature=+crt-static' || '' }}
         run: cargo build --release --bin rust-tunnel-client --target ${{ matrix.target }}
 
       - name: Strip binary (non-Windows)
