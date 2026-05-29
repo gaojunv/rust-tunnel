@@ -40,6 +40,19 @@ pub struct ClientCli {
     #[clap(long = "tls-insecure")]
     pub tls_insecure: Option<bool>,
 
+    /// Mesh network ID to join
+    #[clap(long = "mesh")]
+    pub mesh: Option<String>,
+
+    /// Mesh client display name in the mesh network
+    #[clap(long = "mesh-name")]
+    pub mesh_name: Option<String>,
+
+    /// Mesh service definitions: NAME:PROTOCOL:LOCAL_ADDR
+    /// Example: db:mysql:localhost:3306
+    #[clap(long = "mesh-service", action = ArgAction::Append)]
+    pub mesh_services: Vec<String>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -53,6 +66,9 @@ pub struct ClientConfigFile {
     pub tls: Option<bool>,
     pub tls_server_name: Option<String>,
     pub tls_insecure: Option<bool>,
+    pub mesh: Option<String>,
+    pub mesh_name: Option<String>,
+    pub mesh_services: Option<Vec<String>>,
     pub log: Option<String>,
 }
 
@@ -60,6 +76,12 @@ pub struct ClientConfigFile {
 pub struct ClientConfig {
     pub server: String,
     pub forwards: Vec<String>,
+    /// Mesh network ID to join
+    pub mesh: Option<String>,
+    /// Mesh client display name in the mesh network
+    pub mesh_name: Option<String>,
+    /// Mesh service definitions: NAME:PROTOCOL:LOCAL_ADDR
+    pub mesh_services: Vec<String>,
     /// Authentication token for server (required if server enables client auth)
     pub auth_token: Option<String>,
     /// Enable TLS encryption for control channel
@@ -76,6 +98,9 @@ impl Default for ClientConfig {
         Self {
             server: String::new(),
             forwards: Vec::new(),
+            mesh: None,
+            mesh_name: None,
+            mesh_services: Vec::new(),
             auth_token: None,
             tls: true, // TLS enabled by default for security
             tls_server_name: None,
@@ -120,6 +145,15 @@ impl ClientConfig {
                 if let Some(v) = file_config.tls_insecure {
                     config.tls_insecure = v;
                 }
+                if let Some(v) = file_config.mesh {
+                    config.mesh = Some(v);
+                }
+                if let Some(v) = file_config.mesh_name {
+                    config.mesh_name = Some(v);
+                }
+                if let Some(v) = file_config.mesh_services {
+                    config.mesh_services = v;
+                }
                 if let Some(v) = file_config.log {
                     config.log = v;
                 }
@@ -151,6 +185,15 @@ impl ClientConfig {
         if let Ok(v) = std::env::var("LOG_LEVEL") {
             config.log = v;
         }
+        if let Ok(v) = std::env::var("MESH_ID") {
+            config.mesh = Some(v);
+        }
+        if let Ok(v) = std::env::var("MESH_NAME") {
+            config.mesh_name = Some(v);
+        }
+        if let Ok(v) = std::env::var("MESH_SERVICES") {
+            config.mesh_services = v.split(',').map(|s| s.trim().to_string()).collect();
+        }
 
         // 3. Command line arguments (highest priority)
         if let Some(v) = cli.server {
@@ -174,6 +217,15 @@ impl ClientConfig {
         if let Some(v) = cli.log {
             config.log = v;
         }
+        if let Some(v) = cli.mesh {
+            config.mesh = Some(v);
+        }
+        if let Some(v) = cli.mesh_name {
+            config.mesh_name = Some(v);
+        }
+        if !cli.mesh_services.is_empty() {
+            config.mesh_services = cli.mesh_services;
+        }
 
         // Validate required fields
         if config.server.is_empty() {
@@ -191,6 +243,8 @@ impl ClientConfig {
 pub struct ForwardRule {
     pub remote_port: u16,
     pub local_addr: String,
+    /// Custom DNS name for this forward (e.g. "webapp" -> webapp.tunnel.local)
+    pub dns_name: Option<String>,
 }
 
 impl ClientConfig {
@@ -232,6 +286,7 @@ impl ClientConfig {
             rules.push(ForwardRule {
                 remote_port,
                 local_addr,
+                dns_name: None,
             });
         }
         Ok(rules)
@@ -263,6 +318,9 @@ mod tests {
             tls: Some(true),
             tls_server_name: Some("tunnel.example.com".to_string()),
             tls_insecure: Some(true),
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: Some("debug".to_string()),
         };
 
@@ -289,6 +347,9 @@ mod tests {
             tls: None,
             tls_server_name: None,
             tls_insecure: None,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: None,
         };
 
@@ -306,6 +367,9 @@ mod tests {
             tls: true,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".into(),
         };
 
@@ -324,6 +388,9 @@ mod tests {
             tls: true,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".into(),
         };
 
@@ -344,6 +411,9 @@ mod tests {
             tls: true,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".into(),
         };
 
@@ -360,6 +430,9 @@ mod tests {
             tls: true,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".into(),
         };
 
@@ -378,6 +451,9 @@ mod tests {
             tls: true,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".into(),
         };
 
@@ -394,6 +470,9 @@ mod tests {
             tls: true,
             tls_server_name: Some("test-server".to_string()),
             tls_insecure: true,
+            mesh: Some("mesh-net".to_string()),
+            mesh_name: Some("my-client".to_string()),
+            mesh_services: vec!["db:mysql:localhost:3306".to_string()],
             log: "debug".into(),
         };
 
@@ -404,6 +483,9 @@ mod tests {
         assert_eq!(config.tls, cloned.tls);
         assert_eq!(config.tls_server_name, cloned.tls_server_name);
         assert_eq!(config.tls_insecure, cloned.tls_insecure);
+        assert_eq!(config.mesh, cloned.mesh);
+        assert_eq!(config.mesh_name, cloned.mesh_name);
+        assert_eq!(config.mesh_services, cloned.mesh_services);
         assert_eq!(config.log, cloned.log);
     }
 
@@ -412,11 +494,13 @@ mod tests {
         let rule = ForwardRule {
             remote_port: 8080,
             local_addr: "localhost:80".into(),
+            dns_name: Some("webapp".to_string()),
         };
 
         let cloned = rule.clone();
         assert_eq!(rule.remote_port, cloned.remote_port);
         assert_eq!(rule.local_addr, cloned.local_addr);
+        assert_eq!(rule.dns_name, cloned.dns_name);
     }
 
     #[test]
@@ -429,6 +513,9 @@ mod tests {
             tls: None,
             tls_server_name: None,
             tls_insecure: None,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: None,
         };
 
