@@ -391,12 +391,16 @@ mod tests {
             tls: false,
             tls_server_name: None,
             tls_insecure: true,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);
         let forwards = vec![ForwardRule {
             remote_port: 8080,
             local_addr: "localhost:80".to_string(),
+            dns_name: None,
         }];
         ClientState::new(config, sender, forwards)
     }
