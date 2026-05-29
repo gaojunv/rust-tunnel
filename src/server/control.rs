@@ -16,6 +16,7 @@ use crate::server::quality::{
     calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
     QualityThresholds, QualityTracker,
 };
+use crate::server::mesh::MeshManager;
 use crate::server::{listener, ServerConfig};
 use chrono::{Timelike, Utc};
 
@@ -106,6 +107,8 @@ pub struct ServerState {
     quality_trackers: Arc<Mutex<HashMap<u16, QualityTracker>>>,
     /// Log store for capturing and broadcasting logs
     pub log_store: Option<crate::server::logs::LogStore>,
+    /// Mesh network manager
+    pub mesh_manager: MeshManager,
 }
 
 impl Default for ServerState {
@@ -127,6 +130,7 @@ impl ServerState {
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             log_store: None,
+            mesh_manager: MeshManager::new(),
         }
     }
 
@@ -142,6 +146,7 @@ impl ServerState {
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db.clone()),
             log_store: Some(crate::server::logs::LogStore::new(Some(db))),
+            mesh_manager: MeshManager::new(),
         }
     }
 
