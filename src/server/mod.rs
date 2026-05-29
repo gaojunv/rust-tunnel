@@ -21,3 +21,5 @@ mod trojan_test;
 pub use api::TrafficStore;
 pub use config::*;
 pub use db::Database;
+pub use dns::DnsServer;
+pub use dns::registry::DnsRegistry;

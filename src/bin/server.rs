@@ -128,6 +128,26 @@ async fn main() -> TunnelResult<()> {
         });
     }
 
+    // Start DNS server if enabled
+    if config.dns_enabled {
+        let dns_registry = rust_tunnel::server::DnsRegistry::new(
+            "0.0.0.0".to_string(), // Server public IP - placeholder for now
+            config.dns_tunnel_domain.clone(),
+            config.dns_mesh_domain.clone(),
+        );
+
+        let dns_server = rust_tunnel::server::DnsServer::new(dns_registry, &config.dns_bind)
+            .expect("Failed to create DNS server");
+
+        tokio::spawn(async move {
+            if let Err(e) = dns_server.run().await {
+                tracing::error!("DNS server error: {}", e);
+            }
+        });
+
+        tracing::info!("DNS server started on {}", config.dns_bind);
+    }
+
     // Spawn API server
     tokio::spawn(async move {
         if let Err(e) = api::run_api_server(api_addr, api_state, auth_config).await {

@@ -90,6 +90,22 @@ pub struct ServerCli {
     /// Trojan fallback address for non-Trojan traffic (default: 127.0.0.1:80)
     #[clap(long = "trojan-fallback")]
     pub trojan_fallback: Option<String>,
+
+    /// Enable embedded DNS server
+    #[clap(long = "dns-enabled")]
+    pub dns_enabled: Option<bool>,
+
+    /// DNS server bind address (default: 0.0.0.0:53)
+    #[clap(long = "dns-bind")]
+    pub dns_bind: Option<String>,
+
+    /// Tunnel domain suffix (default: tunnel.local)
+    #[clap(long = "dns-tunnel-domain")]
+    pub dns_tunnel_domain: Option<String>,
+
+    /// Mesh domain suffix (default: mesh.local)
+    #[clap(long = "dns-mesh-domain")]
+    pub dns_mesh_domain: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -112,6 +128,10 @@ pub struct ServerConfigFile {
     pub trojan_port: Option<u16>,
     pub trojan_password: Option<String>,
     pub trojan_fallback: Option<String>,
+    pub dns_enabled: Option<bool>,
+    pub dns_bind: Option<String>,
+    pub dns_tunnel_domain: Option<String>,
+    pub dns_mesh_domain: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +159,10 @@ pub struct ServerConfig {
     pub trojan_port: Option<u16>,
     pub trojan_password: Option<String>,
     pub trojan_fallback: String,
+    pub dns_enabled: bool,
+    pub dns_bind: String,
+    pub dns_tunnel_domain: String,
+    pub dns_mesh_domain: String,
 }
 
 impl Default for ServerConfig {
@@ -162,6 +186,10 @@ impl Default for ServerConfig {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: "127.0.0.1:80".to_string(),
+            dns_enabled: false,
+            dns_bind: "0.0.0.0:53".to_string(),
+            dns_tunnel_domain: "tunnel.local".to_string(),
+            dns_mesh_domain: "mesh.local".to_string(),
         }
     }
 }
@@ -237,6 +265,18 @@ impl ServerConfig {
                 if let Some(v) = file_config.trojan_fallback {
                     config.trojan_fallback = v;
                 }
+                if let Some(v) = file_config.dns_enabled {
+                    config.dns_enabled = v;
+                }
+                if let Some(v) = file_config.dns_bind {
+                    config.dns_bind = v;
+                }
+                if let Some(v) = file_config.dns_tunnel_domain {
+                    config.dns_tunnel_domain = v;
+                }
+                if let Some(v) = file_config.dns_mesh_domain {
+                    config.dns_mesh_domain = v;
+                }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
             }
@@ -306,6 +346,20 @@ impl ServerConfig {
             config.trojan_fallback = v;
         }
 
+        // Environment variables for DNS
+        if let Ok(v) = std::env::var("DNS_ENABLED") {
+            config.dns_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("DNS_BIND") {
+            config.dns_bind = v;
+        }
+        if let Ok(v) = std::env::var("DNS_TUNNEL_DOMAIN") {
+            config.dns_tunnel_domain = v;
+        }
+        if let Ok(v) = std::env::var("DNS_MESH_DOMAIN") {
+            config.dns_mesh_domain = v;
+        }
+
         // 3. Command line arguments (highest priority)
         if let Some(v) = cli.control_addr {
             config.control_addr = v;
@@ -360,6 +414,20 @@ impl ServerConfig {
         }
         if let Some(v) = cli.trojan_fallback {
             config.trojan_fallback = v;
+        }
+
+        // DNS command line arguments
+        if let Some(v) = cli.dns_enabled {
+            config.dns_enabled = v;
+        }
+        if let Some(v) = cli.dns_bind {
+            config.dns_bind = v;
+        }
+        if let Some(v) = cli.dns_tunnel_domain {
+            config.dns_tunnel_domain = v;
+        }
+        if let Some(v) = cli.dns_mesh_domain {
+            config.dns_mesh_domain = v;
         }
 
         // Validate Shadowsocks configuration
@@ -428,6 +496,10 @@ mod tests {
         assert!(config.trojan_port.is_none());
         assert!(config.trojan_password.is_none());
         assert_eq!(config.trojan_fallback, "127.0.0.1:80");
+        assert!(!config.dns_enabled);
+        assert_eq!(config.dns_bind, "0.0.0.0:53");
+        assert_eq!(config.dns_tunnel_domain, "tunnel.local");
+        assert_eq!(config.dns_mesh_domain, "mesh.local");
     }
 
     #[test]
@@ -452,6 +524,10 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let config = ServerConfig::from_cli(cli).unwrap();
@@ -492,6 +568,10 @@ mod tests {
             trojan_port: Some(443),
             trojan_password: Some("trojan-pass".to_string()),
             trojan_fallback: "127.0.0.1:8080".to_string(),
+            dns_enabled: true,
+            dns_bind: "0.0.0.0:53".to_string(),
+            dns_tunnel_domain: "tunnel.local".to_string(),
+            dns_mesh_domain: "mesh.local".to_string(),
         };
 
         let cloned = config.clone();
@@ -513,6 +593,10 @@ mod tests {
         assert_eq!(config.trojan_port, cloned.trojan_port);
         assert_eq!(config.trojan_password, cloned.trojan_password);
         assert_eq!(config.trojan_fallback, cloned.trojan_fallback);
+        assert_eq!(config.dns_enabled, cloned.dns_enabled);
+        assert_eq!(config.dns_bind, cloned.dns_bind);
+        assert_eq!(config.dns_tunnel_domain, cloned.dns_tunnel_domain);
+        assert_eq!(config.dns_mesh_domain, cloned.dns_mesh_domain);
     }
 
     #[test]
@@ -537,6 +621,10 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -566,6 +654,10 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -595,6 +687,10 @@ mod tests {
             trojan_port: None,
             trojan_password: None,
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -624,6 +720,10 @@ mod tests {
             trojan_port: None,
             trojan_password: Some("password".to_string()),
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -653,6 +753,10 @@ mod tests {
             trojan_port: Some(443),
             trojan_password: None,
             trojan_fallback: None,
+            dns_enabled: None,
+            dns_bind: None,
+            dns_tunnel_domain: None,
+            dns_mesh_domain: None,
         };
 
         let result = ServerConfig::from_cli(cli);
