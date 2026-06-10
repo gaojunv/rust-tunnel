@@ -8,3 +8,4 @@ data/rust-tunnel.db
 
 server.toml
 client.toml
+.superpowers/
