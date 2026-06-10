@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ThemeProvider, useTheme } from './ThemeProvider';
 import { THEME_STORAGE_KEY, type ThemePreference } from './theme';
@@ -63,6 +63,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
 });
 
