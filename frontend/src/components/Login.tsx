@@ -7,6 +7,16 @@ interface LoginProps {
   onLogin: () => void;
 }
 
+interface ApiError {
+  response?: {
+    data?: string;
+  };
+}
+
+function isApiError(err: unknown): err is ApiError {
+  return typeof err === 'object' && err !== null && 'response' in err;
+}
+
 export const Login = ({ onLogin }: LoginProps) => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -17,8 +27,12 @@ export const Login = ({ onLogin }: LoginProps) => {
       onSuccess: () => {
         onLogin();
       },
-      onError: (err: any) => {
-        setError(err.response?.data || 'Invalid password');
+      onError: (err: unknown) => {
+        if (isApiError(err)) {
+          setError(err.response?.data || 'Invalid password');
+        } else {
+          setError('Invalid password');
+        }
       },
     }
   );

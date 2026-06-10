@@ -6,7 +6,7 @@ import reactRefresh from 'eslint-plugin-react-refresh';
 
 export default [
   {
-    ignores: ['dist/**', 'node_modules/**', '**/*.test.ts', '**/*.test.tsx'],
+    ignores: ['dist/**', 'node_modules/**'],
   },
   js.configs.recommended,
   {
@@ -42,7 +42,6 @@ export default [
       ...tsPlugin.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': 'off',
-      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
 ];
