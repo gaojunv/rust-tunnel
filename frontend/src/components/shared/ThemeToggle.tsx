@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTheme } from '../../theme/ThemeProvider';
 import type { ThemePreference } from '../../theme/theme';
+import type { ReactNode } from 'react';
 
 interface ThemeOption {
   value: ThemePreference;
@@ -48,15 +49,10 @@ const CheckIcon = () => (
   </svg>
 );
 
-const getIcon = (preference: ThemePreference) => {
-  switch (preference) {
-    case 'system':
-      return <SystemIcon />;
-    case 'light':
-      return <SunIcon />;
-    case 'dark':
-      return <MoonIcon />;
-  }
+const iconByPreference: Record<ThemePreference, ReactNode> = {
+  system: <SystemIcon />,
+  light: <SunIcon />,
+  dark: <MoonIcon />,
 };
 
 export const ThemeToggle = () => {
@@ -65,7 +61,7 @@ export const ThemeToggle = () => {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
+    const handleClickOutside = (event: PointerEvent) => {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setIsOpen(false);
       }
@@ -78,12 +74,12 @@ export const ThemeToggle = () => {
     };
 
     if (isOpen) {
-      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('pointerdown', handleClickOutside);
       document.addEventListener('keydown', handleEscape);
     }
 
     return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('pointerdown', handleClickOutside);
       document.removeEventListener('keydown', handleEscape);
     };
   }, [isOpen]);
@@ -102,7 +98,7 @@ export const ThemeToggle = () => {
         aria-expanded={isOpen}
         className="p-2 rounded-md text-gray-300 hover:text-white hover:bg-gray-700 dark:text-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-white dark:focus:ring-offset-slate-900"
       >
-        {getIcon(preference)}
+        {iconByPreference[preference]}
       </button>
 
       {isOpen && (
@@ -121,7 +117,7 @@ export const ThemeToggle = () => {
                 aria-checked={preference === option.value}
               >
                 <span className="flex items-center justify-center w-6 h-6 mr-3 text-gray-400 dark:text-slate-400">
-                  {getIcon(option.value)}
+                  {iconByPreference[option.value]}
                 </span>
                 <span className="flex-1">
                   <div className="font-medium">{option.label}</div>

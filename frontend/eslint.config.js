@@ -25,15 +25,8 @@ export default [
         localStorage: 'readonly',
         window: 'readonly',
         confirm: 'readonly',
-        HTMLInputElement: 'readonly',
         React: 'readonly',
         EventSource: 'readonly',
-        HTMLDivElement: 'readonly',
-        MediaQueryListEvent: 'readonly',
-        Storage: 'readonly',
-        MouseEvent: 'readonly',
-        Node: 'readonly',
-        KeyboardEvent: 'readonly',
       },
     },
     plugins: {
@@ -45,6 +38,7 @@ export default [
       ...tsPlugin.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': 'off',
+      'no-undef': 'off',
     },
   },
 ];
