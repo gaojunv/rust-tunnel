@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from 'react-query';
 import { Login } from './components/Login';
 import { Dashboard } from './components/Dashboard';
 import { checkHealth } from './api/client';
+import { ThemeProvider } from './theme/ThemeProvider';
 import './index.css';
 
 // Create a client
@@ -60,29 +61,35 @@ function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-          <p className="text-gray-600">Loading...</p>
+      <ThemeProvider>
+        <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-slate-900">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+            <p className="text-gray-600 dark:text-slate-300">Loading...</p>
+          </div>
         </div>
-      </div>
+      </ThemeProvider>
     );
   }
 
   // If no auth required or we're authenticated, show dashboard
   if (!authRequired || authenticated) {
     return (
-      <QueryClientProvider client={queryClient}>
-        <Dashboard onLogout={handleLogout} />
-      </QueryClientProvider>
+      <ThemeProvider>
+        <QueryClientProvider client={queryClient}>
+          <Dashboard onLogout={handleLogout} />
+        </QueryClientProvider>
+      </ThemeProvider>
     );
   }
 
   // Otherwise show login
   return (
-    <QueryClientProvider client={queryClient}>
-      <Login onLogin={handleLogin} />
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <Login onLogin={handleLogin} />
+      </QueryClientProvider>
+    </ThemeProvider>
   );
 }
 
