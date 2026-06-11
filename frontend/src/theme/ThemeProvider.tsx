@@ -40,6 +40,9 @@ const getSystemTheme = (): ResolvedTheme => {
 };
 
 const applyResolvedTheme = (resolvedTheme: ResolvedTheme) => {
+  if (typeof document === 'undefined') {
+    return;
+  }
   document.documentElement.classList.toggle('dark', resolvedTheme === 'dark');
 };
 
@@ -69,7 +72,6 @@ export const ThemeProvider = ({ children }: ThemeProviderProps) => {
       setSystemTheme(event.matches ? 'dark' : 'light');
     };
 
-    setSystemTheme(mediaQuery.matches ? 'dark' : 'light');
     mediaQuery.addEventListener('change', handleChange);
 
     return () => {
