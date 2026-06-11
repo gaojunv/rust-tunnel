@@ -31,6 +31,9 @@ export default [
         HTMLDivElement: 'readonly',
         MediaQueryListEvent: 'readonly',
         Storage: 'readonly',
+        MouseEvent: 'readonly',
+        Node: 'readonly',
+        KeyboardEvent: 'readonly',
       },
     },
     plugins: {
