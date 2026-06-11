@@ -46,7 +46,7 @@ export const TimeRangeSelector = ({
               first:rounded-l-md last:rounded-r-md
               ${preset === p
                 ? 'bg-blue-600 text-white border-blue-600 z-10'
-                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
               }`}
           >
             {PRESET_LABELS[p] || p}
@@ -61,7 +61,7 @@ export const TimeRangeSelector = ({
           className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors
             ${preset === 'custom'
               ? 'bg-blue-600 text-white border-blue-600'
-              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
             }`}
         >
           Custom
@@ -75,9 +75,9 @@ export const TimeRangeSelector = ({
                 const v = new Date(e.target.value).getTime();
                 if (!isNaN(v)) onCustomChange(v, customEndMs);
               }}
-              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto"
+              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto bg-white text-gray-900 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
             />
-            <span className="text-xs text-gray-400">-</span>
+            <span className="text-xs text-gray-400 dark:text-slate-500">-</span>
             <input
               type="datetime-local"
               value={toDatetimeLocal(customEndMs)}
@@ -85,7 +85,7 @@ export const TimeRangeSelector = ({
                 const v = new Date(e.target.value).getTime();
                 if (!isNaN(v)) onCustomChange(customStartMs, v);
               }}
-              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto"
+              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto bg-white text-gray-900 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
             />
           </div>
         )}

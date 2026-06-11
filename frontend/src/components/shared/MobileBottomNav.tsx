@@ -46,7 +46,7 @@ const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
 export const MobileBottomNav = ({ activeTab, onTabChange }: MobileBottomNavProps) => {
   return (
     <nav
-      className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40"
+      className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40 dark:border-slate-700 dark:bg-slate-900"
       style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
     >
       <div className="flex justify-around items-center h-14">
@@ -55,7 +55,9 @@ export const MobileBottomNav = ({ activeTab, onTabChange }: MobileBottomNavProps
             key={tab.id}
             onClick={() => onTabChange(tab.id)}
             className={`flex flex-col items-center justify-center min-w-0 px-1 py-1 transition-colors
-              ${activeTab === tab.id ? 'text-blue-600' : 'text-gray-400 hover:text-gray-600'}`}
+              ${activeTab === tab.id
+                ? 'text-blue-600 dark:bg-blue-500/10 dark:text-blue-300'
+                : 'text-gray-400 hover:text-gray-600 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200'}`}
           >
             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               {tab.icon}

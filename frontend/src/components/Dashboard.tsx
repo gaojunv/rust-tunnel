@@ -38,7 +38,7 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen bg-gray-100 text-gray-900 transition-colors duration-150 dark:bg-slate-900 dark:text-slate-100">
       <Navbar onLogout={onLogout} activeTab={activeTab} onTabChange={setActiveTab} />
       <main className={`max-w-7xl mx-auto py-6 px-4 sm:px-6 lg:px-8 ${isMobile ? 'pb-20' : ''}`}>
         {activeTab === 'dashboard' ? (

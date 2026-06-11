@@ -18,15 +18,15 @@ const colorClasses: Record<string, { bg: string }> = {
 export const StatCard = ({ label, value, icon, color = 'blue', valueColor }: StatCardProps) => {
   const c = colorClasses[color];
   return (
-    <div className="bg-white overflow-hidden shadow rounded-lg p-4 sm:p-6">
+    <div className="bg-white overflow-hidden shadow rounded-lg p-4 sm:p-6 dark:bg-slate-800 dark:shadow-slate-950/20">
       <div className="flex items-center">
         <div className={`flex-shrink-0 ${c.bg} rounded-md p-3`}>
           {icon}
         </div>
         <div className="ml-5 w-0 flex-1">
           <dl>
-            <dt className="text-sm font-medium text-gray-500 truncate">{label}</dt>
-            <dd className={`text-lg font-semibold ${valueColor || 'text-gray-900'}`}>{value}</dd>
+            <dt className="text-sm font-medium text-gray-500 truncate dark:text-slate-400">{label}</dt>
+            <dd className={`text-lg font-semibold ${valueColor || 'text-gray-900 dark:text-slate-100'}`}>{value}</dd>
           </dl>
         </div>
       </div>
