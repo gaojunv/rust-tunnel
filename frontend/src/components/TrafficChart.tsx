@@ -28,6 +28,7 @@ export const TrafficChart = ({ traffic }: TrafficChartProps) => {
   const tooltipStyle = isDark
     ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
     : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
   const legendStyle = isDark ? { color: '#e2e8f0' } : { color: '#111827' };
 
   const handleTimeRangeChange = useCallback((range: ChartTimeRange) => {
@@ -80,8 +81,8 @@ export const TrafficChart = ({ traffic }: TrafficChartProps) => {
             formatter={(value: number) => formatBytes(value)}
             labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
             contentStyle={tooltipStyle}
-            labelStyle={tooltipStyle}
-            itemStyle={tooltipStyle}
+            labelStyle={tooltipTextStyle}
+            itemStyle={tooltipTextStyle}
           />
           <Legend
             wrapperStyle={{ fontSize: isSmallScreen ? '10px' : '12px', ...legendStyle }}
