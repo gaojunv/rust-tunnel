@@ -23,6 +23,23 @@ const levelColor = (level: string): string => {
   }
 };
 
+const levelTextColor = (level: string): string => {
+  switch (level) {
+    case 'ERROR':
+      return 'text-red-600 dark:text-red-400';
+    case 'WARN':
+      return 'text-yellow-600 dark:text-yellow-400';
+    case 'INFO':
+      return 'text-blue-600 dark:text-blue-400';
+    case 'DEBUG':
+      return 'text-gray-500 dark:text-slate-400';
+    case 'TRACE':
+      return 'text-gray-400 dark:text-slate-500';
+    default:
+      return '';
+  }
+};
+
 const formatTimestamp = (ts: number): string => {
   const date = new Date(ts / 1000);
   return date.toLocaleTimeString('zh-CN', { hour12: false }) + '.' +
@@ -286,7 +303,7 @@ export const LogsPage = () => {
                 <span className="text-gray-400 dark:text-slate-500 mr-2">
                   {entry.target}
                 </span>
-                <span className={levelColor(entry.level).split(' ')[0]}>
+                <span className={levelTextColor(entry.level)}>
                   {entry.message}
                 </span>
               </div>

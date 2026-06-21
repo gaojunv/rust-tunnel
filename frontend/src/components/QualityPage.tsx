@@ -100,7 +100,7 @@ const WorstConnectionsTable = ({ clients }: { clients: ClientWithQuality[] }) =>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap" style={{ color }}>
                     <span className="font-semibold">{client.quality.quality_score}</span>
-                    <span className="text-xs ml-2 dark:text-slate-400">({getQualityText(client.quality.quality_score)})</span>
+                    <span className="text-xs ml-2 text-gray-500 dark:text-slate-400">({getQualityText(client.quality.quality_score)})</span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-slate-400">
                     {formatMs(client.quality.avg_rtt_ms)}
