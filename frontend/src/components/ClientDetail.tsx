@@ -6,6 +6,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { getQualityColor, getQualityText } from './ClientList';
 import { formatBytes, formatMs, formatPercent } from '../utils/format';
 import { useMediaQuery } from '../hooks/useMediaQuery';
+import { useTheme } from '../theme/ThemeProvider';
 
 interface ClientDetailProps {
   port: number;
@@ -59,6 +60,15 @@ const QualityGauge = ({ score }: { score: number }) => {
 
 // RTT chart component
 const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+  const axisColor = isDark ? '#94a3b8' : '#6b7280';
+  const gridColor = isDark ? '#334155' : '#e5e7eb';
+  const tooltipStyle = isDark
+    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
+    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
+
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     avg_rtt_ms: sample.avg_rtt_ms,
@@ -70,10 +80,15 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <LineChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} />
-            <Tooltip formatter={(value: number) => formatMs(value)} />
+            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <YAxis tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <Tooltip
+              formatter={(value: number) => formatMs(value)}
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipTextStyle}
+              itemStyle={tooltipTextStyle}
+            />
             <Line
               type="monotone"
               dataKey="avg_rtt_ms"
@@ -93,6 +108,15 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
 
 // Loss rate chart component
 const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+  const axisColor = isDark ? '#94a3b8' : '#6b7280';
+  const gridColor = isDark ? '#334155' : '#e5e7eb';
+  const tooltipStyle = isDark
+    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
+    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
+
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     loss_rate: sample.loss_rate * 100,
@@ -104,10 +128,15 @@ const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSma
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <BarChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} unit="%" />
-            <Tooltip formatter={(value: number) => `${value.toFixed(2)}%`} />
+            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <YAxis tick={{ fontSize: 10, fill: axisColor }} unit="%" stroke={axisColor} />
+            <Tooltip
+              formatter={(value: number) => `${value.toFixed(2)}%`}
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipTextStyle}
+              itemStyle={tooltipTextStyle}
+            />
             <Bar
               dataKey="loss_rate"
               name="Loss Rate"

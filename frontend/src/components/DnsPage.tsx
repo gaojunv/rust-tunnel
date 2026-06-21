@@ -137,7 +137,7 @@ export const DnsPage: React.FC = () => {
                     {record.name}
                   </td>
                   <td className="px-6 py-4 text-sm">
-                    <span className="px-2 py-1 bg-gray-100 dark:bg-slate-700 dark:text-slate-300 rounded text-gray-600 dark:text-slate-300">
+                    <span className="px-2 py-1 bg-gray-100 dark:bg-slate-700 rounded text-gray-600 dark:text-slate-300">
                       {record.record_type}
                     </span>
                   </td>

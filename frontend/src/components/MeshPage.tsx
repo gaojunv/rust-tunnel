@@ -80,7 +80,7 @@ const MeshDetail: React.FC<{
     <div className="space-y-4">
       <div className="bg-white dark:bg-slate-800 rounded-lg shadow dark:shadow-slate-950/20">
         <div className="px-6 py-4 border-b border-gray-200 dark:border-slate-700">
-          <h3 className="text-lg font-semibold dark:text-slate-100">Members ({mesh.members.length})</h3>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">Members ({mesh.members.length})</h3>
         </div>
         <div className="p-6">
           <table className="min-w-full">
@@ -94,7 +94,7 @@ const MeshDetail: React.FC<{
             <tbody>
               {mesh.members.map((member) => (
                 <tr key={member.client_name} className="border-t border-gray-100 dark:border-slate-700">
-                  <td className="py-3 dark:text-slate-100">
+                  <td className="py-3 text-gray-900 dark:text-slate-100">
                     <span className="font-medium">{member.client_name}</span>
                     {member.online && (
                       <span className="ml-2 inline-block w-2 h-2 bg-green-500 rounded-full"></span>
@@ -119,7 +119,7 @@ const MeshDetail: React.FC<{
 
       <div className="bg-white dark:bg-slate-800 rounded-lg shadow dark:shadow-slate-950/20">
         <div className="px-6 py-4 border-b border-gray-200 dark:border-slate-700">
-          <h3 className="text-lg font-semibold dark:text-slate-100">Services ({services.length})</h3>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-slate-100">Services ({services.length})</h3>
         </div>
         <div className="p-6">
           {services.length === 0 ? (
@@ -137,7 +137,7 @@ const MeshDetail: React.FC<{
               <tbody>
                 {services.map((svc) => (
                   <tr key={svc.service_name} className="border-t border-gray-100 dark:border-slate-700">
-                    <td className="py-3 font-medium dark:text-slate-100">{svc.service_name}</td>
+                    <td className="py-3 font-medium text-gray-900 dark:text-slate-100">{svc.service_name}</td>
                     <td className="py-3 text-gray-600 dark:text-slate-300">{svc.protocol}</td>
                     <td className="py-3 text-gray-600 dark:text-slate-300">{svc.local_addr}</td>
                     <td className="py-3 text-gray-600 dark:text-slate-300">{svc.client_name}</td>

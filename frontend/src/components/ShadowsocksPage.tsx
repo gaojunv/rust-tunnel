@@ -1,3 +1,4 @@
+import React from 'react';
 import { useQuery } from 'react-query';
 import { useState, useCallback } from 'react';
 import { getShadowsocksConfig, getShadowsocksStats, getShadowsocksQuality } from '../api/client';
@@ -7,11 +8,21 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { formatBytes, formatBps } from '../utils/format';
 import { ChartContainer } from './shared/ChartContainer';
 import type { ChartTimeRange } from './shared/ChartContainer';
+import { useTheme } from '../theme/ThemeProvider';
 
 const ThroughputHistory = ({ qualityList, timeRange }: {
   qualityList: ShadowsocksQuality[];
   timeRange: ChartTimeRange;
 }) => {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+  const axisColor = isDark ? '#94a3b8' : '#6b7280';
+  const gridColor = isDark ? '#334155' : '#e5e7eb';
+  const tooltipStyle = isDark
+    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
+    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
+
   // Merge samples by timestamp (milliseconds) to avoid the old string-key dedup bug
   const timeMap = new Map<number, Record<string, number | string>>();
   for (const q of qualityList) {
@@ -33,19 +44,22 @@ const ThroughputHistory = ({ qualityList, timeRange }: {
   return (
     <ResponsiveContainer width="100%" height={200}>
       <LineChart data={chartData}>
-        <CartesianGrid strokeDasharray="3 3" />
-        <XAxis dataKey="time" tick={{ fontSize: 10 }}
-          tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()} />
-        <YAxis tick={{ fontSize: 10 }} tickFormatter={formatBps} />
+        <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+        <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }}
+          tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()} stroke={axisColor} />
+        <YAxis tick={{ fontSize: 10, fill: axisColor }} tickFormatter={formatBps} stroke={axisColor} />
         <Tooltip formatter={(value: number) => formatBps(value)}
-          labelFormatter={(ts: number) => new Date(ts).toLocaleString()} />
+          labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
+          contentStyle={tooltipStyle}
+          labelStyle={tooltipTextStyle}
+          itemStyle={tooltipTextStyle} />
         {qualityList.map(q => (
-          <>
-            <Line key={`in-${q.port}`} type="monotone" dataKey={`In (Port ${q.port}) B/s`}
+          <React.Fragment key={q.port}>
+            <Line type="monotone" dataKey={`In (Port ${q.port}) B/s`}
               stroke="#3b82f6" dot={false} strokeWidth={2} />
-            <Line key={`out-${q.port}`} type="monotone" dataKey={`Out (Port ${q.port}) B/s`}
+            <Line type="monotone" dataKey={`Out (Port ${q.port}) B/s`}
               stroke="#10b981" dot={false} strokeWidth={2} />
-          </>
+          </React.Fragment>
         ))}
       </LineChart>
     </ResponsiveContainer>
