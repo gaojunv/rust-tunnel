@@ -28,7 +28,7 @@ const ThroughputHistory = ({ qualityList, timeRange }: {
     .sort((a, b) => (a.time as number) - (b.time as number));
 
   if (chartData.length === 0) {
-    return <p className="text-gray-500 text-center py-4 text-sm">No throughput data available yet</p>;
+    return <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No throughput data available yet</p>;
   }
   return (
     <ResponsiveContainer width="100%" height={200}>
@@ -92,61 +92,61 @@ export const TrojanPage = () => {
   return (
     <div className="space-y-6">
       {/* Configuration Card */}
-      <div className="bg-white shadow rounded-lg p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Trojan Configuration</h2>
+      <div className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg p-6">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">Trojan Configuration</h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <label className="block text-sm font-medium text-gray-500">Status</label>
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Status</label>
             <div className="flex items-center mt-1">
               <span className={`w-3 h-3 rounded-full mr-2 ${config?.enabled ? 'bg-green-500' : 'bg-gray-300'}`}></span>
-              <span className="text-lg font-semibold text-gray-900">
+              <span className="text-lg font-semibold text-gray-900 dark:text-slate-100">
                 {config?.enabled ? 'Enabled' : 'Disabled'}
               </span>
             </div>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-500">Port</label>
-            <p className="text-lg font-semibold text-gray-900">{config?.port || 'N/A'}</p>
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Port</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">{config?.port || 'N/A'}</p>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-500">Fallback</label>
-            <p className="text-lg font-semibold text-gray-900">{config?.fallback || 'N/A'}</p>
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Fallback</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">{config?.fallback || 'N/A'}</p>
           </div>
         </div>
       </div>
 
       {/* Statistics Card */}
-      <div className="bg-white shadow rounded-lg p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">Traffic Statistics</h2>
+      <div className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg p-6">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">Traffic Statistics</h2>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <div className="bg-purple-50 rounded-lg p-4">
-            <label className="block text-sm font-medium text-gray-500">Enabled</label>
-            <p className="text-lg font-semibold text-gray-900">
+          <div className="bg-purple-50 dark:bg-purple-900/30 rounded-lg p-4">
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Enabled</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">
               {stats?.enabled ? 'Yes' : 'No'}
             </p>
           </div>
-          <div className="bg-blue-50 rounded-lg p-4">
-            <label className="block text-sm font-medium text-gray-500">Port</label>
-            <p className="text-lg font-semibold text-gray-900">{stats?.port || 'N/A'}</p>
+          <div className="bg-blue-50 dark:bg-blue-900/30 rounded-lg p-4">
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Port</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">{stats?.port || 'N/A'}</p>
           </div>
-          <div className="bg-green-50 rounded-lg p-4">
-            <label className="block text-sm font-medium text-gray-500">Total Bytes In</label>
-            <p className="text-lg font-semibold text-gray-900">
+          <div className="bg-green-50 dark:bg-green-900/30 rounded-lg p-4">
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Total Bytes In</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">
               {formatBytes(stats?.total_bytes_in || 0)}
             </p>
           </div>
-          <div className="bg-orange-50 rounded-lg p-4">
-            <label className="block text-sm font-medium text-gray-500">Total Bytes Out</label>
-            <p className="text-lg font-semibold text-gray-900">
+          <div className="bg-orange-50 dark:bg-orange-900/30 rounded-lg p-4">
+            <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Total Bytes Out</label>
+            <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">
               {formatBytes(stats?.total_bytes_out || 0)}
             </p>
           </div>
         </div>
         {stats && stats.active_connections !== undefined && (
           <div className="mt-4">
-            <div className="bg-yellow-50 rounded-lg p-4">
-              <label className="block text-sm font-medium text-gray-500">Active Connections</label>
-              <p className="text-lg font-semibold text-gray-900">{stats.active_connections}</p>
+            <div className="bg-yellow-50 dark:bg-yellow-900/30 rounded-lg p-4">
+              <label className="block text-sm font-medium text-gray-500 dark:text-slate-400">Active Connections</label>
+              <p className="text-lg font-semibold text-gray-900 dark:text-slate-100">{stats.active_connections}</p>
             </div>
           </div>
         )}
@@ -154,20 +154,20 @@ export const TrojanPage = () => {
 
       {/* Quality History */}
       {qualityList.length > 0 && (
-        <div className="bg-white shadow rounded-lg p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Quality & Throughput</h2>
+        <div className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg p-6">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-slate-100 mb-4">Quality & Throughput</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
             {qualityList.map(q => {
               const color = getQualityColor(q.quality.quality_score);
               return (
-                <div key={q.port} className="bg-gray-50 rounded-lg p-4">
+                <div key={q.port} className="bg-gray-50 dark:bg-slate-700/50 rounded-lg p-4">
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-sm font-medium text-gray-700">Port {q.port}</span>
+                    <span className="text-sm font-medium text-gray-700 dark:text-slate-200">Port {q.port}</span>
                     <span className="font-semibold" style={{ color }}>
                       Score: {q.quality.quality_score} ({getQualityText(q.quality.quality_score)})
                     </span>
                   </div>
-                  <div className="grid grid-cols-2 gap-2 text-xs text-gray-600">
+                  <div className="grid grid-cols-2 gap-2 text-xs text-gray-600 dark:text-slate-300">
                     <span>In: {formatBps(q.quality.bytes_in_per_sec)}</span>
                     <span>Out: {formatBps(q.quality.bytes_out_per_sec)}</span>
                   </div>
