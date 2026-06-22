@@ -1,5 +1,6 @@
 import { useMutation } from 'react-query';
 import { logout } from '../api/client';
+import { ThemeToggle } from './shared/ThemeToggle';
 
 interface NavbarProps {
   onLogout: () => void;
@@ -19,7 +20,7 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
   };
 
   return (
-    <nav className="bg-gray-800">
+    <nav className="bg-gray-800 dark:bg-slate-900 dark:border-b dark:border-slate-800">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-between h-16">
           <div className="flex items-center">
@@ -31,8 +32,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('dashboard')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'dashboard'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Dashboard
@@ -41,8 +42,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('mesh')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'mesh'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Mesh
@@ -51,8 +52,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('dns')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'dns'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 DNS
@@ -61,8 +62,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('quality')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'quality'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Quality
@@ -71,8 +72,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('shadowsocks')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'shadowsocks'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Shadowsocks
@@ -81,8 +82,8 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('trojan')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'trojan'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Trojan
@@ -91,19 +92,20 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
                 onClick={() => onTabChange('logs')}
                 className={`px-3 py-2 rounded-md text-sm font-medium ${
                   activeTab === 'logs'
-                    ? 'bg-gray-900 text-white'
-                    : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+                    ? 'bg-gray-900 text-white dark:bg-slate-800'
+                    : 'text-gray-300 hover:bg-gray-700 hover:text-white dark:text-slate-300 dark:hover:bg-slate-800 dark:hover:text-white'
                 }`}
               >
                 Logs
               </button>
             </div>
           </div>
-          <div className="ml-4 flex items-center md:ml-6">
+          <div className="ml-4 flex items-center md:ml-6 gap-3">
+            <ThemeToggle />
             <button
               onClick={handleLogout}
               disabled={logoutMutation.isLoading}
-              className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50"
+              className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50 dark:bg-slate-700 dark:hover:bg-slate-600"
             >
               Logout
             </button>

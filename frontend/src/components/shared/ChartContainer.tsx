@@ -62,9 +62,9 @@ export const ChartContainer = ({
   const defaultPresets: TimePreset[] = ['15m', '1h', '6h', '24h', '7d'];
 
   return (
-    <div className={`bg-white p-4 sm:p-6 rounded-lg shadow ${className}`}>
+    <div className={`bg-white p-4 sm:p-6 rounded-lg shadow dark:bg-slate-800 dark:shadow-slate-950/20 transition-colors ${className}`}>
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-3">
-        <h3 className="text-lg font-medium text-gray-900">{title}</h3>
+        <h3 className="text-lg font-medium text-gray-900 dark:text-slate-100">{title}</h3>
         {timeRange && onTimeRangeChange && (
           <TimeRangeSelector
             preset={timeRange.preset}
@@ -81,7 +81,7 @@ export const ChartContainer = ({
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" />
         </div>
       ) : isEmpty ? (
-        <p className="text-gray-500 text-center py-8">No data available</p>
+        <p className="text-gray-500 text-center py-8 dark:text-slate-400">No data available</p>
       ) : (
         children
       )}

@@ -6,6 +6,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { getQualityColor, getQualityText } from './ClientList';
 import { formatBytes, formatMs, formatPercent } from '../utils/format';
 import { useMediaQuery } from '../hooks/useMediaQuery';
+import { useTheme } from '../theme/ThemeProvider';
 
 interface ClientDetailProps {
   port: number;
@@ -26,9 +27,10 @@ const QualityGauge = ({ score }: { score: number }) => {
             cx="60"
             cy="60"
             r="45"
-            stroke="#e5e7eb"
+            stroke="currentColor"
             strokeWidth="10"
             fill="none"
+            className="text-gray-200 dark:text-slate-600"
           />
           <circle
             cx="60"
@@ -47,7 +49,7 @@ const QualityGauge = ({ score }: { score: number }) => {
           <span className="text-2xl font-bold" style={{ color }}>
             {score}
           </span>
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-gray-500 dark:text-slate-400">
             {getQualityText(score)}
           </span>
         </div>
@@ -58,6 +60,15 @@ const QualityGauge = ({ score }: { score: number }) => {
 
 // RTT chart component
 const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+  const axisColor = isDark ? '#94a3b8' : '#6b7280';
+  const gridColor = isDark ? '#334155' : '#e5e7eb';
+  const tooltipStyle = isDark
+    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
+    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
+
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     avg_rtt_ms: sample.avg_rtt_ms,
@@ -65,14 +76,19 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
 
   return (
     <div>
-      <h4 className="text-sm font-medium text-gray-700 mb-2">RTT History (Last 60 min)</h4>
+      <h4 className="text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">RTT History (Last 60 min)</h4>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <LineChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} />
-            <Tooltip formatter={(value: number) => formatMs(value)} />
+            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <YAxis tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <Tooltip
+              formatter={(value: number) => formatMs(value)}
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipTextStyle}
+              itemStyle={tooltipTextStyle}
+            />
             <Line
               type="monotone"
               dataKey="avg_rtt_ms"
@@ -84,7 +100,7 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
           </LineChart>
         </ResponsiveContainer>
       ) : (
-        <p className="text-gray-500 text-center py-4 text-sm">No RTT data available</p>
+        <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No RTT data available</p>
       )}
     </div>
   );
@@ -92,6 +108,15 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
 
 // Loss rate chart component
 const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
+  const axisColor = isDark ? '#94a3b8' : '#6b7280';
+  const gridColor = isDark ? '#334155' : '#e5e7eb';
+  const tooltipStyle = isDark
+    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
+    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
+  const tooltipTextStyle = { color: tooltipStyle.color };
+
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
     loss_rate: sample.loss_rate * 100,
@@ -99,14 +124,19 @@ const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSma
 
   return (
     <div>
-      <h4 className="text-sm font-medium text-gray-700 mb-2">Packet Loss History (Last 60 min)</h4>
+      <h4 className="text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Packet Loss History (Last 60 min)</h4>
       {chartData.length > 0 ? (
         <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
           <BarChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="time" tick={{ fontSize: 10 }} />
-            <YAxis tick={{ fontSize: 10 }} unit="%" />
-            <Tooltip formatter={(value: number) => `${value.toFixed(2)}%`} />
+            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
+            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
+            <YAxis tick={{ fontSize: 10, fill: axisColor }} unit="%" stroke={axisColor} />
+            <Tooltip
+              formatter={(value: number) => `${value.toFixed(2)}%`}
+              contentStyle={tooltipStyle}
+              labelStyle={tooltipTextStyle}
+              itemStyle={tooltipTextStyle}
+            />
             <Bar
               dataKey="loss_rate"
               name="Loss Rate"
@@ -116,7 +146,7 @@ const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSma
           </BarChart>
         </ResponsiveContainer>
       ) : (
-        <p className="text-gray-500 text-center py-4 text-sm">No loss data available</p>
+        <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No loss data available</p>
       )}
     </div>
   );
@@ -146,18 +176,18 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-      <div className={`bg-white shadow-xl w-full overflow-hidden
+      <div className={`bg-white dark:bg-slate-800 shadow-xl dark:shadow-slate-950/20 w-full overflow-hidden
           ${isSmallScreen
             ? 'rounded-none max-w-full h-full'
             : 'rounded-lg max-w-2xl max-h-[90vh]'
           }`}>
-        <div className="flex items-center justify-between p-6 border-b">
-          <h2 className="text-xl font-semibold text-gray-900">
+        <div className="flex items-center justify-between p-6 border-b border-gray-200 dark:border-slate-700">
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-slate-100">
             Client Details - Port {port}
           </h2>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-600"
+            className="text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300"
           >
             <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -167,39 +197,39 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
 
         <div className={`overflow-y-auto ${isSmallScreen ? 'h-full' : 'max-h-[calc(90vh-80px)]'} p-6`}>
           {isLoading ? (
-            <p className="text-gray-500 text-center py-8">Loading...</p>
+            <p className="text-gray-500 dark:text-slate-400 text-center py-8">Loading...</p>
           ) : (
             <div className="space-y-6">
               {/* Quality Summary */}
               {quality && (
                 <div>
-                  <h3 className="text-lg font-medium text-gray-900 mb-4">Connection Quality</h3>
+                  <h3 className="text-lg font-medium text-gray-900 dark:text-slate-100 mb-4">Connection Quality</h3>
                   <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-gray-50 p-4 rounded-lg flex items-center justify-center">
+                    <div className="bg-gray-50 dark:bg-slate-700/50 p-4 rounded-lg flex items-center justify-center">
                       <QualityGauge score={quality.current.quality_score} />
                     </div>
                     <div className="grid grid-cols-2 gap-2">
-                      <div className="bg-blue-50 p-3 rounded-lg">
-                        <dt className="text-xs font-medium text-blue-600">Avg RTT</dt>
-                        <dd className="text-lg font-semibold text-blue-900">
+                      <div className="bg-blue-50 dark:bg-blue-900/30 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-blue-600 dark:text-blue-400">Avg RTT</dt>
+                        <dd className="text-lg font-semibold text-blue-900 dark:text-blue-100">
                           {formatMs(quality.current.avg_rtt_ms)}
                         </dd>
                       </div>
-                      <div className="bg-red-50 p-3 rounded-lg">
-                        <dt className="text-xs font-medium text-red-600">Loss Rate</dt>
-                        <dd className="text-lg font-semibold text-red-900">
+                      <div className="bg-red-50 dark:bg-red-900/30 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-red-600 dark:text-red-400">Loss Rate</dt>
+                        <dd className="text-lg font-semibold text-red-900 dark:text-red-100">
                           {formatPercent(quality.current.loss_rate)}
                         </dd>
                       </div>
-                      <div className="bg-green-50 p-3 rounded-lg">
-                        <dt className="text-xs font-medium text-green-600">Min RTT</dt>
-                        <dd className="text-lg font-semibold text-green-900">
+                      <div className="bg-green-50 dark:bg-green-900/30 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-green-600 dark:text-green-400">Min RTT</dt>
+                        <dd className="text-lg font-semibold text-green-900 dark:text-green-100">
                           {formatMs(quality.current.min_rtt_ms)}
                         </dd>
                       </div>
-                      <div className="bg-orange-50 p-3 rounded-lg">
-                        <dt className="text-xs font-medium text-orange-600">Max RTT</dt>
-                        <dd className="text-lg font-semibold text-orange-900">
+                      <div className="bg-orange-50 dark:bg-orange-900/30 p-3 rounded-lg">
+                        <dt className="text-xs font-medium text-orange-600 dark:text-orange-400">Max RTT</dt>
+                        <dd className="text-lg font-semibold text-orange-900 dark:text-orange-100">
                           {formatMs(quality.current.max_rtt_ms)}
                         </dd>
                       </div>
@@ -208,10 +238,10 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
 
                   {/* Quality Charts */}
                   <div className="grid grid-cols-1 gap-4 mt-4">
-                    <div className="bg-gray-50 p-4 rounded-lg">
+                    <div className="bg-gray-50 dark:bg-slate-700/50 p-4 rounded-lg">
                       <RTTChart samples={quality.history} isSmallScreen={isSmallScreen} />
                     </div>
-                    <div className="bg-gray-50 p-4 rounded-lg">
+                    <div className="bg-gray-50 dark:bg-slate-700/50 p-4 rounded-lg">
                       <LossChart samples={quality.history} isSmallScreen={isSmallScreen} />
                     </div>
                   </div>
@@ -221,17 +251,17 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
               {/* Traffic summary */}
               {traffic && (
                 <div>
-                  <h3 className="text-lg font-medium text-gray-900 mb-4">Traffic Summary</h3>
+                  <h3 className="text-lg font-medium text-gray-900 dark:text-slate-100 mb-4">Traffic Summary</h3>
                   <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-purple-50 p-4 rounded-lg">
-                      <dt className="text-sm font-medium text-purple-600">Total Bytes In</dt>
-                      <dd className="text-2xl font-semibold text-purple-900">
+                    <div className="bg-purple-50 dark:bg-purple-900/30 p-4 rounded-lg">
+                      <dt className="text-sm font-medium text-purple-600 dark:text-purple-400">Total Bytes In</dt>
+                      <dd className="text-2xl font-semibold text-purple-900 dark:text-purple-100">
                         {formatBytes(traffic.total_bytes_in)}
                       </dd>
                     </div>
-                    <div className="bg-orange-50 p-4 rounded-lg">
-                      <dt className="text-sm font-medium text-orange-600">Total Bytes Out</dt>
-                      <dd className="text-2xl font-semibold text-orange-900">
+                    <div className="bg-orange-50 dark:bg-orange-900/30 p-4 rounded-lg">
+                      <dt className="text-sm font-medium text-orange-600 dark:text-orange-400">Total Bytes Out</dt>
+                      <dd className="text-2xl font-semibold text-orange-900 dark:text-orange-100">
                         {formatBytes(traffic.total_bytes_out)}
                       </dd>
                     </div>
@@ -239,7 +269,7 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
 
                   {/* Traffic chart */}
                   <div className="mt-4">
-                    <h4 className="text-sm font-medium text-gray-700 mb-2">Traffic History</h4>
+                    <h4 className="text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Traffic History</h4>
                     <TrafficChart traffic={singlePortTraffic} />
                   </div>
                 </div>
