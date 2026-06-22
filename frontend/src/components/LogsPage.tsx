@@ -9,15 +9,32 @@ const LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
 const levelColor = (level: string): string => {
   switch (level) {
     case 'ERROR':
-      return 'text-red-600 bg-red-50';
+      return 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20';
     case 'WARN':
-      return 'text-yellow-600 bg-yellow-50';
+      return 'text-yellow-600 dark:text-yellow-400 bg-yellow-50 dark:bg-yellow-900/20';
     case 'INFO':
-      return 'text-blue-600';
+      return 'text-blue-600 dark:text-blue-400';
     case 'DEBUG':
-      return 'text-gray-500';
+      return 'text-gray-500 dark:text-slate-400';
     case 'TRACE':
-      return 'text-gray-400';
+      return 'text-gray-400 dark:text-slate-500';
+    default:
+      return '';
+  }
+};
+
+const levelTextColor = (level: string): string => {
+  switch (level) {
+    case 'ERROR':
+      return 'text-red-600 dark:text-red-400';
+    case 'WARN':
+      return 'text-yellow-600 dark:text-yellow-400';
+    case 'INFO':
+      return 'text-blue-600 dark:text-blue-400';
+    case 'DEBUG':
+      return 'text-gray-500 dark:text-slate-400';
+    case 'TRACE':
+      return 'text-gray-400 dark:text-slate-500';
     default:
       return '';
   }
@@ -188,15 +205,15 @@ export const LogsPage = () => {
   return (
     <div className="space-y-4">
       {/* Controls Bar */}
-      <div className="bg-white shadow rounded-lg p-4">
+      <div className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg p-4">
         <div className="flex flex-wrap items-center gap-4">
           {/* Level Filter */}
           <div className="flex items-center space-x-2">
-            <label className="text-sm font-medium text-gray-700">Level:</label>
+            <label className="text-sm font-medium text-gray-700 dark:text-slate-200">Level:</label>
             <select
               value={levelFilter}
               onChange={(e) => handleLevelFilterChange(e.target.value)}
-              className="block w-28 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
+              className="block w-28 rounded-md border-gray-300 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
             >
               {LEVELS.map(l => (
                 <option key={l} value={l}>{l.toUpperCase()}</option>
@@ -211,7 +228,7 @@ export const LogsPage = () => {
               placeholder="Search..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
+              className="block w-full rounded-md border-gray-300 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 dark:placeholder-slate-500 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
             />
           </div>
 
@@ -229,11 +246,11 @@ export const LogsPage = () => {
 
           {/* Set Level */}
           <div className="flex items-center space-x-2">
-            <label className="text-sm font-medium text-gray-700">Set Level:</label>
+            <label className="text-sm font-medium text-gray-700 dark:text-slate-200">Set Level:</label>
             <select
               value={currentLevel}
               onChange={(e) => handleSetLevel(e.target.value)}
-              className="block w-28 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
+              className="block w-28 rounded-md border-gray-300 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 shadow-sm focus:border-blue-500 focus:ring-blue-500 text-sm"
             >
               {LEVELS.map(l => (
                 <option key={l} value={l}>{l.toUpperCase()}</option>
@@ -247,16 +264,16 @@ export const LogsPage = () => {
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="bg-white shadow rounded-lg overflow-y-auto font-mono text-sm"
+        className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg overflow-y-auto font-mono text-sm dark:text-slate-200"
         style={{ height: isMobile ? 'calc(100vh - 280px)' : '600px' }}
       >
         {/* Load More Button */}
         {hasMore && logs.length > 0 && (
-          <div className="sticky top-0 z-10 bg-gray-50 border-b border-gray-200 px-4 py-2">
+          <div className="sticky top-0 z-10 bg-gray-50 dark:bg-slate-700/50 border-b border-gray-200 dark:border-slate-700 px-4 py-2">
             <button
               onClick={loadMore}
               disabled={loading}
-              className="text-blue-600 hover:text-blue-800 text-xs font-medium disabled:opacity-50"
+              className="text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 text-xs font-medium disabled:opacity-50"
             >
               {loading ? 'Loading...' : 'Load more...'}
             </button>
@@ -264,29 +281,29 @@ export const LogsPage = () => {
         )}
 
         {filteredLogs.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-gray-400 text-sm">
+          <div className="flex items-center justify-center h-full text-gray-400 dark:text-slate-500 text-sm">
             {logs.length === 0 ? 'No log entries' : 'No matching entries'}
           </div>
         ) : (
-          <div className="divide-y divide-gray-100">
+          <div className="divide-y divide-gray-100 dark:divide-slate-700">
             {filteredLogs.map((entry) => (
               <div
                 key={entry.id}
-                className={`px-4 py-1.5 hover:bg-gray-50 ${levelColor(entry.level)}`}
+                className={`px-4 py-1.5 hover:bg-gray-50 dark:hover:bg-slate-700/50 ${levelColor(entry.level)}`}
               >
-                <span className="text-gray-400 mr-2">
+                <span className="text-gray-400 dark:text-slate-500 mr-2">
                   {formatTimestamp(entry.timestamp)}
                 </span>
                 <span className="font-semibold mr-2 w-12 inline-block">
                   {entry.level}
                 </span>
-                <span className="text-gray-500 mr-2">
+                <span className="text-gray-500 dark:text-slate-400 mr-2">
                   {entry.source}
                 </span>
-                <span className="text-gray-400 mr-2">
+                <span className="text-gray-400 dark:text-slate-500 mr-2">
                   {entry.target}
                 </span>
-                <span className={levelColor(entry.level).split(' ')[0]}>
+                <span className={levelTextColor(entry.level)}>
                   {entry.message}
                 </span>
               </div>
@@ -296,14 +313,14 @@ export const LogsPage = () => {
       </div>
 
       {/* Status Bar */}
-      <div className="bg-white shadow rounded-lg px-4 py-2 flex items-center justify-between text-sm text-gray-500">
+      <div className="bg-white dark:bg-slate-800 shadow dark:shadow-slate-950/20 rounded-lg px-4 py-2 flex items-center justify-between text-sm text-gray-500 dark:text-slate-400">
         <span>{filteredLogs.length} entries</span>
         <label className="flex items-center space-x-2 cursor-pointer">
           <input
             type="checkbox"
             checked={autoScroll}
             onChange={(e) => setAutoScroll(e.target.checked)}
-            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            className="rounded border-gray-300 dark:border-slate-600 dark:bg-slate-900 text-blue-600 focus:ring-blue-500"
           />
           <span>Auto-scroll</span>
         </label>
