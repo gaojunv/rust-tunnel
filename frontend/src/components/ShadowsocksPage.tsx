@@ -1,18 +1,18 @@
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useState, useCallback } from 'react';
 import { getShadowsocksConfig, getShadowsocksStats, getShadowsocksQuality } from '../api/client';
 import type { ShadowsocksQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { formatBytes, formatBps } from '../utils/format';
 import { ChartContainer } from './shared/ChartContainer';
-import type { ChartTimeRange } from './shared/ChartContainer';
+import { TimeRangeSelector } from './shared/TimeRangeSelector';
+import { useTimeRange, type TimeRange } from '../hooks/useTimeRange';
 import { useTheme } from '../theme/ThemeProvider';
 
 const ThroughputHistory = ({ qualityList, timeRange }: {
   qualityList: ShadowsocksQuality[];
-  timeRange: ChartTimeRange;
+  timeRange: TimeRange;
 }) => {
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme === 'dark';
@@ -85,15 +85,7 @@ export const ShadowsocksPage = () => {
     refetchInterval: 5000,
   });
 
-  const [timeRange, setTimeRange] = useState<ChartTimeRange>({
-    preset: '1h',
-    startMs: Date.now() - 3600000,
-    endMs: Date.now(),
-  });
-
-  const handleTimeRangeChange = useCallback((range: ChartTimeRange) => {
-    setTimeRange(range);
-  }, []);
+  const { range, preset, presets, setPreset, setCustomRange } = useTimeRange();
 
   if (configLoading || statsLoading) {
     return (
@@ -189,13 +181,18 @@ export const ShadowsocksPage = () => {
               );
             })}
           </div>
-          <ChartContainer
-            title="Throughput History"
-            timeRange={timeRange}
-            onTimeRangeChange={handleTimeRangeChange}
-            isEmpty={qualityList.every(q => q.history.length === 0)}
-          >
-            <ThroughputHistory qualityList={qualityList} timeRange={timeRange} />
+          <div className="flex items-center justify-end mb-4">
+            <TimeRangeSelector
+              preset={preset}
+              presets={presets}
+              customStartMs={range.startMs}
+              customEndMs={range.endMs}
+              onPresetChange={setPreset}
+              onCustomChange={setCustomRange}
+            />
+          </div>
+          <ChartContainer title="Throughput History">
+            <ThroughputHistory qualityList={qualityList} timeRange={range} />
           </ChartContainer>
         </div>
       )}
