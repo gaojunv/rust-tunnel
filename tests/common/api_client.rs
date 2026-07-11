@@ -67,4 +67,13 @@ impl ApiClient {
         }
         req.send().await.expect("get send").status()
     }
+
+    /// DELETE a path, returning the status. Injects Bearer if a token is stored.
+    pub async fn delete_status(&self, path: &str) -> StatusCode {
+        let mut req = self.http.delete(format!("{}{}", self.base, path));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        req.send().await.expect("delete send").status()
+    }
 }
