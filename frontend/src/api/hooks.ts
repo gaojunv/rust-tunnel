@@ -10,6 +10,10 @@ import {
   updateShadowsocksConfig,
   getShadowsocksStats,
   getShadowsocksQuality,
+  getTrojanConfig,
+  updateTrojanConfig,
+  getTrojanStats,
+  getTrojanQuality,
 } from './client';
 import type { LoginRequest } from '../types';
 
@@ -118,6 +122,42 @@ export function useShadowsocksQuality() {
   return useQuery({
     queryKey: ['shadowsocks-quality'],
     queryFn: () => getShadowsocksQuality(),
+    refetchInterval: 10000,
+  });
+}
+
+// Trojan hooks
+export function useTrojanConfig() {
+  return useQuery({
+    queryKey: ['trojan-config'],
+    queryFn: () => getTrojanConfig(),
+  });
+}
+
+export function useUpdateTrojanConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: { enabled: boolean; port: number }) =>
+      updateTrojanConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trojan-config'] });
+      queryClient.invalidateQueries({ queryKey: ['trojan-stats'] });
+    },
+  });
+}
+
+export function useTrojanStats() {
+  return useQuery({
+    queryKey: ['trojan-stats'],
+    queryFn: () => getTrojanStats(),
+    refetchInterval: 5000,
+  });
+}
+
+export function useTrojanQuality() {
+  return useQuery({
+    queryKey: ['trojan-quality'],
+    queryFn: () => getTrojanQuality(),
     refetchInterval: 10000,
   });
 }
