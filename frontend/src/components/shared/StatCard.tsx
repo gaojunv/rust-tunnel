@@ -1,35 +1,37 @@
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { cn } from '@/lib/utils';
+
 interface StatCardProps {
-  label: string;
-  value: string;
-  icon: React.ReactNode;
-  color?: 'blue' | 'green' | 'purple' | 'orange' | 'yellow' | 'red';
-  valueColor?: string;
+  title: string;
+  value: string | number;
+  description?: string;
+  icon?: React.ReactNode;
+  trend?: 'up' | 'down' | 'neutral';
+  className?: string;
 }
 
-const colorClasses: Record<string, { bg: string }> = {
-  blue: { bg: 'bg-blue-500' },
-  green: { bg: 'bg-green-500' },
-  purple: { bg: 'bg-purple-500' },
-  orange: { bg: 'bg-orange-500' },
-  yellow: { bg: 'bg-yellow-500' },
-  red: { bg: 'bg-red-500' },
-};
-
-export const StatCard = ({ label, value, icon, color = 'blue', valueColor }: StatCardProps) => {
-  const c = colorClasses[color];
+export function StatCard({ title, value, description, icon, trend, className }: StatCardProps) {
   return (
-    <div className="bg-white overflow-hidden shadow rounded-lg p-4 sm:p-6 dark:bg-slate-800 dark:shadow-slate-950/20">
-      <div className="flex items-center">
-        <div className={`flex-shrink-0 ${c.bg} rounded-md p-3`}>
-          {icon}
-        </div>
-        <div className="ml-5 w-0 flex-1">
-          <dl>
-            <dt className="text-sm font-medium text-gray-500 truncate dark:text-slate-400">{label}</dt>
-            <dd className={`text-lg font-semibold ${valueColor || 'text-gray-900 dark:text-slate-100'}`}>{value}</dd>
-          </dl>
-        </div>
-      </div>
-    </div>
+    <Card className={cn('', className)}>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+        <CardTitle className="text-sm font-medium">{title}</CardTitle>
+        {icon && <div className="text-muted-foreground">{icon}</div>}
+      </CardHeader>
+      <CardContent>
+        <div className="text-2xl font-bold">{value}</div>
+        {description && (
+          <p
+            className={cn(
+              'text-xs',
+              trend === 'up' && 'text-green-500',
+              trend === 'down' && 'text-red-500',
+              !trend && 'text-muted-foreground'
+            )}
+          >
+            {description}
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
-};
+}
