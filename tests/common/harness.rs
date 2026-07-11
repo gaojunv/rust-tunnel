@@ -197,7 +197,11 @@ impl TestHarness {
                     return None;
                 }
                 let n = body.as_array().map(|a| a.len()).unwrap_or(0);
-                if n >= at_least { Some(()) } else { None }
+                if n >= at_least {
+                    Some(())
+                } else {
+                    None
+                }
             }
         })
         .await;
@@ -205,9 +209,11 @@ impl TestHarness {
         match result {
             Ok(v) => Ok(v),
             Err(msg) => {
-                let seen = last_status.lock().unwrap().clone();
+                let seen = *last_status.lock().unwrap();
                 if let Some(st) = seen {
-                    Err(format!("{msg} (last /api/clients status was {st}; did you forget to login?)"))
+                    Err(format!(
+                        "{msg} (last /api/clients status was {st}; did you forget to login?)"
+                    ))
                 } else {
                     Err(msg)
                 }

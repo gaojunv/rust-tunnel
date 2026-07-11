@@ -1658,9 +1658,7 @@ pub async fn run_api_server(
         )
         .route("/*path", get(serve_static));
 
-    let app = Router::new()
-        .merge(public_routes)
-        .merge(protected_routes);
+    let app = Router::new().merge(public_routes).merge(protected_routes);
 
     #[cfg(feature = "embed-frontend")]
     let app = app.merge(static_routes);

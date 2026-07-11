@@ -36,7 +36,9 @@ pub async fn spawn_echo() -> SocketAddr {
 /// Spawn a tiny HTTP server that returns `200 OK\r\n\r\nhello` on any request.
 /// Useful once we add SS/Trojan tests; safe to include now.
 pub async fn spawn_http_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http_echo");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind http_echo");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         loop {
@@ -48,7 +50,8 @@ pub async fn spawn_http_echo() -> SocketAddr {
                 let mut buf = [0u8; 4096];
                 // Read the request headers (best-effort, up to the first \r\n\r\n).
                 let _ = sock.read(&mut buf).await;
-                let body = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+                let body =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
                 let _ = sock.write_all(body).await;
                 let _ = sock.shutdown().await;
             });

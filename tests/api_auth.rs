@@ -18,11 +18,15 @@ async fn login_returns_jwt() {
         .await;
         let mut api = harness.api_client();
         let (status, body) = api.login("secret").await;
-        assert_eq!(status, StatusCode::OK, "login should return 200, body={body:?}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "login should return 200, body={body:?}"
+        );
         let token = body
             .get("token")
             .and_then(|v| v.as_str())
-            .expect(&format!("response must contain a token, got {body:?}"));
+            .unwrap_or_else(|| panic!("response must contain a token, got {body:?}"));
         assert!(
             !token.is_empty() && token.matches('.').count() == 2,
             "token should look like a JWT (three dot-separated segments), got {token:?}"
@@ -87,13 +91,21 @@ async fn no_admin_password_disables_auth() {
         .await;
         let api = harness.api_client();
         let status = api.get_status("/api/clients").await;
-        assert_eq!(status, StatusCode::OK, "no-password mode should allow all routes");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "no-password mode should allow all routes"
+        );
 
         // Login should still succeed in open mode — the handler returns a
         // dummy token regardless of password so existing UI code works.
         let mut api = harness.api_client();
         let (login_status, body) = api.login("anything").await;
-        assert_eq!(login_status, StatusCode::OK, "login should still 200 in open mode, body={body:?}");
+        assert_eq!(
+            login_status,
+            StatusCode::OK,
+            "login should still 200 in open mode, body={body:?}"
+        );
     })
     .await;
     result.expect("test timed out");
