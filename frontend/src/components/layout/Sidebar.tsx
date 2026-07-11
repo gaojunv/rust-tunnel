@@ -63,18 +63,27 @@ const navGroups: NavGroup[] = [
 
 interface SidebarProps {
   onLogout: () => void;
+  collapsed?: boolean;
+  onCollapseChange?: (collapsed: boolean) => void;
 }
 
-export function Sidebar({ onLogout }: SidebarProps) {
-  const [collapsed, setCollapsed] = useState(() => {
+export function Sidebar({ onLogout, collapsed: controlledCollapsed, onCollapseChange }: SidebarProps) {
+  const [internalCollapsed, setInternalCollapsed] = useState(() => {
     return localStorage.getItem('sidebar-collapsed') === 'true';
   });
+  const collapsed = controlledCollapsed ?? internalCollapsed;
   const location = useLocation();
   const { resolvedTheme, setPreference } = useTheme();
 
   useEffect(() => {
     localStorage.setItem('sidebar-collapsed', String(collapsed));
   }, [collapsed]);
+
+  const handleToggleCollapse = () => {
+    const newCollapsed = !collapsed;
+    setInternalCollapsed(newCollapsed);
+    onCollapseChange?.(newCollapsed);
+  };
 
   const toggleTheme = () => {
     setPreference(resolvedTheme === 'dark' ? 'light' : 'dark');
@@ -87,40 +96,41 @@ export function Sidebar({ onLogout }: SidebarProps) {
         collapsed ? 'w-16' : 'w-64'
       )}
     >
-      <div className="flex h-full flex-col">
-        {/* Header */}
-        <div className="flex h-14 items-center justify-between border-b px-4">
-          {!collapsed && (
-            <Link to="/" className="flex items-center gap-2 font-semibold">
-              <Shield className="h-6 w-6" />
-              <span>Rust Tunnel</span>
-            </Link>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setCollapsed(!collapsed)}
-            className="h-8 w-8"
-          >
-            {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
-          </Button>
-        </div>
+      <TooltipProvider>
+        <div className="flex h-full flex-col">
+          {/* Header */}
+          <div className="flex h-14 items-center justify-between border-b px-4">
+            {!collapsed && (
+              <Link to="/" className="flex items-center gap-2 font-semibold">
+                <Shield className="h-6 w-6" />
+                <span>Rust Tunnel</span>
+              </Link>
+            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={handleToggleCollapse}
+              className="h-8 w-8"
+              aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            >
+              {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+            </Button>
+          </div>
 
-        {/* Navigation */}
-        <ScrollArea className="flex-1 py-4">
-          <nav className="space-y-2 px-2">
-            {navGroups.map((group) => (
-              <Collapsible key={group.label} defaultOpen>
-                {!collapsed && (
-                  <CollapsibleTrigger className="flex w-full items-center justify-between px-2 py-1 text-sm font-medium text-muted-foreground hover:text-foreground">
-                    {group.label}
-                  </CollapsibleTrigger>
-                )}
-                <CollapsibleContent>
-                  <div className="space-y-1">
-                    {group.items.map((item) => (
-                      <TooltipProvider key={item.href}>
-                        <Tooltip delayDuration={0}>
+          {/* Navigation */}
+          <ScrollArea className="flex-1 py-4">
+            <nav className="space-y-2 px-2">
+              {navGroups.map((group) => (
+                <Collapsible key={group.label} defaultOpen>
+                  {!collapsed && (
+                    <CollapsibleTrigger className="flex w-full items-center justify-between px-2 py-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+                      {group.label}
+                    </CollapsibleTrigger>
+                  )}
+                  <CollapsibleContent>
+                    <div className="space-y-1">
+                      {group.items.map((item) => (
+                        <Tooltip key={item.href} delayDuration={0}>
                           <TooltipTrigger asChild>
                             <Link
                               to={item.href}
@@ -141,18 +151,16 @@ export function Sidebar({ onLogout }: SidebarProps) {
                             </TooltipContent>
                           )}
                         </Tooltip>
-                      </TooltipProvider>
-                    ))}
-                  </div>
-                </CollapsibleContent>
-              </Collapsible>
-            ))}
-          </nav>
-        </ScrollArea>
+                      ))}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              ))}
+            </nav>
+          </ScrollArea>
 
-        {/* Footer */}
-        <div className="border-t p-4 space-y-2">
-          <TooltipProvider>
+          {/* Footer */}
+          <div className="border-t p-4 space-y-2">
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
                 <Button
@@ -171,9 +179,7 @@ export function Sidebar({ onLogout }: SidebarProps) {
                 </TooltipContent>
               )}
             </Tooltip>
-          </TooltipProvider>
 
-          <TooltipProvider>
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
                 <Button
@@ -192,9 +198,9 @@ export function Sidebar({ onLogout }: SidebarProps) {
                 </TooltipContent>
               )}
             </Tooltip>
-          </TooltipProvider>
+          </div>
         </div>
-      </div>
+      </TooltipProvider>
     </aside>
   );
 }
