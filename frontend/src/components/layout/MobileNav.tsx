@@ -8,6 +8,7 @@ import {
   Network,
   Globe,
   Shield,
+  ShieldCheck,
   FileText,
   Menu,
   LogOut,
@@ -18,10 +19,10 @@ const coreTabs = [
   { label: 'Quality', icon: <Signal className="h-5 w-5" />, href: '/quality' },
   { label: 'Mesh', icon: <Network className="h-5 w-5" />, href: '/mesh' },
   { label: 'DNS', icon: <Globe className="h-5 w-5" />, href: '/dns' },
+  { label: 'Shadowsocks', icon: <ShieldCheck className="h-5 w-5" />, href: '/shadowsocks' },
 ];
 
 const moreItems = [
-  { label: 'Shadowsocks', icon: <Shield className="h-5 w-5" />, href: '/shadowsocks' },
   { label: 'Trojan', icon: <Shield className="h-5 w-5" />, href: '/trojan' },
   { label: 'Logs', icon: <FileText className="h-5 w-5" />, href: '/logs' },
 ];
