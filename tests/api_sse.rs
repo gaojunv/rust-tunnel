@@ -87,7 +87,7 @@ async fn sse_streams_log_entries() {
                 }
                 // Between rounds, briefly yield so the forwarder task can
                 // drain and the SSE broadcaster can emit.
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 let _ = round;
             }
         });
