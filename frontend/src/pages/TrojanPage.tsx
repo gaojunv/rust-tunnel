@@ -11,7 +11,14 @@ import {
   useTrojanStats,
   useTrojanQuality,
 } from '@/api/hooks';
-import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
+import {
+  Shield,
+  ArrowDown,
+  ArrowUp,
+  Signal,
+  Users,
+  Activity,
+} from 'lucide-react';
 import {
   LineChart,
   Line,
@@ -31,11 +38,13 @@ export default function TrojanPage() {
 
   const [enabled, setEnabled] = useState(false);
   const [port, setPort] = useState('');
+  const [fallback, setFallback] = useState('');
 
   useEffect(() => {
     if (config) {
       setEnabled(config.enabled ?? false);
       setPort(config.port?.toString() ?? '');
+      setFallback(config.fallback ?? '');
     }
   }, [config]);
 
@@ -43,6 +52,7 @@ export default function TrojanPage() {
     updateConfig.mutate({
       enabled,
       port: parseInt(port, 10),
+      fallback: fallback || undefined,
     });
   };
 
@@ -104,6 +114,18 @@ export default function TrojanPage() {
                 />
               </div>
 
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Fallback</label>
+                <Input
+                  value={fallback}
+                  onChange={(e) => setFallback(e.target.value)}
+                  placeholder="127.0.0.1:80"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Address to redirect traffic to when authentication fails
+                </p>
+              </div>
+
               <Button onClick={handleSave} disabled={updateConfig.isPending}>
                 {updateConfig.isPending ? 'Saving...' : 'Save Configuration'}
               </Button>
@@ -113,7 +135,7 @@ export default function TrojanPage() {
       </Card>
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-4">
         <StatCard
           title="Status"
           value={enabled ? 'Active' : 'Inactive'}
@@ -128,6 +150,11 @@ export default function TrojanPage() {
           title="Bytes Out"
           value={formatBytes(stats?.total_bytes_out ?? 0)}
           icon={<ArrowUp className="h-4 w-4" />}
+        />
+        <StatCard
+          title="Active Connections"
+          value={stats?.active_connections ?? 0}
+          icon={<Users className="h-4 w-4" />}
         />
       </div>
 
@@ -175,6 +202,72 @@ export default function TrojanPage() {
                   dataKey="bytes_out"
                   stroke="#10b981"
                   name="Bytes Out"
+                  dot={false}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Quality History Chart */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Activity className="h-5 w-5" />
+            Quality History
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {chartData.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground">
+              No quality data available
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="timestamp"
+                  tickFormatter={(ts) =>
+                    new Date(ts).toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    })
+                  }
+                />
+                <YAxis yAxisId="left" />
+                <YAxis
+                  yAxisId="right"
+                  orientation="right"
+                  domain={[0, 100]}
+                />
+                <Tooltip
+                  labelFormatter={(ts) => new Date(ts).toLocaleString()}
+                />
+                <Legend />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="rtt"
+                  stroke="#f59e0b"
+                  name="RTT (ms)"
+                  dot={false}
+                />
+                <Line
+                  yAxisId="left"
+                  type="monotone"
+                  dataKey="loss"
+                  stroke="#ef4444"
+                  name="Loss (%)"
+                  dot={false}
+                />
+                <Line
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="score"
+                  stroke="#8b5cf6"
+                  name="Quality Score"
                   dot={false}
                 />
               </LineChart>
