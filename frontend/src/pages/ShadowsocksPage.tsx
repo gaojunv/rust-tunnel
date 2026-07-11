@@ -18,7 +18,7 @@ import {
   useShadowsocksStats,
   useShadowsocksQuality,
 } from '@/api/hooks';
-import { Shield, ArrowDown, ArrowUp, Activity, Signal } from 'lucide-react';
+import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
 import {
   LineChart,
   Line,
@@ -38,7 +38,6 @@ export default function ShadowsocksPage() {
 
   const [enabled, setEnabled] = useState(false);
   const [port, setPort] = useState('');
-  const [password, setPassword] = useState('');
   const [cipher, setCipher] = useState('aes-256-gcm');
 
   useEffect(() => {
@@ -105,25 +104,14 @@ export default function ShadowsocksPage() {
                 <Switch checked={enabled} onCheckedChange={setEnabled} />
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Port</label>
-                  <Input
-                    type="number"
-                    value={port}
-                    onChange={(e) => setPort(e.target.value)}
-                    placeholder="8388"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Password</label>
-                  <Input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Enter password"
-                  />
-                </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Port</label>
+                <Input
+                  type="number"
+                  value={port}
+                  onChange={(e) => setPort(e.target.value)}
+                  placeholder="8388"
+                />
               </div>
 
               <div className="space-y-2">
@@ -150,16 +138,11 @@ export default function ShadowsocksPage() {
       </Card>
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3">
         <StatCard
           title="Status"
           value={enabled ? 'Active' : 'Inactive'}
           icon={<Shield className="h-4 w-4" />}
-        />
-        <StatCard
-          title="Active Connections"
-          value={stats?.active_connections ?? 0}
-          icon={<Activity className="h-4 w-4" />}
         />
         <StatCard
           title="Bytes In"
@@ -172,65 +155,6 @@ export default function ShadowsocksPage() {
           icon={<ArrowUp className="h-4 w-4" />}
         />
       </div>
-
-      {/* Quality / Throughput Chart */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Quality History</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {chartData.length === 0 ? (
-            <div className="text-center py-8 text-muted-foreground">
-              No quality data available
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="timestamp"
-                  tickFormatter={(ts) =>
-                    new Date(ts).toLocaleTimeString([], {
-                      hour: '2-digit',
-                      minute: '2-digit',
-                    })
-                  }
-                />
-                <YAxis yAxisId="left" domain={[0, 100]} />
-                <YAxis yAxisId="right" orientation="right" />
-                <Tooltip
-                  labelFormatter={(ts) => new Date(ts).toLocaleString()}
-                />
-                <Legend />
-                <Line
-                  yAxisId="left"
-                  type="monotone"
-                  dataKey="score"
-                  stroke="#8b5cf6"
-                  name="Quality Score"
-                  dot={false}
-                />
-                <Line
-                  yAxisId="left"
-                  type="monotone"
-                  dataKey="loss"
-                  stroke="#ef4444"
-                  name="Loss %"
-                  dot={false}
-                />
-                <Line
-                  yAxisId="right"
-                  type="monotone"
-                  dataKey="rtt"
-                  stroke="#f59e0b"
-                  name="RTT (ms)"
-                  dot={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          )}
-        </CardContent>
-      </Card>
 
       {/* Throughput Chart */}
       <Card>
