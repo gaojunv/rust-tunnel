@@ -60,10 +60,10 @@ async fn tunnel_forwards_bytes_bidirectionally() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tunnel_forwards_with_tls_disabled() {
     let result = tokio::time::timeout(Duration::from_secs(15), async {
-        // Explicit tls=false — same as the default in HarnessOpts, but locked in
-        // so a later change to the default can't silently strip coverage.
+        // Ride HarnessOpts::default() (currently tls=false via bool::default()).
+        // If someone later flips the default, this test will start exercising
+        // that new path instead of silently sticking to tls=false.
         let mut harness = TestHarness::spawn(HarnessOpts {
-            tls: false,
             exposed_port_count: 1,
             ..HarnessOpts::default()
         })
