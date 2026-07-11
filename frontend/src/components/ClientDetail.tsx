@@ -1,4 +1,4 @@
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { getPortTraffic, getPortQuality } from '../api/client';
 import type { PortTraffic, PortQualityResponse, QualitySample } from '../types';
 import { TrafficChart } from './TrafficChart';
@@ -155,21 +155,17 @@ const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSma
 export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
   const isSmallScreen = useMediaQuery('(max-width: 639px)');
 
-  const { data: traffic, isLoading: isLoadingTraffic } = useQuery<PortTraffic>(
-    ['portTraffic', port],
-    () => getPortTraffic(port),
-    {
-      refetchInterval: 5000,
-    }
-  );
+  const { data: traffic, isLoading: isLoadingTraffic } = useQuery<PortTraffic>({
+    queryKey: ['portTraffic', port],
+    queryFn: () => getPortTraffic(port),
+    refetchInterval: 5000,
+  });
 
-  const { data: quality, isLoading: isLoadingQuality } = useQuery<PortQualityResponse>(
-    ['portQuality', port],
-    () => getPortQuality(port),
-    {
-      refetchInterval: 5000,
-    }
-  );
+  const { data: quality, isLoading: isLoadingQuality } = useQuery<PortQualityResponse>({
+    queryKey: ['portQuality', port],
+    queryFn: () => getPortQuality(port),
+    refetchInterval: 5000,
+  });
 
   const singlePortTraffic = traffic ? [traffic] : [];
   const isLoading = isLoadingTraffic && isLoadingQuality;

@@ -1,5 +1,5 @@
 import React from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { useState, useCallback } from 'react';
 import { getShadowsocksConfig, getShadowsocksStats, getShadowsocksQuality } from '../api/client';
 import type { ShadowsocksQuality } from '../types';
@@ -67,23 +67,23 @@ const ThroughputHistory = ({ qualityList, timeRange }: {
 };
 
 export const ShadowsocksPage = () => {
-  const { data: config, isLoading: configLoading } = useQuery(
-    'shadowsocks-config',
-    getShadowsocksConfig,
-    { refetchInterval: 5000 }
-  );
+  const { data: config, isLoading: configLoading } = useQuery({
+    queryKey: ['shadowsocks-config'],
+    queryFn: getShadowsocksConfig,
+    refetchInterval: 5000,
+  });
 
-  const { data: stats, isLoading: statsLoading } = useQuery(
-    'shadowsocks-stats',
-    getShadowsocksStats,
-    { refetchInterval: 5000 }
-  );
+  const { data: stats, isLoading: statsLoading } = useQuery({
+    queryKey: ['shadowsocks-stats'],
+    queryFn: getShadowsocksStats,
+    refetchInterval: 5000,
+  });
 
-  const { data: qualityList = [] } = useQuery<ShadowsocksQuality[]>(
-    'shadowsocks-quality',
-    getShadowsocksQuality,
-    { refetchInterval: 5000 }
-  );
+  const { data: qualityList = [] } = useQuery<ShadowsocksQuality[]>({
+    queryKey: ['shadowsocks-quality'],
+    queryFn: getShadowsocksQuality,
+    refetchInterval: 5000,
+  });
 
   const [timeRange, setTimeRange] = useState<ChartTimeRange>({
     preset: '1h',

@@ -1,20 +1,22 @@
 import { useState } from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { getMeshes, getMeshServices } from '../api/client';
 import type { MeshNetworkResponse, MeshServiceResponse } from '../types';
 
 export const MeshPage: React.FC = () => {
   const [selectedMesh, setSelectedMesh] = useState<string | null>(null);
 
-  const { data: meshes, isLoading } = useQuery('meshes', getMeshes, {
+  const { data: meshes, isLoading } = useQuery({
+    queryKey: ['meshes'],
+    queryFn: getMeshes,
     refetchInterval: 10000,
   });
 
-  const { data: services } = useQuery(
-    ['mesh-services', selectedMesh],
-    () => selectedMesh ? getMeshServices(selectedMesh) : Promise.resolve([]),
-    { enabled: !!selectedMesh }
-  );
+  const { data: services } = useQuery({
+    queryKey: ['mesh-services', selectedMesh],
+    queryFn: () => selectedMesh ? getMeshServices(selectedMesh) : Promise.resolve([]),
+    enabled: !!selectedMesh,
+  });
 
   if (isLoading) {
     return (

@@ -1,4 +1,4 @@
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { getAllQuality, getQualityWarnings } from '../api/client';
 import type { ClientWithQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
@@ -198,22 +198,18 @@ interface QualityPageProps {
 }
 
 export const QualityPage = ({ onSelectClient }: QualityPageProps) => {
-  const { data: qualityData = [], isLoading } = useQuery<ClientWithQuality[]>(
-    'allQuality',
-    getAllQuality,
-    {
-      refetchInterval: 5000,
-    }
-  );
+  const { data: qualityData = [], isLoading } = useQuery<ClientWithQuality[]>({
+    queryKey: ['allQuality'],
+    queryFn: getAllQuality,
+    refetchInterval: 5000,
+  });
 
   // Warnings query for future use
-  useQuery(
-    'qualityWarnings',
-    getQualityWarnings,
-    {
-      refetchInterval: 5000,
-    }
-  );
+  useQuery({
+    queryKey: ['qualityWarnings'],
+    queryFn: getQualityWarnings,
+    refetchInterval: 5000,
+  });
 
   // Group by hostname for heatmap
   const groupedByHostname = qualityData.reduce((acc, client) => {

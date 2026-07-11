@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { Navbar } from './Navbar';
 import { ClientList } from './ClientList';
 import { TrafficChart } from './TrafficChart';
@@ -25,11 +25,15 @@ export const Dashboard = ({ onLogout }: DashboardProps) => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'mesh' | 'dns' | 'quality' | 'shadowsocks' | 'trojan' | 'logs'>('dashboard');
   const isMobile = useMediaQuery('(max-width: 767px)');
 
-  const { data: metrics } = useQuery('metrics', getMetrics, {
+  const { data: metrics } = useQuery({
+    queryKey: ['metrics'],
+    queryFn: getMetrics,
     refetchInterval: 5000,
   });
 
-  const { data: traffic = [] } = useQuery('traffic', getTraffic, {
+  const { data: traffic = [] } = useQuery({
+    queryKey: ['traffic'],
+    queryFn: getTraffic,
     refetchInterval: 5000,
   });
 

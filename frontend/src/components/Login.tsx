@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useMutation } from 'react-query';
+import { useMutation } from '@tanstack/react-query';
 import { login } from '../api/client';
 import type { LoginRequest } from '../types';
 
@@ -21,21 +21,19 @@ export const Login = ({ onLogin }: LoginProps) => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
-  const loginMutation = useMutation(
-    (data: LoginRequest) => login(data),
-    {
-      onSuccess: () => {
-        onLogin();
-      },
-      onError: (err: unknown) => {
-        if (isApiError(err)) {
-          setError(err.response?.data || 'Invalid password');
-        } else {
-          setError('Invalid password');
-        }
-      },
-    }
-  );
+  const loginMutation = useMutation({
+    mutationFn: (data: LoginRequest) => login(data),
+    onSuccess: () => {
+      onLogin();
+    },
+    onError: (err: unknown) => {
+      if (isApiError(err)) {
+        setError(err.response?.data || 'Invalid password');
+      } else {
+        setError('Invalid password');
+      }
+    },
+  });
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -81,10 +79,10 @@ export const Login = ({ onLogin }: LoginProps) => {
           <div>
             <button
               type="submit"
-              disabled={loginMutation.isLoading}
+              disabled={loginMutation.isPending}
               className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 dark:focus:ring-offset-slate-900 focus:ring-blue-500 disabled:opacity-50"
             >
-              {loginMutation.isLoading ? 'Signing in...' : 'Sign in'}
+              {loginMutation.isPending ? 'Signing in...' : 'Sign in'}
             </button>
           </div>
         </form>
