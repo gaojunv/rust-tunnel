@@ -5,8 +5,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Poll `cond` up to 50 times with exponential backoff (base 20ms, cap 500ms).
-/// Total worst-case wait ≈ 5 seconds.
+/// Poll `cond` up to 30 times with exponential backoff (base 20ms, cap 500ms).
+/// Total worst-case wait ≈ 13 seconds — comfortably under a 15s per-test timeout.
 ///
 /// Returns `Ok(T)` on the first `Some(T)` from `cond`, `Err(String)` after exhaustion.
 pub async fn wait_until<F, Fut, T>(desc: &str, mut cond: F) -> Result<T, String>
@@ -15,13 +15,12 @@ where
     Fut: Future<Output = Option<T>>,
 {
     let mut delay = Duration::from_millis(20);
-    for attempt in 0..50 {
+    for _ in 0..30 {
         if let Some(value) = cond().await {
             return Ok(value);
         }
         tokio::time::sleep(delay).await;
         delay = std::cmp::min(delay * 2, Duration::from_millis(500));
-        let _ = attempt;
     }
-    Err(format!("wait_until timed out after 50 attempts: {desc}"))
+    Err(format!("wait_until timed out after 30 attempts: {desc}"))
 }
