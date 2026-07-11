@@ -14,6 +14,7 @@ import {
   updateTrojanConfig,
   getTrojanStats,
   getTrojanQuality,
+  getMeshes,
 } from './client';
 import type { LoginRequest } from '../types';
 
@@ -165,5 +166,14 @@ export function useTrojanQuality() {
 export function useLogin() {
   return useMutation({
     mutationFn: (password: string) => login({ password } as LoginRequest),
+  });
+}
+
+// Mesh hooks
+export function useMeshes() {
+  return useQuery({
+    queryKey: ['meshes'],
+    queryFn: () => getMeshes(),
+    refetchInterval: 10000,
   });
 }
