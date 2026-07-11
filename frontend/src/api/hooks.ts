@@ -14,6 +14,8 @@ import {
   updateTrojanConfig,
   getTrojanStats,
   getTrojanQuality,
+  getLogs,
+  setLogsLevel,
 } from './client';
 import type { LoginRequest } from '../types';
 
@@ -159,6 +161,30 @@ export function useTrojanQuality() {
     queryKey: ['trojan-quality'],
     queryFn: () => getTrojanQuality(),
     refetchInterval: 10000,
+  });
+}
+
+// Logs hooks
+export function useLogs(params?: {
+  level?: string;
+  source?: string;
+  search?: string;
+  limit?: number;
+  before_id?: number;
+}) {
+  return useQuery({
+    queryKey: ['logs', params],
+    queryFn: () => getLogs(params),
+  });
+}
+
+export function useSetLogsLevel() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (level: string) => setLogsLevel(level),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['logs'] });
+    },
   });
 }
 
