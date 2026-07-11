@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from 'react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '../api/client';
 
 export const DnsPage: React.FC = () => {
@@ -9,30 +9,28 @@ export const DnsPage: React.FC = () => {
   const [newPort, setNewPort] = useState(80);
   const queryClient = useQueryClient();
 
-  const { data: records, isLoading } = useQuery('dns-records', getDnsRecords, {
+  const { data: records, isLoading } = useQuery({
+    queryKey: ['dns-records'],
+    queryFn: getDnsRecords,
     refetchInterval: 15000,
   });
 
-  const addMutation = useMutation(
-    (data: { name: string; record_type: string; value: string; port?: number }) =>
+  const addMutation = useMutation({
+    mutationFn: (data: { name: string; record_type: string; value: string; port?: number }) =>
       addDnsRecord(data),
-    {
-      onSuccess: () => {
-        queryClient.invalidateQueries('dns-records');
-        setShowAddForm(false);
-        setNewName('');
-        setNewValue('');
-        setNewPort(80);
-      },
-    }
-  );
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dns-records'] });
+      setShowAddForm(false);
+      setNewName('');
+      setNewValue('');
+      setNewPort(80);
+    },
+  });
 
-  const deleteMutation = useMutation(
-    (name: string) => deleteDnsRecord(name),
-    {
-      onSuccess: () => queryClient.invalidateQueries('dns-records'),
-    }
-  );
+  const deleteMutation = useMutation({
+    mutationFn: (name: string) => deleteDnsRecord(name),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['dns-records'] }),
+  });
 
   if (isLoading) {
     return (
@@ -96,10 +94,10 @@ export const DnsPage: React.FC = () => {
                   port: newPort,
                 })
               }
-              disabled={!newName || !newValue || addMutation.isLoading}
+              disabled={!newName || !newValue || addMutation.isPending}
               className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {addMutation.isLoading ? 'Adding...' : 'Add'}
+              {addMutation.isPending ? 'Adding...' : 'Add'}
             </button>
           </div>
         </div>

@@ -1,17 +1,18 @@
-import React, { useState, useCallback } from 'react';
-import { useQuery } from 'react-query';
+import React from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { getTrojanConfig, getTrojanStats, getTrojanQuality } from '../api/client';
 import type { TrojanQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { formatBytes, formatBps } from '../utils/format';
 import { ChartContainer } from './shared/ChartContainer';
-import type { ChartTimeRange } from './shared/ChartContainer';
+import { TimeRangeSelector } from './shared/TimeRangeSelector';
+import { useTimeRange, type TimeRange } from '../hooks/useTimeRange';
 import { useTheme } from '../theme/ThemeProvider';
 
 const ThroughputHistory = ({ qualityList, timeRange }: {
   qualityList: TrojanQuality[];
-  timeRange: ChartTimeRange;
+  timeRange: TimeRange;
 }) => {
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme === 'dark';
@@ -66,33 +67,25 @@ const ThroughputHistory = ({ qualityList, timeRange }: {
 };
 
 export const TrojanPage = () => {
-  const [timeRange, setTimeRange] = useState<ChartTimeRange>({
-    preset: '1h',
-    startMs: Date.now() - 3600000,
-    endMs: Date.now(),
+  const { range, preset, presets, setPreset, setCustomRange } = useTimeRange();
+
+  const { data: config, isLoading: configLoading } = useQuery({
+    queryKey: ['trojan-config'],
+    queryFn: getTrojanConfig,
+    refetchInterval: 5000,
   });
 
-  const handleTimeRangeChange = useCallback((range: ChartTimeRange) => {
-    setTimeRange(range);
-  }, []);
+  const { data: stats, isLoading: statsLoading } = useQuery({
+    queryKey: ['trojan-stats'],
+    queryFn: getTrojanStats,
+    refetchInterval: 5000,
+  });
 
-  const { data: config, isLoading: configLoading } = useQuery(
-    'trojan-config',
-    getTrojanConfig,
-    { refetchInterval: 5000 }
-  );
-
-  const { data: stats, isLoading: statsLoading } = useQuery(
-    'trojan-stats',
-    getTrojanStats,
-    { refetchInterval: 5000 }
-  );
-
-  const { data: qualityList = [] } = useQuery<TrojanQuality[]>(
-    'trojan-quality',
-    getTrojanQuality,
-    { refetchInterval: 5000 }
-  );
+  const { data: qualityList = [] } = useQuery<TrojanQuality[]>({
+    queryKey: ['trojan-quality'],
+    queryFn: getTrojanQuality,
+    refetchInterval: 5000,
+  });
 
   if (configLoading || statsLoading) {
     return (
@@ -188,13 +181,18 @@ export const TrojanPage = () => {
               );
             })}
           </div>
-          <ChartContainer
-            title="Throughput History"
-            timeRange={timeRange}
-            onTimeRangeChange={handleTimeRangeChange}
-            isEmpty={qualityList.every(q => q.history.length === 0)}
-          >
-            <ThroughputHistory qualityList={qualityList} timeRange={timeRange} />
+          <div className="flex items-center justify-end mb-4">
+            <TimeRangeSelector
+              preset={preset}
+              presets={presets}
+              customStartMs={range.startMs}
+              customEndMs={range.endMs}
+              onPresetChange={setPreset}
+              onCustomChange={setCustomRange}
+            />
+          </div>
+          <ChartContainer title="Throughput History">
+            <ThroughputHistory qualityList={qualityList} timeRange={range} />
           </ChartContainer>
         </div>
       )}

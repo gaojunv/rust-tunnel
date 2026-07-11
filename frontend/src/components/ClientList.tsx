@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from 'react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getClients, disconnectClient } from '../api/client';
 import type { ClientResponse, ClientGroup, ConnectionQuality } from '../types';
 import { useMediaQuery } from '../hooks/useMediaQuery';
@@ -107,24 +107,20 @@ export const ClientList = ({ onSelectClient }: ClientListProps) => {
   const queryClient = useQueryClient();
   const isSmallScreen = useMediaQuery('(max-width: 639px)');
 
-  const { data: clients = [], isLoading } = useQuery<ClientResponse[]>(
-    'clients',
-    getClients,
-    {
-      refetchInterval: 5000, // Refresh every 5 seconds
-    }
-  );
+  const { data: clients = [], isLoading } = useQuery<ClientResponse[]>({
+    queryKey: ['clients'],
+    queryFn: getClients,
+    refetchInterval: 5000, // Refresh every 5 seconds
+  });
 
-  const disconnectMutation = useMutation(
-    (port: number) => disconnectClient(port),
-    {
-      onSuccess: () => {
-        queryClient.invalidateQueries('clients');
-        queryClient.invalidateQueries('traffic');
-        queryClient.invalidateQueries('metrics');
-      },
-    }
-  );
+  const disconnectMutation = useMutation({
+    mutationFn: (port: number) => disconnectClient(port),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['clients'] });
+      queryClient.invalidateQueries({ queryKey: ['traffic'] });
+      queryClient.invalidateQueries({ queryKey: ['metrics'] });
+    },
+  });
 
   const handleDisconnect = (port: number) => {
     if (confirm(`Are you sure you want to disconnect the client on port ${port}?`)) {
@@ -169,7 +165,7 @@ export const ClientList = ({ onSelectClient }: ClientListProps) => {
                       client={client}
                       onSelectClient={onSelectClient}
                       onDisconnect={handleDisconnect}
-                      disabled={disconnectMutation.isLoading}
+                      disabled={disconnectMutation.isPending}
                     />
                   ))}
                 </div>
@@ -229,7 +225,7 @@ export const ClientList = ({ onSelectClient }: ClientListProps) => {
                             </button>
                             <button
                               onClick={() => handleDisconnect(client.port)}
-                              disabled={disconnectMutation.isLoading}
+                              disabled={disconnectMutation.isPending}
                               className="text-red-600 dark:text-red-400 hover:text-red-900 dark:hover:text-red-300 disabled:opacity-50"
                             >
                               Disconnect
