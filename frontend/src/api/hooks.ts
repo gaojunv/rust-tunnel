@@ -1,4 +1,4 @@
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   login,
   getClients,
@@ -6,6 +6,10 @@ import {
   getPortQuality,
   getPortTraffic,
   getAllQuality,
+  getShadowsocksConfig,
+  updateShadowsocksConfig,
+  getShadowsocksStats,
+  getShadowsocksQuality,
 } from './client';
 import type { LoginRequest } from '../types';
 
@@ -78,6 +82,42 @@ export function useQualitySummary() {
         worst,
       };
     },
+    refetchInterval: 10000,
+  });
+}
+
+// Shadowsocks hooks
+export function useShadowsocksConfig() {
+  return useQuery({
+    queryKey: ['shadowsocks-config'],
+    queryFn: () => getShadowsocksConfig(),
+  });
+}
+
+export function useUpdateShadowsocksConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: { enabled: boolean; port: number; cipher: string }) =>
+      updateShadowsocksConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['shadowsocks-config'] });
+      queryClient.invalidateQueries({ queryKey: ['shadowsocks-stats'] });
+    },
+  });
+}
+
+export function useShadowsocksStats() {
+  return useQuery({
+    queryKey: ['shadowsocks-stats'],
+    queryFn: () => getShadowsocksStats(),
+    refetchInterval: 5000,
+  });
+}
+
+export function useShadowsocksQuality() {
+  return useQuery({
+    queryKey: ['shadowsocks-quality'],
+    queryFn: () => getShadowsocksQuality(),
     refetchInterval: 10000,
   });
 }
