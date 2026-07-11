@@ -1,7 +1,5 @@
 import { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
 import {
   Table,
   TableBody,
@@ -10,19 +8,29 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
-import { Plus, Trash2, X } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 
 export default function DnsPage() {
   const queryClient = useQueryClient();
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newValue, setNewValue] = useState('');
-  const [newPort, setNewPort] = useState('80');
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [newRecord, setNewRecord] = useState({
+    name: '',
+    record_type: 'A',
+    value: '',
+  });
 
   const { data: records, isLoading } = useQuery({
     queryKey: ['dns-records'],
@@ -34,10 +42,8 @@ export default function DnsPage() {
     mutationFn: (data: AddDnsRecordRequest) => addDnsRecord(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['dns-records'] });
-      setShowAddForm(false);
-      setNewName('');
-      setNewValue('');
-      setNewPort('80');
+      setDialogOpen(false);
+      setNewRecord({ name: '', record_type: 'A', value: '' });
     },
   });
 
@@ -48,19 +54,13 @@ export default function DnsPage() {
     },
   });
 
-  const handleAdd = () => {
+  const handleAdd = (e: React.FormEvent) => {
+    e.preventDefault();
     addMutation.mutate({
-      name: newName,
-      record_type: 'A',
-      value: newValue,
-      port: parseInt(newPort, 10),
+      name: newRecord.name,
+      record_type: newRecord.record_type,
+      value: newRecord.value,
     });
-  };
-
-  const handleDelete = (name: string) => {
-    if (window.confirm(`Delete DNS record "${name}"?`)) {
-      deleteMutation.mutate(name);
-    }
   };
 
   return (
@@ -69,94 +69,77 @@ export default function DnsPage() {
         title="DNS Records"
         description="Manage DNS records for tunnel and mesh domains"
       >
-        <Button
-          onClick={() => setShowAddForm(!showAddForm)}
-          variant={showAddForm ? 'outline' : 'default'}
-        >
-          {showAddForm ? (
-            <>
-              <X className="mr-2 h-4 w-4" />
-              Cancel
-            </>
-          ) : (
-            <>
+        <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <DialogTrigger asChild>
+            <Button>
               <Plus className="mr-2 h-4 w-4" />
               Add Record
-            </>
-          )}
-        </Button>
-      </PageHeader>
-
-      {/* Add Record Form */}
-      {showAddForm && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Add DNS Record</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Domain Name</label>
-              <Input
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="e.g. myapp.tunnel.local"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium">IP Address</label>
-              <Input
-                value={newValue}
-                onChange={(e) => setNewValue(e.target.value)}
-                placeholder="e.g. 10.0.0.1"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Port</label>
-              <Input
-                type="number"
-                value={newPort}
-                onChange={(e) => setNewPort(e.target.value)}
-                placeholder="80"
-              />
-            </div>
-
-            <div className="flex gap-2">
-              <Button
-                onClick={handleAdd}
-                disabled={!newName || !newValue || addMutation.isPending}
-              >
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Add DNS Record</DialogTitle>
+            </DialogHeader>
+            <form onSubmit={handleAdd} className="space-y-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Name</label>
+                <Input
+                  value={newRecord.name}
+                  onChange={(e) =>
+                    setNewRecord({ ...newRecord, name: e.target.value })
+                  }
+                  placeholder="example.com"
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Type</label>
+                <select
+                  className="w-full rounded-md border bg-background px-3 py-2"
+                  value={newRecord.record_type}
+                  onChange={(e) =>
+                    setNewRecord({ ...newRecord, record_type: e.target.value })
+                  }
+                >
+                  <option value="A">A</option>
+                  <option value="AAAA">AAAA</option>
+                  <option value="CNAME">CNAME</option>
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Value</label>
+                <Input
+                  value={newRecord.value}
+                  onChange={(e) =>
+                    setNewRecord({ ...newRecord, value: e.target.value })
+                  }
+                  placeholder="192.168.1.1"
+                  required
+                />
+              </div>
+              {addMutation.isError && (
+                <p className="text-sm text-destructive">
+                  Failed to add record. Please try again.
+                </p>
+              )}
+              <Button type="submit" disabled={addMutation.isPending}>
                 {addMutation.isPending ? 'Adding...' : 'Add Record'}
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => setShowAddForm(false)}
-              >
-                Cancel
-              </Button>
-            </div>
+            </form>
+          </DialogContent>
+        </Dialog>
+      </PageHeader>
 
-            {addMutation.isError && (
-              <p className="text-sm text-destructive">
-                Failed to add record. Please try again.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Records Table */}
       <Card>
         <CardHeader>
-          <CardTitle>DNS Records</CardTitle>
+          <CardTitle>Records</CardTitle>
         </CardHeader>
         <CardContent>
           {isLoading ? (
             <div className="text-center py-8 text-muted-foreground">
               Loading...
             </div>
-          ) : records?.length === 0 ? (
+          ) : !records?.length ? (
             <div className="text-center py-8 text-muted-foreground">
               No DNS records configured
             </div>
@@ -164,21 +147,19 @@ export default function DnsPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Domain Name</TableHead>
+                  <TableHead>Name</TableHead>
                   <TableHead>Type</TableHead>
                   <TableHead>Value</TableHead>
                   <TableHead className="w-[100px]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {records?.map((record, idx) => (
+                {records.map((record, idx) => (
                   <TableRow key={`${record.name}-${idx}`}>
                     <TableCell className="font-medium">
                       {record.name}
                     </TableCell>
-                    <TableCell>
-                      <Badge variant="secondary">{record.record_type}</Badge>
-                    </TableCell>
+                    <TableCell>{record.record_type}</TableCell>
                     <TableCell className="text-muted-foreground">
                       {record.value}
                     </TableCell>
@@ -186,7 +167,11 @@ export default function DnsPage() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => handleDelete(record.name)}
+                        onClick={() => {
+                          if (window.confirm(`Delete DNS record "${record.name}"?`)) {
+                            deleteMutation.mutate(record.name);
+                          }
+                        }}
                         disabled={deleteMutation.isPending}
                       >
                         <Trash2 className="h-4 w-4 text-destructive" />
