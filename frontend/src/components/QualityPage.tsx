@@ -147,44 +147,39 @@ const QualityMetrics = ({ clients }: { clients: ClientWithQuality[] }) => {
   return (
     <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4 mb-6">
       <StatCard
-        label="Avg Quality Score"
+        title="Avg Quality Score"
         value={`${avgScore} (${getQualityText(avgScore)})`}
-        color="blue"
-        valueColor={getQualityColor(avgScore)}
         icon={
-          <svg className="h-6 w-6" style={{ color: getQualityColor(avgScore) }} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
         }
       />
       <StatCard
-        label="Clients Monitored"
+        title="Clients Monitored"
         value={`${clients.length}`}
-        color="blue"
         icon={
-          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
           </svg>
         }
       />
       <StatCard
-        label="Warnings"
+        title="Warnings"
         value={`${warningCount}`}
-        color="yellow"
-        valueColor="text-yellow-600 dark:text-yellow-400"
+        trend="down"
         icon={
-          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
           </svg>
         }
       />
       <StatCard
-        label="Critical"
+        title="Critical"
         value={`${criticalCount}`}
-        color="red"
-        valueColor="text-red-600 dark:text-red-400"
+        trend="down"
         icon={
-          <svg className="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
         }
