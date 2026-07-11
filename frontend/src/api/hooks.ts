@@ -137,7 +137,7 @@ export function useTrojanConfig() {
 export function useUpdateTrojanConfig() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (config: { enabled: boolean; port: number }) =>
+    mutationFn: (config: { enabled: boolean; port: number; fallback?: string }) =>
       updateTrojanConfig(config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['trojan-config'] });
