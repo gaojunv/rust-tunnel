@@ -110,7 +110,7 @@ impl TestHarness {
 
         // Wait for API health so tests know the server is ready.
         let health_base = api_base.clone();
-        wait_until("api health", || {
+        let health_result = wait_until("api health", || {
             let base = health_base.clone();
             async move {
                 let client = reqwest::Client::builder()
@@ -125,8 +125,17 @@ impl TestHarness {
                 }
             }
         })
-        .await
-        .expect("api never became healthy");
+        .await;
+
+        if health_result.is_err() {
+            // Surface whichever background task died, so a bind failure
+            // doesn't masquerade as a slow start.
+            let server_finished = server_task.is_finished();
+            let api_finished = api_task.is_finished();
+            panic!(
+                "api never became healthy (server_task.is_finished={server_finished}, api_task.is_finished={api_finished})"
+            );
+        }
 
         Self {
             _tempdir: tempdir,
@@ -174,19 +183,36 @@ impl TestHarness {
     /// Convenience: assert that at least `at_least` clients are registered via /api/clients.
     /// `api` must already be authenticated if the harness has a password.
     pub async fn wait_client_count(&self, api: &ApiClient, at_least: usize) -> Result<(), String> {
-        wait_until("client registered", || async {
-            let (status, body) = api.get_json("/api/clients").await;
-            if !status.is_success() {
-                return None;
-            }
-            let n = body.as_array().map(|a| a.len()).unwrap_or(0);
-            if n >= at_least {
-                Some(())
-            } else {
-                None
+        // Track the last non-2xx status so an unauthenticated caller against
+        // a password-protected harness gets a diagnostic message instead of
+        // a generic "client registered" timeout.
+        let last_status = std::sync::Arc::new(std::sync::Mutex::new(None::<reqwest::StatusCode>));
+        let last_status_clone = last_status.clone();
+        let result = wait_until("client registered", || {
+            let last_status = last_status_clone.clone();
+            async move {
+                let (status, body) = api.get_json("/api/clients").await;
+                if !status.is_success() {
+                    *last_status.lock().unwrap() = Some(status);
+                    return None;
+                }
+                let n = body.as_array().map(|a| a.len()).unwrap_or(0);
+                if n >= at_least { Some(()) } else { None }
             }
         })
-        .await
+        .await;
+
+        match result {
+            Ok(v) => Ok(v),
+            Err(msg) => {
+                let seen = last_status.lock().unwrap().clone();
+                if let Some(st) = seen {
+                    Err(format!("{msg} (last /api/clients status was {st}; did you forget to login?)"))
+                } else {
+                    Err(msg)
+                }
+            }
+        }
     }
 
     pub fn api_client(&self) -> ApiClient {
