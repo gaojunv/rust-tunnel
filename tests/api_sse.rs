@@ -177,8 +177,14 @@ async fn traffic_bucket_appears_after_transfer() {
                 if port as u16 != remote_port {
                     continue;
                 }
-                let bin = item.get("total_bytes_in").and_then(|v| v.as_u64()).unwrap_or(0);
-                let bout = item.get("total_bytes_out").and_then(|v| v.as_u64()).unwrap_or(0);
+                let bin = item
+                    .get("total_bytes_in")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let bout = item
+                    .get("total_bytes_out")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 if bin > 0 && bout > 0 {
                     return Some((bin, bout));
                 }

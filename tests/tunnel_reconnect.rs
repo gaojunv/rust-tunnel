@@ -29,11 +29,17 @@ async fn client_reregisters_after_admin_disconnect() {
         }]);
 
         let api = harness.api_client();
-        harness.wait_client_count(&api, 1).await.expect("first register");
+        harness
+            .wait_client_count(&api, 1)
+            .await
+            .expect("first register");
 
         // Round-trip on original tunnel
         wait_until("port_a open", || async {
-            TcpStream::connect(("127.0.0.1", port_a)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", port_a))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("port_a never opened");
@@ -61,10 +67,16 @@ async fn client_reregisters_after_admin_disconnect() {
         }]);
 
         // Server should now see a second client registered.
-        harness.wait_client_count(&api, 2).await.expect("replacement did not register");
+        harness
+            .wait_client_count(&api, 2)
+            .await
+            .expect("replacement did not register");
 
         wait_until("port_b open", || async {
-            TcpStream::connect(("127.0.0.1", port_b)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", port_b))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("port_b never opened");
@@ -107,9 +119,7 @@ async fn heartbeat_measures_rtt() {
         // `ConnectionQuality` whose RTT is exposed as `last_rtt_ms` /
         // `avg_rtt_ms` (src/server/quality.rs:30-52).
         wait_until("rtt sample", || async {
-            let (status, body) = api
-                .get_json(&format!("/api/quality/{remote_port}"))
-                .await;
+            let (status, body) = api.get_json(&format!("/api/quality/{remote_port}")).await;
             if !status.is_success() {
                 return None;
             }
@@ -118,7 +128,11 @@ async fn heartbeat_measures_rtt() {
                 .and_then(|c| c.get("last_rtt_ms"))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            if rtt > 0.0 { Some(rtt) } else { None }
+            if rtt > 0.0 {
+                Some(rtt)
+            } else {
+                None
+            }
         })
         .await
         .expect("no RTT sample ever recorded — check heartbeat interval / field name");
@@ -164,7 +178,11 @@ async fn server_restart_survives_reregistration() {
         wait_until("ports free", || async {
             let ok1 = std::net::TcpListener::bind(("127.0.0.1", control_port)).is_ok();
             let ok2 = std::net::TcpListener::bind(("127.0.0.1", api_port)).is_ok();
-            if ok1 && ok2 { Some(()) } else { None }
+            if ok1 && ok2 {
+                Some(())
+            } else {
+                None
+            }
         })
         .await
         .expect("ports never freed");
@@ -183,10 +201,16 @@ async fn server_restart_survives_reregistration() {
             dns_name: None,
         }]);
         let api2 = harness2.api_client();
-        harness2.wait_client_count(&api2, 1).await.expect("register");
+        harness2
+            .wait_client_count(&api2, 1)
+            .await
+            .expect("register");
 
         wait_until("new port open", || async {
-            TcpStream::connect(("127.0.0.1", new_port)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", new_port))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("new port never opened");

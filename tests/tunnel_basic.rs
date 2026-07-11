@@ -36,7 +36,10 @@ async fn tunnel_forwards_bytes_bidirectionally() {
 
         // Wait for the listener to be actually bound on the exposed port.
         wait_until("exposed port open", || async {
-            TcpStream::connect(("127.0.0.1", remote_port)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", remote_port))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("exposed port never opened");
@@ -45,7 +48,9 @@ async fn tunnel_forwards_bytes_bidirectionally() {
         let mut sock = TcpStream::connect(("127.0.0.1", remote_port))
             .await
             .expect("connect exposed");
-        let payload: Vec<u8> = (0..131_072u32).map(|i| (i as u8).wrapping_mul(31)).collect();
+        let payload: Vec<u8> = (0..131_072u32)
+            .map(|i| (i as u8).wrapping_mul(31))
+            .collect();
         sock.write_all(&payload).await.expect("write");
 
         let mut recv = vec![0u8; payload.len()];
@@ -82,7 +87,10 @@ async fn tunnel_forwards_with_tls_disabled() {
         harness.wait_client_count(&api, 1).await.expect("register");
 
         wait_until("exposed port open", || async {
-            TcpStream::connect(("127.0.0.1", remote_port)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", remote_port))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("exposed port never opened");
@@ -132,12 +140,18 @@ async fn tunnel_multi_port() {
         harness.wait_client_count(&api, 1).await.expect("register");
 
         wait_until("port_a open", || async {
-            TcpStream::connect(("127.0.0.1", port_a)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", port_a))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("port_a never opened");
         wait_until("port_b open", || async {
-            TcpStream::connect(("127.0.0.1", port_b)).await.ok().map(|_| ())
+            TcpStream::connect(("127.0.0.1", port_b))
+                .await
+                .ok()
+                .map(|_| ())
         })
         .await
         .expect("port_b never opened");
