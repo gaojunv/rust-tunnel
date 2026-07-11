@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { useQuery } from 'react-query';
+import { useQuery } from '@tanstack/react-query';
 import { getTrojanConfig, getTrojanStats, getTrojanQuality } from '../api/client';
 import type { TrojanQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
@@ -76,23 +76,23 @@ export const TrojanPage = () => {
     setTimeRange(range);
   }, []);
 
-  const { data: config, isLoading: configLoading } = useQuery(
-    'trojan-config',
-    getTrojanConfig,
-    { refetchInterval: 5000 }
-  );
+  const { data: config, isLoading: configLoading } = useQuery({
+    queryKey: ['trojan-config'],
+    queryFn: getTrojanConfig,
+    refetchInterval: 5000,
+  });
 
-  const { data: stats, isLoading: statsLoading } = useQuery(
-    'trojan-stats',
-    getTrojanStats,
-    { refetchInterval: 5000 }
-  );
+  const { data: stats, isLoading: statsLoading } = useQuery({
+    queryKey: ['trojan-stats'],
+    queryFn: getTrojanStats,
+    refetchInterval: 5000,
+  });
 
-  const { data: qualityList = [] } = useQuery<TrojanQuality[]>(
-    'trojan-quality',
-    getTrojanQuality,
-    { refetchInterval: 5000 }
-  );
+  const { data: qualityList = [] } = useQuery<TrojanQuality[]>({
+    queryKey: ['trojan-quality'],
+    queryFn: getTrojanQuality,
+    refetchInterval: 5000,
+  });
 
   if (configLoading || statsLoading) {
     return (

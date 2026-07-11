@@ -1,4 +1,4 @@
-import { useMutation } from 'react-query';
+import { useMutation } from '@tanstack/react-query';
 import { logout } from '../api/client';
 import { ThemeToggle } from './shared/ThemeToggle';
 
@@ -9,7 +9,8 @@ interface NavbarProps {
 }
 
 export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
-  const logoutMutation = useMutation(logout, {
+  const logoutMutation = useMutation({
+    mutationFn: logout,
     onSuccess: () => {
       onLogout();
     },
@@ -104,7 +105,7 @@ export const Navbar = ({ onLogout, activeTab, onTabChange }: NavbarProps) => {
             <ThemeToggle />
             <button
               onClick={handleLogout}
-              disabled={logoutMutation.isLoading}
+              disabled={logoutMutation.isPending}
               className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium disabled:opacity-50 dark:bg-slate-700 dark:hover:bg-slate-600"
             >
               Logout
