@@ -729,7 +729,7 @@ pub struct AddDnsRecordRequest {
 }
 
 /// Request body for PUT /api/acme/config
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct UpdateAcmeConfigRequest {
     enabled: Option<bool>,
     server_url: Option<String>,

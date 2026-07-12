@@ -98,7 +98,7 @@ pub struct AcmeConfigInfo {
 }
 
 /// Full ACME configuration for API access
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AcmeFullConfig {
     pub enabled: bool,
     pub server_url: String,
@@ -108,6 +108,21 @@ pub struct AcmeFullConfig {
     pub renewal_check_interval: u64,
     pub renewal_days_before_expiry: u64,
     pub tos_agreed: bool,
+}
+
+impl Default for AcmeFullConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+            email: None,
+            cert_dir: "./data/certs".to_string(),
+            auto_renew: true,
+            renewal_check_interval: 24,
+            renewal_days_before_expiry: 30,
+            tos_agreed: false,
+        }
+    }
 }
 
 /// Global server state shared between all tasks
@@ -172,16 +187,7 @@ impl ServerState {
             listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             acme_client: None,
             acme_config: None,
-            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig {
-                enabled: false,
-                server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
-                email: None,
-                cert_dir: "./data/certs".to_string(),
-                auto_renew: true,
-                renewal_check_interval: 24,
-                renewal_days_before_expiry: 30,
-                tos_agreed: false,
-            })),
+            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
         }
     }
 
@@ -203,16 +209,7 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db),
             acme_client: None,
             acme_config: None,
-            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig {
-                enabled: false,
-                server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
-                email: None,
-                cert_dir: "./data/certs".to_string(),
-                auto_renew: true,
-                renewal_check_interval: 24,
-                renewal_days_before_expiry: 30,
-                tos_agreed: false,
-            })),
+            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
         }
     }
 
