@@ -1958,6 +1958,12 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
                 "enabled": false,
                 "server_url": null,
                 "cert_dir": null,
+                "consumers": {
+                    "api_tls": false,
+                    "trojan": false,
+                    "control_tls": true,
+                    "reverse_proxy": false,
+                },
             }))
             .into_response();
         }
@@ -1971,11 +1977,20 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
         None => 0,
     };
 
+    let api_tls = state.server_state.cert_manager.is_some();
+    let trojan = !state.server_state.get_trojan_ports().await.is_empty();
+
     Json(serde_json::json!({
         "enabled": config.enabled,
         "server_url": config.server_url,
         "cert_dir": config.cert_dir,
         "certificate_count": cert_count,
+        "consumers": {
+            "api_tls": api_tls,
+            "trojan": trojan,
+            "control_tls": true,
+            "reverse_proxy": false,
+        },
     }))
     .into_response()
 }
