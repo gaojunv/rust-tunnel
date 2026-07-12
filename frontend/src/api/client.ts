@@ -227,18 +227,18 @@ export const deleteDnsRecord = async (name: string): Promise<void> => {
 
 // Reverse Proxy API
 export const getProxyRules = async (): Promise<ProxyRule[]> => {
-  const response = await api.get<ProxyRule[]>('/proxy/rules');
-  return response.data;
+  const response = await api.get<{ rules: ProxyRule[] }>('/proxy/rules');
+  return response.data.rules;
 };
 
 export const createProxyRule = async (data: CreateProxyRuleRequest): Promise<ProxyRule> => {
-  const response = await api.post<ProxyRule>('/proxy/rules', data);
-  return response.data;
+  const response = await api.post<{ rule: ProxyRule }>('/proxy/rules', data);
+  return response.data.rule;
 };
 
 export const updateProxyRule = async (id: string, data: UpdateProxyRuleRequest): Promise<ProxyRule> => {
-  const response = await api.put<ProxyRule>(`/proxy/rules/${id}`, data);
-  return response.data;
+  const response = await api.put<{ rule: ProxyRule }>(`/proxy/rules/${id}`, data);
+  return response.data.rule;
 };
 
 export const deleteProxyRule = async (id: string): Promise<void> => {
