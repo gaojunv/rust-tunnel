@@ -1,0 +1,43 @@
+import { useState } from 'react';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { Button } from '@/components/ui/button';
+import { Plus } from 'lucide-react';
+import { useAcmeCertificates, useAcmeStatus } from '@/api/hooks';
+import { AcmeConfigCard } from '@/components/acme/AcmeConfigCard';
+import { AcmeCertificateTable } from '@/components/acme/AcmeCertificateTable';
+import { AcmeRequestDialog } from '@/components/acme/AcmeRequestDialog';
+
+export default function AcmePage() {
+  const { data: certificates, isLoading: certsLoading } = useAcmeCertificates();
+  const { data: status } = useAcmeStatus();
+  const [requestOpen, setRequestOpen] = useState(false);
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title="ACME Certificates"
+        description="Manage automatic TLS certificates via ACME protocol"
+      >
+        <Button onClick={() => setRequestOpen(true)} disabled={!status?.enabled}>
+          <Plus className="mr-2 h-4 w-4" />
+          Request Certificate
+        </Button>
+      </PageHeader>
+
+      <AcmeConfigCard />
+
+      {!status?.enabled ? (
+        <div className="rounded-md border p-8 text-center text-muted-foreground">
+          ACME is not enabled. Please configure and enable ACME first.
+        </div>
+      ) : (
+        <AcmeCertificateTable
+          certificates={certificates ?? []}
+          isLoading={certsLoading}
+        />
+      )}
+
+      <AcmeRequestDialog open={requestOpen} onOpenChange={setRequestOpen} />
+    </div>
+  );
+}
