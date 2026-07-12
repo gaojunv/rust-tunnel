@@ -1,23 +1,7 @@
-import { useState, useEffect } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
-import { Switch } from '@/components/ui/switch';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
-import {
-  useShadowsocksConfig,
-  useUpdateShadowsocksConfig,
-  useShadowsocksStats,
-  useShadowsocksQuality,
-} from '@/api/hooks';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useShadowsocksConfig, useShadowsocksStats, useShadowsocksQuality } from '@/api/hooks';
 import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
 import {
   LineChart,
@@ -31,30 +15,9 @@ import {
 } from 'recharts';
 
 export default function ShadowsocksPage() {
-  const { data: config, isLoading: configLoading } = useShadowsocksConfig();
+  const { data: config } = useShadowsocksConfig();
   const { data: stats } = useShadowsocksStats();
   const { data: qualityData } = useShadowsocksQuality();
-  const updateConfig = useUpdateShadowsocksConfig();
-
-  const [enabled, setEnabled] = useState(false);
-  const [port, setPort] = useState('');
-  const [cipher, setCipher] = useState('aes-256-gcm');
-
-  useEffect(() => {
-    if (config) {
-      setEnabled(config.enabled ?? false);
-      setPort(config.port?.toString() ?? '');
-      setCipher(config.cipher ?? 'aes-256-gcm');
-    }
-  }, [config]);
-
-  const handleSave = () => {
-    updateConfig.mutate({
-      enabled,
-      port: parseInt(port, 10),
-      cipher,
-    });
-  };
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 B';
@@ -64,7 +27,6 @@ export default function ShadowsocksPage() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Build chart data from quality history
   const qualityHistory = qualityData?.[0]?.history ?? [];
   const chartData = qualityHistory.map((sample) => ({
     timestamp: sample.timestamp,
@@ -79,69 +41,14 @@ export default function ShadowsocksPage() {
     <div className="space-y-6">
       <PageHeader
         title="Shadowsocks"
-        description="Configure and monitor the Shadowsocks proxy server"
+        description="Monitor the Shadowsocks proxy server"
       />
-
-      {/* Configuration Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Configuration</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {configLoading ? (
-            <div className="text-center py-8 text-muted-foreground">
-              Loading...
-            </div>
-          ) : (
-            <>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium">Enable Shadowsocks</div>
-                  <div className="text-sm text-muted-foreground">
-                    Start the Shadowsocks proxy server
-                  </div>
-                </div>
-                <Switch checked={enabled} onCheckedChange={setEnabled} />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Port</label>
-                <Input
-                  type="number"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  placeholder="8388"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Cipher</label>
-                <Select value={cipher} onValueChange={setCipher}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="aes-256-gcm">AES-256-GCM</SelectItem>
-                    <SelectItem value="chacha20-ietf-poly1305">
-                      ChaCha20-IETF-Poly1305
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <Button onClick={handleSave} disabled={updateConfig.isPending}>
-                {updateConfig.isPending ? 'Saving...' : 'Save Configuration'}
-              </Button>
-            </>
-          )}
-        </CardContent>
-      </Card>
 
       {/* Stats */}
       <div className="grid gap-4 md:grid-cols-3">
         <StatCard
           title="Status"
-          value={enabled ? 'Active' : 'Inactive'}
+          value={config?.enabled ? 'Active' : 'Inactive'}
           icon={<Shield className="h-4 w-4" />}
         />
         <StatCard

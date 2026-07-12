@@ -1,16 +1,7 @@
-import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
-import { Switch } from '@/components/ui/switch';
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
-import {
-  useTrojanConfig,
-  useUpdateTrojanConfig,
-  useTrojanStats,
-  useTrojanQuality,
-} from '@/api/hooks';
+import { useTrojanConfig, useTrojanStats, useTrojanQuality } from '@/api/hooks';
 import {
   Shield,
   ArrowDown,
@@ -31,30 +22,9 @@ import {
 } from 'recharts';
 
 export default function TrojanPage() {
-  const { data: config, isLoading: configLoading } = useTrojanConfig();
+  const { data: config } = useTrojanConfig();
   const { data: stats } = useTrojanStats();
   const { data: qualityData } = useTrojanQuality();
-  const updateConfig = useUpdateTrojanConfig();
-
-  const [enabled, setEnabled] = useState(false);
-  const [port, setPort] = useState('');
-  const [fallback, setFallback] = useState('');
-
-  useEffect(() => {
-    if (config) {
-      setEnabled(config.enabled ?? false);
-      setPort(config.port?.toString() ?? '');
-      setFallback(config.fallback ?? '');
-    }
-  }, [config]);
-
-  const handleSave = () => {
-    updateConfig.mutate({
-      enabled,
-      port: parseInt(port, 10),
-      fallback: fallback || undefined,
-    });
-  };
 
   const formatBytes = (bytes: number) => {
     if (bytes === 0) return '0 B';
@@ -64,7 +34,6 @@ export default function TrojanPage() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Build chart data from quality history
   const qualityHistory = qualityData?.[0]?.history ?? [];
   const chartData = qualityHistory.map((sample) => ({
     timestamp: sample.timestamp,
@@ -79,66 +48,14 @@ export default function TrojanPage() {
     <div className="space-y-6">
       <PageHeader
         title="Trojan"
-        description="Configure and monitor the Trojan proxy server"
+        description="Monitor the Trojan proxy server"
       />
-
-      {/* Configuration Card */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Configuration</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {configLoading ? (
-            <div className="text-center py-8 text-muted-foreground">
-              Loading...
-            </div>
-          ) : (
-            <>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="font-medium">Enable Trojan</div>
-                  <div className="text-sm text-muted-foreground">
-                    Start the Trojan proxy server
-                  </div>
-                </div>
-                <Switch checked={enabled} onCheckedChange={setEnabled} />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Port</label>
-                <Input
-                  type="number"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  placeholder="443"
-                />
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Fallback</label>
-                <Input
-                  value={fallback}
-                  onChange={(e) => setFallback(e.target.value)}
-                  placeholder="127.0.0.1:80"
-                />
-                <p className="text-xs text-muted-foreground">
-                  Address to redirect traffic to when authentication fails
-                </p>
-              </div>
-
-              <Button onClick={handleSave} disabled={updateConfig.isPending}>
-                {updateConfig.isPending ? 'Saving...' : 'Save Configuration'}
-              </Button>
-            </>
-          )}
-        </CardContent>
-      </Card>
 
       {/* Stats */}
       <div className="grid gap-4 md:grid-cols-4">
         <StatCard
           title="Status"
-          value={enabled ? 'Active' : 'Inactive'}
+          value={config?.enabled ? 'Active' : 'Inactive'}
           icon={<Shield className="h-4 w-4" />}
         />
         <StatCard
