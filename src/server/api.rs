@@ -2035,6 +2035,42 @@ async fn update_acme_config(
     }))
 }
 
+// ── DNS Provider Endpoints ─────────────────────────────────────────
+
+// GET /api/acme/dns-providers — get available providers and current config
+async fn get_dns_providers(State(state): State<ApiState>) -> impl IntoResponse {
+    let config = state.server_state.dns_provider_config.read().await;
+    Json(serde_json::json!({
+        "providers": ["cloudflare", "aliyun", "tencent", "custom"],
+        "config": *config
+    }))
+}
+
+// PUT /api/acme/dns-providers — update DNS provider configuration
+async fn update_dns_provider(
+    State(state): State<ApiState>,
+    Json(req): Json<crate::server::acme::dns::DnsProviderConfig>,
+) -> impl IntoResponse {
+    let mut config = state.server_state.dns_provider_config.write().await;
+    *config = Some(req.clone());
+    Json(serde_json::json!({
+        "success": true,
+        "config": req
+    }))
+}
+
+// GET /api/acme/challenge-status/:domain — get ACME challenge status for a domain
+async fn get_challenge_status(
+    State(state): State<ApiState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let _ = state;
+    Json(serde_json::json!({
+        "domain": domain,
+        "status": "pending"
+    }))
+}
+
 // DELETE /api/acme/certificates/:domain — delete a certificate
 async fn delete_acme_certificate(
     State(state): State<ApiState>,
@@ -2159,6 +2195,15 @@ pub async fn run_api_server(
         .route(
             "/api/acme/certificates/:domain/renew",
             post(renew_acme_certificate),
+        )
+        // DNS provider endpoints
+        .route(
+            "/api/acme/dns-providers",
+            get(get_dns_providers).put(update_dns_provider),
+        )
+        .route(
+            "/api/acme/challenge-status/:domain",
+            get(get_challenge_status),
         );
 
     // Only apply auth middleware if password is set

@@ -163,6 +163,9 @@ pub struct ServerState {
     pub acme_full_config: Arc<RwLock<AcmeFullConfig>>,
     /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
     pub cert_manager: Option<std::sync::Arc<crate::server::acme::manager::CertificateManager>>,
+    /// DNS provider configuration for ACME DNS-01 challenges
+    pub dns_provider_config:
+        Arc<RwLock<Option<crate::server::acme::dns::DnsProviderConfig>>>,
 }
 
 impl Default for ServerState {
@@ -192,6 +195,7 @@ impl ServerState {
             acme_config: None,
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
+            dns_provider_config: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -215,6 +219,7 @@ impl ServerState {
             acme_config: None,
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
+            dns_provider_config: Arc::new(RwLock::new(None)),
         }
     }
 
