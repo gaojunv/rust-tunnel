@@ -1,8 +1,21 @@
+use super::storage::CertificateStorage;
 use super::{AcmeState, CertificateMetadata, CertificateStatus};
 use anyhow::{Context, Result};
+use chrono::Utc;
+use instant_acme::{
+    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+};
+use rcgen::{Certificate as RcgenCert, CertificateParams, KeyPair};
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use x509_parser::prelude::*;
+
+/// Challenge poll interval
+const CHALLENGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Maximum time to wait for challenge validation
+const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// ACME client for certificate management
 pub struct AcmeClient {
@@ -10,20 +23,34 @@ pub struct AcmeClient {
     server_url: String,
     cert_dir: String,
     email: Option<String>,
+    /// The ACME account (loaded or created during initialization)
+    account: RwLock<Option<Account>>,
+    /// Saved account credentials for persistence
+    credentials: RwLock<Option<AccountCredentials>>,
 }
 
 impl AcmeClient {
     /// Create a new ACME client
-    pub fn new(state: AcmeState, server_url: String, cert_dir: String, email: Option<String>) -> Self {
+    pub fn new(
+        state: AcmeState,
+        server_url: String,
+        cert_dir: String,
+        email: Option<String>,
+    ) -> Self {
         Self {
             state,
             server_url,
             cert_dir,
             email,
+            account: RwLock::new(None),
+            credentials: RwLock::new(None),
         }
     }
 
     /// Initialize the ACME client
+    ///
+    /// Creates the certificate directory if needed, then either loads existing
+    /// account credentials from disk or registers a new account with the ACME server.
     pub async fn initialize(&self) -> Result<()> {
         info!("Initializing ACME client with server: {}", self.server_url);
 
@@ -32,6 +59,52 @@ impl AcmeClient {
         if !cert_dir.exists() {
             std::fs::create_dir_all(cert_dir)
                 .context("Failed to create certificate directory")?;
+        }
+
+        // Try to load existing account credentials
+        let account_path = cert_dir.join("account.json");
+        if account_path.exists() {
+            let data = std::fs::read_to_string(&account_path)
+                .context("Failed to read account credentials file")?;
+            let creds: AccountCredentials =
+                serde_json::from_str(&data).context("Failed to parse account credentials")?;
+
+            // Re-parse credentials for from_credentials since AccountCredentials doesn't implement Clone
+            let creds_for_restore: AccountCredentials =
+                serde_json::from_str(&data).context("Failed to parse account credentials for restore")?;
+
+            let account = Account::from_credentials(creds_for_restore)
+                .await
+                .context("Failed to restore ACME account from saved credentials")?;
+
+            info!("Restored existing ACME account: {}", account.id());
+            *self.account.write().await = Some(account);
+            *self.credentials.write().await = Some(creds);
+        } else {
+            // Register new account with the ACME server
+            let contact_email = self.email.as_deref().unwrap_or("noreply@example.com");
+            let contact_entry = format!("mailto:{contact_email}");
+
+            let new_account = NewAccount {
+                contact: &[&contact_entry],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            };
+
+            let (account, credentials) =
+                Account::create(&new_account, &self.server_url, None)
+                    .await
+                    .context("Failed to register new ACME account")?;
+
+            // Save credentials to disk
+            let creds_json = serde_json::to_string_pretty(&credentials)
+                .context("Failed to serialize account credentials")?;
+            std::fs::write(&account_path, creds_json)
+                .context("Failed to save account credentials to disk")?;
+
+            info!("Registered new ACME account: {}", account.id());
+            *self.account.write().await = Some(account);
+            *self.credentials.write().await = Some(credentials);
         }
 
         Ok(())
@@ -49,7 +122,16 @@ impl AcmeClient {
             }
         }
 
-        // Create certificate metadata
+        // Ensure we have an ACME account
+        let account = {
+            let guard = self.account.read().await;
+            guard
+                .as_ref()
+                .context("ACME account not initialized. Call initialize() first.")?
+                .clone()
+        };
+
+        // Create certificate metadata with pending status
         let metadata = CertificateMetadata {
             domain: domain.to_string(),
             status: CertificateStatus::Pending,
@@ -59,7 +141,7 @@ impl AcmeClient {
             error: None,
         };
 
-        // Save to database
+        // Save pending status to database
         if let Some(db) = self.state.db() {
             db.save_acme_certificate(
                 domain,
@@ -74,15 +156,235 @@ impl AcmeClient {
             .await?;
         }
 
-        // TODO: Implement actual ACME protocol
-        // For now, return pending status
-        warn!("ACME certificate request not yet implemented");
+        // Create ACME order
+        let identifier = Identifier::Dns(domain.to_string());
+        let order_params = NewOrder {
+            identifiers: &[identifier],
+        };
+
+        let mut order = account
+            .new_order(&order_params)
+            .await
+            .context("Failed to create ACME order")?;
+
+        info!("Created ACME order for {}", domain);
+
+        // Process authorizations and set up HTTP-01 challenges
+        let authorizations = order
+            .authorizations()
+            .await
+            .context("Failed to get order authorizations")?;
+
+        for auth in &authorizations {
+            // Find the HTTP-01 challenge
+            let challenge = auth
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::Http01)
+                .context(format!(
+                    "No HTTP-01 challenge found for domain {}",
+                    domain
+                ))?;
+
+            // Get the key authorization response
+            let key_authorization = order.key_authorization(challenge);
+
+            // Deploy the challenge token so the challenge server can serve it
+            self.state
+                .add_challenge(challenge.token.clone(), key_authorization.as_str().to_string())
+                .await;
+
+            info!(
+                "Deployed challenge token for {}: {}",
+                domain, challenge.token
+            );
+
+            // Save challenge to database
+            if let Some(db) = self.state.db() {
+                db.save_acme_challenge(
+                    &challenge.token,
+                    domain,
+                    key_authorization.as_str(),
+                    None,
+                )
+                .await?;
+            }
+
+            // Signal to the ACME server that the challenge is ready
+            order
+                .set_challenge_ready(&challenge.url)
+                .await
+                .context("Failed to set challenge ready")?;
+
+            info!("Challenge ready for {}: {}", domain, challenge.token);
+        }
+
+        // Poll order status until Ready or Invalid
+        let deadline = tokio::time::Instant::now() + CHALLENGE_POLL_TIMEOUT;
+        let _order_status = loop {
+            if tokio::time::Instant::now() >= deadline {
+                // Clean up challenges on timeout
+                for auth in &authorizations {
+                    for challenge in &auth.challenges {
+                        if challenge.r#type == ChallengeType::Http01 {
+                            self.state.remove_challenge(&challenge.token).await;
+                        }
+                    }
+                }
+                anyhow::bail!(
+                    "Challenge validation timed out for domain {} after {:?}",
+                    domain,
+                    CHALLENGE_POLL_TIMEOUT
+                );
+            }
+
+            tokio::time::sleep(CHALLENGE_POLL_INTERVAL).await;
+
+            let state = order.refresh().await.context("Failed to refresh order")?;
+            let status = state.status;
+
+            match status {
+                OrderStatus::Ready => {
+                    info!("Order ready for finalization: {}", domain);
+                    break status;
+                }
+                OrderStatus::Invalid => {
+                    let error_detail = state
+                        .error
+                        .as_ref()
+                        .map(|e| e.detail.clone().unwrap_or_default())
+                        .unwrap_or_default();
+
+                    // Clean up challenges
+                    for auth in &authorizations {
+                        for challenge in &auth.challenges {
+                            if challenge.r#type == ChallengeType::Http01 {
+                                self.state.remove_challenge(&challenge.token).await;
+                            }
+                        }
+                    }
+
+                    // Update database with error
+                    if let Some(db) = self.state.db() {
+                        db.update_acme_certificate_status(domain, "failed", Some(&error_detail))
+                            .await?;
+                    }
+
+                    anyhow::bail!(
+                        "ACME order became invalid for domain {}: {}",
+                        domain,
+                        error_detail
+                    );
+                }
+                _ => {
+                    // Still pending or processing, keep polling
+                    continue;
+                }
+            }
+        };
+
+        // Generate CSR using rcgen
+        let key_pair =
+            KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).context("Failed to generate key pair")?;
+        let params = CertificateParams::new(vec![domain.to_string()]);
+        let cert = RcgenCert::from_params(params).context("Failed to create certificate from params")?;
+        let csr_der = cert
+            .serialize_request_der()
+            .context("Failed to serialize CSR")?;
+
+        // Finalize the order with the CSR
+        order
+            .finalize(&csr_der)
+            .await
+            .context("Failed to finalize ACME order")?;
+
+        info!("Finalized ACME order for {}", domain);
+
+        // Download the certificate chain
+        let cert_chain = order
+            .certificate()
+            .await
+            .context("Failed to download certificate")?
+            .context("Certificate not yet available after finalization")?;
+
+        // Parse the certificate to get expiry date
+        let expires_at = parse_certificate_expiry(&cert_chain)
+            .context("Failed to parse issued certificate")?;
+
+        // Split the certificate chain into cert and chain PEM
+        let (cert_pem, chain_pem) = split_certificate_chain(&cert_chain);
+
+        // Serialize the private key
+        let key_pem = key_pair.serialize_pem();
+
+        // Save certificate files via CertificateStorage
+        let storage = CertificateStorage::new(&self.cert_dir);
+        storage
+            .initialize()
+            .context("Failed to initialize certificate storage")?;
+        storage
+            .save_certificate(domain, &cert_pem, &key_pem, Some(&chain_pem))
+            .context("Failed to save certificate files")?;
+
+        // Update in-memory certificate cache
+        {
+            let mut certs = self.state.certificates.write().await;
+            certs.insert(domain.to_string(), cert_chain.clone());
+        }
+
+        // Clean up challenge tokens
+        for auth in &authorizations {
+            for challenge in &auth.challenges {
+                if challenge.r#type == ChallengeType::Http01 {
+                    self.state.remove_challenge(&challenge.token).await;
+                    // Also clean up from database
+                    if let Some(db) = self.state.db() {
+                        let _ = db.delete_acme_challenge(&challenge.token).await;
+                    }
+                }
+            }
+        }
+
+        let now = Utc::now();
+
+        // Update database with active certificate
+        if let Some(db) = self.state.db() {
+            db.save_acme_certificate(
+                domain,
+                "active",
+                Some(&cert_pem),
+                Some(&key_pem),
+                Some(&chain_pem),
+                Some(now),
+                Some(expires_at),
+                true,
+            )
+            .await?;
+        }
+
+        info!(
+            "Certificate issued for {} (expires: {})",
+            domain, expires_at
+        );
+
+        // Build and return metadata
+        let metadata = CertificateMetadata {
+            domain: domain.to_string(),
+            status: CertificateStatus::Active,
+            issued_at: Some(now.to_rfc3339()),
+            expires_at: Some(expires_at.to_rfc3339()),
+            auto_renew: true,
+            error: None,
+        };
 
         Ok(metadata)
     }
 
     /// Get certificate metadata for a domain
-    pub async fn get_certificate_metadata(&self, domain: &str) -> Result<Option<CertificateMetadata>> {
+    pub async fn get_certificate_metadata(
+        &self,
+        domain: &str,
+    ) -> Result<Option<CertificateMetadata>> {
         if let Some(db) = self.state.db() {
             if let Some(record) = db.get_acme_certificate(domain).await? {
                 return Ok(Some(CertificateMetadata {
@@ -140,7 +442,6 @@ impl AcmeClient {
             db.update_acme_certificate_renewal_attempt(domain).await?;
         }
 
-        // TODO: Implement actual renewal
         self.request_certificate(domain).await
     }
 
@@ -150,6 +451,18 @@ impl AcmeClient {
 
         if let Some(db) = self.state.db() {
             db.delete_acme_certificate(domain).await?;
+        }
+
+        // Also remove from in-memory cache
+        {
+            let mut certs = self.state.certificates.write().await;
+            certs.remove(domain);
+        }
+
+        // Delete certificate files from disk
+        let storage = CertificateStorage::new(&self.cert_dir);
+        if let Err(e) = storage.delete_certificate(domain) {
+            warn!("Failed to delete certificate files for {}: {}", domain, e);
         }
 
         Ok(())
@@ -194,6 +507,60 @@ pub fn start_renewal_task(
             }
         }
     })
+}
+
+/// Parse a PEM certificate chain and extract the expiry date of the first (leaf) certificate
+fn parse_certificate_expiry(cert_chain_pem: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    // Parse the PEM data
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_chain_pem.as_bytes())
+        .context("Failed to parse certificate PEM")?;
+
+    // Parse the DER-encoded certificate
+    let (_, cert) =
+        X509Certificate::from_der(&pem.contents).context("Failed to parse certificate DER")?;
+
+    // Extract the expiry date (x509-parser returns time::OffsetDateTime, convert to chrono)
+    let not_after = cert.validity.not_after.to_datetime();
+    let ts = not_after.unix_timestamp();
+    let naive = chrono::DateTime::from_timestamp(ts, 0)
+        .context("Failed to create DateTime from timestamp")?;
+
+    Ok(naive)
+}
+
+/// Split a PEM certificate chain into the leaf certificate and the remaining chain
+fn split_certificate_chain(cert_chain_pem: &str) -> (String, String) {
+    let mut certs = Vec::new();
+    let mut current_cert = String::new();
+    let mut in_cert = false;
+
+    for line in cert_chain_pem.lines() {
+        if line.contains("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+            current_cert.clear();
+            current_cert.push_str(line);
+            current_cert.push('\n');
+        } else if line.contains("-----END CERTIFICATE-----") {
+            current_cert.push_str(line);
+            current_cert.push('\n');
+            certs.push(current_cert.clone());
+            current_cert.clear();
+            in_cert = false;
+        } else if in_cert {
+            current_cert.push_str(line);
+            current_cert.push('\n');
+        }
+    }
+
+    match certs.len() {
+        0 => (cert_chain_pem.to_string(), String::new()),
+        1 => (certs[0].clone(), String::new()),
+        _ => {
+            let leaf = certs[0].clone();
+            let chain: String = certs[1..].join("");
+            (leaf, chain)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,7 +696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_certificate_pending() {
+    async fn test_request_certificate_no_account() {
         let db = Database::new(":memory:").await.unwrap();
         let state = AcmeState::with_db(db);
         let client = AcmeClient::new(
@@ -339,20 +706,19 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        let metadata = client
-            .request_certificate("example.com")
-            .await
-            .unwrap();
-        assert_eq!(metadata.domain, "example.com");
-        assert_eq!(metadata.status, CertificateStatus::Pending);
-        assert!(metadata.auto_renew);
-        assert!(metadata.issued_at.is_none());
-        assert!(metadata.expires_at.is_none());
-        assert!(metadata.error.is_none());
+        // Should fail because account is not initialized
+        let result = client.request_certificate("example.com").await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ACME account not initialized")
+        );
     }
 
     #[tokio::test]
-    async fn test_request_certificate_with_db_persists() {
+    async fn test_request_certificate_with_db_persists_pending() {
         let db = Database::new(":memory:").await.unwrap();
         let state = AcmeState::with_db(db);
         let client = AcmeClient::new(
@@ -362,12 +728,22 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        // Request a certificate
-        let metadata = client
-            .request_certificate("example.com")
-            .await
-            .unwrap();
-        assert_eq!(metadata.status, CertificateStatus::Pending);
+        // Insert a pending certificate directly to test persistence
+        if let Some(database) = client.state.db() {
+            database
+                .save_acme_certificate(
+                    "example.com",
+                    "pending",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
 
         // Verify it was persisted in the database
         let retrieved = client
@@ -419,7 +795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_certificate_no_db() {
+    async fn test_request_certificate_no_db_no_account() {
         let state = AcmeState::new();
         let client = AcmeClient::new(
             state,
@@ -428,12 +804,9 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        let metadata = client
-            .request_certificate("example.com")
-            .await
-            .unwrap();
-        assert_eq!(metadata.domain, "example.com");
-        assert_eq!(metadata.status, CertificateStatus::Pending);
+        // Should fail because account is not initialized
+        let result = client.request_certificate("example.com").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -477,12 +850,9 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        let metadata = client
-            .renew_certificate("example.com")
-            .await
-            .unwrap();
-        assert_eq!(metadata.domain, "example.com");
-        assert_eq!(metadata.status, CertificateStatus::Pending);
+        // Should fail because account is not initialized
+        let result = client.renew_certificate("example.com").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -496,9 +866,35 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        // Request certificates for two different domains
-        client.request_certificate("a.example.com").await.unwrap();
-        client.request_certificate("b.example.com").await.unwrap();
+        // Insert certificates directly to test listing
+        if let Some(database) = client.state.db() {
+            database
+                .save_acme_certificate(
+                    "a.example.com",
+                    "active",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            database
+                .save_acme_certificate(
+                    "b.example.com",
+                    "active",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
 
         let certs = client.list_certificates().await.unwrap();
         assert_eq!(certs.len(), 2);
@@ -519,8 +915,22 @@ mod tests {
             Some("test@example.com".to_string()),
         );
 
-        // Create a certificate
-        client.request_certificate("example.com").await.unwrap();
+        // Create a certificate record
+        if let Some(database) = client.state.db() {
+            database
+                .save_acme_certificate(
+                    "example.com",
+                    "active",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
         let certs = client.list_certificates().await.unwrap();
         assert_eq!(certs.len(), 1);
 
@@ -530,5 +940,32 @@ mod tests {
         // Verify it's gone
         let certs = client.list_certificates().await.unwrap();
         assert!(certs.is_empty());
+    }
+
+    #[test]
+    fn test_split_certificate_chain_single() {
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIB...leaf...\n-----END CERTIFICATE-----\n";
+        let (leaf, chain) = split_certificate_chain(cert);
+        assert_eq!(leaf, cert);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn test_split_certificate_chain_multiple() {
+        let chain_pem = "-----BEGIN CERTIFICATE-----\nMIIB...leaf...\n-----END CERTIFICATE-----\n\
+                         -----BEGIN CERTIFICATE-----\nMIIB...intermediate...\n-----END CERTIFICATE-----\n\
+                         -----BEGIN CERTIFICATE-----\nMIIB...root...\n-----END CERTIFICATE-----\n";
+        let (leaf, chain) = split_certificate_chain(chain_pem);
+        assert!(leaf.contains("leaf"));
+        assert!(chain.contains("intermediate"));
+        assert!(chain.contains("root"));
+        assert!(!chain.contains("leaf"));
+    }
+
+    #[test]
+    fn test_split_certificate_chain_empty() {
+        let (leaf, chain) = split_certificate_chain("");
+        assert!(leaf.is_empty());
+        assert!(chain.is_empty());
     }
 }
