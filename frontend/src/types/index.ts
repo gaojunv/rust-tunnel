@@ -305,3 +305,21 @@ export interface CertConsumers {
   control_tls: boolean;
   reverse_proxy: boolean;
 }
+
+// === Settings ===
+
+export interface GeneralSettings {
+  log_level: string;
+  reverse_proxy: ReverseProxySettings;
+}
+
+export interface ReverseProxySettings {
+  max_connections: number;
+  connection_timeout_secs: number;
+  buffer_size: number;
+}
+
+export interface DnsSettings {
+  tunnel_domain: string;
+  mesh_domain: string;
+}

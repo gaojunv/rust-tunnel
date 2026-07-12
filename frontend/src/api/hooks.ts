@@ -31,6 +31,11 @@ import {
   getDnsProviders,
   updateDnsProvider,
   getChallengeStatus,
+  getSettings,
+  getReverseProxyConfig,
+  updateReverseProxyConfig,
+  getDnsConfig,
+  updateDnsConfig,
 } from './client';
 import type {
   LoginRequest,
@@ -38,6 +43,8 @@ import type {
   UpdateProxyRuleRequest,
   UpdateAcmeConfigRequest,
   DnsProviderConfig,
+  ReverseProxySettings,
+  DnsSettings,
 } from '../types';
 
 export function useClients() {
@@ -353,5 +360,47 @@ export function useChallengeStatus(domain: string) {
 export function useLogin() {
   return useMutation({
     mutationFn: (password: string) => login({ password } as LoginRequest),
+  });
+}
+
+// Settings hooks
+export function useSettings() {
+  return useQuery({
+    queryKey: ['settings'],
+    queryFn: () => getSettings(),
+  });
+}
+
+export function useReverseProxyConfig() {
+  return useQuery({
+    queryKey: ['settings', 'reverse-proxy'],
+    queryFn: () => getReverseProxyConfig(),
+  });
+}
+
+export function useUpdateReverseProxyConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: ReverseProxySettings) => updateReverseProxyConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+}
+
+export function useDnsConfig() {
+  return useQuery({
+    queryKey: ['settings', 'dns'],
+    queryFn: () => getDnsConfig(),
+  });
+}
+
+export function useUpdateDnsConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: DnsSettings) => updateDnsConfig(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings', 'dns'] });
+    },
   });
 }

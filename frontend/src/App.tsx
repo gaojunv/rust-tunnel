@@ -12,6 +12,7 @@ import ReverseProxyPage from './pages/ReverseProxyPage';
 import AcmePage from './pages/AcmePage';
 import LogsPage from './pages/LogsPage';
 import ClientDetailPage from './pages/ClientDetailPage';
+import SettingsPage from './pages/SettingsPage';
 import AppLayout from './components/layout/AppLayout';
 import './index.css';
 
@@ -56,6 +57,7 @@ const router = createBrowserRouter([
           { path: '/acme', element: <AcmePage /> },
           { path: '/logs', element: <LogsPage /> },
           { path: '/clients/:port', element: <ClientDetailPage /> },
+          { path: '/settings', element: <SettingsPage /> },
         ],
       },
     ],

@@ -18,6 +18,7 @@ import {
   Sun,
   Moon,
   ArrowLeftRight,
+  Settings,
 } from 'lucide-react';
 import { useTheme } from '@/theme/ThemeProvider';
 
@@ -60,6 +61,7 @@ const navGroups: NavGroup[] = [
     label: 'System',
     items: [
       { label: 'Logs', icon: <FileText className="h-4 w-4" />, href: '/logs' },
+      { label: 'Settings', icon: <Settings className="h-4 w-4" />, href: '/settings' },
     ],
   },
 ];

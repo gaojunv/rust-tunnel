@@ -30,6 +30,9 @@ import type {
   UpdateAcmeConfigRequest,
   DnsProviderConfig,
   ChallengeStatus,
+  GeneralSettings,
+  ReverseProxySettings,
+  DnsSettings,
 } from '../types';
 
 const API_BASE = '/api';
@@ -302,4 +305,28 @@ export const updateDnsProvider = async (config: DnsProviderConfig): Promise<{ su
 export const getChallengeStatus = async (domain: string): Promise<ChallengeStatus> => {
   const response = await api.get(`/acme/challenge-status/${domain}`);
   return response.data;
+};
+
+// Settings API
+export const getSettings = async (): Promise<GeneralSettings> => {
+  const response = await api.get<GeneralSettings>('/settings');
+  return response.data;
+};
+
+export const getReverseProxyConfig = async (): Promise<ReverseProxySettings> => {
+  const response = await api.get<ReverseProxySettings>('/settings/reverse-proxy');
+  return response.data;
+};
+
+export const updateReverseProxyConfig = async (config: ReverseProxySettings): Promise<void> => {
+  await api.put('/settings/reverse-proxy', config);
+};
+
+export const getDnsConfig = async (): Promise<DnsSettings> => {
+  const response = await api.get<DnsSettings>('/settings/dns');
+  return response.data;
+};
+
+export const updateDnsConfig = async (config: DnsSettings): Promise<void> => {
+  await api.put('/settings/dns', config);
 };

@@ -12,6 +12,7 @@ import {
   FileText,
   Menu,
   LogOut,
+  Settings,
 } from 'lucide-react';
 
 const coreTabs = [
@@ -25,6 +26,7 @@ const coreTabs = [
 const moreItems = [
   { label: 'Trojan', icon: <Shield className="h-5 w-5" />, href: '/trojan' },
   { label: 'Logs', icon: <FileText className="h-5 w-5" />, href: '/logs' },
+  { label: 'Settings', icon: <Settings className="h-5 w-5" />, href: '/settings' },
 ];
 
 interface MobileNavProps {
