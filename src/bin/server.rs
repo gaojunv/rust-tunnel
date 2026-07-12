@@ -96,6 +96,19 @@ async fn main() -> TunnelResult<()> {
             config.acme_server_url,
             config.acme_cert_dir
         );
+
+        // Populate full ACME config for API access
+        {
+            let mut full_config = state.acme_full_config.write().await;
+            full_config.enabled = config.acme_enabled;
+            full_config.server_url = config.acme_server_url.clone();
+            full_config.email = config.acme_email.clone();
+            full_config.cert_dir = config.acme_cert_dir.clone();
+            full_config.auto_renew = config.acme_auto_renew;
+            full_config.renewal_check_interval = config.acme_renewal_check_interval;
+            full_config.renewal_days_before_expiry = config.acme_renewal_days_before_expiry;
+            full_config.tos_agreed = config.acme_tos_agreed;
+        }
     }
 
     // Split config for control and API servers

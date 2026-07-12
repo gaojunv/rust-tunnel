@@ -728,6 +728,18 @@ pub struct AddDnsRecordRequest {
     pub port: Option<u16>,
 }
 
+/// Request body for PUT /api/acme/config
+#[derive(Deserialize)]
+struct UpdateAcmeConfigRequest {
+    enabled: Option<bool>,
+    server_url: Option<String>,
+    email: Option<String>,
+    auto_renew: Option<bool>,
+    renewal_check_interval: Option<u64>,
+    renewal_days_before_expiry: Option<u64>,
+    tos_agreed: Option<bool>,
+}
+
 // Login handler
 async fn login(
     State(state): State<ApiState>,
@@ -1968,6 +1980,87 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
     .into_response()
 }
 
+// GET /api/acme/config — get ACME configuration
+async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse {
+    let config = state.server_state.acme_full_config.read().await;
+    Json(serde_json::json!({
+        "enabled": config.enabled,
+        "server_url": config.server_url,
+        "email": config.email,
+        "cert_dir": config.cert_dir,
+        "auto_renew": config.auto_renew,
+        "renewal_check_interval": config.renewal_check_interval,
+        "renewal_days_before_expiry": config.renewal_days_before_expiry,
+        "tos_agreed": config.tos_agreed,
+    }))
+}
+
+// PUT /api/acme/config — update ACME configuration
+async fn update_acme_config(
+    State(state): State<ApiState>,
+    Json(req): Json<UpdateAcmeConfigRequest>,
+) -> impl IntoResponse {
+    let mut config = state.server_state.acme_full_config.write().await;
+    if let Some(v) = req.enabled {
+        config.enabled = v;
+    }
+    if let Some(v) = req.server_url {
+        config.server_url = v;
+    }
+    if let Some(v) = req.email {
+        config.email = Some(v);
+    }
+    if let Some(v) = req.auto_renew {
+        config.auto_renew = v;
+    }
+    if let Some(v) = req.renewal_check_interval {
+        config.renewal_check_interval = v;
+    }
+    if let Some(v) = req.renewal_days_before_expiry {
+        config.renewal_days_before_expiry = v;
+    }
+    if let Some(v) = req.tos_agreed {
+        config.tos_agreed = v;
+    }
+
+    Json(serde_json::json!({
+        "enabled": config.enabled,
+        "server_url": config.server_url,
+        "email": config.email,
+        "cert_dir": config.cert_dir,
+        "auto_renew": config.auto_renew,
+        "renewal_check_interval": config.renewal_check_interval,
+        "renewal_days_before_expiry": config.renewal_days_before_expiry,
+        "tos_agreed": config.tos_agreed,
+    }))
+}
+
+// DELETE /api/acme/certificates/:domain — delete a certificate
+async fn delete_acme_certificate(
+    State(state): State<ApiState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let client = match &state.server_state.acme_client {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "ACME is not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.delete_certificate(&domain).await {
+        Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -2049,12 +2142,18 @@ pub async fn run_api_server(
         // ACME certificate management endpoints
         .route("/api/acme/status", get(get_acme_status))
         .route(
+            "/api/acme/config",
+            get(get_acme_config).put(update_acme_config),
+        )
+        .route(
             "/api/acme/certificates",
             get(list_acme_certificates),
         )
         .route(
             "/api/acme/certificates/:domain",
-            get(get_acme_certificate).post(request_acme_certificate),
+            get(get_acme_certificate)
+                .post(request_acme_certificate)
+                .delete(delete_acme_certificate),
         )
         .route(
             "/api/acme/certificates/:domain/renew",

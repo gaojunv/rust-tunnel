@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -96,6 +97,19 @@ pub struct AcmeConfigInfo {
     pub cert_dir: String,
 }
 
+/// Full ACME configuration for API access
+#[derive(Clone)]
+pub struct AcmeFullConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub email: Option<String>,
+    pub cert_dir: String,
+    pub auto_renew: bool,
+    pub renewal_check_interval: u64,
+    pub renewal_days_before_expiry: u64,
+    pub tos_agreed: bool,
+}
+
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
@@ -129,6 +143,8 @@ pub struct ServerState {
     pub acme_client: Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>,
     /// ACME configuration info (set when ACME is enabled)
     pub acme_config: Option<AcmeConfigInfo>,
+    /// Full ACME configuration for API access
+    pub acme_full_config: Arc<RwLock<AcmeFullConfig>>,
 }
 
 impl Default for ServerState {
@@ -156,6 +172,16 @@ impl ServerState {
             listener_tasks: Arc::new(Mutex::new(HashMap::new())),
             acme_client: None,
             acme_config: None,
+            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig {
+                enabled: false,
+                server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+                email: None,
+                cert_dir: "./data/certs".to_string(),
+                auto_renew: true,
+                renewal_check_interval: 24,
+                renewal_days_before_expiry: 30,
+                tos_agreed: false,
+            })),
         }
     }
 
@@ -177,6 +203,16 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db),
             acme_client: None,
             acme_config: None,
+            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig {
+                enabled: false,
+                server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+                email: None,
+                cert_dir: "./data/certs".to_string(),
+                auto_renew: true,
+                renewal_check_interval: 24,
+                renewal_days_before_expiry: 30,
+                tos_agreed: false,
+            })),
         }
     }
 
