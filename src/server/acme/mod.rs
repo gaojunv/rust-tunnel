@@ -1,8 +1,10 @@
 pub mod challenge;
 pub mod client;
+pub mod manager;
 pub mod provider;
 pub mod storage;
 
+pub use manager::{CertEvent, CertificateManager};
 pub use provider::{CertEntry, CertSource, CertificateProvider};
 
 use serde::{Deserialize, Serialize};
