@@ -1785,6 +1785,17 @@ async fn put_logs_level(
         .store(level_u8, std::sync::atomic::Ordering::Relaxed);
     tracing::info!("Log level changed to {}", body.level.to_lowercase());
 
+    // Persist to DB
+    if let Some(db) = state.server_state.db() {
+        let _ = db.save_server_setting("log_level", &body.level.to_lowercase()).await;
+    }
+
+    // Update dynamic config
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.log_level = body.level.to_lowercase();
+    }
+
     Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
 }
 
