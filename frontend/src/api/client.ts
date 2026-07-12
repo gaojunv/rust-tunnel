@@ -20,6 +20,14 @@ import type {
   MeshServiceResponse,
   DnsRecordResponse,
   AddDnsRecordRequest,
+  ProxyRule,
+  ProxyStats,
+  CreateProxyRuleRequest,
+  UpdateProxyRuleRequest,
+  AcmeStatus,
+  AcmeCertificate,
+  AcmeConfig,
+  UpdateAcmeConfigRequest,
 } from '../types';
 
 const API_BASE = '/api';
@@ -215,4 +223,64 @@ export const addDnsRecord = async (record: AddDnsRecordRequest): Promise<void> =
 
 export const deleteDnsRecord = async (name: string): Promise<void> => {
   await api.delete(`/dns/records/${encodeURIComponent(name)}`);
+};
+
+// Reverse Proxy API
+export const getProxyRules = async (): Promise<ProxyRule[]> => {
+  const response = await api.get<ProxyRule[]>('/proxy/rules');
+  return response.data;
+};
+
+export const createProxyRule = async (data: CreateProxyRuleRequest): Promise<ProxyRule> => {
+  const response = await api.post<ProxyRule>('/proxy/rules', data);
+  return response.data;
+};
+
+export const updateProxyRule = async (id: string, data: UpdateProxyRuleRequest): Promise<ProxyRule> => {
+  const response = await api.put<ProxyRule>(`/proxy/rules/${id}`, data);
+  return response.data;
+};
+
+export const deleteProxyRule = async (id: string): Promise<void> => {
+  await api.delete(`/proxy/rules/${id}`);
+};
+
+export const getProxyStats = async (): Promise<ProxyStats> => {
+  const response = await api.get<ProxyStats>('/proxy/stats');
+  return response.data;
+};
+
+// ACME API
+export const getAcmeStatus = async (): Promise<AcmeStatus> => {
+  const response = await api.get<AcmeStatus>('/acme/status');
+  return response.data;
+};
+
+export const getAcmeConfig = async (): Promise<AcmeConfig> => {
+  const response = await api.get<AcmeConfig>('/acme/config');
+  return response.data;
+};
+
+export const updateAcmeConfig = async (data: UpdateAcmeConfigRequest): Promise<AcmeConfig> => {
+  const response = await api.put<AcmeConfig>('/acme/config', data);
+  return response.data;
+};
+
+export const listAcmeCertificates = async (): Promise<AcmeCertificate[]> => {
+  const response = await api.get<{ certificates: AcmeCertificate[] }>('/acme/certificates');
+  return response.data.certificates;
+};
+
+export const requestAcmeCertificate = async (domain: string): Promise<AcmeCertificate> => {
+  const response = await api.post<{ certificate: AcmeCertificate }>(`/acme/certificates/${domain}`);
+  return response.data.certificate;
+};
+
+export const renewAcmeCertificate = async (domain: string): Promise<AcmeCertificate> => {
+  const response = await api.post<{ certificate: AcmeCertificate }>(`/acme/certificates/${domain}/renew`);
+  return response.data.certificate;
+};
+
+export const deleteAcmeCertificate = async (domain: string): Promise<void> => {
+  await api.delete(`/acme/certificates/${domain}`);
 };
