@@ -160,6 +160,8 @@ pub struct ServerState {
     pub acme_config: Option<AcmeConfigInfo>,
     /// Full ACME configuration for API access
     pub acme_full_config: Arc<RwLock<AcmeFullConfig>>,
+    /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
+    pub cert_manager: Option<std::sync::Arc<crate::server::acme::manager::CertificateManager>>,
 }
 
 impl Default for ServerState {
@@ -188,6 +190,7 @@ impl ServerState {
             acme_client: None,
             acme_config: None,
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
+            cert_manager: None,
         }
     }
 
@@ -210,6 +213,7 @@ impl ServerState {
             acme_client: None,
             acme_config: None,
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
+            cert_manager: None,
         }
     }
 
@@ -580,6 +584,14 @@ impl ServerState {
     ) {
         self.acme_client = Some(client);
         self.acme_config = Some(config);
+    }
+
+    /// Set the certificate manager for this server state
+    pub fn set_cert_manager(
+        &mut self,
+        manager: std::sync::Arc<crate::server::acme::manager::CertificateManager>,
+    ) {
+        self.cert_manager = Some(manager);
     }
 
     /// Set the DNS registry for this server state

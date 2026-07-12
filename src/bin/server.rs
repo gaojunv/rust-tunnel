@@ -97,6 +97,40 @@ async fn main() -> TunnelResult<()> {
             config.acme_cert_dir
         );
 
+        // Initialize CertificateManager
+        let cert_manager = Arc::new(
+            rust_tunnel::server::acme::manager::CertificateManager::new(&config.acme_cert_dir),
+        );
+
+        // Load existing certificates from disk
+        if let Err(e) = cert_manager.load_from_storage().await {
+            tracing::warn!("Failed to load certificates from storage: {}", e);
+        }
+
+        // Set ACME client on the certificate manager
+        if let Some(ref acme_client) = state.acme_client {
+            cert_manager
+                .set_acme_client(acme_client.clone())
+                .await;
+        }
+
+        // Start renewal task if auto-renew is enabled
+        if config.acme_auto_renew {
+            let renewal_manager = cert_manager.clone();
+            let interval = config.acme_renewal_check_interval;
+            let days_before = config.acme_renewal_days_before_expiry;
+            renewal_manager
+                .start_renewal_task(interval, days_before);
+            tracing::info!(
+                "Certificate renewal task started (interval: {}h, days before expiry: {})",
+                interval,
+                days_before
+            );
+        }
+
+        state.set_cert_manager(cert_manager);
+        tracing::info!("Certificate manager initialized (cert_dir: {})", config.acme_cert_dir);
+
         // Populate full ACME config for API access
         {
             let mut full_config = state.acme_full_config.write().await;
