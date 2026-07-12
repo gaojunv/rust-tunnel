@@ -153,9 +153,69 @@ async fn main() -> TunnelResult<()> {
     let control_state = state.clone();
     let api_state = state.clone();
 
+    // Create a watch channel for control channel TLS if TLS is enabled
+    let control_tls_rx = if config.tls {
+        let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
+            std::io::Error::other(format!("Failed to load TLS certificates for control channel: {}", e))
+        })?;
+        let tls_config = create_server_config(cert_pair).map_err(|e| {
+            std::io::Error::other(format!("Failed to create TLS config for control channel: {}", e))
+        })?;
+
+        let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
+
+        // If a cert_manager exists, subscribe to cert events and update the watch channel
+        if let Some(ref cert_manager) = state.cert_manager {
+            let mut cert_rx = cert_manager.subscribe();
+            let tx = tls_config_tx.clone();
+            let cert_manager_clone = cert_manager.clone();
+            tokio::spawn(async move {
+                use rust_tunnel::server::acme::manager::CertEvent;
+                loop {
+                    match cert_rx.recv().await {
+                        Ok(event) => match event {
+                            CertEvent::Renewed { ref domain }
+                            | CertEvent::Issued { ref domain } => {
+                                tracing::info!(
+                                    "Certificate event for control channel: {:?} for {}",
+                                    event,
+                                    domain
+                                );
+                                if let Some(new_config) =
+                                    cert_manager_clone.get_tls_server_config(domain).await
+                                {
+                                    if let Err(e) = tx.send(new_config) {
+                                        tracing::error!(
+                                            "Failed to update control channel TLS config: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Cert event subscriber lagged by {} messages", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "Cert event channel closed, stopping control channel TLS config updater"
+                            );
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
+        Some(tls_config_rx)
+    } else {
+        None
+    };
+
     // Spawn control server
     tokio::spawn(async move {
-        if let Err(e) = control::run_server(control_config, control_state).await {
+        if let Err(e) = control::run_server(control_config, control_state, control_tls_rx).await {
             tracing::error!("Control server error: {}", e);
         }
     });

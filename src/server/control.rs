@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
@@ -1646,15 +1647,22 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 }
 
 /// Start the main server
-pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResult<()> {
-    // Set up TLS if enabled
-    let tls_acceptor = if config.tls {
-        info!("TLS ENABLED - generating/loading TLS certificates");
+pub async fn run_server(
+    config: ServerConfig,
+    state: ServerState,
+    tls_config_rx: Option<watch::Receiver<Arc<rustls::server::ServerConfig>>>,
+) -> TunnelResult<()> {
+    // Set up TLS if enabled (fallback when no watch channel is provided)
+    let tls_acceptor = if tls_config_rx.is_none() && config.tls {
+        info!("TLS ENABLED - generating/loading TLS certificates (static mode)");
         let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key)
             .map_err(|e| TunnelError::Tls(format!("Failed to load TLS certificates: {}", e)))?;
         let tls_config = create_server_config(cert_pair)
             .map_err(|e| TunnelError::Tls(format!("Failed to create TLS config: {}", e)))?;
         Some(TlsAcceptor::from(tls_config))
+    } else if config.tls {
+        info!("TLS ENABLED - using dynamic certificate watch channel");
+        None
     } else {
         info!("TLS DISABLED - using plain TCP connections");
         None
@@ -1675,27 +1683,45 @@ pub async fn run_server(config: ServerConfig, state: ServerState) -> TunnelResul
         let config_clone = config.clone();
         let state_clone = state.clone();
         let tls_acceptor_clone = tls_acceptor.clone();
+        let tls_config_rx_clone = tls_config_rx.clone();
 
         tracing::debug!("New control connection from {}", addr);
 
         tokio::spawn(async move {
             // Wrap TCP stream with TLS if enabled
-            let result = match tls_acceptor_clone {
-                Some(acceptor) => {
-                    debug!("Performing TLS handshake with {}", addr);
-                    match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            debug!("TLS handshake successful with {}", addr);
-                            handle_control_connection(config_clone, state_clone, tls_stream, addr)
-                                .await
-                        }
-                        Err(e) => {
-                            warn!("TLS handshake failed with {}: {}", addr, e);
-                            return;
-                        }
+            let result = if let Some(acceptor) = tls_acceptor_clone {
+                // Static TLS mode
+                debug!("Performing TLS handshake with {}", addr);
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        debug!("TLS handshake successful with {}", addr);
+                        handle_control_connection(config_clone, state_clone, tls_stream, addr)
+                            .await
+                    }
+                    Err(e) => {
+                        warn!("TLS handshake failed with {}: {}", addr, e);
+                        return;
                     }
                 }
-                None => handle_control_connection(config_clone, state_clone, stream, addr).await,
+            } else if let Some(rx) = tls_config_rx_clone {
+                // Dynamic TLS mode - read latest config from watch channel
+                let current_config = rx.borrow().clone();
+                let tls_acceptor = TlsAcceptor::from(current_config);
+                debug!("Performing TLS handshake with {} (dynamic cert)", addr);
+                match tls_acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        debug!("TLS handshake successful with {}", addr);
+                        handle_control_connection(config_clone, state_clone, tls_stream, addr)
+                            .await
+                    }
+                    Err(e) => {
+                        warn!("TLS handshake failed with {}: {}", addr, e);
+                        return;
+                    }
+                }
+            } else {
+                // No TLS
+                handle_control_connection(config_clone, state_clone, stream, addr).await
             };
 
             if let Err(e) = result {
