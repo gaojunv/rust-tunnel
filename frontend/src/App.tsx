@@ -8,6 +8,8 @@ import MeshPage from './pages/MeshPage';
 import DnsPage from './pages/DnsPage';
 import ShadowsocksPage from './pages/ShadowsocksPage';
 import TrojanPage from './pages/TrojanPage';
+import ReverseProxyPage from './pages/ReverseProxyPage';
+import AcmePage from './pages/AcmePage';
 import LogsPage from './pages/LogsPage';
 import ClientDetailPage from './pages/ClientDetailPage';
 import AppLayout from './components/layout/AppLayout';
@@ -50,6 +52,8 @@ const router = createBrowserRouter([
           { path: '/dns', element: <DnsPage /> },
           { path: '/shadowsocks', element: <ShadowsocksPage /> },
           { path: '/trojan', element: <TrojanPage /> },
+          { path: '/proxy', element: <ReverseProxyPage /> },
+          { path: '/acme', element: <AcmePage /> },
           { path: '/logs', element: <LogsPage /> },
           { path: '/clients/:port', element: <ClientDetailPage /> },
         ],

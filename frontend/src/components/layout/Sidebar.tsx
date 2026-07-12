@@ -17,6 +17,7 @@ import {
   LogOut,
   Sun,
   Moon,
+  ArrowLeftRight,
 } from 'lucide-react';
 import { useTheme } from '@/theme/ThemeProvider';
 
@@ -49,8 +50,10 @@ const navGroups: NavGroup[] = [
   {
     label: 'Proxy',
     items: [
+      { label: 'Reverse Proxy', icon: <ArrowLeftRight className="h-4 w-4" />, href: '/proxy' },
       { label: 'Shadowsocks', icon: <Shield className="h-4 w-4" />, href: '/shadowsocks' },
       { label: 'Trojan', icon: <Shield className="h-4 w-4" />, href: '/trojan' },
+      { label: 'ACME Certs', icon: <Shield className="h-4 w-4" />, href: '/acme' },
     ],
   },
   {
