@@ -20,6 +20,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::common::DnsRecord;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
+use crate::server::acme::CertificateProvider;
 use crate::server::db::Database;
 use crate::server::reverse_proxy::{ProxyRule, ProxyStats};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -1049,14 +1050,95 @@ async fn get_shadowsocks_quality(State(state): State<ApiState>) -> Json<Vec<Shad
     Json(result)
 }
 
-// Update Shadowsocks configuration (placeholder for dynamic config)
-async fn update_shadowsocks_config(State(_state): State<ApiState>) -> impl IntoResponse {
-    // For now, return not implemented since we don't support dynamic reconfiguration yet
-    // In future: support enabling/disabling SS, changing port/cipher/password
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "Dynamic configuration not implemented yet",
-    )
+// Update Shadowsocks configuration (start/stop/modify)
+async fn update_shadowsocks_config(
+    State(state): State<ApiState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let enabled = payload["enabled"].as_bool().unwrap_or(false);
+    let port = match payload["port"].as_u64() {
+        Some(p) if p > 0 && p <= 65535 => p as u16,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid or missing port",
+            )
+                .into_response();
+        }
+    };
+    let cipher = match payload["cipher"].as_str() {
+        Some(c @ "aes-256-gcm") | Some(c @ "chacha20-ietf-poly1305") => c,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid cipher. Supported: aes-256-gcm, chacha20-ietf-poly1305",
+            )
+                .into_response();
+        }
+    };
+    let password = match payload["password"].as_str() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return (StatusCode::BAD_REQUEST, "Password required").into_response();
+        }
+    };
+
+    // Save to DB
+    if let Some(db) = state.server_state.db() {
+        if let Err(e) = db.save_shadowsocks_config(port, cipher, password, enabled).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // Update in-memory config
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.ss = Some(crate::server::dynamic_config::ShadowsocksDynamicConfig {
+            enabled,
+            port,
+            cipher: cipher.to_string(),
+            password: password.to_string(),
+        });
+    }
+
+    // Handle listener lifecycle
+    {
+        let mut abort = state.server_state.ss_listener_abort.write().await;
+        // Stop existing listener if any
+        if let Some(tx) = abort.take() {
+            let _ = tx.send(true);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        if enabled {
+            let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+            *abort = Some(abort_tx);
+            let state_clone = state.server_state.clone();
+            let ss_port = port;
+            let ss_cipher = cipher.to_string();
+            let ss_password = password.to_string();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::server::listener::start_shadowsocks_listener_with_abort(
+                        state_clone,
+                        ss_port,
+                        ss_cipher,
+                        ss_password,
+                        abort_rx,
+                    )
+                    .await
+                {
+                    tracing::error!("SS listener error: {}", e);
+                }
+            });
+        }
+    }
+
+    Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port})).into_response()
 }
 
 // Get Trojan configuration
@@ -1134,12 +1216,133 @@ async fn get_trojan_quality(State(state): State<ApiState>) -> Json<Vec<TrojanQua
     Json(result)
 }
 
-// Update Trojan configuration (placeholder for dynamic config)
-async fn update_trojan_config(State(_state): State<ApiState>) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "Dynamic configuration not implemented yet",
-    )
+// Update Trojan configuration (start/stop/modify)
+async fn update_trojan_config(
+    State(state): State<ApiState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let enabled = payload["enabled"].as_bool().unwrap_or(false);
+    let port = match payload["port"].as_u64() {
+        Some(p) if p > 0 && p <= 65535 => p as u16,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid or missing port",
+            )
+                .into_response();
+        }
+    };
+    let password = match payload["password"].as_str() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            return (StatusCode::BAD_REQUEST, "Password required").into_response();
+        }
+    };
+    let fallback = payload["fallback"].as_str().unwrap_or("127.0.0.1:80");
+
+    // Save to DB
+    if let Some(db) = state.server_state.db() {
+        if let Err(e) = db.save_trojan_config(port, password, fallback, enabled).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // Update in-memory config
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.trojan = Some(crate::server::dynamic_config::TrojanDynamicConfig {
+            enabled,
+            port,
+            password: password.to_string(),
+            fallback: fallback.to_string(),
+        });
+    }
+
+    // Handle listener lifecycle
+    {
+        let mut abort = state.server_state.trojan_listener_abort.write().await;
+        if let Some(tx) = abort.take() {
+            let _ = tx.send(true);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        if enabled {
+            // Build TLS config channel from cert_manager
+            let tls_config = if let Some(ref cert_manager) = state.server_state.cert_manager {
+                match cert_manager
+                    .get_tls_server_config("default")
+                    .await
+                {
+                    Some(config) => config,
+                    None => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "No TLS certificate available. Issue a certificate first via ACME.",
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Trojan requires TLS. No certificate manager configured.",
+                )
+                    .into_response();
+            };
+            let (tls_config_tx, tls_config_rx) = tokio::sync::watch::channel(tls_config);
+
+            // Subscribe to cert renewal events
+            if let Some(ref cert_manager) = state.server_state.cert_manager {
+                let mut cert_rx = cert_manager.subscribe();
+                let tx = tls_config_tx.clone();
+                let cert_manager_clone = cert_manager.clone();
+                tokio::spawn(async move {
+                    while let Ok(event) = cert_rx.recv().await {
+                        if let crate::server::acme::manager::CertEvent::Renewed {
+                            ref domain,
+                        }
+                        | crate::server::acme::manager::CertEvent::Issued {
+                            ref domain,
+                        } = event
+                        {
+                            if let Some(new_config) =
+                                cert_manager_clone.get_tls_server_config(domain).await
+                            {
+                                let _ = tx.send(new_config);
+                            }
+                        }
+                    }
+                });
+            }
+
+            let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+            *abort = Some(abort_tx);
+            let state_clone = state.server_state.clone();
+            let trojan_port = port;
+            let trojan_password = password.to_string();
+            let trojan_fallback = fallback.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = crate::server::listener::start_trojan_listener_with_abort(
+                    state_clone,
+                    trojan_port,
+                    trojan_password,
+                    trojan_fallback,
+                    tls_config_rx,
+                    abort_rx,
+                )
+                .await
+                {
+                    tracing::error!("Trojan listener error: {}", e);
+                }
+            });
+        }
+    }
+
+    Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port})).into_response()
 }
 
 // ── Mesh Network Endpoints ─────────────────────────────────────────
@@ -2112,6 +2315,110 @@ async fn delete_acme_certificate(
     }
 }
 
+// ── Settings Endpoints ─────────────────────────────────────────────
+
+/// Get all dynamic configuration
+async fn get_settings(State(state): State<ApiState>) -> impl IntoResponse {
+    let dc = state.server_state.dynamic_config.read().await;
+    Json(serde_json::json!({
+        "log_level": dc.log_level,
+        "shadowsocks": dc.ss,
+        "trojan": dc.trojan,
+        "reverse_proxy": dc.reverse_proxy,
+        "dns": dc.dns,
+    }))
+}
+
+/// Get reverse proxy config
+async fn get_reverse_proxy_config(State(state): State<ApiState>) -> impl IntoResponse {
+    let dc = state.server_state.dynamic_config.read().await;
+    Json(serde_json::json!(dc.reverse_proxy))
+}
+
+/// Update reverse proxy config
+async fn update_reverse_proxy_config(
+    State(state): State<ApiState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let max_conn = payload["max_connections"]
+        .as_u64()
+        .unwrap_or(10000) as u32;
+    let timeout = payload["connection_timeout_secs"]
+        .as_u64()
+        .unwrap_or(30);
+    let buffer = payload["buffer_size"]
+        .as_u64()
+        .unwrap_or(8192) as usize;
+
+    // Save to DB
+    if let Some(db) = state.server_state.db() {
+        if let Err(e) = db
+            .save_reverse_proxy_config(max_conn, timeout, buffer)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // Update in-memory
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.reverse_proxy = crate::server::dynamic_config::ReverseProxySettings {
+            max_connections: max_conn,
+            connection_timeout_secs: timeout,
+            buffer_size: buffer,
+        };
+    }
+
+    StatusCode::OK.into_response()
+}
+
+/// Get DNS config
+async fn get_dns_config(State(state): State<ApiState>) -> impl IntoResponse {
+    let dc = state.server_state.dynamic_config.read().await;
+    Json(serde_json::json!(dc.dns))
+}
+
+/// Update DNS config
+async fn update_dns_config(
+    State(state): State<ApiState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let tunnel_domain = payload["tunnel_domain"]
+        .as_str()
+        .unwrap_or("tunnel.local");
+    let mesh_domain = payload["mesh_domain"]
+        .as_str()
+        .unwrap_or("mesh.local");
+
+    if let Some(db) = state.server_state.db() {
+        if let Err(e) = db
+            .save_dns_config(tunnel_domain, mesh_domain)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.dns = crate::server::dynamic_config::DnsSettings {
+            tunnel_domain: tunnel_domain.to_string(),
+            mesh_domain: mesh_domain.to_string(),
+        };
+    }
+
+    StatusCode::OK.into_response()
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -2219,6 +2526,16 @@ pub async fn run_api_server(
         .route(
             "/api/acme/challenge-status/:domain",
             get(get_challenge_status),
+        )
+        // Settings endpoints
+        .route("/api/settings", get(get_settings))
+        .route(
+            "/api/settings/reverse-proxy",
+            get(get_reverse_proxy_config).put(update_reverse_proxy_config),
+        )
+        .route(
+            "/api/settings/dns",
+            get(get_dns_config).put(update_dns_config),
         );
 
     // Only apply auth middleware if password is set
