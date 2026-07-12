@@ -100,7 +100,7 @@ async fn main() -> TunnelResult<()> {
             cert_dir: config.acme_cert_dir.clone(),
         };
 
-        state.set_acme_client(Arc::new(client), acme_config);
+        state.set_acme_client(Arc::new(client), acme_config).await;
         tracing::info!(
             "ACME client initialized (server: {}, cert_dir: {})",
             config.acme_server_url,
@@ -118,10 +118,13 @@ async fn main() -> TunnelResult<()> {
         }
 
         // Set ACME client on the certificate manager
-        if let Some(ref acme_client) = state.acme_client {
-            cert_manager
-                .set_acme_client(acme_client.clone())
-                .await;
+        {
+            let acme_client_guard = state.acme_client.read().await;
+            if let Some(ref acme_client) = *acme_client_guard {
+                cert_manager
+                    .set_acme_client(acme_client.clone())
+                    .await;
+            }
         }
 
         // Start renewal task if auto-renew is enabled

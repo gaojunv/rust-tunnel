@@ -157,9 +157,9 @@ pub struct ServerState {
     /// Active listener tasks (keyed by port) — aborted on client disconnect
     listener_tasks: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>>,
     /// ACME client for certificate management (set when ACME is enabled)
-    pub acme_client: Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>,
+    pub acme_client: Arc<RwLock<Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>>>,
     /// ACME configuration info (set when ACME is enabled)
-    pub acme_config: Option<AcmeConfigInfo>,
+    pub acme_config: Arc<RwLock<Option<AcmeConfigInfo>>>,
     /// Full ACME configuration for API access
     pub acme_full_config: Arc<RwLock<AcmeFullConfig>>,
     /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
@@ -202,8 +202,8 @@ impl ServerState {
             dns_registry: None,
             proxy_state: ReverseProxyState::new(),
             listener_tasks: Arc::new(Mutex::new(HashMap::new())),
-            acme_client: None,
-            acme_config: None,
+            acme_client: Arc::new(RwLock::new(None)),
+            acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
             dns_provider_config: Arc::new(RwLock::new(None)),
@@ -244,8 +244,8 @@ impl ServerState {
             mesh_manager: MeshManager::new(),
             dns_registry: None,
             proxy_state: ReverseProxyState::with_db(db),
-            acme_client: None,
-            acme_config: None,
+            acme_client: Arc::new(RwLock::new(None)),
+            acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
             dns_provider_config: Arc::new(RwLock::new(None)),
@@ -630,13 +630,13 @@ impl ServerState {
     }
 
     /// Set the ACME client for this server state
-    pub fn set_acme_client(
-        &mut self,
+    pub async fn set_acme_client(
+        &self,
         client: std::sync::Arc<crate::server::acme::client::AcmeClient>,
         config: AcmeConfigInfo,
     ) {
-        self.acme_client = Some(client);
-        self.acme_config = Some(config);
+        *self.acme_client.write().await = Some(client);
+        *self.acme_config.write().await = Some(config);
     }
 
     /// Set the certificate manager for this server state

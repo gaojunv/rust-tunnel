@@ -523,6 +523,136 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("active_connections"));
     }
+
+    #[tokio::test]
+    async fn test_update_acme_config_initializes_client() {
+        // Create a server state with in-memory database
+        let db = Database::new(":memory:").await.unwrap();
+        let server_state = ServerState::with_db(db);
+
+        // Verify ACME client is not initialized
+        assert!(server_state.acme_client.read().await.is_none());
+
+        // Create API state
+        let state = ApiState {
+            server_state: server_state.clone(),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+
+        // Create request to enable ACME
+        let req = UpdateAcmeConfigRequest {
+            enabled: Some(true),
+            server_url: Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
+            email: Some("test@example.com".to_string()),
+            auto_renew: Some(true),
+            renewal_check_interval: None,
+            renewal_days_before_expiry: None,
+            tos_agreed: Some(true),
+        };
+
+        // Call update_acme_config
+        let _ = update_acme_config(State(state), Json(req)).await;
+
+        // Verify ACME client is now initialized (shared Arc, visible from original)
+        assert!(server_state.acme_client.read().await.is_some());
+
+        // Verify ACME config is set
+        let acme_config_guard = server_state.acme_config.read().await;
+        assert!(acme_config_guard.is_some());
+        let acme_config = acme_config_guard.as_ref().unwrap();
+        assert_eq!(acme_config.enabled, true);
+        assert_eq!(acme_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+        drop(acme_config_guard);
+
+        // Verify ACME full config is updated
+        let full_config = server_state.acme_full_config.read().await;
+        assert_eq!(full_config.enabled, true);
+        assert_eq!(full_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+        assert_eq!(full_config.email, Some("test@example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_acme_config_disabled_does_not_init_client() {
+        // Create a server state with in-memory database
+        let db = Database::new(":memory:").await.unwrap();
+        let server_state = ServerState::with_db(db);
+
+        // Verify ACME client is not initialized
+        assert!(server_state.acme_client.read().await.is_none());
+
+        // Create API state
+        let state = ApiState {
+            server_state: server_state.clone(),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+
+        // Create request to disable ACME
+        let req = UpdateAcmeConfigRequest {
+            enabled: Some(false),
+            server_url: Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
+            email: None,
+            auto_renew: None,
+            renewal_check_interval: None,
+            renewal_days_before_expiry: None,
+            tos_agreed: None,
+        };
+
+        // Call update_acme_config
+        let _ = update_acme_config(State(state), Json(req)).await;
+
+        // Verify ACME client is still not initialized
+        assert!(server_state.acme_client.read().await.is_none());
+
+        // Verify ACME config is still not set
+        assert!(server_state.acme_config.read().await.is_none());
+
+        // Verify ACME full config is updated
+        let full_config = server_state.acme_full_config.read().await;
+        assert_eq!(full_config.enabled, false);
+    }
+
+    #[tokio::test]
+    async fn test_get_acme_status_reflects_config_update() {
+        // Create a server state with in-memory database
+        let db = Database::new(":memory:").await.unwrap();
+        let server_state = ServerState::with_db(db);
+
+        // Create API state
+        let state = ApiState {
+            server_state: server_state.clone(),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+
+        // Initial status should show ACME disabled
+        let _ = get_acme_status(State(state.clone())).await;
+        let full_config = server_state.acme_full_config.read().await;
+        assert_eq!(full_config.enabled, false);
+        drop(full_config);
+
+        // Enable ACME
+        let req = UpdateAcmeConfigRequest {
+            enabled: Some(true),
+            server_url: Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
+            email: Some("test@example.com".to_string()),
+            auto_renew: Some(true),
+            renewal_check_interval: None,
+            renewal_days_before_expiry: None,
+            tos_agreed: Some(true),
+        };
+
+        let _ = update_acme_config(State(state), Json(req)).await;
+
+        // Verify ACME is now enabled in the config
+        let full_config = server_state.acme_full_config.read().await;
+        assert_eq!(full_config.enabled, true);
+        assert_eq!(full_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+
+        // Verify ACME client is initialized
+        assert!(server_state.acme_client.read().await.is_some());
+    }
 }
 
 /// Log entry response
@@ -2055,8 +2185,9 @@ async fn get_proxy_stats(State(state): State<ApiState>) -> impl IntoResponse {
 
 // GET /api/acme/certificates — list all certificates
 async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoResponse {
-    let client = match &state.server_state.acme_client {
-        Some(c) => c,
+    let client_guard = state.server_state.acme_client.read().await;
+    let client = match client_guard.as_ref() {
+        Some(c) => c.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2065,6 +2196,7 @@ async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoRespo
                 .into_response();
         }
     };
+    drop(client_guard);
 
     match client.list_certificates().await {
         Ok(certs) => Json(serde_json::json!({ "certificates": certs })).into_response(),
@@ -2081,8 +2213,9 @@ async fn request_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client = match &state.server_state.acme_client {
-        Some(c) => c,
+    let client_guard = state.server_state.acme_client.read().await;
+    let client = match client_guard.as_ref() {
+        Some(c) => c.clone(),
         None => {
             tracing::error!("ACME certificate request failed: ACME client not initialized");
             return (
@@ -2092,6 +2225,7 @@ async fn request_acme_certificate(
                 .into_response();
         }
     };
+    drop(client_guard);
 
     match client.request_certificate(&domain).await {
         Ok(metadata) => {
@@ -2118,8 +2252,9 @@ async fn get_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client = match &state.server_state.acme_client {
-        Some(c) => c,
+    let client_guard = state.server_state.acme_client.read().await;
+    let client = match client_guard.as_ref() {
+        Some(c) => c.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2128,6 +2263,7 @@ async fn get_acme_certificate(
                 .into_response();
         }
     };
+    drop(client_guard);
 
     match client.get_certificate_metadata(&domain).await {
         Ok(Some(metadata)) => Json(serde_json::json!({ "certificate": metadata })).into_response(),
@@ -2149,8 +2285,9 @@ async fn renew_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client = match &state.server_state.acme_client {
-        Some(c) => c,
+    let client_guard = state.server_state.acme_client.read().await;
+    let client = match client_guard.as_ref() {
+        Some(c) => c.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2159,6 +2296,7 @@ async fn renew_acme_certificate(
                 .into_response();
         }
     };
+    drop(client_guard);
 
     match client.renew_certificate(&domain).await {
         Ok(metadata) => Json(serde_json::json!({ "certificate": metadata })).into_response(),
@@ -2179,13 +2317,15 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
     let cert_dir = full_config.cert_dir.clone();
     drop(full_config);
 
-    let cert_count = match &state.server_state.acme_client {
+    let client_guard = state.server_state.acme_client.read().await;
+    let cert_count = match client_guard.as_ref() {
         Some(client) => match client.list_certificates().await {
             Ok(certs) => certs.len(),
             Err(_) => 0,
         },
         None => 0,
     };
+    drop(client_guard);
 
     let api_tls = state.server_state.cert_manager.is_some();
     let trojan = !state.server_state.get_trojan_ports().await.is_empty();
@@ -2222,7 +2362,7 @@ async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse {
 
 // PUT /api/acme/config — update ACME configuration
 async fn update_acme_config(
-    State(mut state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(req): Json<UpdateAcmeConfigRequest>,
 ) -> impl IntoResponse {
     let mut config = state.server_state.acme_full_config.write().await;
@@ -2249,11 +2389,20 @@ async fn update_acme_config(
     }
 
     // Capture config values for ACME client initialization
-    let should_init_client = config.enabled && state.server_state.acme_client.is_none();
+    let has_client = state.server_state.acme_client.read().await.is_some();
+    let should_init_client = config.enabled && !has_client;
     let acme_server_url = config.server_url.clone();
     let acme_cert_dir = config.cert_dir.clone();
     let acme_email = config.email.clone();
     let acme_enabled = config.enabled;
+    let has_db = state.server_state.get_db().is_some();
+
+    tracing::info!(
+        "ACME config update: enabled={}, should_init_client={}, has_db={}",
+        config.enabled,
+        should_init_client,
+        has_db
+    );
 
     // Prepare response before potentially dropping the lock
     let response = Json(serde_json::json!({
@@ -2272,6 +2421,7 @@ async fn update_acme_config(
 
     // Initialize ACME client if enabled and not already initialized
     if should_init_client {
+        tracing::info!("Initializing ACME client...");
         if let Some(db) = state.server_state.get_db() {
             let acme_state = crate::server::acme::AcmeState::with_db(db.clone());
             let client = std::sync::Arc::new(
@@ -2284,7 +2434,9 @@ async fn update_acme_config(
             );
 
             if let Err(e) = client.initialize().await {
-                tracing::warn!("Failed to initialize ACME client: {}", e);
+                tracing::error!("Failed to initialize ACME client: {}", e);
+            } else {
+                tracing::info!("ACME client initialized successfully");
             }
 
             let acme_config_info = crate::server::control::AcmeConfigInfo {
@@ -2293,8 +2445,13 @@ async fn update_acme_config(
                 cert_dir: acme_cert_dir,
             };
 
-            state.server_state.set_acme_client(client, acme_config_info);
+            state.server_state.set_acme_client(client, acme_config_info).await;
+            tracing::info!("ACME client set on server state");
+        } else {
+            tracing::error!("Cannot initialize ACME client: no database available");
         }
+    } else if acme_enabled {
+        tracing::info!("ACME client already initialized, skipping");
     }
 
     response
@@ -2341,8 +2498,9 @@ async fn delete_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client = match &state.server_state.acme_client {
-        Some(c) => c,
+    let client_guard = state.server_state.acme_client.read().await;
+    let client = match client_guard.as_ref() {
+        Some(c) => c.clone(),
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2351,6 +2509,7 @@ async fn delete_acme_certificate(
                 .into_response();
         }
     };
+    drop(client_guard);
 
     match client.delete_certificate(&domain).await {
         Ok(()) => Json(serde_json::json!({ "deleted": true })).into_response(),
