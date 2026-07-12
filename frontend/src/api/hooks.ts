@@ -16,8 +16,25 @@ import {
   getTrojanQuality,
   getLogs,
   setLogsLevel,
+  getProxyRules,
+  createProxyRule,
+  updateProxyRule,
+  deleteProxyRule,
+  getProxyStats,
+  getAcmeStatus,
+  getAcmeConfig,
+  updateAcmeConfig,
+  listAcmeCertificates,
+  requestAcmeCertificate,
+  renewAcmeCertificate,
+  deleteAcmeCertificate,
 } from './client';
-import type { LoginRequest } from '../types';
+import type {
+  LoginRequest,
+  CreateProxyRuleRequest,
+  UpdateProxyRuleRequest,
+  UpdateAcmeConfigRequest,
+} from '../types';
 
 export function useClients() {
   return useQuery({
@@ -184,6 +201,119 @@ export function useSetLogsLevel() {
     mutationFn: (level: string) => setLogsLevel(level),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logs'] });
+    },
+  });
+}
+
+// Reverse Proxy hooks
+export function useProxyRules() {
+  return useQuery({
+    queryKey: ['proxy-rules'],
+    queryFn: () => getProxyRules(),
+  });
+}
+
+export function useProxyStats() {
+  return useQuery({
+    queryKey: ['proxy-stats'],
+    queryFn: () => getProxyStats(),
+    refetchInterval: 10000,
+  });
+}
+
+export function useCreateProxyRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: CreateProxyRuleRequest) => createProxyRule(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
+      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+    },
+  });
+}
+
+export function useUpdateProxyRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: UpdateProxyRuleRequest }) =>
+      updateProxyRule(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
+      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+    },
+  });
+}
+
+export function useDeleteProxyRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteProxyRule(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
+      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+    },
+  });
+}
+
+// ACME hooks
+export function useAcmeStatus() {
+  return useQuery({
+    queryKey: ['acme-status'],
+    queryFn: () => getAcmeStatus(),
+  });
+}
+
+export function useAcmeConfig() {
+  return useQuery({
+    queryKey: ['acme-config'],
+    queryFn: () => getAcmeConfig(),
+  });
+}
+
+export function useUpdateAcmeConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (data: UpdateAcmeConfigRequest) => updateAcmeConfig(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['acme-config'] });
+      queryClient.invalidateQueries({ queryKey: ['acme-status'] });
+    },
+  });
+}
+
+export function useAcmeCertificates() {
+  return useQuery({
+    queryKey: ['acme-certificates'],
+    queryFn: () => listAcmeCertificates(),
+  });
+}
+
+export function useRequestAcmeCertificate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (domain: string) => requestAcmeCertificate(domain),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
+    },
+  });
+}
+
+export function useRenewAcmeCertificate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (domain: string) => renewAcmeCertificate(domain),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
+    },
+  });
+}
+
+export function useDeleteAcmeCertificate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (domain: string) => deleteAcmeCertificate(domain),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
     },
   });
 }
