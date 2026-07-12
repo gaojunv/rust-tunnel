@@ -86,7 +86,7 @@ async fn wait_for_port(port: u16, dur: Duration) {
 /// Generate a self-signed TLS certificate pair in a temp directory and return
 /// a `TlsAcceptor` ready for the Trojan server. The `TempDir` must be kept
 /// alive for the duration of the test.
-fn generate_test_tls_acceptor() -> (tokio_rustls::TlsAcceptor, tempfile::TempDir) {
+fn generate_test_tls_config() -> (std::sync::Arc<rustls::ServerConfig>, tempfile::TempDir) {
     let tmp_dir = tempfile::tempdir().unwrap();
     let cert_path = tmp_dir.path().join("cert.pem");
     let key_path = tmp_dir.path().join("key.pem");
@@ -94,12 +94,11 @@ fn generate_test_tls_acceptor() -> (tokio_rustls::TlsAcceptor, tempfile::TempDir
     let cert_pair =
         load_or_generate_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
     let server_config = create_server_config(cert_pair).unwrap();
-    let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
-    (acceptor, tmp_dir)
+    (server_config, tmp_dir)
 }
 
-/// Spawn the Trojan listener as a tokio task. Returns the `TlsAcceptor`
+/// Spawn the Trojan listener as a tokio task. Returns the `watch::Receiver`
 /// (for reference), a `JoinHandle` for the listener task, and the `TempDir`
 /// that must be kept alive.
 async fn start_trojan_server(
@@ -108,21 +107,32 @@ async fn start_trojan_server(
     password: &str,
     fallback: &str,
 ) -> (
-    tokio_rustls::TlsAcceptor,
+    tokio::sync::watch::Receiver<std::sync::Arc<rustls::ServerConfig>>,
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
 ) {
-    let (acceptor, tmp_dir) = generate_test_tls_acceptor();
-    let acceptor_clone = acceptor.clone();
+    let (server_config, tmp_dir) = generate_test_tls_config();
+    let (tx, rx) = tokio::sync::watch::channel(server_config);
     let password = password.to_string();
     let fallback = fallback.to_string();
 
     let handle = tokio::spawn(async move {
         let _ =
-            listener::start_trojan_listener(state, port, password, fallback, acceptor_clone).await;
+            listener::start_trojan_listener(state, port, password, fallback, rx).await;
     });
 
-    (acceptor, handle, tmp_dir)
+    // Return a dummy receiver for compatibility (tx keeps it alive)
+    let (_dummy_tx, dummy_rx) = tokio::sync::watch::channel(
+        create_server_config(
+            load_or_generate_cert(
+                tmp_dir.path().join("cert.pem").to_str().unwrap(),
+                tmp_dir.path().join("key.pem").to_str().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    (dummy_rx, handle, tmp_dir)
 }
 
 /// Build raw Trojan protocol request bytes (without payload).
