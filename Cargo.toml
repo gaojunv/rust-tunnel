@@ -95,6 +95,9 @@ hex = "0.4"
 # DNS protocol types
 hickory-proto = "0.24"
 
+# ACME protocol support
+instant-acme = "0.7"
+
 [features]
 embed-frontend = ["rust-embed"]
 
