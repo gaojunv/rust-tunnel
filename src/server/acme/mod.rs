@@ -1,5 +1,6 @@
 pub mod challenge;
 pub mod client;
+pub mod dns;
 pub mod manager;
 pub mod provider;
 pub mod storage;

@@ -1,0 +1,42 @@
+use async_trait::async_trait;
+use std::time::Duration;
+
+use super::{DnsChallengeSolver, DnsProviderConfig};
+
+/// Custom DNS challenge solver (user-provided webhook)
+pub struct CustomDnsSolver {
+    #[allow(dead_code)]
+    config: DnsProviderConfig,
+}
+
+impl CustomDnsSolver {
+    pub fn new(config: &DnsProviderConfig) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl DnsChallengeSolver for CustomDnsSolver {
+    async fn create_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+        todo!("Custom DNS TXT record creation via webhook")
+    }
+
+    async fn delete_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+        todo!("Custom DNS TXT record deletion via webhook")
+    }
+
+    async fn wait_for_propagation(
+        &self,
+        _domain: &str,
+        _value: &str,
+        _timeout: Duration,
+    ) -> anyhow::Result<()> {
+        todo!("Custom DNS propagation check")
+    }
+
+    fn provider_name(&self) -> &str {
+        "custom"
+    }
+}
