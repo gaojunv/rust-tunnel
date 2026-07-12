@@ -1,6 +1,9 @@
 pub mod challenge;
 pub mod client;
+pub mod provider;
 pub mod storage;
+
+pub use provider::{CertEntry, CertSource, CertificateProvider};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

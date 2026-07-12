@@ -95,8 +95,12 @@ hex = "0.4"
 # DNS protocol types
 hickory-proto = "0.24"
 
+# Async trait support
+async-trait = "0.1"
+
 # ACME protocol support
 instant-acme = "0.7"
+x509-parser = "0.16"
 
 [features]
 embed-frontend = ["rust-embed"]
