@@ -1,5 +1,7 @@
 use rand::Rng;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
@@ -68,7 +70,7 @@ pub async fn start_trojan_listener(
     port: u16,
     password: String,
     fallback: String,
-    tls_acceptor: TlsAcceptor,
+    tls_config_rx: watch::Receiver<Arc<rustls::server::ServerConfig>>,
 ) -> TunnelResult<()> {
     // Register Trojan port in ServerState
     if !state
@@ -92,13 +94,17 @@ pub async fn start_trojan_listener(
 
         let connection_id = generate_connection_id();
         let state_clone = state.clone();
-        let tls_acceptor_clone = tls_acceptor.clone();
         let password_clone = password.clone();
         let fallback_clone = fallback.clone();
+        let tls_config_rx_clone = tls_config_rx.clone();
 
         tokio::spawn(async move {
+            // Read the latest TLS config from the watch channel
+            let current_config = tls_config_rx_clone.borrow().clone();
+            let tls_acceptor = TlsAcceptor::from(current_config);
+
             // TLS handshake first
-            let mut tls_stream = match tls_acceptor_clone.accept(inbound).await {
+            let mut tls_stream = match tls_acceptor.accept(inbound).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("Trojan TLS handshake failed for {}: {}", client_addr, e);
