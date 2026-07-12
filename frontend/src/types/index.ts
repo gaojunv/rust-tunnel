@@ -176,3 +176,98 @@ export interface AddDnsRecordRequest {
   value: string;
   port?: number;
 }
+
+// === Reverse Proxy ===
+
+export type RuleType = 'http' | 'tcp' | 'udp';
+export type LoadBalancing = 'round_robin' | 'weighted_round_robin';
+
+export interface Backend {
+  addr: string;
+  weight: number;
+}
+
+export interface Route {
+  path: string;
+  backends: Backend[];
+  load_balancing: LoadBalancing;
+}
+
+export interface ProxyTlsConfig {
+  enabled: boolean;
+  acme: boolean;
+  domain?: string;
+}
+
+export interface ProxyRule {
+  id: string;
+  name: string;
+  rule_type: RuleType;
+  listen: string;
+  domains: string[];
+  routes: Route[];
+  tls?: ProxyTlsConfig;
+  enabled: boolean;
+  created_at?: string;
+}
+
+export interface ProxyStats {
+  total_rules: number;
+  active_rules: number;
+  total_connections: number;
+  bytes_in: number;
+  bytes_out: number;
+}
+
+export interface CreateProxyRuleRequest {
+  name: string;
+  type: RuleType;
+  listen: string;
+  domains?: string[];
+  routes?: Route[];
+  tls?: ProxyTlsConfig;
+  enabled: boolean;
+}
+
+export type UpdateProxyRuleRequest = CreateProxyRuleRequest;
+
+// === ACME Certificate Management ===
+
+export type CertificateStatus = 'pending' | 'active' | 'expired' | 'failed';
+
+export interface AcmeStatus {
+  enabled: boolean;
+  server_url: string;
+  cert_dir: string;
+  certificate_count: number;
+}
+
+export interface AcmeCertificate {
+  domain: string;
+  status: CertificateStatus;
+  issued_at?: string;
+  expires_at?: string;
+  auto_renew: boolean;
+  error?: string;
+}
+
+export interface AcmeConfig {
+  enabled: boolean;
+  server_url: string;
+  email: string;
+  cert_dir: string;
+  auto_renew: boolean;
+  renewal_check_interval: number;
+  renewal_days_before_expiry: number;
+  tos_agreed: boolean;
+}
+
+export interface UpdateAcmeConfigRequest {
+  enabled?: boolean;
+  server_url?: string;
+  email?: string;
+  auto_renew?: boolean;
+  renewal_check_interval?: number;
+  renewal_days_before_expiry?: number;
+  tos_agreed?: boolean;
+}
