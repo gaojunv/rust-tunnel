@@ -95,6 +95,9 @@ impl TestHarness {
             reverse_proxy_max_connections: 10000,
             reverse_proxy_connection_timeout: 30,
             reverse_proxy_buffer_size: 8192,
+            // API TLS defaults
+            api_tls: false,
+            api_domain: None,
             // ACME defaults
             acme_enabled: false,
             acme_server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
@@ -113,13 +116,13 @@ impl TestHarness {
         let control_state = state.clone();
         let control_config = config.clone();
         let server_task = tokio::spawn(async move {
-            let _ = control::run_server(control_config, control_state).await;
+            let _ = control::run_server(control_config, control_state, None).await;
         });
 
         let api_state = state.clone();
         let api_addr_clone = api_addr.clone();
         let api_task = tokio::spawn(async move {
-            let _ = api::run_api_server(api_addr_clone, api_state, auth_config).await;
+            let _ = api::run_api_server(api_addr_clone, api_state, auth_config, None).await;
         });
 
         // Wait for API health so tests know the server is ready.
