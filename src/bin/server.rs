@@ -336,8 +336,33 @@ async fn main() -> TunnelResult<()> {
     }
 
     // Spawn API server
+    let api_tls_config = if config.api_tls {
+        if let Some(ref cert_manager) = state.cert_manager {
+            // Try to get certificate for API domain
+            if let Some(ref domain) = config.api_domain {
+                match cert_manager.get_tls_server_config(domain).await {
+                    Some(cfg) => {
+                        tracing::info!("API server TLS enabled with ACME certificate for domain: {}", domain);
+                        Some(cfg)
+                    }
+                    None => {
+                        tracing::warn!("No ACME certificate found for API domain '{}', API server will run without TLS", domain);
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("API TLS enabled but no api_domain configured, API server will run without TLS");
+                None
+            }
+        } else {
+            tracing::warn!("API TLS enabled but ACME not configured, API server will run without TLS");
+            None
+        }
+    } else {
+        None
+    };
     tokio::spawn(async move {
-        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config, None).await {
+        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config, api_tls_config).await {
             tracing::error!("API server error: {}", e);
         }
     });

@@ -124,6 +124,15 @@ pub struct ServerCli {
     #[clap(long = "reverse-proxy-buffer-size")]
     pub reverse_proxy_buffer_size: Option<usize>,
 
+    // API TLS options
+    /// Enable TLS for the API server (requires ACME or manual cert)
+    #[clap(long = "api-tls")]
+    pub api_tls: Option<bool>,
+
+    /// Domain name for API server TLS certificate (ACME)
+    #[clap(long = "api-domain")]
+    pub api_domain: Option<String>,
+
     // ACME options
     /// Enable ACME certificate management
     #[clap(long = "acme-enabled")]
@@ -186,6 +195,8 @@ pub struct ServerConfigFile {
     pub reverse_proxy_max_connections: Option<u32>,
     pub reverse_proxy_connection_timeout: Option<u64>,
     pub reverse_proxy_buffer_size: Option<usize>,
+    pub api_tls: Option<bool>,
+    pub api_domain: Option<String>,
     pub acme_enabled: Option<bool>,
     pub acme_server_url: Option<String>,
     pub acme_cert_dir: Option<String>,
@@ -230,6 +241,9 @@ pub struct ServerConfig {
     pub reverse_proxy_max_connections: u32,
     pub reverse_proxy_connection_timeout: u64,
     pub reverse_proxy_buffer_size: usize,
+    // API TLS configuration
+    pub api_tls: bool,
+    pub api_domain: Option<String>,
     // ACME configuration
     pub acme_enabled: bool,
     pub acme_server_url: String,
@@ -271,6 +285,9 @@ impl Default for ServerConfig {
             reverse_proxy_max_connections: 10000,
             reverse_proxy_connection_timeout: 30,
             reverse_proxy_buffer_size: 8192,
+            // API TLS defaults
+            api_tls: false,
+            api_domain: None,
             // ACME defaults
             acme_enabled: false,
             acme_server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
@@ -379,6 +396,13 @@ impl ServerConfig {
                 }
                 if let Some(v) = file_config.reverse_proxy_buffer_size {
                     config.reverse_proxy_buffer_size = v;
+                }
+                // API TLS config file values
+                if let Some(v) = file_config.api_tls {
+                    config.api_tls = v;
+                }
+                if let Some(v) = file_config.api_domain {
+                    config.api_domain = Some(v);
                 }
                 // ACME config file values
                 if let Some(v) = file_config.acme_enabled {
@@ -508,6 +532,14 @@ impl ServerConfig {
             }
         }
 
+        // Environment variables for API TLS
+        if let Ok(v) = std::env::var("API_TLS") {
+            config.api_tls = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("API_DOMAIN") {
+            config.api_domain = Some(v);
+        }
+
         // Environment variables for ACME
         if let Ok(v) = std::env::var("ACME_ENABLED") {
             config.acme_enabled = v.to_lowercase() == "true" || v == "1";
@@ -620,6 +652,14 @@ impl ServerConfig {
         }
         if let Some(v) = cli.reverse_proxy_buffer_size {
             config.reverse_proxy_buffer_size = v;
+        }
+
+        // API TLS command line arguments
+        if let Some(v) = cli.api_tls {
+            config.api_tls = v;
+        }
+        if let Some(v) = cli.api_domain {
+            config.api_domain = Some(v);
         }
 
         // ACME command line arguments
