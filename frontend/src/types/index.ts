@@ -240,6 +240,7 @@ export interface AcmeStatus {
   server_url: string;
   cert_dir: string;
   certificate_count: number;
+  consumers?: CertConsumers;
 }
 
 export interface AcmeCertificate {
@@ -270,4 +271,37 @@ export interface UpdateAcmeConfigRequest {
   renewal_check_interval?: number;
   renewal_days_before_expiry?: number;
   tos_agreed?: boolean;
+}
+
+// === DNS Provider Configuration ===
+
+export type DnsProviderType = 'cloudflare' | 'aliyun' | 'tencent' | 'custom';
+
+export interface DnsProviderConfig {
+  provider: DnsProviderType;
+  api_key: string;
+  api_secret?: string;
+  zone_id?: string;
+}
+
+// === Challenge Status ===
+
+export type ChallengeType = 'http-01' | 'dns-01';
+
+export type ChallengeStatusType = 'pending' | 'verified' | 'failed';
+
+export interface ChallengeStatus {
+  domain: string;
+  status: ChallengeStatusType;
+  type: ChallengeType;
+  error?: string;
+}
+
+// === Certificate Consumer Binding ===
+
+export interface CertConsumers {
+  api_tls: boolean;
+  trojan: boolean;
+  control_tls: boolean;
+  reverse_proxy: boolean;
 }

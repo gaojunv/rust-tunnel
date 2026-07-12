@@ -6,6 +6,8 @@ import { useAcmeCertificates, useAcmeStatus } from '@/api/hooks';
 import { AcmeConfigCard } from '@/components/acme/AcmeConfigCard';
 import { AcmeCertificateTable } from '@/components/acme/AcmeCertificateTable';
 import { AcmeRequestDialog } from '@/components/acme/AcmeRequestDialog';
+import { DnsProviderConfigCard } from '@/components/acme/DnsProviderConfigCard';
+import { CertConsumerBinding } from '@/components/acme/CertConsumerBinding';
 
 export default function AcmePage() {
   const { data: certificates, isLoading: certsLoading } = useAcmeCertificates();
@@ -24,7 +26,10 @@ export default function AcmePage() {
         </Button>
       </PageHeader>
 
-      <AcmeConfigCard />
+      <div className="grid gap-6 md:grid-cols-2">
+        <AcmeConfigCard />
+        <DnsProviderConfigCard />
+      </div>
 
       {!status?.enabled ? (
         <div className="rounded-md border p-8 text-center text-muted-foreground">
@@ -36,6 +41,8 @@ export default function AcmePage() {
           isLoading={certsLoading}
         />
       )}
+
+      <CertConsumerBinding consumers={status?.consumers} />
 
       <AcmeRequestDialog open={requestOpen} onOpenChange={setRequestOpen} />
     </div>

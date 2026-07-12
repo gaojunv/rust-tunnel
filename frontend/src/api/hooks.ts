@@ -28,12 +28,16 @@ import {
   requestAcmeCertificate,
   renewAcmeCertificate,
   deleteAcmeCertificate,
+  getDnsProviders,
+  updateDnsProvider,
+  getChallengeStatus,
 } from './client';
 import type {
   LoginRequest,
   CreateProxyRuleRequest,
   UpdateProxyRuleRequest,
   UpdateAcmeConfigRequest,
+  DnsProviderConfig,
 } from '../types';
 
 export function useClients() {
@@ -315,6 +319,34 @@ export function useDeleteAcmeCertificate() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
     },
+  });
+}
+
+// ACME DNS Provider hooks
+export function useDnsProviders() {
+  return useQuery({
+    queryKey: ['dns-providers'],
+    queryFn: () => getDnsProviders(),
+  });
+}
+
+export function useUpdateDnsProvider() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (config: DnsProviderConfig) => updateDnsProvider(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dns-providers'] });
+      queryClient.invalidateQueries({ queryKey: ['acme-config'] });
+    },
+  });
+}
+
+export function useChallengeStatus(domain: string) {
+  return useQuery({
+    queryKey: ['challenge-status', domain],
+    queryFn: () => getChallengeStatus(domain),
+    enabled: !!domain,
+    refetchInterval: 5000,
   });
 }
 

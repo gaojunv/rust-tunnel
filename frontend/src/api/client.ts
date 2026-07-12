@@ -28,6 +28,8 @@ import type {
   AcmeCertificate,
   AcmeConfig,
   UpdateAcmeConfigRequest,
+  DnsProviderConfig,
+  ChallengeStatus,
 } from '../types';
 
 const API_BASE = '/api';
@@ -283,4 +285,21 @@ export const renewAcmeCertificate = async (domain: string): Promise<AcmeCertific
 
 export const deleteAcmeCertificate = async (domain: string): Promise<void> => {
   await api.delete(`/acme/certificates/${domain}`);
+};
+
+// ACME DNS Provider API
+export const getDnsProviders = async (): Promise<{ providers: string[]; config: DnsProviderConfig | null }> => {
+  const response = await api.get('/acme/dns-providers');
+  return response.data;
+};
+
+export const updateDnsProvider = async (config: DnsProviderConfig): Promise<{ success: boolean }> => {
+  const response = await api.put('/acme/dns-providers', config);
+  return response.data;
+};
+
+// ACME Challenge Status API
+export const getChallengeStatus = async (domain: string): Promise<ChallengeStatus> => {
+  const response = await api.get(`/acme/challenge-status/${domain}`);
+  return response.data;
 };
