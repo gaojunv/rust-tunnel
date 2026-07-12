@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::server::acme::CertificateProvider;
 use crate::server::db::Database;
 
 /// Load balancing algorithm
@@ -142,6 +143,8 @@ pub struct ReverseProxyState {
     pub connection_counts: Arc<Mutex<HashMap<String, u64>>>,
     /// Database reference
     db: Option<Database>,
+    /// Certificate provider for TLS termination
+    cert_provider: Option<Arc<dyn CertificateProvider>>,
 }
 
 impl ReverseProxyState {
@@ -152,6 +155,7 @@ impl ReverseProxyState {
             listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
             db: None,
+            cert_provider: None,
         }
     }
 
@@ -162,7 +166,18 @@ impl ReverseProxyState {
             listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db),
+            cert_provider: None,
         }
+    }
+
+    /// Set the certificate provider for TLS termination
+    pub fn set_cert_provider(&mut self, provider: Arc<dyn CertificateProvider>) {
+        self.cert_provider = Some(provider);
+    }
+
+    /// Get a reference to the certificate provider
+    pub fn cert_provider(&self) -> Option<&Arc<dyn CertificateProvider>> {
+        self.cert_provider.as_ref()
     }
 
     /// Load rules from database

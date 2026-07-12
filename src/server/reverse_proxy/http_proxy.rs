@@ -3,13 +3,14 @@ use crate::server::db::Database;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::any,
     Router,
 };
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 /// HTTP reverse proxy handler
@@ -30,23 +31,134 @@ impl HttpProxy {
         addr: SocketAddr,
         rule_id: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Look up the rule to check TLS configuration
+        let tls_config = {
+            let rules = self.state.rules.lock().await;
+            rules
+                .get(&rule_id)
+                .and_then(|r| r.tls.clone())
+                .filter(|t| t.enabled)
+        };
+
         let state = self.state.clone();
         let db = self.db.clone();
+        let rule_id_clone = rule_id.clone();
 
         let app = Router::new()
             .fallback(any(handle_proxy_request))
             .with_state((state, rule_id.clone()));
 
         let listener = TcpListener::bind(addr).await?;
-        info!("HTTP proxy listening on {}", addr);
 
+        if let Some(tls_cfg) = tls_config {
+            // TLS-enabled path
+            let domain = tls_cfg
+                .domain
+                .clone()
+                .or_else(|| {
+                    // Fall back to first domain in the rule
+                    let rules = self.state.rules.blocking_lock();
+                    rules
+                        .get(&rule_id_clone)
+                        .and_then(|r| r.domains.first().cloned())
+                });
+
+            let domain = match domain {
+                Some(d) => d,
+                None => {
+                    error!(
+                        "TLS enabled for rule {} but no domain configured, falling back to plain HTTP",
+                        rule_id
+                    );
+                    // Fall back to plain HTTP
+                    return self.start_plain(listener, app, rule_id).await;
+                }
+            };
+
+            // Get TLS server config from certificate provider
+            let server_config = match &self.state.cert_provider() {
+                Some(provider) => match provider.get_tls_server_config(&domain).await {
+                    Some(config) => config,
+                    None => {
+                        error!(
+                            "No certificate found for domain '{}' on rule {}, falling back to plain HTTP",
+                            domain, rule_id
+                        );
+                        return self.start_plain(listener, app, rule_id).await;
+                    }
+                },
+                None => {
+                    warn!(
+                        "TLS enabled for rule {} but no certificate provider configured, falling back to plain HTTP",
+                        rule_id
+                    );
+                    return self.start_plain(listener, app, rule_id).await;
+                }
+            };
+
+            info!("HTTP proxy listening on {} with TLS for domain '{}'", addr, domain);
+
+            let tls_acceptor = TlsAcceptor::from(server_config);
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((tcp_stream, _peer_addr)) => {
+                            let tls_acceptor = tls_acceptor.clone();
+                            let app = app.clone();
+
+                            tokio::spawn(async move {
+                                let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        debug!("TLS handshake failed: {}", e);
+                                        return;
+                                    }
+                                };
+
+                                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                                let service = hyper_util::service::TowerToHyperService::new(
+                                    app.into_service(),
+                                );
+
+                                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await
+                                {
+                                    debug!("HTTPS connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept connection: {}", e);
+                        }
+                    }
+                }
+            });
+
+            let mut listeners = self.state.listeners.lock().await;
+            listeners.insert(rule_id, handle);
+        } else {
+            // Plain HTTP path (existing behavior)
+            return self.start_plain(listener, app, rule_id).await;
+        }
+
+        Ok(())
+    }
+
+    /// Start plain HTTP listener (no TLS)
+    async fn start_plain(
+        &self,
+        listener: TcpListener,
+        app: Router,
+        rule_id: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let handle = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 error!("HTTP proxy error: {}", e);
             }
         });
 
-        // Store the listener handle
         let mut listeners = self.state.listeners.lock().await;
         listeners.insert(rule_id, handle);
 
