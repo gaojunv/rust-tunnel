@@ -64,6 +64,50 @@ pub async fn start_shadowsocks_listener(
     run_listener(state, port).await
 }
 
+/// Start Shadowsocks listener with abort support
+pub async fn start_shadowsocks_listener_with_abort(
+    state: ServerState,
+    port: u16,
+    cipher: String,
+    password: String,
+    mut abort_rx: tokio::sync::watch::Receiver<bool>,
+) -> TunnelResult<()> {
+    if !state.register_shadowsocks(port, cipher, password).await {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("Port {} already in use", port),
+        )
+        .into());
+    }
+
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    info!("Shadowsocks listener started on {}", bind_addr);
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (inbound, client_addr) = result?;
+                debug!("New SS connection from {}", client_addr);
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    let connection_id = generate_connection_id();
+                    if let Err(e) = handle_inbound_connection(state_clone, port, connection_id, inbound).await {
+                        debug!("SS connection error: {}", e);
+                    }
+                });
+            }
+            _ = abort_rx.changed() => {
+                if *abort_rx.borrow() {
+                    info!("Shadowsocks listener on port {} shutting down", port);
+                    state.unregister_port(port).await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 /// Start Trojan listener with TLS
 pub async fn start_trojan_listener(
     state: ServerState,
@@ -151,6 +195,107 @@ pub async fn start_trojan_listener(
                 }
             }
         });
+    }
+}
+
+/// Start Trojan listener with abort support
+pub async fn start_trojan_listener_with_abort(
+    state: ServerState,
+    port: u16,
+    password: String,
+    fallback: String,
+    tls_config_rx: tokio::sync::watch::Receiver<Arc<rustls::server::ServerConfig>>,
+    mut abort_rx: tokio::sync::watch::Receiver<bool>,
+) -> TunnelResult<()> {
+    if !state
+        .register_trojan(port, password.clone(), fallback.clone())
+        .await
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!("Port {} already in use", port),
+        )
+        .into());
+    }
+
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    info!("Trojan TLS listener started on {}", bind_addr);
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (inbound, client_addr) = result?;
+                debug!("New Trojan connection from {}", client_addr);
+
+                let connection_id = generate_connection_id();
+                let state_clone = state.clone();
+                let password_clone = password.clone();
+                let fallback_clone = fallback.clone();
+                let tls_config_rx_clone = tls_config_rx.clone();
+
+                tokio::spawn(async move {
+                    // Read the latest TLS config from the watch channel
+                    let current_config = tls_config_rx_clone.borrow().clone();
+                    let tls_acceptor = TlsAcceptor::from(current_config);
+
+                    // TLS handshake first
+                    let mut tls_stream = match tls_acceptor.accept(inbound).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Trojan TLS handshake failed for {}: {}", client_addr, e);
+                            return;
+                        }
+                    };
+
+                    // Trojan handshake over TLS
+                    match handle_trojan_handshake(&mut tls_stream, &password_clone, connection_id, port)
+                        .await
+                    {
+                        Ok((ctx, payload)) => {
+                            debug!(
+                                "Trojan authenticated: target={}, cmd={:?}",
+                                ctx.target_addr, ctx.command
+                            );
+                            proxy_trojan_connection(
+                                connection_id,
+                                port,
+                                tls_stream,
+                                ctx,
+                                payload,
+                                state_clone,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Trojan handshake failed for connection {}: {}",
+                                connection_id, e
+                            );
+                            // Fallback: forward to fallback backend
+                            debug!("Attempting Trojan fallback to {}", fallback_clone);
+                            // Extract initial data from the error if available
+                            let initial_data = match &e {
+                                TunnelError::TrojanAuthFailed(data) => data.as_slice(),
+                                _ => &[],
+                            };
+                            if let Err(fe) =
+                                handle_trojan_fallback(&mut tls_stream, initial_data, &fallback_clone).await
+                            {
+                                warn!("Trojan fallback also failed: {}", fe);
+                            }
+                        }
+                    }
+                });
+            }
+            _ = abort_rx.changed() => {
+                if *abort_rx.borrow() {
+                    info!("Trojan listener on port {} shutting down", port);
+                    state.unregister_port(port).await;
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
