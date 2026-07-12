@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Timelike, Utc};
@@ -21,6 +21,7 @@ use crate::common::DnsRecord;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
+use crate::server::reverse_proxy::{ProxyRule, ProxyStats};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use std::time::Duration;
 
@@ -1572,6 +1573,401 @@ async fn put_logs_level(
     Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
 }
 
+// ── Proxy Rules Endpoints ─────────────────────────────────────────
+
+/// Request body for creating a proxy rule
+#[derive(Debug, Deserialize)]
+pub struct CreateProxyRuleRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    pub listen: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<crate::server::reverse_proxy::Route>,
+    pub tls: Option<crate::server::reverse_proxy::ProxyTlsConfig>,
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+}
+
+/// Request body for updating a proxy rule
+#[derive(Debug, Deserialize)]
+pub struct UpdateProxyRuleRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    pub listen: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<crate::server::reverse_proxy::Route>,
+    pub tls: Option<crate::server::reverse_proxy::ProxyTlsConfig>,
+    #[serde(default = "default_rule_enabled")]
+    pub enabled: bool,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+// GET /api/proxy/rules — list all proxy rules
+async fn list_proxy_rules(State(state): State<ApiState>) -> impl IntoResponse {
+    let rules = state.server_state.proxy_state.rules.lock().await;
+    let rules_vec: Vec<&ProxyRule> = rules.values().collect();
+    Json(serde_json::json!({ "rules": rules_vec }))
+}
+
+// POST /api/proxy/rules — create a new proxy rule
+async fn create_proxy_rule(
+    State(state): State<ApiState>,
+    Json(body): Json<CreateProxyRuleRequest>,
+) -> impl IntoResponse {
+    // Parse rule type
+    let rule_type = match body.rule_type.to_lowercase().as_str() {
+        "http" => crate::server::reverse_proxy::RuleType::Http,
+        "tcp" => crate::server::reverse_proxy::RuleType::Tcp,
+        "udp" => crate::server::reverse_proxy::RuleType::Udp,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Generate a unique ID
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let rule = ProxyRule {
+        id: id.clone(),
+        name: body.name,
+        rule_type,
+        listen: body.listen,
+        domains: body.domains,
+        routes: body.routes,
+        tls: body.tls,
+        enabled: body.enabled,
+        created_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    // Save to database
+    if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
+        tracing::error!("Failed to save proxy rule: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
+        )
+            .into_response();
+    }
+
+    // Add to in-memory state
+    let mut rules = state.server_state.proxy_state.rules.lock().await;
+    rules.insert(id.clone(), rule.clone());
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "rule": rule })),
+    )
+        .into_response()
+}
+
+// PUT /api/proxy/rules/:id — update a proxy rule
+async fn update_proxy_rule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateProxyRuleRequest>,
+) -> impl IntoResponse {
+    // Parse rule type
+    let rule_type = match body.rule_type.to_lowercase().as_str() {
+        "http" => crate::server::reverse_proxy::RuleType::Http,
+        "tcp" => crate::server::reverse_proxy::RuleType::Tcp,
+        "udp" => crate::server::reverse_proxy::RuleType::Udp,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Check if rule exists
+    let existing = {
+        let rules = state.server_state.proxy_state.rules.lock().await;
+        rules.get(&id).cloned()
+    };
+
+    let existing = match existing {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Rule not found" })),
+            )
+                .into_response();
+        }
+    };
+
+    let rule = ProxyRule {
+        id: id.clone(),
+        name: body.name,
+        rule_type,
+        listen: body.listen,
+        domains: body.domains,
+        routes: body.routes,
+        tls: body.tls,
+        enabled: body.enabled,
+        created_at: existing.created_at,
+    };
+
+    // Save to database
+    if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
+        tracing::error!("Failed to save proxy rule: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
+        )
+            .into_response();
+    }
+
+    // Update in-memory state
+    let mut rules = state.server_state.proxy_state.rules.lock().await;
+    rules.insert(id, rule.clone());
+
+    Json(serde_json::json!({ "rule": rule })).into_response()
+}
+
+// DELETE /api/proxy/rules/:id — delete a proxy rule
+async fn delete_proxy_rule(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // Check if rule exists
+    let exists = {
+        let rules = state.server_state.proxy_state.rules.lock().await;
+        rules.contains_key(&id)
+    };
+
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Rule not found" })),
+        )
+            .into_response();
+    }
+
+    // Stop the listener if it's running
+    let listener_handle = {
+        let mut listeners = state.server_state.proxy_state.listeners.lock().await;
+        listeners.remove(&id)
+    };
+    if let Some(handle) = listener_handle {
+        handle.abort();
+    }
+
+    // Delete from database
+    if let Err(e) = state.server_state.proxy_state.delete_rule(&id).await {
+        tracing::error!("Failed to delete proxy rule from database: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Failed to delete proxy rule" })),
+        )
+            .into_response();
+    }
+
+    // Remove from in-memory state
+    {
+        let mut rules = state.server_state.proxy_state.rules.lock().await;
+        rules.remove(&id);
+    }
+
+    StatusCode::OK.into_response()
+}
+
+// GET /api/proxy/stats — get proxy statistics
+async fn get_proxy_stats(State(state): State<ApiState>) -> impl IntoResponse {
+    // Try to get stats from database if available
+    if let Some(db) = state.server_state.get_db() {
+        match db.get_proxy_stats().await {
+            Ok((total_rules, active_rules, total_connections, bytes_in, bytes_out)) => {
+                return Json(ProxyStats {
+                    total_rules,
+                    active_rules,
+                    total_connections,
+                    bytes_in,
+                    bytes_out,
+                })
+                .into_response();
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get proxy stats from database: {}", e);
+            }
+        }
+    }
+
+    // Fallback to in-memory stats
+    let rules = state.server_state.proxy_state.rules.lock().await;
+    let total_rules = rules.len() as i64;
+    let active_rules = rules.values().filter(|r| r.enabled).count() as i64;
+
+    let connection_counts = state.server_state.proxy_state.connection_counts.lock().await;
+    let active_connections: u64 = connection_counts.values().sum();
+
+    Json(ProxyStats {
+        total_rules,
+        active_rules,
+        total_connections: active_connections as i64,
+        bytes_in: 0,
+        bytes_out: 0,
+    })
+    .into_response()
+}
+
+// ── ACME Certificate Management Endpoints ──────────────────────────
+
+// GET /api/acme/certificates — list all certificates
+async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoResponse {
+    let client = match &state.server_state.acme_client {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "ACME is not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.list_certificates().await {
+        Ok(certs) => Json(serde_json::json!({ "certificates": certs })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/acme/certificates/:domain — request a new certificate
+async fn request_acme_certificate(
+    State(state): State<ApiState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let client = match &state.server_state.acme_client {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "ACME is not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.request_certificate(&domain).await {
+        Ok(metadata) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "certificate": metadata })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// GET /api/acme/certificates/:domain — get certificate details
+async fn get_acme_certificate(
+    State(state): State<ApiState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let client = match &state.server_state.acme_client {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "ACME is not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.get_certificate_metadata(&domain).await {
+        Ok(Some(metadata)) => Json(serde_json::json!({ "certificate": metadata })).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Certificate not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// POST /api/acme/certificates/:domain/renew — manual renewal
+async fn renew_acme_certificate(
+    State(state): State<ApiState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let client = match &state.server_state.acme_client {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "ACME is not enabled" })),
+            )
+                .into_response();
+        }
+    };
+
+    match client.renew_certificate(&domain).await {
+        Ok(metadata) => Json(serde_json::json!({ "certificate": metadata })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// GET /api/acme/status — get ACME status
+async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
+    let config = match &state.server_state.acme_config {
+        Some(c) => c,
+        None => {
+            return Json(serde_json::json!({
+                "enabled": false,
+                "server_url": null,
+                "cert_dir": null,
+            }))
+            .into_response();
+        }
+    };
+
+    let cert_count = match &state.server_state.acme_client {
+        Some(client) => match client.list_certificates().await {
+            Ok(certs) => certs.len(),
+            Err(_) => 0,
+        },
+        None => 0,
+    };
+
+    Json(serde_json::json!({
+        "enabled": config.enabled,
+        "server_url": config.server_url,
+        "cert_dir": config.cert_dir,
+        "certificate_count": cert_count,
+    }))
+    .into_response()
+}
+
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -1639,7 +2035,31 @@ pub async fn run_api_server(
         .route("/api/dns/records/:name", delete(delete_dns_record))
         // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/logs", get(get_logs))
-        .route("/api/logs/level", get(get_logs_level).put(put_logs_level));
+        .route("/api/logs/level", get(get_logs_level).put(put_logs_level))
+        // Proxy rules management endpoints
+        .route(
+            "/api/proxy/rules",
+            get(list_proxy_rules).post(create_proxy_rule),
+        )
+        .route(
+            "/api/proxy/rules/:id",
+            put(update_proxy_rule).delete(delete_proxy_rule),
+        )
+        .route("/api/proxy/stats", get(get_proxy_stats))
+        // ACME certificate management endpoints
+        .route("/api/acme/status", get(get_acme_status))
+        .route(
+            "/api/acme/certificates",
+            get(list_acme_certificates),
+        )
+        .route(
+            "/api/acme/certificates/:domain",
+            get(get_acme_certificate).post(request_acme_certificate),
+        )
+        .route(
+            "/api/acme/certificates/:domain/renew",
+            post(renew_acme_certificate),
+        );
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {

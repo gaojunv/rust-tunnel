@@ -240,6 +240,120 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // ============================================================
+        // Reverse Proxy tables
+        // ============================================================
+
+        // Proxy rules table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp')),
+                listen_addr TEXT NOT NULL,
+                domains TEXT,
+                routes TEXT,
+                tls_enabled INTEGER NOT NULL DEFAULT 0,
+                tls_acme INTEGER NOT NULL DEFAULT 0,
+                tls_domain TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_enabled ON proxy_rules(enabled)")
+            .execute(pool)
+            .await?;
+
+        // Proxy traffic statistics table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS proxy_traffic (
+                rule_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                bytes_in BIGINT NOT NULL DEFAULT 0,
+                bytes_out BIGINT NOT NULL DEFAULT 0,
+                connections INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (rule_id, timestamp),
+                FOREIGN KEY (rule_id) REFERENCES proxy_rules(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_proxy_traffic_timestamp ON proxy_traffic(timestamp)",
+        )
+        .execute(pool)
+        .await?;
+
+        // ============================================================
+        // ACME Certificate tables
+        // ============================================================
+
+        // ACME certificates table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS acme_certificates (
+                domain TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'expired', 'failed')),
+                cert_pem TEXT,
+                key_pem TEXT,
+                chain_pem TEXT,
+                issued_at DATETIME,
+                expires_at DATETIME,
+                auto_renew INTEGER NOT NULL DEFAULT 1,
+                last_renewal_attempt DATETIME,
+                error_message TEXT,
+                created_at DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_acme_certificates_status ON acme_certificates(status)",
+        )
+        .execute(pool)
+        .await?;
+
+        // ACME challenges table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS acme_challenges (
+                token TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                authorization TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'valid', 'invalid')),
+                created_at DATETIME NOT NULL,
+                expires_at DATETIME
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_acme_challenges_domain ON acme_challenges(domain)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_acme_challenges_expires ON acme_challenges(expires_at)",
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1015,6 +1129,456 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    // ============================================================
+    // Reverse Proxy methods
+    // ============================================================
+
+    /// Save or update a proxy rule
+    pub async fn save_proxy_rule(
+        &self,
+        id: &str,
+        name: &str,
+        rule_type: &str,
+        listen_addr: &str,
+        domains: Option<&str>,
+        routes: Option<&str>,
+        tls_enabled: bool,
+        tls_acme: bool,
+        tls_domain: Option<&str>,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_rules (id, name, type, listen_addr, domains, routes,
+                tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                type = excluded.type,
+                listen_addr = excluded.listen_addr,
+                domains = excluded.domains,
+                routes = excluded.routes,
+                tls_enabled = excluded.tls_enabled,
+                tls_acme = excluded.tls_acme,
+                tls_domain = excluded.tls_domain,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(rule_type)
+        .bind(listen_addr)
+        .bind(domains)
+        .bind(routes)
+        .bind(tls_enabled as i32)
+        .bind(tls_acme as i32)
+        .bind(tls_domain)
+        .bind(enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load all proxy rules
+    pub async fn load_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ProxyRuleRecord>(
+            r#"
+            SELECT id, name, type, listen_addr, domains, routes,
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+            FROM proxy_rules
+            ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load enabled proxy rules
+    pub async fn load_enabled_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ProxyRuleRecord>(
+            r#"
+            SELECT id, name, type, listen_addr, domains, routes,
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+            FROM proxy_rules
+            WHERE enabled = 1
+            ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Get a proxy rule by ID
+    pub async fn get_proxy_rule(&self, id: &str) -> Result<Option<ProxyRuleRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ProxyRuleRecord>(
+            r#"
+            SELECT id, name, type, listen_addr, domains, routes,
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+            FROM proxy_rules
+            WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Delete a proxy rule
+    pub async fn delete_proxy_rule(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM proxy_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert proxy traffic record
+    pub async fn insert_proxy_traffic(
+        &self,
+        rule_id: &str,
+        bytes_in: u64,
+        bytes_out: u64,
+        connections: i32,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO proxy_traffic (rule_id, timestamp, bytes_in, bytes_out, connections)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(rule_id, timestamp) DO UPDATE SET
+                bytes_in = bytes_in + excluded.bytes_in,
+                bytes_out = bytes_out + excluded.bytes_out,
+                connections = connections + excluded.connections
+            "#,
+        )
+        .bind(rule_id)
+        .bind(now)
+        .bind(bytes_in as i64)
+        .bind(bytes_out as i64)
+        .bind(connections)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get proxy traffic for a rule within time range
+    pub async fn get_proxy_traffic(
+        &self,
+        rule_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<ProxyTrafficRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ProxyTrafficRecord>(
+            r#"
+            SELECT rule_id, timestamp, bytes_in, bytes_out, connections
+            FROM proxy_traffic
+            WHERE rule_id = ? AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp
+            "#,
+        )
+        .bind(rule_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Get proxy stats summary
+    pub async fn get_proxy_stats(&self) -> Result<(i64, i64, i64, i64, i64), sqlx::Error> {
+        #[derive(FromRow)]
+        struct StatsRow {
+            total_rules: i64,
+            active_rules: i64,
+        }
+
+        let stats = sqlx::query_as::<_, StatsRow>(
+            r#"
+            SELECT
+                COUNT(*) as total_rules,
+                SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as active_rules
+            FROM proxy_rules
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        #[derive(FromRow)]
+        struct TrafficStatsRow {
+            total_connections: i64,
+            total_bytes_in: i64,
+            total_bytes_out: i64,
+        }
+
+        let traffic = sqlx::query_as::<_, TrafficStatsRow>(
+            r#"
+            SELECT
+                COALESCE(SUM(connections), 0) as total_connections,
+                COALESCE(SUM(bytes_in), 0) as total_bytes_in,
+                COALESCE(SUM(bytes_out), 0) as total_bytes_out
+            FROM proxy_traffic
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((
+            stats.total_rules,
+            stats.active_rules,
+            traffic.total_connections,
+            traffic.total_bytes_in,
+            traffic.total_bytes_out,
+        ))
+    }
+
+    // ============================================================
+    // ACME Certificate methods
+    // ============================================================
+
+    /// Save or update an ACME certificate
+    pub async fn save_acme_certificate(
+        &self,
+        domain: &str,
+        status: &str,
+        cert_pem: Option<&str>,
+        key_pem: Option<&str>,
+        chain_pem: Option<&str>,
+        issued_at: Option<DateTime<Utc>>,
+        expires_at: Option<DateTime<Utc>>,
+        auto_renew: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO acme_certificates (domain, status, cert_pem, key_pem, chain_pem,
+                issued_at, expires_at, auto_renew, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                status = excluded.status,
+                cert_pem = excluded.cert_pem,
+                key_pem = excluded.key_pem,
+                chain_pem = excluded.chain_pem,
+                issued_at = excluded.issued_at,
+                expires_at = excluded.expires_at,
+                auto_renew = excluded.auto_renew
+            "#,
+        )
+        .bind(domain)
+        .bind(status)
+        .bind(cert_pem)
+        .bind(key_pem)
+        .bind(chain_pem)
+        .bind(issued_at)
+        .bind(expires_at)
+        .bind(auto_renew as i32)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load all ACME certificates
+    pub async fn load_acme_certificates(&self) -> Result<Vec<AcmeCertificateRecord>, sqlx::Error> {
+        sqlx::query_as::<_, AcmeCertificateRecord>(
+            r#"
+            SELECT domain, status, cert_pem, key_pem, chain_pem,
+                   issued_at, expires_at, auto_renew, last_renewal_attempt,
+                   error_message, created_at
+            FROM acme_certificates
+            ORDER BY created_at
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Get an ACME certificate by domain
+    pub async fn get_acme_certificate(
+        &self,
+        domain: &str,
+    ) -> Result<Option<AcmeCertificateRecord>, sqlx::Error> {
+        sqlx::query_as::<_, AcmeCertificateRecord>(
+            r#"
+            SELECT domain, status, cert_pem, key_pem, chain_pem,
+                   issued_at, expires_at, auto_renew, last_renewal_attempt,
+                   error_message, created_at
+            FROM acme_certificates
+            WHERE domain = ?
+            "#,
+        )
+        .bind(domain)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Update ACME certificate status
+    pub async fn update_acme_certificate_status(
+        &self,
+        domain: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE acme_certificates
+            SET status = ?, error_message = ?
+            WHERE domain = ?
+            "#,
+        )
+        .bind(status)
+        .bind(error_message)
+        .bind(domain)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update ACME certificate renewal attempt
+    pub async fn update_acme_certificate_renewal_attempt(
+        &self,
+        domain: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            UPDATE acme_certificates
+            SET last_renewal_attempt = ?
+            WHERE domain = ?
+            "#,
+        )
+        .bind(now)
+        .bind(domain)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete an ACME certificate
+    pub async fn delete_acme_certificate(&self, domain: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM acme_certificates WHERE domain = ?")
+            .bind(domain)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Save an ACME challenge
+    pub async fn save_acme_challenge(
+        &self,
+        token: &str,
+        domain: &str,
+        authorization: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO acme_challenges (token, domain, authorization, status, created_at, expires_at)
+            VALUES (?, ?, ?, 'pending', ?, ?)
+            ON CONFLICT(token) DO UPDATE SET
+                domain = excluded.domain,
+                authorization = excluded.authorization,
+                status = 'pending',
+                expires_at = excluded.expires_at
+            "#,
+        )
+        .bind(token)
+        .bind(domain)
+        .bind(authorization)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get an ACME challenge by token
+    pub async fn get_acme_challenge(
+        &self,
+        token: &str,
+    ) -> Result<Option<AcmeChallengeRecord>, sqlx::Error> {
+        sqlx::query_as::<_, AcmeChallengeRecord>(
+            r#"
+            SELECT token, domain, authorization, status, created_at, expires_at
+            FROM acme_challenges
+            WHERE token = ?
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Update ACME challenge status
+    pub async fn update_acme_challenge_status(
+        &self,
+        token: &str,
+        status: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE acme_challenges
+            SET status = ?
+            WHERE token = ?
+            "#,
+        )
+        .bind(status)
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete expired ACME challenges
+    pub async fn cleanup_expired_acme_challenges(&self) -> Result<u64, sqlx::Error> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            DELETE FROM acme_challenges
+            WHERE expires_at IS NOT NULL AND expires_at < ?
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete an ACME challenge
+    pub async fn delete_acme_challenge(&self, token: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM acme_challenges WHERE token = ?")
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Load ACME certificates that need renewal
+    pub async fn load_acme_certificates_needing_renewal(
+        &self,
+        days_before_expiry: i64,
+    ) -> Result<Vec<AcmeCertificateRecord>, sqlx::Error> {
+        let cutoff = Utc::now() + chrono::Duration::days(days_before_expiry);
+        sqlx::query_as::<_, AcmeCertificateRecord>(
+            r#"
+            SELECT domain, status, cert_pem, key_pem, chain_pem,
+                   issued_at, expires_at, auto_renew, last_renewal_attempt,
+                   error_message, created_at
+            FROM acme_certificates
+            WHERE status = 'active'
+              AND auto_renew = 1
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await
+    }
 }
 
 /// Port traffic record from database
@@ -1100,6 +1664,61 @@ pub struct MeshServiceRecord {
     pub protocol: String,
     pub local_addr: String,
     pub dns_record: String,
+}
+
+/// Proxy rule record from database
+#[derive(FromRow, Debug, Clone)]
+pub struct ProxyRuleRecord {
+    pub id: String,
+    pub name: String,
+    #[sqlx(rename = "type")]
+    pub rule_type: String,
+    pub listen_addr: String,
+    pub domains: Option<String>,
+    pub routes: Option<String>,
+    pub tls_enabled: i32,
+    pub tls_acme: i32,
+    pub tls_domain: Option<String>,
+    pub enabled: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Proxy traffic record from database
+#[derive(FromRow, Debug)]
+pub struct ProxyTrafficRecord {
+    pub rule_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    pub connections: i32,
+}
+
+/// ACME certificate record from database
+#[derive(FromRow, Debug, Clone)]
+pub struct AcmeCertificateRecord {
+    pub domain: String,
+    pub status: String,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+    pub chain_pem: Option<String>,
+    pub issued_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub auto_renew: i32,
+    pub last_renewal_attempt: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// ACME challenge record from database
+#[derive(FromRow, Debug)]
+pub struct AcmeChallengeRecord {
+    pub token: String,
+    pub domain: String,
+    pub authorization: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

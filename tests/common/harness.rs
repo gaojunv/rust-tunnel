@@ -90,6 +90,20 @@ impl TestHarness {
             dns_bind: "127.0.0.1:0".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
             dns_mesh_domain: "mesh.local".to_string(),
+            // Reverse Proxy defaults
+            reverse_proxy_enabled: false,
+            reverse_proxy_max_connections: 10000,
+            reverse_proxy_connection_timeout: 30,
+            reverse_proxy_buffer_size: 8192,
+            // ACME defaults
+            acme_enabled: false,
+            acme_server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+            acme_cert_dir: "./data/certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            acme_email: None,
+            acme_tos_agreed: false,
         };
 
         let db = Database::new(&config.db_path).await.expect("db new");

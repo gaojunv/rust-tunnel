@@ -4,6 +4,7 @@ use rust_tunnel::common::{
 };
 use rust_tunnel::server::logs::LogLayer;
 use rust_tunnel::server::{api, auth, control, listener, Database, ServerConfig};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
@@ -67,6 +68,34 @@ async fn main() -> TunnelResult<()> {
         });
 
         tracing::info!("DNS server started on {}", config.dns_bind);
+    }
+
+    // Initialize ACME client if enabled
+    if config.acme_enabled {
+        let acme_state = rust_tunnel::server::acme::AcmeState::with_db(db.clone());
+        let client = rust_tunnel::server::acme::client::AcmeClient::new(
+            acme_state,
+            config.acme_server_url.clone(),
+            config.acme_cert_dir.clone(),
+            config.acme_email.clone(),
+        );
+
+        if let Err(e) = client.initialize().await {
+            tracing::warn!("Failed to initialize ACME client: {}", e);
+        }
+
+        let acme_config = control::AcmeConfigInfo {
+            enabled: true,
+            server_url: config.acme_server_url.clone(),
+            cert_dir: config.acme_cert_dir.clone(),
+        };
+
+        state.set_acme_client(Arc::new(client), acme_config);
+        tracing::info!(
+            "ACME client initialized (server: {}, cert_dir: {})",
+            config.acme_server_url,
+            config.acme_cert_dir
+        );
     }
 
     // Split config for control and API servers

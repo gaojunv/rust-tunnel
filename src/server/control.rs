@@ -14,6 +14,7 @@ use crate::server::api::TrafficStore;
 use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
 use crate::server::mesh::MeshManager;
+use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::quality::{
     calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
     QualityThresholds, QualityTracker,
@@ -87,6 +88,14 @@ struct ActiveConnection {
     remote_port: u16,
 }
 
+/// ACME configuration summary for API responses
+#[derive(Debug, Clone)]
+pub struct AcmeConfigInfo {
+    pub enabled: bool,
+    pub server_url: String,
+    pub cert_dir: String,
+}
+
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
@@ -112,8 +121,14 @@ pub struct ServerState {
     pub mesh_manager: MeshManager,
     /// DNS registry (set when DNS server is enabled)
     pub dns_registry: Option<DnsRegistry>,
+    /// Reverse proxy state
+    pub proxy_state: ReverseProxyState,
     /// Active listener tasks (keyed by port) — aborted on client disconnect
     listener_tasks: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>>,
+    /// ACME client for certificate management (set when ACME is enabled)
+    pub acme_client: Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>,
+    /// ACME configuration info (set when ACME is enabled)
+    pub acme_config: Option<AcmeConfigInfo>,
 }
 
 impl Default for ServerState {
@@ -137,7 +152,10 @@ impl ServerState {
             log_store: None,
             mesh_manager: MeshManager::new(),
             dns_registry: None,
+            proxy_state: ReverseProxyState::new(),
             listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            acme_client: None,
+            acme_config: None,
         }
     }
 
@@ -153,9 +171,12 @@ impl ServerState {
             quality_store: QualityStore::with_db(db.clone()),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db.clone()),
-            log_store: Some(crate::server::logs::LogStore::new(Some(db))),
+            log_store: Some(crate::server::logs::LogStore::new(Some(db.clone()))),
             mesh_manager: MeshManager::new(),
             dns_registry: None,
+            proxy_state: ReverseProxyState::with_db(db),
+            acme_client: None,
+            acme_config: None,
         }
     }
 
@@ -518,9 +539,24 @@ impl ServerState {
         }
     }
 
+    /// Set the ACME client for this server state
+    pub fn set_acme_client(
+        &mut self,
+        client: std::sync::Arc<crate::server::acme::client::AcmeClient>,
+        config: AcmeConfigInfo,
+    ) {
+        self.acme_client = Some(client);
+        self.acme_config = Some(config);
+    }
+
     /// Set the DNS registry for this server state
     pub fn set_dns_registry(&mut self, registry: DnsRegistry) {
         self.dns_registry = Some(registry);
+    }
+
+    /// Get a reference to the database (if available)
+    pub fn get_db(&self) -> Option<&Database> {
+        self.db.as_ref()
     }
 }
 

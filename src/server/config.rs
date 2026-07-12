@@ -106,6 +106,56 @@ pub struct ServerCli {
     /// Mesh domain suffix (default: mesh.local)
     #[clap(long = "dns-mesh-domain")]
     pub dns_mesh_domain: Option<String>,
+
+    // Reverse Proxy options
+    /// Enable reverse proxy service
+    #[clap(long = "reverse-proxy-enabled")]
+    pub reverse_proxy_enabled: Option<bool>,
+
+    /// Maximum connections for reverse proxy
+    #[clap(long = "reverse-proxy-max-connections")]
+    pub reverse_proxy_max_connections: Option<u32>,
+
+    /// Connection timeout in seconds for reverse proxy
+    #[clap(long = "reverse-proxy-connection-timeout")]
+    pub reverse_proxy_connection_timeout: Option<u64>,
+
+    /// Buffer size for reverse proxy
+    #[clap(long = "reverse-proxy-buffer-size")]
+    pub reverse_proxy_buffer_size: Option<usize>,
+
+    // ACME options
+    /// Enable ACME certificate management
+    #[clap(long = "acme-enabled")]
+    pub acme_enabled: Option<bool>,
+
+    /// ACME server URL
+    #[clap(long = "acme-server-url")]
+    pub acme_server_url: Option<String>,
+
+    /// Certificate storage directory
+    #[clap(long = "acme-cert-dir")]
+    pub acme_cert_dir: Option<String>,
+
+    /// Enable automatic certificate renewal
+    #[clap(long = "acme-auto-renew")]
+    pub acme_auto_renew: Option<bool>,
+
+    /// Renewal check interval in hours
+    #[clap(long = "acme-renewal-check-interval")]
+    pub acme_renewal_check_interval: Option<u64>,
+
+    /// Days before expiry to trigger renewal
+    #[clap(long = "acme-renewal-days-before-expiry")]
+    pub acme_renewal_days_before_expiry: Option<u64>,
+
+    /// Contact email for ACME/Let's Encrypt
+    #[clap(long = "acme-email")]
+    pub acme_email: Option<String>,
+
+    /// Agree to Let's Encrypt Terms of Service
+    #[clap(long = "acme-tos-agreed")]
+    pub acme_tos_agreed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -132,6 +182,18 @@ pub struct ServerConfigFile {
     pub dns_bind: Option<String>,
     pub dns_tunnel_domain: Option<String>,
     pub dns_mesh_domain: Option<String>,
+    pub reverse_proxy_enabled: Option<bool>,
+    pub reverse_proxy_max_connections: Option<u32>,
+    pub reverse_proxy_connection_timeout: Option<u64>,
+    pub reverse_proxy_buffer_size: Option<usize>,
+    pub acme_enabled: Option<bool>,
+    pub acme_server_url: Option<String>,
+    pub acme_cert_dir: Option<String>,
+    pub acme_auto_renew: Option<bool>,
+    pub acme_renewal_check_interval: Option<u64>,
+    pub acme_renewal_days_before_expiry: Option<u64>,
+    pub acme_email: Option<String>,
+    pub acme_tos_agreed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +225,20 @@ pub struct ServerConfig {
     pub dns_bind: String,
     pub dns_tunnel_domain: String,
     pub dns_mesh_domain: String,
+    // Reverse Proxy configuration
+    pub reverse_proxy_enabled: bool,
+    pub reverse_proxy_max_connections: u32,
+    pub reverse_proxy_connection_timeout: u64,
+    pub reverse_proxy_buffer_size: usize,
+    // ACME configuration
+    pub acme_enabled: bool,
+    pub acme_server_url: String,
+    pub acme_cert_dir: String,
+    pub acme_auto_renew: bool,
+    pub acme_renewal_check_interval: u64,
+    pub acme_renewal_days_before_expiry: u64,
+    pub acme_email: Option<String>,
+    pub acme_tos_agreed: bool,
 }
 
 impl Default for ServerConfig {
@@ -190,6 +266,20 @@ impl Default for ServerConfig {
             dns_bind: "0.0.0.0:53".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
             dns_mesh_domain: "mesh.local".to_string(),
+            // Reverse Proxy defaults
+            reverse_proxy_enabled: false,
+            reverse_proxy_max_connections: 10000,
+            reverse_proxy_connection_timeout: 30,
+            reverse_proxy_buffer_size: 8192,
+            // ACME defaults
+            acme_enabled: false,
+            acme_server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+            acme_cert_dir: "./data/certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            acme_email: None,
+            acme_tos_agreed: false,
         }
     }
 }
@@ -277,6 +367,44 @@ impl ServerConfig {
                 if let Some(v) = file_config.dns_mesh_domain {
                     config.dns_mesh_domain = v;
                 }
+                // Reverse Proxy config file values
+                if let Some(v) = file_config.reverse_proxy_enabled {
+                    config.reverse_proxy_enabled = v;
+                }
+                if let Some(v) = file_config.reverse_proxy_max_connections {
+                    config.reverse_proxy_max_connections = v;
+                }
+                if let Some(v) = file_config.reverse_proxy_connection_timeout {
+                    config.reverse_proxy_connection_timeout = v;
+                }
+                if let Some(v) = file_config.reverse_proxy_buffer_size {
+                    config.reverse_proxy_buffer_size = v;
+                }
+                // ACME config file values
+                if let Some(v) = file_config.acme_enabled {
+                    config.acme_enabled = v;
+                }
+                if let Some(v) = file_config.acme_server_url {
+                    config.acme_server_url = v;
+                }
+                if let Some(v) = file_config.acme_cert_dir {
+                    config.acme_cert_dir = v;
+                }
+                if let Some(v) = file_config.acme_auto_renew {
+                    config.acme_auto_renew = v;
+                }
+                if let Some(v) = file_config.acme_renewal_check_interval {
+                    config.acme_renewal_check_interval = v;
+                }
+                if let Some(v) = file_config.acme_renewal_days_before_expiry {
+                    config.acme_renewal_days_before_expiry = v;
+                }
+                if let Some(v) = file_config.acme_email {
+                    config.acme_email = Some(v);
+                }
+                if let Some(v) = file_config.acme_tos_agreed {
+                    config.acme_tos_agreed = v;
+                }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
             }
@@ -360,6 +488,56 @@ impl ServerConfig {
             config.dns_mesh_domain = v;
         }
 
+        // Environment variables for Reverse Proxy
+        if let Ok(v) = std::env::var("REVERSE_PROXY_ENABLED") {
+            config.reverse_proxy_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("REVERSE_PROXY_MAX_CONNECTIONS") {
+            if let Ok(val) = v.parse::<u32>() {
+                config.reverse_proxy_max_connections = val;
+            }
+        }
+        if let Ok(v) = std::env::var("REVERSE_PROXY_CONNECTION_TIMEOUT") {
+            if let Ok(val) = v.parse::<u64>() {
+                config.reverse_proxy_connection_timeout = val;
+            }
+        }
+        if let Ok(v) = std::env::var("REVERSE_PROXY_BUFFER_SIZE") {
+            if let Ok(val) = v.parse::<usize>() {
+                config.reverse_proxy_buffer_size = val;
+            }
+        }
+
+        // Environment variables for ACME
+        if let Ok(v) = std::env::var("ACME_ENABLED") {
+            config.acme_enabled = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("ACME_SERVER_URL") {
+            config.acme_server_url = v;
+        }
+        if let Ok(v) = std::env::var("ACME_CERT_DIR") {
+            config.acme_cert_dir = v;
+        }
+        if let Ok(v) = std::env::var("ACME_AUTO_RENEW") {
+            config.acme_auto_renew = v.to_lowercase() == "true" || v == "1";
+        }
+        if let Ok(v) = std::env::var("ACME_RENEWAL_CHECK_INTERVAL") {
+            if let Ok(val) = v.parse::<u64>() {
+                config.acme_renewal_check_interval = val;
+            }
+        }
+        if let Ok(v) = std::env::var("ACME_RENEWAL_DAYS_BEFORE_EXPIRY") {
+            if let Ok(val) = v.parse::<u64>() {
+                config.acme_renewal_days_before_expiry = val;
+            }
+        }
+        if let Ok(v) = std::env::var("ACME_EMAIL") {
+            config.acme_email = Some(v);
+        }
+        if let Ok(v) = std::env::var("ACME_TOS_AGREED") {
+            config.acme_tos_agreed = v.to_lowercase() == "true" || v == "1";
+        }
+
         // 3. Command line arguments (highest priority)
         if let Some(v) = cli.control_addr {
             config.control_addr = v;
@@ -430,6 +608,46 @@ impl ServerConfig {
             config.dns_mesh_domain = v;
         }
 
+        // Reverse Proxy command line arguments
+        if let Some(v) = cli.reverse_proxy_enabled {
+            config.reverse_proxy_enabled = v;
+        }
+        if let Some(v) = cli.reverse_proxy_max_connections {
+            config.reverse_proxy_max_connections = v;
+        }
+        if let Some(v) = cli.reverse_proxy_connection_timeout {
+            config.reverse_proxy_connection_timeout = v;
+        }
+        if let Some(v) = cli.reverse_proxy_buffer_size {
+            config.reverse_proxy_buffer_size = v;
+        }
+
+        // ACME command line arguments
+        if let Some(v) = cli.acme_enabled {
+            config.acme_enabled = v;
+        }
+        if let Some(v) = cli.acme_server_url {
+            config.acme_server_url = v;
+        }
+        if let Some(v) = cli.acme_cert_dir {
+            config.acme_cert_dir = v;
+        }
+        if let Some(v) = cli.acme_auto_renew {
+            config.acme_auto_renew = v;
+        }
+        if let Some(v) = cli.acme_renewal_check_interval {
+            config.acme_renewal_check_interval = v;
+        }
+        if let Some(v) = cli.acme_renewal_days_before_expiry {
+            config.acme_renewal_days_before_expiry = v;
+        }
+        if let Some(v) = cli.acme_email {
+            config.acme_email = Some(v);
+        }
+        if let Some(v) = cli.acme_tos_agreed {
+            config.acme_tos_agreed = v;
+        }
+
         // Validate Shadowsocks configuration
         if config.ss_enabled {
             if config.ss_port.is_none() {
@@ -474,6 +692,19 @@ impl ServerConfig {
                 .dns_bind
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("Invalid dns_bind '{}': {}", config.dns_bind, e))?;
+        }
+
+        // Validate ACME configuration
+        if config.acme_enabled {
+            if config.acme_email.is_none() {
+                return Err("acme_email is required when acme_enabled is true".to_string());
+            }
+            if !config.acme_tos_agreed {
+                return Err(
+                    "acme_tos_agreed must be true when acme_enabled is true (Let's Encrypt ToS)"
+                        .to_string(),
+                );
+            }
         }
 
         Ok(config)
@@ -536,6 +767,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let config = ServerConfig::from_cli(cli).unwrap();
@@ -580,6 +823,18 @@ mod tests {
             dns_bind: "0.0.0.0:53".to_string(),
             dns_tunnel_domain: "tunnel.local".to_string(),
             dns_mesh_domain: "mesh.local".to_string(),
+            reverse_proxy_enabled: false,
+            reverse_proxy_max_connections: 10000,
+            reverse_proxy_connection_timeout: 30,
+            reverse_proxy_buffer_size: 8192,
+            acme_enabled: false,
+            acme_server_url: "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+            acme_cert_dir: "./data/certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            acme_email: None,
+            acme_tos_agreed: false,
         };
 
         let cloned = config.clone();
@@ -633,6 +888,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -666,6 +933,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -699,6 +978,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -732,6 +1023,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -765,6 +1068,18 @@ mod tests {
             dns_bind: None,
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);
@@ -798,6 +1113,18 @@ mod tests {
             dns_bind: Some("not-an-address".to_string()),
             dns_tunnel_domain: None,
             dns_mesh_domain: None,
+            reverse_proxy_enabled: None,
+            reverse_proxy_max_connections: None,
+            reverse_proxy_connection_timeout: None,
+            reverse_proxy_buffer_size: None,
+            acme_enabled: None,
+            acme_server_url: None,
+            acme_cert_dir: None,
+            acme_auto_renew: None,
+            acme_renewal_check_interval: None,
+            acme_renewal_days_before_expiry: None,
+            acme_email: None,
+            acme_tos_agreed: None,
         };
 
         let result = ServerConfig::from_cli(cli);

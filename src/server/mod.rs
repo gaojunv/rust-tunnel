@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -9,6 +10,7 @@ pub mod logs;
 pub mod mesh;
 pub mod proxy;
 pub mod quality;
+pub mod reverse_proxy;
 pub mod shadowsocks;
 pub mod trojan;
 

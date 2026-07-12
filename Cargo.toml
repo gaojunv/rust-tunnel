@@ -49,6 +49,12 @@ axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 async-stream = "0.3"
 
+# HTTP client and utilities for reverse proxy
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Embed frontend assets
 rust-embed = { version = "8.0", features = ["axum"], optional = true }
 mime_guess = "2.0"
