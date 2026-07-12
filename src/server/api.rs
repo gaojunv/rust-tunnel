@@ -2165,23 +2165,12 @@ async fn renew_acme_certificate(
 
 // GET /api/acme/status — get ACME status
 async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
-    let config = match &state.server_state.acme_config {
-        Some(c) => c,
-        None => {
-            return Json(serde_json::json!({
-                "enabled": false,
-                "server_url": null,
-                "cert_dir": null,
-                "consumers": {
-                    "api_tls": false,
-                    "trojan": false,
-                    "control_tls": true,
-                    "reverse_proxy": false,
-                },
-            }))
-            .into_response();
-        }
-    };
+    // Read enabled status from acme_full_config to stay in sync with API updates
+    let full_config = state.server_state.acme_full_config.read().await;
+    let enabled = full_config.enabled;
+    let server_url = full_config.server_url.clone();
+    let cert_dir = full_config.cert_dir.clone();
+    drop(full_config);
 
     let cert_count = match &state.server_state.acme_client {
         Some(client) => match client.list_certificates().await {
@@ -2195,9 +2184,9 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
     let trojan = !state.server_state.get_trojan_ports().await.is_empty();
 
     Json(serde_json::json!({
-        "enabled": config.enabled,
-        "server_url": config.server_url,
-        "cert_dir": config.cert_dir,
+        "enabled": enabled,
+        "server_url": server_url,
+        "cert_dir": cert_dir,
         "certificate_count": cert_count,
         "consumers": {
             "api_tls": api_tls,
