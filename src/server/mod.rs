@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod control;
 pub mod db;
+pub mod dynamic_config;
 pub mod dns;
 pub mod listener;
 pub mod logs;
