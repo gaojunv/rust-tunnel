@@ -2084,6 +2084,7 @@ async fn request_acme_certificate(
     let client = match &state.server_state.acme_client {
         Some(c) => c,
         None => {
+            tracing::error!("ACME certificate request failed: ACME client not initialized");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": "ACME is not enabled" })),
@@ -2093,16 +2094,22 @@ async fn request_acme_certificate(
     };
 
     match client.request_certificate(&domain).await {
-        Ok(metadata) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "certificate": metadata })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(metadata) => {
+            tracing::info!("Certificate request successful for domain: {}", domain);
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "certificate": metadata })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Certificate request failed for domain {}: {:?}", domain, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -2215,7 +2222,7 @@ async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse {
 
 // PUT /api/acme/config — update ACME configuration
 async fn update_acme_config(
-    State(state): State<ApiState>,
+    State(mut state): State<ApiState>,
     Json(req): Json<UpdateAcmeConfigRequest>,
 ) -> impl IntoResponse {
     let mut config = state.server_state.acme_full_config.write().await;
@@ -2241,7 +2248,15 @@ async fn update_acme_config(
         config.tos_agreed = v;
     }
 
-    Json(serde_json::json!({
+    // Capture config values for ACME client initialization
+    let should_init_client = config.enabled && state.server_state.acme_client.is_none();
+    let acme_server_url = config.server_url.clone();
+    let acme_cert_dir = config.cert_dir.clone();
+    let acme_email = config.email.clone();
+    let acme_enabled = config.enabled;
+
+    // Prepare response before potentially dropping the lock
+    let response = Json(serde_json::json!({
         "enabled": config.enabled,
         "server_url": config.server_url,
         "email": config.email,
@@ -2250,7 +2265,39 @@ async fn update_acme_config(
         "renewal_check_interval": config.renewal_check_interval,
         "renewal_days_before_expiry": config.renewal_days_before_expiry,
         "tos_agreed": config.tos_agreed,
-    }))
+    }));
+
+    // Drop the write lock before initializing ACME client
+    drop(config);
+
+    // Initialize ACME client if enabled and not already initialized
+    if should_init_client {
+        if let Some(db) = state.server_state.get_db() {
+            let acme_state = crate::server::acme::AcmeState::with_db(db.clone());
+            let client = std::sync::Arc::new(
+                crate::server::acme::client::AcmeClient::new(
+                    acme_state,
+                    acme_server_url.clone(),
+                    acme_cert_dir.clone(),
+                    acme_email,
+                ),
+            );
+
+            if let Err(e) = client.initialize().await {
+                tracing::warn!("Failed to initialize ACME client: {}", e);
+            }
+
+            let acme_config_info = crate::server::control::AcmeConfigInfo {
+                enabled: acme_enabled,
+                server_url: acme_server_url,
+                cert_dir: acme_cert_dir,
+            };
+
+            state.server_state.set_acme_client(client, acme_config_info);
+        }
+    }
+
+    response
 }
 
 // ── DNS Provider Endpoints ─────────────────────────────────────────
