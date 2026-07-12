@@ -15,6 +15,7 @@ use crate::common::{
 use crate::server::api::TrafficStore;
 use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
+use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
 use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::quality::{
@@ -166,6 +167,12 @@ pub struct ServerState {
     /// DNS provider configuration for ACME DNS-01 challenges
     pub dns_provider_config:
         Arc<RwLock<Option<crate::server::acme::dns::DnsProviderConfig>>>,
+    /// Dynamic configuration (DB-backed, runtime-changeable)
+    pub dynamic_config: Arc<RwLock<DynamicConfig>>,
+    /// Shadowsocks listener abort handle
+    pub ss_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// Trojan listener abort handle
+    pub trojan_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
 }
 
 impl Default for ServerState {
@@ -196,6 +203,22 @@ impl ServerState {
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
             dns_provider_config: Arc::new(RwLock::new(None)),
+            dynamic_config: Arc::new(RwLock::new(DynamicConfig {
+                log_level: "info".to_string(),
+                ss: None,
+                trojan: None,
+                reverse_proxy: crate::server::dynamic_config::ReverseProxySettings {
+                    max_connections: 10000,
+                    connection_timeout_secs: 30,
+                    buffer_size: 8192,
+                },
+                dns: crate::server::dynamic_config::DnsSettings {
+                    tunnel_domain: "tunnel.local".to_string(),
+                    mesh_domain: "mesh.local".to_string(),
+                },
+            })),
+            ss_listener_abort: Arc::new(RwLock::new(None)),
+            trojan_listener_abort: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -220,6 +243,22 @@ impl ServerState {
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
             cert_manager: None,
             dns_provider_config: Arc::new(RwLock::new(None)),
+            dynamic_config: Arc::new(RwLock::new(DynamicConfig {
+                log_level: "info".to_string(),
+                ss: None,
+                trojan: None,
+                reverse_proxy: crate::server::dynamic_config::ReverseProxySettings {
+                    max_connections: 10000,
+                    connection_timeout_secs: 30,
+                    buffer_size: 8192,
+                },
+                dns: crate::server::dynamic_config::DnsSettings {
+                    tunnel_domain: "tunnel.local".to_string(),
+                    mesh_domain: "mesh.local".to_string(),
+                },
+            })),
+            ss_listener_abort: Arc::new(RwLock::new(None)),
+            trojan_listener_abort: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -608,6 +647,17 @@ impl ServerState {
     /// Get a reference to the database (if available)
     pub fn get_db(&self) -> Option<&Database> {
         self.db.as_ref()
+    }
+
+    /// Get database reference (if available)
+    pub fn db(&self) -> Option<&Database> {
+        self.db.as_ref()
+    }
+
+    /// Set the dynamic config (called after DB initialization)
+    pub async fn set_dynamic_config(&self, config: DynamicConfig) {
+        let mut dc = self.dynamic_config.write().await;
+        *dc = config;
     }
 }
 
