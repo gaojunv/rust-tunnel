@@ -354,6 +354,52 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // ============================================================
+        // Dynamic configuration tables
+        // ============================================================
+
+        // Reverse proxy global config (singleton)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS reverse_proxy_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                max_connections INTEGER NOT NULL DEFAULT 10000,
+                connection_timeout_secs INTEGER NOT NULL DEFAULT 30,
+                buffer_size INTEGER NOT NULL DEFAULT 8192,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // DNS config (singleton)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS dns_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                tunnel_domain TEXT NOT NULL DEFAULT 'tunnel.local',
+                mesh_domain TEXT NOT NULL DEFAULT 'mesh.local',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // General server settings (key-value)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1579,6 +1625,113 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
+
+    // ============================================================
+    // Dynamic configuration methods
+    // ============================================================
+
+    /// Load reverse proxy config (singleton)
+    pub async fn load_reverse_proxy_config(
+        &self,
+    ) -> Result<Option<ReverseProxyConfigRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ReverseProxyConfigRecord>(
+            "SELECT max_connections, connection_timeout_secs, buffer_size FROM reverse_proxy_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Save reverse proxy config (singleton, upsert)
+    pub async fn save_reverse_proxy_config(
+        &self,
+        max_connections: u32,
+        connection_timeout_secs: u64,
+        buffer_size: usize,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO reverse_proxy_config (id, max_connections, connection_timeout_secs, buffer_size, updated_at)
+            VALUES (1, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                max_connections = excluded.max_connections,
+                connection_timeout_secs = excluded.connection_timeout_secs,
+                buffer_size = excluded.buffer_size,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(max_connections as i64)
+        .bind(connection_timeout_secs as i64)
+        .bind(buffer_size as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load DNS config (singleton)
+    pub async fn load_dns_config(&self) -> Result<Option<DnsConfigRecord>, sqlx::Error> {
+        sqlx::query_as::<_, DnsConfigRecord>(
+            "SELECT tunnel_domain, mesh_domain FROM dns_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Save DNS config (singleton, upsert)
+    pub async fn save_dns_config(
+        &self,
+        tunnel_domain: &str,
+        mesh_domain: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO dns_config (id, tunnel_domain, mesh_domain, updated_at)
+            VALUES (1, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                tunnel_domain = excluded.tunnel_domain,
+                mesh_domain = excluded.mesh_domain,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(tunnel_domain)
+        .bind(mesh_domain)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load a server setting by key
+    pub async fn load_server_setting(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT value FROM server_settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    /// Save a server setting (upsert)
+    pub async fn save_server_setting(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO server_settings (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Port traffic record from database
@@ -1719,6 +1872,21 @@ pub struct AcmeChallengeRecord {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Reverse proxy config record
+#[derive(Debug, Clone, FromRow)]
+pub struct ReverseProxyConfigRecord {
+    pub max_connections: i64,
+    pub connection_timeout_secs: i64,
+    pub buffer_size: i64,
+}
+
+/// DNS config record
+#[derive(Debug, Clone, FromRow)]
+pub struct DnsConfigRecord {
+    pub tunnel_domain: String,
+    pub mesh_domain: String,
 }
 
 #[cfg(test)]
