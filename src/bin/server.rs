@@ -20,6 +20,10 @@ async fn main() -> TunnelResult<()> {
     // Create shared state with database
     let mut state = control::ServerState::with_db(db.clone());
 
+    // Load or seed dynamic config from DB
+    let dynamic_config = rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
+    state.set_dynamic_config(dynamic_config).await;
+
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();
     if let Some(store) = log_store {
@@ -220,119 +224,128 @@ async fn main() -> TunnelResult<()> {
         }
     });
 
-    // Start Shadowsocks listener if enabled
-    if config.ss_enabled {
-        let ss_port = config
-            .ss_port
-            .expect("ss_port should be set when ss_enabled is true");
-        let ss_cipher = config
-            .ss_cipher
-            .expect("ss_cipher should be set when ss_enabled is true");
-        let ss_password = config
-            .ss_password
-            .expect("ss_password should be set when ss_enabled is true");
-
-        tracing::info!(
-            "Starting Shadowsocks listener on port {}, cipher {}",
-            ss_port,
-            ss_cipher
-        );
-
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                listener::start_shadowsocks_listener(state_clone, ss_port, ss_cipher, ss_password)
+    // Start Shadowsocks if enabled in dynamic config
+    {
+        let dc = state.dynamic_config.read().await;
+        if let Some(ref ss) = dc.ss {
+            if ss.enabled {
+                let state_clone = state.clone();
+                let ss_port = ss.port;
+                let ss_cipher = ss.cipher.clone();
+                let ss_password = ss.password.clone();
+                tracing::info!(
+                    "Starting Shadowsocks listener on port {}, cipher {}",
+                    ss_port,
+                    ss_cipher
+                );
+                drop(dc); // Release the read lock before spawning
+                tokio::spawn(async move {
+                    if let Err(e) = listener::start_shadowsocks_listener(
+                        state_clone, ss_port, ss_cipher, ss_password,
+                    )
                     .await
-            {
-                tracing::error!("Shadowsocks listener failed: {}", e);
+                    {
+                        tracing::error!("Shadowsocks listener error: {}", e);
+                    }
+                });
             }
-        });
+        }
     }
 
-    // Start Trojan listener if enabled
-    if config.trojan_enabled {
-        let trojan_port = config
-            .trojan_port
-            .expect("trojan_port should be set when trojan_enabled is true");
-        let trojan_password = config
-            .trojan_password
-            .expect("trojan_password should be set when trojan_enabled is true");
-        let trojan_fallback = config.trojan_fallback.clone();
+    // Start Trojan if enabled in dynamic config
+    {
+        let dc = state.dynamic_config.read().await;
+        if let Some(ref tj) = dc.trojan {
+            if tj.enabled {
+                let state_clone = state.clone();
+                let trojan_port = tj.port;
+                let trojan_password = tj.password.clone();
+                let trojan_fallback = tj.fallback.clone();
+                tracing::info!(
+                    "Starting Trojan TLS listener on port {}, fallback {}",
+                    trojan_port,
+                    trojan_fallback
+                );
+                drop(dc); // Release the read lock before spawning
 
-        tracing::info!(
-            "Starting Trojan TLS listener on port {}, fallback {}",
-            trojan_port,
-            trojan_fallback
-        );
+                // Trojan requires TLS - load or generate certificates
+                let cert_pair =
+                    load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
+                        std::io::Error::other(format!(
+                            "Failed to load TLS certificates for Trojan: {}",
+                            e
+                        ))
+                    })?;
+                let tls_config = create_server_config(cert_pair).map_err(|e| {
+                    std::io::Error::other(format!(
+                        "Failed to create TLS config for Trojan: {}",
+                        e
+                    ))
+                })?;
 
-        // Trojan requires TLS - load or generate certificates
-        let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
-            std::io::Error::other(format!("Failed to load TLS certificates for Trojan: {}", e))
-        })?;
-        let tls_config = create_server_config(cert_pair).map_err(|e| {
-            std::io::Error::other(format!("Failed to create TLS config for Trojan: {}", e))
-        })?;
+                // Create a watch channel for dynamic TLS config updates
+                let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
 
-        // Create a watch channel for dynamic TLS config updates
-        let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
-
-        // If a cert_manager exists, subscribe to cert events and update the watch channel
-        if let Some(ref cert_manager) = state.cert_manager {
-            let mut cert_rx = cert_manager.subscribe();
-            let tx = tls_config_tx.clone();
-            let cert_manager_clone = cert_manager.clone();
-            tokio::spawn(async move {
-                use rust_tunnel::server::acme::manager::CertEvent;
-                loop {
-                    match cert_rx.recv().await {
-                        Ok(event) => match event {
-                            CertEvent::Renewed { ref domain }
-                            | CertEvent::Issued { ref domain } => {
-                                tracing::info!(
-                                    "Certificate event for Trojan listener: {:?} for {}",
-                                    event,
-                                    domain
-                                );
-                                // Try to get the updated TLS config from the cert manager
-                                if let Some(new_config) =
-                                    cert_manager_clone.get_tls_server_config(domain).await
-                                {
-                                    if let Err(e) = tx.send(new_config) {
-                                        tracing::error!(
-                                            "Failed to update Trojan TLS config: {}",
-                                            e
+                // If a cert_manager exists, subscribe to cert events and update the watch channel
+                if let Some(ref cert_manager) = state.cert_manager {
+                    let mut cert_rx = cert_manager.subscribe();
+                    let tx = tls_config_tx.clone();
+                    let cert_manager_clone = cert_manager.clone();
+                    tokio::spawn(async move {
+                        use rust_tunnel::server::acme::manager::CertEvent;
+                        loop {
+                            match cert_rx.recv().await {
+                                Ok(event) => match event {
+                                    CertEvent::Renewed { ref domain }
+                                    | CertEvent::Issued { ref domain } => {
+                                        tracing::info!(
+                                            "Certificate event for Trojan listener: {:?} for {}",
+                                            event,
+                                            domain
                                         );
+                                        // Try to get the updated TLS config from the cert manager
+                                        if let Some(new_config) =
+                                            cert_manager_clone.get_tls_server_config(domain).await
+                                        {
+                                            if let Err(e) = tx.send(new_config) {
+                                                tracing::error!(
+                                                    "Failed to update Trojan TLS config: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
                                     }
+                                    _ => {}
+                                },
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    tracing::warn!("Cert event subscriber lagged by {} messages", n);
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    tracing::info!(
+                                        "Cert event channel closed, stopping TLS config updater"
+                                    );
+                                    break;
                                 }
                             }
-                            _ => {}
-                        },
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("Cert event subscriber lagged by {} messages", n);
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Cert event channel closed, stopping TLS config updater");
-                            break;
-                        }
-                    }
+                    });
                 }
-            });
-        }
 
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = listener::start_trojan_listener(
-                state_clone,
-                trojan_port,
-                trojan_password,
-                trojan_fallback,
-                tls_config_rx,
-            )
-            .await
-            {
-                tracing::error!("Trojan listener failed: {}", e);
+                tokio::spawn(async move {
+                    if let Err(e) = listener::start_trojan_listener(
+                        state_clone,
+                        trojan_port,
+                        trojan_password,
+                        trojan_fallback,
+                        tls_config_rx,
+                    )
+                    .await
+                    {
+                        tracing::error!("Trojan listener error: {}", e);
+                    }
+                });
             }
-        });
+        }
     }
 
     // Spawn API server
