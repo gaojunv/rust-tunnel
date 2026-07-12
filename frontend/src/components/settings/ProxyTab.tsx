@@ -15,20 +15,25 @@ import {
   useUpdateShadowsocksConfig,
   useTrojanConfig,
   useUpdateTrojanConfig,
+  useAcmeStatus,
 } from '@/api/hooks';
+import { Info } from 'lucide-react';
 
 export default function ProxyTab() {
   const { data: ssConfig, isLoading: ssLoading } = useShadowsocksConfig();
   const { data: tjConfig, isLoading: tjLoading } = useTrojanConfig();
+  const { data: acmeStatus } = useAcmeStatus();
   const updateSS = useUpdateShadowsocksConfig();
   const updateTJ = useUpdateTrojanConfig();
 
   const [ssEnabled, setSsEnabled] = useState(false);
   const [ssPort, setSsPort] = useState('8388');
   const [ssCipher, setSsCipher] = useState('aes-256-gcm');
+  const [ssPassword, setSsPassword] = useState('');
 
   const [tjEnabled, setTjEnabled] = useState(false);
   const [tjPort, setTjPort] = useState('443');
+  const [tjPassword, setTjPassword] = useState('');
   const [tjFallback, setTjFallback] = useState('127.0.0.1:80');
 
   useEffect(() => {
@@ -36,6 +41,7 @@ export default function ProxyTab() {
       setSsEnabled(ssConfig.enabled ?? false);
       setSsPort(ssConfig.port?.toString() ?? '8388');
       setSsCipher(ssConfig.cipher ?? 'aes-256-gcm');
+      // Password not returned from API for security
     }
   }, [ssConfig]);
 
@@ -44,21 +50,30 @@ export default function ProxyTab() {
       setTjEnabled(tjConfig.enabled ?? false);
       setTjPort(tjConfig.port?.toString() ?? '443');
       setTjFallback(tjConfig.fallback ?? '127.0.0.1:80');
+      // Password not returned from API for security
     }
   }, [tjConfig]);
 
   const handleSaveSS = () => {
+    if (!ssPassword && !ssConfig?.enabled) {
+      return; // Password required when enabling
+    }
     updateSS.mutate({
       enabled: ssEnabled,
       port: parseInt(ssPort, 10),
       cipher: ssCipher,
+      ...(ssPassword && { password: ssPassword }),
     });
   };
 
   const handleSaveTJ = () => {
+    if (!tjPassword && !tjConfig?.enabled) {
+      return; // Password required when enabling
+    }
     updateTJ.mutate({
       enabled: tjEnabled,
       port: parseInt(tjPort, 10),
+      ...(tjPassword && { password: tjPassword }),
       fallback: tjFallback || undefined,
     });
   };
@@ -105,6 +120,18 @@ export default function ProxyTab() {
                 </SelectContent>
               </Select>
             </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Password</label>
+              <Input
+                type="password"
+                value={ssPassword}
+                onChange={(e) => setSsPassword(e.target.value)}
+                placeholder={ssConfig?.enabled ? '••••••••' : 'Enter password'}
+              />
+              <p className="text-xs text-muted-foreground">
+                {ssConfig?.enabled ? 'Leave blank to keep current password' : 'Required to enable'}
+              </p>
+            </div>
           </div>
           <Button onClick={handleSaveSS} disabled={updateSS.isPending}>
             {updateSS.isPending ? 'Saving...' : 'Save Shadowsocks Config'}
@@ -135,6 +162,18 @@ export default function ProxyTab() {
               />
             </div>
             <div className="space-y-2">
+              <label className="text-sm font-medium">Password</label>
+              <Input
+                type="password"
+                value={tjPassword}
+                onChange={(e) => setTjPassword(e.target.value)}
+                placeholder={tjConfig?.enabled ? '••••••••' : 'Enter password'}
+              />
+              <p className="text-xs text-muted-foreground">
+                {tjConfig?.enabled ? 'Leave blank to keep current password' : 'Required to enable'}
+              </p>
+            </div>
+            <div className="space-y-2">
               <label className="text-sm font-medium">Fallback</label>
               <Input
                 value={tjFallback}
@@ -146,6 +185,28 @@ export default function ProxyTab() {
               </p>
             </div>
           </div>
+
+          {/* Trojan TLS info */}
+          <div className="rounded-md bg-muted p-3 flex items-start gap-2">
+            <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+            <div className="text-sm text-muted-foreground">
+              <p className="font-medium mb-1">TLS Certificate</p>
+              <p>
+                Trojan requires TLS. The certificate is managed via{' '}
+                <a href="/acme" className="underline font-medium">ACME</a>.{' '}
+                {acmeStatus?.enabled ? (
+                  <span className="text-green-600 dark:text-green-400">
+                    ACME is enabled. Trojan will use the certificate for the configured domain.
+                  </span>
+                ) : (
+                  <span className="text-yellow-600 dark:text-yellow-400">
+                    ⚠ ACME is not enabled. Enable ACME first to use Trojan.
+                  </span>
+                )}
+              </p>
+            </div>
+          </div>
+
           <Button onClick={handleSaveTJ} disabled={updateTJ.isPending}>
             {updateTJ.isPending ? 'Saving...' : 'Save Trojan Config'}
           </Button>

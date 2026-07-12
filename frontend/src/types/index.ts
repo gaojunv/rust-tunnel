@@ -310,6 +310,8 @@ export interface CertConsumers {
 
 export interface GeneralSettings {
   log_level: string;
+  api_tls?: boolean;
+  api_domain?: string;
   reverse_proxy: ReverseProxySettings;
 }
 

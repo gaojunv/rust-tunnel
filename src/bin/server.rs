@@ -24,6 +24,10 @@ async fn main() -> TunnelResult<()> {
     let dynamic_config = rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
     state.set_dynamic_config(dynamic_config).await;
 
+    // Set API TLS config on state (read-only, from config)
+    state.api_tls = config.api_tls;
+    state.api_domain = config.api_domain.clone();
+
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();
     if let Some(store) = log_store {

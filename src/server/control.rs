@@ -173,6 +173,10 @@ pub struct ServerState {
     pub ss_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
     /// Trojan listener abort handle
     pub trojan_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// Whether API TLS is enabled (read-only, from config)
+    pub api_tls: bool,
+    /// API domain for TLS certificate (read-only, from config)
+    pub api_domain: Option<String>,
 }
 
 impl Default for ServerState {
@@ -219,6 +223,8 @@ impl ServerState {
             })),
             ss_listener_abort: Arc::new(RwLock::new(None)),
             trojan_listener_abort: Arc::new(RwLock::new(None)),
+            api_tls: false,
+            api_domain: None,
         }
     }
 
@@ -259,6 +265,8 @@ impl ServerState {
             })),
             ss_listener_abort: Arc::new(RwLock::new(None)),
             trojan_listener_abort: Arc::new(RwLock::new(None)),
+            api_tls: false,
+            api_domain: None,
         }
     }
 

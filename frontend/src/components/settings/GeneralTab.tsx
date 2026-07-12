@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
@@ -9,33 +9,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { useSettings, useUpdateReverseProxyConfig } from '@/api/hooks';
+import { useSettings, useAcmeStatus } from '@/api/hooks';
+import { Info } from 'lucide-react';
 
 const LOG_LEVELS = ['trace', 'debug', 'info', 'warn', 'error'];
 
 export default function GeneralTab() {
   const { data: settings, isLoading } = useSettings();
-  const updateProxyConfig = useUpdateReverseProxyConfig();
+  const { data: acmeStatus } = useAcmeStatus();
 
-  const [maxConn, setMaxConn] = useState('');
-  const [timeout, setTimeout_] = useState('');
-  const [bufferSize, setBufferSize] = useState('');
+  const [apiTls, setApiTls] = useState(false);
+  const [apiDomain, setApiDomain] = useState('');
 
   useEffect(() => {
-    if (settings?.reverse_proxy) {
-      setMaxConn(String(settings.reverse_proxy.max_connections));
-      setTimeout_(String(settings.reverse_proxy.connection_timeout_secs));
-      setBufferSize(String(settings.reverse_proxy.buffer_size));
+    if (settings) {
+      setApiTls(settings.api_tls ?? false);
+      setApiDomain(settings.api_domain ?? '');
     }
   }, [settings]);
-
-  const handleSave = () => {
-    updateProxyConfig.mutate({
-      max_connections: Number(maxConn),
-      connection_timeout_secs: Number(timeout),
-      buffer_size: Number(bufferSize),
-    });
-  };
 
   if (isLoading) {
     return <div className="text-center py-8 text-muted-foreground">Loading...</div>;
@@ -64,50 +55,80 @@ export default function GeneralTab() {
               </SelectContent>
             </Select>
             <p className="text-xs text-muted-foreground">
-              Log level is configured via the server config file or environment variables.
+              Log level is managed via the server config file or environment variables.
             </p>
           </div>
         </CardContent>
       </Card>
 
-      {/* Reverse Proxy Settings */}
+      {/* API Server TLS */}
       <Card>
         <CardHeader>
-          <CardTitle>Reverse Proxy Defaults</CardTitle>
+          <CardTitle>API Server TLS</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Max Connections</label>
-              <Input
-                type="number"
-                value={maxConn}
-                onChange={(e) => setMaxConn(e.target.value)}
-                placeholder="10000"
-              />
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <label className="text-sm font-medium">Enable TLS</label>
+              <p className="text-xs text-muted-foreground">
+                Serve the API over HTTPS using ACME certificates
+              </p>
             </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Timeout (seconds)</label>
-              <Input
-                type="number"
-                value={timeout}
-                onChange={(e) => setTimeout_(e.target.value)}
-                placeholder="30"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Buffer Size (bytes)</label>
-              <Input
-                type="number"
-                value={bufferSize}
-                onChange={(e) => setBufferSize(e.target.value)}
-                placeholder="8192"
-              />
+            <Switch
+              checked={apiTls}
+              onCheckedChange={setApiTls}
+              disabled
+            />
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium">API Domain</label>
+            <Input
+              value={apiDomain}
+              onChange={(e) => setApiDomain(e.target.value)}
+              placeholder="api.example.com"
+              disabled
+            />
+            <p className="text-xs text-muted-foreground">
+              Domain name for the API server TLS certificate. Requires ACME to be enabled.
+            </p>
+          </div>
+
+          <div className="rounded-md bg-muted p-3 flex items-start gap-2">
+            <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+            <div className="text-sm text-muted-foreground">
+              <p className="font-medium mb-1">Configuration via server config file</p>
+              <p>
+                API TLS settings (<code className="text-xs bg-background px-1 rounded">api_tls</code>,{' '}
+                <code className="text-xs bg-background px-1 rounded">api_domain</code>) require a server
+                restart to take effect. Configure them in the TOML config file or via environment variables.
+              </p>
+              {!acmeStatus?.enabled && (
+                <p className="mt-2 text-yellow-600 dark:text-yellow-400">
+                  ⚠ ACME is not enabled. Enable ACME first to use API TLS.
+                </p>
+              )}
             </div>
           </div>
-          <Button onClick={handleSave} disabled={updateProxyConfig.isPending}>
-            {updateProxyConfig.isPending ? 'Saving...' : 'Save'}
-          </Button>
+        </CardContent>
+      </Card>
+
+      {/* Reverse Proxy */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Reverse Proxy</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-md bg-muted p-3 flex items-start gap-2">
+            <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+            <div className="text-sm text-muted-foreground">
+              <p>
+                Reverse proxy rules are managed on the{' '}
+                <a href="/reverse-proxy" className="underline font-medium">Reverse Proxy</a> page.
+                Create and configure HTTP, TCP, and UDP proxy rules there.
+              </p>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>
