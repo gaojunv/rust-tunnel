@@ -230,7 +230,7 @@ async fn main() -> TunnelResult<()> {
 
     // Spawn API server
     tokio::spawn(async move {
-        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config).await {
+        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config, None).await {
             tracing::error!("API server error: {}", e);
         }
     });

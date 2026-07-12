@@ -2066,6 +2066,7 @@ pub async fn run_api_server(
     api_addr: String,
     server_state: ServerState,
     auth_config: AuthConfig,
+    tls_config: Option<Arc<rustls::server::ServerConfig>>,
 ) -> Result<(), std::io::Error> {
     let auth_config = Arc::new(auth_config);
 
@@ -2184,9 +2185,97 @@ pub async fn run_api_server(
 
     let app = app.layer(cors).with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(&api_addr).await?;
-    tracing::info!("API server listening on {}", api_addr);
-    axum::serve(listener, app).await?;
+    match tls_config {
+        Some(tls_config) => {
+            // Extract port 80 address from api_addr for HTTP redirect
+            let http_addr = {
+                let parts: Vec<&str> = api_addr.split(':').collect();
+                if parts.len() == 2 {
+                    format!("{}:80", parts[0])
+                } else {
+                    format!("0.0.0.0:80")
+                }
+            };
 
-    Ok(())
+            // Start HTTP redirect server on port 80
+            let http_app = axum::Router::new()
+                .fallback(|req: axum::http::Request<Body>| async move {
+                    let uri = req.uri();
+                    let host = uri.host().unwrap_or("localhost").to_string();
+                    let path = format!(
+                        "https://{host}{}",
+                        uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+                    );
+                    (
+                        StatusCode::MOVED_PERMANENTLY,
+                        [(axum::http::header::LOCATION, path)],
+                    )
+                        .into_response()
+                });
+
+            tokio::spawn(async move {
+                let http_listener = match tokio::net::TcpListener::bind(&http_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to bind HTTP redirect server on {}: {}",
+                            http_addr,
+                            e
+                        );
+                        return;
+                    }
+                };
+                tracing::info!("HTTP redirect server listening on {}", http_addr);
+                if let Err(e) = axum::serve(http_listener, http_app).await {
+                    tracing::error!("HTTP redirect server error: {}", e);
+                }
+            });
+
+            // Start HTTPS server on api_addr
+            let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+            let listener = tokio::net::TcpListener::bind(&api_addr).await?;
+            tracing::info!("HTTPS API server listening on {}", api_addr);
+
+            loop {
+                let (tcp_stream, _remote_addr) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::error!("Failed to accept TLS connection: {}", e);
+                        continue;
+                    }
+                };
+
+                let tls_acceptor = tls_acceptor.clone();
+                let app = app.clone();
+
+                tokio::spawn(async move {
+                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("TLS handshake failed: {}", e);
+                            return;
+                        }
+                    };
+
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let service =
+                        hyper_util::service::TowerToHyperService::new(app.into_service());
+
+                    if let Err(e) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        tracing::error!("HTTPS connection error: {}", e);
+                    }
+                });
+            }
+        }
+        None => {
+            // Plain HTTP — original behavior
+            let listener = tokio::net::TcpListener::bind(&api_addr).await?;
+            tracing::info!("API server listening on {}", api_addr);
+            axum::serve(listener, app).await?;
+            Ok(())
+        }
+    }
 }
