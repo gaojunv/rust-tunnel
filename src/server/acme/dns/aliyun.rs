@@ -200,13 +200,13 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let (main_domain, rr) = parse_domain(domain)?;
 
         info!(
-            "Creating Aliyun DNS TXT record: {}._acme-challenge.{} = {}",
+            "Creating Aliyun DNS TXT record: {}.{} = {}",
             rr, main_domain, value
         );
 
         let params = vec![
             ("DomainName".to_string(), main_domain),
-            ("RR".to_string(), format!("_acme-challenge.{}", rr)),
+            ("RR".to_string(), rr),
             ("Type".to_string(), "TXT".to_string()),
             ("Value".to_string(), value.to_string()),
             ("TTL".to_string(), "600".to_string()),
@@ -299,6 +299,16 @@ mod tests {
     #[test]
     fn test_parse_domain_invalid() {
         assert!(parse_domain("com").is_err());
+    }
+
+    #[test]
+    fn test_parse_acme_challenge_domain() {
+        // For wildcard domain *.example.com, the ACME challenge domain
+        // should be _acme-challenge.example.com
+        let domain = "_acme-challenge.example.com";
+        let (main_domain, rr) = parse_domain(domain).unwrap();
+        assert_eq!(main_domain, "example.com");
+        assert_eq!(rr, "_acme-challenge");
     }
 
     #[test]

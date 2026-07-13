@@ -471,7 +471,10 @@ impl AcmeClient {
             );
 
             // Create DNS TXT record
-            let acme_domain = format!("_acme-challenge.{}", domain);
+            // For wildcard domains like *.example.com, the ACME challenge
+            // domain should be _acme-challenge.example.com (without the *)
+            let base_domain = domain.strip_prefix("*.").unwrap_or(domain);
+            let acme_domain = format!("_acme-challenge.{}", base_domain);
             dns_solver
                 .create_txt_record(&acme_domain, &txt_value)
                 .await
