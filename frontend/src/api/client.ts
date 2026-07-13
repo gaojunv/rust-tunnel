@@ -276,8 +276,8 @@ export const listAcmeCertificates = async (): Promise<AcmeCertificate[]> => {
   return response.data.certificates;
 };
 
-export const requestAcmeCertificate = async (domain: string): Promise<AcmeCertificate> => {
-  const response = await api.post<{ certificate: AcmeCertificate }>(`/acme/certificates/${domain}`);
+export const requestAcmeCertificate = async (domain: string, challengeType: string = 'http-01'): Promise<AcmeCertificate> => {
+  const response = await api.post<{ certificate: AcmeCertificate }>(`/acme/certificates/${domain}`, { challenge_type: challengeType });
   return response.data.certificate;
 };
 

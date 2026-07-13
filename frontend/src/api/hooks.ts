@@ -302,7 +302,8 @@ export function useAcmeCertificates() {
 export function useRequestAcmeCertificate() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (domain: string) => requestAcmeCertificate(domain),
+    mutationFn: ({ domain, challengeType }: { domain: string; challengeType: string }) =>
+      requestAcmeCertificate(domain, challengeType),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['acme-certificates'] });
     },

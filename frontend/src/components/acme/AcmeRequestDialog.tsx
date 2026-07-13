@@ -32,13 +32,16 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    requestMutation.mutate(domain, {
-      onSuccess: () => {
-        onOpenChange(false);
-        setDomain('');
-        setChallengeType('http-01');
-      },
-    });
+    requestMutation.mutate(
+      { domain, challengeType },
+      {
+        onSuccess: () => {
+          onOpenChange(false);
+          setDomain('');
+          setChallengeType('http-01');
+        },
+      }
+    );
   };
 
   return (
