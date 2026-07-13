@@ -98,6 +98,10 @@ impl AliyunDnsSolver {
             urlencoding::encode(&query_string)
         );
 
+        // Debug logging for signature calculation
+        debug!("Canonical query string: {}", query_string);
+        debug!("String to sign: {}", string_to_sign);
+
         // Compute HMAC-SHA1 signature
         type HmacSha1 = Hmac<Sha1>;
         let mut mac =
@@ -131,6 +135,7 @@ impl AliyunDnsSolver {
         let url = format!("{}?{}", ALIYUN_DNS_API, query_string);
 
         debug!("Calling Aliyun API: action={}", action);
+        debug!("Request URL: {}", url);
 
         let response = self.client.get(&url).send().await?;
 
