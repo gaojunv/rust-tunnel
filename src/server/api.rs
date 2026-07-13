@@ -871,6 +871,13 @@ struct UpdateAcmeConfigRequest {
     tos_agreed: Option<bool>,
 }
 
+/// 证书申请请求
+#[derive(Debug, Deserialize)]
+struct CertificateRequest {
+    /// 挑战类型: "http-01" 或 "dns-01"
+    challenge_type: Option<String>,
+}
+
 // Login handler
 async fn login(
     State(state): State<ApiState>,
@@ -2212,6 +2219,7 @@ async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoRespo
 async fn request_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
+    Json(req): Json<CertificateRequest>,
 ) -> impl IntoResponse {
     let client_guard = state.server_state.acme_client.read().await;
     let client = match client_guard.as_ref() {
@@ -2227,7 +2235,56 @@ async fn request_acme_certificate(
     };
     drop(client_guard);
 
-    match client.request_certificate(&domain).await {
+    let challenge_type = req.challenge_type.unwrap_or_else(|| "http-01".to_string());
+
+    let result = match challenge_type.as_str() {
+        "dns-01" => {
+            // 获取 DNS solver
+            let dns_config = state.server_state.dns_provider_config.read().await;
+            match dns_config.as_ref() {
+                Some(config) => {
+                    let solver: std::sync::Arc<dyn crate::server::acme::dns::DnsChallengeSolver> =
+                        match config.provider {
+                            crate::server::acme::dns::DnsProvider::Aliyun => {
+                                std::sync::Arc::new(
+                                    crate::server::acme::dns::aliyun::AliyunDnsSolver::new(config),
+                                )
+                            }
+                            crate::server::acme::dns::DnsProvider::Cloudflare => {
+                                std::sync::Arc::new(
+                                    crate::server::acme::dns::cloudflare::CloudflareDnsSolver::new(
+                                        config,
+                                    ),
+                                )
+                            }
+                            crate::server::acme::dns::DnsProvider::TencentCloud => {
+                                std::sync::Arc::new(
+                                    crate::server::acme::dns::tencent::TencentDnsSolver::new(
+                                        config,
+                                    ),
+                                )
+                            }
+                            crate::server::acme::dns::DnsProvider::Custom => {
+                                std::sync::Arc::new(
+                                    crate::server::acme::dns::custom::CustomDnsSolver::new(config),
+                                )
+                            }
+                        };
+                    client.request_certificate_with_dns(&domain, solver).await
+                }
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "DNS provider not configured" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "http-01" | _ => client.request_certificate(&domain).await,
+    };
+
+    match result {
         Ok(metadata) => {
             tracing::info!("Certificate request successful for domain: {}", domain);
             (
