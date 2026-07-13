@@ -81,7 +81,7 @@ figment = { version = "0.10", features = ["env", "toml"] }
 rustls = "0.22"
 rustls-pemfile = "2.0"
 tokio-rustls = "0.25"
-rcgen = "0.12"
+rcgen = "0.14"
 webpki-roots = "0.26"
 rustls-native-certs = "0.7"
 time = "0.3"
@@ -99,8 +99,13 @@ hickory-proto = "0.24"
 async-trait = "0.1"
 
 # ACME protocol support
-instant-acme = "0.7"
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
 x509-parser = "0.16"
+
+# DNS-01 challenge support
+base64 = "0.22"
+urlencoding = "2.1"
+trust-dns-resolver = "0.23"
 
 [features]
 embed-frontend = ["rust-embed"]

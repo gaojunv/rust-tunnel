@@ -35,7 +35,8 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
         "127.0.0.1".to_string(),
         "::1".to_string(),
         "rust-tunnel-server".to_string(),
-    ]);
+    ])
+    .map_err(|e| format!("Failed to create certificate params: {}", e))?;
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
@@ -43,9 +44,9 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
 
-    let key_pair = KeyPair::generate(&rcgen::PKCS_ED25519)
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .map_err(|e| format!("Failed to generate key pair: {}", e))?;
-    let cert = Certificate::from_params(params)
+    let cert = params.self_signed(&key_pair)
         .map_err(|e| format!("Failed to generate certificate: {}", e))?;
 
     Ok((cert, key_pair))
@@ -77,11 +78,7 @@ pub fn load_or_generate_cert(cert_path: &str, key_path: &str) -> TunnelResult<Tl
     // Save certificate and key
     let mut cert_file = fs::File::create(cert_path).map_err(TunnelError::Io)?;
     cert_file
-        .write_all(
-            cert.serialize_pem()
-                .map_err(|e| TunnelError::Tls(format!("Failed to serialize cert: {}", e)))?
-                .as_bytes(),
-        )
+        .write_all(cert.pem().as_bytes())
         .map_err(TunnelError::Io)?;
 
     let mut key_file = fs::File::create(key_path).map_err(TunnelError::Io)?;
@@ -292,8 +289,8 @@ mod tests {
         let (cert, key_pair) = result.unwrap();
 
         // Verify the cert can be serialized to PEM
-        let cert_pem = cert.serialize_pem();
-        assert!(cert_pem.is_ok(), "Failed to serialize cert to PEM");
+        let cert_pem = cert.pem();
+        assert!(!cert_pem.is_empty(), "Failed to serialize cert to PEM");
 
         // Verify the key can be serialized to PEM
         let key_pem = key_pair.serialize_pem();
