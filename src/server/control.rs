@@ -24,6 +24,7 @@ use crate::server::quality::{
 };
 use crate::server::{listener, ServerConfig};
 use chrono::{Timelike, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -100,7 +101,7 @@ pub struct AcmeConfigInfo {
 }
 
 /// Full ACME configuration for API access
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeFullConfig {
     pub enabled: bool,
     pub server_url: String,

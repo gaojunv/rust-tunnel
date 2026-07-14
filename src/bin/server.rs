@@ -24,6 +24,22 @@ async fn main() -> TunnelResult<()> {
     let dynamic_config = rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
     state.set_dynamic_config(dynamic_config).await;
 
+    // Load persisted ACME and DNS provider configs from database
+    if let Some(db_ref) = state.get_db() {
+        if let Ok(Some(json)) = db_ref.load_server_setting("acme_config").await {
+            if let Ok(acme_config) = serde_json::from_str::<control::AcmeFullConfig>(&json) {
+                *state.acme_full_config.write().await = acme_config;
+                tracing::info!("Loaded persisted ACME config from database");
+            }
+        }
+        if let Ok(Some(json)) = db_ref.load_server_setting("dns_provider_config").await {
+            if let Ok(dns_config) = serde_json::from_str::<rust_tunnel::server::acme::dns::DnsProviderConfig>(&json) {
+                *state.dns_provider_config.write().await = Some(dns_config);
+                tracing::info!("Loaded persisted DNS provider config from database");
+            }
+        }
+    }
+
     // Set API TLS config on state (read-only, from config)
     state.api_tls = config.api_tls;
     state.api_domain = config.api_domain.clone();

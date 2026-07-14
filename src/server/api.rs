@@ -2445,6 +2445,15 @@ async fn update_acme_config(
         config.tos_agreed = v;
     }
 
+    // Persist ACME config to database
+    if let Some(db) = state.server_state.get_db() {
+        if let Ok(json) = serde_json::to_string(&*config) {
+            if let Err(e) = db.save_server_setting("acme_config", &json).await {
+                tracing::error!("Failed to persist ACME config: {}", e);
+            }
+        }
+    }
+
     // Capture config values for ACME client initialization
     let has_client = state.server_state.acme_client.read().await.is_some();
     let should_init_client = config.enabled && !has_client;
@@ -2532,6 +2541,16 @@ async fn update_dns_provider(
 ) -> impl IntoResponse {
     let mut config = state.server_state.dns_provider_config.write().await;
     *config = Some(req.clone());
+
+    // Persist DNS provider config to database
+    if let Some(db) = state.server_state.get_db() {
+        if let Ok(json) = serde_json::to_string(&*config) {
+            if let Err(e) = db.save_server_setting("dns_provider_config", &json).await {
+                tracing::error!("Failed to persist DNS provider config: {}", e);
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "success": true,
         "config": req
