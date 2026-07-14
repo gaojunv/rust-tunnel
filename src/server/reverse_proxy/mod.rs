@@ -272,6 +272,15 @@ impl ReverseProxyState {
             };
             let tls = rule.tls.as_ref();
 
+            let cert_source_str: Option<&'static str> = rule.cert_status.as_ref().map(|s| match s.source {
+                CertSourceKind::Exact => "exact",
+                CertSourceKind::WildcardReuse => "wildcard_reuse",
+                CertSourceKind::PendingIssuance => "pending_issuance",
+                CertSourceKind::None => "none",
+            });
+            let cert_covering = rule.cert_status.as_ref().map(|s| s.covering_domain.as_str());
+            let cert_updated = rule.cert_status.as_ref().map(|s| &s.last_updated);
+
             db.save_proxy_rule(
                 &rule.id,
                 &rule.name,
@@ -283,6 +292,9 @@ impl ReverseProxyState {
                 tls.map_or(false, |t| t.acme),
                 tls.and_then(|t| t.domain.as_deref()),
                 rule.enabled,
+                cert_source_str,
+                cert_covering,
+                cert_updated,
             )
             .await?;
         }

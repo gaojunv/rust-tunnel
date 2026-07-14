@@ -259,12 +259,29 @@ impl Database {
                 tls_domain TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
+                updated_at DATETIME NOT NULL,
+                cert_source TEXT,
+                cert_covering_domain TEXT,
+                cert_status_updated_at DATETIME
             )
             "#,
         )
         .execute(pool)
         .await?;
+
+        // Migrate: add columns if missing (idempotent — errors ignored on "duplicate column")
+        for col_sql in [
+            "ALTER TABLE proxy_rules ADD COLUMN cert_source TEXT",
+            "ALTER TABLE proxy_rules ADD COLUMN cert_covering_domain TEXT",
+            "ALTER TABLE proxy_rules ADD COLUMN cert_status_updated_at DATETIME",
+        ] {
+            if let Err(e) = sqlx::query(col_sql).execute(pool).await {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e);
+                }
+            }
+        }
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)")
             .execute(pool)
@@ -1193,13 +1210,17 @@ impl Database {
         tls_acme: bool,
         tls_domain: Option<&str>,
         enabled: bool,
+        cert_source: Option<&str>,
+        cert_covering_domain: Option<&str>,
+        cert_status_updated_at: Option<&DateTime<Utc>>,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
             r#"
             INSERT INTO proxy_rules (id, name, type, listen_addr, domains, routes,
-                tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
+                cert_source, cert_covering_domain, cert_status_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 type = excluded.type,
@@ -1210,7 +1231,10 @@ impl Database {
                 tls_acme = excluded.tls_acme,
                 tls_domain = excluded.tls_domain,
                 enabled = excluded.enabled,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                cert_source = excluded.cert_source,
+                cert_covering_domain = excluded.cert_covering_domain,
+                cert_status_updated_at = excluded.cert_status_updated_at
             "#,
         )
         .bind(id)
@@ -1225,6 +1249,9 @@ impl Database {
         .bind(enabled as i32)
         .bind(now)
         .bind(now)
+        .bind(cert_source)
+        .bind(cert_covering_domain)
+        .bind(cert_status_updated_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1235,7 +1262,8 @@ impl Database {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r#"
             SELECT id, name, type, listen_addr, domains, routes,
-                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
+                   cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             ORDER BY created_at
             "#,
@@ -1249,7 +1277,8 @@ impl Database {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r#"
             SELECT id, name, type, listen_addr, domains, routes,
-                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
+                   cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             WHERE enabled = 1
             ORDER BY created_at
@@ -1264,7 +1293,8 @@ impl Database {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r#"
             SELECT id, name, type, listen_addr, domains, routes,
-                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at
+                   tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
+                   cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             WHERE id = ?
             "#,
@@ -1732,6 +1762,11 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.pool
+    }
 }
 
 /// Port traffic record from database
@@ -1835,6 +1870,9 @@ pub struct ProxyRuleRecord {
     pub enabled: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub cert_source: Option<String>,
+    pub cert_covering_domain: Option<String>,
+    pub cert_status_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Proxy traffic record from database
@@ -2298,5 +2336,63 @@ mod tests {
 
         let results = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert_eq!(results.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod cert_status_migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migration_adds_cert_columns_to_empty_db() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+
+        // 查询 pragma_table_info 验证列存在
+        let cols: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('proxy_rules')"
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let names: Vec<String> = cols.into_iter().map(|(n,)| n).collect();
+        assert!(names.contains(&"cert_source".to_string()));
+        assert!(names.contains(&"cert_covering_domain".to_string()));
+        assert!(names.contains(&"cert_status_updated_at".to_string()));
+    }
+
+    #[tokio::test]
+    async fn migration_idempotent_on_existing_db() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("test.db");
+        // 打开两次应无错
+        let _db1 = Database::new(path.to_str().unwrap()).await.unwrap();
+        let _db2 = Database::new(path.to_str().unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_and_load_rule_with_cert_status_fields() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+
+        db.save_proxy_rule(
+            "r-1", "test", "http", "0.0.0.0:443",
+            Some(r#"["a.example.com"]"#),
+            Some(r#"[]"#),
+            true, true, Some("a.example.com"),
+            true,
+            Some("exact"),
+            Some("a.example.com"),
+            Some(&chrono::Utc::now()),
+        ).await.unwrap();
+
+        let rules = db.load_proxy_rules().await.unwrap();
+        assert_eq!(rules.len(), 1);
+        let r = &rules[0];
+        assert_eq!(r.cert_source.as_deref(), Some("exact"));
+        assert_eq!(r.cert_covering_domain.as_deref(), Some("a.example.com"));
+        assert!(r.cert_status_updated_at.is_some());
     }
 }
