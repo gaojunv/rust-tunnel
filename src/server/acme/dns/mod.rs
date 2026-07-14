@@ -80,3 +80,6 @@ impl Default for DnsProviderRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod aliyun_test;
