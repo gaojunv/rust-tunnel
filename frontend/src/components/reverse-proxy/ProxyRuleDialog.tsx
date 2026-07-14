@@ -69,14 +69,35 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         : { routes: form.routes.length > 0 ? form.routes : undefined }),
     };
 
+    const handleError = (error: unknown) => {
+      const err = error as {
+        response?: {
+          status?: number;
+          data?: { error?: string; conflicts?: Array<{ reason: string }> };
+        };
+      };
+      if (err?.response?.status === 409) {
+        const body = err.response.data ?? {};
+        const details = (body.conflicts ?? [])
+          .map((c) => c.reason)
+          .join('; ');
+        // eslint-disable-next-line no-alert
+        alert(`规则冲突：${body.error ?? '与现有规则冲突'}${details ? '\n' + details : ''}`);
+      }
+    };
+
     if (editingRule) {
       updateMutation.mutate(
         { id: editingRule.id, data },
-        { onSuccess: () => onOpenChange(false) }
+        {
+          onSuccess: () => onOpenChange(false),
+          onError: handleError,
+        }
       );
     } else {
       createMutation.mutate(data, {
         onSuccess: () => onOpenChange(false),
+        onError: handleError,
       });
     }
   };

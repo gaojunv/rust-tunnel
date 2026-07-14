@@ -199,6 +199,14 @@ export interface ProxyTlsConfig {
   domain?: string;
 }
 
+export type CertSourceKind = 'exact' | 'wildcard_reuse' | 'pending_issuance' | 'none';
+
+export interface RuleCertStatus {
+  source: CertSourceKind;
+  covering_domain: string;
+  last_updated: string; // RFC3339
+}
+
 export interface ProxyRule {
   id: string;
   name: string;
@@ -209,6 +217,7 @@ export interface ProxyRule {
   tls?: ProxyTlsConfig;
   enabled: boolean;
   created_at?: string;
+  cert_status?: RuleCertStatus | null;
 }
 
 export interface ProxyStats {
