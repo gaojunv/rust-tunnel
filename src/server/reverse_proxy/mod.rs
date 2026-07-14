@@ -183,6 +183,67 @@ pub struct ReverseProxyState {
     cert_manager: Option<Arc<crate::server::acme::CertificateManager>>,
 }
 
+/// Compute the cert coverage source for a rule at save time.
+///
+/// Selection of the "primary domain":
+/// 1. `rule.tls.domain` if set
+/// 2. `rule.domains.first()`
+/// 3. otherwise: source = None
+pub async fn resolve_cert_source_for_rule(
+    rule: &ProxyRule,
+    cert_manager: Option<&Arc<crate::server::acme::CertificateManager>>,
+) -> RuleCertStatus {
+    let now = chrono::Utc::now();
+
+    let Some(tls) = rule.tls.as_ref().filter(|t| t.enabled) else {
+        return RuleCertStatus {
+            source: CertSourceKind::None,
+            covering_domain: String::new(),
+            last_updated: now,
+        };
+    };
+    let primary = tls
+        .domain
+        .clone()
+        .or_else(|| rule.domains.first().cloned())
+        // Normalize so it matches the storage key inside CertificateManager
+        // (which lowercases on add) and the SNI value delivered by rustls.
+        .map(|d| d.to_ascii_lowercase());
+    let Some(domain) = primary else {
+        return RuleCertStatus {
+            source: CertSourceKind::None,
+            covering_domain: String::new(),
+            last_updated: now,
+        };
+    };
+
+    let Some(mgr) = cert_manager else {
+        return RuleCertStatus {
+            source: CertSourceKind::PendingIssuance,
+            covering_domain: domain,
+            last_updated: now,
+        };
+    };
+
+    match mgr.find_covering_cert(&domain).await {
+        Some(crate::server::acme::CertCoverage::Exact) => RuleCertStatus {
+            source: CertSourceKind::Exact,
+            covering_domain: domain,
+            last_updated: now,
+        },
+        Some(crate::server::acme::CertCoverage::Wildcard(w)) => RuleCertStatus {
+            source: CertSourceKind::WildcardReuse,
+            covering_domain: w,
+            last_updated: now,
+        },
+        None => RuleCertStatus {
+            source: CertSourceKind::PendingIssuance,
+            covering_domain: domain,
+            last_updated: now,
+        },
+    }
+}
+
 impl ReverseProxyState {
     /// Create a new reverse proxy state without database
     pub fn new() -> Self {
@@ -426,5 +487,43 @@ mod mod_tests {
         }"#;
         let rule: ProxyRule = serde_json::from_str(json).unwrap();
         assert!(rule.cert_status.is_none(), "cert_status should be skipped on deserialize");
+    }
+
+    #[tokio::test]
+    async fn resolve_cert_source_none_when_tls_disabled() {
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let out = resolve_cert_source_for_rule(&rule, None).await;
+        assert_eq!(out.source, CertSourceKind::None);
+    }
+
+    #[tokio::test]
+    async fn resolve_cert_source_pending_when_no_cert() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(crate::server::acme::CertificateManager::new(temp_dir.path().to_str().unwrap()));
+
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["nope.example.com".into()],
+            routes: vec![],
+            tls: Some(ProxyTlsConfig { enabled: true, acme: true, domain: None }),
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let out = resolve_cert_source_for_rule(&rule, Some(&mgr)).await;
+        assert_eq!(out.source, CertSourceKind::PendingIssuance);
+        assert_eq!(out.covering_domain, "nope.example.com");
     }
 }

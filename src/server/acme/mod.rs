@@ -6,7 +6,7 @@ pub mod provider;
 pub mod storage;
 
 pub use manager::{CertEvent, CertificateManager};
-pub use provider::{CertEntry, CertSource, CertificateProvider};
+pub use provider::{CertCoverage, CertEntry, CertSource, CertificateProvider};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
