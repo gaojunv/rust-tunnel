@@ -253,15 +253,72 @@ impl DnsChallengeSolver for AliyunDnsSolver {
 
     async fn wait_for_propagation(
         &self,
-        _domain: &str,
-        _value: &str,
+        domain: &str,
+        value: &str,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        // Wait a fixed interval for DNS propagation
-        let wait = std::cmp::min(timeout, Duration::from_secs(30));
-        debug!("Waiting {:?} for Aliyun DNS propagation", wait);
-        tokio::time::sleep(wait).await;
-        Ok(())
+        use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+        use trust_dns_resolver::TokioAsyncResolver;
+
+        // Build resolver with Google DNS + Alibaba DNS
+        let mut config = ResolverConfig::new();
+        config.add_name_server(NameServerConfig::new(
+            "8.8.8.8:53".parse().unwrap(),
+            Protocol::Udp,
+        ));
+        config.add_name_server(NameServerConfig::new(
+            "223.5.5.5:53".parse().unwrap(),
+            Protocol::Udp,
+        ));
+        let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_secs(5);
+
+        info!(
+            "Waiting for DNS propagation of TXT record for {} (timeout: {:?})",
+            domain, timeout
+        );
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "DNS propagation timeout for {} after {:?}",
+                    domain,
+                    timeout
+                );
+            }
+
+            match resolver.txt_lookup(domain).await {
+                Ok(lookup) => {
+                    let mut found_count = 0;
+                    for txt in lookup.iter() {
+                        found_count += 1;
+                        // TXT::Display concatenates all data segments
+                        let txt_str = txt.to_string();
+                        if txt_str == value {
+                            info!(
+                                "DNS TXT record confirmed for {}: {}",
+                                domain, value
+                            );
+                            return Ok(());
+                        }
+                    }
+                    debug!(
+                        "TXT record not yet propagated for {} (found {} records, none match)",
+                        domain, found_count
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "DNS lookup failed for {} (may be NXDOMAIN): {}",
+                        domain, e
+                    );
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     fn provider_name(&self) -> &str {
