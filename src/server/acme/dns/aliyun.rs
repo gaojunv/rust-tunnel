@@ -281,7 +281,9 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         );
 
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            // Check deadline BEFORE sleeping
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 anyhow::bail!(
                     "DNS propagation timeout for {} after {:?}",
                     domain,
@@ -294,7 +296,6 @@ impl DnsChallengeSolver for AliyunDnsSolver {
                     let mut found_count = 0;
                     for txt in lookup.iter() {
                         found_count += 1;
-                        // TXT::Display concatenates all data segments
                         let txt_str = txt.to_string();
                         if txt_str == value {
                             info!(
@@ -317,7 +318,9 @@ impl DnsChallengeSolver for AliyunDnsSolver {
                 }
             }
 
-            tokio::time::sleep(poll_interval).await;
+            // Sleep for the lesser of poll_interval and remaining time
+            let sleep_time = remaining.min(poll_interval);
+            tokio::time::sleep(sleep_time).await;
         }
     }
 
