@@ -76,7 +76,7 @@ impl HttpProxy {
             };
 
             // Get TLS server config from certificate provider
-            let server_config = match &self.state.cert_provider() {
+            let server_config = match self.state.cert_provider() {
                 Some(provider) => match provider.get_tls_server_config(&domain).await {
                     Some(config) => config,
                     None => {
@@ -136,7 +136,7 @@ impl HttpProxy {
                 }
             });
 
-            let mut listeners = self.state.listeners.lock().await;
+            let mut listeners = self.state.tcp_listeners.lock().await;
             listeners.insert(rule_id, handle);
         } else {
             // Plain HTTP path (existing behavior)
@@ -159,7 +159,7 @@ impl HttpProxy {
             }
         });
 
-        let mut listeners = self.state.listeners.lock().await;
+        let mut listeners = self.state.tcp_listeners.lock().await;
         listeners.insert(rule_id, handle);
 
         Ok(())

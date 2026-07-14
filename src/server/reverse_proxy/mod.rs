@@ -2,15 +2,15 @@ pub mod config;
 pub mod error;
 pub mod http_proxy;
 pub mod router;
+pub mod shared_listener;
 pub mod sni_resolver;
 pub mod tcp_proxy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
-use crate::server::acme::CertificateProvider;
 use crate::server::db::Database;
 
 /// Load balancing algorithm
@@ -168,14 +168,19 @@ pub struct ProxyStats {
 pub struct ReverseProxyState {
     /// Active proxy rules (id -> rule)
     pub rules: Arc<Mutex<HashMap<String, ProxyRule>>>,
-    /// Active listener tasks (rule_id -> handle)
-    pub listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// HTTP shared listeners keyed by listen_addr (e.g. "0.0.0.0:443").
+    pub shared_listeners:
+        Arc<Mutex<HashMap<String, crate::server::reverse_proxy::shared_listener::SharedListener>>>,
+    /// TCP/UDP per-rule listeners (previously named `listeners`).
+    pub tcp_listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Connection counters per rule
     pub connection_counts: Arc<Mutex<HashMap<String, u64>>>,
+    /// Per-listen_addr async mutex to serialize reconcile calls.
+    pub reconcile_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Database reference
     db: Option<Database>,
-    /// Certificate provider for TLS termination
-    cert_provider: Option<Arc<dyn CertificateProvider>>,
+    /// Concrete CertificateManager (needed for SNI resolver and coverage queries).
+    cert_manager: Option<Arc<crate::server::acme::CertificateManager>>,
 }
 
 impl ReverseProxyState {
@@ -183,10 +188,12 @@ impl ReverseProxyState {
     pub fn new() -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
-            listeners: Arc::new(Mutex::new(HashMap::new())),
+            shared_listeners: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: None,
-            cert_provider: None,
+            cert_manager: None,
         }
     }
 
@@ -194,21 +201,33 @@ impl ReverseProxyState {
     pub fn with_db(db: Database) -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
-            listeners: Arc::new(Mutex::new(HashMap::new())),
+            shared_listeners: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: Some(db),
-            cert_provider: None,
+            cert_manager: None,
         }
     }
 
-    /// Set the certificate provider for TLS termination
-    pub fn set_cert_provider(&mut self, provider: Arc<dyn CertificateProvider>) {
-        self.cert_provider = Some(provider);
+    /// Set the concrete certificate manager for TLS termination and coverage queries.
+    pub fn set_cert_manager(&mut self, manager: Arc<crate::server::acme::CertificateManager>) {
+        self.cert_manager = Some(manager);
     }
 
-    /// Get a reference to the certificate provider
-    pub fn cert_provider(&self) -> Option<&Arc<dyn CertificateProvider>> {
-        self.cert_provider.as_ref()
+    /// Get the concrete certificate manager.
+    #[must_use]
+    pub fn cert_manager(&self) -> Option<&Arc<crate::server::acme::CertificateManager>> {
+        self.cert_manager.as_ref()
+    }
+
+    /// Backwards-compatible accessor returning the manager as a trait object.
+    /// TCP proxy and legacy HTTP paths still use `CertificateProvider`.
+    #[must_use]
+    pub fn cert_provider(&self) -> Option<Arc<dyn crate::server::acme::CertificateProvider>> {
+        self.cert_manager
+            .as_ref()
+            .map(|m| m.clone() as Arc<dyn crate::server::acme::CertificateProvider>)
     }
 
     /// Load rules from database
@@ -218,6 +237,32 @@ impl ReverseProxyState {
             let mut rules = self.rules.lock().await;
 
             for record in records {
+                // Reconstruct cert_status if all three DB columns are present.
+                let cert_status = match (
+                    record.cert_source.as_deref(),
+                    record.cert_covering_domain.clone(),
+                    record.cert_status_updated_at,
+                ) {
+                    (Some(src), Some(covering), Some(ts)) => {
+                        let source = match src {
+                            "exact" => Some(CertSourceKind::Exact),
+                            "wildcard_reuse" => Some(CertSourceKind::WildcardReuse),
+                            "pending_issuance" => Some(CertSourceKind::PendingIssuance),
+                            "none" => Some(CertSourceKind::None),
+                            other => {
+                                tracing::warn!("Unknown cert_source '{}' in DB, dropping", other);
+                                None
+                            }
+                        };
+                        source.map(|s| RuleCertStatus {
+                            source: s,
+                            covering_domain: covering,
+                            last_updated: ts,
+                        })
+                    }
+                    _ => None, // Partial state / pre-migration row → refresh on next event
+                };
+
                 let rule = ProxyRule {
                     id: record.id,
                     name: record.name,
@@ -249,7 +294,7 @@ impl ReverseProxyState {
                     },
                     enabled: record.enabled != 0,
                     created_at: Some(record.created_at.to_rfc3339()),
-                    cert_status: None,
+                    cert_status,
                 };
                 rules.insert(rule.id.clone(), rule);
             }

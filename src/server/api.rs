@@ -2125,7 +2125,7 @@ async fn delete_proxy_rule(
 
     // Stop the listener if it's running
     let listener_handle = {
-        let mut listeners = state.server_state.proxy_state.listeners.lock().await;
+        let mut listeners = state.server_state.proxy_state.tcp_listeners.lock().await;
         listeners.remove(&id)
     };
     if let Some(handle) = listener_handle {
