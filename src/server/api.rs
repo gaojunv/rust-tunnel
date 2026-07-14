@@ -2013,6 +2013,7 @@ async fn create_proxy_rule(
         tls: body.tls,
         enabled: body.enabled,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
+        cert_status: None,
     };
 
     // Save to database
@@ -2083,6 +2084,7 @@ async fn update_proxy_rule(
         tls: body.tls,
         enabled: body.enabled,
         created_at: existing.created_at,
+        cert_status: None,
     };
 
     // Save to database

@@ -84,6 +84,32 @@ pub struct ProxyTlsConfig {
     pub domain: Option<String>,
 }
 
+/// Kind of certificate coverage for a proxy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertSourceKind {
+    /// Exact-match certificate is available for the rule's primary domain.
+    Exact,
+    /// A wildcard certificate covers the rule's primary domain.
+    WildcardReuse,
+    /// TLS is enabled but no covering certificate exists yet
+    /// (ACME issuance in progress or not yet triggered).
+    PendingIssuance,
+    /// TLS is not enabled for this rule.
+    None,
+}
+
+/// Runtime certificate status attached to a proxy rule.
+///
+/// Read-only: populated by the server on rule save and cert events,
+/// never accepted from client input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleCertStatus {
+    pub source: CertSourceKind,
+    pub covering_domain: String,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+}
+
 /// Proxy rule definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRule {
@@ -109,6 +135,9 @@ pub struct ProxyRule {
     pub enabled: bool,
     /// Creation timestamp
     pub created_at: Option<String>,
+    /// Runtime cert coverage status. Never accepted from client input.
+    #[serde(default, skip_deserializing)]
+    pub cert_status: Option<RuleCertStatus>,
 }
 
 fn default_enabled() -> bool {
@@ -220,6 +249,7 @@ impl ReverseProxyState {
                     },
                     enabled: record.enabled != 0,
                     created_at: Some(record.created_at.to_rfc3339()),
+                    cert_status: None,
                 };
                 rules.insert(rule.id.clone(), rule);
             }
@@ -293,5 +323,51 @@ impl ReverseProxyState {
 impl Default for ReverseProxyState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod mod_tests {
+    use super::*;
+
+    #[test]
+    fn cert_status_default_is_none_optional() {
+        let rule = ProxyRule {
+            id: "id-1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        assert!(rule.cert_status.is_none());
+    }
+
+    #[test]
+    fn cert_source_kind_serializes_lowercase() {
+        let s = serde_json::to_string(&CertSourceKind::WildcardReuse).unwrap();
+        assert_eq!(s, "\"wildcard_reuse\"");
+    }
+
+    #[test]
+    fn cert_status_skip_deserializing_ignored_from_input() {
+        // ProxyRule.tls is Option<ProxyTlsConfig>; serde treats missing
+        // Option fields as None so the test JSON does not strictly need
+        // "tls": null. Included here for clarity — the important assertion
+        // is that cert_status is dropped regardless of what the client sends.
+        let json = r#"{
+            "id": "id-1",
+            "name": "r1",
+            "type": "http",
+            "listen": "0.0.0.0:443",
+            "tls": null,
+            "cert_status": { "source": "exact", "covering_domain": "x", "last_updated": "2026-01-01T00:00:00Z" }
+        }"#;
+        let rule: ProxyRule = serde_json::from_str(json).unwrap();
+        assert!(rule.cert_status.is_none(), "cert_status should be skipped on deserialize");
     }
 }
