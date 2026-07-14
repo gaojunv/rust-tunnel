@@ -1,6 +1,7 @@
 pub mod config;
 pub mod http_proxy;
 pub mod router;
+pub mod sni_resolver;
 pub mod tcp_proxy;
 
 use serde::{Deserialize, Serialize};

@@ -6,6 +6,7 @@ use super::storage::CertificateStorage;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use rustls::server::ResolvesServerCert;
 use rustls::server::ServerConfig;
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
@@ -380,7 +381,7 @@ impl CertificateManager {
         if let Some(k) = map.get(&sni) {
             return Some(k.clone());
         }
-        let wildcard = Self::local_wildcard_for(&sni)?;
+        let wildcard = crate::server::reverse_proxy::sni_resolver::wildcard_for(&sni)?;
         map.get(&wildcard).cloned()
     }
 
@@ -398,22 +399,17 @@ impl CertificateManager {
         if cache.contains_key(&domain) {
             return Some(super::provider::CertCoverage::Exact);
         }
-        let wildcard = Self::local_wildcard_for(&domain)?;
+        let wildcard = crate::server::reverse_proxy::sni_resolver::wildcard_for(&domain)?;
         if cache.contains_key(&wildcard) {
             return Some(super::provider::CertCoverage::Wildcard(wildcard));
         }
         None
     }
 
-    /// Temporary local helper — Task 4 will replace uses with
-    /// `crate::server::reverse_proxy::sni_resolver::wildcard_for`.
-    fn local_wildcard_for(domain: &str) -> Option<String> {
-        let (_, rest) = domain.split_once('.')?;
-        if rest.contains('.') {
-            Some(format!("*.{rest}"))
-        } else {
-            None
-        }
+    /// Build a resolver for use with `rustls::ServerConfig::with_cert_resolver`.
+    #[must_use]
+    pub fn sni_resolver(self: Arc<Self>) -> Arc<dyn ResolvesServerCert> {
+        Arc::new(crate::server::reverse_proxy::sni_resolver::SniCertResolver::new(self))
     }
 }
 
