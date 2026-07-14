@@ -29,7 +29,7 @@ export default function ReverseProxyPage() {
       id: rule.id,
       data: {
         name: rule.name,
-        type: rule.rule_type,
+        type: rule.type,
         listen: rule.listen,
         domains: rule.domains,
         routes: rule.routes,

@@ -43,7 +43,7 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
   };
 
   const getBackendCount = (rule: ProxyRule) => {
-    if (rule.rule_type === 'tcp' || rule.rule_type === 'udp') {
+    if (rule.type === 'tcp' || rule.type === 'udp') {
       return rule.routes?.[0]?.backends?.length ?? 0;
     }
     return rule.routes?.reduce((sum, r) => sum + r.backends.length, 0) ?? 0;
@@ -79,13 +79,13 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
                 <TableRow key={rule.id}>
                   <TableCell className="font-medium">{rule.name}</TableCell>
                   <TableCell>
-                    <Badge variant="secondary" className={typeColors[rule.rule_type]}>
-                      {rule.rule_type.toUpperCase()}
+                    <Badge variant="secondary" className={typeColors[rule.type]}>
+                      {rule.type.toUpperCase()}
                     </Badge>
                   </TableCell>
                   <TableCell className="font-mono text-sm">{rule.listen}</TableCell>
                   <TableCell className="text-muted-foreground">
-                    {rule.rule_type === 'http'
+                    {rule.type === 'http'
                       ? rule.domains?.join(', ') || '—'
                       : '—'}
                   </TableCell>

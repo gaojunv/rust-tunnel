@@ -202,7 +202,7 @@ export interface ProxyTlsConfig {
 export interface ProxyRule {
   id: string;
   name: string;
-  rule_type: RuleType;
+  type: RuleType;
   listen: string;
   domains: string[];
   routes: Route[];

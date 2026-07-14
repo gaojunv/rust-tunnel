@@ -27,7 +27,7 @@ interface ProxyRuleDialogProps {
 
 const emptyForm = {
   name: '',
-  rule_type: 'http' as RuleType,
+  type: 'http' as RuleType,
   listen: '',
   domains: [] as string[],
   routes: [] as Route[],
@@ -44,7 +44,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
     if (editingRule) {
       setForm({
         name: editingRule.name,
-        rule_type: editingRule.rule_type,
+        type: editingRule.type,
         listen: editingRule.listen,
         domains: editingRule.domains ?? [],
         routes: editingRule.routes ?? [],
@@ -61,10 +61,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
     const data: CreateProxyRuleRequest = {
       name: form.name,
-      type: form.rule_type,
+      type: form.type,
       listen: form.listen,
       enabled: form.enabled,
-      ...(form.rule_type === 'http'
+      ...(form.type === 'http'
         ? { domains: form.domains, routes: form.routes, tls: form.tls }
         : { routes: form.routes.length > 0 ? form.routes : undefined }),
     };
@@ -105,8 +105,8 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           <div className="space-y-2">
             <label className="text-sm font-medium">Type</label>
             <Select
-              value={form.rule_type}
-              onValueChange={(v) => setForm({ ...form, rule_type: v as RuleType })}
+              value={form.type}
+              onValueChange={(v) => setForm({ ...form, type: v as RuleType })}
             >
               <SelectTrigger>
                 <SelectValue />
@@ -131,7 +131,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           </div>
 
           {/* HTTP-specific fields */}
-          {form.rule_type === 'http' && (
+          {form.type === 'http' && (
             <HttpRouteFields
               domains={form.domains}
               onDomainsChange={(domains) => setForm({ ...form, domains })}
@@ -143,7 +143,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           )}
 
           {/* TCP/UDP backend */}
-          {(form.rule_type === 'tcp' || form.rule_type === 'udp') && (
+          {(form.type === 'tcp' || form.type === 'udp') && (
             <div className="space-y-2">
               <label className="text-sm font-medium">Backend Address</label>
               <Input
