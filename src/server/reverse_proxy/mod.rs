@@ -1,4 +1,5 @@
 pub mod config;
+pub mod error;
 pub mod http_proxy;
 pub mod router;
 pub mod sni_resolver;
