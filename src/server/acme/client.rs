@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, NewOrder, OrderStatus,
+    Account, AccountCredentials, ChallengeType, Identifier, NewOrder, OrderStatus, RetryPolicy,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -297,12 +297,15 @@ impl AcmeClient {
 
         info!("Finalized ACME order for {}", domain);
 
-        // Download the certificate chain
+        // Poll for the certificate - after finalization, the server may take time
+        // to issue the certificate. poll_certificate handles the retry logic.
+        let retry_policy = RetryPolicy::new()
+            .initial_delay(Duration::from_secs(2))
+            .timeout(Duration::from_secs(120));
         let cert_chain = order
-            .certificate()
+            .poll_certificate(&retry_policy)
             .await
-            .context("Failed to download certificate")?
-            .context("Certificate not yet available after finalization")?;
+            .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
         let expires_at = parse_certificate_expiry(&cert_chain)
@@ -590,12 +593,15 @@ impl AcmeClient {
 
         info!("Finalized ACME order for {}", domain);
 
-        // Download the certificate chain
+        // Poll for the certificate - after finalization, the server may take time
+        // to issue the certificate. poll_certificate handles the retry logic.
+        let retry_policy = RetryPolicy::new()
+            .initial_delay(Duration::from_secs(2))
+            .timeout(Duration::from_secs(120));
         let cert_chain = order
-            .certificate()
+            .poll_certificate(&retry_policy)
             .await
-            .context("Failed to download certificate")?
-            .context("Certificate not yet available after finalization")?;
+            .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
         let expires_at = parse_certificate_expiry(&cert_chain)
