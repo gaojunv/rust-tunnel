@@ -427,6 +427,112 @@ mod tests {
         assert!(state.shared_listeners.lock().await.is_empty());
     }
 
+    /// End-to-end: two HTTP rules on the same port dispatch to different mock backends.
+    #[tokio::test]
+    async fn e2e_two_rules_same_port_dispatched_by_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock backend A: replies "A\n"
+        let backend_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = backend_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend_a.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nA\n")
+                        .await;
+                });
+            }
+        });
+
+        // Mock backend B: replies "B\n"
+        let backend_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_addr = backend_b.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend_b.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nB\n")
+                        .await;
+                });
+            }
+        });
+
+        // Pick a free listen port
+        let listen_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listen_probe.local_addr().unwrap().port();
+        drop(listen_probe);
+        let listen_addr = format!("127.0.0.1:{listen_port}");
+
+        let state = ReverseProxyState::new();
+        let mk = |id: &str, host: &str, backend: SocketAddr| ProxyRule {
+            id: id.into(),
+            name: id.into(),
+            rule_type: RuleType::Http,
+            listen: listen_addr.clone(),
+            domains: vec![host.into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend.to_string(),
+                    weight: 100,
+                }],
+                load_balancing: LoadBalancing::RoundRobin,
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        state
+            .rules
+            .lock()
+            .await
+            .insert("a".into(), mk("a", "a.local", a_addr));
+        state
+            .rules
+            .lock()
+            .await
+            .insert("b".into(), mk("b", "b.local", b_addr));
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+
+        // Small delay to let the listener spawn
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Client hits port, alternating Host header
+        let url_a = format!("http://{listen_addr}/x");
+        let url_b = format!("http://{listen_addr}/x");
+        let client = reqwest::Client::new();
+        let resp_a = client
+            .get(&url_a)
+            .header("Host", "a.local")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp_a.text().await.unwrap().starts_with('A'));
+        let resp_b = client
+            .get(&url_b)
+            .header("Host", "b.local")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp_b.text().await.unwrap().starts_with('B'));
+
+        // Cleanup: drop rules FIRST (release the lock) before reconcile,
+        // otherwise reconcile_http_listener would deadlock trying to
+        // re-acquire the rules mutex.
+        {
+            state.rules.lock().await.clear();
+        }
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+    }
+
     #[tokio::test]
     async fn reconcile_starts_and_stops_listener() {
         let state = ReverseProxyState::new();
