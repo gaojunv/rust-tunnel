@@ -157,8 +157,30 @@ async fn main() -> TunnelResult<()> {
             );
         }
 
-        state.set_cert_manager(cert_manager);
+        state.set_cert_manager(cert_manager.clone());
         tracing::info!("Certificate manager initialized (cert_dir: {})", config.acme_cert_dir);
+
+        // Spawn cert-event reactor: refresh proxy rule cert_status on cert changes
+        {
+            let mut rx = cert_manager.subscribe();
+            let proxy_state = state.proxy_state.clone();
+            let mgr = cert_manager.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(rust_tunnel::server::acme::CertEvent::Issued { .. })
+                        | Ok(rust_tunnel::server::acme::CertEvent::Renewed { .. })
+                        | Ok(rust_tunnel::server::acme::CertEvent::Expired { .. }) => {
+                            proxy_state.refresh_all_cert_status(&mgr).await;
+                        }
+                        Ok(rust_tunnel::server::acme::CertEvent::Error { .. }) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            tracing::info!("cert-event reactor started");
+        }
 
         // Populate full ACME config for API access
         {

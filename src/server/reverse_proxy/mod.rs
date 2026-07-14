@@ -436,6 +436,60 @@ impl ReverseProxyState {
         let counts = self.connection_counts.lock().await;
         counts.get(rule_id).copied().unwrap_or(0)
     }
+
+    /// Recompute cert_status for every TLS-enabled rule. Called from the
+    /// cert_event_reactor after CertEvent::Issued/Renewed/Expired.
+    pub async fn refresh_all_cert_status(
+        &self,
+        cert_manager: &Arc<crate::server::acme::CertificateManager>,
+    ) {
+        // Snapshot rules to compute outside the lock
+        let snapshot: Vec<ProxyRule> = {
+            let rules = self.rules.lock().await;
+            rules.values().cloned().collect()
+        };
+
+        let mut updates: Vec<(String, RuleCertStatus)> = Vec::new();
+        for rule in &snapshot {
+            if rule.tls.as_ref().is_some_and(|t| t.enabled) {
+                let new = resolve_cert_source_for_rule(rule, Some(cert_manager)).await;
+                let changed = match &rule.cert_status {
+                    None => true,
+                    Some(prev) => prev.source != new.source
+                        || prev.covering_domain != new.covering_domain,
+                };
+                if changed {
+                    updates.push((rule.id.clone(), new));
+                }
+            }
+        }
+
+        if updates.is_empty() {
+            return;
+        }
+
+        // Apply in-memory + persist
+        {
+            let mut rules = self.rules.lock().await;
+            for (id, status) in &updates {
+                if let Some(r) = rules.get_mut(id) {
+                    r.cert_status = Some(status.clone());
+                }
+            }
+        }
+        // Persist (fire-and-forget on failure — logged)
+        for (id, _) in &updates {
+            let rule = {
+                let rules = self.rules.lock().await;
+                rules.get(id).cloned()
+            };
+            if let Some(r) = rule {
+                if let Err(e) = self.save_rule(&r).await {
+                    tracing::error!("Failed to persist refreshed cert_status for {}: {}", id, e);
+                }
+            }
+        }
+    }
 }
 
 impl Default for ReverseProxyState {
@@ -525,5 +579,48 @@ mod mod_tests {
         let out = resolve_cert_source_for_rule(&rule, Some(&mgr)).await;
         assert_eq!(out.source, CertSourceKind::PendingIssuance);
         assert_eq!(out.covering_domain, "nope.example.com");
+    }
+
+    #[tokio::test]
+    async fn refresh_all_cert_status_updates_pending_to_wildcard() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(crate::server::acme::CertificateManager::new(temp_dir.path().to_str().unwrap()));
+
+        let state = ReverseProxyState::new();
+        // Insert a rule referencing api.example.com, TLS enabled but no cert yet -> PendingIssuance
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["api.example.com".into()],
+            routes: vec![],
+            tls: Some(ProxyTlsConfig { enabled: true, acme: true, domain: None }),
+            enabled: true,
+            created_at: None,
+            cert_status: Some(RuleCertStatus {
+                source: CertSourceKind::PendingIssuance,
+                covering_domain: "api.example.com".into(),
+                last_updated: chrono::Utc::now(),
+            }),
+        };
+        state.rules.lock().await.insert("r1".into(), rule);
+
+        // Add wildcard cert to manager (rcgen 0.14 API, matches gen_self_signed_pem_for in manager tests)
+        let (cert_pem, key_pem) = {
+            use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+            let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let params = CertificateParams::new(vec!["*.example.com".to_string()]).unwrap();
+            let cert = params.self_signed(&key_pair).unwrap();
+            (cert.pem(), key_pair.serialize_pem())
+        };
+        mgr.add_certificate("*.example.com", crate::server::acme::CertEntry {
+            cert_pem, key_pem, chain_pem: None, expires_at: None,
+            source: crate::server::acme::CertSource::Manual,
+        }).await.unwrap();
+
+        state.refresh_all_cert_status(&mgr).await;
+        let rules = state.rules.lock().await;
+        let r = rules.get("r1").unwrap();
+        assert_eq!(r.cert_status.as_ref().unwrap().source, CertSourceKind::WildcardReuse);
     }
 }
