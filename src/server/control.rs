@@ -2114,5 +2114,52 @@ mod acme_config_load_or_seed_tests {
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
         assert!(!out.tos_agreed, "empty DB should not infer ToS agreement");
+
+        // And the persisted seed also has tos_agreed=false
+        let stored: AcmeFullConfig = serde_json::from_str(
+            &db.load_server_setting("acme_config").await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(!stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn tos_inference_does_not_run_when_db_already_has_config() {
+        let (db, _tmp) = fresh_db().await;
+
+        // First call: seed with no certs → tos_agreed=false persisted
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = false;
+        cfg.acme_server_url = "https://a.example/acme".to_string();
+        cfg.acme_cert_dir = "/a".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 24;
+        cfg.acme_renewal_days_before_expiry = 30;
+
+        let first = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+        assert!(!first.tos_agreed);
+
+        // Now add certs after the first seed. If inference re-ran on the
+        // second call, it would flip tos_agreed to true.
+        db.save_acme_certificate(
+            "example.test",
+            "active",
+            Some("cert"),
+            Some("key"),
+            None,
+            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now() + chrono::Duration::days(90)),
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Second call should read the persisted config (tos_agreed=false)
+        // via the DB-hit fast path and NOT re-run inference.
+        let second = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+        assert!(
+            !second.tos_agreed,
+            "inference must not overwrite persisted tos_agreed=false — DB row is authoritative"
+        );
     }
 }
