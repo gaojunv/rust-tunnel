@@ -129,21 +129,52 @@ impl Default for AcmeFullConfig {
 }
 
 impl AcmeFullConfig {
-    /// Seed `AcmeFullConfig` from CLI/TOML values and persist to
-    /// `server_settings.acme_config` in the database.
+    /// Resolve `AcmeFullConfig` for the current process.
     ///
-    /// This is the entry point that will grow (in subsequent tasks) into
-    /// the full "DB is the runtime source of truth" resolver:
-    /// - Task 2 adds the DB-hit fast path (return stored value, ignore seed)
-    /// - Task 3 adds malformed-row handling (preserve the bad row on disk)
-    /// - Task 4 adds `tos_agreed` inference from existing certificates
+    /// If `server_settings.acme_config` in the database contains valid JSON,
+    /// return it verbatim — the CLI/TOML `server_config` values are ignored
+    /// on this path. This makes DB the runtime source of truth: values set
+    /// via `PUT /api/acme/config` (which writes back to DB) survive restart.
     ///
-    /// For now this always writes the seed. DB failures are logged as
-    /// warnings and never fatal.
+    /// If the row is absent, seed from `server_config` and persist.
+    /// If the row is present but malformed, currently logs a warning and
+    /// re-seeds (overwriting the bad row). Task 3 will change this to
+    /// preserve the malformed row instead.
+    ///
+    /// Task 4 will add: on first seed, infer `tos_agreed=true` when
+    /// `acme_certificates` already contains rows (upgrade path).
+    ///
+    /// All DB failures are logged as warnings and never fatal.
     pub async fn load_or_seed(db: &Database, server_config: &ServerConfig) -> Self {
-        // Build seed from CLI/TOML arguments. Used both as the return
-        // value when DB has no config yet, and as a fallback when DB
-        // reads fail.
+        // Fast path: DB has a valid config → return it verbatim.
+        // CLI seed args are ignored on this path.
+        match db.load_server_setting("acme_config").await {
+            Ok(Some(json)) => {
+                match serde_json::from_str::<Self>(&json) {
+                    Ok(cfg) => return cfg,
+                    Err(e) => {
+                        // Malformed row handling is added in Task 3. For now
+                        // fall through to seed and overwrite. Tests only
+                        // exercise the valid-JSON case here.
+                        warn!(
+                            "acme_config in DB is malformed ({}), re-seeding from CLI/TOML",
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                // No row → normal seed path
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to load ACME config from DB ({}), falling back to CLI/TOML seed",
+                    e
+                );
+            }
+        }
+
+        // Build seed from CLI/TOML values (existing code below).
         let seed = Self {
             enabled: server_config.acme_enabled,
             server_url: server_config.acme_server_url.clone(),
@@ -152,11 +183,10 @@ impl AcmeFullConfig {
             auto_renew: server_config.acme_auto_renew,
             renewal_check_interval: server_config.acme_renewal_check_interval,
             renewal_days_before_expiry: server_config.acme_renewal_days_before_expiry,
-            tos_agreed: false, // never seeded from CLI — must be explicit UI opt-in
+            tos_agreed: false,
         };
 
-        // Persist the seed to DB. Failures are non-fatal — the next
-        // startup will retry.
+        // Persist the seed to DB. Failures are non-fatal.
         match serde_json::to_string(&seed) {
             Ok(json) => {
                 if let Err(e) = db.save_server_setting("acme_config", &json).await {
@@ -1886,5 +1916,75 @@ mod acme_config_load_or_seed_tests {
         assert!(stored.enabled);
         assert_eq!(stored.server_url, "https://example.test/acme");
         assert!(!stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn existing_db_returns_stored_values_ignoring_seed() {
+        let (db, _tmp) = fresh_db().await;
+
+        // Pre-populate DB with a distinctive config
+        let stored = AcmeFullConfig {
+            enabled: true,
+            server_url: "https://stored.example/acme".to_string(),
+            email: Some("stored@example.test".to_string()),
+            cert_dir: "/stored/certs".to_string(),
+            auto_renew: false,
+            renewal_check_interval: 99,
+            renewal_days_before_expiry: 77,
+            tos_agreed: true,
+        };
+        db.save_server_setting("acme_config", &serde_json::to_string(&stored).unwrap())
+            .await
+            .unwrap();
+
+        // Call with completely different seed args — none of them should leak through
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = false; // different from stored
+        cfg.acme_server_url = "https://cli.example/acme".to_string();
+        cfg.acme_email = Some("cli@example.test".to_string());
+        cfg.acme_cert_dir = "/cli/certs".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 1;
+        cfg.acme_renewal_days_before_expiry = 2;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        assert!(out.enabled);
+        assert_eq!(out.server_url, "https://stored.example/acme");
+        assert_eq!(out.email.as_deref(), Some("stored@example.test"));
+        assert_eq!(out.cert_dir, "/stored/certs");
+        assert!(!out.auto_renew);
+        assert_eq!(out.renewal_check_interval, 99);
+        assert_eq!(out.renewal_days_before_expiry, 77);
+        assert!(out.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn seed_never_overwrites_existing_db() {
+        let (db, _tmp) = fresh_db().await;
+
+        // First call: seed DB with initial values
+        let mut first_cfg = crate::server::config::ServerConfig::default();
+        first_cfg.acme_enabled = true;
+        first_cfg.acme_server_url = "https://first.example/acme".to_string();
+        first_cfg.acme_cert_dir = "/first".to_string();
+        AcmeFullConfig::load_or_seed(&db, &first_cfg).await;
+
+        // Second call with different seed args — should not touch DB
+        let mut second_cfg = crate::server::config::ServerConfig::default();
+        second_cfg.acme_enabled = false;
+        second_cfg.acme_server_url = "https://second.example/acme".to_string();
+        second_cfg.acme_email = Some("x@y".to_string());
+        second_cfg.acme_cert_dir = "/second".to_string();
+        second_cfg.acme_auto_renew = false;
+        second_cfg.acme_renewal_check_interval = 1;
+        second_cfg.acme_renewal_days_before_expiry = 1;
+        AcmeFullConfig::load_or_seed(&db, &second_cfg).await;
+
+        // DB row must still be the first seed
+        let json = db.load_server_setting("acme_config").await.unwrap().unwrap();
+        let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored.server_url, "https://first.example/acme");
+        assert_eq!(stored.cert_dir, "/first");
     }
 }
