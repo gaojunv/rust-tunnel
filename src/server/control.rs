@@ -128,6 +128,50 @@ impl Default for AcmeFullConfig {
     }
 }
 
+impl AcmeFullConfig {
+    /// Seed `AcmeFullConfig` from CLI/TOML values and persist to
+    /// `server_settings.acme_config` in the database.
+    ///
+    /// This is the entry point that will grow (in subsequent tasks) into
+    /// the full "DB is the runtime source of truth" resolver:
+    /// - Task 2 adds the DB-hit fast path (return stored value, ignore seed)
+    /// - Task 3 adds malformed-row handling (preserve the bad row on disk)
+    /// - Task 4 adds `tos_agreed` inference from existing certificates
+    ///
+    /// For now this always writes the seed. DB failures are logged as
+    /// warnings and never fatal.
+    pub async fn load_or_seed(db: &Database, server_config: &ServerConfig) -> Self {
+        // Build seed from CLI/TOML arguments. Used both as the return
+        // value when DB has no config yet, and as a fallback when DB
+        // reads fail.
+        let seed = Self {
+            enabled: server_config.acme_enabled,
+            server_url: server_config.acme_server_url.clone(),
+            email: server_config.acme_email.clone(),
+            cert_dir: server_config.acme_cert_dir.clone(),
+            auto_renew: server_config.acme_auto_renew,
+            renewal_check_interval: server_config.acme_renewal_check_interval,
+            renewal_days_before_expiry: server_config.acme_renewal_days_before_expiry,
+            tos_agreed: false, // never seeded from CLI — must be explicit UI opt-in
+        };
+
+        // Persist the seed to DB. Failures are non-fatal — the next
+        // startup will retry.
+        match serde_json::to_string(&seed) {
+            Ok(json) => {
+                if let Err(e) = db.save_server_setting("acme_config", &json).await {
+                    warn!("Failed to persist ACME seed config to DB: {}", e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize ACME seed config: {}", e);
+            }
+        }
+
+        seed
+    }
+}
+
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
@@ -1792,5 +1836,55 @@ pub async fn run_server(
                 warn!("Control connection error from {}: {}", addr, e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod acme_config_load_or_seed_tests {
+    use super::*;
+    use crate::server::db::Database;
+
+    async fn fresh_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn fresh_db_uses_cli_values_and_writes_back() {
+        let (db, _tmp) = fresh_db().await;
+
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = true;
+        cfg.acme_server_url = "https://example.test/acme".to_string();
+        cfg.acme_email = Some("op@example.test".to_string());
+        cfg.acme_cert_dir = "/tmp/certs".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 12;
+        cfg.acme_renewal_days_before_expiry = 15;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        // Returned value comes from seed args
+        assert!(out.enabled);
+        assert_eq!(out.server_url, "https://example.test/acme");
+        assert_eq!(out.email.as_deref(), Some("op@example.test"));
+        assert_eq!(out.cert_dir, "/tmp/certs");
+        assert!(out.auto_renew);
+        assert_eq!(out.renewal_check_interval, 12);
+        assert_eq!(out.renewal_days_before_expiry, 15);
+        assert!(!out.tos_agreed); // no certs in fresh DB → no inference
+
+        // DB row now contains the seed
+        let json = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .expect("acme_config row should exist after seed");
+        let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert!(stored.enabled);
+        assert_eq!(stored.server_url, "https://example.test/acme");
+        assert!(!stored.tos_agreed);
     }
 }
