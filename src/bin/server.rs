@@ -110,14 +110,9 @@ async fn main() -> TunnelResult<()> {
     let dynamic_config = rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
     state.set_dynamic_config(dynamic_config).await;
 
-    // Load persisted ACME and DNS provider configs from database
+    // Load persisted DNS provider config from database.
+    // (ACME config is handled below via AcmeFullConfig::load_or_seed.)
     if let Some(db_ref) = state.get_db() {
-        if let Ok(Some(json)) = db_ref.load_server_setting("acme_config").await {
-            if let Ok(acme_config) = serde_json::from_str::<control::AcmeFullConfig>(&json) {
-                *state.acme_full_config.write().await = acme_config;
-                tracing::info!("Loaded persisted ACME config from database");
-            }
-        }
         if let Ok(Some(json)) = db_ref.load_server_setting("dns_provider_config").await {
             if let Ok(dns_config) = serde_json::from_str::<rust_tunnel::server::acme::dns::DnsProviderConfig>(&json) {
                 *state.dns_provider_config.write().await = Some(dns_config);
@@ -125,6 +120,19 @@ async fn main() -> TunnelResult<()> {
             }
         }
     }
+
+    // Resolve effective ACME config: DB is the runtime source of truth;
+    // CLI/TOML values seed a fresh install and are ignored thereafter.
+    // See docs/superpowers/specs/2026-07-16-acme-config-db-source-of-truth-design.md
+    let effective_acme_config =
+        control::AcmeFullConfig::load_or_seed(&db, &config).await;
+    tracing::info!(
+        "ACME config resolved: enabled={}, server={}, cert_dir={}",
+        effective_acme_config.enabled,
+        effective_acme_config.server_url,
+        effective_acme_config.cert_dir,
+    );
+    *state.acme_full_config.write().await = effective_acme_config.clone();
 
     // Set API TLS config on state (read-only, from config)
     state.api_tls = config.api_tls;
@@ -183,13 +191,13 @@ async fn main() -> TunnelResult<()> {
     }
 
     // Initialize ACME client if enabled
-    if config.acme_enabled {
+    if effective_acme_config.enabled {
         let acme_state = rust_tunnel::server::acme::AcmeState::with_db(db.clone());
         let client = rust_tunnel::server::acme::client::AcmeClient::new(
             acme_state,
-            config.acme_server_url.clone(),
-            config.acme_cert_dir.clone(),
-            config.acme_email.clone(),
+            effective_acme_config.server_url.clone(),
+            effective_acme_config.cert_dir.clone(),
+            effective_acme_config.email.clone(),
         );
 
         if let Err(e) = client.initialize().await {
@@ -198,20 +206,20 @@ async fn main() -> TunnelResult<()> {
 
         let acme_config = control::AcmeConfigInfo {
             enabled: true,
-            server_url: config.acme_server_url.clone(),
-            cert_dir: config.acme_cert_dir.clone(),
+            server_url: effective_acme_config.server_url.clone(),
+            cert_dir: effective_acme_config.cert_dir.clone(),
         };
 
         state.set_acme_client(Arc::new(client), acme_config).await;
         tracing::info!(
             "ACME client initialized (server: {}, cert_dir: {})",
-            config.acme_server_url,
-            config.acme_cert_dir
+            effective_acme_config.server_url,
+            effective_acme_config.cert_dir
         );
 
         // Initialize CertificateManager
         let cert_manager = Arc::new(
-            rust_tunnel::server::acme::manager::CertificateManager::new(&config.acme_cert_dir),
+            rust_tunnel::server::acme::manager::CertificateManager::new(&effective_acme_config.cert_dir),
         );
 
         // Load existing certificates from disk
@@ -230,10 +238,10 @@ async fn main() -> TunnelResult<()> {
         }
 
         // Start renewal task if auto-renew is enabled
-        if config.acme_auto_renew {
+        if effective_acme_config.auto_renew {
             let renewal_manager = cert_manager.clone();
-            let interval = config.acme_renewal_check_interval;
-            let days_before = config.acme_renewal_days_before_expiry;
+            let interval = effective_acme_config.renewal_check_interval;
+            let days_before = effective_acme_config.renewal_days_before_expiry;
             renewal_manager
                 .start_renewal_task(interval, days_before);
             tracing::info!(
@@ -244,7 +252,7 @@ async fn main() -> TunnelResult<()> {
         }
 
         state.set_cert_manager(cert_manager.clone());
-        tracing::info!("Certificate manager initialized (cert_dir: {})", config.acme_cert_dir);
+        tracing::info!("Certificate manager initialized (cert_dir: {})", effective_acme_config.cert_dir);
 
         // Propagate the cert manager to ReverseProxyState so the shared
         // listener's SNI resolver and coverage queries have access to it.
@@ -274,19 +282,6 @@ async fn main() -> TunnelResult<()> {
                 }
             });
             tracing::info!("cert-event reactor started");
-        }
-
-        // Populate full ACME config for API access
-        {
-            let mut full_config = state.acme_full_config.write().await;
-            full_config.enabled = config.acme_enabled;
-            full_config.server_url = config.acme_server_url.clone();
-            full_config.email = config.acme_email.clone();
-            full_config.cert_dir = config.acme_cert_dir.clone();
-            full_config.auto_renew = config.acme_auto_renew;
-            full_config.renewal_check_interval = config.acme_renewal_check_interval;
-            full_config.renewal_days_before_expiry = config.acme_renewal_days_before_expiry;
-            full_config.tos_agreed = config.acme_tos_agreed;
         }
     }
 
