@@ -1,5 +1,7 @@
+use super::router::RouteTable;
 use super::ReverseProxyState;
 use crate::server::db::Database;
+use arc_swap::ArcSwap;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -9,6 +11,7 @@ use axum::{
     Router,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -76,7 +79,7 @@ impl HttpProxy {
             };
 
             // Get TLS server config from certificate provider
-            let server_config = match &self.state.cert_provider() {
+            let server_config = match self.state.cert_provider() {
                 Some(provider) => match provider.get_tls_server_config(&domain).await {
                     Some(config) => config,
                     None => {
@@ -136,7 +139,7 @@ impl HttpProxy {
                 }
             });
 
-            let mut listeners = self.state.listeners.lock().await;
+            let mut listeners = self.state.tcp_listeners.lock().await;
             listeners.insert(rule_id, handle);
         } else {
             // Plain HTTP path (existing behavior)
@@ -159,7 +162,7 @@ impl HttpProxy {
             }
         });
 
-        let mut listeners = self.state.listeners.lock().await;
+        let mut listeners = self.state.tcp_listeners.lock().await;
         listeners.insert(rule_id, handle);
 
         Ok(())
@@ -277,4 +280,69 @@ fn find_backend(routes: &[super::Route], path: &str) -> Option<String> {
         .first()
         .and_then(|r| r.backends.first())
         .map(|b| b.addr.clone())
+}
+
+/// Axum handler used by the shared listener.
+/// State carries a hot-swappable `RouteTable`; each request loads a snapshot.
+pub async fn handle_proxy_request_shared(
+    State(table): State<Arc<ArcSwap<RouteTable>>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.split(':').next().unwrap_or(s).to_string())
+        .unwrap_or_default();
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
+    let table_snap = table.load();
+    let matched = table_snap.match_http_request(&host, &path).await;
+
+    let backend_addr = match matched {
+        Some((_, _, backend)) => backend.addr.clone(),
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(format!("No route for host '{host}'")))
+                .unwrap();
+        }
+    };
+
+    let upstream_uri = format!("http://{backend_addr}{path}");
+    let client = reqwest::Client::new();
+    let mut upstream_req = client.request(method, &upstream_uri);
+
+    for (key, value) in req.headers() {
+        if key != "host" {
+            upstream_req = upstream_req.header(key, value);
+        }
+    }
+    upstream_req = upstream_req.header("X-Forwarded-For", "127.0.0.1");
+    upstream_req = upstream_req.header("X-Real-IP", "127.0.0.1");
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+
+    match upstream_req.body(body_bytes.to_vec()).send().await {
+        Ok(response) => {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut proxy_response = Response::builder().status(status);
+            for (key, value) in response.headers() {
+                proxy_response = proxy_response.header(key, value);
+            }
+            let body = response.bytes().await.unwrap_or_default();
+            proxy_response.body(Body::from(body)).unwrap()
+        }
+        Err(e) => {
+            error!("Backend request failed: {}", e);
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("Backend error: {e}")))
+                .unwrap()
+        }
+    }
 }

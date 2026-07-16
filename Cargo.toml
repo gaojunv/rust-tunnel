@@ -78,6 +78,7 @@ toml = "0.8"
 figment = { version = "0.10", features = ["env", "toml"] }
 
 # TLS support
+arc-swap = "1.7"
 rustls = "0.22"
 rustls-pemfile = "2.0"
 tokio-rustls = "0.25"

@@ -33,6 +33,22 @@ const typeColors: Record<string, string> = {
   udp: 'bg-yellow-500/10 text-yellow-500 hover:bg-yellow-500/20',
 };
 
+function CertStatusBadge({ status }: { status?: ProxyRule['cert_status'] }) {
+  if (!status || status.source === 'none') {
+    return <span title="明文（无 TLS）">🔓</span>;
+  }
+  switch (status.source) {
+    case 'exact':
+      return <span title={`证书：${status.covering_domain}（独立）`}>🔒</span>;
+    case 'wildcard_reuse':
+      return <span title={`证书：复用自 ${status.covering_domain}`}>🔒✨</span>;
+    case 'pending_issuance':
+      return <span title="证书申请中...">⏳</span>;
+    default:
+      return null;
+  }
+}
+
 export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: ProxyRuleTableProps) {
   const deleteMutation = useDeleteProxyRule();
 
@@ -69,6 +85,7 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
                 <TableHead>Type</TableHead>
                 <TableHead>Listen</TableHead>
                 <TableHead>Domains</TableHead>
+                <TableHead>TLS</TableHead>
                 <TableHead>Backends</TableHead>
                 <TableHead>Enabled</TableHead>
                 <TableHead className="w-[80px]">Actions</TableHead>
@@ -88,6 +105,9 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
                     {rule.type === 'http'
                       ? rule.domains?.join(', ') || '—'
                       : '—'}
+                  </TableCell>
+                  <TableCell>
+                    <CertStatusBadge status={rule.cert_status} />
                   </TableCell>
                   <TableCell>{getBackendCount(rule)} backend(s)</TableCell>
                   <TableCell>

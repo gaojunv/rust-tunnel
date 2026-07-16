@@ -221,6 +221,7 @@ mod tests {
             tls: None,
             enabled: true,
             created_at: None,
+            cert_status: None,
         }
     }
 
@@ -304,6 +305,7 @@ mod tests {
             tls: None,
             enabled: true,
             created_at: None,
+            cert_status: None,
         };
         table.add_rule(rule);
 
@@ -342,6 +344,7 @@ mod tests {
             tls: None,
             enabled: false, // Disabled
             created_at: None,
+            cert_status: None,
         };
         table.add_rule(rule);
 
@@ -369,6 +372,7 @@ mod tests {
             tls: None,
             enabled: true,
             created_at: None,
+            cert_status: None,
         };
         table.add_rule(rule);
 
@@ -400,6 +404,7 @@ mod tests {
             tls: None,
             enabled: true,
             created_at: None,
+            cert_status: None,
         };
         table.add_rule(rule);
 

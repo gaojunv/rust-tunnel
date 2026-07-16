@@ -8,6 +8,92 @@ use rust_tunnel::server::{api, auth, control, listener, Database, ServerConfig};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+async fn disable_conflicting_rules_on_port(
+    proxy_state: &rust_tunnel::server::reverse_proxy::ReverseProxyState,
+    listen_addr: &str,
+    err: &rust_tunnel::server::reverse_proxy::error::ReconcileError,
+) {
+    use rust_tunnel::server::reverse_proxy::error::ReconcileError as E;
+    use rust_tunnel::server::reverse_proxy::{ProxyRule, RuleType};
+
+    // Pick a set of rule ids to disable based on the failure mode.
+    let rule_ids_to_disable: Vec<String> = {
+        let rules = proxy_state.rules.lock().await;
+        let mut on_port: Vec<&ProxyRule> = rules
+            .values()
+            .filter(|r| {
+                r.enabled && r.rule_type == RuleType::Http && r.listen == listen_addr
+            })
+            .collect();
+        on_port.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        match err {
+            E::DomainConflict { .. } => {
+                // Keep the oldest rule per domain, disable duplicates.
+                let mut seen_domains: std::collections::HashSet<String> = Default::default();
+                let mut victims: Vec<String> = Vec::new();
+                for r in &on_port {
+                    let clashes = r.domains.iter().any(|d| !seen_domains.insert(d.clone()));
+                    if clashes {
+                        victims.push(r.id.clone());
+                    }
+                }
+                victims
+            }
+            E::TlsMismatch { .. } => {
+                // Majority wins. Ties: whichever the oldest rule chose.
+                let tls_on = on_port.iter().filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled)).count();
+                let tls_off = on_port.len() - tls_on;
+                let keep_tls = if tls_on == tls_off {
+                    on_port.first().is_some_and(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
+                } else {
+                    tls_on > tls_off
+                };
+                on_port.iter()
+                    .filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled) != keep_tls)
+                    .map(|r| r.id.clone())
+                    .collect()
+            }
+            E::NoCertManager { .. } => {
+                // Cert manager missing but TLS requested → disable every
+                // TLS-enabled rule so the port at least serves plain-HTTP rules.
+                on_port.iter()
+                    .filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
+                    .map(|r| r.id.clone())
+                    .collect()
+            }
+            E::BindFailed { .. } => {
+                // Bind failure is an environment issue (port already in use,
+                // permission denied). Disabling rules will not help — leave
+                // them alone and let the operator fix the port.
+                Vec::new()
+            }
+        }
+    };
+
+    for id in rule_ids_to_disable {
+        let rule_opt = {
+            let mut rules = proxy_state.rules.lock().await;
+            if let Some(r) = rules.get_mut(&id) {
+                r.enabled = false;
+                Some(r.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(r) = rule_opt {
+            if let Err(e) = proxy_state.save_rule(&r).await {
+                tracing::error!("Failed to disable conflicting rule {}: {}", id, e);
+            } else {
+                tracing::warn!(
+                    "Disabled rule {} on port {} to resolve reconcile conflict",
+                    id, listen_addr
+                );
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> TunnelResult<()> {
     let config = ServerConfig::load().map_err(std::io::Error::other)?;
@@ -157,8 +243,38 @@ async fn main() -> TunnelResult<()> {
             );
         }
 
-        state.set_cert_manager(cert_manager);
+        state.set_cert_manager(cert_manager.clone());
         tracing::info!("Certificate manager initialized (cert_dir: {})", config.acme_cert_dir);
+
+        // Propagate the cert manager to ReverseProxyState so the shared
+        // listener's SNI resolver and coverage queries have access to it.
+        // ServerState::set_cert_manager (called above) only sets the top-level
+        // cert_manager field; ReverseProxyState needs its own copy.
+        if let Some(mgr) = state.cert_manager.clone() {
+            state.proxy_state.set_cert_manager(mgr);
+        }
+
+        // Spawn cert-event reactor: refresh proxy rule cert_status on cert changes
+        {
+            let mut rx = cert_manager.subscribe();
+            let proxy_state = state.proxy_state.clone();
+            let mgr = cert_manager.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(rust_tunnel::server::acme::CertEvent::Issued { .. })
+                        | Ok(rust_tunnel::server::acme::CertEvent::Renewed { .. })
+                        | Ok(rust_tunnel::server::acme::CertEvent::Expired { .. }) => {
+                            proxy_state.refresh_all_cert_status(&mgr).await;
+                        }
+                        Ok(rust_tunnel::server::acme::CertEvent::Error { .. }) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            tracing::info!("cert-event reactor started");
+        }
 
         // Populate full ACME config for API access
         {
@@ -171,6 +287,35 @@ async fn main() -> TunnelResult<()> {
             full_config.renewal_check_interval = config.acme_renewal_check_interval;
             full_config.renewal_days_before_expiry = config.acme_renewal_days_before_expiry;
             full_config.tos_agreed = config.acme_tos_agreed;
+        }
+    }
+
+    // Load persisted proxy rules and reconcile HTTP listeners. Runs regardless
+    // of whether ACME is enabled — plain-HTTP reverse-proxy rules must still
+    // start on boot. If cert_manager is missing, TLS-enabled rules will be
+    // disabled by disable_conflicting_rules_on_port's NoCertManager branch.
+    if let Err(e) = state.proxy_state.load_from_db().await {
+        tracing::warn!("Failed to load proxy rules from DB: {}", e);
+    }
+    {
+        let addrs = state.proxy_state.distinct_http_listen_addrs().await;
+        for addr in addrs {
+            match state.proxy_state.reconcile_http_listener(&addr).await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup reconcile failed for {}: {}. Attempting fallback.",
+                        addr, e
+                    );
+                    disable_conflicting_rules_on_port(&state.proxy_state, &addr, &e).await;
+                    if let Err(e2) = state.proxy_state.reconcile_http_listener(&addr).await {
+                        tracing::error!(
+                            "Retry reconcile still failed for {}: {}. Port left offline.",
+                            addr, e2
+                        );
+                    }
+                }
+            }
         }
     }
 

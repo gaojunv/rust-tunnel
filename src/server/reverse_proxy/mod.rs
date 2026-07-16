@@ -1,14 +1,16 @@
 pub mod config;
+pub mod error;
 pub mod http_proxy;
 pub mod router;
+pub mod shared_listener;
+pub mod sni_resolver;
 pub mod tcp_proxy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
-use crate::server::acme::CertificateProvider;
 use crate::server::db::Database;
 
 /// Load balancing algorithm
@@ -82,6 +84,32 @@ pub struct ProxyTlsConfig {
     pub domain: Option<String>,
 }
 
+/// Kind of certificate coverage for a proxy rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertSourceKind {
+    /// Exact-match certificate is available for the rule's primary domain.
+    Exact,
+    /// A wildcard certificate covers the rule's primary domain.
+    WildcardReuse,
+    /// TLS is enabled but no covering certificate exists yet
+    /// (ACME issuance in progress or not yet triggered).
+    PendingIssuance,
+    /// TLS is not enabled for this rule.
+    None,
+}
+
+/// Runtime certificate status attached to a proxy rule.
+///
+/// Read-only: populated by the server on rule save and cert events,
+/// never accepted from client input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleCertStatus {
+    pub source: CertSourceKind,
+    pub covering_domain: String,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+}
+
 /// Proxy rule definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRule {
@@ -107,6 +135,9 @@ pub struct ProxyRule {
     pub enabled: bool,
     /// Creation timestamp
     pub created_at: Option<String>,
+    /// Runtime cert coverage status. Never accepted from client input.
+    #[serde(default, skip_deserializing)]
+    pub cert_status: Option<RuleCertStatus>,
 }
 
 fn default_enabled() -> bool {
@@ -137,14 +168,80 @@ pub struct ProxyStats {
 pub struct ReverseProxyState {
     /// Active proxy rules (id -> rule)
     pub rules: Arc<Mutex<HashMap<String, ProxyRule>>>,
-    /// Active listener tasks (rule_id -> handle)
-    pub listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// HTTP shared listeners keyed by listen_addr (e.g. "0.0.0.0:443").
+    pub shared_listeners:
+        Arc<Mutex<HashMap<String, crate::server::reverse_proxy::shared_listener::SharedListener>>>,
+    /// TCP/UDP per-rule listeners (previously named `listeners`).
+    pub tcp_listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Connection counters per rule
     pub connection_counts: Arc<Mutex<HashMap<String, u64>>>,
+    /// Per-listen_addr async mutex to serialize reconcile calls.
+    pub reconcile_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Database reference
     db: Option<Database>,
-    /// Certificate provider for TLS termination
-    cert_provider: Option<Arc<dyn CertificateProvider>>,
+    /// Concrete CertificateManager (needed for SNI resolver and coverage queries).
+    cert_manager: Option<Arc<crate::server::acme::CertificateManager>>,
+}
+
+/// Compute the cert coverage source for a rule at save time.
+///
+/// Selection of the "primary domain":
+/// 1. `rule.tls.domain` if set
+/// 2. `rule.domains.first()`
+/// 3. otherwise: source = None
+pub async fn resolve_cert_source_for_rule(
+    rule: &ProxyRule,
+    cert_manager: Option<&Arc<crate::server::acme::CertificateManager>>,
+) -> RuleCertStatus {
+    let now = chrono::Utc::now();
+
+    let Some(tls) = rule.tls.as_ref().filter(|t| t.enabled) else {
+        return RuleCertStatus {
+            source: CertSourceKind::None,
+            covering_domain: String::new(),
+            last_updated: now,
+        };
+    };
+    let primary = tls
+        .domain
+        .clone()
+        .or_else(|| rule.domains.first().cloned())
+        // Normalize so it matches the storage key inside CertificateManager
+        // (which lowercases on add) and the SNI value delivered by rustls.
+        .map(|d| d.to_ascii_lowercase());
+    let Some(domain) = primary else {
+        return RuleCertStatus {
+            source: CertSourceKind::None,
+            covering_domain: String::new(),
+            last_updated: now,
+        };
+    };
+
+    let Some(mgr) = cert_manager else {
+        return RuleCertStatus {
+            source: CertSourceKind::PendingIssuance,
+            covering_domain: domain,
+            last_updated: now,
+        };
+    };
+
+    match mgr.find_covering_cert(&domain).await {
+        Some(crate::server::acme::CertCoverage::Exact) => RuleCertStatus {
+            source: CertSourceKind::Exact,
+            covering_domain: domain,
+            last_updated: now,
+        },
+        Some(crate::server::acme::CertCoverage::Wildcard(w)) => RuleCertStatus {
+            source: CertSourceKind::WildcardReuse,
+            covering_domain: w,
+            last_updated: now,
+        },
+        None => RuleCertStatus {
+            source: CertSourceKind::PendingIssuance,
+            covering_domain: domain,
+            last_updated: now,
+        },
+    }
 }
 
 impl ReverseProxyState {
@@ -152,10 +249,12 @@ impl ReverseProxyState {
     pub fn new() -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
-            listeners: Arc::new(Mutex::new(HashMap::new())),
+            shared_listeners: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: None,
-            cert_provider: None,
+            cert_manager: None,
         }
     }
 
@@ -163,21 +262,33 @@ impl ReverseProxyState {
     pub fn with_db(db: Database) -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
-            listeners: Arc::new(Mutex::new(HashMap::new())),
+            shared_listeners: Arc::new(Mutex::new(HashMap::new())),
+            tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: Some(db),
-            cert_provider: None,
+            cert_manager: None,
         }
     }
 
-    /// Set the certificate provider for TLS termination
-    pub fn set_cert_provider(&mut self, provider: Arc<dyn CertificateProvider>) {
-        self.cert_provider = Some(provider);
+    /// Set the concrete certificate manager for TLS termination and coverage queries.
+    pub fn set_cert_manager(&mut self, manager: Arc<crate::server::acme::CertificateManager>) {
+        self.cert_manager = Some(manager);
     }
 
-    /// Get a reference to the certificate provider
-    pub fn cert_provider(&self) -> Option<&Arc<dyn CertificateProvider>> {
-        self.cert_provider.as_ref()
+    /// Get the concrete certificate manager.
+    #[must_use]
+    pub fn cert_manager(&self) -> Option<&Arc<crate::server::acme::CertificateManager>> {
+        self.cert_manager.as_ref()
+    }
+
+    /// Backwards-compatible accessor returning the manager as a trait object.
+    /// TCP proxy and legacy HTTP paths still use `CertificateProvider`.
+    #[must_use]
+    pub fn cert_provider(&self) -> Option<Arc<dyn crate::server::acme::CertificateProvider>> {
+        self.cert_manager
+            .as_ref()
+            .map(|m| m.clone() as Arc<dyn crate::server::acme::CertificateProvider>)
     }
 
     /// Load rules from database
@@ -187,6 +298,32 @@ impl ReverseProxyState {
             let mut rules = self.rules.lock().await;
 
             for record in records {
+                // Reconstruct cert_status if all three DB columns are present.
+                let cert_status = match (
+                    record.cert_source.as_deref(),
+                    record.cert_covering_domain.clone(),
+                    record.cert_status_updated_at,
+                ) {
+                    (Some(src), Some(covering), Some(ts)) => {
+                        let source = match src {
+                            "exact" => Some(CertSourceKind::Exact),
+                            "wildcard_reuse" => Some(CertSourceKind::WildcardReuse),
+                            "pending_issuance" => Some(CertSourceKind::PendingIssuance),
+                            "none" => Some(CertSourceKind::None),
+                            other => {
+                                tracing::warn!("Unknown cert_source '{}' in DB, dropping", other);
+                                None
+                            }
+                        };
+                        source.map(|s| RuleCertStatus {
+                            source: s,
+                            covering_domain: covering,
+                            last_updated: ts,
+                        })
+                    }
+                    _ => None, // Partial state / pre-migration row → refresh on next event
+                };
+
                 let rule = ProxyRule {
                     id: record.id,
                     name: record.name,
@@ -218,6 +355,7 @@ impl ReverseProxyState {
                     },
                     enabled: record.enabled != 0,
                     created_at: Some(record.created_at.to_rfc3339()),
+                    cert_status,
                 };
                 rules.insert(rule.id.clone(), rule);
             }
@@ -240,6 +378,15 @@ impl ReverseProxyState {
             };
             let tls = rule.tls.as_ref();
 
+            let cert_source_str: Option<&'static str> = rule.cert_status.as_ref().map(|s| match s.source {
+                CertSourceKind::Exact => "exact",
+                CertSourceKind::WildcardReuse => "wildcard_reuse",
+                CertSourceKind::PendingIssuance => "pending_issuance",
+                CertSourceKind::None => "none",
+            });
+            let cert_covering = rule.cert_status.as_ref().map(|s| s.covering_domain.as_str());
+            let cert_updated = rule.cert_status.as_ref().map(|s| &s.last_updated);
+
             db.save_proxy_rule(
                 &rule.id,
                 &rule.name,
@@ -251,6 +398,9 @@ impl ReverseProxyState {
                 tls.map_or(false, |t| t.acme),
                 tls.and_then(|t| t.domain.as_deref()),
                 rule.enabled,
+                cert_source_str,
+                cert_covering,
+                cert_updated,
             )
             .await?;
         }
@@ -286,10 +436,191 @@ impl ReverseProxyState {
         let counts = self.connection_counts.lock().await;
         counts.get(rule_id).copied().unwrap_or(0)
     }
+
+    /// Recompute cert_status for every TLS-enabled rule. Called from the
+    /// cert_event_reactor after CertEvent::Issued/Renewed/Expired.
+    pub async fn refresh_all_cert_status(
+        &self,
+        cert_manager: &Arc<crate::server::acme::CertificateManager>,
+    ) {
+        // Snapshot rules to compute outside the lock
+        let snapshot: Vec<ProxyRule> = {
+            let rules = self.rules.lock().await;
+            rules.values().cloned().collect()
+        };
+
+        let mut updates: Vec<(String, RuleCertStatus)> = Vec::new();
+        for rule in &snapshot {
+            if rule.tls.as_ref().is_some_and(|t| t.enabled) {
+                let new = resolve_cert_source_for_rule(rule, Some(cert_manager)).await;
+                let changed = match &rule.cert_status {
+                    None => true,
+                    Some(prev) => prev.source != new.source
+                        || prev.covering_domain != new.covering_domain,
+                };
+                if changed {
+                    updates.push((rule.id.clone(), new));
+                }
+            }
+        }
+
+        if updates.is_empty() {
+            return;
+        }
+
+        // Apply in-memory + persist
+        {
+            let mut rules = self.rules.lock().await;
+            for (id, status) in &updates {
+                if let Some(r) = rules.get_mut(id) {
+                    r.cert_status = Some(status.clone());
+                }
+            }
+        }
+        // Persist (fire-and-forget on failure — logged)
+        for (id, _) in &updates {
+            let rule = {
+                let rules = self.rules.lock().await;
+                rules.get(id).cloned()
+            };
+            if let Some(r) = rule {
+                if let Err(e) = self.save_rule(&r).await {
+                    tracing::error!("Failed to persist refreshed cert_status for {}: {}", id, e);
+                }
+            }
+        }
+    }
 }
 
 impl Default for ReverseProxyState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod mod_tests {
+    use super::*;
+
+    #[test]
+    fn cert_status_default_is_none_optional() {
+        let rule = ProxyRule {
+            id: "id-1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        assert!(rule.cert_status.is_none());
+    }
+
+    #[test]
+    fn cert_source_kind_serializes_lowercase() {
+        let s = serde_json::to_string(&CertSourceKind::WildcardReuse).unwrap();
+        assert_eq!(s, "\"wildcard_reuse\"");
+    }
+
+    #[test]
+    fn cert_status_skip_deserializing_ignored_from_input() {
+        // ProxyRule.tls is Option<ProxyTlsConfig>; serde treats missing
+        // Option fields as None so the test JSON does not strictly need
+        // "tls": null. Included here for clarity — the important assertion
+        // is that cert_status is dropped regardless of what the client sends.
+        let json = r#"{
+            "id": "id-1",
+            "name": "r1",
+            "type": "http",
+            "listen": "0.0.0.0:443",
+            "tls": null,
+            "cert_status": { "source": "exact", "covering_domain": "x", "last_updated": "2026-01-01T00:00:00Z" }
+        }"#;
+        let rule: ProxyRule = serde_json::from_str(json).unwrap();
+        assert!(rule.cert_status.is_none(), "cert_status should be skipped on deserialize");
+    }
+
+    #[tokio::test]
+    async fn resolve_cert_source_none_when_tls_disabled() {
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let out = resolve_cert_source_for_rule(&rule, None).await;
+        assert_eq!(out.source, CertSourceKind::None);
+    }
+
+    #[tokio::test]
+    async fn resolve_cert_source_pending_when_no_cert() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(crate::server::acme::CertificateManager::new(temp_dir.path().to_str().unwrap()));
+
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["nope.example.com".into()],
+            routes: vec![],
+            tls: Some(ProxyTlsConfig { enabled: true, acme: true, domain: None }),
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let out = resolve_cert_source_for_rule(&rule, Some(&mgr)).await;
+        assert_eq!(out.source, CertSourceKind::PendingIssuance);
+        assert_eq!(out.covering_domain, "nope.example.com");
+    }
+
+    #[tokio::test]
+    async fn refresh_all_cert_status_updates_pending_to_wildcard() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(crate::server::acme::CertificateManager::new(temp_dir.path().to_str().unwrap()));
+
+        let state = ReverseProxyState::new();
+        // Insert a rule referencing api.example.com, TLS enabled but no cert yet -> PendingIssuance
+        let rule = ProxyRule {
+            id: "r1".into(), name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["api.example.com".into()],
+            routes: vec![],
+            tls: Some(ProxyTlsConfig { enabled: true, acme: true, domain: None }),
+            enabled: true,
+            created_at: None,
+            cert_status: Some(RuleCertStatus {
+                source: CertSourceKind::PendingIssuance,
+                covering_domain: "api.example.com".into(),
+                last_updated: chrono::Utc::now(),
+            }),
+        };
+        state.rules.lock().await.insert("r1".into(), rule);
+
+        // Add wildcard cert to manager (rcgen 0.14 API, matches gen_self_signed_pem_for in manager tests)
+        let (cert_pem, key_pem) = {
+            use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+            let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let params = CertificateParams::new(vec!["*.example.com".to_string()]).unwrap();
+            let cert = params.self_signed(&key_pair).unwrap();
+            (cert.pem(), key_pair.serialize_pem())
+        };
+        mgr.add_certificate("*.example.com", crate::server::acme::CertEntry {
+            cert_pem, key_pem, chain_pem: None, expires_at: None,
+            source: crate::server::acme::CertSource::Manual,
+        }).await.unwrap();
+
+        state.refresh_all_cert_status(&mgr).await;
+        let rules = state.rules.lock().await;
+        let r = rules.get("r1").unwrap();
+        assert_eq!(r.cert_status.as_ref().unwrap().source, CertSourceKind::WildcardReuse);
     }
 }
