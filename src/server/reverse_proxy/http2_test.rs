@@ -271,3 +271,59 @@ async fn upstream_h2c() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(bytes, "h2c ok");
 }
+
+#[tokio::test]
+async fn upstream_connect_failure_returns_502() {
+    use hyper_util::client::legacy::{connect::HttpConnector, Client};
+
+    // Point the rule at a reserved/closed port — connect will refuse quickly.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let mgr = Arc::new(CertificateManager::new(temp_dir.path().to_str().unwrap()));
+
+    let listen_addr = free_port().await;
+    let rule = ProxyRule {
+        id: "r_fail".into(),
+        name: "r_fail".into(),
+        rule_type: RuleType::Http,
+        listen: listen_addr.to_string(),
+        domains: vec!["test.local".into()],
+        routes: vec![Route {
+            path: "/".into(),
+            backends: vec![Backend {
+                // Port 1 is well-known-reserved and effectively always closed on localhost.
+                addr: "127.0.0.1:1".to_string(),
+                weight: 100,
+                protocol: BackendProtocol::Http1,
+                scheme: BackendScheme::Http,
+            }],
+            load_balancing: LoadBalancing::default(),
+        }],
+        tls: None,
+        enabled: true,
+        created_at: None,
+        cert_status: None,
+    };
+    let table = RouteTable::from_rules(vec![rule]);
+    let _listener = SharedListener::spawn(
+        listen_addr.to_string(),
+        false,
+        table,
+        Some(mgr),
+        HashSet::from(["r_fail".to_string()]),
+    )
+    .await
+    .expect("shared listener spawn");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let client: Client<HttpConnector, http_body_util::Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let uri: hyper::Uri = format!("http://{listen_addr}/").parse().unwrap();
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("host", "test.local")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), 502, "connect refused must produce 502");
+}
