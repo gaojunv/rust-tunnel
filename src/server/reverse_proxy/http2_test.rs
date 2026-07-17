@@ -168,10 +168,11 @@ async fn downstream_h2_over_tls() {
     );
 
     let io = hyper_util::rt::TokioIo::new(tls);
-    let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, http_body_util::Empty<Bytes>>(
-        TokioExecutor::new(),
-        io,
-    )
+    let (mut sender, conn) = hyper::client::conn::http2::handshake::<
+        _,
+        _,
+        http_body_util::Empty<Bytes>,
+    >(TokioExecutor::new(), io)
     .await
     .unwrap();
     tokio::spawn(async move {
@@ -206,9 +207,9 @@ async fn upstream_h2c() {
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(|_req| async {
-                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
-                        Bytes::from("h2c ok"),
-                    )))
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                        "h2c ok",
+                    ))))
                 });
                 let _ = h2_server::Builder::new(TokioExecutor::new())
                     .serve_connection(io, svc)

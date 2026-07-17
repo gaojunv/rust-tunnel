@@ -188,11 +188,10 @@ async fn handle_one_connection(
 
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection(io, service)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await
             {
                 debug!("HTTPS connection error: {}", e);
             }
@@ -200,11 +199,10 @@ async fn handle_one_connection(
         None => {
             let io = hyper_util::rt::TokioIo::new(stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection(io, service)
-            .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await
             {
                 debug!("HTTP connection error: {}", e);
             }
