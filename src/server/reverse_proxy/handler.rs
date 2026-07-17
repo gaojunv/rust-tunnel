@@ -243,4 +243,197 @@ mod tests {
         assert_eq!(host_without_port("[fe80::1]"), "fe80::1");
         assert_eq!(host_without_port("[::1]"), "::1");
     }
+
+    #[tokio::test]
+    async fn stream_response_does_not_buffer() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use futures_util::stream;
+        use hyper::body::Bytes;
+        use tokio::net::TcpListener;
+        use tokio::time::Instant;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{Backend, LoadBalancing, ProxyRule, Route, RuleType};
+
+        // 1. Backend that trickles 8 chunks of 1 KiB with 50 ms between them.
+        let backend_app = Router::new().route(
+            "/",
+            get(|| async {
+                let s = stream::unfold(0u32, |i| async move {
+                    if i >= 8 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let chunk: Result<Bytes, std::io::Error> = Ok(Bytes::from(vec![b'x'; 1024]));
+                    Some((chunk, i + 1))
+                });
+                Body::from_stream(s)
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        // 2. Proxy: single-rule RouteTable pointing at the backend.
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend_addr.to_string(),
+                    weight: 100,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // 3. Build the axum Router with the unified handler and bind it.
+        let app = Router::new()
+            .fallback(axum::routing::any(handle_proxy_request_unified))
+            .with_state((source, upstream));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        // 4. Send a request via reqwest with Host: test.local.
+        let client = reqwest::Client::builder().build().unwrap();
+        let started = Instant::now();
+        let resp = client
+            .get(format!("http://{proxy_addr}/"))
+            .header("host", "test.local")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // The first chunk should arrive well before the full 8*50ms = 400 ms
+        // it would take if the body were buffered.
+        use futures_util::StreamExt;
+        let mut body_stream = resp.bytes_stream();
+        let first = body_stream.next().await.unwrap().unwrap();
+        let ttfb = started.elapsed();
+        assert!(!first.is_empty());
+        assert!(
+            ttfb < Duration::from_millis(300),
+            "first byte took {ttfb:?} — body appears to have been buffered"
+        );
+    }
+
+    #[tokio::test]
+    async fn hop_by_hop_headers_are_stripped_on_upstream() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::extract::Request as AxumRequest;
+        use axum::routing::any;
+        use axum::Router;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{Backend, LoadBalancing, ProxyRule, Route, RuleType};
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<hyper::HeaderMap>();
+        let tx_clone = tx.clone();
+        let backend_app = Router::new().route(
+            "/",
+            any(move |req: AxumRequest| {
+                let tx = tx_clone.clone();
+                async move {
+                    let _ = tx.send(req.headers().clone());
+                    "ok"
+                }
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        let rule = ProxyRule {
+            id: "r_hop".into(),
+            name: "r_hop".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend_addr.to_string(),
+                    weight: 100,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        let app = Router::new()
+            .fallback(any(handle_proxy_request_unified))
+            .with_state((source, upstream));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("http://{proxy_addr}/"))
+            .header("host", "test.local")
+            .header("connection", "keep-alive, x-custom-hop")
+            .header("keep-alive", "timeout=5")
+            .header("x-custom-hop", "should-be-stripped")
+            .header("x-keep", "keep-me")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let received = rx.recv().await.unwrap();
+        assert!(
+            received.get("connection").is_none(),
+            "connection should be stripped"
+        );
+        assert!(
+            received.get("keep-alive").is_none(),
+            "keep-alive should be stripped"
+        );
+        assert!(
+            received.get("x-custom-hop").is_none(),
+            "x-custom-hop from Connection should be stripped"
+        );
+        assert_eq!(received.get("x-keep").unwrap(), "keep-me");
+    }
 }
