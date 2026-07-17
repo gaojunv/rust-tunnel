@@ -14,8 +14,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::error::ReconcileError;
-use super::http_proxy::handle_proxy_request_shared;
+use super::handler::{handle_proxy_request_unified, RouteSource};
 use super::router::RouteTable;
+use super::upstream::UpstreamClient;
 use super::{ProxyRule, ReverseProxyState, RuleType};
 use crate::server::acme::CertificateManager;
 
@@ -58,6 +59,7 @@ impl SharedListener {
                 })?;
 
         let route_table = Arc::new(ArcSwap::from_pointee(initial_table));
+        let upstream_for_task = Arc::new(UpstreamClient::new());
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let tls_acceptor = if tls_enabled {
@@ -101,8 +103,9 @@ impl SharedListener {
                         };
                         let table = route_table_for_task.clone();
                         let acceptor = tls_acceptor.clone();
+                        let upstream_c = upstream_for_task.clone();
                         tokio::spawn(async move {
-                            handle_one_connection(stream, peer, acceptor, table).await;
+                            handle_one_connection(stream, peer, acceptor, table, upstream_c).await;
                         });
                     }
                 }
@@ -159,10 +162,12 @@ async fn handle_one_connection(
     _peer: SocketAddr,
     acceptor: Option<TlsAcceptor>,
     route_table: Arc<ArcSwap<RouteTable>>,
+    upstream: Arc<UpstreamClient>,
 ) {
+    let source = RouteSource(route_table);
     let app: Router = Router::new()
-        .fallback(any(handle_proxy_request_shared))
-        .with_state(route_table);
+        .fallback(any(handle_proxy_request_unified))
+        .with_state((source, upstream));
 
     match acceptor {
         Some(acc) => {
