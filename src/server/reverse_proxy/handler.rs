@@ -1,6 +1,33 @@
 //! Unified HTTP proxy request handler.
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::Request;
+use tracing::error;
+
+use super::router::RouteTable;
+use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
+use super::Backend;
+
 use hyper::header::{HeaderMap, HeaderValue};
+
+/// Where the handler pulls its routing decision from.
+///
+/// The unified handler routes every request through a `RouteTable` snapshot.
+/// Callers that only serve a single rule (legacy per-rule listener) build a
+/// single-rule `RouteTable` and pass it in as `Shared`.
+#[derive(Clone)]
+pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
+
+/// State injected into the axum Router.
+pub type ProxyState = (RouteSource, Arc<UpstreamClient>);
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
 /// and must be stripped by any intermediary.
@@ -45,6 +72,20 @@ pub fn strip_hop_by_hop(headers: &HeaderMap<HeaderValue>) -> HeaderMap<HeaderVal
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+/// Resolve the target backend for a request. Returns `None` when no route
+/// matches (caller should reply 404).
+///
+/// Both listener types (legacy per-rule and shared) go through this — legacy
+/// listeners just build a one-rule table. `RouteTable::match_http_request`
+/// already honors `rule.enabled`, longest-prefix matching, and the route's
+/// configured load balancing algorithm.
+async fn resolve_backend(source: &RouteSource, host: &str, path: &str) -> Option<Backend> {
+    let snap = source.0.load();
+    snap.match_http_request(host, path)
+        .await
+        .map(|(_, _, backend)| backend.clone())
 }
 
 #[cfg(test)]
