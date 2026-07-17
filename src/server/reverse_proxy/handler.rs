@@ -169,11 +169,18 @@ pub async fn handle_proxy_request_unified(
     State((source, upstream)): State<ProxyState>,
     req: Request<Body>,
 ) -> Response {
+    // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
+    // h1 requests may put it in either the URI (absolute-form) or a Host header.
     let host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| host_without_port(s).to_string())
+        .uri()
+        .host()
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| host_without_port(s).to_string())
+        })
         .unwrap_or_default();
     let path = req.uri().path().to_string();
 
@@ -461,5 +468,142 @@ mod tests {
             "x-custom-hop from Connection should be stripped"
         );
         assert_eq!(received.get("x-keep").unwrap(), "keep-me");
+    }
+
+    /// Regression: a real HTTP/2 request has host in `:authority` (surfaced via
+    /// `Uri::host()`), NOT in a `Host` header. If we only look at the `host`
+    /// header, browsers over h2 get "No route for host ''".
+    #[tokio::test]
+    async fn handler_reads_host_from_uri_authority_when_no_host_header() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+        };
+
+        // Backend that returns 200 with a known body.
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        let backend_app = axum::Router::new().route("/", axum::routing::any(|| async { "ok" }));
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        let rule = ProxyRule {
+            id: "r".into(),
+            name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend_addr.to_string(),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // Build a request the way hyper delivers an h2 request:
+        // - authority set on the URI (from :authority pseudo-header)
+        // - NO Host header
+        // - Version HTTP_2
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("GET")
+            .uri("http://test.local/")
+            .version(hyper::Version::HTTP_2)
+            .body(Body::empty())
+            .unwrap();
+
+        let state = State((source, upstream));
+        let resp = handle_proxy_request_unified(state, req).await;
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "handler must resolve host from URI authority when Host header is absent"
+        );
+    }
+
+    /// h1 fallback: when URI is relative (no authority) and only Host header
+    /// carries the value, it must still be honored.
+    #[tokio::test]
+    async fn handler_falls_back_to_host_header_for_relative_uri() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+        };
+
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        let backend_app = axum::Router::new().route("/", axum::routing::any(|| async { "ok" }));
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        let rule = ProxyRule {
+            id: "r".into(),
+            name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend_addr.to_string(),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // h1-style: URI is just "/", host lives in the Host header.
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "test.local:8080")
+            .body(Body::empty())
+            .unwrap();
+
+        let state = State((source, upstream));
+        let resp = handle_proxy_request_unified(state, req).await;
+
+        assert_eq!(resp.status(), 200);
     }
 }
