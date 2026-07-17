@@ -102,7 +102,12 @@ fn build_upstream_request(
         .path_and_query()
         .map(hyper::http::uri::PathAndQuery::as_str)
         .unwrap_or("/");
-    let uri: hyper::Uri = format!("http://{}{}", backend.addr, pq)
+    use super::BackendScheme;
+    let scheme = match backend.scheme {
+        BackendScheme::Http => "http",
+        BackendScheme::Https => "https",
+    };
+    let uri: hyper::Uri = format!("{scheme}://{}{}", backend.addr, pq)
         .parse()
         .map_err(|e| ProxyError::BadBackendAddr(format!("{e}")))?;
     parts.uri = uri;
@@ -175,12 +180,16 @@ pub async fn handle_proxy_request_unified(
         Err(e) => return error_response(&e),
     };
 
-    // PR 1 only uses the h1 plain path. PR 2 will call upstream.forward() with
-    // full scheme/protocol dispatch.
-    match upstream.forward_h1_plain(upstream_req).await {
+    match upstream.forward(&backend, upstream_req).await {
         Ok(resp) => build_downstream_response(resp),
         Err(e) => {
-            error!(error = %e, backend = %backend.addr, "upstream request failed");
+            error!(
+                error = %e,
+                backend = %backend.addr,
+                scheme = ?backend.scheme,
+                protocol = ?backend.protocol,
+                "upstream request failed"
+            );
             error_response(&e)
         }
     }
