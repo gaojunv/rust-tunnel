@@ -16,7 +16,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::time::Duration;
 
 /// Body type carried through the proxy pipeline.
@@ -65,6 +65,7 @@ impl UpstreamClient {
             .build::<_, ProxyBody>(plain_conn.clone());
         let h2_plain = Client::builder(TokioExecutor::new())
             .http2_only(true)
+            .timer(TokioTimer::new())
             .http2_keep_alive_interval(Some(ka))
             .pool_idle_timeout(idle)
             .build::<_, ProxyBody>(plain_conn);
@@ -86,6 +87,7 @@ impl UpstreamClient {
             .build(tls_h1_conn);
         let h2_tls = Client::builder(TokioExecutor::new())
             .http2_only(true)
+            .timer(TokioTimer::new())
             .http2_keep_alive_interval(Some(ka))
             .pool_idle_timeout(idle)
             .build(tls_h2_conn);

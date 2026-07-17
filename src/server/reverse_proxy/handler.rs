@@ -102,7 +102,7 @@ fn build_upstream_request(
         .path_and_query()
         .map(hyper::http::uri::PathAndQuery::as_str)
         .unwrap_or("/");
-    use super::BackendScheme;
+    use super::{BackendProtocol, BackendScheme};
     let scheme = match backend.scheme {
         BackendScheme::Http => "http",
         BackendScheme::Https => "https",
@@ -112,6 +112,15 @@ fn build_upstream_request(
         .map_err(|e| ProxyError::BadBackendAddr(format!("{e}")))?;
     parts.uri = uri;
     parts.headers = strip_hop_by_hop(&parts.headers);
+    // Normalize the request version to match the outgoing client's protocol.
+    // The incoming downstream version may be HTTP/2 (from the h2 listener) or
+    // HTTP/1.1; the upstream client is protocol-locked at build time, so we
+    // must align the request version with the target client, otherwise
+    // hyper-util returns UserUnsupportedVersion.
+    parts.version = match backend.protocol {
+        BackendProtocol::Http1 => hyper::Version::HTTP_11,
+        BackendProtocol::Http2 => hyper::Version::HTTP_2,
+    };
 
     let boxed: ProxyBody = body
         .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))

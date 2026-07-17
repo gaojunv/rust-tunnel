@@ -7,6 +7,9 @@ pub mod sni_resolver;
 pub mod tcp_proxy;
 pub mod upstream;
 
+#[cfg(test)]
+mod http2_test;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
