@@ -481,7 +481,7 @@ impl AcmeClient {
 
             // Wait for DNS propagation
             dns_solver
-                .wait_for_propagation(&acme_domain, &txt_value, Duration::from_secs(120))
+                .wait_for_propagation(&acme_domain, &txt_value, Duration::from_secs(600))
                 .await
                 .context("DNS propagation timeout")?;
 
