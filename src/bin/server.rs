@@ -418,12 +418,21 @@ async fn main() -> TunnelResult<()> {
                     ss_cipher
                 );
                 drop(dc); // Release the read lock before spawning
+
+                // Register abort handle so API updates can stop this listener
+                let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+                {
+                    let mut abort = state.ss_listener_abort.write().await;
+                    *abort = Some(abort_tx);
+                }
+
                 tokio::spawn(async move {
-                    if let Err(e) = listener::start_shadowsocks_listener(
+                    if let Err(e) = listener::start_shadowsocks_listener_with_abort(
                         state_clone,
                         ss_port,
                         ss_cipher,
                         ss_password,
+                        abort_rx,
                     )
                     .await
                     {
@@ -464,6 +473,13 @@ async fn main() -> TunnelResult<()> {
 
                 // Create a watch channel for dynamic TLS config updates
                 let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
+
+                // Register abort handle so API updates can stop this listener
+                let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+                {
+                    let mut abort = state.trojan_listener_abort.write().await;
+                    *abort = Some(abort_tx);
+                }
 
                 // If a cert_manager exists, subscribe to cert events and update the watch channel
                 if let Some(ref cert_manager) = state.cert_manager {
@@ -514,12 +530,13 @@ async fn main() -> TunnelResult<()> {
                 }
 
                 tokio::spawn(async move {
-                    if let Err(e) = listener::start_trojan_listener(
+                    if let Err(e) = listener::start_trojan_listener_with_abort(
                         state_clone,
                         trojan_port,
                         trojan_password,
                         trojan_fallback,
                         tls_config_rx,
+                        abort_rx,
                     )
                     .await
                     {
