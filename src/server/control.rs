@@ -128,6 +128,121 @@ impl Default for AcmeFullConfig {
     }
 }
 
+impl AcmeFullConfig {
+    /// Resolve `AcmeFullConfig` for the current process.
+    ///
+    /// If `server_settings.acme_config` in the database contains valid JSON,
+    /// return it verbatim — the CLI/TOML `server_config` values are ignored
+    /// on this path. This makes DB the runtime source of truth: values set
+    /// via `PUT /api/acme/config` (which writes back to DB) survive restart.
+    ///
+    /// If the row is absent, seed from `server_config` and persist. On this
+    /// first-seed path, `tos_agreed` is inferred as `true` when
+    /// `acme_certificates` already contains rows — upgrading from a
+    /// CLI-only ACME deployment shouldn't force the operator to re-agree.
+    ///
+    /// If the row is present but malformed, or the DB read fails, run this
+    /// process with a fresh seed but leave the DB row untouched — this
+    /// preserves any state the operator may want to inspect/repair, and
+    /// avoids letting a transient DB error wipe good persistent config.
+    ///
+    /// All DB failures are logged as warnings and never fatal.
+    pub async fn load_or_seed(
+        db: &Database,
+        server_config: &ServerConfig,
+    ) -> Self {
+        // Tracks whether we should persist the seed back to DB.
+        // Set to false in branches where the DB may hold state we
+        // shouldn't overwrite:
+        // - malformed row: preserve it so an operator can inspect/repair
+        // - transient read failure: a valid row may still exist; don't
+        //   clobber it with the CLI seed
+        //
+        // Set to true (default) only when we're confident the row is
+        // absent (Ok(None)).
+        let mut should_persist_seed = true;
+
+        match db.load_server_setting("acme_config").await {
+            Ok(Some(json)) => {
+                match serde_json::from_str::<Self>(&json) {
+                    Ok(cfg) => return cfg,
+                    Err(e) => {
+                        warn!(
+                            "acme_config in DB is malformed ({}), re-seeding from CLI/TOML without overwriting the bad row",
+                            e
+                        );
+                        should_persist_seed = false;
+                    }
+                }
+            }
+            Ok(None) => {
+                // Normal seed path — should_persist_seed stays true
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to load ACME config from DB ({}), falling back to CLI/TOML seed for this process; leaving DB alone until the next successful startup",
+                    e
+                );
+                should_persist_seed = false;
+            }
+        }
+
+        let mut seed = Self {
+            enabled: server_config.acme_enabled,
+            server_url: server_config.acme_server_url.clone(),
+            email: server_config.acme_email.clone(),
+            cert_dir: server_config.acme_cert_dir.clone(),
+            auto_renew: server_config.acme_auto_renew,
+            renewal_check_interval: server_config.acme_renewal_check_interval,
+            renewal_days_before_expiry: server_config.acme_renewal_days_before_expiry,
+            tos_agreed: false,
+        };
+
+        // Legacy DB path: if certificates already exist in this DB, the
+        // operator must have agreed to ToS in a previous version —
+        // otherwise those certs couldn't have been issued. Carry that
+        // state forward so they don't get re-prompted after upgrade.
+        // Only runs on first seed (should_persist_seed == true); the
+        // DB-has-value fast path returns before we get here.
+        if should_persist_seed && !seed.tos_agreed {
+            match db.load_acme_certificates().await {
+                Ok(records) if !records.is_empty() => {
+                    info!(
+                        "Inferred tos_agreed=true from {} existing certificates",
+                        records.len()
+                    );
+                    seed.tos_agreed = true;
+                }
+                Ok(_) => {
+                    // No certs → keep tos_agreed=false
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to query acme_certificates for ToS inference: {}. \
+                         Keeping tos_agreed=false; user can re-agree via UI.",
+                        e
+                    );
+                }
+            }
+        }
+
+        if should_persist_seed {
+            match serde_json::to_string(&seed) {
+                Ok(json) => {
+                    if let Err(e) = db.save_server_setting("acme_config", &json).await {
+                        warn!("Failed to persist ACME seed config to DB: {}", e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize ACME seed config: {}", e);
+                }
+            }
+        }
+
+        seed
+    }
+}
+
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
@@ -1792,5 +1907,259 @@ pub async fn run_server(
                 warn!("Control connection error from {}: {}", addr, e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod acme_config_load_or_seed_tests {
+    use super::*;
+    use crate::server::db::Database;
+
+    async fn fresh_db() -> (Database, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn fresh_db_uses_cli_values_and_writes_back() {
+        let (db, _tmp) = fresh_db().await;
+
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = true;
+        cfg.acme_server_url = "https://example.test/acme".to_string();
+        cfg.acme_email = Some("op@example.test".to_string());
+        cfg.acme_cert_dir = "/tmp/certs".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 12;
+        cfg.acme_renewal_days_before_expiry = 15;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        // Returned value comes from seed args
+        assert!(out.enabled);
+        assert_eq!(out.server_url, "https://example.test/acme");
+        assert_eq!(out.email.as_deref(), Some("op@example.test"));
+        assert_eq!(out.cert_dir, "/tmp/certs");
+        assert!(out.auto_renew);
+        assert_eq!(out.renewal_check_interval, 12);
+        assert_eq!(out.renewal_days_before_expiry, 15);
+        assert!(!out.tos_agreed); // no certs in fresh DB → no inference
+
+        // DB row now contains the seed
+        let json = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .expect("acme_config row should exist after seed");
+        let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert!(stored.enabled);
+        assert_eq!(stored.server_url, "https://example.test/acme");
+        assert!(!stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn existing_db_returns_stored_values_ignoring_seed() {
+        let (db, _tmp) = fresh_db().await;
+
+        // Pre-populate DB with a distinctive config
+        let stored = AcmeFullConfig {
+            enabled: true,
+            server_url: "https://stored.example/acme".to_string(),
+            email: Some("stored@example.test".to_string()),
+            cert_dir: "/stored/certs".to_string(),
+            auto_renew: false,
+            renewal_check_interval: 99,
+            renewal_days_before_expiry: 77,
+            tos_agreed: true,
+        };
+        db.save_server_setting("acme_config", &serde_json::to_string(&stored).unwrap())
+            .await
+            .unwrap();
+
+        // Call with completely different seed args — none of them should leak through
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = false; // different from stored
+        cfg.acme_server_url = "https://cli.example/acme".to_string();
+        cfg.acme_email = Some("cli@example.test".to_string());
+        cfg.acme_cert_dir = "/cli/certs".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 1;
+        cfg.acme_renewal_days_before_expiry = 2;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        assert!(out.enabled);
+        assert_eq!(out.server_url, "https://stored.example/acme");
+        assert_eq!(out.email.as_deref(), Some("stored@example.test"));
+        assert_eq!(out.cert_dir, "/stored/certs");
+        assert!(!out.auto_renew);
+        assert_eq!(out.renewal_check_interval, 99);
+        assert_eq!(out.renewal_days_before_expiry, 77);
+        assert!(out.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn seed_never_overwrites_existing_db() {
+        let (db, _tmp) = fresh_db().await;
+
+        // First call: seed DB with initial values
+        let mut first_cfg = crate::server::config::ServerConfig::default();
+        first_cfg.acme_enabled = true;
+        first_cfg.acme_server_url = "https://first.example/acme".to_string();
+        first_cfg.acme_cert_dir = "/first".to_string();
+        AcmeFullConfig::load_or_seed(&db, &first_cfg).await;
+
+        // Second call with different seed args — should not touch DB
+        let mut second_cfg = crate::server::config::ServerConfig::default();
+        second_cfg.acme_enabled = false;
+        second_cfg.acme_server_url = "https://second.example/acme".to_string();
+        second_cfg.acme_email = Some("x@y".to_string());
+        second_cfg.acme_cert_dir = "/second".to_string();
+        second_cfg.acme_auto_renew = false;
+        second_cfg.acme_renewal_check_interval = 1;
+        second_cfg.acme_renewal_days_before_expiry = 1;
+        AcmeFullConfig::load_or_seed(&db, &second_cfg).await;
+
+        // DB row must still be the first seed
+        let json = db.load_server_setting("acme_config").await.unwrap().unwrap();
+        let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored.server_url, "https://first.example/acme");
+        assert_eq!(stored.cert_dir, "/first");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_falls_back_to_seed_without_overwriting_db() {
+        let (db, _tmp) = fresh_db().await;
+
+        // Poison the row with unparseable JSON
+        db.save_server_setting("acme_config", "not valid json {[").await.unwrap();
+
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = true;
+        cfg.acme_server_url = "https://seed.example/acme".to_string();
+        cfg.acme_cert_dir = "/seed".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 24;
+        cfg.acme_renewal_days_before_expiry = 30;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        // Returned value comes from seed args
+        assert!(out.enabled);
+        assert_eq!(out.server_url, "https://seed.example/acme");
+        assert_eq!(out.cert_dir, "/seed");
+
+        // But DB row is untouched — operator can inspect / repair it
+        let stored = db.load_server_setting("acme_config").await.unwrap().unwrap();
+        assert_eq!(stored, "not valid json {[");
+    }
+
+    #[tokio::test]
+    async fn tos_agreed_inferred_from_existing_certs_on_first_seed() {
+        let (db, _tmp) = fresh_db().await;
+
+        // Simulate an upgrade path: certs exist in DB (from a previous
+        // version that only used CLI-based ACME) but acme_config row
+        // was never written.
+        db.save_acme_certificate(
+            "example.test",
+            "active",
+            Some("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----"),
+            Some("-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----"),
+            None,
+            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now() + chrono::Duration::days(90)),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = true;
+        cfg.acme_server_url = "https://seed.example/acme".to_string();
+        cfg.acme_cert_dir = "/seed".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 24;
+        cfg.acme_renewal_days_before_expiry = 30;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        assert!(
+            out.tos_agreed,
+            "existing certs should imply ToS was previously agreed"
+        );
+
+        // And the persisted seed carries it forward
+        let stored: AcmeFullConfig = serde_json::from_str(
+            &db.load_server_setting("acme_config").await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn tos_agreed_stays_false_when_no_certs_exist() {
+        let (db, _tmp) = fresh_db().await;
+
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = true;
+        cfg.acme_server_url = "https://seed.example/acme".to_string();
+        cfg.acme_cert_dir = "/seed".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 24;
+        cfg.acme_renewal_days_before_expiry = 30;
+
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        assert!(!out.tos_agreed, "empty DB should not infer ToS agreement");
+
+        // And the persisted seed also has tos_agreed=false
+        let stored: AcmeFullConfig = serde_json::from_str(
+            &db.load_server_setting("acme_config").await.unwrap().unwrap(),
+        )
+        .unwrap();
+        assert!(!stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn tos_inference_does_not_run_when_db_already_has_config() {
+        let (db, _tmp) = fresh_db().await;
+
+        // First call: seed with no certs → tos_agreed=false persisted
+        let mut cfg = crate::server::config::ServerConfig::default();
+        cfg.acme_enabled = false;
+        cfg.acme_server_url = "https://a.example/acme".to_string();
+        cfg.acme_cert_dir = "/a".to_string();
+        cfg.acme_auto_renew = true;
+        cfg.acme_renewal_check_interval = 24;
+        cfg.acme_renewal_days_before_expiry = 30;
+
+        let first = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+        assert!(!first.tos_agreed);
+
+        // Now add certs after the first seed. If inference re-ran on the
+        // second call, it would flip tos_agreed to true.
+        db.save_acme_certificate(
+            "example.test",
+            "active",
+            Some("cert"),
+            Some("key"),
+            None,
+            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now() + chrono::Duration::days(90)),
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Second call should read the persisted config (tos_agreed=false)
+        // via the DB-hit fast path and NOT re-run inference.
+        let second = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+        assert!(
+            !second.tos_agreed,
+            "inference must not overwrite persisted tos_agreed=false — DB row is authoritative"
+        );
     }
 }
