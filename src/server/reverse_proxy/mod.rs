@@ -43,6 +43,25 @@ impl std::fmt::Display for RuleType {
     }
 }
 
+/// Application-layer protocol on the connection to the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendProtocol {
+    #[default]
+    Http1,
+    /// h2 over TLS (ALPN-negotiated) or h2c prior-knowledge over plain TCP.
+    Http2,
+}
+
+/// Transport scheme on the connection to the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendScheme {
+    #[default]
+    Http,
+    Https,
+}
+
 /// Backend server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Backend {
@@ -51,6 +70,12 @@ pub struct Backend {
     /// Weight for load balancing (default: 100)
     #[serde(default = "default_weight")]
     pub weight: u32,
+    /// Application-layer protocol; defaults to Http1 for backward compat.
+    #[serde(default)]
+    pub protocol: BackendProtocol,
+    /// Transport scheme; defaults to Http.
+    #[serde(default)]
+    pub scheme: BackendScheme,
 }
 
 fn default_weight() -> u32 {
@@ -653,5 +678,27 @@ mod mod_tests {
             r.cert_status.as_ref().unwrap().source,
             CertSourceKind::WildcardReuse
         );
+    }
+
+    #[test]
+    fn backend_deserializes_with_defaults_for_missing_fields() {
+        let json = r#"{"addr":"127.0.0.1:80","weight":100}"#;
+        let backend: Backend = serde_json::from_str(json).unwrap();
+        assert_eq!(backend.protocol, BackendProtocol::Http1);
+        assert_eq!(backend.scheme, BackendScheme::Http);
+    }
+
+    #[test]
+    fn backend_roundtrip_with_explicit_fields() {
+        let backend = Backend {
+            addr: "10.0.0.1:8080".to_string(),
+            weight: 100,
+            protocol: BackendProtocol::Http2,
+            scheme: BackendScheme::Https,
+        };
+        let s = serde_json::to_string(&backend).unwrap();
+        let parsed: Backend = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.protocol, BackendProtocol::Http2);
+        assert_eq!(parsed.scheme, BackendScheme::Https);
     }
 }

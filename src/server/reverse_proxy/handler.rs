@@ -261,7 +261,9 @@ mod tests {
 
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
-        use crate::server::reverse_proxy::{Backend, LoadBalancing, ProxyRule, Route, RuleType};
+        use crate::server::reverse_proxy::{
+            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+        };
 
         // 1. Backend that trickles 8 chunks of 1 KiB with 50 ms between them.
         let backend_app = Router::new().route(
@@ -296,6 +298,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: backend_addr.to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
@@ -356,7 +360,9 @@ mod tests {
 
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
-        use crate::server::reverse_proxy::{Backend, LoadBalancing, ProxyRule, Route, RuleType};
+        use crate::server::reverse_proxy::{
+            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+        };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<hyper::HeaderMap>();
         let tx_clone = tx.clone();
@@ -387,6 +393,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: backend_addr.to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::default(),
             }],

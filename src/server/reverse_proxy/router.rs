@@ -198,6 +198,7 @@ impl Default for RouteTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::reverse_proxy::{BackendProtocol, BackendScheme};
 
     fn create_test_rule(id: &str, domains: Vec<&str>, path: &str) -> ProxyRule {
         ProxyRule {
@@ -211,6 +212,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: "127.0.0.1:8080".to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
@@ -286,6 +289,8 @@ mod tests {
                     backends: vec![Backend {
                         addr: "127.0.0.1:8081".to_string(),
                         weight: 100,
+                        protocol: BackendProtocol::Http1,
+                        scheme: BackendScheme::Http,
                     }],
                     load_balancing: LoadBalancing::RoundRobin,
                 },
@@ -294,6 +299,8 @@ mod tests {
                     backends: vec![Backend {
                         addr: "127.0.0.1:8080".to_string(),
                         weight: 100,
+                        protocol: BackendProtocol::Http1,
+                        scheme: BackendScheme::Http,
                     }],
                     load_balancing: LoadBalancing::RoundRobin,
                 },
@@ -334,6 +341,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: "127.0.0.1:8080".to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
@@ -362,6 +371,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: "127.0.0.1:3306".to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
@@ -394,6 +405,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: "127.0.0.1:8080".to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
