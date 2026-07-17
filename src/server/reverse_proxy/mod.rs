@@ -1,10 +1,12 @@
 pub mod config;
 pub mod error;
+pub mod handler;
 pub mod http_proxy;
 pub mod router;
 pub mod shared_listener;
 pub mod sni_resolver;
 pub mod tcp_proxy;
+pub mod upstream;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
