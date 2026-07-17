@@ -1,4 +1,6 @@
+use super::handler::{handle_proxy_request_unified, RouteSource};
 use super::router::RouteTable;
+use super::upstream::UpstreamClient;
 use super::ReverseProxyState;
 use crate::server::db::Database;
 use arc_swap::ArcSwap;
@@ -19,6 +21,7 @@ use tracing::{debug, error, info, warn};
 /// HTTP reverse proxy handler
 pub struct HttpProxy {
     state: ReverseProxyState,
+    #[allow(dead_code)]
     db: Option<Database>,
 }
 
@@ -34,34 +37,36 @@ impl HttpProxy {
         addr: SocketAddr,
         rule_id: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Look up the rule to check TLS configuration
-        let tls_config = {
+        // Look up the rule and snapshot needed pieces atomically.
+        let (rule_snapshot, tls_config, fallback_domain) = {
             let rules = self.state.rules.lock().await;
-            rules
-                .get(&rule_id)
+            let rule = rules.get(&rule_id).cloned();
+            let tls = rule
+                .as_ref()
                 .and_then(|r| r.tls.clone())
-                .filter(|t| t.enabled)
+                .filter(|t| t.enabled);
+            let fallback = rule.as_ref().and_then(|r| r.domains.first().cloned());
+            (rule, tls, fallback)
         };
 
-        let state = self.state.clone();
-        let _db = self.db.clone();
-        let rule_id_clone = rule_id.clone();
+        let Some(rule) = rule_snapshot else {
+            return Err(format!("rule {rule_id} not found in state").into());
+        };
+
+        // Build a single-rule RouteTable snapshot for this listener.
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
 
         let app = Router::new()
-            .fallback(any(handle_proxy_request))
-            .with_state((state, rule_id.clone()));
+            .fallback(any(handle_proxy_request_unified))
+            .with_state((source, upstream));
 
         let listener = TcpListener::bind(addr).await?;
 
         if let Some(tls_cfg) = tls_config {
             // TLS-enabled path
-            let domain = tls_cfg.domain.clone().or_else(|| {
-                // Fall back to first domain in the rule
-                let rules = self.state.rules.blocking_lock();
-                rules
-                    .get(&rule_id_clone)
-                    .and_then(|r| r.domains.first().cloned())
-            });
+            let domain = tls_cfg.domain.clone().or(fallback_domain);
 
             let domain = match domain {
                 Some(d) => d,
@@ -167,119 +172,6 @@ impl HttpProxy {
 
         Ok(())
     }
-}
-
-/// Handle proxy request
-async fn handle_proxy_request(
-    State((state, rule_id)): State<(ReverseProxyState, String)>,
-    req: Request<Body>,
-) -> impl IntoResponse {
-    // Extract host from request
-    let _host = req
-        .headers()
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let path = req.uri().path().to_string();
-    let method = req.method().clone();
-
-    // Match route
-    let route_match = state
-        .rules
-        .lock()
-        .await
-        .get(&rule_id)
-        .map(|rule| rule.routes.clone());
-
-    let Some(routes) = route_match else {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("No matching route"))
-            .unwrap();
-    };
-
-    // Find matching route and backend
-    let backend_addr = find_backend(&routes, &path);
-
-    let Some(backend) = backend_addr else {
-        return Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("No backend available"))
-            .unwrap();
-    };
-
-    // Build upstream URL
-    let upstream_uri = format!("http://{}{}", backend, path);
-
-    // Create HTTP client
-    let client = reqwest::Client::new();
-
-    // Build upstream request
-    let mut upstream_req = client.request(method, &upstream_uri);
-
-    // Copy headers
-    for (key, value) in req.headers() {
-        if key != "host" {
-            upstream_req = upstream_req.header(key, value);
-        }
-    }
-
-    // Add proxy headers
-    upstream_req = upstream_req.header("X-Forwarded-For", "127.0.0.1");
-    upstream_req = upstream_req.header("X-Real-IP", "127.0.0.1");
-
-    // Get request body
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
-
-    // Send to backend
-    match upstream_req.body(body_bytes.to_vec()).send().await {
-        Ok(response) => {
-            let status = StatusCode::from_u16(response.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-            let mut proxy_response = Response::builder().status(status);
-
-            // Copy response headers
-            for (key, value) in response.headers() {
-                proxy_response = proxy_response.header(key, value);
-            }
-
-            let body = response.bytes().await.unwrap_or_default();
-            proxy_response.body(Body::from(body)).unwrap()
-        }
-        Err(e) => {
-            error!("Backend request failed: {}", e);
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("Backend error: {}", e)))
-                .unwrap()
-        }
-    }
-}
-
-/// Find a backend address from routes
-fn find_backend(routes: &[super::Route], path: &str) -> Option<String> {
-    // Sort routes by path length (longest first)
-    let mut sorted_routes: Vec<&super::Route> = routes.iter().collect();
-    sorted_routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
-
-    for route in sorted_routes {
-        if path.starts_with(&route.path) || route.path == "/" {
-            if let Some(backend) = route.backends.first() {
-                return Some(backend.addr.clone());
-            }
-        }
-    }
-
-    // Default: first route's first backend
-    routes
-        .first()
-        .and_then(|r| r.backends.first())
-        .map(|b| b.addr.clone())
 }
 
 /// Axum handler used by the shared listener.
