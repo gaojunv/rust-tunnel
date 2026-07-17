@@ -1,5 +1,4 @@
 use super::ReverseProxyState;
-use crate::server::db::Database;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -9,13 +8,12 @@ use tracing::{debug, error, info, warn};
 /// TCP reverse proxy handler
 pub struct TcpProxy {
     state: ReverseProxyState,
-    db: Option<Database>,
 }
 
 impl TcpProxy {
     /// Create a new TCP proxy
-    pub fn new(state: ReverseProxyState, db: Option<Database>) -> Self {
-        Self { state, db }
+    pub fn new(state: ReverseProxyState) -> Self {
+        Self { state }
     }
 
     /// Start TCP proxy listener on the given address
@@ -262,8 +260,10 @@ impl UdpProxy {
                         // Forward to backend
                         if let Ok(backend_socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                             if let Ok(backend_addr) = backend_addr.parse::<SocketAddr>() {
-                                if let Ok(_) =
-                                    backend_socket.send_to(&buf[..len], backend_addr).await
+                                if backend_socket
+                                    .send_to(&buf[..len], backend_addr)
+                                    .await
+                                    .is_ok()
                                 {
                                     // Wait for response
                                     let mut response_buf = vec![0u8; 65535];

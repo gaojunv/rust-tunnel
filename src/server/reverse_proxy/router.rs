@@ -121,7 +121,7 @@ impl RouteTable {
     ) -> Option<(&'a Route, &'a Backend)> {
         // Sort routes by path length (longest first) for most specific match
         let mut routes: Vec<&Route> = rule.routes.iter().collect();
-        routes.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
 
         for route in routes {
             if path.starts_with(&route.path) || route.path == "/" {

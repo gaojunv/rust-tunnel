@@ -216,6 +216,7 @@ mod integration_tests {
 
         // 5. cleanup
         ss_local.kill().ok();
+        ss_local.wait().ok();
         echo_handle.abort();
     }
 
@@ -248,6 +249,7 @@ mod integration_tests {
         assert_eq!(echoed, b"chacha20 test");
 
         ss_local.kill().ok();
+        ss_local.wait().ok();
         echo_handle.abort();
     }
 
@@ -281,6 +283,7 @@ mod integration_tests {
         assert_eq!(echoed, payload);
 
         ss_local.kill().ok();
+        ss_local.wait().ok();
         echo_handle.abort();
     }
 
@@ -329,6 +332,7 @@ mod integration_tests {
         );
 
         ss_local.kill().ok();
+        ss_local.wait().ok();
         echo_handle.abort();
     }
 }

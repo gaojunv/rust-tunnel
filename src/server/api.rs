@@ -2435,7 +2435,7 @@ async fn request_acme_certificate(
                 }
             }
         }
-        "http-01" | _ => client.request_certificate(&domain).await,
+        _ => client.request_certificate(&domain).await,
     };
 
     match result {

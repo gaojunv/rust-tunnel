@@ -1198,6 +1198,7 @@ impl Database {
     // ============================================================
 
     /// Save or update a proxy rule
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_proxy_rule(
         &self,
         id: &str,
@@ -1416,6 +1417,7 @@ impl Database {
     // ============================================================
 
     /// Save or update an ACME certificate
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_acme_certificate(
         &self,
         domain: &str,

@@ -265,7 +265,7 @@ async fn handle_proxy_request(
 fn find_backend(routes: &[super::Route], path: &str) -> Option<String> {
     // Sort routes by path length (longest first)
     let mut sorted_routes: Vec<&super::Route> = routes.iter().collect();
-    sorted_routes.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+    sorted_routes.sort_by_key(|r| std::cmp::Reverse(r.path.len()));
 
     for route in sorted_routes {
         if path.starts_with(&route.path) || route.path == "/" {
