@@ -721,8 +721,7 @@ mod tests {
                     let mut h = Sha1::new();
                     h.update(key.as_bytes());
                     h.update(WS_MAGIC.as_bytes());
-                    let accept =
-                        base64::engine::general_purpose::STANDARD.encode(h.finalize());
+                    let accept = base64::engine::general_purpose::STANDARD.encode(h.finalize());
                     let resp = format!(
                         "HTTP/1.1 101 Switching Protocols\r\n\
                          Upgrade: websocket\r\n\
@@ -800,19 +799,14 @@ mod tests {
         let mut resp_buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 1024];
         let header_end = loop {
-            let n = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.read(&mut chunk),
-            )
-            .await
-            .expect("timed out waiting for 101 headers")
-            .unwrap();
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+                    .await
+                    .expect("timed out waiting for 101 headers")
+                    .unwrap();
             assert!(n > 0, "connection closed before 101 completed");
             resp_buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = resp_buf
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-            {
+            if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 break pos + 4;
             }
         };
@@ -845,13 +839,10 @@ mod tests {
         let mut got = leftover;
         while got.len() < payload.len() {
             let mut buf = [0u8; 64];
-            let n = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.read(&mut buf),
-            )
-            .await
-            .expect("timed out reading echo through tunnel")
-            .unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("timed out reading echo through tunnel")
+                .unwrap();
             assert!(n > 0, "tunnel closed before echoing bytes");
             got.extend_from_slice(&buf[..n]);
         }
