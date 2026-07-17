@@ -117,8 +117,7 @@ async fn start_trojan_server(
     let fallback = fallback.to_string();
 
     let handle = tokio::spawn(async move {
-        let _ =
-            listener::start_trojan_listener(state, port, password, fallback, rx).await;
+        let _ = listener::start_trojan_listener(state, port, password, fallback, rx).await;
     });
 
     // Return a dummy receiver for compatibility (tx keeps it alive)

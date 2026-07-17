@@ -17,11 +17,11 @@ use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
 use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
-use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::quality::{
     calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
     QualityThresholds, QualityTracker,
 };
+use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::{listener, ServerConfig};
 use chrono::{Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -147,10 +147,7 @@ impl AcmeFullConfig {
     /// avoids letting a transient DB error wipe good persistent config.
     ///
     /// All DB failures are logged as warnings and never fatal.
-    pub async fn load_or_seed(
-        db: &Database,
-        server_config: &ServerConfig,
-    ) -> Self {
+    pub async fn load_or_seed(db: &Database, server_config: &ServerConfig) -> Self {
         // Tracks whether we should persist the seed back to DB.
         // Set to false in branches where the DB may hold state we
         // shouldn't overwrite:
@@ -163,18 +160,16 @@ impl AcmeFullConfig {
         let mut should_persist_seed = true;
 
         match db.load_server_setting("acme_config").await {
-            Ok(Some(json)) => {
-                match serde_json::from_str::<Self>(&json) {
-                    Ok(cfg) => return cfg,
-                    Err(e) => {
-                        warn!(
+            Ok(Some(json)) => match serde_json::from_str::<Self>(&json) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    warn!(
                             "acme_config in DB is malformed ({}), re-seeding from CLI/TOML without overwriting the bad row",
                             e
                         );
-                        should_persist_seed = false;
-                    }
+                    should_persist_seed = false;
                 }
-            }
+            },
             Ok(None) => {
                 // Normal seed path — should_persist_seed stays true
             }
@@ -281,8 +276,7 @@ pub struct ServerState {
     /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
     pub cert_manager: Option<std::sync::Arc<crate::server::acme::manager::CertificateManager>>,
     /// DNS provider configuration for ACME DNS-01 challenges
-    pub dns_provider_config:
-        Arc<RwLock<Option<crate::server::acme::dns::DnsProviderConfig>>>,
+    pub dns_provider_config: Arc<RwLock<Option<crate::server::acme::dns::DnsProviderConfig>>>,
     /// Dynamic configuration (DB-backed, runtime-changeable)
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
     /// Shadowsocks listener abort handle
@@ -1874,8 +1868,7 @@ pub async fn run_server(
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         debug!("TLS handshake successful with {}", addr);
-                        handle_control_connection(config_clone, state_clone, tls_stream, addr)
-                            .await
+                        handle_control_connection(config_clone, state_clone, tls_stream, addr).await
                     }
                     Err(e) => {
                         warn!("TLS handshake failed with {}: {}", addr, e);
@@ -1890,8 +1883,7 @@ pub async fn run_server(
                 match tls_acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         debug!("TLS handshake successful with {}", addr);
-                        handle_control_connection(config_clone, state_clone, tls_stream, addr)
-                            .await
+                        handle_control_connection(config_clone, state_clone, tls_stream, addr).await
                     }
                     Err(e) => {
                         warn!("TLS handshake failed with {}: {}", addr, e);
@@ -2031,7 +2023,11 @@ mod acme_config_load_or_seed_tests {
         AcmeFullConfig::load_or_seed(&db, &second_cfg).await;
 
         // DB row must still be the first seed
-        let json = db.load_server_setting("acme_config").await.unwrap().unwrap();
+        let json = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .unwrap();
         let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(stored.server_url, "https://first.example/acme");
         assert_eq!(stored.cert_dir, "/first");
@@ -2042,7 +2038,9 @@ mod acme_config_load_or_seed_tests {
         let (db, _tmp) = fresh_db().await;
 
         // Poison the row with unparseable JSON
-        db.save_server_setting("acme_config", "not valid json {[").await.unwrap();
+        db.save_server_setting("acme_config", "not valid json {[")
+            .await
+            .unwrap();
 
         let cfg = crate::server::config::ServerConfig {
             acme_enabled: true,
@@ -2062,7 +2060,11 @@ mod acme_config_load_or_seed_tests {
         assert_eq!(out.cert_dir, "/seed");
 
         // But DB row is untouched — operator can inspect / repair it
-        let stored = db.load_server_setting("acme_config").await.unwrap().unwrap();
+        let stored = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored, "not valid json {[");
     }
 
@@ -2105,7 +2107,10 @@ mod acme_config_load_or_seed_tests {
 
         // And the persisted seed carries it forward
         let stored: AcmeFullConfig = serde_json::from_str(
-            &db.load_server_setting("acme_config").await.unwrap().unwrap(),
+            &db.load_server_setting("acme_config")
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .unwrap();
         assert!(stored.tos_agreed);
@@ -2131,7 +2136,10 @@ mod acme_config_load_or_seed_tests {
 
         // And the persisted seed also has tos_agreed=false
         let stored: AcmeFullConfig = serde_json::from_str(
-            &db.load_server_setting("acme_config").await.unwrap().unwrap(),
+            &db.load_server_setting("acme_config")
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .unwrap();
         assert!(!stored.tos_agreed);

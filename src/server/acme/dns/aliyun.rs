@@ -81,13 +81,7 @@ impl AliyunDnsSolver {
         // Build canonical query string
         let query_string: String = params
             .iter()
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    urlencoding::encode(k),
-                    urlencoding::encode(v)
-                )
-            })
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
             .collect::<Vec<_>>()
             .join("&");
 
@@ -104,9 +98,8 @@ impl AliyunDnsSolver {
 
         // Compute HMAC-SHA1 signature
         type HmacSha1 = Hmac<Sha1>;
-        let mut mac =
-            HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
-                .expect("HMAC can take key of any size");
+        let mut mac = HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
+            .expect("HMAC can take key of any size");
         mac.update(string_to_sign.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -143,11 +136,7 @@ impl AliyunDnsSolver {
         let body: serde_json::Value = response.json().await?;
 
         if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Aliyun API error: {} - {}",
-                status,
-                body
-            ));
+            return Err(anyhow::anyhow!("Aliyun API error: {} - {}", status, body));
         }
 
         // Check for Aliyun business-level errors
@@ -164,11 +153,7 @@ impl AliyunDnsSolver {
     }
 
     /// Find an existing TXT record by domain and value
-    async fn find_txt_record(
-        &self,
-        domain: &str,
-        value: &str,
-    ) -> anyhow::Result<Option<String>> {
+    async fn find_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<Option<String>> {
         let (main_domain, rr) = parse_domain(domain)?;
 
         let params = vec![
@@ -233,15 +218,15 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let record_id = match self.find_txt_record(domain, value).await? {
             Some(id) => id,
             None => {
-                warn!("No matching Aliyun DNS TXT record found for domain {}", domain);
+                warn!(
+                    "No matching Aliyun DNS TXT record found for domain {}",
+                    domain
+                );
                 return Ok(());
             }
         };
 
-        info!(
-            "Deleting Aliyun DNS TXT record: RecordId={}",
-            record_id
-        );
+        info!("Deleting Aliyun DNS TXT record: RecordId={}", record_id);
 
         let params = vec![("RecordId".to_string(), record_id)];
 
@@ -257,7 +242,9 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         value: &str,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+        use trust_dns_resolver::config::{
+            NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
+        };
         use trust_dns_resolver::TokioAsyncResolver;
 
         // Build resolver with Google DNS + Alibaba DNS
@@ -284,11 +271,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
             // Check deadline BEFORE sleeping
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                anyhow::bail!(
-                    "DNS propagation timeout for {} after {:?}",
-                    domain,
-                    timeout
-                );
+                anyhow::bail!("DNS propagation timeout for {} after {:?}", domain, timeout);
             }
 
             match resolver.txt_lookup(domain).await {
@@ -298,10 +281,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
                         found_count += 1;
                         let txt_str = txt.to_string();
                         if txt_str == value {
-                            info!(
-                                "DNS TXT record confirmed for {}: {}",
-                                domain, value
-                            );
+                            info!("DNS TXT record confirmed for {}: {}", domain, value);
                             return Ok(());
                         }
                     }
@@ -311,10 +291,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
                     );
                 }
                 Err(e) => {
-                    debug!(
-                        "DNS lookup failed for {} (may be NXDOMAIN): {}",
-                        domain, e
-                    );
+                    debug!("DNS lookup failed for {} (may be NXDOMAIN): {}", domain, e);
                 }
             }
 

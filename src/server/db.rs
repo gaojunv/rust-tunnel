@@ -1730,10 +1730,7 @@ impl Database {
     }
 
     /// Load a server setting by key
-    pub async fn load_server_setting(
-        &self,
-        key: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
+    pub async fn load_server_setting(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query("SELECT value FROM server_settings WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -1742,11 +1739,7 @@ impl Database {
     }
 
     /// Save a server setting (upsert)
-    pub async fn save_server_setting(
-        &self,
-        key: &str,
-        value: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn save_server_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO server_settings (key, value, updated_at)
@@ -2350,12 +2343,11 @@ mod cert_status_migration_tests {
         let db = Database::new(path.to_str().unwrap()).await.unwrap();
 
         // 查询 pragma_table_info 验证列存在
-        let cols: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('proxy_rules')"
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
+        let cols: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('proxy_rules')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
         let names: Vec<String> = cols.into_iter().map(|(n,)| n).collect();
         assert!(names.contains(&"cert_source".to_string()));
         assert!(names.contains(&"cert_covering_domain".to_string()));
@@ -2378,15 +2370,22 @@ mod cert_status_migration_tests {
         let db = Database::new(path.to_str().unwrap()).await.unwrap();
 
         db.save_proxy_rule(
-            "r-1", "test", "http", "0.0.0.0:443",
+            "r-1",
+            "test",
+            "http",
+            "0.0.0.0:443",
             Some(r#"["a.example.com"]"#),
             Some(r#"[]"#),
-            true, true, Some("a.example.com"),
+            true,
+            true,
+            Some("a.example.com"),
             true,
             Some("exact"),
             Some("a.example.com"),
             Some(&chrono::Utc::now()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         let rules = db.load_proxy_rules().await.unwrap();
         assert_eq!(rules.len(), 1);

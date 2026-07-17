@@ -55,16 +55,13 @@ impl HttpProxy {
 
         if let Some(tls_cfg) = tls_config {
             // TLS-enabled path
-            let domain = tls_cfg
-                .domain
-                .clone()
-                .or_else(|| {
-                    // Fall back to first domain in the rule
-                    let rules = self.state.rules.blocking_lock();
-                    rules
-                        .get(&rule_id_clone)
-                        .and_then(|r| r.domains.first().cloned())
-                });
+            let domain = tls_cfg.domain.clone().or_else(|| {
+                // Fall back to first domain in the rule
+                let rules = self.state.rules.blocking_lock();
+                rules
+                    .get(&rule_id_clone)
+                    .and_then(|r| r.domains.first().cloned())
+            });
 
             let domain = match domain {
                 Some(d) => d,
@@ -99,7 +96,10 @@ impl HttpProxy {
                 }
             };
 
-            info!("HTTP proxy listening on {} with TLS for domain '{}'", addr, domain);
+            info!(
+                "HTTP proxy listening on {} with TLS for domain '{}'",
+                addr, domain
+            );
 
             let tls_acceptor = TlsAcceptor::from(server_config);
 

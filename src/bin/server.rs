@@ -21,9 +21,7 @@ async fn disable_conflicting_rules_on_port(
         let rules = proxy_state.rules.lock().await;
         let mut on_port: Vec<&ProxyRule> = rules
             .values()
-            .filter(|r| {
-                r.enabled && r.rule_type == RuleType::Http && r.listen == listen_addr
-            })
+            .filter(|r| r.enabled && r.rule_type == RuleType::Http && r.listen == listen_addr)
             .collect();
         on_port.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
@@ -42,14 +40,20 @@ async fn disable_conflicting_rules_on_port(
             }
             E::TlsMismatch { .. } => {
                 // Majority wins. Ties: whichever the oldest rule chose.
-                let tls_on = on_port.iter().filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled)).count();
+                let tls_on = on_port
+                    .iter()
+                    .filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
+                    .count();
                 let tls_off = on_port.len() - tls_on;
                 let keep_tls = if tls_on == tls_off {
-                    on_port.first().is_some_and(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
+                    on_port
+                        .first()
+                        .is_some_and(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
                 } else {
                     tls_on > tls_off
                 };
-                on_port.iter()
+                on_port
+                    .iter()
                     .filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled) != keep_tls)
                     .map(|r| r.id.clone())
                     .collect()
@@ -57,7 +61,8 @@ async fn disable_conflicting_rules_on_port(
             E::NoCertManager { .. } => {
                 // Cert manager missing but TLS requested → disable every
                 // TLS-enabled rule so the port at least serves plain-HTTP rules.
-                on_port.iter()
+                on_port
+                    .iter()
                     .filter(|r| r.tls.as_ref().is_some_and(|t| t.enabled))
                     .map(|r| r.id.clone())
                     .collect()
@@ -87,7 +92,8 @@ async fn disable_conflicting_rules_on_port(
             } else {
                 tracing::warn!(
                     "Disabled rule {} on port {} to resolve reconcile conflict",
-                    id, listen_addr
+                    id,
+                    listen_addr
                 );
             }
         }
@@ -107,14 +113,17 @@ async fn main() -> TunnelResult<()> {
     let mut state = control::ServerState::with_db(db.clone());
 
     // Load or seed dynamic config from DB
-    let dynamic_config = rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
+    let dynamic_config =
+        rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
     state.set_dynamic_config(dynamic_config).await;
 
     // Load persisted DNS provider config from database.
     // (ACME config is handled below via AcmeFullConfig::load_or_seed.)
     if let Some(db_ref) = state.get_db() {
         if let Ok(Some(json)) = db_ref.load_server_setting("dns_provider_config").await {
-            if let Ok(dns_config) = serde_json::from_str::<rust_tunnel::server::acme::dns::DnsProviderConfig>(&json) {
+            if let Ok(dns_config) =
+                serde_json::from_str::<rust_tunnel::server::acme::dns::DnsProviderConfig>(&json)
+            {
                 *state.dns_provider_config.write().await = Some(dns_config);
                 tracing::info!("Loaded persisted DNS provider config from database");
             }
@@ -124,8 +133,7 @@ async fn main() -> TunnelResult<()> {
     // Resolve effective ACME config: DB is the runtime source of truth;
     // CLI/TOML values seed a fresh install and are ignored thereafter.
     // See docs/superpowers/specs/2026-07-16-acme-config-db-source-of-truth-design.md
-    let effective_acme_config =
-        control::AcmeFullConfig::load_or_seed(&db, &config).await;
+    let effective_acme_config = control::AcmeFullConfig::load_or_seed(&db, &config).await;
     tracing::info!(
         "ACME config resolved: enabled={}, server={}, cert_dir={}",
         effective_acme_config.enabled,
@@ -218,9 +226,9 @@ async fn main() -> TunnelResult<()> {
         );
 
         // Initialize CertificateManager
-        let cert_manager = Arc::new(
-            rust_tunnel::server::acme::manager::CertificateManager::new(&effective_acme_config.cert_dir),
-        );
+        let cert_manager = Arc::new(rust_tunnel::server::acme::manager::CertificateManager::new(
+            &effective_acme_config.cert_dir,
+        ));
 
         // Load existing certificates from disk
         if let Err(e) = cert_manager.load_from_storage().await {
@@ -231,9 +239,7 @@ async fn main() -> TunnelResult<()> {
         {
             let acme_client_guard = state.acme_client.read().await;
             if let Some(ref acme_client) = *acme_client_guard {
-                cert_manager
-                    .set_acme_client(acme_client.clone())
-                    .await;
+                cert_manager.set_acme_client(acme_client.clone()).await;
             }
         }
 
@@ -242,8 +248,7 @@ async fn main() -> TunnelResult<()> {
             let renewal_manager = cert_manager.clone();
             let interval = effective_acme_config.renewal_check_interval;
             let days_before = effective_acme_config.renewal_days_before_expiry;
-            renewal_manager
-                .start_renewal_task(interval, days_before);
+            renewal_manager.start_renewal_task(interval, days_before);
             tracing::info!(
                 "Certificate renewal task started (interval: {}h, days before expiry: {})",
                 interval,
@@ -252,7 +257,10 @@ async fn main() -> TunnelResult<()> {
         }
 
         state.set_cert_manager(cert_manager.clone());
-        tracing::info!("Certificate manager initialized (cert_dir: {})", effective_acme_config.cert_dir);
+        tracing::info!(
+            "Certificate manager initialized (cert_dir: {})",
+            effective_acme_config.cert_dir
+        );
 
         // Propagate the cert manager to ReverseProxyState so the shared
         // listener's SNI resolver and coverage queries have access to it.
@@ -300,13 +308,15 @@ async fn main() -> TunnelResult<()> {
                 Err(e) => {
                     tracing::warn!(
                         "Startup reconcile failed for {}: {}. Attempting fallback.",
-                        addr, e
+                        addr,
+                        e
                     );
                     disable_conflicting_rules_on_port(&state.proxy_state, &addr, &e).await;
                     if let Err(e2) = state.proxy_state.reconcile_http_listener(&addr).await {
                         tracing::error!(
                             "Retry reconcile still failed for {}: {}. Port left offline.",
-                            addr, e2
+                            addr,
+                            e2
                         );
                     }
                 }
@@ -323,10 +333,16 @@ async fn main() -> TunnelResult<()> {
     // Create a watch channel for control channel TLS if TLS is enabled
     let control_tls_rx = if config.tls {
         let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
-            std::io::Error::other(format!("Failed to load TLS certificates for control channel: {}", e))
+            std::io::Error::other(format!(
+                "Failed to load TLS certificates for control channel: {}",
+                e
+            ))
         })?;
         let tls_config = create_server_config(cert_pair).map_err(|e| {
-            std::io::Error::other(format!("Failed to create TLS config for control channel: {}", e))
+            std::io::Error::other(format!(
+                "Failed to create TLS config for control channel: {}",
+                e
+            ))
         })?;
 
         let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
@@ -404,7 +420,10 @@ async fn main() -> TunnelResult<()> {
                 drop(dc); // Release the read lock before spawning
                 tokio::spawn(async move {
                     if let Err(e) = listener::start_shadowsocks_listener(
-                        state_clone, ss_port, ss_cipher, ss_password,
+                        state_clone,
+                        ss_port,
+                        ss_cipher,
+                        ss_password,
                     )
                     .await
                     {
@@ -440,10 +459,7 @@ async fn main() -> TunnelResult<()> {
                         ))
                     })?;
                 let tls_config = create_server_config(cert_pair).map_err(|e| {
-                    std::io::Error::other(format!(
-                        "Failed to create TLS config for Trojan: {}",
-                        e
-                    ))
+                    std::io::Error::other(format!("Failed to create TLS config for Trojan: {}", e))
                 })?;
 
                 // Create a watch channel for dynamic TLS config updates
@@ -481,7 +497,10 @@ async fn main() -> TunnelResult<()> {
                                     _ => {}
                                 },
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!("Cert event subscriber lagged by {} messages", n);
+                                    tracing::warn!(
+                                        "Cert event subscriber lagged by {} messages",
+                                        n
+                                    );
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                     tracing::info!(
@@ -518,7 +537,10 @@ async fn main() -> TunnelResult<()> {
             if let Some(ref domain) = config.api_domain {
                 match cert_manager.get_tls_server_config(domain).await {
                     Some(cfg) => {
-                        tracing::info!("API server TLS enabled with ACME certificate for domain: {}", domain);
+                        tracing::info!(
+                            "API server TLS enabled with ACME certificate for domain: {}",
+                            domain
+                        );
                         Some(cfg)
                     }
                     None => {
@@ -527,18 +549,23 @@ async fn main() -> TunnelResult<()> {
                     }
                 }
             } else {
-                tracing::warn!("API TLS enabled but no api_domain configured, API server will run without TLS");
+                tracing::warn!(
+                    "API TLS enabled but no api_domain configured, API server will run without TLS"
+                );
                 None
             }
         } else {
-            tracing::warn!("API TLS enabled but ACME not configured, API server will run without TLS");
+            tracing::warn!(
+                "API TLS enabled but ACME not configured, API server will run without TLS"
+            );
             None
         }
     } else {
         None
     };
     tokio::spawn(async move {
-        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config, api_tls_config).await {
+        if let Err(e) = api::run_api_server(api_addr, api_state, auth_config, api_tls_config).await
+        {
             tracing::error!("API server error: {}", e);
         }
     });

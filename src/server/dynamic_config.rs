@@ -74,10 +74,14 @@ impl DynamicConfig {
             }
             _ => {
                 if server_config.ss_enabled {
-                    if let (Some(port), Some(ref cipher), Some(ref password)) =
-                        (server_config.ss_port, &server_config.ss_cipher, &server_config.ss_password)
-                    {
-                        let _ = db.save_shadowsocks_config(port, cipher, password, true).await;
+                    if let (Some(port), Some(ref cipher), Some(ref password)) = (
+                        server_config.ss_port,
+                        &server_config.ss_cipher,
+                        &server_config.ss_password,
+                    ) {
+                        let _ = db
+                            .save_shadowsocks_config(port, cipher, password, true)
+                            .await;
                         Some(ShadowsocksDynamicConfig {
                             enabled: true,
                             port,
@@ -109,7 +113,14 @@ impl DynamicConfig {
                     if let (Some(port), Some(ref password)) =
                         (server_config.trojan_port, &server_config.trojan_password)
                     {
-                        let _ = db.save_trojan_config(port, password, &server_config.trojan_fallback, true).await;
+                        let _ = db
+                            .save_trojan_config(
+                                port,
+                                password,
+                                &server_config.trojan_fallback,
+                                true,
+                            )
+                            .await;
                         Some(TrojanDynamicConfig {
                             enabled: true,
                             port,

@@ -1,8 +1,8 @@
 //! SNI-based certificate resolver for shared HTTPS listeners.
 
-use std::sync::Arc;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use std::sync::Arc;
 
 use crate::server::acme::CertificateManager;
 
@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn wildcard_for_three_labels() {
-        assert_eq!(wildcard_for("foo.example.com"), Some("*.example.com".to_string()));
+        assert_eq!(
+            wildcard_for("foo.example.com"),
+            Some("*.example.com".to_string())
+        );
     }
 
     #[test]
@@ -82,6 +85,9 @@ mod tests {
     #[test]
     fn wildcard_for_trailing_dot() {
         // 严格串处理：不特殊处理 trailing dot
-        assert_eq!(wildcard_for("foo.example.com."), Some("*.example.com.".to_string()));
+        assert_eq!(
+            wildcard_for("foo.example.com."),
+            Some("*.example.com.".to_string())
+        );
     }
 }

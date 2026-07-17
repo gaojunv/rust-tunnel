@@ -96,8 +96,7 @@ mod e2e_tests {
         // 解析证书验证域名和有效期
         let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
             .expect("Failed to parse cert PEM");
-        let (_, cert) = X509Certificate::from_der(&pem.contents)
-            .expect("Failed to parse cert DER");
+        let (_, cert) = X509Certificate::from_der(&pem.contents).expect("Failed to parse cert DER");
 
         // 验证证书 SAN 包含通配符域名
         let san = cert
@@ -114,7 +113,9 @@ mod e2e_tests {
             })
             .collect();
         assert!(
-            dns_names.iter().any(|n| n == "*.example.com" || n == "example.com"),
+            dns_names
+                .iter()
+                .any(|n| n == "*.example.com" || n == "example.com"),
             "Certificate SAN should contain *.example.com or example.com, got: {:?}",
             dns_names
         );
@@ -147,10 +148,7 @@ mod e2e_tests {
         assert!(account_path.exists(), "account.json should be saved");
 
         // 清理由 TempDir drop 自动处理
-        println!(
-            "✅ ACME DNS-01 e2e test passed for domain: {}",
-            TEST_DOMAIN
-        );
+        println!("✅ ACME DNS-01 e2e test passed for domain: {}", TEST_DOMAIN);
     }
 
     /// 测试阿里云 DNS TXT 记录的创建和删除
@@ -208,7 +206,10 @@ mod e2e_tests {
 
         // 验证 account.json 已保存
         let account_path = std::path::Path::new(&cert_dir).join("account.json");
-        assert!(account_path.exists(), "account.json should be saved after first init");
+        assert!(
+            account_path.exists(),
+            "account.json should be saved after first init"
+        );
 
         // 第二次初始化：从文件恢复账号
         let state2 = AcmeState::new();

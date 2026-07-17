@@ -59,8 +59,7 @@ impl AcmeClient {
         // Create cert directory if it doesn't exist
         let cert_dir = Path::new(&self.cert_dir);
         if !cert_dir.exists() {
-            std::fs::create_dir_all(cert_dir)
-                .context("Failed to create certificate directory")?;
+            std::fs::create_dir_all(cert_dir).context("Failed to create certificate directory")?;
         }
 
         // Try to load existing account credentials
@@ -72,8 +71,8 @@ impl AcmeClient {
                 serde_json::from_str(&data).context("Failed to parse account credentials")?;
 
             // Re-parse credentials for from_credentials since AccountCredentials doesn't implement Clone
-            let creds_for_restore: AccountCredentials =
-                serde_json::from_str(&data).context("Failed to parse account credentials for restore")?;
+            let creds_for_restore: AccountCredentials = serde_json::from_str(&data)
+                .context("Failed to parse account credentials for restore")?;
 
             let account = Account::builder()?
                 .from_credentials(creds_for_restore)
@@ -88,19 +87,18 @@ impl AcmeClient {
             let contact_email = self.email.as_deref().unwrap_or("noreply@example.com");
             let contact_entry = format!("mailto:{contact_email}");
 
-            let (account, credentials) =
-                Account::builder()?
-                    .create(
-                        &instant_acme::NewAccount {
-                            contact: &[&contact_entry],
-                            terms_of_service_agreed: true,
-                            only_return_existing: false,
-                        },
-                        self.server_url.clone(),
-                        None,
-                    )
-                    .await
-                    .context("Failed to register new ACME account")?;
+            let (account, credentials) = Account::builder()?
+                .create(
+                    &instant_acme::NewAccount {
+                        contact: &[&contact_entry],
+                        terms_of_service_agreed: true,
+                        only_return_existing: false,
+                    },
+                    self.server_url.clone(),
+                    None,
+                )
+                .await
+                .context("Failed to register new ACME account")?;
 
             // Save credentials to disk
             let creds_json = serde_json::to_string_pretty(&credentials)
@@ -183,17 +181,17 @@ impl AcmeClient {
             // Find the HTTP-01 challenge
             let mut challenge_handle = auth_handle
                 .challenge(ChallengeType::Http01)
-                .context(format!(
-                    "No HTTP-01 challenge found for domain {}",
-                    domain
-                ))?;
+                .context(format!("No HTTP-01 challenge found for domain {}", domain))?;
 
             // Get the key authorization response
             let key_authorization = challenge_handle.key_authorization();
 
             // Deploy the challenge token so the challenge server can serve it
             self.state
-                .add_challenge(challenge_handle.token.clone(), key_authorization.as_str().to_string())
+                .add_challenge(
+                    challenge_handle.token.clone(),
+                    key_authorization.as_str().to_string(),
+                )
                 .await;
 
             info!(
@@ -280,8 +278,7 @@ impl AcmeClient {
         };
 
         // Generate CSR using rcgen
-        let key_pair =
-            rcgen::KeyPair::generate().context("Failed to generate key pair")?;
+        let key_pair = rcgen::KeyPair::generate().context("Failed to generate key pair")?;
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
             .map_err(|e| anyhow::anyhow!("Failed to create certificate params: {}", e))?;
         params.distinguished_name = rcgen::DistinguishedName::new();
@@ -308,8 +305,8 @@ impl AcmeClient {
             .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
-        let expires_at = parse_certificate_expiry(&cert_chain)
-            .context("Failed to parse issued certificate")?;
+        let expires_at =
+            parse_certificate_expiry(&cert_chain).context("Failed to parse issued certificate")?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = split_certificate_chain(&cert_chain);
@@ -453,10 +450,7 @@ impl AcmeClient {
             // Find the DNS-01 challenge
             let mut challenge_handle = auth_handle
                 .challenge(ChallengeType::Dns01)
-                .context(format!(
-                    "No DNS-01 challenge found for domain {}",
-                    domain
-                ))?;
+                .context(format!("No DNS-01 challenge found for domain {}", domain))?;
 
             // Get the key authorization
             let key_authorization = challenge_handle.key_authorization();
@@ -604,8 +598,8 @@ impl AcmeClient {
             .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
-        let expires_at = parse_certificate_expiry(&cert_chain)
-            .context("Failed to parse issued certificate")?;
+        let expires_at =
+            parse_certificate_expiry(&cert_chain).context("Failed to parse issued certificate")?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = split_certificate_chain(&cert_chain);
@@ -771,8 +765,7 @@ pub fn start_renewal_task(
     days_before_expiry: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(check_interval_hours * 3600));
+        let mut interval = tokio::time::interval(Duration::from_secs(check_interval_hours * 3600));
 
         loop {
             interval.tick().await;
@@ -788,10 +781,7 @@ pub fn start_renewal_task(
                         for cert in certs {
                             info!("Renewing certificate for domain: {}", cert.domain);
                             if let Err(e) = client.renew_certificate(&cert.domain).await {
-                                error!(
-                                    "Failed to renew certificate for {}: {}",
-                                    cert.domain, e
-                                );
+                                error!("Failed to renew certificate for {}: {}", cert.domain, e);
                             }
                         }
                     }
@@ -1004,12 +994,10 @@ mod tests {
         // Should fail because account is not initialized
         let result = client.request_certificate("example.com").await;
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("ACME account not initialized")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("ACME account not initialized"));
     }
 
     #[tokio::test]
@@ -1026,16 +1014,7 @@ mod tests {
         // Insert a pending certificate directly to test persistence
         if let Some(database) = client.state.db() {
             database
-                .save_acme_certificate(
-                    "example.com",
-                    "pending",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    true,
-                )
+                .save_acme_certificate("example.com", "pending", None, None, None, None, None, true)
                 .await
                 .unwrap();
         }
@@ -1081,10 +1060,7 @@ mod tests {
         }
 
         // Requesting the same domain should return the existing active cert
-        let metadata = client
-            .request_certificate("example.com")
-            .await
-            .unwrap();
+        let metadata = client.request_certificate("example.com").await.unwrap();
         assert_eq!(metadata.domain, "example.com");
         assert_eq!(metadata.status, CertificateStatus::Active);
     }
@@ -1213,16 +1189,7 @@ mod tests {
         // Create a certificate record
         if let Some(database) = client.state.db() {
             database
-                .save_acme_certificate(
-                    "example.com",
-                    "active",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    true,
-                )
+                .save_acme_certificate("example.com", "active", None, None, None, None, None, true)
                 .await
                 .unwrap();
         }

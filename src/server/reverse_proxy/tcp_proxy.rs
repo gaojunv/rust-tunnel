@@ -41,9 +41,7 @@ impl TcpProxy {
         let tls_acceptor = if let Some(tls_cfg) = tls_config {
             let domain = tls_cfg.domain.clone().or_else(|| {
                 let rules = self.state.rules.blocking_lock();
-                rules
-                    .get(&rule_id)
-                    .and_then(|r| r.domains.first().cloned())
+                rules.get(&rule_id).and_then(|r| r.domains.first().cloned())
             });
 
             match domain {
@@ -262,11 +260,10 @@ impl UdpProxy {
                         state.increment_connections(&rule_id_clone).await;
 
                         // Forward to backend
-                        if let Ok(backend_socket) =
-                            tokio::net::UdpSocket::bind("0.0.0.0:0").await
-                        {
+                        if let Ok(backend_socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                             if let Ok(backend_addr) = backend_addr.parse::<SocketAddr>() {
-                                if let Ok(_) = backend_socket.send_to(&buf[..len], backend_addr).await
+                                if let Ok(_) =
+                                    backend_socket.send_to(&buf[..len], backend_addr).await
                                 {
                                     // Wait for response
                                     let mut response_buf = vec![0u8; 65535];

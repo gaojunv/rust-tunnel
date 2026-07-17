@@ -18,9 +18,9 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::common::DnsRecord;
+use crate::server::acme::CertificateProvider;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
-use crate::server::acme::CertificateProvider;
 use crate::server::db::Database;
 use crate::server::reverse_proxy::{ProxyRule, ProxyStats};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -562,13 +562,19 @@ mod tests {
         assert!(acme_config_guard.is_some());
         let acme_config = acme_config_guard.as_ref().unwrap();
         assert_eq!(acme_config.enabled, true);
-        assert_eq!(acme_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            acme_config.server_url,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
         drop(acme_config_guard);
 
         // Verify ACME full config is updated
         let full_config = server_state.acme_full_config.read().await;
         assert_eq!(full_config.enabled, true);
-        assert_eq!(full_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            full_config.server_url,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
         assert_eq!(full_config.email, Some("test@example.com".to_string()));
     }
 
@@ -648,7 +654,10 @@ mod tests {
         // Verify ACME is now enabled in the config
         let full_config = server_state.acme_full_config.read().await;
         assert_eq!(full_config.enabled, true);
-        assert_eq!(full_config.server_url, "https://acme-staging-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            full_config.server_url,
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+        );
 
         // Verify ACME client is initialized
         assert!(server_state.acme_client.read().await.is_some());
@@ -1196,11 +1205,7 @@ async fn update_shadowsocks_config(
     let port = match payload["port"].as_u64() {
         Some(p) if p > 0 && p <= 65535 => p as u16,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Invalid or missing port",
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, "Invalid or missing port").into_response();
         }
     };
     let cipher = match payload["cipher"].as_str() {
@@ -1222,7 +1227,10 @@ async fn update_shadowsocks_config(
 
     // Save to DB
     if let Some(db) = state.server_state.db() {
-        if let Err(e) = db.save_shadowsocks_config(port, cipher, password, enabled).await {
+        if let Err(e) = db
+            .save_shadowsocks_config(port, cipher, password, enabled)
+            .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("DB error: {}", e),
@@ -1259,15 +1267,14 @@ async fn update_shadowsocks_config(
             let ss_cipher = cipher.to_string();
             let ss_password = password.to_string();
             tokio::spawn(async move {
-                if let Err(e) =
-                    crate::server::listener::start_shadowsocks_listener_with_abort(
-                        state_clone,
-                        ss_port,
-                        ss_cipher,
-                        ss_password,
-                        abort_rx,
-                    )
-                    .await
+                if let Err(e) = crate::server::listener::start_shadowsocks_listener_with_abort(
+                    state_clone,
+                    ss_port,
+                    ss_cipher,
+                    ss_password,
+                    abort_rx,
+                )
+                .await
                 {
                     tracing::error!("SS listener error: {}", e);
                 }
@@ -1362,11 +1369,7 @@ async fn update_trojan_config(
     let port = match payload["port"].as_u64() {
         Some(p) if p > 0 && p <= 65535 => p as u16,
         _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Invalid or missing port",
-            )
-                .into_response();
+            return (StatusCode::BAD_REQUEST, "Invalid or missing port").into_response();
         }
     };
     let password = match payload["password"].as_str() {
@@ -1379,7 +1382,10 @@ async fn update_trojan_config(
 
     // Save to DB
     if let Some(db) = state.server_state.db() {
-        if let Err(e) = db.save_trojan_config(port, password, fallback, enabled).await {
+        if let Err(e) = db
+            .save_trojan_config(port, password, fallback, enabled)
+            .await
+        {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("DB error: {}", e),
@@ -1410,10 +1416,7 @@ async fn update_trojan_config(
         if enabled {
             // Build TLS config channel from cert_manager
             let tls_config = if let Some(ref cert_manager) = state.server_state.cert_manager {
-                match cert_manager
-                    .get_tls_server_config("default")
-                    .await
-                {
+                match cert_manager.get_tls_server_config("default").await {
                     Some(config) => config,
                     None => {
                         return (
@@ -1439,12 +1442,8 @@ async fn update_trojan_config(
                 let cert_manager_clone = cert_manager.clone();
                 tokio::spawn(async move {
                     while let Ok(event) = cert_rx.recv().await {
-                        if let crate::server::acme::manager::CertEvent::Renewed {
-                            ref domain,
-                        }
-                        | crate::server::acme::manager::CertEvent::Issued {
-                            ref domain,
-                        } = event
+                        if let crate::server::acme::manager::CertEvent::Renewed { ref domain }
+                        | crate::server::acme::manager::CertEvent::Issued { ref domain } = event
                         {
                             if let Some(new_config) =
                                 cert_manager_clone.get_tls_server_config(domain).await
@@ -1924,7 +1923,9 @@ async fn put_logs_level(
 
     // Persist to DB
     if let Some(db) = state.server_state.db() {
-        let _ = db.save_server_setting("log_level", &body.level.to_lowercase()).await;
+        let _ = db
+            .save_server_setting("log_level", &body.level.to_lowercase())
+            .await;
     }
 
     // Update dynamic config
@@ -1994,7 +1995,8 @@ async fn create_proxy_rule(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -2016,7 +2018,8 @@ async fn create_proxy_rule(
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,
         state.server_state.proxy_state.cert_manager(),
-    ).await;
+    )
+    .await;
     rule.cert_status = Some(cert_status.clone());
 
     if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
@@ -2024,7 +2027,8 @@ async fn create_proxy_rule(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     {
@@ -2040,9 +2044,18 @@ async fn create_proxy_rule(
             .await
         {
             tracing::warn!("Reconcile failed on create, rolling back: {}", e);
-            let _ = state.server_state.proxy_state.rules.lock().await.remove(&id);
+            let _ = state
+                .server_state
+                .proxy_state
+                .rules
+                .lock()
+                .await
+                .remove(&id);
             if let Err(del_err) = state.server_state.proxy_state.delete_rule(&id).await {
-                tracing::error!("Compensating delete failed after reconcile error: {}", del_err);
+                tracing::error!(
+                    "Compensating delete failed after reconcile error: {}",
+                    del_err
+                );
             }
             return (
                 StatusCode::CONFLICT,
@@ -2050,7 +2063,8 @@ async fn create_proxy_rule(
                     "error": format!("{}", e),
                     "conflicts": conflicts_from_error(&e),
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
 
@@ -2067,17 +2081,31 @@ async fn create_proxy_rule(
         }
     }
 
-    (StatusCode::CREATED, Json(serde_json::json!({ "rule": rule }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "rule": rule })),
+    )
+        .into_response()
 }
 
-fn conflicts_from_error(e: &crate::server::reverse_proxy::error::ReconcileError) -> Vec<serde_json::Value> {
+fn conflicts_from_error(
+    e: &crate::server::reverse_proxy::error::ReconcileError,
+) -> Vec<serde_json::Value> {
     use crate::server::reverse_proxy::error::ReconcileError as E;
     match e {
-        E::DomainConflict { domain, other_rule_id, .. } => vec![serde_json::json!({
+        E::DomainConflict {
+            domain,
+            other_rule_id,
+            ..
+        } => vec![serde_json::json!({
             "rule_id": other_rule_id,
             "reason": format!("domain {} already claimed", domain),
         })],
-        E::TlsMismatch { existing_tls, new_tls, .. } => vec![serde_json::json!({
+        E::TlsMismatch {
+            existing_tls,
+            new_tls,
+            ..
+        } => vec![serde_json::json!({
             "reason": format!("tls mismatch: existing={} new={}", existing_tls, new_tls),
         })],
         E::BindFailed { source, .. } => vec![serde_json::json!({
@@ -2103,7 +2131,8 @@ async fn update_proxy_rule(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -2117,7 +2146,8 @@ async fn update_proxy_rule(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "Rule not found" })),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -2137,7 +2167,8 @@ async fn update_proxy_rule(
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,
         state.server_state.proxy_state.cert_manager(),
-    ).await;
+    )
+    .await;
     rule.cert_status = Some(cert_status.clone());
 
     if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
@@ -2145,7 +2176,8 @@ async fn update_proxy_rule(
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "Failed to save proxy rule" })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     {
@@ -2170,8 +2202,9 @@ async fn update_proxy_rule(
             }
             let _ = state.server_state.proxy_state.save_rule(&previous).await;
 
-            let ports: std::collections::HashSet<&str> =
-                [old_listen.as_str(), new_listen.as_str()].into_iter().collect();
+            let ports: std::collections::HashSet<&str> = [old_listen.as_str(), new_listen.as_str()]
+                .into_iter()
+                .collect();
             for port in ports {
                 if let Err(rb) = state
                     .server_state
@@ -2188,10 +2221,13 @@ async fn update_proxy_rule(
                     "error": format!("{}", e),
                     "conflicts": conflicts_from_error(&e),
                 })),
-            ).into_response();
+            )
+                .into_response();
         }
     }
-    if previous.rule_type == crate::server::reverse_proxy::RuleType::Http && old_listen != new_listen {
+    if previous.rule_type == crate::server::reverse_proxy::RuleType::Http
+        && old_listen != new_listen
+    {
         if let Err(e) = state
             .server_state
             .proxy_state
@@ -2232,7 +2268,8 @@ async fn delete_proxy_rule(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "Rule not found" })),
-            ).into_response();
+            )
+                .into_response();
         }
         Some(r) => r,
     };
@@ -2291,7 +2328,12 @@ async fn get_proxy_stats(State(state): State<ApiState>) -> impl IntoResponse {
     let total_rules = rules.len() as i64;
     let active_rules = rules.values().filter(|r| r.enabled).count() as i64;
 
-    let connection_counts = state.server_state.proxy_state.connection_counts.lock().await;
+    let connection_counts = state
+        .server_state
+        .proxy_state
+        .connection_counts
+        .lock()
+        .await;
     let active_connections: u64 = connection_counts.values().sum();
 
     Json(ProxyStats {
@@ -2361,11 +2403,9 @@ async fn request_acme_certificate(
                 Some(config) => {
                     let solver: std::sync::Arc<dyn crate::server::acme::dns::DnsChallengeSolver> =
                         match config.provider {
-                            crate::server::acme::dns::DnsProvider::Aliyun => {
-                                std::sync::Arc::new(
-                                    crate::server::acme::dns::aliyun::AliyunDnsSolver::new(config),
-                                )
-                            }
+                            crate::server::acme::dns::DnsProvider::Aliyun => std::sync::Arc::new(
+                                crate::server::acme::dns::aliyun::AliyunDnsSolver::new(config),
+                            ),
                             crate::server::acme::dns::DnsProvider::Cloudflare => {
                                 std::sync::Arc::new(
                                     crate::server::acme::dns::cloudflare::CloudflareDnsSolver::new(
@@ -2380,11 +2420,9 @@ async fn request_acme_certificate(
                                     ),
                                 )
                             }
-                            crate::server::acme::dns::DnsProvider::Custom => {
-                                std::sync::Arc::new(
-                                    crate::server::acme::dns::custom::CustomDnsSolver::new(config),
-                                )
-                            }
+                            crate::server::acme::dns::DnsProvider::Custom => std::sync::Arc::new(
+                                crate::server::acme::dns::custom::CustomDnsSolver::new(config),
+                            ),
                         };
                     client.request_certificate_with_dns(&domain, solver).await
                 }
@@ -2606,14 +2644,12 @@ async fn update_acme_config(
         tracing::info!("Initializing ACME client...");
         if let Some(db) = state.server_state.get_db() {
             let acme_state = crate::server::acme::AcmeState::with_db(db.clone());
-            let client = std::sync::Arc::new(
-                crate::server::acme::client::AcmeClient::new(
-                    acme_state,
-                    acme_server_url.clone(),
-                    acme_cert_dir.clone(),
-                    acme_email,
-                ),
-            );
+            let client = std::sync::Arc::new(crate::server::acme::client::AcmeClient::new(
+                acme_state,
+                acme_server_url.clone(),
+                acme_cert_dir.clone(),
+                acme_email,
+            ));
 
             if let Err(e) = client.initialize().await {
                 tracing::error!("Failed to initialize ACME client: {}", e);
@@ -2627,7 +2663,10 @@ async fn update_acme_config(
                 cert_dir: acme_cert_dir,
             };
 
-            state.server_state.set_acme_client(client, acme_config_info).await;
+            state
+                .server_state
+                .set_acme_client(client, acme_config_info)
+                .await;
             tracing::info!("ACME client set on server state");
         } else {
             tracing::error!("Cannot initialize ACME client: no database available");
@@ -2740,15 +2779,9 @@ async fn update_reverse_proxy_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let max_conn = payload["max_connections"]
-        .as_u64()
-        .unwrap_or(10000) as u32;
-    let timeout = payload["connection_timeout_secs"]
-        .as_u64()
-        .unwrap_or(30);
-    let buffer = payload["buffer_size"]
-        .as_u64()
-        .unwrap_or(8192) as usize;
+    let max_conn = payload["max_connections"].as_u64().unwrap_or(10000) as u32;
+    let timeout = payload["connection_timeout_secs"].as_u64().unwrap_or(30);
+    let buffer = payload["buffer_size"].as_u64().unwrap_or(8192) as usize;
 
     // Save to DB
     if let Some(db) = state.server_state.db() {
@@ -2788,18 +2821,11 @@ async fn update_dns_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let tunnel_domain = payload["tunnel_domain"]
-        .as_str()
-        .unwrap_or("tunnel.local");
-    let mesh_domain = payload["mesh_domain"]
-        .as_str()
-        .unwrap_or("mesh.local");
+    let tunnel_domain = payload["tunnel_domain"].as_str().unwrap_or("tunnel.local");
+    let mesh_domain = payload["mesh_domain"].as_str().unwrap_or("mesh.local");
 
     if let Some(db) = state.server_state.db() {
-        if let Err(e) = db
-            .save_dns_config(tunnel_domain, mesh_domain)
-            .await
-        {
+        if let Err(e) = db.save_dns_config(tunnel_domain, mesh_domain).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("DB error: {}", e),
@@ -2904,10 +2930,7 @@ pub async fn run_api_server(
             "/api/acme/config",
             get(get_acme_config).put(update_acme_config),
         )
-        .route(
-            "/api/acme/certificates",
-            get(list_acme_certificates),
-        )
+        .route("/api/acme/certificates", get(list_acme_certificates))
         .route(
             "/api/acme/certificates/:domain",
             get(get_acme_certificate)
@@ -2975,8 +2998,8 @@ pub async fn run_api_server(
             };
 
             // Start HTTP redirect server on port 80
-            let http_app = axum::Router::new()
-                .fallback(|req: axum::http::Request<Body>| async move {
+            let http_app =
+                axum::Router::new().fallback(|req: axum::http::Request<Body>| async move {
                     let uri = req.uri();
                     let host = uri.host().unwrap_or("localhost").to_string();
                     let path = format!(
@@ -3035,8 +3058,7 @@ pub async fn run_api_server(
                     };
 
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
-                    let service =
-                        hyper_util::service::TowerToHyperService::new(app.into_service());
+                    let service = hyper_util::service::TowerToHyperService::new(app.into_service());
 
                     if let Err(e) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)

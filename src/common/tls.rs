@@ -46,7 +46,8 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
 
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .map_err(|e| format!("Failed to generate key pair: {}", e))?;
-    let cert = params.self_signed(&key_pair)
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| format!("Failed to generate certificate: {}", e))?;
 
     Ok((cert, key_pair))

@@ -49,12 +49,13 @@ impl SharedListener {
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e),
             }
         })?;
-        let listener = TcpListener::bind(addr).await.map_err(|source| {
-            ReconcileError::BindFailed {
-                listen_addr: listen_addr.clone(),
-                source,
-            }
-        })?;
+        let listener =
+            TcpListener::bind(addr)
+                .await
+                .map_err(|source| ReconcileError::BindFailed {
+                    listen_addr: listen_addr.clone(),
+                    source,
+                })?;
 
         let route_table = Arc::new(ArcSwap::from_pointee(initial_table));
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -238,10 +239,7 @@ pub fn validate_rules_for_port(
 
 impl ReverseProxyState {
     /// Acquire the per-port reconcile lock.
-    async fn acquire_reconcile_lock(
-        &self,
-        listen_addr: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn acquire_reconcile_lock(&self, listen_addr: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let m = {
             let mut map = self.reconcile_locks.lock().unwrap();
             map.entry(listen_addr.to_string())
@@ -253,21 +251,14 @@ impl ReverseProxyState {
 
     /// Reconcile the shared HTTP listener for `listen_addr` with the current
     /// set of enabled HTTP rules. Idempotent.
-    pub async fn reconcile_http_listener(
-        &self,
-        listen_addr: &str,
-    ) -> Result<(), ReconcileError> {
+    pub async fn reconcile_http_listener(&self, listen_addr: &str) -> Result<(), ReconcileError> {
         let _guard = self.acquire_reconcile_lock(listen_addr).await;
 
         let rules_snapshot: Vec<ProxyRule> = {
             let rules = self.rules.lock().await;
             rules
                 .values()
-                .filter(|r| {
-                    r.enabled
-                        && r.rule_type == RuleType::Http
-                        && r.listen == listen_addr
-                })
+                .filter(|r| r.enabled && r.rule_type == RuleType::Http && r.listen == listen_addr)
                 .cloned()
                 .collect()
         };
@@ -546,11 +537,19 @@ mod tests {
 
         state.rules.lock().await.insert("r1".into(), rule);
         state.reconcile_http_listener(&listen_addr).await.unwrap();
-        assert!(state.shared_listeners.lock().await.contains_key(&listen_addr));
+        assert!(state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
 
         // Remove rule and reconcile again — listener should be removed.
         state.rules.lock().await.remove("r1");
         state.reconcile_http_listener(&listen_addr).await.unwrap();
-        assert!(!state.shared_listeners.lock().await.contains_key(&listen_addr));
+        assert!(!state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
     }
 }

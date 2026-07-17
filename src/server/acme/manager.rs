@@ -124,10 +124,7 @@ impl CertificateManager {
                     entries.push((domain.clone(), cached));
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to load certificate for domain {}: {}",
-                        domain, e
-                    );
+                    warn!("Failed to load certificate for domain {}: {}", domain, e);
                 }
             }
         }
@@ -196,8 +193,8 @@ impl CertificateManager {
         let domain = domain.to_ascii_lowercase();
         let tls_config = create_server_config_from_entry(&entry)
             .context("Failed to create TLS server config")?;
-        let certified_key = super::provider::build_certified_key(&entry)
-            .context("Failed to build CertifiedKey")?;
+        let certified_key =
+            super::provider::build_certified_key(&entry).context("Failed to build CertifiedKey")?;
 
         // Save to disk
         self.storage.save_certificate(
@@ -317,8 +314,7 @@ impl CertificateManager {
         days_before_expiry: u64,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(interval_hours * 3600));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_hours * 3600));
 
             loop {
                 interval.tick().await;
@@ -331,11 +327,9 @@ impl CertificateManager {
 
                     cache
                         .iter()
-                        .filter_map(|(domain, cached)| {
-                            match cached.entry.expires_at {
-                                Some(expires) if expires <= threshold => Some(domain.clone()),
-                                _ => None,
-                            }
+                        .filter_map(|(domain, cached)| match cached.entry.expires_at {
+                            Some(expires) if expires <= threshold => Some(domain.clone()),
+                            _ => None,
                         })
                         .collect()
                 };
@@ -390,10 +384,7 @@ impl CertificateManager {
     /// Returns `Some(CertCoverage::Exact)` if an exact-match certificate exists,
     /// `Some(CertCoverage::Wildcard(pattern))` if a one-level wildcard covers it,
     /// or `None` otherwise. Comparison is case-insensitive.
-    pub async fn find_covering_cert(
-        &self,
-        domain: &str,
-    ) -> Option<super::provider::CertCoverage> {
+    pub async fn find_covering_cert(&self, domain: &str) -> Option<super::provider::CertCoverage> {
         let domain = domain.to_ascii_lowercase();
         let cache = self.cache.read().await;
         if cache.contains_key(&domain) {
@@ -568,9 +559,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_from_storage_empty_dir() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let manager = CertificateManager::new(
-            temp_dir.path().to_str().unwrap(),
-        );
+        let manager = CertificateManager::new(temp_dir.path().to_str().unwrap());
 
         manager.load_from_storage().await.unwrap();
 
@@ -587,12 +576,7 @@ mod tests {
         let storage = CertificateStorage::new(&cert_dir);
         storage.initialize().unwrap();
         storage
-            .save_certificate(
-                "bad.example.com",
-                "not-a-cert",
-                "not-a-key",
-                None,
-            )
+            .save_certificate("bad.example.com", "not-a-cert", "not-a-key", None)
             .unwrap();
 
         let manager = CertificateManager::new(&cert_dir);
@@ -666,7 +650,10 @@ mod tests {
             expires_at: None,
             source: CertSource::Manual,
         };
-        manager.add_certificate("foo.example.com", entry).await.unwrap();
+        manager
+            .add_certificate("foo.example.com", entry)
+            .await
+            .unwrap();
 
         let cov = manager.find_covering_cert("foo.example.com").await;
         assert_eq!(cov, Some(super::super::provider::CertCoverage::Exact));
@@ -685,7 +672,10 @@ mod tests {
             expires_at: None,
             source: CertSource::Manual,
         };
-        manager.add_certificate("*.example.com", entry).await.unwrap();
+        manager
+            .add_certificate("*.example.com", entry)
+            .await
+            .unwrap();
 
         let cov = manager.find_covering_cert("api.example.com").await;
         assert_eq!(
@@ -700,7 +690,10 @@ mod tests {
     async fn test_find_covering_cert_none() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let manager = Arc::new(CertificateManager::new(temp_dir.path().to_str().unwrap()));
-        assert!(manager.find_covering_cert("nope.example.com").await.is_none());
+        assert!(manager
+            .find_covering_cert("nope.example.com")
+            .await
+            .is_none());
     }
 
     #[test]

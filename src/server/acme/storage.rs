@@ -39,17 +39,14 @@ impl CertificateStorage {
     ) -> Result<()> {
         let dir = self.domain_dir(domain);
         if !dir.exists() {
-            std::fs::create_dir_all(&dir)
-                .context("Failed to create domain directory")?;
+            std::fs::create_dir_all(&dir).context("Failed to create domain directory")?;
         }
 
         // Write certificate
-        std::fs::write(dir.join("cert.pem"), cert_pem)
-            .context("Failed to write certificate")?;
+        std::fs::write(dir.join("cert.pem"), cert_pem).context("Failed to write certificate")?;
 
         // Write private key
-        std::fs::write(dir.join("key.pem"), key_pem)
-            .context("Failed to write private key")?;
+        std::fs::write(dir.join("key.pem"), key_pem).context("Failed to write private key")?;
 
         // Write chain if provided
         if let Some(chain) = chain_pem {
@@ -65,8 +62,7 @@ impl CertificateStorage {
     pub fn load_certificate(&self, domain: &str) -> Result<Option<String>> {
         let cert_path = self.domain_dir(domain).join("cert.pem");
         if cert_path.exists() {
-            let cert = std::fs::read_to_string(&cert_path)
-                .context("Failed to read certificate")?;
+            let cert = std::fs::read_to_string(&cert_path).context("Failed to read certificate")?;
             Ok(Some(cert))
         } else {
             Ok(None)
@@ -77,8 +73,7 @@ impl CertificateStorage {
     pub fn load_private_key(&self, domain: &str) -> Result<Option<String>> {
         let key_path = self.domain_dir(domain).join("key.pem");
         if key_path.exists() {
-            let key = std::fs::read_to_string(&key_path)
-                .context("Failed to read private key")?;
+            let key = std::fs::read_to_string(&key_path).context("Failed to read private key")?;
             Ok(Some(key))
         } else {
             Ok(None)
@@ -89,8 +84,8 @@ impl CertificateStorage {
     pub fn load_chain(&self, domain: &str) -> Result<Option<String>> {
         let chain_path = self.domain_dir(domain).join("chain.pem");
         if chain_path.exists() {
-            let chain = std::fs::read_to_string(&chain_path)
-                .context("Failed to read certificate chain")?;
+            let chain =
+                std::fs::read_to_string(&chain_path).context("Failed to read certificate chain")?;
             Ok(Some(chain))
         } else {
             Ok(None)
@@ -101,8 +96,7 @@ impl CertificateStorage {
     pub fn delete_certificate(&self, domain: &str) -> Result<()> {
         let dir = self.domain_dir(domain);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .context("Failed to delete certificate directory")?;
+            std::fs::remove_dir_all(&dir).context("Failed to delete certificate directory")?;
             info!("Deleted certificate files for domain: {}", domain);
         }
         Ok(())
@@ -147,7 +141,9 @@ mod tests {
         let cert = "-----BEGIN CERTIFICATE-----\ntest cert\n-----END CERTIFICATE-----";
         let key = "-----BEGIN PRIVATE KEY-----\ntest key\n-----END PRIVATE KEY-----";
 
-        storage.save_certificate("example.com", cert, key, None).unwrap();
+        storage
+            .save_certificate("example.com", cert, key, None)
+            .unwrap();
 
         let loaded_cert = storage.load_certificate("example.com").unwrap();
         assert!(loaded_cert.is_some());
@@ -166,7 +162,9 @@ mod tests {
         let cert = "-----BEGIN CERTIFICATE-----\ntest cert\n-----END CERTIFICATE-----";
         let key = "-----BEGIN PRIVATE KEY-----\ntest key\n-----END PRIVATE KEY-----";
 
-        storage.save_certificate("example.com", cert, key, None).unwrap();
+        storage
+            .save_certificate("example.com", cert, key, None)
+            .unwrap();
         assert!(storage.has_certificate("example.com"));
 
         storage.delete_certificate("example.com").unwrap();
@@ -181,8 +179,12 @@ mod tests {
         let cert = "-----BEGIN CERTIFICATE-----\ntest cert\n-----END CERTIFICATE-----";
         let key = "-----BEGIN PRIVATE KEY-----\ntest key\n-----END PRIVATE KEY-----";
 
-        storage.save_certificate("example.com", cert, key, None).unwrap();
-        storage.save_certificate("test.com", cert, key, None).unwrap();
+        storage
+            .save_certificate("example.com", cert, key, None)
+            .unwrap();
+        storage
+            .save_certificate("test.com", cert, key, None)
+            .unwrap();
 
         let domains = storage.list_domains().unwrap();
         assert_eq!(domains.len(), 2);

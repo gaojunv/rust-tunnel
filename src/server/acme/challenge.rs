@@ -27,10 +27,7 @@ impl ChallengeServer {
         let state = self.state.clone();
 
         let app = Router::new()
-            .route(
-                "/.well-known/acme-challenge/{token}",
-                get(handle_challenge),
-            )
+            .route("/.well-known/acme-challenge/{token}", get(handle_challenge))
             .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));

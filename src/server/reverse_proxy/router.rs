@@ -142,11 +142,7 @@ impl RouteTable {
     }
 
     /// Select a backend using the configured load balancing algorithm
-    async fn select_backend<'a>(
-        &self,
-        route_key: &str,
-        route: &'a Route,
-    ) -> Option<&'a Backend> {
+    async fn select_backend<'a>(&self, route_key: &str, route: &'a Route) -> Option<&'a Backend> {
         if route.backends.is_empty() {
             return None;
         }
@@ -409,7 +405,10 @@ mod tests {
         table.add_rule(rule);
 
         assert!(table.match_http_request("example.com", "/").await.is_some());
-        assert!(table.match_http_request("www.example.com", "/").await.is_some());
+        assert!(table
+            .match_http_request("www.example.com", "/")
+            .await
+            .is_some());
         assert!(table.match_http_request("other.com", "/").await.is_none());
     }
 }
