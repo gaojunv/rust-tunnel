@@ -190,7 +190,7 @@ async fn handle_one_connection(
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
             if let Err(e) =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, service)
+                    .serve_connection_with_upgrades(io, service)
                     .await
             {
                 debug!("HTTPS connection error: {}", e);
@@ -201,7 +201,7 @@ async fn handle_one_connection(
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
             if let Err(e) =
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, service)
+                    .serve_connection_with_upgrades(io, service)
                     .await
             {
                 debug!("HTTP connection error: {}", e);
