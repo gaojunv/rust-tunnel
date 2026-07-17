@@ -4,7 +4,7 @@
 //! a boxed-body request to a backend and returns the raw hyper response.
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -16,7 +16,7 @@ use std::time::Duration;
 /// Both hyper request bodies and axum request bodies are converted to this
 /// boxed type before hitting the upstream client so all four client instances
 /// share one concrete `Body` type.
-pub type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+pub type ProxyBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
