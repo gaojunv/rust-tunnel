@@ -1527,7 +1527,7 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 if let Some(ref log_store) = state.log_store {
                     // Find hostname from first registered port
                     let hostname = if let Some(&port) = registered_ports.first() {
-                        state.get_client(port).await.map(|c| c.hostname).flatten()
+                        state.get_client(port).await.and_then(|c| c.hostname)
                     } else {
                         None
                     };
