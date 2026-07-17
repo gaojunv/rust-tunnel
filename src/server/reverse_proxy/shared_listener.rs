@@ -179,11 +179,20 @@ async fn handle_one_connection(
                     return;
                 }
             };
+            let alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned());
+            debug!(peer = %_peer, alpn = ?alpn, "tls handshake ok");
+
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(io, service)
+            .await
             {
                 debug!("HTTPS connection error: {}", e);
             }
@@ -191,9 +200,11 @@ async fn handle_one_connection(
         None => {
             let io = hyper_util::rt::TokioIo::new(stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
+            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection(io, service)
+            .await
             {
                 debug!("HTTP connection error: {}", e);
             }
