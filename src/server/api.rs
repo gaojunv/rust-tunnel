@@ -561,7 +561,7 @@ mod tests {
         let acme_config_guard = server_state.acme_config.read().await;
         assert!(acme_config_guard.is_some());
         let acme_config = acme_config_guard.as_ref().unwrap();
-        assert_eq!(acme_config.enabled, true);
+        assert!(acme_config.enabled);
         assert_eq!(
             acme_config.server_url,
             "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -570,7 +570,7 @@ mod tests {
 
         // Verify ACME full config is updated
         let full_config = server_state.acme_full_config.read().await;
-        assert_eq!(full_config.enabled, true);
+        assert!(full_config.enabled);
         assert_eq!(
             full_config.server_url,
             "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -616,7 +616,7 @@ mod tests {
 
         // Verify ACME full config is updated
         let full_config = server_state.acme_full_config.read().await;
-        assert_eq!(full_config.enabled, false);
+        assert!(!full_config.enabled);
     }
 
     #[tokio::test]
@@ -635,7 +635,7 @@ mod tests {
         // Initial status should show ACME disabled
         let _ = get_acme_status(State(state.clone())).await;
         let full_config = server_state.acme_full_config.read().await;
-        assert_eq!(full_config.enabled, false);
+        assert!(!full_config.enabled);
         drop(full_config);
 
         // Enable ACME
@@ -653,7 +653,7 @@ mod tests {
 
         // Verify ACME is now enabled in the config
         let full_config = server_state.acme_full_config.read().await;
-        assert_eq!(full_config.enabled, true);
+        assert!(full_config.enabled);
         assert_eq!(
             full_config.server_url,
             "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -2993,7 +2993,7 @@ pub async fn run_api_server(
                 if parts.len() == 2 {
                     format!("{}:80", parts[0])
                 } else {
-                    format!("0.0.0.0:80")
+                    "0.0.0.0:80".to_string()
                 }
             };
 

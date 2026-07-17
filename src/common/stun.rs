@@ -85,18 +85,14 @@ pub fn parse_binding_response(data: &[u8], expected_tid: &[u8; 12]) -> Option<St
         }
 
         match attr_type {
-            ATTR_XOR_MAPPED_ADDRESS => {
-                if attr_len >= 8 {
-                    if let Some(addr) = parse_xor_mapped_address(&data[pos..pos + attr_len]) {
-                        mapped_address = Some(addr);
-                    }
+            ATTR_XOR_MAPPED_ADDRESS if attr_len >= 8 => {
+                if let Some(addr) = parse_xor_mapped_address(&data[pos..pos + attr_len]) {
+                    mapped_address = Some(addr);
                 }
             }
-            ATTR_MAPPED_ADDRESS => {
-                if mapped_address.is_none() && attr_len >= 8 {
-                    if let Some(addr) = parse_mapped_address(&data[pos..pos + attr_len]) {
-                        mapped_address = Some(addr);
-                    }
+            ATTR_MAPPED_ADDRESS if mapped_address.is_none() && attr_len >= 8 => {
+                if let Some(addr) = parse_mapped_address(&data[pos..pos + attr_len]) {
+                    mapped_address = Some(addr);
                 }
             }
             _ => {}

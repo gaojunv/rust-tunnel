@@ -112,7 +112,7 @@ async fn start_trojan_server(
     tempfile::TempDir,
 ) {
     let (server_config, tmp_dir) = generate_test_tls_config();
-    let (tx, rx) = tokio::sync::watch::channel(server_config);
+    let (_tx, rx) = tokio::sync::watch::channel(server_config);
     let password = password.to_string();
     let fallback = fallback.to_string();
 

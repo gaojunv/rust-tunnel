@@ -13,6 +13,12 @@ pub struct MeshRelay {
     tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
 }
 
+impl Default for MeshRelay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MeshRelay {
     pub fn new() -> Self {
         Self {

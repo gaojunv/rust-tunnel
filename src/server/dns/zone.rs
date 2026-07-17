@@ -7,6 +7,12 @@ pub struct DnsZone {
     records: HashMap<String, Vec<DnsRecord>>,
 }
 
+impl Default for DnsZone {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DnsZone {
     pub fn new() -> Self {
         Self {

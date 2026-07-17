@@ -16,15 +16,11 @@ use crate::server::db::Database;
 /// Load balancing algorithm
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum LoadBalancing {
+    #[default]
     RoundRobin,
     WeightedRoundRobin,
-}
-
-impl Default for LoadBalancing {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 /// Proxy rule type
@@ -398,8 +394,8 @@ impl ReverseProxyState {
                 &rule.listen,
                 domains_json.as_deref(),
                 routes_json.as_deref(),
-                tls.map_or(false, |t| t.enabled),
-                tls.map_or(false, |t| t.acme),
+                tls.is_some_and(|t| t.enabled),
+                tls.is_some_and(|t| t.acme),
                 tls.and_then(|t| t.domain.as_deref()),
                 rule.enabled,
                 cert_source_str,

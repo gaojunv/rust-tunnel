@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_io_error_conversion() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "io error");
+        let io_err = std::io::Error::other("io error");
         let tunnel_err: TunnelError = io_err.into();
         assert!(matches!(tunnel_err, TunnelError::Io(_)));
     }
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn test_database_error_conversion() {
         // Create a sqlx error via a failed connection
-        let db_err = sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "db error"));
+        let db_err = sqlx::Error::Io(std::io::Error::other("db error"));
         let tunnel_err: TunnelError = db_err.into();
         assert!(matches!(tunnel_err, TunnelError::Database(_)));
     }
@@ -131,11 +131,8 @@ mod tests {
     fn test_all_error_variants_display() {
         // Verify all variants produce non-empty display output
         let variants: Vec<TunnelError> = vec![
-            TunnelError::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
-            TunnelError::Database(sqlx::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "db",
-            ))),
+            TunnelError::Io(std::io::Error::other("io")),
+            TunnelError::Database(sqlx::Error::Io(std::io::Error::other("db"))),
             TunnelError::Protocol("proto".into()),
             TunnelError::ConnectionClosed,
             TunnelError::Timeout,

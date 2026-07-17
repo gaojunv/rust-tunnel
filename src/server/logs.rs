@@ -162,7 +162,7 @@ impl LogStore {
                 }
             })
             .filter(|e| {
-                if let Some(ref s) = search {
+                if let Some(s) = search {
                     e.message.to_lowercase().contains(&s.to_lowercase())
                 } else {
                     true

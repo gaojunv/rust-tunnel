@@ -127,7 +127,7 @@ async fn handle_dns_query(registry: &DnsRegistry, data: &[u8]) -> Vec<u8> {
                     response_code = ResponseCode::NXDomain;
                 } else {
                     for (target, port) in &srvs {
-                        if let Ok(target_name) = Name::from_ascii(&format!("{}.", target)) {
+                        if let Ok(target_name) = Name::from_ascii(format!("{}.", target)) {
                             let mut record = Record::new();
                             record.set_name(question.name().clone());
                             record.set_record_type(RecordType::SRV);

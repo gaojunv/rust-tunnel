@@ -44,7 +44,7 @@ impl HttpProxy {
         };
 
         let state = self.state.clone();
-        let db = self.db.clone();
+        let _db = self.db.clone();
         let rule_id_clone = rule_id.clone();
 
         let app = Router::new()
@@ -175,7 +175,7 @@ async fn handle_proxy_request(
     req: Request<Body>,
 ) -> impl IntoResponse {
     // Extract host from request
-    let host = req
+    let _host = req
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())

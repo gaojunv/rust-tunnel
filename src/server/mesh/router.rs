@@ -7,6 +7,12 @@ pub struct MeshRouter {
     networks: HashMap<String, HashMap<String, MeshRoute>>,
 }
 
+impl Default for MeshRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MeshRouter {
     pub fn new() -> Self {
         Self {

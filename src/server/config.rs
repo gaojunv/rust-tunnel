@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(config.admin_password, Some("secret123".into()));
         assert_eq!(config.jwt_secret, Some("test-secret".into()));
         assert_eq!(config.client_auth_token, Some("client-secret".into()));
-        assert_eq!(config.tls, false);
+        assert!(!config.tls);
         assert_eq!(config.tls_cert, "/custom/cert.pem");
         assert_eq!(config.tls_key, "/custom/key.pem");
         assert_eq!(config.log, "debug");

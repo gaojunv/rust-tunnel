@@ -20,6 +20,12 @@ pub struct MeshManager {
     clients: Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<ControlMessage>>>>,
 }
 
+impl Default for MeshManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MeshManager {
     pub fn new() -> Self {
         Self {
