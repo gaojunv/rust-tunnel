@@ -73,6 +73,21 @@ pub fn strip_hop_by_hop(headers: &HeaderMap<HeaderValue>) -> HeaderMap<HeaderVal
     out
 }
 
+/// Walk `err.source()` chain to build a string like:
+///   "outer message | caused by: middle | caused by: inner"
+///
+/// Useful when the top-level error variant hides the real cause several
+/// layers down (e.g. hyper-util's `SendRequest` wrapping `hyper::Error`).
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut cursor: Option<&(dyn std::error::Error + 'static)> = err.source();
+    while let Some(e) = cursor {
+        parts.push(format!("caused by: {e}"));
+        cursor = e.source();
+    }
+    parts.join(" | ")
+}
+
 /// Resolve the target backend for a request. Returns `None` when no route
 /// matches (caller should reply 404).
 ///
@@ -184,6 +199,12 @@ pub async fn handle_proxy_request_unified(
         .unwrap_or_default();
     let path = req.uri().path().to_string();
 
+    // Diagnostics captured up-front so we can include them in error logs
+    // regardless of where the flow fails.
+    let method = req.method().clone();
+    let incoming_version = req.version();
+    let incoming_header_count = req.headers().len();
+
     let Some(backend) = resolve_backend(&source, &host, &path).await else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -200,10 +221,14 @@ pub async fn handle_proxy_request_unified(
         Ok(resp) => build_downstream_response(resp),
         Err(e) => {
             error!(
-                error = %e,
+                error = %error_chain(&e),
                 backend = %backend.addr,
                 scheme = ?backend.scheme,
                 protocol = ?backend.protocol,
+                method = %method,
+                path = %path,
+                incoming_version = ?incoming_version,
+                header_count = incoming_header_count,
                 "upstream request failed"
             );
             error_response(&e)
