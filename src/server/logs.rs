@@ -365,9 +365,22 @@ mod tests {
                 message: format!("msg {}", i),
             });
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let entries = store.get_all().await;
+        // Wait for the background drain task to consume all 1100 entries.
+        // Fixed 10ms was flaky under CI load — the task might have only
+        // consumed a subset when we call get_all().
+        let entries = {
+            let mut out = Vec::new();
+            for _ in 0..200 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                out = store.get_all().await;
+                if out.len() == 1000 && out[0].timestamp >= 100 {
+                    break;
+                }
+            }
+            out
+        };
+
         assert_eq!(entries.len(), 1000);
         // Oldest entries should be dropped
         assert!(entries[0].timestamp >= 100);
