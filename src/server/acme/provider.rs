@@ -45,10 +45,11 @@ pub fn create_server_config_from_entry(entry: &CertEntry) -> anyhow::Result<Arc<
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
         .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_der)
         .map_err(|e| anyhow::anyhow!("Failed to create server config: {}", e))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }

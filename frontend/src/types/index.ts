@@ -181,10 +181,14 @@ export interface AddDnsRecordRequest {
 
 export type RuleType = 'http' | 'tcp' | 'udp';
 export type LoadBalancing = 'round_robin' | 'weighted_round_robin';
+export type BackendScheme = 'http' | 'https';
+export type BackendProtocol = 'http1' | 'http2';
 
 export interface Backend {
   addr: string;
   weight: number;
+  scheme?: BackendScheme;
+  protocol?: BackendProtocol;
 }
 
 export interface Route {

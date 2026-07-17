@@ -1380,6 +1380,24 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0bea761b46ae2b24eb4aef630d8d1c398157b6fc29e6350ecf090a0b70c952c"
+dependencies = [
+ "futures-util",
+ "http",
+ "hyper",
+ "hyper-util",
+ "rustls 0.22.4",
+ "rustls-native-certs 0.7.3",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls 0.25.0",
+ "tower-service",
+]
+
+[[package]]
+name = "hyper-rustls"
 version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
@@ -1603,7 +1621,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "hyper",
- "hyper-rustls",
+ "hyper-rustls 0.27.9",
  "hyper-util",
  "rcgen",
  "ring",
@@ -2459,7 +2477,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
- "hyper-rustls",
+ "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
  "log",
@@ -2597,6 +2615,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "hyper",
+ "hyper-rustls 0.26.0",
  "hyper-util",
  "instant-acme",
  "jsonwebtoken",

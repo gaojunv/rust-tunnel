@@ -14,8 +14,9 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::error::ReconcileError;
-use super::http_proxy::handle_proxy_request_shared;
+use super::handler::{handle_proxy_request_unified, RouteSource};
 use super::router::RouteTable;
+use super::upstream::UpstreamClient;
 use super::{ProxyRule, ReverseProxyState, RuleType};
 use crate::server::acme::CertificateManager;
 
@@ -58,14 +59,16 @@ impl SharedListener {
                 })?;
 
         let route_table = Arc::new(ArcSwap::from_pointee(initial_table));
+        let upstream_for_task = Arc::new(UpstreamClient::new());
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let tls_acceptor = if tls_enabled {
             let mgr = cert_manager.expect("checked above");
             let resolver = mgr.sni_resolver();
-            let cfg = rustls::ServerConfig::builder()
+            let mut cfg = rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_cert_resolver(resolver);
+            cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             Some(TlsAcceptor::from(Arc::new(cfg)))
         } else {
             None
@@ -101,8 +104,9 @@ impl SharedListener {
                         };
                         let table = route_table_for_task.clone();
                         let acceptor = tls_acceptor.clone();
+                        let upstream_c = upstream_for_task.clone();
                         tokio::spawn(async move {
-                            handle_one_connection(stream, peer, acceptor, table).await;
+                            handle_one_connection(stream, peer, acceptor, table, upstream_c).await;
                         });
                     }
                 }
@@ -159,10 +163,12 @@ async fn handle_one_connection(
     _peer: SocketAddr,
     acceptor: Option<TlsAcceptor>,
     route_table: Arc<ArcSwap<RouteTable>>,
+    upstream: Arc<UpstreamClient>,
 ) {
+    let source = RouteSource(route_table);
     let app: Router = Router::new()
-        .fallback(any(handle_proxy_request_shared))
-        .with_state(route_table);
+        .fallback(any(handle_proxy_request_unified))
+        .with_state((source, upstream));
 
     match acceptor {
         Some(acc) => {
@@ -173,11 +179,19 @@ async fn handle_one_connection(
                     return;
                 }
             };
+            let alpn = tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned());
+            debug!(peer = %_peer, alpn = ?alpn, "tls handshake ok");
+
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await
             {
                 debug!("HTTPS connection error: {}", e);
             }
@@ -185,9 +199,10 @@ async fn handle_one_connection(
         None => {
             let io = hyper_util::rt::TokioIo::new(stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, service)
+                    .await
             {
                 debug!("HTTP connection error: {}", e);
             }
@@ -348,7 +363,8 @@ impl ReverseProxyState {
 mod tests {
     use super::*;
     use crate::server::reverse_proxy::{
-        Backend, LoadBalancing, ProxyRule, ProxyTlsConfig, Route, RuleType,
+        Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route,
+        RuleType,
     };
 
     fn http_rule(id: &str, listen: &str, domain: &str, tls: bool) -> ProxyRule {
@@ -363,6 +379,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: "127.0.0.1:8080".into(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
@@ -473,6 +491,8 @@ mod tests {
                 backends: vec![Backend {
                     addr: backend.to_string(),
                     weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
                 }],
                 load_balancing: LoadBalancing::RoundRobin,
             }],
@@ -551,5 +571,52 @@ mod tests {
             .lock()
             .await
             .contains_key(&listen_addr));
+    }
+}
+
+#[cfg(test)]
+mod alpn_tests {
+    use rustls::server::ServerConfig;
+    use std::sync::Arc;
+
+    /// Sanity check: the ServerConfig built by CertificateManager for a domain
+    /// has h2 and http/1.1 in its ALPN list. Full ALPN negotiation is
+    /// exercised end-to-end by Task 2.6's E2E test.
+    #[tokio::test]
+    async fn manager_built_server_config_has_alpn() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(crate::server::acme::CertificateManager::new(
+            temp_dir.path().to_str().unwrap(),
+        ));
+
+        // Generate a self-signed cert for "localhost".
+        let (cert_pem, key_pem) = {
+            use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+            let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+            let cert = params.self_signed(&kp).unwrap();
+            (cert.pem(), kp.serialize_pem())
+        };
+        mgr.add_certificate(
+            "localhost",
+            crate::server::acme::CertEntry {
+                cert_pem,
+                key_pem,
+                chain_pem: None,
+                expires_at: None,
+                source: crate::server::acme::CertSource::Manual,
+            },
+        )
+        .await
+        .unwrap();
+
+        let cfg_arc: Arc<ServerConfig> = {
+            use crate::server::acme::CertificateProvider;
+            mgr.get_tls_server_config("localhost").await.unwrap()
+        };
+        assert_eq!(
+            cfg_arc.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 }
