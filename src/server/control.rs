@@ -1926,14 +1926,16 @@ mod acme_config_load_or_seed_tests {
     async fn fresh_db_uses_cli_values_and_writes_back() {
         let (db, _tmp) = fresh_db().await;
 
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = true;
-        cfg.acme_server_url = "https://example.test/acme".to_string();
-        cfg.acme_email = Some("op@example.test".to_string());
-        cfg.acme_cert_dir = "/tmp/certs".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 12;
-        cfg.acme_renewal_days_before_expiry = 15;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://example.test/acme".to_string(),
+            acme_email: Some("op@example.test".to_string()),
+            acme_cert_dir: "/tmp/certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 12,
+            acme_renewal_days_before_expiry: 15,
+            ..Default::default()
+        };
 
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
@@ -1979,14 +1981,16 @@ mod acme_config_load_or_seed_tests {
             .unwrap();
 
         // Call with completely different seed args — none of them should leak through
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = false; // different from stored
-        cfg.acme_server_url = "https://cli.example/acme".to_string();
-        cfg.acme_email = Some("cli@example.test".to_string());
-        cfg.acme_cert_dir = "/cli/certs".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 1;
-        cfg.acme_renewal_days_before_expiry = 2;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: false, // different from stored
+            acme_server_url: "https://cli.example/acme".to_string(),
+            acme_email: Some("cli@example.test".to_string()),
+            acme_cert_dir: "/cli/certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 1,
+            acme_renewal_days_before_expiry: 2,
+            ..Default::default()
+        };
 
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
@@ -2005,21 +2009,25 @@ mod acme_config_load_or_seed_tests {
         let (db, _tmp) = fresh_db().await;
 
         // First call: seed DB with initial values
-        let mut first_cfg = crate::server::config::ServerConfig::default();
-        first_cfg.acme_enabled = true;
-        first_cfg.acme_server_url = "https://first.example/acme".to_string();
-        first_cfg.acme_cert_dir = "/first".to_string();
+        let first_cfg = crate::server::config::ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://first.example/acme".to_string(),
+            acme_cert_dir: "/first".to_string(),
+            ..Default::default()
+        };
         AcmeFullConfig::load_or_seed(&db, &first_cfg).await;
 
         // Second call with different seed args — should not touch DB
-        let mut second_cfg = crate::server::config::ServerConfig::default();
-        second_cfg.acme_enabled = false;
-        second_cfg.acme_server_url = "https://second.example/acme".to_string();
-        second_cfg.acme_email = Some("x@y".to_string());
-        second_cfg.acme_cert_dir = "/second".to_string();
-        second_cfg.acme_auto_renew = false;
-        second_cfg.acme_renewal_check_interval = 1;
-        second_cfg.acme_renewal_days_before_expiry = 1;
+        let second_cfg = crate::server::config::ServerConfig {
+            acme_enabled: false,
+            acme_server_url: "https://second.example/acme".to_string(),
+            acme_email: Some("x@y".to_string()),
+            acme_cert_dir: "/second".to_string(),
+            acme_auto_renew: false,
+            acme_renewal_check_interval: 1,
+            acme_renewal_days_before_expiry: 1,
+            ..Default::default()
+        };
         AcmeFullConfig::load_or_seed(&db, &second_cfg).await;
 
         // DB row must still be the first seed
@@ -2036,13 +2044,15 @@ mod acme_config_load_or_seed_tests {
         // Poison the row with unparseable JSON
         db.save_server_setting("acme_config", "not valid json {[").await.unwrap();
 
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = true;
-        cfg.acme_server_url = "https://seed.example/acme".to_string();
-        cfg.acme_cert_dir = "/seed".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 24;
-        cfg.acme_renewal_days_before_expiry = 30;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://seed.example/acme".to_string(),
+            acme_cert_dir: "/seed".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            ..Default::default()
+        };
 
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
@@ -2076,13 +2086,15 @@ mod acme_config_load_or_seed_tests {
         .await
         .unwrap();
 
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = true;
-        cfg.acme_server_url = "https://seed.example/acme".to_string();
-        cfg.acme_cert_dir = "/seed".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 24;
-        cfg.acme_renewal_days_before_expiry = 30;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://seed.example/acme".to_string(),
+            acme_cert_dir: "/seed".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            ..Default::default()
+        };
 
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
@@ -2103,13 +2115,15 @@ mod acme_config_load_or_seed_tests {
     async fn tos_agreed_stays_false_when_no_certs_exist() {
         let (db, _tmp) = fresh_db().await;
 
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = true;
-        cfg.acme_server_url = "https://seed.example/acme".to_string();
-        cfg.acme_cert_dir = "/seed".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 24;
-        cfg.acme_renewal_days_before_expiry = 30;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://seed.example/acme".to_string(),
+            acme_cert_dir: "/seed".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            ..Default::default()
+        };
 
         let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
 
@@ -2128,13 +2142,15 @@ mod acme_config_load_or_seed_tests {
         let (db, _tmp) = fresh_db().await;
 
         // First call: seed with no certs → tos_agreed=false persisted
-        let mut cfg = crate::server::config::ServerConfig::default();
-        cfg.acme_enabled = false;
-        cfg.acme_server_url = "https://a.example/acme".to_string();
-        cfg.acme_cert_dir = "/a".to_string();
-        cfg.acme_auto_renew = true;
-        cfg.acme_renewal_check_interval = 24;
-        cfg.acme_renewal_days_before_expiry = 30;
+        let cfg = crate::server::config::ServerConfig {
+            acme_enabled: false,
+            acme_server_url: "https://a.example/acme".to_string(),
+            acme_cert_dir: "/a".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 24,
+            acme_renewal_days_before_expiry: 30,
+            ..Default::default()
+        };
 
         let first = AcmeFullConfig::load_or_seed(&db, &cfg).await;
         assert!(!first.tos_agreed);
