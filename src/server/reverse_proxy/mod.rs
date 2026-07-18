@@ -6,6 +6,7 @@ pub mod shared_listener;
 pub mod sni_resolver;
 pub mod tcp_proxy;
 pub mod upstream;
+pub mod connector;
 
 #[cfg(test)]
 mod http2_test;
