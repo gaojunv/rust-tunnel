@@ -24,6 +24,7 @@ tests/
   tunnel_reconnect.rs  # 管理员断开重连、心跳 RTT、server 重启
   api_auth.rs          # /api/login、Bearer 校验、无密码模式
   api_sse.rs           # SSE 日志流、流量桶
+  config_persist.rs    # SS/Trojan 改配置后用同一 DB 重启，端口不回退
 ```
 
 ## 写新用例的模板

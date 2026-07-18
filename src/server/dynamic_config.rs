@@ -50,6 +50,9 @@ pub struct DynamicConfig {
 
 impl DynamicConfig {
     /// Load dynamic config from DB. If DB has no records, seed from ServerConfig (first run).
+    ///
+    /// 表中若存在多行（旧版本按端口 upsert 可能残留多份配置），取最近更新的一行——
+    /// 那是用户最近一次通过 API 保存的配置。
     pub async fn load_or_seed(db: &Database, server_config: &ServerConfig) -> Self {
         // Log level
         let log_level = match db.load_server_setting("log_level").await {
@@ -64,7 +67,10 @@ impl DynamicConfig {
         // Shadowsocks
         let ss = match db.load_shadowsocks_configs().await {
             Ok(configs) if !configs.is_empty() => {
-                let c = &configs[0];
+                let c = configs
+                    .iter()
+                    .max_by_key(|c| (c.updated_at, c.id))
+                    .expect("non-empty configs");
                 Some(ShadowsocksDynamicConfig {
                     enabled: c.enabled != 0,
                     port: c.port as u16,
@@ -100,7 +106,10 @@ impl DynamicConfig {
         // Trojan
         let trojan = match db.load_trojan_configs().await {
             Ok(configs) if !configs.is_empty() => {
-                let c = &configs[0];
+                let c = configs
+                    .iter()
+                    .max_by_key(|c| (c.updated_at, c.id))
+                    .expect("non-empty configs");
                 Some(TrojanDynamicConfig {
                     enabled: c.enabled != 0,
                     port: c.port as u16,

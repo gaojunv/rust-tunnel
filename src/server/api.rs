@@ -1225,10 +1225,10 @@ async fn update_shadowsocks_config(
         }
     };
 
-    // Save to DB
+    // Save to DB（单份配置语义：整表替换，避免修改端口时残留旧行）
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db
-            .save_shadowsocks_config(port, cipher, password, enabled)
+            .replace_shadowsocks_config(port, cipher, password, enabled)
             .await
         {
             return (
@@ -1380,10 +1380,10 @@ async fn update_trojan_config(
     };
     let fallback = payload["fallback"].as_str().unwrap_or("127.0.0.1:80");
 
-    // Save to DB
+    // Save to DB（单份配置语义：整表替换，避免修改端口时残留旧行）
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db
-            .save_trojan_config(port, password, fallback, enabled)
+            .replace_trojan_config(port, password, fallback, enabled)
             .await
         {
             return (

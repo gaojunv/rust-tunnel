@@ -149,7 +149,7 @@ cargo test --tests                    # 全部集成测试
 cargo test --test tunnel_basic        # 指定文件
 ```
 
-测试文件：`tunnel_basic.rs`（双向转发、多端口）、`tunnel_reconnect.rs`（断开重连、心跳）、`api_auth.rs`（登录/Bearer 校验）、`api_sse.rs`（SSE 日志流、流量桶）。共享工具在 `tests/common/`（`TestHarness`、带 JWT 的 reqwest 封装、echo 服务、`wait_until` 指数退避）。
+测试文件：`tunnel_basic.rs`（双向转发、多端口）、`tunnel_reconnect.rs`（断开重连、心跳）、`api_auth.rs`（登录/Bearer 校验）、`api_sse.rs`（SSE 日志流、流量桶）、`config_persist.rs`（SS/Trojan 配置修改后同库重启持久化）。共享工具在 `tests/common/`（`TestHarness`、带 JWT 的 reqwest 封装、echo 服务、`wait_until` 指数退避）。
 
 **集成测试硬性规矩**（来自 `tests/README.md`，写新用例必须遵守）：
 

@@ -59,6 +59,19 @@ impl ApiClient {
         (status, body)
     }
 
+    /// POST a JSON body, returning `(status, body)`.
+    /// Injects `Authorization: Bearer <token>` if a token is stored.
+    pub async fn post_json(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        let mut req = self.http.post(format!("{}{}", self.base, path));
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.json(&body).send().await.expect("post send");
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
     /// Bare GET returning status (used for auth-negative tests where body is irrelevant).
     pub async fn get_status(&self, path: &str) -> StatusCode {
         let mut req = self.http.get(format!("{}{}", self.base, path));

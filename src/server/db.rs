@@ -801,6 +801,43 @@ impl Database {
         Ok(())
     }
 
+    /// Replace the entire Shadowsocks configuration with a single record.
+    ///
+    /// 运行时只支持单份 SS 配置（API/动态配置均如此），而按端口 upsert 的
+    /// `save_shadowsocks_config` 在修改端口时会残留旧行，导致重启后读到旧配置。
+    /// 配置更新接口应使用本方法：先清空再插入，保证表中始终只有一份配置。
+    pub async fn replace_shadowsocks_config(
+        &self,
+        port: u16,
+        cipher: &str,
+        password: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM shadowsocks_config")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO shadowsocks_config (port, cipher, password, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(port as i32)
+        .bind(cipher)
+        .bind(password)
+        .bind(enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     /// Load all Shadowsocks configurations
     pub async fn load_shadowsocks_configs(
         &self,
@@ -899,6 +936,42 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Replace the entire Trojan configuration with a single record.
+    ///
+    /// 与 `replace_shadowsocks_config` 同理：修改端口时按端口 upsert 会残留旧行，
+    /// 配置更新接口应使用本方法保证表中始终只有一份配置。
+    pub async fn replace_trojan_config(
+        &self,
+        port: u16,
+        password: &str,
+        fallback: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM trojan_config")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO trojan_config (port, password, fallback, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(port as i32)
+        .bind(password)
+        .bind(fallback)
+        .bind(enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -2226,6 +2299,46 @@ mod tests {
         let configs = db.load_shadowsocks_configs().await.unwrap();
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].cipher, "chacha20-ietf-poly1305");
+    }
+
+    #[tokio::test]
+    async fn test_replace_shadowsocks_config_single_row() {
+        let db = create_test_db().await;
+
+        db.save_shadowsocks_config(8388, "aes-256-gcm", "pass1", true)
+            .await
+            .unwrap();
+        // 修改端口：整表替换，不应残留旧行
+        db.replace_shadowsocks_config(9999, "chacha20-ietf-poly1305", "pass2", true)
+            .await
+            .unwrap();
+
+        let configs = db.load_shadowsocks_configs().await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].port, 9999);
+        assert_eq!(configs[0].cipher, "chacha20-ietf-poly1305");
+        assert_eq!(configs[0].password, "pass2");
+        assert_eq!(configs[0].enabled, 1);
+    }
+
+    #[tokio::test]
+    async fn test_replace_trojan_config_single_row() {
+        let db = create_test_db().await;
+
+        db.save_trojan_config(443, "pass1", "127.0.0.1:80", true)
+            .await
+            .unwrap();
+        // 修改端口：整表替换，不应残留旧行
+        db.replace_trojan_config(8443, "pass2", "127.0.0.1:8080", false)
+            .await
+            .unwrap();
+
+        let configs = db.load_trojan_configs().await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].port, 8443);
+        assert_eq!(configs[0].password, "pass2");
+        assert_eq!(configs[0].fallback, "127.0.0.1:8080");
+        assert_eq!(configs[0].enabled, 0);
     }
 
     #[tokio::test]
