@@ -19,6 +19,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { PageHeader } from '@/components/layout/PageHeader';
+import DnsConfigCard from '@/components/dns/DnsConfigCard';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDnsRecords, addDnsRecord, deleteDnsRecord } from '@/api/client';
 import type { AddDnsRecordRequest } from '@/types';
@@ -130,6 +131,8 @@ export default function DnsPage() {
           </DialogContent>
         </Dialog>
       </PageHeader>
+
+      <DnsConfigCard />
 
       <Card>
         <CardHeader>

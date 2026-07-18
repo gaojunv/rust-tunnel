@@ -142,7 +142,7 @@ export default function GeneralTab() {
               <p>
                 Reverse proxy rules are managed on the{' '}
                 <a
-                  href="/reverse-proxy"
+                  href="/proxy"
                   className="font-medium text-primary underline underline-offset-4 hover:text-primary/80"
                 >
                   Reverse Proxy

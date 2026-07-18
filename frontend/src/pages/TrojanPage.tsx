@@ -11,6 +11,7 @@ import {
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { useTrojanConfig, useTrojanStats, useTrojanQuality } from '@/api/hooks';
+import TrojanConfigCard from '@/components/trojan/TrojanConfigCard';
 import { formatBytes, formatBps } from '@/utils/format';
 import {
   Shield,
@@ -83,6 +84,9 @@ export default function TrojanPage() {
           icon={<Users className="h-4 w-4" />}
         />
       </div>
+
+      {/* Server Configuration */}
+      <TrojanConfigCard />
 
       {/* Throughput Chart */}
       <Card>

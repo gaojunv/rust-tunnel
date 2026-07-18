@@ -11,6 +11,7 @@ import {
   type ChartConfig,
 } from '@/components/ui/chart';
 import { useShadowsocksConfig, useShadowsocksStats, useShadowsocksQuality } from '@/api/hooks';
+import ShadowsocksConfigCard from '@/components/shadowsocks/ShadowsocksConfigCard';
 import { formatBytes, formatBps } from '@/utils/format';
 import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
@@ -63,6 +64,9 @@ export default function ShadowsocksPage() {
           icon={<ArrowUp className="h-4 w-4" />}
         />
       </div>
+
+      {/* Server Configuration */}
+      <ShadowsocksConfigCard />
 
       {/* Throughput Chart */}
       <Card>
