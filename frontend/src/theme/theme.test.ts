@@ -54,12 +54,12 @@ describe('theme utilities', () => {
     expect(isThemePreference(null)).toBe(false);
   });
 
-  it('defaults to system when storage is empty or invalid', () => {
+  it('defaults to dark when storage is empty or invalid', () => {
     const storage = new MemoryStorage();
-    expect(readStoredThemePreference(storage)).toBe('system');
+    expect(readStoredThemePreference(storage)).toBe('dark');
 
     storage.setItem(THEME_STORAGE_KEY, 'blue');
-    expect(readStoredThemePreference(storage)).toBe('system');
+    expect(readStoredThemePreference(storage)).toBe('dark');
   });
 
   it('reads and writes the supported preference using the rust-tunnel key', () => {
@@ -74,7 +74,7 @@ describe('theme utilities', () => {
   it('falls back safely when storage throws', () => {
     const storage = new ThrowingStorage();
 
-    expect(readStoredThemePreference(storage)).toBe('system');
+    expect(readStoredThemePreference(storage)).toBe('dark');
     expect(writeStoredThemePreference('light', storage)).toBe(false);
   });
 

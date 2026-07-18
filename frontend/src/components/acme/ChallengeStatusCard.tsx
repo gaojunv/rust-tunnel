@@ -10,24 +10,48 @@ interface ChallengeStatusCardProps {
 function getStatusIcon(status: string) {
   switch (status) {
     case 'verified':
-      return <CheckCircle className="h-4 w-4 text-green-500" />;
+      return <CheckCircle className="h-4 w-4 text-emerald-500" />;
     case 'failed':
       return <AlertCircle className="h-4 w-4 text-red-500" />;
     case 'pending':
     default:
-      return <Clock className="h-4 w-4 text-yellow-500" />;
+      return <Clock className="h-4 w-4 text-amber-500" />;
   }
 }
 
 function getStatusBadge(status: string) {
   switch (status) {
     case 'verified':
-      return <Badge className="bg-green-500/10 text-green-700 border-green-200">Verified</Badge>;
+      return (
+        <Badge
+          variant="outline"
+          className="gap-1.5 font-medium bg-emerald-500/10 text-emerald-500 border-emerald-500/25"
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_hsl(160_84%_45%/0.8)]" />
+          Verified
+        </Badge>
+      );
     case 'failed':
-      return <Badge variant="destructive">Failed</Badge>;
+      return (
+        <Badge
+          variant="outline"
+          className="gap-1.5 font-medium bg-red-500/10 text-red-500 border-red-500/25"
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-red-500 shadow-[0_0_6px_hsl(0_72%_51%/0.8)]" />
+          Failed
+        </Badge>
+      );
     case 'pending':
     default:
-      return <Badge variant="secondary">Pending</Badge>;
+      return (
+        <Badge
+          variant="outline"
+          className="gap-1.5 font-medium bg-amber-500/10 text-amber-500 border-amber-500/25"
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-amber-500 shadow-[0_0_6px_hsl(38_92%_55%/0.8)]" />
+          Pending
+        </Badge>
+      );
   }
 }
 
@@ -84,7 +108,7 @@ export function ChallengeStatusCard({ domain }: ChallengeStatusCardProps) {
           </div>
         </div>
         {status.error && (
-          <div className="mt-4 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+          <div className="mt-4 rounded-lg border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive">
             {status.error}
           </div>
         )}

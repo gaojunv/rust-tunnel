@@ -1,17 +1,10 @@
 import { StatCard } from '@/components/shared/StatCard';
-import { Network, Activity, Link, ArrowDown } from 'lucide-react';
+import { Network, Activity, Link, ArrowDownUp } from 'lucide-react';
 import { useProxyStats } from '@/api/hooks';
+import { formatBytes } from '@/utils/format';
 
 export function ProxyStatsCards() {
   const { data: stats, isLoading } = useProxyStats();
-
-  const formatBytes = (bytes: number) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -33,7 +26,7 @@ export function ProxyStatsCards() {
       <StatCard
         title="Total Traffic"
         value={isLoading ? '—' : formatBytes((stats?.bytes_in ?? 0) + (stats?.bytes_out ?? 0))}
-        icon={<ArrowDown className="h-4 w-4" />}
+        icon={<ArrowDownUp className="h-4 w-4" />}
       />
     </div>
   );

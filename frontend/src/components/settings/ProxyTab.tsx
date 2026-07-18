@@ -17,7 +17,7 @@ import {
   useUpdateTrojanConfig,
   useAcmeStatus,
 } from '@/api/hooks';
-import { Info } from 'lucide-react';
+import { Info, Shield, ShieldCheck } from 'lucide-react';
 
 export default function ProxyTab() {
   const { data: ssConfig, isLoading: ssLoading } = useShadowsocksConfig();
@@ -79,7 +79,7 @@ export default function ProxyTab() {
   };
 
   if (ssLoading || tjLoading) {
-    return <div className="text-center py-8 text-muted-foreground">Loading...</div>;
+    return <div className="py-8 text-center text-muted-foreground">Loading...</div>;
   }
 
   return (
@@ -88,7 +88,12 @@ export default function ProxyTab() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>Shadowsocks Proxy</CardTitle>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Shield className="h-4 w-4" />
+              </div>
+              <CardTitle className="text-lg">Shadowsocks Proxy</CardTitle>
+            </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">Enable</span>
               <Switch checked={ssEnabled} onCheckedChange={setSsEnabled} />
@@ -143,7 +148,12 @@ export default function ProxyTab() {
       <Card>
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle>Trojan Proxy</CardTitle>
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <ShieldCheck className="h-4 w-4" />
+              </div>
+              <CardTitle className="text-lg">Trojan Proxy</CardTitle>
+            </div>
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">Enable</span>
               <Switch checked={tjEnabled} onCheckedChange={setTjEnabled} />
@@ -187,19 +197,25 @@ export default function ProxyTab() {
           </div>
 
           {/* Trojan TLS info */}
-          <div className="rounded-md bg-muted p-3 flex items-start gap-2">
-            <Info className="h-4 w-4 mt-0.5 text-muted-foreground shrink-0" />
+          <div className="flex items-start gap-2 rounded-lg border bg-muted/50 p-3">
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
             <div className="text-sm text-muted-foreground">
-              <p className="font-medium mb-1">TLS Certificate</p>
+              <p className="mb-1 font-medium text-foreground">TLS Certificate</p>
               <p>
                 Trojan requires TLS. The certificate is managed via{' '}
-                <a href="/acme" className="underline font-medium">ACME</a>.{' '}
+                <a
+                  href="/acme"
+                  className="font-medium text-primary underline underline-offset-4 hover:text-primary/80"
+                >
+                  ACME
+                </a>
+                .{' '}
                 {acmeStatus?.enabled ? (
-                  <span className="text-green-600 dark:text-green-400">
+                  <span className="text-emerald-500">
                     ACME is enabled. Trojan will use the certificate for the configured domain.
                   </span>
                 ) : (
-                  <span className="text-yellow-600 dark:text-yellow-400">
+                  <span className="text-amber-500">
                     ⚠ ACME is not enabled. Enable ACME first to use Trojan.
                   </span>
                 )}

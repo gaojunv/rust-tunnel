@@ -1,31 +1,24 @@
+import { useMemo } from 'react';
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { useShadowsocksConfig, useShadowsocksStats, useShadowsocksQuality } from '@/api/hooks';
-import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
 import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  Legend,
-} from 'recharts';
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
+import { useShadowsocksConfig, useShadowsocksStats, useShadowsocksQuality } from '@/api/hooks';
+import { formatBytes, formatBps } from '@/utils/format';
+import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 
 export default function ShadowsocksPage() {
   const { data: config } = useShadowsocksConfig();
   const { data: stats } = useShadowsocksStats();
   const { data: qualityData } = useShadowsocksQuality();
-
-  const formatBytes = (bytes: number) => {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
 
   const qualityHistory = qualityData?.[0]?.history ?? [];
   const chartData = qualityHistory.map((sample) => ({
@@ -36,6 +29,14 @@ export default function ShadowsocksPage() {
     bytes_in: sample.bytes_in_per_sec,
     bytes_out: sample.bytes_out_per_sec,
   }));
+
+  const chartConfig = useMemo<ChartConfig>(
+    () => ({
+      bytes_in: { label: 'Bytes In', color: 'hsl(var(--chart-1))' },
+      bytes_out: { label: 'Bytes Out', color: 'hsl(var(--chart-2))' },
+    }),
+    []
+  );
 
   return (
     <div className="space-y-6">
@@ -77,40 +78,69 @@ export default function ShadowsocksPage() {
               No throughput data available
             </div>
           ) : (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" />
+            <ChartContainer config={chartConfig} className="h-[250px] w-full sm:h-[300px]">
+              <LineChart data={chartData} margin={{ left: 12, right: 12 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
                 <XAxis
                   dataKey="timestamp"
-                  tickFormatter={(ts) =>
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  tickFormatter={(ts: string) =>
                     new Date(ts).toLocaleTimeString([], {
                       hour: '2-digit',
                       minute: '2-digit',
                     })
                   }
                 />
-                <YAxis tickFormatter={(v) => formatBytes(v) + '/s'} />
-                <Tooltip
-                  labelFormatter={(ts) => new Date(ts).toLocaleString()}
-                  formatter={(value: number) => formatBytes(value) + '/s'}
+                <YAxis
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  width={80}
+                  tickFormatter={(v: number) => formatBps(v)}
                 />
-                <Legend />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                      formatter={(value, name) => {
+                        const key = String(name);
+                        return (
+                          <div className="flex w-full items-center gap-2">
+                            <span
+                              className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                              style={{ backgroundColor: chartConfig[key]?.color }}
+                            />
+                            <span className="flex-1 text-muted-foreground">
+                              {chartConfig[key]?.label ?? key}
+                            </span>
+                            <span className="font-mono font-medium tabular-nums text-foreground">
+                              {formatBps(Number(value))}
+                            </span>
+                          </div>
+                        );
+                      }}
+                    />
+                  }
+                />
+                <ChartLegend content={<ChartLegendContent />} />
                 <Line
                   type="monotone"
                   dataKey="bytes_in"
-                  stroke="#3b82f6"
-                  name="Bytes In"
+                  stroke="var(--color-bytes_in)"
                   dot={false}
+                  strokeWidth={2}
                 />
                 <Line
                   type="monotone"
                   dataKey="bytes_out"
-                  stroke="#10b981"
-                  name="Bytes Out"
+                  stroke="var(--color-bytes_out)"
                   dot={false}
+                  strokeWidth={2}
                 />
               </LineChart>
-            </ResponsiveContainer>
+            </ChartContainer>
           )}
         </CardContent>
       </Card>

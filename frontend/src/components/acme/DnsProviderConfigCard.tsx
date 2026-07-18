@@ -18,6 +18,7 @@ import {
 } from '@/components/ui/dialog';
 import { Settings, Globe } from 'lucide-react';
 import { useDnsProviders, useUpdateDnsProvider } from '@/api/hooks';
+import { cn } from '@/lib/utils';
 import type { DnsProviderType, DnsProviderConfig } from '@/types';
 
 const PROVIDER_LABELS: Record<DnsProviderType, string> = {
@@ -66,9 +67,25 @@ export function DnsProviderConfigCard() {
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle className="flex items-center gap-2">
-            <Globe className="h-5 w-5" />
+            <Globe className="h-5 w-5 text-primary" />
             DNS Provider
-            <Badge variant={data?.config ? 'default' : 'secondary'}>
+            <Badge
+              variant="outline"
+              className={cn(
+                'gap-1.5 font-medium',
+                data?.config
+                  ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/25'
+                  : 'text-muted-foreground'
+              )}
+            >
+              <span
+                className={cn(
+                  'h-1.5 w-1.5 rounded-full',
+                  data?.config
+                    ? 'bg-emerald-500 shadow-[0_0_6px_hsl(160_84%_45%/0.8)]'
+                    : 'bg-muted-foreground/50'
+                )}
+              />
               {data?.config ? PROVIDER_LABELS[data.config.provider] : 'Not Configured'}
             </Badge>
           </CardTitle>

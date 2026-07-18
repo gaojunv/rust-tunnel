@@ -15,6 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { AlertTriangle } from 'lucide-react';
 import { useCreateProxyRule, useUpdateProxyRule } from '@/api/hooks';
 import { HttpRouteFields } from './HttpRouteFields';
 import type { ProxyRule, RuleType, Route, ProxyTlsConfig, CreateProxyRuleRequest } from '@/types';
@@ -81,7 +82,6 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         const details = (body.conflicts ?? [])
           .map((c) => c.reason)
           .join('; ');
-        // eslint-disable-next-line no-alert
         alert(`规则冲突：${body.error ?? '与现有规则冲突'}${details ? '\n' + details : ''}`);
       }
     };
@@ -110,34 +110,34 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         <DialogHeader>
           <DialogTitle>{editingRule ? 'Edit Rule' : 'New Rule'}</DialogTitle>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {/* Name */}
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Name</label>
-            <Input
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              placeholder="my-proxy-rule"
-              required
-            />
-          </div>
-
-          {/* Rule Type */}
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Type</label>
-            <Select
-              value={form.type}
-              onValueChange={(v) => setForm({ ...form, type: v as RuleType })}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="http">HTTP</SelectItem>
-                <SelectItem value="tcp">TCP</SelectItem>
-                <SelectItem value="udp">UDP</SelectItem>
-              </SelectContent>
-            </Select>
+        <form onSubmit={handleSubmit} className="space-y-5">
+          {/* Name + Type */}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Name</label>
+              <Input
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                placeholder="my-proxy-rule"
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Type</label>
+              <Select
+                value={form.type}
+                onValueChange={(v) => setForm({ ...form, type: v as RuleType })}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="http">HTTP</SelectItem>
+                  <SelectItem value="tcp">TCP</SelectItem>
+                  <SelectItem value="udp">UDP</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
 
           {/* Listen Address */}
@@ -147,6 +147,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
               value={form.listen}
               onChange={(e) => setForm({ ...form, listen: e.target.value })}
               placeholder="0.0.0.0:8080"
+              className="font-mono"
               required
             />
           </div>
@@ -182,13 +183,14 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
                   })
                 }
                 placeholder="127.0.0.1:3000"
+                className="font-mono"
                 required
               />
             </div>
           )}
 
           {/* Enabled */}
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between rounded-lg border bg-muted/30 p-4">
             <div>
               <div className="text-sm font-medium">Enabled</div>
               <div className="text-xs text-muted-foreground">Start this proxy rule immediately</div>
@@ -201,9 +203,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
           {/* Error */}
           {mutation.isError && (
-            <p className="text-sm text-destructive">
+            <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
               Failed to {editingRule ? 'update' : 'create'} rule. Please try again.
-            </p>
+            </div>
           )}
 
           {/* Submit */}

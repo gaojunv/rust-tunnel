@@ -1,27 +1,40 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getShadowsocksConfig, getShadowsocksStats, getShadowsocksQuality } from '../api/client';
 import type { ShadowsocksQuality } from '../types';
 import { getQualityColor, getQualityText } from './ClientList';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 import { formatBytes, formatBps } from '../utils/format';
-import { ChartContainer } from './shared/ChartContainer';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 import { TimeRangeSelector } from './shared/TimeRangeSelector';
 import { useTimeRange, type TimeRange } from '../hooks/useTimeRange';
-import { useTheme } from '../theme/ThemeProvider';
 
 const ThroughputHistory = ({ qualityList, timeRange }: {
   qualityList: ShadowsocksQuality[];
   timeRange: TimeRange;
 }) => {
-  const { resolvedTheme } = useTheme();
-  const isDark = resolvedTheme === 'dark';
-  const axisColor = isDark ? '#94a3b8' : '#6b7280';
-  const gridColor = isDark ? '#334155' : '#e5e7eb';
-  const tooltipStyle = isDark
-    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
-    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
-  const tooltipTextStyle = { color: tooltipStyle.color };
+  const chartConfig = useMemo<ChartConfig>(() => {
+    const config: ChartConfig = {};
+    qualityList.forEach((q, idx) => {
+      config[`in_${q.port}`] = {
+        label: `In (Port ${q.port}) B/s`,
+        color: `hsl(var(--chart-${((idx * 2) % 5) + 1}))`,
+      };
+      config[`out_${q.port}`] = {
+        label: `Out (Port ${q.port}) B/s`,
+        color: `hsl(var(--chart-${((idx * 2 + 1) % 5) + 1}))`,
+      };
+    });
+    return config;
+  }, [qualityList]);
 
   // Merge samples by timestamp (milliseconds) to avoid the old string-key dedup bug
   const timeMap = new Map<number, Record<string, number | string>>();
@@ -31,38 +44,66 @@ const ThroughputHistory = ({ qualityList, timeRange }: {
       if (ts < timeRange.startMs || ts > timeRange.endMs) continue;
       if (!timeMap.has(ts)) timeMap.set(ts, { time: ts });
       const pt = timeMap.get(ts)!;
-      pt[`In (Port ${q.port}) B/s`] = s.bytes_in_per_sec;
-      pt[`Out (Port ${q.port}) B/s`] = s.bytes_out_per_sec;
+      pt[`in_${q.port}`] = s.bytes_in_per_sec;
+      pt[`out_${q.port}`] = s.bytes_out_per_sec;
     }
   }
   const chartData = Array.from(timeMap.values())
     .sort((a, b) => (a.time as number) - (b.time as number));
 
   if (chartData.length === 0) {
-    return <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No throughput data available yet</p>;
+    return <p className="py-4 text-center text-sm text-muted-foreground">No throughput data available yet</p>;
   }
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <LineChart data={chartData}>
-        <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-        <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }}
-          tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()} stroke={axisColor} />
-        <YAxis tick={{ fontSize: 10, fill: axisColor }} tickFormatter={formatBps} stroke={axisColor} />
-        <Tooltip formatter={(value: number) => formatBps(value)}
-          labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
-          contentStyle={tooltipStyle}
-          labelStyle={tooltipTextStyle}
-          itemStyle={tooltipTextStyle} />
+    <ChartContainer config={chartConfig} className="h-[200px] w-full">
+      <LineChart data={chartData} margin={{ left: 12, right: 12 }}>
+        <CartesianGrid strokeDasharray="3 3" vertical={false} />
+        <XAxis
+          dataKey="time"
+          tickLine={false}
+          axisLine={false}
+          tickMargin={8}
+          tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
+        />
+        <YAxis
+          tickLine={false}
+          axisLine={false}
+          tickMargin={8}
+          tickFormatter={formatBps}
+          width={70}
+        />
+        <ChartTooltip
+          content={
+            <ChartTooltipContent
+              labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
+              formatter={(value, name) => (
+                <div className="flex w-full items-center gap-2">
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                    style={{ backgroundColor: chartConfig[name]?.color }}
+                  />
+                  <span className="flex-1 text-muted-foreground">
+                    {chartConfig[name]?.label ?? name}
+                  </span>
+                  <span className="font-mono font-medium tabular-nums text-foreground">
+                    {formatBps(Number(value))}
+                  </span>
+                </div>
+              )}
+            />
+          }
+        />
+        <ChartLegend content={<ChartLegendContent />} />
         {qualityList.map(q => (
           <React.Fragment key={q.port}>
-            <Line type="monotone" dataKey={`In (Port ${q.port}) B/s`}
-              stroke="#3b82f6" dot={false} strokeWidth={2} />
-            <Line type="monotone" dataKey={`Out (Port ${q.port}) B/s`}
-              stroke="#10b981" dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey={`in_${q.port}`}
+              stroke={`var(--color-in_${q.port})`} dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey={`out_${q.port}`}
+              stroke={`var(--color-out_${q.port})`} dot={false} strokeWidth={2} />
           </React.Fragment>
         ))}
       </LineChart>
-    </ResponsiveContainer>
+    </ChartContainer>
   );
 };
 
@@ -191,9 +232,14 @@ export const ShadowsocksPage = () => {
               onCustomChange={setCustomRange}
             />
           </div>
-          <ChartContainer title="Throughput History">
-            <ThroughputHistory qualityList={qualityList} timeRange={range} />
-          </ChartContainer>
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Throughput History</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ThroughputHistory qualityList={qualityList} timeRange={range} />
+            </CardContent>
+          </Card>
         </div>
       )}
     </div>

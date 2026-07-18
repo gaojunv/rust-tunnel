@@ -1,32 +1,40 @@
-import React, { useMemo } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { Fragment, useMemo } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 import type { PortTraffic } from '../types';
-import { ChartContainer } from './shared/ChartContainer';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 import { TimeRangeSelector } from './shared/TimeRangeSelector';
 import { useTimeRange } from '../hooks/useTimeRange';
 import { formatBytes } from '../utils/format';
-import { useMediaQuery } from '../hooks/useMediaQuery';
-import { useTheme } from '../theme/ThemeProvider';
 
 interface TrafficChartProps {
   traffic: PortTraffic[];
 }
 
-const colorPool = ['#3b82f6', '#10b981', '#8b5cf6', '#f59e0b', '#ef4444', '#06b6d4'];
-
 export const TrafficChart = ({ traffic }: TrafficChartProps) => {
-  const { resolvedTheme } = useTheme();
   const { range, preset, presets, setPreset, setCustomRange } = useTimeRange();
-  const isSmallScreen = useMediaQuery('(max-width: 639px)');
 
-  const isDark = resolvedTheme === 'dark';
-  const axisColor = isDark ? '#94a3b8' : '#6b7280';
-  const gridColor = isDark ? '#334155' : '#e5e7eb';
-  const tooltipStyle = isDark
-    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
-    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
-  const tooltipTextStyle = { color: tooltipStyle.color };
-  const legendStyle = isDark ? { color: '#e2e8f0' } : { color: '#111827' };
+  const chartConfig = useMemo<ChartConfig>(() => {
+    const config: ChartConfig = {};
+    traffic.forEach((portTraffic, idx) => {
+      config[`in_${portTraffic.port}`] = {
+        label: `In (Port ${portTraffic.port})`,
+        color: `hsl(var(--chart-${((idx * 2) % 5) + 1}))`,
+      };
+      config[`out_${portTraffic.port}`] = {
+        label: `Out (Port ${portTraffic.port})`,
+        color: `hsl(var(--chart-${((idx * 2 + 1) % 5) + 1}))`,
+      };
+    });
+    return config;
+  }, [traffic]);
 
   const chartData = useMemo(() => {
     const timeMap = new Map<number, Record<string, number | string>>();
@@ -60,59 +68,76 @@ export const TrafficChart = ({ traffic }: TrafficChartProps) => {
           onCustomChange={setCustomRange}
         />
       </div>
-      <ChartContainer title="Network Traffic">
-        {chartData.length === 0 ? (
-          <p className="text-gray-500 text-center py-8 dark:text-slate-400">No data available</p>
-        ) : (
-          <ResponsiveContainer width="100%" height={isSmallScreen ? 250 : 300}>
-            <LineChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-              <XAxis
-                dataKey="time"
-                tick={{ fontSize: isSmallScreen ? 9 : 12, fill: axisColor }}
-                tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
-                stroke={axisColor}
-              />
-              <YAxis
-                tick={{ fontSize: isSmallScreen ? 9 : 12, fill: axisColor }}
-                tickFormatter={formatBytes}
-                width={70}
-                stroke={axisColor}
-              />
-              <Tooltip
-                formatter={(value: number) => formatBytes(value)}
-                labelFormatter={(ts: number) => new Date(ts).toLocaleString()}
-                contentStyle={tooltipStyle}
-                labelStyle={tooltipTextStyle}
-                itemStyle={tooltipTextStyle}
-              />
-              <Legend
-                wrapperStyle={{ fontSize: isSmallScreen ? '10px' : '12px', ...legendStyle }}
-              />
-              {traffic.map((portTraffic, idx) => (
-                <React.Fragment key={portTraffic.port}>
-                  <Line
-                    type="monotone"
-                    dataKey={`in_${portTraffic.port}`}
-                    name={`In (Port ${portTraffic.port})`}
-                    stroke={colorPool[idx * 2 % colorPool.length]}
-                    dot={false}
-                    strokeWidth={2}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey={`out_${portTraffic.port}`}
-                    name={`Out (Port ${portTraffic.port})`}
-                    stroke={colorPool[(idx * 2 + 1) % colorPool.length]}
-                    dot={false}
-                    strokeWidth={2}
-                  />
-                </React.Fragment>
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
-        )}
-      </ChartContainer>
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-lg">Network Traffic</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {chartData.length === 0 ? (
+            <p className="py-8 text-center text-muted-foreground">No data available</p>
+          ) : (
+            <ChartContainer config={chartConfig} className="h-[250px] w-full sm:h-[300px]">
+              <LineChart data={chartData} margin={{ left: 12, right: 12 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                <XAxis
+                  dataKey="time"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  tickFormatter={(ts: number) => new Date(ts).toLocaleTimeString()}
+                />
+                <YAxis
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  tickFormatter={formatBytes}
+                  width={70}
+                />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(ts) => new Date(Number(ts)).toLocaleString()}
+                      formatter={(value, name) => (
+                        <div className="flex w-full items-center gap-2">
+                          <span
+                            className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                            style={{ backgroundColor: chartConfig[name]?.color }}
+                          />
+                          <span className="flex-1 text-muted-foreground">
+                            {chartConfig[name]?.label ?? name}
+                          </span>
+                          <span className="font-mono font-medium tabular-nums text-foreground">
+                            {formatBytes(Number(value))}
+                          </span>
+                        </div>
+                      )}
+                    />
+                  }
+                />
+                <ChartLegend content={<ChartLegendContent />} />
+                {traffic.map((portTraffic) => (
+                  <Fragment key={portTraffic.port}>
+                    <Line
+                      type="monotone"
+                      dataKey={`in_${portTraffic.port}`}
+                      stroke={`var(--color-in_${portTraffic.port})`}
+                      dot={false}
+                      strokeWidth={2}
+                    />
+                    <Line
+                      type="monotone"
+                      dataKey={`out_${portTraffic.port}`}
+                      stroke={`var(--color-out_${portTraffic.port})`}
+                      dot={false}
+                      strokeWidth={2}
+                    />
+                  </Fragment>
+                ))}
+              </LineChart>
+            </ChartContainer>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 };

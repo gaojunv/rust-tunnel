@@ -7,7 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Plus, Trash2 } from 'lucide-react';
+import { AlertTriangle, Plus, Trash2 } from 'lucide-react';
 import type { Backend, BackendScheme, BackendProtocol } from '@/types';
 
 interface BackendFieldsProps {
@@ -43,13 +43,13 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
         const protocol = backend.protocol ?? 'http1';
         const showH2cHint = protocol === 'http2' && scheme === 'http';
         return (
-          <div key={index} className="space-y-2 rounded-md border p-2">
+          <div key={index} className="space-y-3 rounded-lg border bg-muted/30 p-3">
             <div className="flex items-center gap-2">
               <Input
                 value={backend.addr}
                 onChange={(e) => updateBackend(index, 'addr', e.target.value)}
                 placeholder="127.0.0.1:8080"
-                className="flex-1"
+                className="flex-1 font-mono"
               />
               <Input
                 type="number"
@@ -106,7 +106,8 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
               </div>
             </div>
             {showH2cHint && (
-              <p className="text-xs text-yellow-600">
+              <p className="flex items-center gap-1.5 text-xs text-amber-500">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                 h2c prior-knowledge: 后端需支持明文 HTTP/2
               </p>
             )}

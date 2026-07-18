@@ -67,7 +67,7 @@ export function HttpRouteFields({
       </div>
 
       {/* Routes */}
-      <div className="space-y-4">
+      <div className="space-y-3">
         <div className="flex items-center justify-between">
           <label className="text-sm font-medium">Routes</label>
           <Button type="button" variant="outline" size="sm" onClick={addRoute}>
@@ -76,7 +76,7 @@ export function HttpRouteFields({
           </Button>
         </div>
         {routes.map((route, index) => (
-          <div key={index} className="rounded-md border p-4 space-y-3">
+          <div key={index} className="rounded-lg border bg-muted/30 p-4 space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-sm font-medium">Route {index + 1}</span>
               <Button
@@ -92,6 +92,7 @@ export function HttpRouteFields({
               value={route.path}
               onChange={(e) => updateRoute(index, { path: e.target.value })}
               placeholder="/api"
+              className="font-mono"
             />
             <BackendFields
               backends={route.backends}
@@ -119,7 +120,7 @@ export function HttpRouteFields({
       </div>
 
       {/* TLS */}
-      <div className="space-y-3 rounded-md border p-4">
+      <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm font-medium">TLS</div>
@@ -153,13 +154,16 @@ export function HttpRouteFields({
               />
             </div>
             {tls.acme && (
-              <Input
-                value={tls.domain ?? ''}
-                onChange={(e) =>
-                  onTlsChange({ ...tls, domain: e.target.value })
-                }
-                placeholder="example.com"
-              />
+              <div className="space-y-1">
+                <label className="text-xs text-muted-foreground">Domain</label>
+                <Input
+                  value={tls.domain ?? ''}
+                  onChange={(e) =>
+                    onTlsChange({ ...tls, domain: e.target.value })
+                  }
+                  placeholder="example.com"
+                />
+              </div>
             )}
           </>
         )}

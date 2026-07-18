@@ -1,12 +1,18 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getPortTraffic, getPortQuality } from '../api/client';
 import type { PortTraffic, PortQualityResponse, QualitySample } from '../types';
 import { TrafficChart } from './TrafficChart';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, BarChart, Bar } from 'recharts';
 import { getQualityColor, getQualityText } from './ClientList';
 import { formatBytes, formatMs, formatPercent } from '../utils/format';
 import { useMediaQuery } from '../hooks/useMediaQuery';
-import { useTheme } from '../theme/ThemeProvider';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 
 interface ClientDetailProps {
   port: number;
@@ -59,15 +65,13 @@ const QualityGauge = ({ score }: { score: number }) => {
 };
 
 // RTT chart component
-const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
-  const { resolvedTheme } = useTheme();
-  const isDark = resolvedTheme === 'dark';
-  const axisColor = isDark ? '#94a3b8' : '#6b7280';
-  const gridColor = isDark ? '#334155' : '#e5e7eb';
-  const tooltipStyle = isDark
-    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
-    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
-  const tooltipTextStyle = { color: tooltipStyle.color };
+const RTTChart = ({ samples }: { samples: QualitySample[] }) => {
+  const chartConfig = useMemo<ChartConfig>(
+    () => ({
+      avg_rtt_ms: { label: 'Avg RTT', color: 'hsl(var(--chart-1))' },
+    }),
+    []
+  );
 
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
@@ -78,44 +82,55 @@ const RTTChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmal
     <div>
       <h4 className="text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">RTT History (Last 60 min)</h4>
       {chartData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
-          <LineChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
-            <YAxis tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
-            <Tooltip
-              formatter={(value: number) => formatMs(value)}
-              contentStyle={tooltipStyle}
-              labelStyle={tooltipTextStyle}
-              itemStyle={tooltipTextStyle}
+        <ChartContainer config={chartConfig} className="h-[150px] w-full sm:h-[200px]">
+          <LineChart data={chartData} margin={{ left: 12, right: 12 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="time" tickLine={false} axisLine={false} tickMargin={8} />
+            <YAxis tickLine={false} axisLine={false} tickMargin={8} width={50} />
+            <ChartTooltip
+              content={
+                <ChartTooltipContent
+                  formatter={(value, name) => (
+                    <div className="flex w-full items-center gap-2">
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                        style={{ backgroundColor: chartConfig[name]?.color }}
+                      />
+                      <span className="flex-1 text-muted-foreground">
+                        {chartConfig[name]?.label ?? name}
+                      </span>
+                      <span className="font-mono font-medium tabular-nums text-foreground">
+                        {formatMs(Number(value))}
+                      </span>
+                    </div>
+                  )}
+                />
+              }
             />
             <Line
               type="monotone"
               dataKey="avg_rtt_ms"
-              name="Avg RTT"
-              stroke="#3b82f6"
+              stroke="var(--color-avg_rtt_ms)"
               dot={false}
               strokeWidth={2}
             />
           </LineChart>
-        </ResponsiveContainer>
+        </ChartContainer>
       ) : (
-        <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No RTT data available</p>
+        <p className="py-4 text-center text-sm text-muted-foreground">No RTT data available</p>
       )}
     </div>
   );
 };
 
 // Loss rate chart component
-const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSmallScreen: boolean }) => {
-  const { resolvedTheme } = useTheme();
-  const isDark = resolvedTheme === 'dark';
-  const axisColor = isDark ? '#94a3b8' : '#6b7280';
-  const gridColor = isDark ? '#334155' : '#e5e7eb';
-  const tooltipStyle = isDark
-    ? { backgroundColor: '#1e293b', border: '1px solid #475569', color: '#f1f5f9' }
-    : { backgroundColor: '#ffffff', border: '1px solid #e5e7eb', color: '#111827' };
-  const tooltipTextStyle = { color: tooltipStyle.color };
+const LossChart = ({ samples }: { samples: QualitySample[] }) => {
+  const chartConfig = useMemo<ChartConfig>(
+    () => ({
+      loss_rate: { label: 'Loss Rate', color: 'hsl(var(--chart-2))' },
+    }),
+    []
+  );
 
   const chartData = samples.map(sample => ({
     time: new Date(sample.timestamp).toLocaleTimeString(),
@@ -126,27 +141,46 @@ const LossChart = ({ samples, isSmallScreen }: { samples: QualitySample[]; isSma
     <div>
       <h4 className="text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Packet Loss History (Last 60 min)</h4>
       {chartData.length > 0 ? (
-        <ResponsiveContainer width="100%" height={isSmallScreen ? 150 : 200}>
-          <BarChart data={chartData}>
-            <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-            <XAxis dataKey="time" tick={{ fontSize: 10, fill: axisColor }} stroke={axisColor} />
-            <YAxis tick={{ fontSize: 10, fill: axisColor }} unit="%" stroke={axisColor} />
-            <Tooltip
-              formatter={(value: number) => `${value.toFixed(2)}%`}
-              contentStyle={tooltipStyle}
-              labelStyle={tooltipTextStyle}
-              itemStyle={tooltipTextStyle}
+        <ChartContainer config={chartConfig} className="h-[150px] w-full sm:h-[200px]">
+          <BarChart data={chartData} margin={{ left: 12, right: 12 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="time" tickLine={false} axisLine={false} tickMargin={8} />
+            <YAxis
+              tickLine={false}
+              axisLine={false}
+              tickMargin={8}
+              tickFormatter={(v: number) => `${v}%`}
+              width={50}
+            />
+            <ChartTooltip
+              content={
+                <ChartTooltipContent
+                  formatter={(value, name) => (
+                    <div className="flex w-full items-center gap-2">
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+                        style={{ backgroundColor: chartConfig[name]?.color }}
+                      />
+                      <span className="flex-1 text-muted-foreground">
+                        {chartConfig[name]?.label ?? name}
+                      </span>
+                      <span className="font-mono font-medium tabular-nums text-foreground">
+                        {`${Number(value).toFixed(2)}%`}
+                      </span>
+                    </div>
+                  )}
+                />
+              }
             />
             <Bar
               dataKey="loss_rate"
-              name="Loss Rate"
-              fill="#ef4444"
+              fill="var(--color-loss_rate)"
               radius={[2, 2, 0, 0]}
             />
           </BarChart>
-        </ResponsiveContainer>
+        </ChartContainer>
       ) : (
-        <p className="text-gray-500 dark:text-slate-400 text-center py-4 text-sm">No loss data available</p>
+        <p className="py-4 text-center text-sm text-muted-foreground">No loss data available</p>
       )}
     </div>
   );
@@ -235,10 +269,10 @@ export const ClientDetail = ({ port, onClose }: ClientDetailProps) => {
                   {/* Quality Charts */}
                   <div className="grid grid-cols-1 gap-4 mt-4">
                     <div className="bg-gray-50 dark:bg-slate-700/50 p-4 rounded-lg">
-                      <RTTChart samples={quality.history} isSmallScreen={isSmallScreen} />
+                      <RTTChart samples={quality.history} />
                     </div>
                     <div className="bg-gray-50 dark:bg-slate-700/50 p-4 rounded-lg">
-                      <LossChart samples={quality.history} isSmallScreen={isSmallScreen} />
+                      <LossChart samples={quality.history} />
                     </div>
                   </div>
                 </div>

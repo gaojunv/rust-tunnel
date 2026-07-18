@@ -5,19 +5,22 @@ export type ResolvedTheme = 'light' | 'dark';
 
 export const THEME_PREFERENCES: ThemePreference[] = ['system', 'light', 'dark'];
 
+/** 未保存偏好时的默认主题：深色优先 */
+export const DEFAULT_THEME_PREFERENCE: ThemePreference = 'dark';
+
 export const isThemePreference = (value: unknown): value is ThemePreference =>
   typeof value === 'string' && THEME_PREFERENCES.includes(value as ThemePreference);
 
 export const readStoredThemePreference = (storage: Storage | undefined): ThemePreference => {
   if (!storage) {
-    return 'system';
+    return DEFAULT_THEME_PREFERENCE;
   }
 
   try {
     const value = storage.getItem(THEME_STORAGE_KEY);
-    return isThemePreference(value) ? value : 'system';
+    return isThemePreference(value) ? value : DEFAULT_THEME_PREFERENCE;
   } catch {
-    return 'system';
+    return DEFAULT_THEME_PREFERENCE;
   }
 };
 

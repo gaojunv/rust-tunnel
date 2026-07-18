@@ -17,11 +17,31 @@ export default function SettingsPage() {
       />
 
       <Tabs value={activeTab} onValueChange={setActiveTab}>
-        <TabsList>
-          <TabsTrigger value="general">General</TabsTrigger>
-          <TabsTrigger value="proxy">Proxy</TabsTrigger>
-          <TabsTrigger value="dns">DNS</TabsTrigger>
-          <TabsTrigger value="security">Security</TabsTrigger>
+        <TabsList className="border bg-card/60 backdrop-blur-xl">
+          <TabsTrigger
+            value="general"
+            className="data-[state=active]:bg-primary/10 data-[state=active]:text-primary"
+          >
+            General
+          </TabsTrigger>
+          <TabsTrigger
+            value="proxy"
+            className="data-[state=active]:bg-primary/10 data-[state=active]:text-primary"
+          >
+            Proxy
+          </TabsTrigger>
+          <TabsTrigger
+            value="dns"
+            className="data-[state=active]:bg-primary/10 data-[state=active]:text-primary"
+          >
+            DNS
+          </TabsTrigger>
+          <TabsTrigger
+            value="security"
+            className="data-[state=active]:bg-primary/10 data-[state=active]:text-primary"
+          >
+            Security
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="general">

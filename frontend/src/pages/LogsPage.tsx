@@ -27,11 +27,11 @@ import { cn } from '@/lib/utils';
 const LEVEL_OPTIONS = ['ALL', 'TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'] as const;
 
 const LEVEL_COLORS: Record<string, string> = {
-  ERROR: 'bg-red-500/20 text-red-400 border-red-500/30',
-  WARN: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-  INFO: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  DEBUG: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
-  TRACE: 'bg-zinc-500/20 text-zinc-500 border-zinc-500/30',
+  ERROR: 'bg-red-500/10 text-red-500 border-red-500/25',
+  WARN: 'bg-amber-500/10 text-amber-500 border-amber-500/25',
+  INFO: 'bg-sky-500/10 text-sky-500 border-sky-500/25',
+  DEBUG: 'bg-violet-500/10 text-violet-500 border-violet-500/25',
+  TRACE: 'bg-muted text-muted-foreground border-border',
 };
 
 function formatTimestamp(microseconds: number): string {
@@ -303,7 +303,7 @@ export default function LogsPage() {
             <div
               ref={scrollContainerRef}
               onScroll={handleScroll}
-              className="h-[calc(100vh-320px)] overflow-y-auto"
+              className="h-[calc(100vh-320px)] overflow-y-auto bg-muted/30 dark:bg-black/40"
             >
               <div className="space-y-0.5 p-4">
                 {hasMore && (
@@ -370,7 +370,7 @@ export default function LogsPage() {
           {isPaused && (
             <Badge
               variant="outline"
-              className="border-yellow-500/30 bg-yellow-500/20 text-yellow-400"
+              className="border-amber-500/25 bg-amber-500/10 text-amber-500"
             >
               Paused
             </Badge>

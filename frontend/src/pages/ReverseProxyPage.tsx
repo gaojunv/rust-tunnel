@@ -45,7 +45,7 @@ export default function ReverseProxyPage() {
         title="Reverse Proxy"
         description="Manage HTTP, TCP, and UDP proxy rules"
       >
-        <Button onClick={handleCreate}>
+        <Button onClick={handleCreate} className="shadow-glow">
           <Plus className="mr-2 h-4 w-4" />
           New Rule
         </Button>

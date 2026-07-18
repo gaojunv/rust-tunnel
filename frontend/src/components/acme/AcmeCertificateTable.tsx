@@ -34,8 +34,8 @@ function getExpiryColor(expiresAt?: string) {
   if (!expiresAt) return '';
   const daysLeft =
     (new Date(expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24);
-  if (daysLeft < 7) return 'text-red-500';
-  if (daysLeft < 30) return 'text-yellow-500';
+  if (daysLeft < 7) return 'text-red-500 font-medium';
+  if (daysLeft < 30) return 'text-amber-500 font-medium';
   return '';
 }
 

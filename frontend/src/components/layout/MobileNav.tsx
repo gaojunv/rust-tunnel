@@ -37,7 +37,7 @@ export function MobileNav({ onLogout }: MobileNavProps) {
   const location = useLocation();
 
   return (
-    <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-card md:hidden">
+    <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-card/60 backdrop-blur-xl md:hidden">
       <nav className="flex h-16 items-center justify-around">
         {coreTabs.map((tab) => (
           <Link

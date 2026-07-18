@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
 import {
   Dialog,
   DialogContent,
@@ -95,7 +96,7 @@ export default function DnsPage() {
               <div className="space-y-2">
                 <label className="text-sm font-medium">Type</label>
                 <select
-                  className="w-full rounded-md border bg-background px-3 py-2"
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   value={newRecord.record_type}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, record_type: e.target.value })
@@ -159,7 +160,14 @@ export default function DnsPage() {
                     <TableCell className="font-medium">
                       {record.name}
                     </TableCell>
-                    <TableCell>{record.record_type}</TableCell>
+                    <TableCell>
+                      <Badge
+                        variant="outline"
+                        className="font-mono text-[11px] font-semibold"
+                      >
+                        {record.record_type}
+                      </Badge>
+                    </TableCell>
                     <TableCell className="text-muted-foreground">
                       {record.value}
                     </TableCell>

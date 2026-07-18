@@ -96,37 +96,37 @@ export const ThemeToggle = () => {
         aria-label="切换主题"
         aria-haspopup="menu"
         aria-expanded={isOpen}
-        className="p-2 rounded-md text-gray-300 hover:text-white hover:bg-gray-700 dark:text-slate-200 dark:hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-white dark:focus:ring-offset-slate-900"
+        className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
       >
         {iconByPreference[preference]}
       </button>
 
       {isOpen && (
-        <div className="absolute right-0 mt-2 w-56 rounded-md shadow-lg bg-white dark:bg-slate-800 ring-1 ring-black ring-opacity-5 dark:ring-slate-700 focus:outline-none z-50">
+        <div className="absolute right-0 z-50 mt-2 w-56 rounded-lg border bg-popover shadow-xl focus:outline-none">
           <div className="py-1" role="menu" aria-orientation="vertical">
             {themeOptions.map((option) => (
               <button
                 key={option.value}
                 onClick={() => handleSelect(option.value)}
-                className={`group flex items-center w-full px-4 py-2 text-sm text-left ${
+                className={`group flex items-center w-full px-4 py-2 text-sm text-left transition-colors ${
                   preference === option.value
-                    ? 'bg-gray-100 dark:bg-slate-700 text-gray-900 dark:text-white'
-                    : 'text-gray-700 dark:text-slate-200 hover:bg-gray-50 dark:hover:bg-slate-700'
+                    ? 'bg-accent text-foreground'
+                    : 'text-muted-foreground hover:bg-accent hover:text-foreground'
                 }`}
                 role="menuitemradio"
                 aria-checked={preference === option.value}
               >
-                <span className="flex items-center justify-center w-6 h-6 mr-3 text-gray-400 dark:text-slate-400">
+                <span className="mr-3 flex h-6 w-6 items-center justify-center text-muted-foreground">
                   {iconByPreference[option.value]}
                 </span>
                 <span className="flex-1">
                   <div className="font-medium">{option.label}</div>
                   {option.description && (
-                    <div className="text-xs text-gray-500 dark:text-slate-400">{option.description}</div>
+                    <div className="text-xs text-muted-foreground">{option.description}</div>
                   )}
                 </span>
                 {preference === option.value && (
-                  <span className="ml-3 text-gray-600 dark:text-slate-300">
+                  <span className="ml-3 text-primary">
                     <CheckIcon />
                   </span>
                 )}

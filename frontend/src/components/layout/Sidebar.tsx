@@ -97,7 +97,7 @@ export function Sidebar({ onLogout, collapsed: controlledCollapsed, onCollapseCh
   return (
     <aside
       className={cn(
-        'fixed left-0 top-0 z-40 h-screen border-r bg-card transition-all duration-300',
+        'fixed left-0 top-0 z-40 h-screen border-r bg-card/60 backdrop-blur-xl transition-all duration-300',
         collapsed ? 'w-16' : 'w-64'
       )}
     >
@@ -107,8 +107,12 @@ export function Sidebar({ onLogout, collapsed: controlledCollapsed, onCollapseCh
           <div className="flex h-14 items-center justify-between border-b px-4">
             {!collapsed && (
               <Link to="/" className="flex items-center gap-2 font-semibold">
-                <Shield className="h-6 w-6" />
-                <span>Rust Tunnel</span>
+                <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-chart-2 shadow-glow">
+                  <Shield className="h-4 w-4 text-primary-foreground" />
+                </div>
+                <span className="bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent">
+                  Rust Tunnel
+                </span>
               </Link>
             )}
             <Button
@@ -140,12 +144,15 @@ export function Sidebar({ onLogout, collapsed: controlledCollapsed, onCollapseCh
                             <Link
                               to={item.href}
                               className={cn(
-                                'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium hover:bg-accent hover:text-accent-foreground',
+                                'relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground',
                                 location.pathname === item.href
-                                  ? 'bg-accent text-accent-foreground'
+                                  ? 'bg-primary/10 text-primary shadow-[inset_0_0_0_1px_hsl(var(--primary)/0.25)]'
                                   : 'text-muted-foreground'
                               )}
                             >
+                              {location.pathname === item.href && (
+                                <span className="absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-primary shadow-glow" />
+                              )}
                               {item.icon}
                               {!collapsed && <span>{item.label}</span>}
                             </Link>

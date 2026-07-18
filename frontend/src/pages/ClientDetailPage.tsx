@@ -1,28 +1,42 @@
+import { useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  ChartLegend,
+  ChartLegendContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 import { StatCard } from '@/components/shared/StatCard';
 import { QualityBadge } from '@/components/shared/QualityBadge';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { useClients, useQuality, useTraffic } from '@/api/hooks';
+import { formatBytes } from '@/utils/format';
 import { ArrowLeft, Signal, Clock, Activity, ArrowDown, ArrowUp } from 'lucide-react';
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-} from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts';
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
+const makeTooltipFormatter =
+  (config: ChartConfig, format: (value: number) => string) =>
+  (value: unknown, name: unknown) => {
+    const key = String(name);
+    return (
+      <div className="flex w-full items-center gap-2">
+        <span
+          className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+          style={{ backgroundColor: config[key]?.color }}
+        />
+        <span className="flex-1 text-muted-foreground">
+          {config[key]?.label ?? key}
+        </span>
+        <span className="font-mono font-medium tabular-nums text-foreground">
+          {format(Number(value))}
+        </span>
+      </div>
+    );
+  };
 
 export default function ClientDetailPage() {
   const { port } = useParams<{ port: string }>();
@@ -37,6 +51,39 @@ export default function ClientDetailPage() {
   const current = quality?.current;
   const history = quality?.history ?? [];
   const buckets = traffic?.buckets ?? [];
+
+  const trafficChartConfig = useMemo<ChartConfig>(
+    () => ({
+      bytes_in: { label: 'Bytes In', color: 'hsl(var(--chart-1))' },
+      bytes_out: { label: 'Bytes Out', color: 'hsl(var(--chart-2))' },
+    }),
+    []
+  );
+  const qualityChartConfig = useMemo<ChartConfig>(
+    () => ({
+      quality_score: { label: 'Quality Score', color: 'hsl(var(--chart-3))' },
+    }),
+    []
+  );
+  const rttChartConfig = useMemo<ChartConfig>(
+    () => ({
+      avg_rtt_ms: { label: 'Avg RTT', color: 'hsl(var(--chart-4))' },
+    }),
+    []
+  );
+  const lossChartConfig = useMemo<ChartConfig>(
+    () => ({
+      loss_rate: { label: 'Loss Rate', color: 'hsl(var(--chart-5))' },
+    }),
+    []
+  );
+  const throughputChartConfig = useMemo<ChartConfig>(
+    () => ({
+      bytes_in_per_sec: { label: 'Bytes In/s', color: 'hsl(var(--chart-1))' },
+      bytes_out_per_sec: { label: 'Bytes Out/s', color: 'hsl(var(--chart-2))' },
+    }),
+    []
+  );
 
   return (
     <div className="space-y-6">
@@ -98,34 +145,48 @@ export default function ClientDetailPage() {
           {buckets.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">No traffic data</div>
           ) : (
-            <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={buckets}>
-                <CartesianGrid strokeDasharray="3 3" />
+            <ChartContainer config={trafficChartConfig} className="h-[250px] w-full sm:h-[300px]">
+              <LineChart data={buckets} margin={{ left: 12, right: 12 }}>
+                <CartesianGrid strokeDasharray="3 3" vertical={false} />
                 <XAxis
                   dataKey="timestamp"
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
                   tickFormatter={(ts: string) => new Date(ts).toLocaleTimeString()}
                 />
-                <YAxis tickFormatter={(v: number) => formatBytes(v)} />
-                <Tooltip
-                  labelFormatter={(ts: string) => new Date(ts).toLocaleString()}
-                  formatter={(value: number) => formatBytes(value)}
+                <YAxis
+                  tickLine={false}
+                  axisLine={false}
+                  tickMargin={8}
+                  width={70}
+                  tickFormatter={(v: number) => formatBytes(v)}
                 />
+                <ChartTooltip
+                  content={
+                    <ChartTooltipContent
+                      labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                      formatter={makeTooltipFormatter(trafficChartConfig, formatBytes)}
+                    />
+                  }
+                />
+                <ChartLegend content={<ChartLegendContent />} />
                 <Line
                   type="monotone"
                   dataKey="bytes_in"
-                  stroke="#3b82f6"
-                  name="Bytes In"
+                  stroke="var(--color-bytes_in)"
                   dot={false}
+                  strokeWidth={2}
                 />
                 <Line
                   type="monotone"
                   dataKey="bytes_out"
-                  stroke="#10b981"
-                  name="Bytes Out"
+                  stroke="var(--color-bytes_out)"
                   dot={false}
+                  strokeWidth={2}
                 />
               </LineChart>
-            </ResponsiveContainer>
+            </ChartContainer>
           )}
         </CardContent>
       </Card>
@@ -143,111 +204,157 @@ export default function ClientDetailPage() {
               {/* Quality Score Chart */}
               <div>
                 <h4 className="text-sm font-medium mb-2">Quality Score</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={history}>
-                    <CartesianGrid strokeDasharray="3 3" />
+                <ChartContainer config={qualityChartConfig} className="h-[200px] w-full">
+                  <LineChart data={history} margin={{ left: 12, right: 12 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
                     <XAxis
                       dataKey="timestamp"
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
                       tickFormatter={(ts: string) => new Date(ts).toLocaleTimeString()}
                     />
-                    <YAxis domain={[0, 100]} />
-                    <Tooltip
-                      labelFormatter={(ts: string) => new Date(ts).toLocaleString()}
+                    <YAxis
+                      domain={[0, 100]}
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
+                    />
+                    <ChartTooltip
+                      content={
+                        <ChartTooltipContent
+                          labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                          formatter={makeTooltipFormatter(qualityChartConfig, (v) => v.toFixed(0))}
+                        />
+                      }
                     />
                     <Line
                       type="monotone"
                       dataKey="quality_score"
-                      stroke="#8b5cf6"
-                      name="Quality Score"
+                      stroke="var(--color-quality_score)"
                       dot={false}
+                      strokeWidth={2}
                     />
                   </LineChart>
-                </ResponsiveContainer>
+                </ChartContainer>
               </div>
 
               {/* RTT Chart */}
               <div>
                 <h4 className="text-sm font-medium mb-2">RTT (ms)</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={history}>
-                    <CartesianGrid strokeDasharray="3 3" />
+                <ChartContainer config={rttChartConfig} className="h-[200px] w-full">
+                  <LineChart data={history} margin={{ left: 12, right: 12 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
                     <XAxis
                       dataKey="timestamp"
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
                       tickFormatter={(ts: string) => new Date(ts).toLocaleTimeString()}
                     />
-                    <YAxis />
-                    <Tooltip
-                      labelFormatter={(ts: string) => new Date(ts).toLocaleString()}
-                      formatter={(value: number) => `${value.toFixed(1)}ms`}
+                    <YAxis tickLine={false} axisLine={false} tickMargin={8} />
+                    <ChartTooltip
+                      content={
+                        <ChartTooltipContent
+                          labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                          formatter={makeTooltipFormatter(rttChartConfig, (v) => `${v.toFixed(1)}ms`)}
+                        />
+                      }
                     />
                     <Line
                       type="monotone"
                       dataKey="avg_rtt_ms"
-                      stroke="#f59e0b"
-                      name="Avg RTT"
+                      stroke="var(--color-avg_rtt_ms)"
                       dot={false}
+                      strokeWidth={2}
                     />
                   </LineChart>
-                </ResponsiveContainer>
+                </ChartContainer>
               </div>
 
               {/* Loss Rate Chart */}
               <div>
                 <h4 className="text-sm font-medium mb-2">Loss Rate</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={history}>
-                    <CartesianGrid strokeDasharray="3 3" />
+                <ChartContainer config={lossChartConfig} className="h-[200px] w-full">
+                  <LineChart data={history} margin={{ left: 12, right: 12 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
                     <XAxis
                       dataKey="timestamp"
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
                       tickFormatter={(ts: string) => new Date(ts).toLocaleTimeString()}
                     />
-                    <YAxis tickFormatter={(v: number) => `${(v * 100).toFixed(0)}%`} />
-                    <Tooltip
-                      labelFormatter={(ts: string) => new Date(ts).toLocaleString()}
-                      formatter={(value: number) => `${(value * 100).toFixed(1)}%`}
+                    <YAxis
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
+                      tickFormatter={(v: number) => `${(v * 100).toFixed(0)}%`}
+                    />
+                    <ChartTooltip
+                      content={
+                        <ChartTooltipContent
+                          labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                          formatter={makeTooltipFormatter(lossChartConfig, (v) => `${(v * 100).toFixed(1)}%`)}
+                        />
+                      }
                     />
                     <Line
                       type="monotone"
                       dataKey="loss_rate"
-                      stroke="#ef4444"
-                      name="Loss Rate"
+                      stroke="var(--color-loss_rate)"
                       dot={false}
+                      strokeWidth={2}
                     />
                   </LineChart>
-                </ResponsiveContainer>
+                </ChartContainer>
               </div>
 
               {/* Throughput Chart */}
               <div>
                 <h4 className="text-sm font-medium mb-2">Throughput</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={history}>
-                    <CartesianGrid strokeDasharray="3 3" />
+                <ChartContainer config={throughputChartConfig} className="h-[200px] w-full">
+                  <LineChart data={history} margin={{ left: 12, right: 12 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} />
                     <XAxis
                       dataKey="timestamp"
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
                       tickFormatter={(ts: string) => new Date(ts).toLocaleTimeString()}
                     />
-                    <YAxis tickFormatter={(v: number) => formatBytes(v)} />
-                    <Tooltip
-                      labelFormatter={(ts: string) => new Date(ts).toLocaleString()}
-                      formatter={(value: number) => formatBytes(value)}
+                    <YAxis
+                      tickLine={false}
+                      axisLine={false}
+                      tickMargin={8}
+                      width={70}
+                      tickFormatter={(v: number) => formatBytes(v)}
                     />
+                    <ChartTooltip
+                      content={
+                        <ChartTooltipContent
+                          labelFormatter={(ts) => new Date(String(ts)).toLocaleString()}
+                          formatter={makeTooltipFormatter(throughputChartConfig, formatBytes)}
+                        />
+                      }
+                    />
+                    <ChartLegend content={<ChartLegendContent />} />
                     <Line
                       type="monotone"
                       dataKey="bytes_in_per_sec"
-                      stroke="#3b82f6"
-                      name="Bytes In/s"
+                      stroke="var(--color-bytes_in_per_sec)"
                       dot={false}
+                      strokeWidth={2}
                     />
                     <Line
                       type="monotone"
                       dataKey="bytes_out_per_sec"
-                      stroke="#10b981"
-                      name="Bytes Out/s"
+                      stroke="var(--color-bytes_out_per_sec)"
                       dot={false}
+                      strokeWidth={2}
                     />
                   </LineChart>
-                </ResponsiveContainer>
+                </ChartContainer>
               </div>
             </div>
           )}

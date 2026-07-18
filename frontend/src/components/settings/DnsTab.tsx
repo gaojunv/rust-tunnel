@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { useDnsConfig, useUpdateDnsConfig } from '@/api/hooks';
+import { Globe } from 'lucide-react';
 
 export default function DnsTab() {
   const { data, isLoading } = useDnsConfig();
@@ -26,14 +27,19 @@ export default function DnsTab() {
   };
 
   if (isLoading) {
-    return <div className="text-center py-8 text-muted-foreground">Loading...</div>;
+    return <div className="py-8 text-center text-muted-foreground">Loading...</div>;
   }
 
   return (
     <div className="space-y-6">
       <Card>
         <CardHeader>
-          <CardTitle>DNS Configuration</CardTitle>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Globe className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">DNS Configuration</CardTitle>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">

@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog';
 import { ChevronDown, Settings } from 'lucide-react';
 import { useAcmeConfig, useUpdateAcmeConfig } from '@/api/hooks';
+import { cn } from '@/lib/utils';
 import type { UpdateAcmeConfigRequest } from '@/types';
 
 export function AcmeConfigCard() {
@@ -59,7 +60,23 @@ export function AcmeConfigCard() {
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="flex items-center gap-2">
               ACME Configuration
-              <Badge variant={config.enabled ? 'default' : 'secondary'}>
+              <Badge
+                variant="outline"
+                className={cn(
+                  'gap-1.5 font-medium',
+                  config.enabled
+                    ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/25'
+                    : 'text-muted-foreground'
+                )}
+              >
+                <span
+                  className={cn(
+                    'h-1.5 w-1.5 rounded-full',
+                    config.enabled
+                      ? 'bg-emerald-500 shadow-[0_0_6px_hsl(160_84%_45%/0.8)]'
+                      : 'bg-muted-foreground/50'
+                  )}
+                />
                 {config.enabled ? 'Enabled' : 'Disabled'}
               </Badge>
             </CardTitle>

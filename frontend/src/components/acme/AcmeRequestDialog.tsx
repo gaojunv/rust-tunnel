@@ -75,7 +75,7 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
               <SelectContent>
                 <SelectItem value="http-01">
                   HTTP-01
-                  <Badge variant="secondary" className="ml-2 text-xs">
+                  <Badge variant="outline" className="ml-2 text-xs text-primary border-primary/25">
                     Recommended
                   </Badge>
                 </SelectItem>

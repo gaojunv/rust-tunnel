@@ -36,17 +36,16 @@ export const TimeRangeSelector = ({
 
   return (
     <div className={`flex items-center gap-2 ${isMobile ? 'flex-col items-start' : 'flex-wrap'}`}>
-      <div className="flex rounded-md shadow-sm" role="group">
+      <div className="flex rounded-lg border bg-muted/40 p-0.5" role="group">
         {presets.map((p) => (
           <button
             key={p}
             type="button"
             onClick={() => onPresetChange(p)}
-            className={`px-3 py-1.5 text-xs font-medium border transition-colors
-              first:rounded-l-md last:rounded-r-md
+            className={`rounded-md px-3 py-1 text-xs font-medium transition-colors
               ${preset === p
-                ? 'bg-blue-600 text-white border-blue-600 z-10'
-                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
+                ? 'bg-primary/15 text-primary shadow-[inset_0_0_0_1px_hsl(var(--primary)/0.3)]'
+                : 'text-muted-foreground hover:text-foreground'
               }`}
           >
             {PRESET_LABELS[p] || p}
@@ -58,10 +57,10 @@ export const TimeRangeSelector = ({
         <button
           type="button"
           onClick={() => onPresetChange('custom')}
-          className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors
+          className={`rounded-md px-3 py-1.5 text-xs font-medium border transition-colors
             ${preset === 'custom'
-              ? 'bg-blue-600 text-white border-blue-600'
-              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
+              ? 'bg-primary/15 text-primary border-primary/30'
+              : 'text-muted-foreground hover:text-foreground hover:bg-accent'
             }`}
         >
           Custom
@@ -75,9 +74,9 @@ export const TimeRangeSelector = ({
                 const v = new Date(e.target.value).getTime();
                 if (!isNaN(v)) onCustomChange(v, customEndMs);
               }}
-              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto bg-white text-gray-900 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+              className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground sm:w-auto"
             />
-            <span className="text-xs text-gray-400 dark:text-slate-500">-</span>
+            <span className="text-xs text-muted-foreground">-</span>
             <input
               type="datetime-local"
               value={toDatetimeLocal(customEndMs)}
@@ -85,7 +84,7 @@ export const TimeRangeSelector = ({
                 const v = new Date(e.target.value).getTime();
                 if (!isNaN(v)) onCustomChange(customStartMs, v);
               }}
-              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-full sm:w-auto bg-white text-gray-900 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+              className="w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground sm:w-auto"
             />
           </div>
         )}

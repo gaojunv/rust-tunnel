@@ -1,6 +1,7 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Link, Shield, Server, Globe } from 'lucide-react';
+import { cn } from '@/lib/utils';
 import type { CertConsumers } from '@/types';
 
 interface CertConsumerBindingProps {
@@ -59,15 +60,19 @@ export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
               return (
                 <div
                   key={item.key}
-                  className="flex items-center justify-between rounded-md border p-3"
+                  className={cn(
+                    'flex items-center justify-between rounded-lg border p-3 transition-colors',
+                    active ? 'border-emerald-500/25 bg-emerald-500/5' : 'bg-muted/30'
+                  )}
                 >
                   <div className="flex items-center gap-3">
                     <div
-                      className={
+                      className={cn(
+                        'flex h-8 w-8 items-center justify-center rounded-md border',
                         active
-                          ? 'text-green-500'
-                          : 'text-muted-foreground'
-                      }
+                          ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/25'
+                          : 'bg-muted text-muted-foreground'
+                      )}
                     >
                       {item.icon}
                     </div>
@@ -79,9 +84,22 @@ export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
                     </div>
                   </div>
                   <Badge
-                    variant={active ? 'default' : 'secondary'}
-                    className={active ? 'bg-green-500/10 text-green-700 border-green-200' : ''}
+                    variant="outline"
+                    className={cn(
+                      'gap-1.5 font-medium',
+                      active
+                        ? 'bg-emerald-500/10 text-emerald-500 border-emerald-500/25'
+                        : 'text-muted-foreground'
+                    )}
                   >
+                    <span
+                      className={cn(
+                        'h-1.5 w-1.5 rounded-full',
+                        active
+                          ? 'bg-emerald-500 shadow-[0_0_6px_hsl(160_84%_45%/0.8)]'
+                          : 'bg-muted-foreground/50'
+                      )}
+                    />
                     {active ? 'Active' : 'Inactive'}
                   </Badge>
                 </div>

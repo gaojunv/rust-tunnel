@@ -68,12 +68,10 @@ afterEach(() => {
 });
 
 describe('ThemeProvider', () => {
-  it('defaults to system and follows the current system theme', () => {
-    systemMatchesDark = true;
-
+  it('defaults to dark regardless of the current system theme', () => {
     renderProbe();
 
-    expect(screen.getByTestId('preference').textContent).toBe('system');
+    expect(screen.getByTestId('preference').textContent).toBe('dark');
     expect(screen.getByTestId('resolvedTheme').textContent).toBe('dark');
     expect(document.documentElement.classList.contains('dark')).toBe(true);
   });
