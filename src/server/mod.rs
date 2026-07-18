@@ -15,6 +15,7 @@ pub mod quality;
 pub mod reverse_proxy;
 pub mod shadowsocks;
 pub mod trojan;
+pub mod tunnel_stream;
 
 #[cfg(test)]
 mod shadowsocks_test;
