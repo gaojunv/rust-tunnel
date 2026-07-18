@@ -14,7 +14,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::error::ReconcileError;
-use super::handler::{handle_proxy_request_unified, RouteSource};
+use super::handler::{handle_proxy_request_unified, ConnectionCounts, RouteSource};
 use super::router::RouteTable;
 use super::upstream::UpstreamClient;
 use super::{ProxyRule, ReverseProxyState, RuleType};
@@ -37,6 +37,7 @@ impl SharedListener {
         initial_table: RouteTable,
         cert_manager: Option<Arc<CertificateManager>>,
         active_rule_ids: HashSet<String>,
+        connection_counts: ConnectionCounts,
     ) -> Result<Self, ReconcileError> {
         if tls_enabled && cert_manager.is_none() {
             return Err(ReconcileError::NoCertManager {
@@ -105,8 +106,10 @@ impl SharedListener {
                         let table = route_table_for_task.clone();
                         let acceptor = tls_acceptor.clone();
                         let upstream_c = upstream_for_task.clone();
+                        let cc = connection_counts.clone();
                         tokio::spawn(async move {
-                            handle_one_connection(stream, peer, acceptor, table, upstream_c).await;
+                            handle_one_connection(stream, peer, acceptor, table, upstream_c, cc)
+                                .await;
                         });
                     }
                 }
@@ -164,11 +167,12 @@ async fn handle_one_connection(
     acceptor: Option<TlsAcceptor>,
     route_table: Arc<ArcSwap<RouteTable>>,
     upstream: Arc<UpstreamClient>,
+    connection_counts: ConnectionCounts,
 ) {
     let source = RouteSource(route_table);
     let app: Router = Router::new()
         .fallback(any(handle_proxy_request_unified))
-        .with_state((source, upstream));
+        .with_state((source, upstream, connection_counts));
 
     match acceptor {
         Some(acc) => {
@@ -325,6 +329,7 @@ impl ReverseProxyState {
             new_table,
             self.cert_manager().cloned(),
             active_rule_ids,
+            self.connection_counts.clone(),
         )
         .await
         {

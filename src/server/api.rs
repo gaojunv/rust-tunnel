@@ -2540,6 +2540,15 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
 
     let api_tls = state.server_state.cert_manager.is_some();
     let trojan = !state.server_state.get_trojan_ports().await.is_empty();
+    let control_tls = state.server_state.cert_manager.is_some();
+
+    // Check if any reverse-proxy rule has TLS with ACME enabled
+    let reverse_proxy = {
+        let rules = state.server_state.proxy_state.rules.lock().await;
+        rules
+            .values()
+            .any(|r| r.tls.as_ref().is_some_and(|t| t.enabled && t.acme))
+    };
 
     Json(serde_json::json!({
         "enabled": enabled,
@@ -2549,8 +2558,8 @@ async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
         "consumers": {
             "api_tls": api_tls,
             "trojan": trojan,
-            "control_tls": true,
-            "reverse_proxy": false,
+            "control_tls": control_tls,
+            "reverse_proxy": reverse_proxy,
         },
     }))
     .into_response()

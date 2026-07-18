@@ -1,5 +1,6 @@
 //! Unified HTTP proxy request handler.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -17,6 +18,9 @@ use super::Backend;
 
 use hyper::header::{HeaderMap, HeaderValue};
 
+/// Per-rule connection counter shared with `ReverseProxyState`.
+pub type ConnectionCounts = Arc<tokio::sync::Mutex<HashMap<String, u64>>>;
+
 /// Where the handler pulls its routing decision from.
 ///
 /// The unified handler routes every request through a `RouteTable` snapshot.
@@ -26,7 +30,7 @@ use hyper::header::{HeaderMap, HeaderValue};
 pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 
 /// State injected into the axum Router.
-pub type ProxyState = (RouteSource, Arc<UpstreamClient>);
+pub type ProxyState = (RouteSource, Arc<UpstreamClient>, ConnectionCounts);
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
 /// and must be stripped by any intermediary.
@@ -108,18 +112,19 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     parts.join(" | ")
 }
 
-/// Resolve the target backend for a request. Returns `None` when no route
-/// matches (caller should reply 404).
+/// Resolve the target backend for a request. Returns the matched rule id and
+/// the selected backend, or `None` when no route matches (caller should reply
+/// 404).
 ///
 /// Both listener types (legacy per-rule and shared) go through this — legacy
 /// listeners just build a one-rule table. `RouteTable::match_http_request`
 /// already honors `rule.enabled`, longest-prefix matching, and the route's
 /// configured load balancing algorithm.
-async fn resolve_backend(source: &RouteSource, host: &str, path: &str) -> Option<Backend> {
+async fn resolve_backend(source: &RouteSource, host: &str, path: &str) -> Option<(String, Backend)> {
     let snap = source.0.load();
     snap.match_http_request(host, path)
         .await
-        .map(|(_, _, backend)| backend.clone())
+        .map(|(rule, _, backend)| (rule.id.clone(), backend.clone()))
 }
 
 /// Return true if the given headers announce a WebSocket-style upgrade
@@ -220,7 +225,7 @@ fn host_without_port(raw: &str) -> &str {
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
 pub async fn handle_proxy_request_unified(
-    State((source, upstream)): State<ProxyState>,
+    State((source, upstream, connection_counts)): State<ProxyState>,
     mut req: Request<Body>,
 ) -> Response {
     // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
@@ -244,12 +249,22 @@ pub async fn handle_proxy_request_unified(
     let incoming_version = req.version();
     let incoming_header_count = req.headers().len();
 
-    let Some(backend) = resolve_backend(&source, &host, &path).await else {
+    let Some((rule_id, backend)) = resolve_backend(&source, &host, &path).await else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from(format!("No route for host '{host}'")))
             .unwrap();
     };
+
+    // Track connection for stats
+    {
+        let mut counts = connection_counts.lock().await;
+        *counts.entry(rule_id.clone()).or_insert(0) += 1;
+    }
+
+    // Decrement on scope exit (deferred via clone)
+    let rule_id_for_decrement = rule_id.clone();
+    let counts_for_decrement = connection_counts.clone();
 
     // WebSocket upgrade path: capture the downstream OnUpgrade future BEFORE
     // `req` is consumed by `build_upstream_request` — hyper's upgrade handle
@@ -262,23 +277,44 @@ pub async fn handle_proxy_request_unified(
 
     let upstream_req = match build_upstream_request(req, &backend) {
         Ok(r) => r,
-        Err(e) => return error_response(&e),
+        Err(e) => {
+            // Decrement on build error
+            let mut counts = counts_for_decrement.lock().await;
+            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
+            return error_response(&e);
+        }
     };
+
+    let ws_potential = downstream_upgrade.is_some();
 
     match upstream.forward(&backend, upstream_req).await {
         Ok(mut resp) => {
+            let is_ws = ws_potential && resp.status() == StatusCode::SWITCHING_PROTOCOLS;
             if let Some(client_upgrade) = downstream_upgrade {
                 if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
                     // Take the upstream upgrade handle now, before `resp` is
                     // consumed by `build_downstream_response` — same one-shot
                     // constraint as the downstream side.
                     let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                    let rid = rule_id_for_decrement.clone();
+                    let cc = counts_for_decrement.clone();
                     tokio::spawn(async move {
                         let (client_up, server_up) =
                             match tokio::try_join!(client_upgrade, upstream_upgrade) {
                                 Ok(pair) => pair,
                                 Err(e) => {
                                     tracing::debug!("ws upgrade join failed: {e}");
+                                    // Decrement on WS join failure
+                                    let mut counts = cc.lock().await;
+                                    if let Some(c) = counts.get_mut(&rid) {
+                                        if *c > 0 {
+                                            *c -= 1;
+                                        }
+                                    }
                                     return;
                                 }
                             };
@@ -292,12 +328,35 @@ pub async fn handle_proxy_request_unified(
                         {
                             tracing::debug!("ws bidirectional copy ended: {e}");
                         }
+                        // Decrement on WS tunnel close
+                        let mut counts = cc.lock().await;
+                        if let Some(c) = counts.get_mut(&rid) {
+                            if *c > 0 {
+                                *c -= 1;
+                            }
+                        }
                     });
+                }
+            }
+            if !is_ws {
+                // Decrement for regular (non-WS) responses
+                let mut counts = counts_for_decrement.lock().await;
+                if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
+                    if *c > 0 {
+                        *c -= 1;
+                    }
                 }
             }
             build_downstream_response(resp)
         }
         Err(e) => {
+            // Decrement on upstream error
+            let mut counts = counts_for_decrement.lock().await;
+            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
             error!(
                 error = %error_chain(&e),
                 backend = %backend.addr,
@@ -462,11 +521,13 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
+        let connection_counts: ConnectionCounts =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // 3. Build the axum Router with the unified handler and bind it.
         let app = Router::new()
             .fallback(axum::routing::any(handle_proxy_request_unified))
-            .with_state((source, upstream));
+            .with_state((source, upstream, connection_counts));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -557,10 +618,12 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
+        let connection_counts: ConnectionCounts =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         let app = Router::new()
             .fallback(any(handle_proxy_request_unified))
-            .with_state((source, upstream));
+            .with_state((source, upstream, connection_counts));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -647,6 +710,8 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
+        let connection_counts: ConnectionCounts =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // Build a request the way hyper delivers an h2 request:
         // - authority set on the URI (from :authority pseudo-header)
@@ -659,7 +724,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((source, upstream));
+        let state = State((source, upstream, connection_counts));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(
@@ -774,12 +839,15 @@ mod tests {
             cert_status: None,
         };
         let table = RouteTable::from_rules(vec![rule]);
+        let connection_counts: ConnectionCounts =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let _listener = SharedListener::spawn(
             listen_addr.to_string(),
             false,
             table,
             Some(mgr),
             HashSet::from(["r_ws".to_string()]),
+            connection_counts,
         )
         .await
         .expect("shared listener spawn");
@@ -902,6 +970,8 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
+        let connection_counts: ConnectionCounts =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // h1-style: URI is just "/", host lives in the Host header.
         let req: AxumRequest<Body> = AxumRequest::builder()
@@ -911,7 +981,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((source, upstream));
+        let state = State((source, upstream, connection_counts));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(resp.status(), 200);
