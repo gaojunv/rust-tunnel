@@ -263,6 +263,10 @@ pub struct ReverseProxyState {
     db: Option<Database>,
     /// Concrete CertificateManager (needed for SNI resolver and coverage queries).
     cert_manager: Option<Arc<crate::server::acme::CertificateManager>>,
+    /// Direct connector (always available).
+    pub direct_connector: Arc<connector::DirectConnector>,
+    /// Optional client connector — Some(_) once ClientRegistry is wired in.
+    pub client_connector: Arc<tokio::sync::RwLock<Option<Arc<connector::ClientConnector>>>>,
 }
 
 /// Compute the cert coverage source for a rule at save time.
@@ -338,6 +342,8 @@ impl ReverseProxyState {
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: None,
             cert_manager: None,
+            direct_connector: Arc::new(connector::DirectConnector),
+            client_connector: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -352,6 +358,8 @@ impl ReverseProxyState {
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: Some(db),
             cert_manager: None,
+            direct_connector: Arc::new(connector::DirectConnector),
+            client_connector: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -373,6 +381,34 @@ impl ReverseProxyState {
         self.cert_manager
             .as_ref()
             .map(|m| m.clone() as Arc<dyn crate::server::acme::CertificateProvider>)
+    }
+
+    /// Set the ClientConnector once ClientRegistry is available.
+    pub async fn set_client_connector(&self, cc: Arc<connector::ClientConnector>) {
+        *self.client_connector.write().await = Some(cc);
+    }
+
+    /// Pick the correct connector for a backend. Returns Err if kind=Client
+    /// but no ClientConnector is registered yet.
+    pub async fn connector_for(
+        &self,
+        backend: &Backend,
+    ) -> std::io::Result<Arc<dyn connector::Connector>> {
+        match backend.kind {
+            BackendKind::Direct => Ok(self.direct_connector.clone() as Arc<dyn connector::Connector>),
+            BackendKind::Client => {
+                let guard = self.client_connector.read().await;
+                guard
+                    .as_ref()
+                    .map(|c| c.clone() as Arc<dyn connector::Connector>)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "client backend used before ClientConnector was registered",
+                        )
+                    })
+            }
+        }
     }
 
     /// Load rules from database

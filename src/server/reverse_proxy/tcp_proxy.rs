@@ -1,6 +1,6 @@
-use super::ReverseProxyState;
+use super::{Backend, ReverseProxyState};
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -20,11 +20,11 @@ impl TcpProxy {
     pub async fn start(
         &self,
         addr: SocketAddr,
-        backend_addr: String,
+        backend: Backend,
         rule_id: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(addr).await?;
-        info!("TCP proxy listening on {} -> {}", addr, backend_addr);
+        info!("TCP proxy listening on {} -> {}", addr, backend.addr);
 
         // Look up TLS configuration for this rule
         let tls_config = {
@@ -85,7 +85,7 @@ impl TcpProxy {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         let state = state.clone();
-                        let backend = backend_addr.clone();
+                        let backend = backend.clone();
                         let rule_id = rule_id_clone.clone();
                         let tls_acceptor = tls_acceptor.clone();
 
@@ -93,7 +93,7 @@ impl TcpProxy {
                             state.increment_connections(&rule_id).await;
 
                             if let Err(e) =
-                                handle_tcp_connection(stream, peer_addr, &backend, tls_acceptor)
+                                handle_tcp_connection(stream, peer_addr, state.clone(), backend, tls_acceptor)
                                     .await
                             {
                                 debug!("TCP connection error from {}: {}", peer_addr, e);
@@ -119,18 +119,19 @@ impl TcpProxy {
 
 /// Handle a TCP connection, optionally performing TLS termination
 async fn handle_tcp_connection(
-    mut client_stream: TcpStream,
+    client_stream: TcpStream,
     peer_addr: SocketAddr,
-    backend_addr: &str,
+    state: ReverseProxyState,
+    backend: Backend,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Connect to backend
-    let mut backend_stream = TcpStream::connect(backend_addr).await?;
-    let (mut backend_read, mut backend_write) = backend_stream.split();
+    // Dial backend via appropriate connector
+    let connector = state.connector_for(&backend).await?;
+    let mut backend_stream = connector.connect(&backend).await?;
 
     if let Some(acceptor) = tls_acceptor {
         // TLS termination: accept TLS, then bidirectional copy with backend
-        let tls_stream = match acceptor.accept(client_stream).await {
+        let mut tls_stream = match acceptor.accept(client_stream).await {
             Ok(s) => s,
             Err(e) => {
                 warn!("TLS handshake failed for {}: {}", peer_addr, e);
@@ -138,89 +139,27 @@ async fn handle_tcp_connection(
             }
         };
 
-        let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
-
-        let client_to_backend = async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = tls_read.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                backend_write.write_all(&buf[..n]).await?;
-            }
-            backend_write.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        };
-
-        let backend_to_client = async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = backend_read.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                tls_write.write_all(&buf[..n]).await?;
-            }
-            tls_write.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        };
-
-        tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
-                    debug!("TLS client to backend error: {}", e);
-                }
-            }
-            result = backend_to_client => {
-                if let Err(e) = result {
-                    debug!("Backend to TLS client error: {}", e);
-                }
-            }
-        }
+        let (bytes_c2b, bytes_b2c) = tokio::io::copy_bidirectional(&mut tls_stream, &mut *backend_stream)
+            .await
+            .unwrap_or((0, 0));
+        debug!(
+            "TCP TLS connection closed from {}: {} bytes client->backend, {} bytes backend->client",
+            peer_addr, bytes_c2b, bytes_b2c
+        );
     } else {
         // Plain TCP: direct bidirectional copy
-        let (mut client_read, mut client_write) = client_stream.split();
-
-        let client_to_backend = async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = client_read.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                backend_write.write_all(&buf[..n]).await?;
-            }
-            backend_write.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        };
-
-        let backend_to_client = async {
-            let mut buf = vec![0u8; 8192];
-            loop {
-                let n = backend_read.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                client_write.write_all(&buf[..n]).await?;
-            }
-            client_write.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        };
-
-        tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
-                    debug!("Client to backend error: {}", e);
-                }
-            }
-            result = backend_to_client => {
-                if let Err(e) = result {
-                    debug!("Backend to client error: {}", e);
-                }
-            }
-        }
+        let mut client_stream = client_stream;
+        let (bytes_c2b, bytes_b2c) = tokio::io::copy_bidirectional(&mut client_stream, &mut *backend_stream)
+            .await
+            .unwrap_or((0, 0));
+        debug!(
+            "TCP connection closed from {}: {} bytes client->backend, {} bytes backend->client",
+            peer_addr, bytes_c2b, bytes_b2c
+        );
     }
+
+    // Ensure backend stream is properly closed
+    let _ = backend_stream.shutdown().await;
 
     debug!("TCP connection closed from {}", peer_addr);
     Ok(())
@@ -241,14 +180,15 @@ impl UdpProxy {
     pub async fn start(
         &self,
         addr: SocketAddr,
-        backend_addr: String,
+        backend: Backend,
         rule_id: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let socket = tokio::net::UdpSocket::bind(addr).await?;
-        info!("UDP proxy listening on {} -> {}", addr, backend_addr);
+        info!("UDP proxy listening on {} -> {}", addr, backend.addr);
 
         let state = self.state.clone();
         let rule_id_clone = rule_id.clone();
+        let backend_addr = backend.addr; // UDP always uses Direct (Client rejected at rule-save time)
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
