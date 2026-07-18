@@ -92,8 +92,17 @@ export function Header({ onLogout }: HeaderProps) {
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    <header className="sticky top-0 z-40 border-b bg-card/60 backdrop-blur-xl">
-      <div className="container mx-auto flex h-14 items-center gap-2 px-4 md:px-6">
+    <header className="sticky top-0 z-40 overflow-hidden border-b bg-card/60 backdrop-blur-xl">
+      {/* 光影流动装饰层（环境辉光 + 扫过高光 + 底部流光渐变线） */}
+      <div aria-hidden className="pointer-events-none absolute inset-0">
+        <div className="header-ambient-glow absolute inset-0" />
+        <div className="header-sheen absolute inset-0" />
+      </div>
+      <div
+        aria-hidden
+        className="header-light-flow pointer-events-none absolute inset-x-0 bottom-0 h-[2px] opacity-70"
+      />
+      <div className="container relative mx-auto flex h-14 items-center gap-2 px-4 md:px-6">
         <Link to="/" className="flex items-center gap-2 font-semibold">
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-chart-2 shadow-glow">
             <Shield className="h-4 w-4 text-primary-foreground" />

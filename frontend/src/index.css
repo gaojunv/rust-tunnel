@@ -99,4 +99,75 @@
   .text-gradient {
     @apply bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent;
   }
+
+  /* 页头光影流动：底部流光渐变线（primary → 紫 → 青 循环流动） */
+  .header-light-flow {
+    background-image: linear-gradient(
+      90deg,
+      transparent 0%,
+      hsl(var(--primary) / 0.7) 25%,
+      hsl(var(--chart-2) / 0.7) 50%,
+      hsl(var(--chart-3) / 0.6) 75%,
+      transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: header-flow 8s linear infinite;
+  }
+
+  /* 页头光影流动：周期性扫过的高光带 */
+  .header-sheen {
+    background: linear-gradient(
+      100deg,
+      transparent 30%,
+      hsl(var(--primary) / 0.06) 44%,
+      hsl(var(--primary) / 0.14) 50%,
+      hsl(var(--primary) / 0.06) 56%,
+      transparent 70%
+    );
+    animation: header-sheen-sweep 7s ease-in-out infinite;
+  }
+
+  /* 页头光影流动：缓慢漂移的环境辉光 */
+  .header-ambient-glow {
+    background:
+      radial-gradient(ellipse 40% 130% at 25% 0%, hsl(var(--primary) / 0.12), transparent 70%),
+      radial-gradient(ellipse 35% 130% at 75% 0%, hsl(var(--chart-2) / 0.1), transparent 70%);
+    animation: header-glow-drift 12s ease-in-out infinite alternate;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .header-light-flow,
+    .header-sheen,
+    .header-ambient-glow {
+      animation: none;
+    }
+  }
+}
+
+@keyframes header-flow {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes header-sheen-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  45%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes header-glow-drift {
+  from {
+    transform: translateX(-6%);
+  }
+  to {
+    transform: translateX(6%);
+  }
 }
