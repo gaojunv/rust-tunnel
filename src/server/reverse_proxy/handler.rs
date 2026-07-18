@@ -532,7 +532,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         // 1. Backend that trickles 8 chunks of 1 KiB with 50 ms between them.
@@ -566,7 +567,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -637,7 +640,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<hyper::HeaderMap>();
@@ -667,7 +671,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -743,7 +749,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         // Backend that returns 200 with a known body.
@@ -763,7 +770,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -823,7 +832,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::shared_listener::SharedListener;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -898,7 +908,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -1008,7 +1020,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1027,7 +1040,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -1078,7 +1093,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1098,7 +1114,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,

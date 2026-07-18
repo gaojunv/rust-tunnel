@@ -23,8 +23,8 @@ use crate::server::reverse_proxy::handler::ConnectionCounts;
 use crate::server::reverse_proxy::router::RouteTable;
 use crate::server::reverse_proxy::shared_listener::SharedListener;
 use crate::server::reverse_proxy::{
-    Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route,
-    RuleType, TrafficPending,
+    Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig,
+    Route, RuleType, TrafficPending,
 };
 
 /// Register a self-signed cert for the given domain in the manager.
@@ -126,7 +126,9 @@ async fn downstream_h2_over_tls() {
         routes: vec![Route {
             path: "/".into(),
             backends: vec![Backend {
+                kind: BackendKind::Direct,
                 addr: backend_addr.to_string(),
+                client_name: None,
                 weight: 100,
                 protocol: BackendProtocol::Http1,
                 scheme: BackendScheme::Http,
@@ -236,7 +238,9 @@ async fn upstream_h2c() {
         routes: vec![Route {
             path: "/".into(),
             backends: vec![Backend {
+                kind: BackendKind::Direct,
                 addr: backend_addr.to_string(),
+                client_name: None,
                 weight: 100,
                 protocol: BackendProtocol::Http2,
                 scheme: BackendScheme::Http,
@@ -298,8 +302,10 @@ async fn upstream_connect_failure_returns_502() {
         routes: vec![Route {
             path: "/".into(),
             backends: vec![Backend {
+                kind: BackendKind::Direct,
                 // Port 1 is well-known-reserved and effectively always closed on localhost.
                 addr: "127.0.0.1:1".to_string(),
+                client_name: None,
                 weight: 100,
                 protocol: BackendProtocol::Http1,
                 scheme: BackendScheme::Http,

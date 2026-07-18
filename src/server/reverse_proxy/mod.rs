@@ -65,11 +65,34 @@ pub enum BackendScheme {
     Https,
 }
 
+/// Kind of backend endpoint.
+///
+/// - `Direct`: `addr` is an external `host:port` reachable from the server.
+/// - `Client`: `addr` is a `host:port` reachable from the client named
+///   `client_name` (dial goes through the control channel tunnel).
+///
+/// Missing on deserialize → `Direct` (backward compat with pre-2026-07 rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    #[default]
+    Direct,
+    Client,
+}
+
 /// Backend server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Backend {
-    /// Backend server address (host:port)
+    /// Backend endpoint kind (Direct = external, Client = via tunnel).
+    /// Missing on deserialize → Direct.
+    #[serde(default)]
+    pub kind: BackendKind,
+    /// Backend server address (`host:port`). For `kind = Client` this is a
+    /// host:port reachable from the named client's own network.
     pub addr: String,
+    /// Required when `kind = Client`; None for `kind = Direct` (sanitized on save).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
     /// Weight for load balancing (default: 100)
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -788,7 +811,9 @@ mod mod_tests {
     #[test]
     fn backend_roundtrip_with_explicit_fields() {
         let backend = Backend {
+            kind: BackendKind::Direct,
             addr: "10.0.0.1:8080".to_string(),
+            client_name: None,
             weight: 100,
             protocol: BackendProtocol::Http2,
             scheme: BackendScheme::Https,
@@ -853,5 +878,49 @@ mod mod_tests {
         assert_eq!(total_connections, 3);
         assert_eq!(bytes_in, 115);
         assert_eq!(bytes_out, 225);
+    }
+
+    #[test]
+    fn backend_kind_defaults_to_direct_on_missing() {
+        let json = r#"{"addr":"10.0.0.1:80","weight":100,"protocol":"http1","scheme":"http"}"#;
+        let b: Backend = serde_json::from_str(json).unwrap();
+        assert_eq!(b.kind, BackendKind::Direct);
+        assert!(b.client_name.is_none());
+    }
+
+    #[test]
+    fn backend_client_roundtrip() {
+        let b = Backend {
+            kind: BackendKind::Client,
+            addr: "localhost:80".into(),
+            client_name: Some("home-nas".into()),
+            weight: 100,
+            protocol: BackendProtocol::Http1,
+            scheme: BackendScheme::Http,
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        let back: Backend = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.kind, BackendKind::Client);
+        assert_eq!(back.client_name.as_deref(), Some("home-nas"));
+    }
+
+    #[test]
+    fn backend_direct_omits_client_name_on_serialize() {
+        let b = Backend {
+            kind: BackendKind::Direct,
+            addr: "10.0.0.1:80".into(),
+            client_name: None,
+            weight: 100,
+            protocol: BackendProtocol::Http1,
+            scheme: BackendScheme::Http,
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        assert!(!s.contains("client_name"), "serialized: {s}");
+    }
+
+    #[test]
+    fn backend_kind_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&BackendKind::Direct).unwrap(), "\"direct\"");
+        assert_eq!(serde_json::to_string(&BackendKind::Client).unwrap(), "\"client\"");
     }
 }

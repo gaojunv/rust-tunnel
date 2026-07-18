@@ -372,8 +372,8 @@ impl ReverseProxyState {
 mod tests {
     use super::*;
     use crate::server::reverse_proxy::{
-        Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route,
-        RuleType,
+        Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig,
+        Route, RuleType,
     };
 
     fn http_rule(id: &str, listen: &str, domain: &str, tls: bool) -> ProxyRule {
@@ -386,7 +386,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: "127.0.0.1:8080".into(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -498,7 +500,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
