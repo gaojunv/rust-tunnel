@@ -188,6 +188,37 @@ pub struct ProxyStats {
     pub bytes_out: i64,
 }
 
+/// Accumulated traffic for one rule, pending flush to the database.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrafficDelta {
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub connections: u64,
+}
+
+/// In-memory traffic accumulator shared between the proxy handlers and the
+/// periodic DB flush task. Uses a std mutex so it can be updated from sync
+/// contexts (e.g. body-stream `inspect` callbacks) without an async runtime.
+pub type TrafficPending = Arc<StdMutex<HashMap<String, TrafficDelta>>>;
+
+/// Add bytes / connections to the pending accumulator for a rule.
+pub fn record_traffic(
+    pending: &TrafficPending,
+    rule_id: &str,
+    bytes_in: u64,
+    bytes_out: u64,
+    connections: u64,
+) {
+    if bytes_in == 0 && bytes_out == 0 && connections == 0 {
+        return;
+    }
+    let mut map = pending.lock().unwrap();
+    let entry = map.entry(rule_id.to_string()).or_default();
+    entry.bytes_in += bytes_in;
+    entry.bytes_out += bytes_out;
+    entry.connections += connections;
+}
+
 /// State for the reverse proxy module
 #[derive(Clone)]
 pub struct ReverseProxyState {
@@ -200,6 +231,8 @@ pub struct ReverseProxyState {
     pub tcp_listeners: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Connection counters per rule
     pub connection_counts: Arc<Mutex<HashMap<String, u64>>>,
+    /// Traffic accumulator per rule, flushed to DB periodically
+    pub traffic_pending: TrafficPending,
     /// Per-listen_addr async mutex to serialize reconcile calls.
     pub reconcile_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Database reference
@@ -277,6 +310,7 @@ impl ReverseProxyState {
             shared_listeners: Arc::new(Mutex::new(HashMap::new())),
             tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            traffic_pending: Arc::new(StdMutex::new(HashMap::new())),
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: None,
             cert_manager: None,
@@ -290,6 +324,7 @@ impl ReverseProxyState {
             shared_listeners: Arc::new(Mutex::new(HashMap::new())),
             tcp_listeners: Arc::new(Mutex::new(HashMap::new())),
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
+            traffic_pending: Arc::new(StdMutex::new(HashMap::new())),
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
             db: Some(db),
             cert_manager: None,
@@ -464,6 +499,65 @@ impl ReverseProxyState {
     pub async fn get_connection_count(&self, rule_id: &str) -> u64 {
         let counts = self.connection_counts.lock().await;
         counts.get(rule_id).copied().unwrap_or(0)
+    }
+
+    /// Accumulate traffic for a rule in the pending map (flushed to DB periodically).
+    pub fn record_traffic(&self, rule_id: &str, bytes_in: u64, bytes_out: u64, connections: u64) {
+        record_traffic(
+            &self.traffic_pending,
+            rule_id,
+            bytes_in,
+            bytes_out,
+            connections,
+        );
+    }
+
+    /// Drain the pending traffic accumulator into the `proxy_traffic` table.
+    /// Called periodically by the background flush task.
+    pub async fn flush_traffic_to_db(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+
+        // Atomically take the accumulated deltas (brief lock)
+        let deltas: HashMap<String, TrafficDelta> = {
+            let mut pending = self.traffic_pending.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+
+        for (rule_id, delta) in deltas {
+            // Note: if the rule was deleted since the delta was recorded the
+            // FK constraint rejects the insert; the delta is dropped rather
+            // than re-queued so a stale rule id can't poison every flush.
+            if let Err(e) = db
+                .insert_proxy_traffic(
+                    &rule_id,
+                    delta.bytes_in,
+                    delta.bytes_out,
+                    delta.connections as i32,
+                )
+                .await
+            {
+                tracing::warn!("Failed to flush proxy_traffic for rule {}: {}", rule_id, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start the background task that periodically flushes proxy traffic to the database.
+    pub fn start_traffic_flush_task(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = state.flush_traffic_to_db().await {
+                    tracing::warn!("Failed to flush proxy traffic to DB: {}", e);
+                }
+            }
+        });
     }
 
     /// Recompute cert_status for every TLS-enabled rule. Called from the
@@ -703,5 +797,61 @@ mod mod_tests {
         let parsed: Backend = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.protocol, BackendProtocol::Http2);
         assert_eq!(parsed.scheme, BackendScheme::Https);
+    }
+
+    #[test]
+    fn record_traffic_accumulates_per_rule() {
+        let pending = TrafficPending::default();
+        record_traffic(&pending, "r1", 100, 200, 1);
+        record_traffic(&pending, "r1", 50, 0, 0);
+        record_traffic(&pending, "r2", 0, 0, 2);
+
+        let map = pending.lock().unwrap();
+        let r1 = map.get("r1").unwrap();
+        assert_eq!(r1.bytes_in, 150);
+        assert_eq!(r1.bytes_out, 200);
+        assert_eq!(r1.connections, 1);
+        assert_eq!(map.get("r2").unwrap().connections, 2);
+    }
+
+    #[tokio::test]
+    async fn flush_traffic_to_db_persists_and_drains() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let state = ReverseProxyState::with_db(db.clone());
+
+        // proxy_traffic has a FK to proxy_rules — the rule must exist first
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec![],
+            routes: vec![],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        state.save_rule(&rule).await.unwrap();
+
+        state.record_traffic("r1", 100, 200, 2);
+        state.record_traffic("r1", 10, 20, 0);
+        state.flush_traffic_to_db().await.unwrap();
+
+        // Pending map must be drained after a successful flush
+        assert!(state.traffic_pending.lock().unwrap().is_empty());
+
+        let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
+        assert_eq!(total_connections, 2);
+        assert_eq!(bytes_in, 110);
+        assert_eq!(bytes_out, 220);
+
+        // A second flush within the same minute merges into the same bucket row
+        state.record_traffic("r1", 5, 5, 1);
+        state.flush_traffic_to_db().await.unwrap();
+        let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
+        assert_eq!(total_connections, 3);
+        assert_eq!(bytes_in, 115);
+        assert_eq!(bytes_out, 225);
     }
 }

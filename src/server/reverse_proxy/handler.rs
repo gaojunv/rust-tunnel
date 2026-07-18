@@ -14,8 +14,9 @@ use tracing::error;
 
 use super::router::RouteTable;
 use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
-use super::Backend;
+use super::{record_traffic, Backend, TrafficPending};
 
+use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
 
 /// Per-rule connection counter shared with `ReverseProxyState`.
@@ -30,7 +31,12 @@ pub type ConnectionCounts = Arc<tokio::sync::Mutex<HashMap<String, u64>>>;
 pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 
 /// State injected into the axum Router.
-pub type ProxyState = (RouteSource, Arc<UpstreamClient>, ConnectionCounts);
+pub type ProxyState = (
+    RouteSource,
+    Arc<UpstreamClient>,
+    ConnectionCounts,
+    TrafficPending,
+);
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
 /// and must be stripped by any intermediary.
@@ -120,7 +126,11 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// listeners just build a one-rule table. `RouteTable::match_http_request`
 /// already honors `rule.enabled`, longest-prefix matching, and the route's
 /// configured load balancing algorithm.
-async fn resolve_backend(source: &RouteSource, host: &str, path: &str) -> Option<(String, Backend)> {
+async fn resolve_backend(
+    source: &RouteSource,
+    host: &str,
+    path: &str,
+) -> Option<(String, Backend)> {
     let snap = source.0.load();
     snap.match_http_request(host, path)
         .await
@@ -139,6 +149,32 @@ pub fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
         .get(hyper::header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| s.eq_ignore_ascii_case("websocket"))
+}
+
+/// Wrap a body so each data frame's length is accumulated into the matched
+/// rule's pending traffic (`is_in = true` counts bytes_in — client to
+/// backend; otherwise bytes_out — backend to client). Recording is live: the
+/// periodic flush task picks the deltas up without waiting for the body to end.
+fn count_body<B>(
+    body: B,
+    pending: TrafficPending,
+    rule_id: String,
+    is_in: bool,
+) -> impl HttpBody<Data = Bytes, Error = B::Error> + Send
+where
+    B: HttpBody<Data = Bytes> + Send,
+{
+    body.map_frame(move |frame| {
+        if let Some(data) = frame.data_ref() {
+            let n = data.len() as u64;
+            if is_in {
+                record_traffic(&pending, &rule_id, n, 0, 0);
+            } else {
+                record_traffic(&pending, &rule_id, 0, n, 0);
+            }
+        }
+        frame
+    })
 }
 
 /// Build the outgoing upstream Request from the incoming axum Request.
@@ -184,15 +220,20 @@ fn build_upstream_request(
 }
 
 /// Convert the hyper response returned by `UpstreamClient` back to an axum
-/// `Response<Body>`. Streams the body without buffering.
-fn build_downstream_response(resp: hyper::Response<hyper::body::Incoming>) -> Response {
+/// `Response<Body>`. Streams the body without buffering, counting response
+/// bytes into the rule's traffic accumulator.
+fn build_downstream_response(
+    resp: hyper::Response<hyper::body::Incoming>,
+    pending: TrafficPending,
+    rule_id: String,
+) -> Response {
     let (mut parts, incoming) = resp.into_parts();
     // Preserve Upgrade/Connection on a 101 so the caller can complete the
     // WebSocket handshake — otherwise the browser sees the switch but no
     // negotiated upgrade tokens and treats it as a protocol error.
     let preserve_upgrade = parts.status == StatusCode::SWITCHING_PROTOCOLS;
     parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
-    let axum_body = Body::new(incoming);
+    let axum_body = Body::new(count_body(incoming, pending, rule_id, false));
     Response::from_parts(parts, axum_body)
 }
 
@@ -225,7 +266,7 @@ fn host_without_port(raw: &str) -> &str {
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
 pub async fn handle_proxy_request_unified(
-    State((source, upstream, connection_counts)): State<ProxyState>,
+    State((source, upstream, connection_counts, traffic_pending)): State<ProxyState>,
     mut req: Request<Body>,
 ) -> Response {
     // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
@@ -261,6 +302,8 @@ pub async fn handle_proxy_request_unified(
         let mut counts = connection_counts.lock().await;
         *counts.entry(rule_id.clone()).or_insert(0) += 1;
     }
+    // Count this request as one connection in the traffic accumulator
+    record_traffic(&traffic_pending, &rule_id, 0, 0, 1);
 
     // Decrement on scope exit (deferred via clone)
     let rule_id_for_decrement = rule_id.clone();
@@ -273,6 +316,18 @@ pub async fn handle_proxy_request_unified(
         Some(hyper::upgrade::on(&mut req))
     } else {
         None
+    };
+
+    // Wrap the request body to count bytes sent to the backend (bytes_in)
+    let req = {
+        let (parts, body) = req.into_parts();
+        let counted = Body::new(count_body(
+            body,
+            traffic_pending.clone(),
+            rule_id.clone(),
+            true,
+        ));
+        Request::from_parts(parts, counted)
     };
 
     let upstream_req = match build_upstream_request(req, &backend) {
@@ -302,6 +357,7 @@ pub async fn handle_proxy_request_unified(
                     let upstream_upgrade = hyper::upgrade::on(&mut resp);
                     let rid = rule_id_for_decrement.clone();
                     let cc = counts_for_decrement.clone();
+                    let tp = traffic_pending.clone();
                     tokio::spawn(async move {
                         let (client_up, server_up) =
                             match tokio::try_join!(client_upgrade, upstream_upgrade) {
@@ -323,10 +379,14 @@ pub async fn handle_proxy_request_unified(
                         // tokio's AsyncRead + AsyncWrite for copy_bidirectional.
                         let mut client_io = hyper_util::rt::TokioIo::new(client_up);
                         let mut server_io = hyper_util::rt::TokioIo::new(server_up);
-                        if let Err(e) =
-                            tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await
-                        {
-                            tracing::debug!("ws bidirectional copy ended: {e}");
+                        match tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await {
+                            // (client→backend, backend→client) = (bytes_in, bytes_out)
+                            Ok((to_backend, to_client)) => {
+                                record_traffic(&tp, &rid, to_backend, to_client, 0);
+                            }
+                            Err(e) => {
+                                tracing::debug!("ws bidirectional copy ended: {e}");
+                            }
                         }
                         // Decrement on WS tunnel close
                         let mut counts = cc.lock().await;
@@ -347,7 +407,7 @@ pub async fn handle_proxy_request_unified(
                     }
                 }
             }
-            build_downstream_response(resp)
+            build_downstream_response(resp, traffic_pending.clone(), rule_id.clone())
         }
         Err(e) => {
             // Decrement on upstream error
@@ -521,13 +581,17 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // 3. Build the axum Router with the unified handler and bind it.
         let app = Router::new()
             .fallback(axum::routing::any(handle_proxy_request_unified))
-            .with_state((source, upstream, connection_counts));
+            .with_state((
+                source,
+                upstream,
+                connection_counts,
+                TrafficPending::default(),
+            ));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -618,12 +682,16 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         let app = Router::new()
             .fallback(any(handle_proxy_request_unified))
-            .with_state((source, upstream, connection_counts));
+            .with_state((
+                source,
+                upstream,
+                connection_counts,
+                TrafficPending::default(),
+            ));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -710,8 +778,7 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // Build a request the way hyper delivers an h2 request:
         // - authority set on the URI (from :authority pseudo-header)
@@ -724,7 +791,12 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((source, upstream, connection_counts));
+        let state = State((
+            source,
+            upstream,
+            connection_counts,
+            TrafficPending::default(),
+        ));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(
@@ -839,8 +911,7 @@ mod tests {
             cert_status: None,
         };
         let table = RouteTable::from_rules(vec![rule]);
-        let connection_counts: ConnectionCounts =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let _listener = SharedListener::spawn(
             listen_addr.to_string(),
             false,
@@ -848,6 +919,7 @@ mod tests {
             Some(mgr),
             HashSet::from(["r_ws".to_string()]),
             connection_counts,
+            TrafficPending::default(),
         )
         .await
         .expect("shared listener spawn");
@@ -970,8 +1042,7 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         // h1-style: URI is just "/", host lives in the Host header.
         let req: AxumRequest<Body> = AxumRequest::builder()
@@ -981,9 +1052,89 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((source, upstream, connection_counts));
+        let state = State((
+            source,
+            upstream,
+            connection_counts,
+            TrafficPending::default(),
+        ));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(resp.status(), 200);
+    }
+
+    /// Traffic accounting: a proxied request must record one connection and
+    /// the request/response body bytes into the rule's pending accumulator.
+    #[tokio::test]
+    async fn traffic_is_recorded_for_proxied_request() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+        };
+
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        let backend_app =
+            axum::Router::new().route("/", axum::routing::any(|| async { "hello world" }));
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    addr: backend_addr.to_string(),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let traffic_pending = TrafficPending::default();
+
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "test.local")
+            .body(Body::from("abc"))
+            .unwrap();
+
+        let state = State((source, upstream, connection_counts, traffic_pending.clone()));
+        let resp = handle_proxy_request_unified(state, req).await;
+        assert_eq!(resp.status(), 200);
+
+        // Consume the response body so its bytes are counted
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"hello world");
+
+        let map = traffic_pending.lock().unwrap();
+        let delta = map.get("r1").expect("traffic recorded for rule r1");
+        assert_eq!(delta.connections, 1);
+        assert_eq!(delta.bytes_in, 3, "request body bytes counted");
+        assert_eq!(delta.bytes_out, 11, "response body bytes counted");
     }
 }

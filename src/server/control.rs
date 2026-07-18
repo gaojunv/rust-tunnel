@@ -1250,8 +1250,10 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     );
                     break;
                 } else {
-                    // No ports registered yet, just ignore and continue waiting
-                    continue;
+                    // No ports registered yet, but still allow registration to complete
+                    // (e.g. mesh-only clients)
+                    info!("Registration phase complete (received Ping), 0 ports registered");
+                    break;
                 }
             }
             ControlMessage::LogBatch { .. } => {
@@ -1259,25 +1261,14 @@ async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 // (no ports registered yet, so no source context)
             }
             _ => {
-                // If we have registered ports, this is the end of registration phase
-                if !registered_ports.is_empty() {
-                    info!(
-                        "Registration phase complete, {} ports registered",
-                        registered_ports.len()
-                    );
-                    deferred_msg = Some(msg);
-                    break;
-                } else {
-                    let _ = sender
-                        .send(ControlMessage::RegisterResponse {
-                            success: false,
-                            message: "Expected registration message".into(),
-                        })
-                        .await;
-                    return Err(TunnelError::Protocol(
-                        "Expected registration message".into(),
-                    ));
-                }
+                // If we have registered ports, this is the end of registration phase.
+                // Also allow registration to complete with 0 ports (e.g. mesh-only clients).
+                info!(
+                    "Registration phase complete, {} ports registered",
+                    registered_ports.len()
+                );
+                deferred_msg = Some(msg);
+                break;
             }
         }
     }

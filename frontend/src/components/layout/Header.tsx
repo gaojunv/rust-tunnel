@@ -92,9 +92,11 @@ export function Header({ onLogout }: HeaderProps) {
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    <header className="sticky top-0 z-40 overflow-hidden border-b bg-card/60 backdrop-blur-xl">
-      {/* 光影流动装饰层（环境辉光 + 扫过高光 + 底部流光渐变线） */}
-      <div aria-hidden className="pointer-events-none absolute inset-0">
+    <header className="sticky top-0 z-40 border-b bg-card/60 backdrop-blur-xl">
+      {/* 光影流动装饰层（环境辉光 + 扫过高光 + 底部流光渐变线）。
+          overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
+          弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击 */}
+      <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
         <div className="header-ambient-glow absolute inset-0" />
         <div className="header-sheen absolute inset-0" />
       </div>

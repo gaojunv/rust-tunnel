@@ -590,6 +590,9 @@ async fn main() -> TunnelResult<()> {
     // Start periodic DB flush for traffic data (every 30 seconds)
     state.traffic_store.start_flush_task();
 
+    // Start periodic DB flush for reverse proxy traffic stats (every 30 seconds)
+    state.proxy_state.start_traffic_flush_task();
+
     // Start periodic quality sampling for Shadowsocks / Trojan ports (every 60 seconds)
     let quality_state = state.clone();
     tokio::spawn(async move {

@@ -1,5 +1,5 @@
 use crate::server::quality::QualitySample;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     FromRow, Pool, Row, Sqlite,
@@ -1388,6 +1388,10 @@ impl Database {
     }
 
     /// Insert proxy traffic record
+    ///
+    /// The timestamp is bucketed to the minute so repeated flushes within the
+    /// same minute merge into one row via the upsert below (the table doubles
+    /// as a per-minute time series for charts).
     pub async fn insert_proxy_traffic(
         &self,
         rule_id: &str,
@@ -1396,6 +1400,9 @@ impl Database {
         connections: i32,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
+        let bucket = now
+            - chrono::Duration::seconds(i64::from(now.second()))
+            - chrono::Duration::nanoseconds(i64::from(now.nanosecond()));
         sqlx::query(
             r#"
             INSERT INTO proxy_traffic (rule_id, timestamp, bytes_in, bytes_out, connections)
@@ -1407,7 +1414,7 @@ impl Database {
             "#,
         )
         .bind(rule_id)
-        .bind(now)
+        .bind(bucket)
         .bind(bytes_in as i64)
         .bind(bytes_out as i64)
         .bind(connections)
