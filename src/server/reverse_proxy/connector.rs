@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use crate::server::client_registry::ClientRegistry;
 use crate::server::reverse_proxy::Backend;
 
 /// Marker trait combining tokio's async read+write. Blanket-impl'd for any
@@ -41,6 +42,37 @@ impl Connector for DirectConnector {
     async fn connect(&self, backend: &Backend) -> io::Result<BoxedStream> {
         let s = TcpStream::connect(&backend.addr).await?;
         Ok(Box::new(s))
+    }
+}
+
+/// Dials a backend via a tunneled client control channel using `ClientRegistry`.
+/// Backend must have `kind == Client` and `client_name` must be set.
+pub struct ClientConnector {
+    registry: ClientRegistry,
+}
+
+impl ClientConnector {
+    #[must_use]
+    pub fn new(registry: ClientRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Connector for ClientConnector {
+    async fn connect(&self, backend: &Backend) -> io::Result<BoxedStream> {
+        use crate::server::reverse_proxy::BackendKind;
+        if backend.kind != BackendKind::Client {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ClientConnector requires backend.kind == Client",
+            ));
+        }
+        let client_name = backend.client_name.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "client backend missing client_name")
+        })?;
+        let stream = self.registry.open_tunnel(client_name, &backend.addr).await?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -96,5 +128,85 @@ mod tests {
             "unexpected kind: {:?}",
             err.kind()
         );
+    }
+
+    #[tokio::test]
+    async fn client_connector_full_path() {
+        use crate::common::ControlMessage;
+        use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
+        use crate::server::db::Database;
+
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("pw").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(32);
+        let entry = registry
+            .register("home-nas", None, None, "pw", client_tx)
+            .await
+            .unwrap();
+
+        // Fake client task: reply TunnelOpenResult{true}, then echo any Data.
+        let entry_for_client = entry.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = client_rx.recv().await {
+                match msg {
+                    ControlMessage::OpenTunnel { connection_id, .. } => {
+                        let mut conns = entry_for_client.active_connections.lock().await;
+                        if let Some(active) = conns.get_mut(&connection_id) {
+                            if let Some(tx) = active.open_result.take() {
+                                let _ = tx.send(TunnelOpenOutcome::Ok);
+                            }
+                        }
+                    }
+                    ControlMessage::Data { connection_id, data } => {
+                        let conns = entry_for_client.active_connections.lock().await;
+                        if let Some(active) = conns.get(&connection_id) {
+                            let _ = active.inbound.send(data).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let backend = Backend {
+            kind: BackendKind::Client,
+            addr: "irrelevant:80".into(),
+            client_name: Some("home-nas".into()),
+            weight: 100,
+            protocol: BackendProtocol::Http1,
+            scheme: BackendScheme::Http,
+        };
+        let connector = ClientConnector::new(registry);
+        let mut stream = connector.connect(&backend).await.unwrap();
+
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn client_connector_offline_returns_err() {
+        use crate::server::client_registry::ClientRegistry;
+        use crate::server::db::Database;
+
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = ClientRegistry::new(db);
+        let backend = Backend {
+            kind: BackendKind::Client,
+            addr: "x:80".into(),
+            client_name: Some("nope".into()),
+            weight: 100,
+            protocol: BackendProtocol::Http1,
+            scheme: BackendScheme::Http,
+        };
+        let connector = ClientConnector::new(registry);
+        let result = connector.connect(&backend).await;
+        match result {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotConnected),
+            Ok(_) => panic!("expected NotConnected error, got Ok"),
+        }
     }
 }

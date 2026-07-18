@@ -173,6 +173,95 @@ impl ClientRegistry {
     pub fn db(&self) -> &Database {
         &self.db
     }
+
+    /// Initiate a tunneled dial from a specific client to `target_addr`.
+    /// Returns a duplex stream ready for the reverse-proxy handler to read/write.
+    /// Fails if the client is offline or the client's dial fails within 5 s.
+    ///
+    /// # Errors
+    /// - `NotConnected` — client is not online
+    /// - `BrokenPipe` — control channel closed while sending OpenTunnel
+    /// - `TimedOut` — client did not respond within 5 seconds
+    /// - `ConnectionRefused` — client's dial to target_addr failed
+    pub async fn open_tunnel(
+        &self,
+        client_name: &str,
+        target_addr: &str,
+    ) -> std::io::Result<crate::server::tunnel_stream::ClientTunnelStream> {
+        use std::io::{Error, ErrorKind};
+        use std::time::Duration;
+
+        let entry = self.get(client_name).await.ok_or_else(|| {
+            Error::new(ErrorKind::NotConnected, format!("client '{client_name}' offline"))
+        })?;
+
+        // Random cid; collision is astronomically unlikely for u64.
+        let cid: u64 = rand::random();
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut conns = entry.active_connections.lock().await;
+            conns.insert(
+                cid,
+                ActiveTunnelConnection {
+                    inbound: inbound_tx,
+                    open_result: Some(open_tx),
+                },
+            );
+        }
+
+        // Send OpenTunnel
+        entry
+            .control_sender
+            .send(ControlMessage::OpenTunnel {
+                connection_id: cid,
+                target_addr: target_addr.to_string(),
+            })
+            .await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "control channel closed"))?;
+
+        // Await result with 5s timeout
+        let outcome = tokio::time::timeout(Duration::from_secs(5), open_rx).await;
+
+        // Handle timeout separately (needs async cleanup)
+        let outcome = match outcome {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                // Clean up connection entry on timeout
+                let mut conns = entry.active_connections.lock().await;
+                conns.remove(&cid);
+                return Err(Error::new(ErrorKind::TimedOut, "OpenTunnel timed out after 5s"));
+            }
+        };
+
+        // Handle oneshot cancellation
+        let outcome = match outcome {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(Error::new(ErrorKind::BrokenPipe, "open_result channel dropped"));
+            }
+        };
+
+        match outcome {
+            TunnelOpenOutcome::Ok => {
+                Ok(crate::server::tunnel_stream::ClientTunnelStream::new(
+                    cid,
+                    entry.control_sender.clone(),
+                    inbound_rx,
+                ))
+            }
+            TunnelOpenOutcome::Failed(err) => {
+                // Clean up connection entry on failure
+                let mut conns = entry.active_connections.lock().await;
+                conns.remove(&cid);
+                Err(Error::new(
+                    ErrorKind::ConnectionRefused,
+                    format!("client dial failed: {err}"),
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
