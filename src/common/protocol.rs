@@ -34,23 +34,17 @@ pub struct MeshServiceDef {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
-    /// Client requests registration to expose a remote port
+    /// Client requests registration with protocol version, name, password, and client version
     Register {
-        remote_port: u16,
-        /// Hostname of the client machine (optional for backward compatibility)
-        hostname: Option<String>,
-        /// Authentication token (optional for backward compatibility, required if server enables auth)
-        auth_token: Option<String>,
+        protocol_version: u32,
+        client_name: String,
+        password: String,
+        client_version: String,
     },
     /// Server response to registration
     RegisterResponse { success: bool, message: String },
-    /// Server notifies client of a new incoming connection
-    NewConnection {
-        connection_id: u64,
-        remote_port: u16,
-    },
-    /// Client notifies server it's connected to local target and ready
-    ConnectionReady { connection_id: u64 },
+    /// Server requests client to disconnect (web interface admin action / close reason)
+    Disconnect { reason: String },
     /// Data transfer for a specific connection
     Data { connection_id: u64, data: Vec<u8> },
     /// Close a specific connection
@@ -71,8 +65,10 @@ pub enum ControlMessage {
         /// Pong send timestamp (server time)
         pong_timestamp_micros: u64,
     },
-    /// Server requests client to disconnect (web interface admin action)
-    Disconnect,
+    /// Client requests to open a tunnel to a local target
+    OpenTunnel { connection_id: u64, target_addr: String },
+    /// Server response to a tunnel open request
+    TunnelOpenResult { connection_id: u64, success: bool, error: Option<String> },
     /// Mesh network registration (client -> server)
     MeshJoin {
         mesh_id: String,
@@ -184,104 +180,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_serialize_deserialize() {
+    fn test_register_v2_roundtrip() {
         let msg = ControlMessage::Register {
-            remote_port: 8080,
-            hostname: Some("test-host".into()),
-            auth_token: Some("secret-token".into()),
+            protocol_version: 2,
+            client_name: "home-nas".into(),
+            password: "secret".into(),
+            client_version: "0.4.0".into(),
         };
         let bytes = msg.serialize().unwrap();
-        assert!(bytes.len() > 4);
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        match decoded {
+            ControlMessage::Register { protocol_version, client_name, password, client_version } => {
+                assert_eq!(protocol_version, 2);
+                assert_eq!(client_name, "home-nas");
+                assert_eq!(password, "secret");
+                assert_eq!(client_version, "0.4.0");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
-    fn test_message_variants_serialization() {
-        // Test all message variants can be serialized
-        let messages = vec![
-            ControlMessage::Register {
-                remote_port: 8080,
-                hostname: None,
-                auth_token: None,
-            },
-            ControlMessage::RegisterResponse {
-                success: true,
-                message: "ok".into(),
-            },
-            ControlMessage::NewConnection {
-                connection_id: 12345,
-                remote_port: 9000,
-            },
-            ControlMessage::ConnectionReady {
-                connection_id: 12345,
-            },
-            ControlMessage::Data {
-                connection_id: 12345,
-                data: vec![1, 2, 3, 4],
-            },
-            ControlMessage::Close {
-                connection_id: 12345,
-            },
-            ControlMessage::Ping {
-                seq: 1,
-                timestamp_micros: 123456789,
-            },
-            ControlMessage::Pong {
-                seq: 1,
-                ping_timestamp_micros: 123456789,
-                pong_timestamp_micros: 123456795,
-            },
-            ControlMessage::Disconnect,
-            ControlMessage::MeshJoin {
-                mesh_id: "test-mesh".into(),
-                client_name: "client-a".into(),
-            },
-            ControlMessage::MeshLeave {
-                mesh_id: "test-mesh".into(),
-            },
-            ControlMessage::MeshMemberList {
-                mesh_id: "test-mesh".into(),
-                members: vec![MeshMember {
-                    client_name: "client-a".into(),
-                    public_addr: Some("1.2.3.4:12345".into()),
-                    online: true,
-                }],
-            },
-            ControlMessage::MeshConnect {
-                target_client: "client-b".into(),
-                service_name: "db".into(),
-            },
-            ControlMessage::P2PRequest {
-                target_client: "client-b".into(),
-                local_addr: "1.2.3.4:12345".into(),
-            },
-            ControlMessage::P2PResponse {
-                target_client: "client-b".into(),
-                remote_addr: "5.6.7.8:54321".into(),
-            },
-            ControlMessage::P2PResult {
-                target_client: "client-b".into(),
-                success: true,
-            },
-            ControlMessage::MeshRelay {
-                target_client: "client-b".into(),
-                data: vec![1, 2, 3],
-            },
-            ControlMessage::MeshRegisterServices {
-                mesh_id: "test-mesh".into(),
-                services: vec![MeshServiceDef {
-                    name: "db".into(),
-                    protocol: "mysql".into(),
-                    local_addr: "localhost:3306".into(),
-                }],
-            },
-        ];
+    fn test_open_tunnel_roundtrip() {
+        let msg = ControlMessage::OpenTunnel {
+            connection_id: 42,
+            target_addr: "127.0.0.1:80".into(),
+        };
+        let bytes = msg.serialize().unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        match decoded {
+            ControlMessage::OpenTunnel { connection_id, target_addr } => {
+                assert_eq!(connection_id, 42);
+                assert_eq!(target_addr, "127.0.0.1:80");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 
-        for msg in messages {
-            let bytes = msg.serialize().unwrap();
-            assert!(bytes.len() > 4);
-            // Verify length prefix
-            let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-            assert_eq!(len, bytes.len() - 4);
+    #[test]
+    fn test_tunnel_open_result_roundtrip() {
+        let msg = ControlMessage::TunnelOpenResult {
+            connection_id: 42,
+            success: false,
+            error: Some("connection refused".into()),
+        };
+        let bytes = msg.serialize().unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        match decoded {
+            ControlMessage::TunnelOpenResult { connection_id, success, error } => {
+                assert_eq!(connection_id, 42);
+                assert!(!success);
+                assert_eq!(error.as_deref(), Some("connection refused"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_disconnect_with_reason_roundtrip() {
+        let msg = ControlMessage::Disconnect { reason: "replaced".into() };
+        let bytes = msg.serialize().unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        match decoded {
+            ControlMessage::Disconnect { reason } => assert_eq!(reason, "replaced"),
+            _ => panic!("wrong variant"),
         }
     }
 
@@ -361,9 +323,10 @@ mod tests {
     async fn test_roundtrip_all_message_types() {
         let messages = vec![
             ControlMessage::Register {
-                remote_port: 8080,
-                hostname: Some("test-host".into()),
-                auth_token: Some("token".into()),
+                protocol_version: 2,
+                client_name: "test-client".into(),
+                password: "token".into(),
+                client_version: "0.4.0".into(),
             },
             ControlMessage::RegisterResponse {
                 success: true,
@@ -373,12 +336,8 @@ mod tests {
                 success: false,
                 message: "port in use".into(),
             },
-            ControlMessage::NewConnection {
-                connection_id: 12345,
-                remote_port: 9000,
-            },
-            ControlMessage::ConnectionReady {
-                connection_id: 12345,
+            ControlMessage::Disconnect {
+                reason: "shutdown".into(),
             },
             ControlMessage::Data {
                 connection_id: 12345,
@@ -391,6 +350,15 @@ mod tests {
             ControlMessage::Close {
                 connection_id: 12345,
             },
+            ControlMessage::OpenTunnel {
+                connection_id: 12345,
+                target_addr: "127.0.0.1:80".into(),
+            },
+            ControlMessage::TunnelOpenResult {
+                connection_id: 12345,
+                success: true,
+                error: None,
+            },
             ControlMessage::Ping {
                 seq: 42,
                 timestamp_micros: 123456789,
@@ -400,7 +368,6 @@ mod tests {
                 ping_timestamp_micros: 123456789,
                 pong_timestamp_micros: 123456795,
             },
-            ControlMessage::Disconnect,
             ControlMessage::MeshJoin {
                 mesh_id: "test-mesh".into(),
                 client_name: "client-a".into(),
@@ -483,9 +450,10 @@ mod tests {
         let mut buffer = Vec::new();
 
         let msg1 = ControlMessage::Register {
-            remote_port: 8080,
-            hostname: None,
-            auth_token: None,
+            protocol_version: 2,
+            client_name: "test-client".into(),
+            password: "secret".into(),
+            client_version: "0.4.0".into(),
         };
         let msg2 = ControlMessage::RegisterResponse {
             success: true,
@@ -552,7 +520,10 @@ mod tests {
 
     #[test]
     fn test_serialize_length_prefix_correct() {
-        let msg = ControlMessage::Disconnect;
+        let msg = ControlMessage::Ping {
+            seq: 1,
+            timestamp_micros: 100,
+        };
         let bytes = msg.serialize().unwrap();
 
         // Length prefix should match payload length
@@ -563,9 +534,10 @@ mod tests {
     #[test]
     fn test_serialize_register_with_all_fields() {
         let msg = ControlMessage::Register {
-            remote_port: 65535,
-            hostname: Some("a-very-long-hostname-with-special-chars-!@#$%".into()),
-            auth_token: Some("bearer-token-12345".into()),
+            protocol_version: 2,
+            client_name: "a-very-long-hostname-with-special-chars-!@#$%".into(),
+            password: "bearer-password-12345".into(),
+            client_version: "0.4.0".into(),
         };
         let bytes = msg.serialize().unwrap();
         assert!(bytes.len() > 4);
