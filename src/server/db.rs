@@ -1973,6 +1973,47 @@ impl Database {
         Ok(())
     }
 
+    /// Return `(rule_id, rule_name)` pairs for every proxy rule whose routes
+    /// JSON contains a backend with `kind == "client"` and matching
+    /// `client_name`. Used to enforce "reject delete when referenced" (spec §2.4).
+    pub async fn rules_referencing_client(
+        &self,
+        client_name: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let rows = sqlx::query("SELECT id, name, routes FROM proxy_rules")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let id: String = row.get("id");
+            let name: String = row.get("name");
+            let routes_json: Option<String> = row.get("routes");
+            let Some(routes_json) = routes_json else { continue };
+            let Ok(routes) = serde_json::from_str::<serde_json::Value>(&routes_json) else {
+                continue;
+            };
+            let Some(arr) = routes.as_array() else { continue };
+            let mut hit = false;
+            'route: for r in arr {
+                let Some(backends) = r.get("backends").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for b in backends {
+                    let kind = b.get("kind").and_then(|v| v.as_str()).unwrap_or("direct");
+                    let cn = b.get("client_name").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind == "client" && cn == client_name {
+                        hit = true;
+                        break 'route;
+                    }
+                }
+            }
+            if hit {
+                out.push((id, name));
+            }
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     pub fn pool(&self) -> &sqlx::SqlitePool {
         &self.pool
@@ -2652,6 +2693,73 @@ mod tests {
         assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-abc"));
         db.save_server_auth("token-def").await.unwrap();
         assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-def"));
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client() {
+        let db = Database::new(":memory:").await.unwrap();
+
+        // route JSON: 一个 backend 指向 home-nas，一个 direct
+        let routes_json = serde_json::json!([
+            {
+                "path": "/",
+                "backends": [
+                    { "kind": "client", "addr": "localhost:80", "client_name": "home-nas",
+                      "weight": 100, "protocol": "http1", "scheme": "http" },
+                    { "kind": "direct", "addr": "10.0.0.1:80",
+                      "weight": 100, "protocol": "http1", "scheme": "http" }
+                ],
+                "load_balancing": "round_robin"
+            }
+        ]).to_string();
+
+        db.save_proxy_rule(
+            "rule-1", "web", "http", "0.0.0.0:80",
+            None, Some(&routes_json),
+            false, false, None, true,
+            None, None, None,
+        ).await.unwrap();
+
+        let refs = db.rules_referencing_client("home-nas").await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "rule-1");
+        assert_eq!(refs[0].1, "web");
+
+        let refs = db.rules_referencing_client("nonexistent").await.unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client_ignores_direct_only() {
+        let db = Database::new(":memory:").await.unwrap();
+        let routes_json = serde_json::json!([{
+            "path": "/",
+            "backends": [
+                { "kind": "direct", "addr": "10.0.0.1:80",
+                  "weight": 100, "protocol": "http1", "scheme": "http" }
+            ],
+            "load_balancing": "round_robin"
+        }]).to_string();
+        db.save_proxy_rule(
+            "r1", "web", "http", "0.0.0.0:80",
+            None, Some(&routes_json),
+            false, false, None, true,
+            None, None, None,
+        ).await.unwrap();
+        assert!(db.rules_referencing_client("anything").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client_null_routes() {
+        // rule with routes = NULL (e.g. tcp rule)
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_proxy_rule(
+            "r1", "tcp-rule", "tcp", "0.0.0.0:9000",
+            None, None,
+            false, false, None, true,
+            None, None, None,
+        ).await.unwrap();
+        assert!(db.rules_referencing_client("anyone").await.unwrap().is_empty());
     }
 }
 
