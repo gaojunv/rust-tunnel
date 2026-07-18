@@ -417,6 +417,37 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Client registry table (spec §2.1)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS clients (
+                name          TEXT PRIMARY KEY,
+                hostname      TEXT,
+                first_seen_at DATETIME NOT NULL,
+                last_seen_at  DATETIME NOT NULL,
+                note          TEXT
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_clients_last_seen ON clients(last_seen_at)")
+            .execute(pool)
+            .await?;
+
+        // Single-row server auth table (spec §2.2)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_auth (
+                id           INTEGER PRIMARY KEY CHECK(id = 1),
+                client_token TEXT NOT NULL,
+                updated_at   DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1838,6 +1869,110 @@ impl Database {
         Ok(())
     }
 
+    // ============================================================
+    // Client registry methods
+    // ============================================================
+
+    pub async fn upsert_client(
+        &self,
+        name: &str,
+        hostname: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO clients (name, hostname, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                hostname = excluded.hostname,
+                last_seen_at = excluded.last_seen_at
+            "#,
+        )
+        .bind(name)
+        .bind(hostname)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn touch_client_last_seen(&self, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE clients SET last_seen_at = ? WHERE name = ?")
+            .bind(Utc::now())
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_clients(&self) -> Result<Vec<ClientRecord>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ClientRecord>(
+            "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn get_client(&self, name: &str) -> Result<Option<ClientRecord>, sqlx::Error> {
+        sqlx::query_as::<_, ClientRecord>(
+            "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    pub async fn update_client_note(
+        &self,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE clients SET note = ? WHERE name = ?")
+            .bind(note)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_client(&self, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM clients WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ============================================================
+    // Server auth methods
+    // ============================================================
+
+    pub async fn load_server_auth(&self) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query("SELECT client_token FROM server_auth WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("client_token")))
+    }
+
+    pub async fn save_server_auth(&self, token: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO server_auth (id, client_token, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                client_token = excluded.client_token,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(token)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn pool(&self) -> &sqlx::SqlitePool {
         &self.pool
@@ -2000,6 +2135,16 @@ pub struct ReverseProxyConfigRecord {
 pub struct DnsConfigRecord {
     pub tunnel_domain: String,
     pub mesh_domain: String,
+}
+
+/// Client registry record from database
+#[derive(Debug, Clone, FromRow)]
+pub struct ClientRecord {
+    pub name: String,
+    pub hostname: Option<String>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub note: Option<String>,
 }
 
 #[cfg(test)]
@@ -2451,6 +2596,62 @@ mod tests {
 
         let results = db.query_logs(None, None, None, 10, None).await.unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_and_list_clients() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", Some("nas.local")).await.unwrap();
+        db.upsert_client("home-nas", Some("nas.local")).await.unwrap(); // idempotent
+        db.upsert_client("office-pc", None).await.unwrap();
+
+        let list = db.list_clients().await.unwrap();
+        assert_eq!(list.len(), 2);
+        let nas = list.iter().find(|c| c.name == "home-nas").unwrap();
+        assert_eq!(nas.hostname.as_deref(), Some("nas.local"));
+    }
+
+    #[tokio::test]
+    async fn test_touch_client_last_seen() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+        let before = db.get_client("home-nas").await.unwrap().unwrap().last_seen_at;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        db.touch_client_last_seen("home-nas").await.unwrap();
+        let after = db.get_client("home-nas").await.unwrap().unwrap().last_seen_at;
+        assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn test_update_client_note() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+        db.update_client_note("home-nas", Some("primary")).await.unwrap();
+        assert_eq!(
+            db.get_client("home-nas").await.unwrap().unwrap().note.as_deref(),
+            Some("primary")
+        );
+        db.update_client_note("home-nas", None).await.unwrap();
+        assert!(db.get_client("home-nas").await.unwrap().unwrap().note.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_client() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+        db.delete_client("home-nas").await.unwrap();
+        let list = db.list_clients().await.unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_server_auth_load_and_save() {
+        let db = Database::new(":memory:").await.unwrap();
+        assert!(db.load_server_auth().await.unwrap().is_none());
+        db.save_server_auth("token-abc").await.unwrap();
+        assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-abc"));
+        db.save_server_auth("token-def").await.unwrap();
+        assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-def"));
     }
 }
 
