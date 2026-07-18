@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/sheet';
 import { Separator } from '@/components/ui/separator';
 import { ThemeToggle } from '@/components/shared/ThemeToggle';
+import { Logo } from '@/components/shared/Logo';
 import {
   LayoutDashboard,
   Signal,
@@ -106,9 +107,7 @@ export function Header({ onLogout }: HeaderProps) {
       />
       <div className="container relative mx-auto flex h-14 items-center gap-2 px-4 md:px-6">
         <Link to="/" className="flex items-center gap-2 font-semibold">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-chart-2 shadow-glow">
-            <Shield className="h-4 w-4 text-primary-foreground" />
-          </div>
+          <Logo className="h-7 w-7 rounded-lg shadow-glow" />
           <span className="hidden bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent sm:inline">
             Rust Tunnel
           </span>
@@ -173,9 +172,7 @@ export function Header({ onLogout }: HeaderProps) {
           <SheetContent side="right" className="flex w-72 flex-col p-0">
             <SheetHeader className="border-b p-4">
               <SheetTitle className="flex items-center gap-2 text-left">
-                <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-chart-2 shadow-glow">
-                  <Shield className="h-4 w-4 text-primary-foreground" />
-                </div>
+                <Logo className="h-7 w-7 rounded-lg shadow-glow" />
                 Rust Tunnel
               </SheetTitle>
             </SheetHeader>

@@ -4,7 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { useLogin } from '@/api/hooks';
-import { Shield } from 'lucide-react';
+import { Logo } from '@/components/shared/Logo';
 
 export default function LoginPage() {
   const [password, setPassword] = useState('');
@@ -35,9 +35,7 @@ export default function LoginPage() {
 
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-chart-2 shadow-glow">
-            <Shield className="h-6 w-6 text-primary-foreground" />
-          </div>
+          <Logo className="mx-auto mb-4 h-12 w-12 rounded-xl shadow-glow" />
           <CardTitle className="text-2xl text-gradient">Rust Tunnel</CardTitle>
           <CardDescription>Enter your password to continue</CardDescription>
         </CardHeader>
