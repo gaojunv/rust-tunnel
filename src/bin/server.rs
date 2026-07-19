@@ -183,6 +183,9 @@ async fn main() -> TunnelResult<()> {
     // Set API TLS config on state (read-only, from config)
     state.api_tls = config.api_tls;
     state.api_domain = config.api_domain.clone();
+    // 控制通道 TLS 证书路径：Trojan 无匹配 ACME 证书时回退复用
+    state.tls_cert_path = config.tls_cert.clone();
+    state.tls_key_path = config.tls_key.clone();
 
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();

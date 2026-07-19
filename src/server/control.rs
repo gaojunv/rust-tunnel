@@ -224,6 +224,16 @@ impl AcmeFullConfig {
     }
 }
 
+/// Trojan 运行时状态：证书来源与监听模式。
+/// 由 `trojan_runtime::apply_trojan_config` / API 更新路径写入，`GET /api/trojan` 读取。
+#[derive(Debug, Clone, Default)]
+pub struct TrojanRuntimeStatus {
+    /// "acme_exact" | "acme_wildcard" | "self_signed"；未运行时为 None
+    pub cert_source: Option<String>,
+    /// true = 与反代共享端口（SNI 分流）；false = 独立监听
+    pub shared: bool,
+}
+
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
@@ -271,6 +281,12 @@ pub struct ServerState {
     pub api_tls: bool,
     /// API domain for TLS certificate (read-only, from config)
     pub api_domain: Option<String>,
+    /// 控制通道 TLS 证书路径（Trojan 自签名回退复用，read-only，来自 config）
+    pub tls_cert_path: String,
+    /// 控制通道 TLS 私钥路径
+    pub tls_key_path: String,
+    /// Trojan 运行时状态（证书来源、共享模式）
+    pub trojan_runtime: Arc<RwLock<TrojanRuntimeStatus>>,
 }
 
 impl Default for ServerState {
@@ -318,6 +334,9 @@ impl ServerState {
             trojan_listener_abort: Arc::new(RwLock::new(None)),
             api_tls: false,
             api_domain: None,
+            tls_cert_path: "./data/tls/cert.pem".to_string(),
+            tls_key_path: "./data/tls/key.pem".to_string(),
+            trojan_runtime: Arc::new(RwLock::new(TrojanRuntimeStatus::default())),
         }
     }
 
@@ -359,6 +378,9 @@ impl ServerState {
             trojan_listener_abort: Arc::new(RwLock::new(None)),
             api_tls: false,
             api_domain: None,
+            tls_cert_path: "./data/tls/cert.pem".to_string(),
+            tls_key_path: "./data/tls/key.pem".to_string(),
+            trojan_runtime: Arc::new(RwLock::new(TrojanRuntimeStatus::default())),
         }
     }
 

@@ -21,7 +21,6 @@ pub mod clients;
 pub mod server_auth;
 
 use crate::common::DnsRecord;
-use crate::server::acme::CertificateProvider;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::db::Database;
@@ -788,6 +787,11 @@ pub struct TrojanConfig {
     pub enabled: bool,
     pub port: Option<u16>,
     pub fallback: Option<String>,
+    pub domain: Option<String>,
+    /// 证书来源："acme_exact" | "acme_wildcard" | "self_signed"；未运行时为 null
+    pub cert_source: Option<String>,
+    /// true = 与反代共享端口（SNI 分流）；false = 独立监听
+    pub shared: bool,
 }
 
 /// Trojan statistics
@@ -1208,27 +1212,26 @@ async fn update_shadowsocks_config(
 
 // Get Trojan configuration
 async fn get_trojan_config(State(state): State<ApiState>) -> Json<TrojanConfig> {
-    let trojan_ports = state.server_state.get_trojan_ports().await;
-
-    let (port, fallback) = if !trojan_ports.is_empty() {
-        // Get fallback from port info
-        let port_info = state.server_state.get_port(trojan_ports[0]).await;
-        let fallback = port_info.and_then(|info| {
-            if let crate::server::control::PortInfo::Trojan { fallback, .. } = info {
-                Some(fallback)
-            } else {
-                None
-            }
-        });
-        (Some(trojan_ports[0]), fallback)
-    } else {
-        (None, None)
+    let (enabled, port, fallback, domain) = {
+        let dc = state.server_state.dynamic_config.read().await;
+        match dc.trojan.as_ref() {
+            Some(t) => (
+                t.enabled,
+                Some(t.port),
+                Some(t.fallback.clone()),
+                Some(t.domain.clone()),
+            ),
+            None => (false, None, None, None),
+        }
     };
-
+    let rt = state.server_state.trojan_runtime.read().await;
     Json(TrojanConfig {
-        enabled: !trojan_ports.is_empty(),
+        enabled,
         port,
         fallback,
+        domain,
+        cert_source: rt.cert_source.clone(),
+        shared: rt.shared,
     })
 }
 
@@ -1293,18 +1296,43 @@ async fn update_trojan_config(
             return (StatusCode::BAD_REQUEST, "Invalid or missing port").into_response();
         }
     };
-    let password = match payload["password"].as_str() {
-        Some(p) if !p.is_empty() => p,
-        _ => {
-            return (StatusCode::BAD_REQUEST, "Password required").into_response();
-        }
-    };
     let fallback = payload["fallback"].as_str().unwrap_or("127.0.0.1:80");
+
+    // 现有配置：password/domain 留空时保留原值
+    let existing = {
+        let dc = state.server_state.dynamic_config.read().await;
+        dc.trojan.clone()
+    };
+
+    // password 可选：留空保留原密码（首次启用必须提供）
+    let password = match payload["password"].as_str() {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => match existing.as_ref() {
+            Some(t) if !t.password.is_empty() => t.password.clone(),
+            _ => {
+                return (StatusCode::BAD_REQUEST, "Password required").into_response();
+            }
+        },
+    };
+
+    // domain 可选：空串 = 不用 ACME 证书、不参与 SNI 分流
+    let domain = match payload["domain"].as_str() {
+        Some(d) => d.trim().to_ascii_lowercase(),
+        None => existing
+            .as_ref()
+            .map(|t| t.domain.clone())
+            .unwrap_or_default(),
+    };
+    if !domain.is_empty() {
+        if let Err(e) = crate::server::trojan::validate_trojan_domain(&domain) {
+            return (StatusCode::BAD_REQUEST, format!("Invalid domain: {}", e)).into_response();
+        }
+    }
 
     // Save to DB（单份配置语义：整表替换，避免修改端口时残留旧行）
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db
-            .replace_trojan_config(port, password, fallback, enabled, "")
+            .replace_trojan_config(port, &password, fallback, enabled, &domain)
             .await
         {
             return (
@@ -1321,9 +1349,9 @@ async fn update_trojan_config(
         dc.trojan = Some(crate::server::dynamic_config::TrojanDynamicConfig {
             enabled,
             port,
-            password: password.to_string(),
+            password: password.clone(),
             fallback: fallback.to_string(),
-            domain: String::new(),
+            domain: domain.clone(),
         });
     }
 
@@ -1336,57 +1364,46 @@ async fn update_trojan_config(
         }
 
         if enabled {
-            // Build TLS config channel from cert_manager
-            let tls_config = if let Some(ref cert_manager) = state.server_state.cert_manager {
-                match cert_manager.get_tls_server_config("default").await {
-                    Some(config) => config,
-                    None => {
+            // 自签名证书（修复原硬编码查询 "default" 域名证书的死路径；
+            // ACME 优先解析在 trojan_runtime 统一实现后由 Task 7 接入）
+            let tls_config = match crate::common::tls::load_or_generate_cert(
+                &state.server_state.tls_cert_path,
+                &state.server_state.tls_key_path,
+            ) {
+                Ok(pair) => match crate::common::tls::create_server_config(pair) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
                         return (
-                            StatusCode::BAD_REQUEST,
-                            "No TLS certificate available. Issue a certificate first via ACME.",
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("TLS config error: {}", e),
                         )
                             .into_response();
                     }
+                },
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("TLS cert error: {}", e),
+                    )
+                        .into_response();
                 }
-            } else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Trojan requires TLS. No certificate manager configured.",
-                )
-                    .into_response();
             };
-            let (tls_config_tx, tls_config_rx) = tokio::sync::watch::channel(tls_config);
-
-            // Subscribe to cert renewal events
-            if let Some(ref cert_manager) = state.server_state.cert_manager {
-                let mut cert_rx = cert_manager.subscribe();
-                let tx = tls_config_tx.clone();
-                let cert_manager_clone = cert_manager.clone();
-                tokio::spawn(async move {
-                    while let Ok(event) = cert_rx.recv().await {
-                        if let crate::server::acme::manager::CertEvent::Renewed { ref domain }
-                        | crate::server::acme::manager::CertEvent::Issued { ref domain } = event
-                        {
-                            if let Some(new_config) =
-                                cert_manager_clone.get_tls_server_config(domain).await
-                            {
-                                let _ = tx.send(new_config);
-                            }
-                        }
-                    }
-                });
+            let (_tls_config_tx, tls_config_rx) = tokio::sync::watch::channel(tls_config);
+            {
+                let mut rt = state.server_state.trojan_runtime.write().await;
+                rt.cert_source = Some("self_signed".to_string());
+                rt.shared = false;
             }
 
             let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
             *abort = Some(abort_tx);
             let state_clone = state.server_state.clone();
-            let trojan_port = port;
-            let trojan_password = password.to_string();
+            let trojan_password = password.clone();
             let trojan_fallback = fallback.to_string();
             tokio::spawn(async move {
                 if let Err(e) = crate::server::listener::start_trojan_listener_with_abort(
                     state_clone,
-                    trojan_port,
+                    port,
                     trojan_password,
                     trojan_fallback,
                     tls_config_rx,
@@ -1397,10 +1414,13 @@ async fn update_trojan_config(
                     tracing::error!("Trojan listener error: {}", e);
                 }
             });
+        } else {
+            *state.server_state.trojan_runtime.write().await = Default::default();
         }
     }
 
-    Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port})).into_response()
+    Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port, "domain": domain}))
+        .into_response()
 }
 
 // ── Mesh Network Endpoints ─────────────────────────────────────────

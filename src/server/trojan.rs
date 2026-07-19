@@ -343,6 +343,38 @@ pub async fn handle_trojan_fallback(
     Ok(())
 }
 
+/// 校验 Trojan 域名：必须是合法 DNS 域名（不含 `*`、端口或路径）。
+/// 调用方保证传入前已 trim + 转小写；空串由调用方自行处理（空 = 不配置域名）。
+pub fn validate_trojan_domain(domain: &str) -> Result<(), String> {
+    if domain.is_empty() {
+        return Err("domain is empty".to_string());
+    }
+    if domain.len() > 253 {
+        return Err("domain too long (max 253 chars)".to_string());
+    }
+    if domain.contains('*') {
+        return Err("wildcard domains are not allowed".to_string());
+    }
+    if domain.contains(':') || domain.contains('/') {
+        return Err("domain must not contain port or path".to_string());
+    }
+    for label in domain.split('.') {
+        if label.is_empty() {
+            return Err("domain contains an empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("domain label too long (max 63 chars)".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("domain label must not start or end with '-'".to_string());
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("domain contains invalid characters".to_string());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +398,25 @@ mod tests {
         let h1 = sha224_hex("password1");
         let h2 = sha224_hex("password2");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn validate_trojan_domain_accepts_valid() {
+        assert!(validate_trojan_domain("trojan.example.com").is_ok());
+        assert!(validate_trojan_domain("ok-1.example.com").is_ok());
+        assert!(validate_trojan_domain("localhost").is_ok());
+    }
+
+    #[test]
+    fn validate_trojan_domain_rejects_invalid() {
+        assert!(validate_trojan_domain("").is_err());
+        assert!(validate_trojan_domain("*.example.com").is_err());
+        assert!(validate_trojan_domain("host:443").is_err());
+        assert!(validate_trojan_domain("a/b").is_err());
+        assert!(validate_trojan_domain("exa mple.com").is_err());
+        assert!(validate_trojan_domain("-bad.com").is_err());
+        assert!(validate_trojan_domain("bad-.com").is_err());
+        assert!(validate_trojan_domain("a..com").is_err());
     }
 
     #[test]
