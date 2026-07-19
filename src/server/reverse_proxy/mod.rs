@@ -5,6 +5,7 @@ pub mod handler;
 pub mod router;
 pub mod shared_listener;
 pub mod sni_resolver;
+pub mod sni_sniff;
 pub mod tcp_proxy;
 pub mod upstream;
 
