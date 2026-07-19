@@ -112,6 +112,9 @@ async fn main() -> TunnelResult<()> {
     // Create shared state with database
     let mut state = control::ServerState::with_db(db.clone());
 
+    // Wire up ClientConnector to ReverseProxyState so client-kind backends work
+    state.wire_up_client_connector().await;
+
     // Load or seed dynamic config from DB
     let dynamic_config =
         rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
