@@ -268,18 +268,22 @@ mod tests {
     /// poll_shutdown sends Close and suppresses drop's second Close.
     #[tokio::test]
     async fn test_shutdown_sends_close_once() {
-        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMessage>(8);
         let (_inbound_tx, inbound_rx) = mpsc::channel(8);
         let mut stream = ClientTunnelStream::new(9, ctl_tx, inbound_rx);
         stream.shutdown().await.unwrap();
 
+        // First Close arrives from poll_shutdown's try_send.
         let first = ctl_rx.recv().await.unwrap();
         assert!(matches!(first, ControlMessage::Close { connection_id: 9 }));
 
+        // drop must NOT emit a second Close because closed flag is already set.
         drop(stream);
-        // Give the possible-second Close a chance to arrive (it should NOT).
-        let second = tokio::time::timeout(std::time::Duration::from_millis(100), ctl_rx.recv()).await;
-        assert!(second.is_err(), "second Close should not be sent after shutdown");
+        tokio::task::yield_now().await;
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "second Close should not be sent after shutdown"
+        );
     }
 
     /// Inbound channel closed → read() returns 0 (EOF).
