@@ -95,6 +95,62 @@ pub async fn start_shadowsocks_listener_with_abort(
     }
 }
 
+/// Handle one Trojan connection: TLS 终止 → Trojan 握手 → 代理/回退。
+///
+/// 从独立 listener 的每连接逻辑提取，供独立监听模式与反代 SNI 分流模式共用。
+/// 每连接从 watch channel borrow 最新的 TLS 配置（证书热更新机制）。
+pub async fn handle_trojan_connection(
+    inbound: TcpStream,
+    client_addr: std::net::SocketAddr,
+    port: u16,
+    password: String,
+    fallback: String,
+    tls_config_rx: watch::Receiver<Arc<rustls::server::ServerConfig>>,
+    state: ServerState,
+) {
+    let connection_id = generate_connection_id();
+    // Read the latest TLS config from the watch channel
+    let current_config = tls_config_rx.borrow().clone();
+    let tls_acceptor = TlsAcceptor::from(current_config);
+
+    // TLS handshake first
+    let mut tls_stream = match tls_acceptor.accept(inbound).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Trojan TLS handshake failed for {}: {}", client_addr, e);
+            return;
+        }
+    };
+
+    // Trojan handshake over TLS
+    match handle_trojan_handshake(&mut tls_stream, &password, connection_id, port).await {
+        Ok((ctx, payload)) => {
+            debug!(
+                "Trojan authenticated: target={}, cmd={:?}",
+                ctx.target_addr, ctx.command
+            );
+            proxy_trojan_connection(connection_id, port, tls_stream, ctx, payload, state).await;
+        }
+        Err(e) => {
+            warn!(
+                "Trojan handshake failed for connection {}: {}",
+                connection_id, e
+            );
+            // Fallback: forward to fallback backend
+            debug!("Attempting Trojan fallback to {}", fallback);
+            // Extract initial data from the error if available
+            let initial_data = match &e {
+                TunnelError::TrojanAuthFailed(data) => data.as_slice(),
+                _ => &[],
+            };
+            if let Err(fe) = handle_trojan_fallback(&mut tls_stream, initial_data, &fallback).await
+            {
+                warn!("Trojan fallback also failed: {}", fe);
+            }
+        }
+    }
+}
+
 /// Start Trojan listener with TLS
 pub async fn start_trojan_listener(
     state: ServerState,
@@ -123,64 +179,22 @@ pub async fn start_trojan_listener(
         let (inbound, client_addr) = listener.accept().await?;
         debug!("New Trojan connection from {}", client_addr);
 
-        let connection_id = generate_connection_id();
         let state_clone = state.clone();
         let password_clone = password.clone();
         let fallback_clone = fallback.clone();
         let tls_config_rx_clone = tls_config_rx.clone();
 
         tokio::spawn(async move {
-            // Read the latest TLS config from the watch channel
-            let current_config = tls_config_rx_clone.borrow().clone();
-            let tls_acceptor = TlsAcceptor::from(current_config);
-
-            // TLS handshake first
-            let mut tls_stream = match tls_acceptor.accept(inbound).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Trojan TLS handshake failed for {}: {}", client_addr, e);
-                    return;
-                }
-            };
-
-            // Trojan handshake over TLS
-            match handle_trojan_handshake(&mut tls_stream, &password_clone, connection_id, port)
-                .await
-            {
-                Ok((ctx, payload)) => {
-                    debug!(
-                        "Trojan authenticated: target={}, cmd={:?}",
-                        ctx.target_addr, ctx.command
-                    );
-                    proxy_trojan_connection(
-                        connection_id,
-                        port,
-                        tls_stream,
-                        ctx,
-                        payload,
-                        state_clone,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(
-                        "Trojan handshake failed for connection {}: {}",
-                        connection_id, e
-                    );
-                    // Fallback: forward to fallback backend
-                    debug!("Attempting Trojan fallback to {}", fallback_clone);
-                    // Extract initial data from the error if available
-                    let initial_data = match &e {
-                        TunnelError::TrojanAuthFailed(data) => data.as_slice(),
-                        _ => &[],
-                    };
-                    if let Err(fe) =
-                        handle_trojan_fallback(&mut tls_stream, initial_data, &fallback_clone).await
-                    {
-                        warn!("Trojan fallback also failed: {}", fe);
-                    }
-                }
-            }
+            handle_trojan_connection(
+                inbound,
+                client_addr,
+                port,
+                password_clone,
+                fallback_clone,
+                tls_config_rx_clone,
+                state_clone,
+            )
+            .await;
         });
     }
 }
@@ -215,64 +229,22 @@ pub async fn start_trojan_listener_with_abort(
                 let (inbound, client_addr) = result?;
                 debug!("New Trojan connection from {}", client_addr);
 
-                let connection_id = generate_connection_id();
                 let state_clone = state.clone();
                 let password_clone = password.clone();
                 let fallback_clone = fallback.clone();
                 let tls_config_rx_clone = tls_config_rx.clone();
 
                 tokio::spawn(async move {
-                    // Read the latest TLS config from the watch channel
-                    let current_config = tls_config_rx_clone.borrow().clone();
-                    let tls_acceptor = TlsAcceptor::from(current_config);
-
-                    // TLS handshake first
-                    let mut tls_stream = match tls_acceptor.accept(inbound).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("Trojan TLS handshake failed for {}: {}", client_addr, e);
-                            return;
-                        }
-                    };
-
-                    // Trojan handshake over TLS
-                    match handle_trojan_handshake(&mut tls_stream, &password_clone, connection_id, port)
-                        .await
-                    {
-                        Ok((ctx, payload)) => {
-                            debug!(
-                                "Trojan authenticated: target={}, cmd={:?}",
-                                ctx.target_addr, ctx.command
-                            );
-                            proxy_trojan_connection(
-                                connection_id,
-                                port,
-                                tls_stream,
-                                ctx,
-                                payload,
-                                state_clone,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Trojan handshake failed for connection {}: {}",
-                                connection_id, e
-                            );
-                            // Fallback: forward to fallback backend
-                            debug!("Attempting Trojan fallback to {}", fallback_clone);
-                            // Extract initial data from the error if available
-                            let initial_data = match &e {
-                                TunnelError::TrojanAuthFailed(data) => data.as_slice(),
-                                _ => &[],
-                            };
-                            if let Err(fe) =
-                                handle_trojan_fallback(&mut tls_stream, initial_data, &fallback_clone).await
-                            {
-                                warn!("Trojan fallback also failed: {}", fe);
-                            }
-                        }
-                    }
+                    handle_trojan_connection(
+                        inbound,
+                        client_addr,
+                        port,
+                        password_clone,
+                        fallback_clone,
+                        tls_config_rx_clone,
+                        state_clone,
+                    )
+                    .await;
                 });
             }
             _ = abort_rx.changed() => {
