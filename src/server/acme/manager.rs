@@ -278,29 +278,8 @@ impl CertificateManager {
             .await
             .context("ACME certificate request failed")?;
 
-        // Load the issued certificate from disk
-        let cached = self
-            .build_cached_cert(domain)
-            .context("Failed to load issued certificate from storage")?;
-
-        let certified_key = super::provider::build_certified_key(&cached.entry)
-            .context("Failed to build CertifiedKey for renewed cert")?;
-        let entry = cached.entry.clone();
-        {
-            let mut cache = self.cache.write().await;
-            cache.insert(domain.to_string(), cached);
-            let old_snap = self.certified_key_cache.load();
-            let mut new_map = (**old_snap).clone();
-            new_map.insert(domain.to_string(), certified_key);
-            self.certified_key_cache.store(Arc::new(new_map));
-        }
-
-        self.broadcast_event(CertEvent::Issued {
-            domain: domain.to_string(),
-        });
-
-        info!("Issued ACME certificate for domain: {}", domain);
-        Ok(entry)
+        // Load the issued certificate from disk into cache + broadcast Issued
+        self.load_issued_certificate(domain).await
     }
 
     /// Start the background certificate renewal task
@@ -395,6 +374,55 @@ impl CertificateManager {
             return Some(super::provider::CertCoverage::Wildcard(wildcard));
         }
         None
+    }
+
+    /// 获取覆盖 `domain` 的 TLS `ServerConfig`：先精确匹配，未命中回退一层通配。
+    ///
+    /// 返回 `(config, coverage)`，`coverage` 标明命中的是精确证书还是通配符证书，
+    /// 供调用方标注证书来源（如 Trojan 的 `cert_source`）。比较不区分大小写。
+    pub async fn get_tls_server_config_covering(
+        &self,
+        domain: &str,
+    ) -> Option<(Arc<ServerConfig>, super::provider::CertCoverage)> {
+        let coverage = self.find_covering_cert(domain).await?;
+        let key = match &coverage {
+            super::provider::CertCoverage::Exact => domain.to_ascii_lowercase(),
+            super::provider::CertCoverage::Wildcard(pattern) => pattern.clone(),
+        };
+        let cache = self.cache.read().await;
+        cache.get(&key).map(|c| (c.tls_config.clone(), coverage))
+    }
+
+    /// 把磁盘上新签发的证书加载进内存缓存并广播 [`CertEvent::Issued`]。
+    ///
+    /// ACME 客户端（`AcmeClient`）签发成功后只写磁盘；调用本方法后证书
+    /// 无需重启即可被 SNI resolver / Trojan 等消费者使用。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate cannot be loaded from disk or parsed.
+    pub async fn load_issued_certificate(&self, domain: &str) -> Result<CertEntry> {
+        let cached = self
+            .build_cached_cert(domain)
+            .context("Failed to load issued certificate from storage")?;
+        let certified_key = super::provider::build_certified_key(&cached.entry)
+            .context("Failed to build CertifiedKey for issued cert")?;
+        let entry = cached.entry.clone();
+        {
+            let mut cache = self.cache.write().await;
+            cache.insert(domain.to_string(), cached);
+            let old_snap = self.certified_key_cache.load();
+            let mut new_map = (**old_snap).clone();
+            new_map.insert(domain.to_string(), certified_key);
+            self.certified_key_cache.store(Arc::new(new_map));
+        }
+
+        self.broadcast_event(CertEvent::Issued {
+            domain: domain.to_string(),
+        });
+
+        info!("Loaded issued certificate for domain: {}", domain);
+        Ok(entry)
     }
 
     /// Build a resolver for use with `rustls::ServerConfig::with_cert_resolver`.
@@ -726,5 +754,101 @@ mod tests {
         let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
         let cert = params.self_signed(&key_pair).unwrap();
         (cert.pem(), key_pair.serialize_pem())
+    }
+
+    /// 造一张自签名证书并加入 manager。
+    async fn add_test_cert(mgr: &CertificateManager, domain: &str) {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = CertificateParams::new(vec![domain.to_string()]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        mgr.add_certificate(
+            domain,
+            super::CertEntry {
+                cert_pem: cert.pem(),
+                key_pem: kp.serialize_pem(),
+                chain_pem: None,
+                expires_at: None,
+                source: super::CertSource::Manual,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn covering_config_exact_match() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
+        add_test_cert(&mgr, "trojan.example.com").await;
+
+        let (cfg, coverage) = mgr
+            .get_tls_server_config_covering("trojan.example.com")
+            .await
+            .expect("exact match should hit");
+        assert_eq!(coverage, crate::server::acme::provider::CertCoverage::Exact);
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn covering_config_wildcard_fallback() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
+        add_test_cert(&mgr, "*.example.com").await;
+
+        let (_, coverage) = mgr
+            .get_tls_server_config_covering("trojan.example.com")
+            .await
+            .expect("wildcard should cover");
+        assert_eq!(
+            coverage,
+            crate::server::acme::provider::CertCoverage::Wildcard("*.example.com".to_string())
+        );
+
+        // 不相关的域名不命中
+        assert!(mgr
+            .get_tls_server_config_covering("other.com")
+            .await
+            .is_none());
+        // 两层子域不被一层通配覆盖（wildcard_for 规则）
+        assert!(mgr
+            .get_tls_server_config_covering("a.b.example.com")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn load_issued_certificate_populates_cache_and_broadcasts() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
+        let mut rx = mgr.subscribe();
+
+        // 模拟 ACME 客户端只写磁盘的结果
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = CertificateParams::new(vec!["new.example.com".to_string()]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        mgr.storage
+            .save_certificate("new.example.com", &cert.pem(), &kp.serialize_pem(), None)
+            .unwrap();
+
+        mgr.load_issued_certificate("new.example.com")
+            .await
+            .unwrap();
+
+        // 内存缓存立即可用（CertificateProvider 已随 use super::* 引入）
+        assert!(mgr.get_tls_server_config("new.example.com").await.is_some());
+        assert!(mgr.resolve_certified_key("new.example.com").is_some());
+
+        // 广播了 Issued 事件（tests mod 已 use super::*，CertEvent 直接在作用域内）
+        match rx.try_recv() {
+            Ok(CertEvent::Issued { domain }) => {
+                assert_eq!(domain, "new.example.com")
+            }
+            _ => panic!("expected Issued event"),
+        }
     }
 }

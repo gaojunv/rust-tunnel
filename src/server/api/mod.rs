@@ -2393,6 +2393,17 @@ async fn request_acme_certificate(
     match result {
         Ok(metadata) => {
             tracing::info!("Certificate request successful for domain: {}", domain);
+            // 签发结果写入 CertificateManager 内存缓存并广播 CertEvent::Issued，
+            // 否则重启前 Trojan / 反代 SNI resolver 看不到新证书。
+            if let Some(ref cm) = state.server_state.cert_manager {
+                if let Err(e) = cm.load_issued_certificate(&domain).await {
+                    tracing::warn!(
+                        "Failed to load issued certificate into cache for {}: {}",
+                        domain,
+                        e
+                    );
+                }
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "certificate": metadata })),
