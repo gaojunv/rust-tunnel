@@ -211,6 +211,15 @@ fn build_upstream_request(
     if let Ok(host) = HeaderValue::from_str(&backend.addr) {
         parts.headers.insert(hyper::header::HOST, host);
     }
+    // On WebSocket upgrades, keep Origin consistent with the rewritten Host:
+    // WS servers commonly reject handshakes whose Origin host differs from
+    // the request Host (e.g. gorilla/websocket's default CheckOrigin).
+    // Only rewrite when an Origin header is actually present.
+    if preserve_upgrade && parts.headers.contains_key(hyper::header::ORIGIN) {
+        if let Ok(origin) = HeaderValue::from_str(&format!("{scheme}://{}", backend.addr)) {
+            parts.headers.insert(hyper::header::ORIGIN, origin);
+        }
+    }
     // Normalize the request version to match the outgoing client's protocol.
     // The incoming downstream version may be HTTP/2 (from the h2 listener) or
     // HTTP/1.1; the upstream client is protocol-locked at build time, so we
@@ -322,23 +331,6 @@ pub async fn handle_proxy_request_unified(
     // Client backend fork: bypass the shared UpstreamClient and dial
     // through the ClientConnector tunnel.
     if backend.kind == BackendKind::Client {
-        // WebSocket upgrade not supported for client backends
-        // (hyper::client::conn::http1 does not surface upgrade() in
-        // the simple send_request path).
-        if is_websocket_upgrade(req.headers()) {
-            let mut counts = counts_for_decrement.lock().await;
-            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
-                if *c > 0 {
-                    *c -= 1;
-                }
-            }
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(
-                    "websocket upgrade to client backend not yet supported",
-                ))
-                .unwrap();
-        }
         // HTTP/2 not supported for client backends
         if backend.protocol != BackendProtocol::Http1 {
             let mut counts = counts_for_decrement.lock().await;
@@ -493,6 +485,10 @@ pub async fn handle_proxy_request_unified(
 /// This path is used when `backend.kind == Client`. It bypasses the
 /// shared `UpstreamClient` and opens a fresh `ClientTunnelStream` for
 /// each request (no connection pooling in this first version).
+///
+/// WebSocket upgrades are supported: on a 101 the upgraded downstream and
+/// upstream IOs are bridged with `copy_bidirectional`, raw bytes flowing
+/// through the control-channel tunnel.
 async fn handle_client_backend(
     state: Arc<ReverseProxyState>,
     req: Request<Body>,
@@ -502,6 +498,16 @@ async fn handle_client_backend(
 ) -> Response {
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
+
+    // Capture the downstream OnUpgrade future BEFORE `req` is consumed —
+    // hyper's upgrade handle is one-shot per request. The handle is stored
+    // in the request extensions, so it survives `into_parts` below.
+    let mut req = req;
+    let downstream_upgrade = if is_websocket_upgrade(req.headers()) {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
 
     // Wrap request body to count bytes_in
     let (parts, body) = req.into_parts();
@@ -552,11 +558,22 @@ async fn handle_client_backend(
                 .unwrap();
         }
     };
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!("client backend conn ended: {e}");
-        }
-    });
+    let ws_potential = downstream_upgrade.is_some();
+    if ws_potential {
+        // `with_upgrades` keeps the Upgraded IO alive after the 101 so the
+        // raw byte stream can be bridged below.
+        tokio::spawn(async move {
+            if let Err(e) = conn.with_upgrades().await {
+                tracing::debug!("client backend conn ended: {e}");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!("client backend conn ended: {e}");
+            }
+        });
+    }
 
     // Rewrite the request URI to relative form for the tunneled backend
     let mut upstream_req = match build_upstream_request(req, &backend) {
@@ -579,8 +596,57 @@ async fn handle_client_backend(
     }
 
     match sender.send_request(upstream_req).await {
-        Ok(resp) => {
-            state.decrement_connections(&rule_id).await;
+        Ok(mut resp) => {
+            let is_ws = ws_potential && resp.status() == StatusCode::SWITCHING_PROTOCOLS;
+            if is_ws {
+                // Take the upstream upgrade handle before `resp` is consumed
+                // by `build_downstream_response` — same one-shot constraint
+                // as the downstream side.
+                let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                let client_upgrade = downstream_upgrade.expect("checked above");
+                let rid = rule_id.clone();
+                let cc = state.connection_counts.clone();
+                let tp = traffic_pending.clone();
+                tokio::spawn(async move {
+                    let (client_up, server_up) =
+                        match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                tracing::debug!("ws upgrade join failed: {e}");
+                                let mut counts = cc.lock().await;
+                                if let Some(c) = counts.get_mut(&rid) {
+                                    if *c > 0 {
+                                        *c -= 1;
+                                    }
+                                }
+                                return;
+                            }
+                        };
+                    // hyper 1.x's `Upgraded` implements hyper's own Read/Write
+                    // traits; wrap with TokioIo so it satisfies tokio's
+                    // AsyncRead + AsyncWrite for copy_bidirectional.
+                    let mut client_io = TokioIo::new(client_up);
+                    let mut server_io = TokioIo::new(server_up);
+                    match tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await {
+                        // (client→backend, backend→client) = (bytes_in, bytes_out)
+                        Ok((to_backend, to_client)) => {
+                            record_traffic(&tp, &rid, to_backend, to_client, 0);
+                        }
+                        Err(e) => {
+                            tracing::debug!("ws bidirectional copy ended: {e}");
+                        }
+                    }
+                    let mut counts = cc.lock().await;
+                    if let Some(c) = counts.get_mut(&rid) {
+                        if *c > 0 {
+                            *c -= 1;
+                        }
+                    }
+                });
+            }
+            if !is_ws {
+                state.decrement_connections(&rule_id).await;
+            }
             build_downstream_response(resp, traffic_pending, rule_id)
         }
         Err(e) => {
@@ -1249,6 +1315,198 @@ mod tests {
         );
     }
 
+    /// End-to-end: WebSocket upgrade through a **client-kind** backend —
+    /// downstream → proxy → control-channel tunnel → (fake) client → WS echo.
+    /// The fake client lives at the registry message level: it answers
+    /// OpenTunnel, completes the WS handshake on the first Data frame, then
+    /// echoes raw bytes.
+    #[tokio::test]
+    async fn websocket_upgrade_to_client_backend_end_to_end() {
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::routing::any;
+        use axum::Router;
+        use base64::Engine;
+        use sha1::{Digest, Sha1};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        use crate::common::ControlMessage;
+        use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
+        use crate::server::db::Database;
+        use crate::server::reverse_proxy::connector::ClientConnector;
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+        // 1. Fake tunnel client registered in a ClientRegistry.
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("pw").await.unwrap();
+        let registry = ClientRegistry::new(db);
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(64);
+        let entry = registry
+            .register("ws-client", None, None, "pw", client_tx)
+            .await
+            .unwrap();
+
+        let entry_for_client = entry.clone();
+        tokio::spawn(async move {
+            let mut upgraded: HashSet<u64> = HashSet::new();
+            while let Some(msg) = client_rx.recv().await {
+                match msg {
+                    ControlMessage::OpenTunnel { connection_id, .. } => {
+                        let mut conns = entry_for_client.active_connections.lock().await;
+                        if let Some(active) = conns.get_mut(&connection_id) {
+                            if let Some(tx) = active.open_result.take() {
+                                let _ = tx.send(TunnelOpenOutcome::Ok);
+                            }
+                        }
+                    }
+                    ControlMessage::Data {
+                        connection_id,
+                        data,
+                    } => {
+                        let reply = if upgraded.contains(&connection_id) {
+                            Some(data) // raw echo after the handshake
+                        } else {
+                            // First frame: HTTP upgrade request — answer 101.
+                            let text = String::from_utf8_lossy(&data);
+                            let key = text
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                                .and_then(|l| l.split_once(':'))
+                                .map(|(_, v)| v.trim().to_string())
+                                .expect("no ws key in upgrade request");
+                            let mut h = Sha1::new();
+                            h.update(key.as_bytes());
+                            h.update(WS_MAGIC.as_bytes());
+                            let accept =
+                                base64::engine::general_purpose::STANDARD.encode(h.finalize());
+                            upgraded.insert(connection_id);
+                            Some(
+                                format!(
+                                    "HTTP/1.1 101 Switching Protocols\r\n\
+                                     Upgrade: websocket\r\n\
+                                     Connection: Upgrade\r\n\
+                                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                                )
+                                .into_bytes(),
+                            )
+                        };
+                        if let Some(bytes) = reply {
+                            let conns = entry_for_client.active_connections.lock().await;
+                            if let Some(active) = conns.get(&connection_id) {
+                                let _ = active.inbound.send(bytes).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 2. Proxy with a client-kind backend.
+        let rule = ProxyRule {
+            id: "r_ws_client".into(),
+            name: "r_ws_client".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "127.0.0.1:9999".into(),
+                    client_name: Some("ws-client".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let proxy_state = Arc::new(ReverseProxyState::new());
+        proxy_state
+            .set_client_connector(Arc::new(ClientConnector::new(registry)))
+            .await;
+
+        let app = Router::new()
+            .fallback(any(handle_proxy_request_unified))
+            .with_state((source, upstream, proxy_state));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        // 3. Raw WS handshake through the proxy.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let req = "GET /chat HTTP/1.1\r\n\
+                   Host: test.local\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\n\r\n";
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let mut resp_buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut chunk))
+                    .await
+                    .expect("timed out waiting for 101 headers")
+                    .unwrap();
+            assert!(n > 0, "connection closed before 101 completed");
+            resp_buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = resp_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = std::str::from_utf8(&resp_buf[..header_end]).unwrap();
+        let status_line = head.lines().next().unwrap();
+        assert!(
+            status_line.contains("101"),
+            "expected 101 Switching Protocols through client backend, got: {status_line}"
+        );
+
+        // 4. Post-upgrade bytes flow both ways through the tunnel.
+        let leftover = resp_buf[header_end..].to_vec();
+        let payload: [u8; 8] = [0x81, 0x82, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11];
+        client.write_all(&payload).await.unwrap();
+
+        let mut got = leftover;
+        while got.len() < payload.len() {
+            let mut buf = [0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("timed out reading echo through client tunnel")
+                .unwrap();
+            assert!(n > 0, "tunnel closed before echoing bytes");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            &got[..payload.len()],
+            &payload,
+            "echoed bytes must match through the client-backend upgrade tunnel"
+        );
+    }
+
     /// h1 fallback: when URI is relative (no authority) and only Host header
     /// carries the value, it must still be honored.
     #[tokio::test]
@@ -1459,74 +1717,9 @@ mod tests {
         );
     }
 
-    /// Client backend with WebSocket upgrade header → 502.
-    #[tokio::test]
-    async fn client_backend_websocket_returns_502() {
-        use arc_swap::ArcSwap;
-        use axum::body::Body;
-        use axum::extract::State;
-        use axum::http::Request as AxumRequest;
-
-        use crate::server::reverse_proxy::router::RouteTable;
-        use crate::server::reverse_proxy::upstream::UpstreamClient;
-        use crate::server::reverse_proxy::{
-            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
-            RuleType,
-        };
-
-        // Build a rule with a client-kind backend using HTTP/1.1
-        let rule = ProxyRule {
-            id: "r1".into(),
-            name: "r1".into(),
-            rule_type: RuleType::Http,
-            listen: "127.0.0.1:0".into(),
-            domains: vec!["test.local".into()],
-            routes: vec![Route {
-                path: "/".into(),
-                backends: vec![Backend {
-                    kind: BackendKind::Client,
-                    addr: "localhost:80".into(),
-                    client_name: Some("home-nas".into()),
-                    weight: 100,
-                    protocol: BackendProtocol::Http1,
-                    scheme: BackendScheme::Http,
-                }],
-                load_balancing: LoadBalancing::default(),
-            }],
-            tls: None,
-            enabled: true,
-            created_at: None,
-            cert_status: None,
-        };
-        let table = RouteTable::from_rules(vec![rule]);
-        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
-        let upstream = Arc::new(UpstreamClient::new());
-        let proxy_state = Arc::new(ReverseProxyState::new());
-
-        // Request with WebSocket upgrade headers
-        let req: AxumRequest<Body> = AxumRequest::builder()
-            .method("GET")
-            .uri("/")
-            .header("host", "test.local")
-            .header("upgrade", "websocket")
-            .header("connection", "upgrade")
-            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-            .header("sec-websocket-version", "13")
-            .body(Body::empty())
-            .unwrap();
-
-        let state = State((source, upstream, proxy_state));
-        let resp = handle_proxy_request_unified(state, req).await;
-        assert_eq!(resp.status(), 502);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains("websocket upgrade to client backend not yet supported"),
-            "body: {text}"
-        );
-    }
-
     /// Client backend with no ClientConnector registered → 502.
+    /// (WebSocket upgrades to client backends are supported — see
+    /// `websocket_upgrade_to_client_backend_end_to_end`.)
     #[tokio::test]
     async fn client_backend_offline_returns_502() {
         use arc_swap::ArcSwap;
