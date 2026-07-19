@@ -9,7 +9,8 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useClients } from '@/api/hooks';
+import { useQuery } from '@tanstack/react-query';
+import { clientsApi } from '@/api/client';
 import { cn } from '@/lib/utils';
 
 type StatusTone = 'critical' | 'warning' | 'connected' | 'unknown';
@@ -36,7 +37,11 @@ const STATUS_LABELS: Record<StatusTone, string> = {
 };
 
 export default function MeshPage() {
-  const { data: clients, isLoading } = useClients();
+  const { data: clients = [], isLoading } = useQuery({
+    queryKey: ['clients', 'mesh'],
+    queryFn: () => clientsApi.list(),
+    refetchInterval: 5000,
+  });
 
   return (
     <div className="space-y-6">
@@ -54,7 +59,7 @@ export default function MeshPage() {
             <div className="text-center py-8 text-muted-foreground">
               Loading...
             </div>
-          ) : clients?.length === 0 ? (
+          ) : clients.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               No clients connected
             </div>
@@ -62,25 +67,19 @@ export default function MeshPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Port</TableHead>
+                  <TableHead>Name</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead>Connections</TableHead>
-                  <TableHead>Services</TableHead>
+                  <TableHead>Hostname</TableHead>
+                  <TableHead>Version</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {clients?.map((client) => {
-                  const tone: StatusTone = client.quality?.is_critical
-                    ? 'critical'
-                    : client.quality?.is_warning
-                      ? 'warning'
-                      : client.quality
-                        ? 'connected'
-                        : 'unknown';
+                {clients.map((client) => {
+                  const tone: StatusTone = client.online ? 'connected' : 'unknown';
                   return (
-                    <TableRow key={client.port}>
+                    <TableRow key={client.name}>
                       <TableCell className="font-medium">
-                        {client.port}
+                        {client.name}
                       </TableCell>
                       <TableCell>
                         <Badge
@@ -96,9 +95,9 @@ export default function MeshPage() {
                           {STATUS_LABELS[tone]}
                         </Badge>
                       </TableCell>
-                      <TableCell>{client.connection_count}</TableCell>
+                      <TableCell>{client.hostname ?? '-'}</TableCell>
                       <TableCell className="text-muted-foreground">
-                        {client.hostname ?? '-'}
+                        {client.client_version ?? '-'}
                       </TableCell>
                     </TableRow>
                   );

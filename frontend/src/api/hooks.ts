@@ -1,7 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   login,
-  getClients,
   getMetrics,
   getPortQuality,
   getPortTraffic,
@@ -46,14 +45,6 @@ import type {
   ReverseProxySettings,
   DnsSettings,
 } from '../types';
-
-export function useClients() {
-  return useQuery({
-    queryKey: ['clients'],
-    queryFn: () => getClients(),
-    refetchInterval: 5000,
-  });
-}
 
 export function useMetrics() {
   return useQuery({

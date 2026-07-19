@@ -1,4 +1,5 @@
 import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -10,9 +11,9 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { StatCard } from '@/components/shared/StatCard';
-import { QualityBadge } from '@/components/shared/QualityBadge';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useClients, useMetrics } from '@/api/hooks';
+import { clientsApi } from '@/api/client';
+import { useMetrics } from '@/api/hooks';
 import {
   Users,
   Activity,
@@ -31,10 +32,14 @@ function formatBytes(bytes: number): string {
 
 export default function DashboardPage() {
   const navigate = useNavigate();
-  const { data: clients, isLoading: clientsLoading } = useClients();
+  const { data: clients = [], isLoading: clientsLoading } = useQuery({
+    queryKey: ['clients', 'dashboard'],
+    queryFn: () => clientsApi.list(),
+    refetchInterval: 5000,
+  });
   const { data: metrics, isLoading: metricsLoading } = useMetrics();
 
-  const connectedClients = metrics?.client_count ?? 0;
+  const connectedClients = clients.filter((c) => c.online).length;
   const activeConnections = metrics?.active_connection_count ?? 0;
   const totalBytesIn = metrics?.total_bytes_in ?? 0;
   const totalBytesOut = metrics?.total_bytes_out ?? 0;
@@ -80,29 +85,29 @@ export default function DashboardPage() {
             <div className="py-12 text-center text-sm text-muted-foreground">
               Loading...
             </div>
-          ) : clients?.length === 0 ? (
+          ) : clients.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">
               <Users className="h-8 w-8 opacity-40" />
-              <p className="text-sm">No clients connected</p>
+              <p className="text-sm">No clients registered</p>
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Port
+                    Name
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Quality
+                    Hostname
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    RTT
+                    Status
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Loss
+                    Version
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Connections
+                    Referenced
                   </TableHead>
                   <TableHead className="text-right text-xs uppercase tracking-wider">
                     Actions
@@ -110,35 +115,35 @@ export default function DashboardPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {clients?.map((client) => (
-                  <TableRow key={client.port}>
-                    <TableCell className="font-medium tabular-nums">
-                      {client.port}
+                {clients.map((client) => (
+                  <TableRow key={client.name}>
+                    <TableCell className="font-medium">{client.name}</TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {client.hostname ?? '-'}
                     </TableCell>
                     <TableCell>
-                      <QualityBadge
-                        score={client.quality?.quality_score ?? 0}
-                      />
+                      <span
+                        className={`inline-flex items-center rounded-full px-2 py-1 text-xs font-medium ${
+                          client.online
+                            ? 'bg-emerald-500/10 text-emerald-500'
+                            : 'bg-muted text-muted-foreground'
+                        }`}
+                      >
+                        {client.online ? 'online' : 'offline'}
+                      </span>
                     </TableCell>
-                    <TableCell className="tabular-nums text-muted-foreground">
-                      {client.quality?.last_rtt_ms != null
-                        ? `${client.quality.last_rtt_ms.toFixed(1)}ms`
-                        : '-'}
+                    <TableCell className="text-muted-foreground">
+                      {client.client_version ?? '-'}
                     </TableCell>
-                    <TableCell className="tabular-nums text-muted-foreground">
-                      {client.quality?.loss_rate != null
-                        ? `${(client.quality.loss_rate * 100).toFixed(1)}%`
-                        : '-'}
-                    </TableCell>
-                    <TableCell className="tabular-nums text-muted-foreground">
-                      {client.connection_count}
+                    <TableCell className="text-muted-foreground">
+                      {client.referenced_by_rules}
                     </TableCell>
                     <TableCell className="text-right">
                       <Button
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                        onClick={() => navigate(`/clients/${client.port}`)}
+                        onClick={() => navigate(`/clients/${client.name}`)}
                       >
                         <ExternalLink className="h-4 w-4" />
                       </Button>

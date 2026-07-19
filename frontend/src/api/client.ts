@@ -1,6 +1,5 @@
 import axios from 'axios';
 import type {
-  ClientResponse,
   PortTraffic,
   ServerMetrics,
   LoginRequest,
@@ -40,7 +39,7 @@ import type {
 const API_BASE = '/api';
 
 // Create axios instance
-const api = axios.create({
+export const api = axios.create({
   baseURL: API_BASE,
 });
 
@@ -77,16 +76,6 @@ export const login = async (data: LoginRequest): Promise<LoginResponse> => {
 export const logout = async (): Promise<void> => {
   await api.post('/logout');
   localStorage.removeItem('auth_token');
-};
-
-// Clients API
-export const getClients = async (): Promise<ClientResponse[]> => {
-  const response = await api.get<ClientResponse[]>('/clients');
-  return response.data;
-};
-
-export const disconnectClient = async (port: number): Promise<void> => {
-  await api.delete(`/clients/${port}`);
 };
 
 // Traffic API

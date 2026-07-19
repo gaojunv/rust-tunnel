@@ -45,18 +45,6 @@ export interface QualityWarning {
   warning_type: string;
 }
 
-export interface ClientResponse {
-  port: number;
-  hostname?: string;
-  connection_count: number;
-  quality?: ConnectionQuality;
-}
-
-export interface ClientGroup {
-  hostname: string;
-  clients: ClientResponse[];
-}
-
 export interface TrafficBucket {
   timestamp: string;
   bytes_in: number;
