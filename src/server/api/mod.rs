@@ -2905,6 +2905,12 @@ pub async fn run_api_server(
             patch(clients::patch_client_note).delete(clients::delete_client),
         )
         .route("/api/clients/:name/kick", post(clients::kick_client))
+        // Server auth token management
+        .route(
+            "/api/server-auth",
+            get(server_auth::get_auth).put(server_auth::put_auth),
+        )
+        .route("/api/server-auth/rotate", post(server_auth::rotate_auth))
         .route("/api/traffic", get(get_traffic))
         .route("/api/traffic/:port", get(get_port_traffic))
         .route("/api/metrics", get(get_metrics))
