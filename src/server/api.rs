@@ -2015,6 +2015,11 @@ async fn create_proxy_rule(
         cert_status: None,
     };
 
+    if let Err(e) = crate::server::reverse_proxy::validate_rule_for_save(&rule) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    crate::server::reverse_proxy::sanitize_rule(&mut rule);
+
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,
         state.server_state.proxy_state.cert_manager(),
@@ -2163,6 +2168,11 @@ async fn update_proxy_rule(
         created_at: previous.created_at.clone(),
         cert_status: None,
     };
+
+    if let Err(e) = crate::server::reverse_proxy::validate_rule_for_save(&rule) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    crate::server::reverse_proxy::sanitize_rule(&mut rule);
 
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,

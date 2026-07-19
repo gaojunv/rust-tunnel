@@ -330,6 +330,52 @@ pub async fn resolve_cert_source_for_rule(
     }
 }
 
+/// Validate a rule about to be persisted. See spec §2.5.
+/// Returns Err(message) on the first failing constraint.
+pub fn validate_rule_for_save(rule: &ProxyRule) -> Result<(), String> {
+    for route in &rule.routes {
+        for b in &route.backends {
+            match b.kind {
+                BackendKind::Client => {
+                    let name = b.client_name.as_deref().unwrap_or("");
+                    if name.trim().is_empty() {
+                        return Err("client backend requires non-empty client_name".into());
+                    }
+                    // parse host:port
+                    if b.addr.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).is_none() {
+                        return Err(format!(
+                            "client backend addr '{}' is not a valid host:port",
+                            b.addr
+                        ));
+                    }
+                    if rule.rule_type == RuleType::Udp {
+                        return Err("UDP rules cannot use client backends".into());
+                    }
+                    if b.protocol == BackendProtocol::Http2 {
+                        return Err("HTTP/2 to client backend not yet supported".into());
+                    }
+                }
+                BackendKind::Direct => {
+                    // client_name must be None for direct; harmless if not,
+                    // but sanitize_rule() will zero it out.
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Zero out `client_name` on `Direct` backends before persisting.
+pub fn sanitize_rule(rule: &mut ProxyRule) {
+    for route in &mut rule.routes {
+        for b in &mut route.backends {
+            if b.kind == BackendKind::Direct {
+                b.client_name = None;
+            }
+        }
+    }
+}
+
 impl ReverseProxyState {
     /// Create a new reverse proxy state without database
     pub fn new() -> Self {
@@ -959,5 +1005,154 @@ mod mod_tests {
     fn backend_kind_serializes_lowercase() {
         assert_eq!(serde_json::to_string(&BackendKind::Direct).unwrap(), "\"direct\"");
         assert_eq!(serde_json::to_string(&BackendKind::Client).unwrap(), "\"client\"");
+    }
+
+    #[test]
+    fn validate_rule_rejects_client_backend_missing_name() {
+        let rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["x.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "localhost:80".into(),
+                    client_name: None,
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        let err = validate_rule_for_save(&rule).expect_err("should reject");
+        assert!(err.contains("client_name"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_client_backend_bad_addr() {
+        let rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["x.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "no-port".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        let err = validate_rule_for_save(&rule).expect_err("should reject bad addr");
+        assert!(err.contains("not a valid host:port"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_udp_client_backend() {
+        let rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Udp,
+            listen: "0.0.0.0:53".into(),
+            domains: vec![],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "1.1.1.1:53".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        let err = validate_rule_for_save(&rule).expect_err("should reject UDP client");
+        assert!(err.contains("UDP"));
+    }
+
+    #[test]
+    fn validate_rule_rejects_http2_client_backend() {
+        let rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["x.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "localhost:80".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http2,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        let err = validate_rule_for_save(&rule).expect_err("should reject HTTP/2 client");
+        assert!(err.contains("HTTP/2"));
+    }
+
+    #[test]
+    fn validate_rule_direct_backend_ok() {
+        let rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["x.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Direct,
+                    addr: "10.0.0.1:80".into(),
+                    client_name: None,
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        assert!(validate_rule_for_save(&rule).is_ok());
+    }
+
+    #[test]
+    fn sanitize_rule_zeroes_client_name_on_direct() {
+        let mut rule = ProxyRule {
+            id: "r".into(), name: "r".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:80".into(),
+            domains: vec!["x.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Direct,
+                    addr: "10.0.0.1:80".into(),
+                    client_name: Some("stray".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None, enabled: true, created_at: None, cert_status: None,
+        };
+        sanitize_rule(&mut rule);
+        assert!(rule.routes[0].backends[0].client_name.is_none());
     }
 }
