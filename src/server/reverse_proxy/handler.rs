@@ -204,6 +204,13 @@ fn build_upstream_request(
     parts.uri = uri;
     let preserve_upgrade = is_websocket_upgrade(&parts.headers);
     parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
+    // Rewrite Host to the backend authority (standard reverse-proxy behavior,
+    // cf. nginx `proxy_set_header Host $proxy_host`). Forwarding the public
+    // domain verbatim makes Host-sensitive upstreams (ALLOWED_HOSTS checks,
+    // dev servers, virtual-host routers) reject the request, often with 400.
+    if let Ok(host) = HeaderValue::from_str(&backend.addr) {
+        parts.headers.insert(hyper::header::HOST, host);
+    }
     // Normalize the request version to match the outgoing client's protocol.
     // The incoming downstream version may be HTTP/2 (from the h2 listener) or
     // HTTP/1.1; the upstream client is protocol-locked at build time, so we
@@ -874,6 +881,106 @@ mod tests {
             "x-custom-hop from Connection should be stripped"
         );
         assert_eq!(received.get("x-keep").unwrap(), "keep-me");
+    }
+
+    /// Regression: the proxy must rewrite the Host header to the backend
+    /// address. Forwarding the public domain verbatim makes Host-sensitive
+    /// upstreams (Django ALLOWED_HOSTS, webpack-dev-server, virtual-host
+    /// routers) reject the request — typically with a 400.
+    #[tokio::test]
+    async fn host_header_is_rewritten_to_backend_addr() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        use arc_swap::ArcSwap;
+        use axum::extract::Request as AxumRequest;
+        use axum::routing::any;
+        use axum::Router;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
+        let tx_clone = tx.clone();
+        let backend_app = Router::new().route(
+            "/",
+            any(move |req: AxumRequest| {
+                let tx = tx_clone.clone();
+                async move {
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .map(str::to_string);
+                    let _ = tx.send(host);
+                    "ok"
+                }
+            }),
+        );
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr: SocketAddr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(backend_listener, backend_app).await.unwrap();
+        });
+
+        let rule = ProxyRule {
+            id: "r_host".into(),
+            name: "r_host".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Direct,
+                    addr: backend_addr.to_string(),
+                    client_name: None,
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let proxy_state = Arc::new(ReverseProxyState::new());
+
+        let app = Router::new()
+            .fallback(any(handle_proxy_request_unified))
+            .with_state((source, upstream, proxy_state));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let resp = client
+            .get(format!("http://{proxy_addr}/"))
+            .header("host", "test.local")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(
+            received.as_deref(),
+            Some(backend_addr.to_string().as_str()),
+            "backend must see Host rewritten to its own addr, not the public domain"
+        );
     }
 
     /// Regression: a real HTTP/2 request has host in `:authority` (surfaced via
