@@ -134,9 +134,9 @@ async fn main() -> TunnelResult<()> {
                 tracing::info!("loaded existing client token from DB (len={})", t.len());
             }
             (None, Some(cli_token)) => {
-                db.save_server_auth(cli_token)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("save initial auth token: {e}"))?;
+                db.save_server_auth(cli_token).await.map_err(|e| {
+                    std::io::Error::other(format!("save initial auth token: {e}"))
+                })?;
                 tracing::info!("seeded client token from CLI/env");
             }
             (None, None) => {
@@ -145,10 +145,10 @@ async fn main() -> TunnelResult<()> {
                 let mut bytes = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut bytes);
                 let token =
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-                db.save_server_auth(&token)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("save generated auth token: {e}"))?;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+                db.save_server_auth(&token).await.map_err(|e| {
+                    std::io::Error::other(format!("save generated auth token: {e}"))
+                })?;
                 tracing::info!(
                     "generated random client token; new clients must use: {token}"
                 );
