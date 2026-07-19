@@ -486,104 +486,15 @@ async fn main() -> TunnelResult<()> {
 
     // Start Trojan if enabled in dynamic config
     {
-        let dc = state.dynamic_config.read().await;
-        if let Some(ref tj) = dc.trojan {
-            if tj.enabled {
-                let state_clone = state.clone();
-                let trojan_port = tj.port;
-                let trojan_password = tj.password.clone();
-                let trojan_fallback = tj.fallback.clone();
-                tracing::info!(
-                    "Starting Trojan TLS listener on port {}, fallback {}",
-                    trojan_port,
-                    trojan_fallback
-                );
-                drop(dc); // Release the read lock before spawning
-
-                // Trojan requires TLS - load or generate certificates
-                let cert_pair =
-                    load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
-                        std::io::Error::other(format!(
-                            "Failed to load TLS certificates for Trojan: {}",
-                            e
-                        ))
-                    })?;
-                let tls_config = create_server_config(cert_pair).map_err(|e| {
-                    std::io::Error::other(format!("Failed to create TLS config for Trojan: {}", e))
-                })?;
-
-                // Create a watch channel for dynamic TLS config updates
-                let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
-
-                // Register abort handle so API updates can stop this listener
-                let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
-                {
-                    let mut abort = state.trojan_listener_abort.write().await;
-                    *abort = Some(abort_tx);
-                }
-
-                // If a cert_manager exists, subscribe to cert events and update the watch channel
-                if let Some(ref cert_manager) = state.cert_manager {
-                    let mut cert_rx = cert_manager.subscribe();
-                    let tx = tls_config_tx.clone();
-                    let cert_manager_clone = cert_manager.clone();
-                    tokio::spawn(async move {
-                        use rust_tunnel::server::acme::manager::CertEvent;
-                        loop {
-                            match cert_rx.recv().await {
-                                Ok(event) => match event {
-                                    CertEvent::Renewed { ref domain }
-                                    | CertEvent::Issued { ref domain } => {
-                                        tracing::info!(
-                                            "Certificate event for Trojan listener: {:?} for {}",
-                                            event,
-                                            domain
-                                        );
-                                        // Try to get the updated TLS config from the cert manager
-                                        if let Some(new_config) =
-                                            cert_manager_clone.get_tls_server_config(domain).await
-                                        {
-                                            if let Err(e) = tx.send(new_config) {
-                                                tracing::error!(
-                                                    "Failed to update Trojan TLS config: {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                },
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                    tracing::warn!(
-                                        "Cert event subscriber lagged by {} messages",
-                                        n
-                                    );
-                                }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                    tracing::info!(
-                                        "Cert event channel closed, stopping TLS config updater"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                }
-
-                tokio::spawn(async move {
-                    if let Err(e) = listener::start_trojan_listener_with_abort(
-                        state_clone,
-                        trojan_port,
-                        trojan_password,
-                        trojan_fallback,
-                        tls_config_rx,
-                        abort_rx,
-                    )
-                    .await
-                    {
-                        tracing::error!("Trojan listener error: {}", e);
-                    }
-                });
+        let tj = {
+            let dc = state.dynamic_config.read().await;
+            dc.trojan.clone()
+        };
+        if let Some(ref tj) = tj {
+            if let Err(e) =
+                rust_tunnel::server::trojan_runtime::apply_trojan_config(&state, tj).await
+            {
+                tracing::error!("Trojan 启动失败: {}", e);
             }
         }
     }

@@ -1329,6 +1329,37 @@ async fn update_trojan_config(
         }
     }
 
+    // 端口与反代共享的边界规则检查
+    if enabled {
+        if let Some((listen_addr, tls_enabled)) = state
+            .server_state
+            .proxy_state
+            .http_listen_addr_for_port(port)
+            .await
+        {
+            if !tls_enabled {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Port {} is used by reverse proxy listener {} without TLS. Trojan requires TLS.",
+                        port, listen_addr
+                    ),
+                )
+                    .into_response();
+            }
+            if domain.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Port {} is used by reverse proxy listener {}. Set a domain to share it via SNI.",
+                        port, listen_addr
+                    ),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Save to DB（单份配置语义：整表替换，避免修改端口时残留旧行）
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db
@@ -1343,80 +1374,28 @@ async fn update_trojan_config(
         }
     }
 
-    // Update in-memory config
+    // Update in-memory config（new_cfg 同时供 lifecycle 段复用）
+    let new_cfg = crate::server::dynamic_config::TrojanDynamicConfig {
+        enabled,
+        port,
+        password: password.clone(),
+        fallback: fallback.to_string(),
+        domain: domain.clone(),
+    };
     {
         let mut dc = state.server_state.dynamic_config.write().await;
-        dc.trojan = Some(crate::server::dynamic_config::TrojanDynamicConfig {
-            enabled,
-            port,
-            password: password.clone(),
-            fallback: fallback.to_string(),
-            domain: domain.clone(),
-        });
+        dc.trojan = Some(new_cfg.clone());
     }
 
-    // Handle listener lifecycle
+    // Handle listener lifecycle（证书解析 + 共享/独立模式判定统一在 trojan_runtime）
+    if let Err(e) =
+        crate::server::trojan_runtime::apply_trojan_config(&state.server_state, &new_cfg).await
     {
-        let mut abort = state.server_state.trojan_listener_abort.write().await;
-        if let Some(tx) = abort.take() {
-            let _ = tx.send(true);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        if enabled {
-            // 自签名证书（修复原硬编码查询 "default" 域名证书的死路径；
-            // ACME 优先解析在 trojan_runtime 统一实现后由 Task 7 接入）
-            let tls_config = match crate::common::tls::load_or_generate_cert(
-                &state.server_state.tls_cert_path,
-                &state.server_state.tls_key_path,
-            ) {
-                Ok(pair) => match crate::common::tls::create_server_config(pair) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("TLS config error: {}", e),
-                        )
-                            .into_response();
-                    }
-                },
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("TLS cert error: {}", e),
-                    )
-                        .into_response();
-                }
-            };
-            let (_tls_config_tx, tls_config_rx) = tokio::sync::watch::channel(tls_config);
-            {
-                let mut rt = state.server_state.trojan_runtime.write().await;
-                rt.cert_source = Some("self_signed".to_string());
-                rt.shared = false;
-            }
-
-            let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
-            *abort = Some(abort_tx);
-            let state_clone = state.server_state.clone();
-            let trojan_password = password.clone();
-            let trojan_fallback = fallback.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = crate::server::listener::start_trojan_listener_with_abort(
-                    state_clone,
-                    port,
-                    trojan_password,
-                    trojan_fallback,
-                    tls_config_rx,
-                    abort_rx,
-                )
-                .await
-                {
-                    tracing::error!("Trojan listener error: {}", e);
-                }
-            });
-        } else {
-            *state.server_state.trojan_runtime.write().await = Default::default();
-        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to apply trojan config: {}", e),
+        )
+            .into_response();
     }
 
     Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port, "domain": domain}))
@@ -2015,6 +1994,9 @@ async fn create_proxy_rule(
         }
     }
 
+    // 反代规则变更可能影响 Trojan 共享/独立模式
+    crate::server::trojan_runtime::sync_trojan_mode(&state.server_state).await;
+
     if cert_status.source == crate::server::reverse_proxy::CertSourceKind::PendingIssuance {
         if let Some(mgr) = state.server_state.proxy_state.cert_manager().cloned() {
             if rule.tls.as_ref().is_some_and(|t| t.acme) {
@@ -2190,6 +2172,9 @@ async fn update_proxy_rule(
         }
     }
 
+    // 新旧端口 reconcile 都完成后，检查 Trojan 共享/独立模式是否需要切换
+    crate::server::trojan_runtime::sync_trojan_mode(&state.server_state).await;
+
     if cert_status.source == crate::server::reverse_proxy::CertSourceKind::PendingIssuance {
         if let Some(mgr) = state.server_state.proxy_state.cert_manager().cloned() {
             if rule.tls.as_ref().is_some_and(|t| t.acme) {
@@ -2250,6 +2235,9 @@ async fn delete_proxy_rule(
             tracing::warn!("Reconcile failed on delete: {}", e);
         }
     }
+
+    // 共享 listener 可能已删除/降级，检查 Trojan 是否需要回退独立监听
+    crate::server::trojan_runtime::sync_trojan_mode(&state.server_state).await;
 
     Json(serde_json::json!({ "deleted": id })).into_response()
 }
