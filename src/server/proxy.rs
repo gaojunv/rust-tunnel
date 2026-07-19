@@ -1,5 +1,4 @@
 use std::time::Instant;
-use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, warn};

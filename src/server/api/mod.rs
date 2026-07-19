@@ -490,19 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_client_response_serialize() {
-        let response = ClientResponse {
-            port: 8080,
-            hostname: Some("test-host".into()),
-            connection_count: 3,
-            quality: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("8080"));
-        assert!(json.contains("test-host"));
-    }
-
-    #[test]
     fn test_shadowsocks_config_serialize() {
         let config = ShadowsocksConfig {
             enabled: true,
@@ -723,15 +710,6 @@ pub struct LoginResponse {
     pub auth_required: bool,
 }
 
-/// Client response for API
-#[derive(Debug, Serialize)]
-pub struct ClientResponse {
-    pub port: u16,
-    pub hostname: Option<String>,
-    pub connection_count: usize,
-    pub quality: Option<ConnectionQuality>,
-}
-
 /// Server metrics
 #[derive(Debug, Serialize)]
 pub struct ServerMetrics {
@@ -922,66 +900,6 @@ async fn login(
 // Logout handler (client just discards token)
 async fn logout() -> impl IntoResponse {
     StatusCode::OK
-}
-
-// List all clients
-async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>> {
-    let clients = state.server_state.get_all_clients().await;
-    let mut response = Vec::with_capacity(clients.len() + 1);
-
-    // Tunnel clients
-    for (port, info) in clients {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: info.hostname,
-            connection_count,
-            quality,
-        });
-    }
-
-    // Shadowsocks ports — show them in the client list so SS activity is visible
-    let ss_ports = state.server_state.get_shadowsocks_ports().await;
-    for port in ss_ports {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: Some("[Shadowsocks]".to_string()),
-            connection_count,
-            quality,
-        });
-    }
-
-    // Trojan ports — show them in the client list
-    let trojan_ports = state.server_state.get_trojan_ports().await;
-    for port in trojan_ports {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: Some("[Trojan]".to_string()),
-            connection_count,
-            quality,
-        });
-    }
-
-    Json(response)
-}
-
-// Disconnect client
-async fn disconnect_client(
-    State(state): State<ApiState>,
-    Path(port): Path<u16>,
-) -> impl IntoResponse {
-    let success = state.server_state.disconnect_client(port).await;
-    if success {
-        state.server_state.traffic_store.remove_port(port).await;
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    }
 }
 
 // Get traffic for all clients

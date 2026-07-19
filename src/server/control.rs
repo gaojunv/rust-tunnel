@@ -7,7 +7,7 @@ use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::{
     create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
@@ -19,12 +19,11 @@ use crate::server::dns::registry::DnsRegistry;
 use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
 use crate::server::quality::{
-    calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
-    QualityThresholds, QualityTracker,
+    ConnectionQuality, QualitySample, QualityStore, QualityTracker,
 };
 use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::ServerConfig;
-use chrono::{Timelike, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Sender for control messages - can be shared across tasks
@@ -506,11 +505,6 @@ impl ServerState {
         let ss_connections = self.ss_active_connections.lock().await;
         let trojan_connections = self.trojan_active_connections.lock().await;
         ss_connections.values().sum::<usize>() + trojan_connections.values().sum::<usize>()
-    }
-
-    /// Disconnect a tunnel-forward client (deprecated, always returns false)
-    pub async fn disconnect_client(&self, _remote_port: u16) -> bool {
-        false
     }
 
     /// Get or create quality tracker for a port
