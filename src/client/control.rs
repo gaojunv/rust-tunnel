@@ -40,20 +40,14 @@ pub struct ClientState {
     pub config: ClientConfig,
     /// Sender for control messages to server
     pub control_sender: ControlSender,
-    pub forwards: Vec<ForwardRule>,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
 }
 
 impl ClientState {
-    fn new(
-        config: ClientConfig,
-        control_sender: ControlSender,
-        forwards: Vec<ForwardRule>,
-    ) -> Self {
+    fn new(config: ClientConfig, control_sender: ControlSender) -> Self {
         Self {
             config,
             control_sender,
-            forwards,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -198,26 +192,26 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                             seq, client_rtt_micros, server_processing_time
                         );
                     }
-                    ControlMessage::NewConnection {
+                    ControlMessage::OpenTunnel {
                         connection_id,
-                        remote_port,
+                        target_addr,
                     } => {
                         info!(
-                            "New connection request id {} for remote port {}",
-                            connection_id, remote_port
+                            "OpenTunnel request id {} for target {}",
+                            connection_id, target_addr
                         );
                         // Pre-register as pending so Data messages are buffered instead of dropped
                         state.add_pending_connection(connection_id).await;
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy::handle_new_connection(
+                            if let Err(e) = proxy::handle_open_tunnel(
                                 state_clone,
                                 connection_id,
-                                remote_port,
+                                target_addr,
                             )
                             .await
                             {
-                                warn!("Failed to handle new connection {}: {}", connection_id, e);
+                                warn!("Failed to handle OpenTunnel {}: {}", connection_id, e);
                             }
                         });
                     }
@@ -236,9 +230,11 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         info!("Connection {} closed by server", connection_id);
                         state.close_connection(connection_id).await;
                     }
-                    ControlMessage::Disconnect => {
-                        info!("Server requested disconnect. Shutting down...");
-                        return Err(TunnelError::Protocol("Server requested disconnect".into()));
+                    ControlMessage::Disconnect { reason } => {
+                        info!("Server requested disconnect: {}", reason);
+                        return Err(TunnelError::Protocol(format!(
+                            "Server requested disconnect: {reason}"
+                        )));
                     }
                     ControlMessage::MeshMemberList { mesh_id, members } => {
                         debug!(
@@ -286,10 +282,8 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-use crate::client::ForwardRule;
-
 /// Main client entry point
-pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> TunnelResult<()> {
+pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
     // Connect to server with or without TLS
     let (mut reader, mut writer): (
         Box<dyn AsyncRead + Unpin + Send>,
@@ -321,46 +315,48 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
         (Box::new(r), Box::new(w))
     };
 
-    // Get hostname
+    // Get hostname for client name
     let hostname = gethostname::gethostname().into_string().ok();
+    let client_name = config
+        .name
+        .clone()
+        .or_else(|| hostname.clone())
+        .unwrap_or_else(|| "unnamed-client".to_string());
 
-    // Register all forward rules
-    for rule in &forwards {
-        ControlMessage::Register {
-            remote_port: rule.remote_port,
-            hostname: hostname.clone(),
-            auth_token: config.auth_token.clone(),
+    // Register with v2 protocol (single Register, no per-forward loop)
+    let register = ControlMessage::Register {
+        protocol_version: 2,
+        client_name: client_name.clone(),
+        password: config.password.clone(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    register.write_to_stream(&mut writer).await?;
+    info!("Sent Register to server (name='{client_name}')");
+
+    match ControlMessage::read_from_stream(&mut reader).await {
+        Ok(Some(ControlMessage::RegisterResponse {
+            success: true,
+            ..
+        })) => {
+            info!("registered as '{client_name}'");
         }
-        .write_to_stream(&mut writer)
-        .await?;
-
-        // Read registration response
-        let resp = match ControlMessage::read_from_stream(&mut reader).await {
-            Ok(Some(ControlMessage::RegisterResponse { success, message })) => (success, message),
-            Ok(Some(_)) => {
-                return Err(TunnelError::Protocol(
-                    "Expected registration response".into(),
-                ));
-            }
-            Ok(None) => {
-                return Err(TunnelError::Protocol(
-                    "Connection closed during registration".into(),
-                ));
-            }
-            Err(e) => return Err(e),
-        };
-
-        if !resp.0 {
+        Ok(Some(ControlMessage::RegisterResponse {
+            success: false,
+            message,
+        })) => {
             return Err(TunnelError::ControlChannel(format!(
-                "Registration failed for port {}: {}",
-                rule.remote_port, resp.1
+                "register failed: {message}"
             )));
         }
-
-        info!(
-            "Registration successful for remote port {} -> {}",
-            rule.remote_port, rule.local_addr
-        );
+        Ok(Some(other)) => {
+            return Err(TunnelError::Protocol(format!(
+                "expected RegisterResponse, got {other:?}"
+            )));
+        }
+        Ok(None) => {
+            return Err(TunnelError::Protocol("closed during register".into()));
+        }
+        Err(e) => return Err(e),
     }
 
     // Mesh network registration
@@ -368,7 +364,7 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
         let mesh_name = config
             .mesh_name
             .clone()
-            .unwrap_or_else(|| hostname.clone().unwrap_or_else(|| "unknown".into()));
+            .unwrap_or_else(|| hostname.unwrap_or_else(|| "unknown".into()));
 
         ControlMessage::MeshJoin {
             mesh_id: mesh_id.clone(),
@@ -435,7 +431,7 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
     }
     // --- End log capture setup ---
 
-    let state = ClientState::new(config, sender.clone(), forwards);
+    let state = ClientState::new(config, sender.clone());
 
     // Start heartbeat task
     tokio::spawn(start_heartbeat(sender));
@@ -450,14 +446,13 @@ pub async fn run_client(config: ClientConfig, forwards: Vec<ForwardRule>) -> Tun
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::ForwardRule;
     use crate::common::ControlMessage;
 
     fn create_test_state() -> ClientState {
         let config = ClientConfig {
             server: "localhost:8080".to_string(),
-            forwards: vec!["8080:localhost:80".to_string()],
-            auth_token: None,
+            name: None,
+            password: "pw".to_string(),
             tls: false,
             tls_server_name: None,
             tls_insecure: true,
@@ -467,12 +462,7 @@ mod tests {
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);
-        let forwards = vec![ForwardRule {
-            remote_port: 8080,
-            local_addr: "localhost:80".to_string(),
-            dns_name: None,
-        }];
-        ClientState::new(config, sender, forwards)
+        ClientState::new(config, sender)
     }
 
     #[tokio::test]
@@ -620,10 +610,12 @@ mod tests {
         let state = create_test_state();
 
         let mut buffer = Vec::new();
-        ControlMessage::Disconnect
-            .write_to_stream(&mut buffer)
-            .await
-            .unwrap();
+        ControlMessage::Disconnect {
+            reason: "testing".into(),
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
 
         let mut reader = &buffer[..];
         let result = process_control_messages(&mut reader, state).await;

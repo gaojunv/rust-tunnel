@@ -3,7 +3,7 @@
 //! - `downstream_h2_over_tls`: client (h2 over TLS + ALPN) → gateway → h1 backend
 //! - `upstream_h2c`: client (h1) → gateway → h2c backend (prior-knowledge)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,12 +19,11 @@ use tokio::net::TcpListener;
 use tokio_rustls::rustls;
 
 use crate::server::acme::{CertEntry, CertSource, CertificateManager};
-use crate::server::reverse_proxy::handler::ConnectionCounts;
 use crate::server::reverse_proxy::router::RouteTable;
 use crate::server::reverse_proxy::shared_listener::SharedListener;
 use crate::server::reverse_proxy::{
     Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig,
-    Route, RuleType, TrafficPending,
+    ReverseProxyState, Route, RuleType,
 };
 
 /// Register a self-signed cert for the given domain in the manager.
@@ -146,15 +145,13 @@ async fn downstream_h2_over_tls() {
     };
     let table = RouteTable::from_rules(vec![rule]);
 
-    let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let _listener = SharedListener::spawn(
         listen_addr.to_string(),
         true,
         table,
         Some(mgr.clone()),
         HashSet::from(["r1".to_string()]),
-        connection_counts,
-        TrafficPending::default(),
+        Arc::new(ReverseProxyState::new()),
     )
     .await
     .expect("shared listener spawn");
@@ -253,15 +250,13 @@ async fn upstream_h2c() {
         cert_status: None,
     };
     let table = RouteTable::from_rules(vec![rule]);
-    let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let _listener = SharedListener::spawn(
         listen_addr.to_string(),
         false,
         table,
         Some(mgr),
         HashSet::from(["r_h2c".to_string()]),
-        connection_counts,
-        TrafficPending::default(),
+        Arc::new(ReverseProxyState::new()),
     )
     .await
     .expect("shared listener spawn");
@@ -318,15 +313,13 @@ async fn upstream_connect_failure_returns_502() {
         cert_status: None,
     };
     let table = RouteTable::from_rules(vec![rule]);
-    let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let _listener = SharedListener::spawn(
         listen_addr.to_string(),
         false,
         table,
         Some(mgr),
         HashSet::from(["r_fail".to_string()]),
-        connection_counts,
-        TrafficPending::default(),
+        Arc::new(ReverseProxyState::new()),
     )
     .await
     .expect("shared listener spawn");
