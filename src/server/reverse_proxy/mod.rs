@@ -477,6 +477,16 @@ impl ReverseProxyState {
             .map(|r| (r.listen.clone(), r.tls.as_ref().is_some_and(|t| t.enabled)))
     }
 
+    /// 判断指定端口是否仍被反代共享监听器占用，返回占用的 listen 地址。
+    /// 用于 Trojan 独立监听回退前的端口冲突检测（规则已降级/删除但 listener 仍绑定端口）。
+    pub async fn shared_listener_addr_for_port(&self, port: u16) -> Option<String> {
+        let listeners = self.shared_listeners.lock().await;
+        listeners
+            .keys()
+            .find(|addr| addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) == Some(port))
+            .cloned()
+    }
+
     /// Backwards-compatible accessor returning the manager as a trait object.
     /// TCP proxy and legacy HTTP paths still use `CertificateProvider`.
     #[must_use]

@@ -9,15 +9,14 @@
 //! 共享/独立监听模式判定与切换、ACME 证书热更新订阅。
 
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
 use crate::common::error::TunnelResult;
 use crate::common::tls::{create_server_config, load_or_generate_cert};
 use crate::server::acme::manager::{CertEvent, CertificateManager};
 use crate::server::acme::provider::CertCoverage;
-use crate::server::acme::CertificateProvider;
-use crate::server::control::ServerState;
+use crate::server::control::{ServerState, TrojanRuntimeStatus};
 use crate::server::dynamic_config::TrojanDynamicConfig;
 use crate::server::reverse_proxy::sni_resolver::wildcard_for;
 use crate::server::reverse_proxy::TrojanSniEntry;
@@ -79,15 +78,19 @@ pub async fn resolve_trojan_tls(
 }
 
 /// 订阅证书事件：当签发/续期的证书覆盖 trojan 域名（精确或通配）时，
-/// 把新 TLS 配置推入 watch channel。仅 ACME 模式下调用。
+/// 重新走证书解析——命中 ACME 证书则把新 TLS 配置推入 watch channel 并把
+/// `cert_source` 更新为实际来源（自签名模式由此热升级到 ACME，续期场景
+/// 也会重新解析保持正确来源）；未命中则保持现状不动作。
 pub fn spawn_trojan_cert_reload(
     cert_manager: Arc<CertificateManager>,
     trojan_domain: String,
     tls_config_tx: watch::Sender<Arc<rustls::ServerConfig>>,
     mut abort_rx: watch::Receiver<bool>,
+    trojan_runtime: Arc<RwLock<TrojanRuntimeStatus>>,
 ) -> tokio::task::JoinHandle<()> {
+    // 在 spawn 前订阅，避免任务调度延迟导致丢失订阅前瞬间的签发事件
+    let mut cert_rx = cert_manager.subscribe();
     tokio::spawn(async move {
-        let mut cert_rx = cert_manager.subscribe();
         loop {
             tokio::select! {
                 _ = abort_rx.changed() => {
@@ -101,9 +104,22 @@ pub fn spawn_trojan_cert_reload(
                             let covers = d == trojan_domain
                                 || wildcard_for(&trojan_domain).as_deref() == Some(d.as_str());
                             if covers {
-                                if let Some(cfg) = cert_manager.get_tls_server_config(&d).await {
-                                    info!("Trojan TLS 配置热更新（证书 {}）", d);
+                                if let Some((cfg, coverage)) = cert_manager
+                                    .get_tls_server_config_covering(&trojan_domain)
+                                    .await
+                                {
+                                    let source = match coverage {
+                                        CertCoverage::Exact => TrojanCertSource::AcmeExact,
+                                        CertCoverage::Wildcard(_) => TrojanCertSource::AcmeWildcard,
+                                    };
+                                    info!(
+                                        "Trojan TLS 配置热更新（证书 {}，来源 {}）",
+                                        d,
+                                        source.as_str()
+                                    );
                                     let _ = tls_config_tx.send(cfg);
+                                    trojan_runtime.write().await.cert_source =
+                                        Some(source.as_str().to_string());
                                 }
                             }
                         }
@@ -154,6 +170,25 @@ pub async fn apply_trojan_config(
         }
     };
 
+    // 2.5 独立监听回退前检测端口占用：目标端口仍被反代共享监听器占用时
+    // bind 必失败，按规格"端口被占则停止并告警"，避免运行状态误报"运行中"
+    let port_occupied_by = if shared_listen_addr.is_none() {
+        state
+            .proxy_state
+            .shared_listener_addr_for_port(cfg.port)
+            .await
+    } else {
+        None
+    };
+    if let Some(addr) = port_occupied_by {
+        warn!(
+            "Trojan 端口 {} 仍被反代共享监听器 {} 占用，无法回退独立监听，Trojan 已停止",
+            cfg.port, addr
+        );
+        *state.trojan_runtime.write().await = Default::default();
+        return Ok(());
+    }
+
     // 3. 证书解析（ACME 优先，回退自签名）
     let domain_lc = cfg.domain.to_ascii_lowercase();
     let (tls_config, source) = resolve_trojan_tls(
@@ -169,10 +204,16 @@ pub async fn apply_trojan_config(
     let (abort_tx, abort_rx) = watch::channel(false);
     *state.trojan_listener_abort.write().await = Some(abort_tx);
 
-    // 4. ACME 证书热更新订阅（自签名模式无需订阅）
-    if !domain_lc.is_empty() && source != TrojanCertSource::SelfSigned {
+    // 4. 证书热更新订阅：domain 非空即订阅（自签名模式也可经此热升级到 ACME）
+    if !domain_lc.is_empty() {
         if let Some(mgr) = state.cert_manager.clone() {
-            spawn_trojan_cert_reload(mgr, domain_lc.clone(), tls_config_tx, abort_rx.clone());
+            spawn_trojan_cert_reload(
+                mgr,
+                domain_lc.clone(),
+                tls_config_tx,
+                abort_rx.clone(),
+                state.trojan_runtime.clone(),
+            );
         }
     }
 
@@ -338,5 +379,185 @@ mod tests {
         let rt = state.trojan_runtime.read().await;
         assert!(rt.cert_source.is_none());
         assert!(!rt.shared);
+    }
+
+    /// 修复①：自签名模式（domain 非空、启动时无 ACME 证书）也订阅证书事件，
+    /// Issued 覆盖 trojan 域名后热升级：cert_source 变为 acme_exact。
+    #[tokio::test]
+    async fn apply_self_signed_hot_upgrades_to_acme_on_issued() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(CertificateManager::new(temp.path().to_str().unwrap()));
+        let mut state = ServerState::new();
+        state.cert_manager = Some(mgr.clone());
+        state.tls_cert_path = temp.path().join("c.pem").to_str().unwrap().to_string();
+        state.tls_key_path = temp.path().join("k.pem").to_str().unwrap().to_string();
+
+        let cfg = TrojanDynamicConfig {
+            enabled: true,
+            port: 0, // 独立监听绑定随机端口，避免端口冲突
+            password: "p".to_string(),
+            fallback: "127.0.0.1:80".to_string(),
+            domain: "trojan.example.com".to_string(),
+        };
+        apply_trojan_config(&state, &cfg).await.unwrap();
+        // 启动时无 ACME 证书 → 自签名回退
+        assert_eq!(
+            state.trojan_runtime.read().await.cert_source.as_deref(),
+            Some("self_signed")
+        );
+
+        // 模拟 ACME 签发（add_certificate 广播 CertEvent::Issued）
+        add_test_cert(&mgr, "trojan.example.com").await;
+
+        // 热升级：watch 推送新配置（同一分支内）并把 cert_source 更新为 acme_exact
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state.trojan_runtime.read().await.cert_source.as_deref() == Some("acme_exact") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("自签名模式未热升级到 ACME 证书");
+    }
+
+    /// 修复①：直接验证 spawn_trojan_cert_reload —— Issued 后 watch 收到新 TLS
+    /// 配置且 cert_source 更新；续期（再次 Issued）仍能正确推送。
+    #[tokio::test]
+    async fn cert_reload_pushes_new_config_and_updates_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mgr = Arc::new(CertificateManager::new(temp.path().to_str().unwrap()));
+        // 初始为自签名 TLS 配置
+        let pair = load_or_generate_cert(
+            temp.path().join("c.pem").to_str().unwrap(),
+            temp.path().join("k.pem").to_str().unwrap(),
+        )
+        .unwrap();
+        let initial = create_server_config(pair).unwrap();
+        let (tx, mut rx) = watch::channel(initial);
+        let (_abort_tx, abort_rx) = watch::channel(false);
+        let runtime = Arc::new(RwLock::new(TrojanRuntimeStatus {
+            cert_source: Some("self_signed".to_string()),
+            shared: false,
+        }));
+        spawn_trojan_cert_reload(
+            mgr.clone(),
+            "trojan.example.com".to_string(),
+            tx,
+            abort_rx,
+            runtime.clone(),
+        );
+
+        // 模拟 ACME 签发事件 → watch 收到新配置
+        add_test_cert(&mgr, "trojan.example.com").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed())
+            .await
+            .expect("watch 未收到热升级后的 TLS 配置")
+            .unwrap();
+        // cert_source 在 send 之后写入，轮询等待避免竞态
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if runtime.read().await.cert_source.as_deref() == Some("acme_exact") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cert_source 未更新为 acme_exact");
+
+        // 续期场景：再次签发同域证书仍能收到新配置、来源保持正确
+        add_test_cert(&mgr, "trojan.example.com").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed())
+            .await
+            .expect("续期事件未推送新配置")
+            .unwrap();
+        assert_eq!(
+            runtime.read().await.cert_source.as_deref(),
+            Some("acme_exact")
+        );
+    }
+
+    /// 修复②：独立监听回退时目标端口仍被反代共享监听器占用 →
+    /// 不 spawn 独立 listener、清空运行状态（相当于停止）。
+    #[tokio::test]
+    async fn apply_independent_fallback_stops_when_port_occupied() {
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        let state = ServerState::new();
+
+        // 反代在该端口保留共享监听器（模拟规则从 TLS 降级为 HTTP 后 listener 仍绑定端口）
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen_addr = format!("127.0.0.1:{port}");
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: listen_addr.clone(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Direct,
+                    addr: "127.0.0.1:9".into(),
+                    client_name: None,
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::RoundRobin,
+            }],
+            tls: None, // 未启用 TLS → trojan 无法共享，需回退独立监听
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        state
+            .proxy_state
+            .rules
+            .lock()
+            .await
+            .insert("r1".into(), rule);
+        state
+            .proxy_state
+            .reconcile_http_listener(&listen_addr)
+            .await
+            .unwrap();
+        assert!(state
+            .proxy_state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
+
+        // 模拟 trojan 原处于共享模式运行中
+        {
+            let mut rt = state.trojan_runtime.write().await;
+            rt.cert_source = Some("acme_exact".to_string());
+            rt.shared = true;
+        }
+
+        let cfg = TrojanDynamicConfig {
+            enabled: true,
+            port,
+            password: "p".to_string(),
+            fallback: "127.0.0.1:80".to_string(),
+            domain: "trojan.example.com".to_string(),
+        };
+        apply_trojan_config(&state, &cfg).await.unwrap();
+
+        // 端口被占用：运行状态清空，abort handle 未重建（未 spawn 独立 listener）
+        {
+            let rt = state.trojan_runtime.read().await;
+            assert!(rt.cert_source.is_none());
+            assert!(!rt.shared);
+        }
+        assert!(state.trojan_listener_abort.read().await.is_none());
     }
 }
