@@ -181,11 +181,14 @@ export interface AddDnsRecordRequest {
 
 export type RuleType = 'http' | 'tcp' | 'udp';
 export type LoadBalancing = 'round_robin' | 'weighted_round_robin';
+export type BackendKind = 'direct' | 'client';
 export type BackendScheme = 'http' | 'https';
 export type BackendProtocol = 'http1' | 'http2';
 
 export interface Backend {
+  kind: BackendKind;
   addr: string;
+  client_name?: string | null;
   weight: number;
   scheme?: BackendScheme;
   protocol?: BackendProtocol;
@@ -243,6 +246,23 @@ export interface CreateProxyRuleRequest {
 }
 
 export type UpdateProxyRuleRequest = CreateProxyRuleRequest;
+
+export interface Client {
+  name: string;
+  hostname: string | null;
+  note: string | null;
+  online: boolean;
+  connected_at: string | null;
+  last_seen_at: string;
+  first_seen_at: string;
+  client_version: string | null;
+  referenced_by_rules: number;
+}
+
+export interface ServerAuthView {
+  client_token: string;
+  updated_at: string;
+}
 
 // === ACME Certificate Management ===
 
