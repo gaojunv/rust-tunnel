@@ -14,7 +14,7 @@ use tracing::error;
 
 use super::router::RouteTable;
 use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
-use super::{record_traffic, Backend, TrafficPending};
+use super::{record_traffic, Backend, BackendKind, BackendProtocol, ReverseProxyState, TrafficPending};
 
 use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
@@ -31,11 +31,14 @@ pub type ConnectionCounts = Arc<tokio::sync::Mutex<HashMap<String, u64>>>;
 pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 
 /// State injected into the axum Router.
+///
+/// The third element is `Arc<ReverseProxyState>` which provides access to
+/// `connection_counts`, `traffic_pending`, and the `ClientConnector` for
+/// client-kind backends.
 pub type ProxyState = (
     RouteSource,
     Arc<UpstreamClient>,
-    ConnectionCounts,
-    TrafficPending,
+    Arc<ReverseProxyState>,
 );
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
@@ -266,9 +269,11 @@ fn host_without_port(raw: &str) -> &str {
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
 pub async fn handle_proxy_request_unified(
-    State((source, upstream, connection_counts, traffic_pending)): State<ProxyState>,
+    State((source, upstream, proxy_state)): State<ProxyState>,
     mut req: Request<Body>,
 ) -> Response {
+    let connection_counts = proxy_state.connection_counts.clone();
+    let traffic_pending = proxy_state.traffic_pending.clone();
     // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
     // h1 requests may put it in either the URI (absolute-form) or a Host header.
     let host = req
@@ -308,6 +313,47 @@ pub async fn handle_proxy_request_unified(
     // Decrement on scope exit (deferred via clone)
     let rule_id_for_decrement = rule_id.clone();
     let counts_for_decrement = connection_counts.clone();
+
+    // Client backend fork: bypass the shared UpstreamClient and dial
+    // through the ClientConnector tunnel.
+    if backend.kind == BackendKind::Client {
+        // WebSocket upgrade not supported for client backends
+        // (hyper::client::conn::http1 does not surface upgrade() in
+        // the simple send_request path).
+        if is_websocket_upgrade(req.headers()) {
+            let mut counts = counts_for_decrement.lock().await;
+            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("websocket upgrade to client backend not yet supported"))
+                .unwrap();
+        }
+        // HTTP/2 not supported for client backends
+        if backend.protocol != BackendProtocol::Http1 {
+            let mut counts = counts_for_decrement.lock().await;
+            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
+                if *c > 0 {
+                    *c -= 1;
+                }
+            }
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("HTTP/2 to client backend not yet supported"))
+                .unwrap();
+        }
+        return handle_client_backend(
+            proxy_state,
+            req,
+            backend,
+            rule_id_for_decrement,
+            traffic_pending.clone(),
+        )
+        .await;
+    }
 
     // WebSocket upgrade path: capture the downstream OnUpgrade future BEFORE
     // `req` is consumed by `build_upstream_request` — hyper's upgrade handle
@@ -433,6 +479,108 @@ pub async fn handle_proxy_request_unified(
     }
 }
 
+/// Client backend handler: dials through the ClientConnector tunnel,
+/// performs an HTTP/1.1 handshake, sends the rewritten request, and
+/// returns the response.
+///
+/// This path is used when `backend.kind == Client`. It bypasses the
+/// shared `UpstreamClient` and opens a fresh `ClientTunnelStream` for
+/// each request (no connection pooling in this first version).
+async fn handle_client_backend(
+    state: Arc<ReverseProxyState>,
+    req: Request<Body>,
+    backend: Backend,
+    rule_id: String,
+    traffic_pending: TrafficPending,
+) -> Response {
+    use hyper::client::conn::http1;
+    use hyper_util::rt::TokioIo;
+
+    // Wrap request body to count bytes_in
+    let (parts, body) = req.into_parts();
+    let counted = Body::new(count_body(body, traffic_pending.clone(), rule_id.clone(), true));
+    let req = Request::from_parts(parts, counted);
+
+    // Dial via ClientConnector
+    let connector = match state.connector_for(&backend).await {
+        Ok(c) => c,
+        Err(e) => {
+            state.decrement_connections(&rule_id).await;
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("connector unavailable: {e}")))
+                .unwrap();
+        }
+    };
+    let stream = match connector.connect(&backend).await {
+        Ok(s) => s,
+        Err(e) => {
+            state.decrement_connections(&rule_id).await;
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("client backend dial failed: {e}")))
+                .unwrap();
+        }
+    };
+    let io = TokioIo::new(stream);
+
+    // HTTP/1.1 handshake
+    let (mut sender, conn) = match http1::Builder::new()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .handshake(io)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            state.decrement_connections(&rule_id).await;
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("http1 handshake failed: {e}")))
+                .unwrap();
+        }
+    };
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::debug!("client backend conn ended: {e}");
+        }
+    });
+
+    // Rewrite the request URI to relative form for the tunneled backend
+    let mut upstream_req = match build_upstream_request(req, &backend) {
+        Ok(r) => r,
+        Err(e) => {
+            state.decrement_connections(&rule_id).await;
+            return error_response(&e);
+        }
+    };
+
+    // For direct http1::handshake (not through a proxy), hyper's Client expects
+    // the URI in origin-form (e.g. "/path?query"), not absolute-form. Rewrite.
+    {
+        let pq = upstream_req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        *upstream_req.uri_mut() = pq.parse().unwrap_or_else(|_| upstream_req.uri().clone());
+    }
+
+    match sender.send_request(upstream_req).await {
+        Ok(resp) => {
+            state.decrement_connections(&rule_id).await;
+            build_downstream_response(resp, traffic_pending, rule_id)
+        }
+        Err(e) => {
+            state.decrement_connections(&rule_id).await;
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("upstream request failed: {e}")))
+                .unwrap()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,7 +680,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         // 1. Backend that trickles 8 chunks of 1 KiB with 50 ms between them.
@@ -566,7 +715,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -581,7 +732,7 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let proxy_state = Arc::new(ReverseProxyState::new());
 
         // 3. Build the axum Router with the unified handler and bind it.
         let app = Router::new()
@@ -589,8 +740,7 @@ mod tests {
             .with_state((
                 source,
                 upstream,
-                connection_counts,
-                TrafficPending::default(),
+                proxy_state,
             ));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
@@ -637,7 +787,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<hyper::HeaderMap>();
@@ -667,7 +818,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -682,15 +835,14 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let proxy_state = Arc::new(ReverseProxyState::new());
 
         let app = Router::new()
             .fallback(any(handle_proxy_request_unified))
             .with_state((
                 source,
                 upstream,
-                connection_counts,
-                TrafficPending::default(),
+                proxy_state,
             ));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
@@ -743,7 +895,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         // Backend that returns 200 with a known body.
@@ -763,7 +916,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -778,7 +933,7 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let proxy_state = Arc::new(ReverseProxyState::new());
 
         // Build a request the way hyper delivers an h2 request:
         // - authority set on the URI (from :authority pseudo-header)
@@ -794,8 +949,7 @@ mod tests {
         let state = State((
             source,
             upstream,
-            connection_counts,
-            TrafficPending::default(),
+            proxy_state,
         ));
         let resp = handle_proxy_request_unified(state, req).await;
 
@@ -823,7 +977,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::shared_listener::SharedListener;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -898,7 +1053,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -911,15 +1068,14 @@ mod tests {
             cert_status: None,
         };
         let table = RouteTable::from_rules(vec![rule]);
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let proxy_state = Arc::new(ReverseProxyState::new());
         let _listener = SharedListener::spawn(
             listen_addr.to_string(),
             false,
             table,
             Some(mgr),
             HashSet::from(["r_ws".to_string()]),
-            connection_counts,
-            TrafficPending::default(),
+            proxy_state,
         )
         .await
         .expect("shared listener spawn");
@@ -1008,7 +1164,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1027,7 +1184,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -1042,7 +1201,7 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let proxy_state = Arc::new(ReverseProxyState::new());
 
         // h1-style: URI is just "/", host lives in the Host header.
         let req: AxumRequest<Body> = AxumRequest::builder()
@@ -1055,8 +1214,7 @@ mod tests {
         let state = State((
             source,
             upstream,
-            connection_counts,
-            TrafficPending::default(),
+            proxy_state,
         ));
         let resp = handle_proxy_request_unified(state, req).await;
 
@@ -1078,7 +1236,8 @@ mod tests {
         use crate::server::reverse_proxy::router::RouteTable;
         use crate::server::reverse_proxy::upstream::UpstreamClient;
         use crate::server::reverse_proxy::{
-            Backend, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
         };
 
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1098,7 +1257,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".into(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: backend_addr.to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -1113,8 +1274,8 @@ mod tests {
         let table = RouteTable::from_rules(vec![rule]);
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
-        let connection_counts: ConnectionCounts = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        let traffic_pending = TrafficPending::default();
+        let proxy_state = Arc::new(ReverseProxyState::new());
+        let traffic_pending = proxy_state.traffic_pending.clone();
 
         let req: AxumRequest<Body> = AxumRequest::builder()
             .method("POST")
@@ -1123,7 +1284,7 @@ mod tests {
             .body(Body::from("abc"))
             .unwrap();
 
-        let state = State((source, upstream, connection_counts, traffic_pending.clone()));
+        let state = State((source, upstream, proxy_state));
         let resp = handle_proxy_request_unified(state, req).await;
         assert_eq!(resp.status(), 200);
 
@@ -1136,5 +1297,198 @@ mod tests {
         assert_eq!(delta.connections, 1);
         assert_eq!(delta.bytes_in, 3, "request body bytes counted");
         assert_eq!(delta.bytes_out, 11, "response body bytes counted");
+    }
+
+    // ---- Client backend tests ----
+
+    /// Client backend with HTTP/2 protocol → 502.
+    #[tokio::test]
+    async fn client_backend_http2_returns_502() {
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        // Build a rule with a client-kind backend using HTTP/2
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "localhost:80".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http2,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let proxy_state = Arc::new(ReverseProxyState::new());
+
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "test.local")
+            .body(Body::empty())
+            .unwrap();
+
+        let state = State((source, upstream, proxy_state));
+        let resp = handle_proxy_request_unified(state, req).await;
+        assert_eq!(resp.status(), 502);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("HTTP/2 to client backend not yet supported"),
+            "body: {text}"
+        );
+    }
+
+    /// Client backend with WebSocket upgrade header → 502.
+    #[tokio::test]
+    async fn client_backend_websocket_returns_502() {
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        // Build a rule with a client-kind backend using HTTP/1.1
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "localhost:80".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let proxy_state = Arc::new(ReverseProxyState::new());
+
+        // Request with WebSocket upgrade headers
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "test.local")
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(Body::empty())
+            .unwrap();
+
+        let state = State((source, upstream, proxy_state));
+        let resp = handle_proxy_request_unified(state, req).await;
+        assert_eq!(resp.status(), 502);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("websocket upgrade to client backend not yet supported"),
+            "body: {text}"
+        );
+    }
+
+    /// Client backend with no ClientConnector registered → 502.
+    #[tokio::test]
+    async fn client_backend_offline_returns_502() {
+        use arc_swap::ArcSwap;
+        use axum::body::Body;
+        use axum::extract::State;
+        use axum::http::Request as AxumRequest;
+
+        use crate::server::reverse_proxy::router::RouteTable;
+        use crate::server::reverse_proxy::upstream::UpstreamClient;
+        use crate::server::reverse_proxy::{
+            Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
+            RuleType,
+        };
+
+        // Build a rule with a client-kind backend (no ClientConnector registered)
+        let rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "127.0.0.1:0".into(),
+            domains: vec!["test.local".into()],
+            routes: vec![Route {
+                path: "/".into(),
+                backends: vec![Backend {
+                    kind: BackendKind::Client,
+                    addr: "localhost:80".into(),
+                    client_name: Some("home-nas".into()),
+                    weight: 100,
+                    protocol: BackendProtocol::Http1,
+                    scheme: BackendScheme::Http,
+                }],
+                load_balancing: LoadBalancing::default(),
+            }],
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        let table = RouteTable::from_rules(vec![rule]);
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
+        let upstream = Arc::new(UpstreamClient::new());
+        let proxy_state = Arc::new(ReverseProxyState::new());
+
+        let req: AxumRequest<Body> = AxumRequest::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "test.local")
+            .body(Body::empty())
+            .unwrap();
+
+        let state = State((source, upstream, proxy_state));
+        let resp = handle_proxy_request_unified(state, req).await;
+        assert_eq!(resp.status(), 502);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("client backend"),
+            "body should mention client backend, got: {text}"
+        );
     }
 }

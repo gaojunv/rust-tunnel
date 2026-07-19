@@ -19,7 +19,7 @@ cargo test -- --nocapture      # 运行测试并显示输出
 cargo test -p rust-tunnel --test '*' module::test_name  # 按模块筛选
 cargo clippy                   # Lint（项目配置为 clippy::pedantic）
 cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
-cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 9000:localhost:80
+cargo run --bin rust-tunnel-client -- --server localhost:8080 --password <token> --name home-nas
 cargo run --bin checkdb        # SQLite 数据库诊断工具
 ```
 
@@ -49,9 +49,10 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 库入口 `src/lib.rs` 导出三个模块：`client`、`common`、`server`。
 
 ### 核心数据流
-1. 服务器监听暴露端口 → 收到连接 → 通过控制通道通知客户端
-2. 客户端收到通知 → 连接本地服务 → 建立代理隧道
-3. 服务器和客户端的 `proxy.rs` 各自执行双向 `tokio::io::copy` 转发流量
+1. 客户端通过控制通道（加密 TLS）向服务端注册，提供名称和密码
+2. 管道路由由服务端 Web 管理的"反向代理规则"定义（Backend `kind=Direct` 直连外部，`kind=Client` 通过客户端内网穿透）
+3. `ClientConnector` → `ClientRegistry.open_tunnel` → `ClientTunnelStream` 在控制通道上搭建 `AsyncRead/Write` 流
+4. 反向代理的 TCP/HTTP handler 通过 `Connector` trait 统一调用，无需关心 backend 是直连还是 tunnel
 
 ### 模块职责
 
@@ -62,22 +63,23 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `logging.rs` — 日志初始化
 
 **`src/server/`** — 服务器实现
-- `control.rs` — `ServerState`：客户端注册、多端口支持、断开清理、连接数追踪、心跳质量监控、SS/Trojan 端口追踪
-- `listener.rs` — 监听暴露端口，通知客户端新连接
-- `proxy.rs` — 每连接代理和双向流量转发
-- `api.rs` — Axum API + `rust-embed` 嵌入前端 + `TrafficStore` 指标
+- `control.rs` — `ServerState`：控制连接接收、`ClientRegistry` 管理、消息分发（OpenTunnel/Data/Close）、心跳质量监控、SS/Trojan 端口追踪
+- `client_registry.rs` — 客户端名录（在线/离线）、注册认证、踢人、`open_tunnel` 拨号入口
+- `tunnel_stream.rs` — `ClientTunnelStream`：基于控制通道的 `AsyncRead+AsyncWrite`，`write→Data{bytes}` / `read←Data{bytes}` / `drop→Close`
+- `api/` — Axum API 路由（`mod.rs` + `clients.rs` + `server_auth.rs`）+ `rust-embed` 嵌入前端 + `TrafficStore` 指标
 - `auth.rs` — JWT 认证
-- `db.rs` — SQLite（WAL 模式）：流量、质量、会话、SS/Trojan 配置、日志持久化
+- `db.rs` — SQLite（WAL 模式）：流量、质量、会话、clients、server_auth、SS/Trojan 配置、日志持久化
 - `config.rs` — Clap + figment（TOML）+ 环境变量，三级优先级
 - `quality.rs` — 实时质量监控：RTT/丢包/吞吐量追踪、评分（0-100）、阈值告警、历史采样（内存 60 分钟，数据库 24 小时）
+- `reverse_proxy/` — 反向代理子系统，含 `mod.rs`（规则、校验、状态）、`connector.rs`（`Connector` trait + `DirectConnector` + `ClientConnector`）、`handler.rs`（HTTP 请求处理）、`tcp_proxy.rs`（TCP 透明代理）、`upstream.rs`（直连 HTTP 客户端池）、`router.rs`（host/路径路由表）、`shared_listener.rs`（多规则共享端口）、`sni_resolver.rs`（TLS SNI 分发）、`error.rs`（ReconcileError）
 - `shadowsocks.rs` — 内置 SS 代理：`shadowsocks-rust` crate，AES-256-GCM / ChaCha20-Poly1305，EVP_BytesToKey 密钥派生
 - `trojan.rs` — 内置 Trojan 代理：TLS 必需、SHA-224 认证、增量解析（`ParseResult`）、认证失败回退
 - `logs.rs` — 自定义 tracing Layer，捕获日志到内存 + SQLite，API 支持分页/过滤
 
-**`src/client/`** — 客户端实现
-- `control.rs` — 建立控制连接、TLS、认证令牌、增强心跳 RTT 测量、`ClientState` 连接管理
-- `proxy.rs` — 连接本地服务并代理流量
-- `config.rs` — 同服务器的三级配置优先级
+**`src/client/`** — 客户端实现（零配置范式的端侧）
+- `control.rs` — 建立控制连接、TLS、密码认证、`Register{protocol_version:2, name, password, version}`、`ClientState`（pending→active 连接管理）、分发 `OpenTunnel`/`Data`/`Close`/`Disconnect`
+- `proxy.rs` — `handle_open_tunnel`：收到 OpenTunnel 后 `TcpStream::connect(target_addr)`，TunnelOpenResult 反馈，双向 shuttle 转发
+- `config.rs` — 同上三级配置优先级，但只保留 `server/password/name/tls*` 和 `mesh*`，删除 `forwards`
 - `logs.rs` — 客户端日志收集
 
 ### 前端架构
@@ -92,12 +94,12 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）
 
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`
-- 受保护（设置密码时需 JWT）：`/api/clients`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
-- 完整列表见 `src/server/api.rs`
+- 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
+- 完整列表见 `src/server/api/mod.rs`
 
 ## 代码模式
 
@@ -118,6 +120,12 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - 服务器：`config/server.example.toml`
 - 客户端：`config/client.example.toml`
 - 环境变量示例：`.env.example`
+
+客户端 CLI 已收敛为仅三个必填/常用参数：
+- `--server <host:port>` — 服务器地址
+- `--password <token>` — 客户端 token（即服务端 Web 管理的 client_token）
+- `--name <name>` — 客户端名称（默认系统 hostname）
+- `--tls` / `--tls-insecure` — TLS 连接控制
 
 ## 测试
 

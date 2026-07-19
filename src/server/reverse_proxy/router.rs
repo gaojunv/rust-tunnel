@@ -198,7 +198,7 @@ impl Default for RouteTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::reverse_proxy::{BackendProtocol, BackendScheme};
+    use crate::server::reverse_proxy::{BackendKind, BackendProtocol, BackendScheme};
 
     fn create_test_rule(id: &str, domains: Vec<&str>, path: &str) -> ProxyRule {
         ProxyRule {
@@ -210,7 +210,9 @@ mod tests {
             routes: vec![Route {
                 path: path.to_string(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: "127.0.0.1:8080".to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -287,7 +289,9 @@ mod tests {
                 Route {
                     path: "/api".to_string(),
                     backends: vec![Backend {
+                        kind: BackendKind::Direct,
                         addr: "127.0.0.1:8081".to_string(),
+                        client_name: None,
                         weight: 100,
                         protocol: BackendProtocol::Http1,
                         scheme: BackendScheme::Http,
@@ -297,7 +301,9 @@ mod tests {
                 Route {
                     path: "/".to_string(),
                     backends: vec![Backend {
+                        kind: BackendKind::Direct,
                         addr: "127.0.0.1:8080".to_string(),
+                        client_name: None,
                         weight: 100,
                         protocol: BackendProtocol::Http1,
                         scheme: BackendScheme::Http,
@@ -339,7 +345,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".to_string(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: "127.0.0.1:8080".to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -369,7 +377,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".to_string(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: "127.0.0.1:3306".to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,
@@ -403,7 +413,9 @@ mod tests {
             routes: vec![Route {
                 path: "/".to_string(),
                 backends: vec![Backend {
+                    kind: BackendKind::Direct,
                     addr: "127.0.0.1:8080".to_string(),
+                    client_name: None,
                     weight: 100,
                     protocol: BackendProtocol::Http1,
                     scheme: BackendScheme::Http,

@@ -33,6 +33,8 @@ import type {
   GeneralSettings,
   ReverseProxySettings,
   DnsSettings,
+  Client,
+  ServerAuthView,
 } from '../types';
 
 const API_BASE = '/api';
@@ -228,6 +230,37 @@ export const addDnsRecord = async (record: AddDnsRecordRequest): Promise<void> =
 
 export const deleteDnsRecord = async (name: string): Promise<void> => {
   await api.delete(`/dns/records/${encodeURIComponent(name)}`);
+};
+
+// Clients API (v2)
+export const clientsApi = {
+  list: async (): Promise<Client[]> => {
+    const { data } = await api.get<{ clients: Client[] }>('/clients');
+    return data.clients;
+  },
+  patchNote: async (name: string, note: string | null): Promise<void> => {
+    await api.patch(`/clients/${encodeURIComponent(name)}`, { note });
+  },
+  remove: async (name: string): Promise<void> => {
+    await api.delete(`/clients/${encodeURIComponent(name)}`);
+  },
+  kick: async (name: string): Promise<void> => {
+    await api.post(`/clients/${encodeURIComponent(name)}/kick`);
+  },
+};
+
+export const serverAuthApi = {
+  get: async (): Promise<ServerAuthView> => {
+    const { data } = await api.get<ServerAuthView>('/server-auth');
+    return data;
+  },
+  rotate: async (): Promise<string> => {
+    const { data } = await api.post<{ client_token: string }>('/server-auth/rotate');
+    return data.client_token;
+  },
+  set: async (token: string): Promise<void> => {
+    await api.put('/server-auth', { token });
+  },
 };
 
 // Reverse Proxy API

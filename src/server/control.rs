@@ -1,29 +1,29 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::{
     create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
 };
 use crate::server::api::TrafficStore;
+use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
 use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
 use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
 use crate::server::quality::{
-    calculate_quality_score, check_warnings, ConnectionQuality, QualitySample, QualityStore,
-    QualityThresholds, QualityTracker,
+    ConnectionQuality, QualitySample, QualityStore, QualityTracker,
 };
 use crate::server::reverse_proxy::ReverseProxyState;
-use crate::server::{listener, ServerConfig};
-use chrono::{Timelike, Utc};
+use crate::server::ServerConfig;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Sender for control messages - can be shared across tasks
@@ -31,7 +31,6 @@ pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortType {
-    Tunnel,
     Shadowsocks,
     Trojan,
 }
@@ -49,7 +48,6 @@ pub struct ClientInfo {
 
 #[derive(Debug, Clone)]
 pub enum PortInfo {
-    Tunnel(ClientInfo),
     Shadowsocks {
         port: u16,
         cipher: String,
@@ -69,7 +67,6 @@ pub enum PortInfo {
 impl PortInfo {
     pub fn port_type(&self) -> PortType {
         match self {
-            PortInfo::Tunnel(_) => PortType::Tunnel,
             PortInfo::Shadowsocks { .. } => PortType::Shadowsocks,
             PortInfo::Trojan { .. } => PortType::Trojan,
         }
@@ -77,19 +74,10 @@ impl PortInfo {
 
     pub fn port(&self) -> u16 {
         match self {
-            PortInfo::Tunnel(info) => info.remote_port,
             PortInfo::Shadowsocks { port, .. } => *port,
             PortInfo::Trojan { port, .. } => *port,
         }
     }
-}
-
-/// Information about an active connection between user and client
-struct ActiveConnection {
-    /// User TCP stream writer half connected to client
-    user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
-    /// Remote port this connection belongs to
-    remote_port: u16,
 }
 
 /// ACME configuration summary for API responses
@@ -241,10 +229,8 @@ impl AcmeFullConfig {
 /// Global server state shared between all tasks
 #[derive(Clone)]
 pub struct ServerState {
-    /// Map from port to port info (Tunnel or Shadowsocks)
+    /// Map from port to port info (Shadowsocks or Trojan)
     ports: Arc<Mutex<HashMap<u16, PortInfo>>>,
-    /// Map from connection_id to active tunnel connection info
-    active_connections: Arc<Mutex<HashMap<u64, ActiveConnection>>>,
     /// Active Shadowsocks connections per port
     ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Active Trojan connections per port
@@ -265,8 +251,8 @@ pub struct ServerState {
     pub dns_registry: Option<DnsRegistry>,
     /// Reverse proxy state
     pub proxy_state: ReverseProxyState,
-    /// Active listener tasks (keyed by port) — aborted on client disconnect
-    listener_tasks: Arc<Mutex<HashMap<u16, tokio::task::JoinHandle<()>>>>,
+    /// Client registry (spec §2.6)
+    pub client_registry: Option<ClientRegistry>,
     /// ACME client for certificate management (set when ACME is enabled)
     pub acme_client: Arc<RwLock<Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>>>,
     /// ACME configuration info (set when ACME is enabled)
@@ -300,7 +286,6 @@ impl ServerState {
     pub fn new() -> Self {
         Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
-            active_connections: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
@@ -311,7 +296,7 @@ impl ServerState {
             mesh_manager: MeshManager::new(),
             dns_registry: None,
             proxy_state: ReverseProxyState::new(),
-            listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            client_registry: None,
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
@@ -342,8 +327,6 @@ impl ServerState {
     pub fn with_db(db: Database) -> Self {
         Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
-            listener_tasks: Arc::new(Mutex::new(HashMap::new())),
-            active_connections: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
@@ -353,7 +336,8 @@ impl ServerState {
             log_store: Some(crate::server::logs::LogStore::new(Some(db.clone()))),
             mesh_manager: MeshManager::new(),
             dns_registry: None,
-            proxy_state: ReverseProxyState::with_db(db),
+            proxy_state: ReverseProxyState::with_db(db.clone()),
+            client_registry: Some(ClientRegistry::new(db)),
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
@@ -380,69 +364,15 @@ impl ServerState {
         }
     }
 
-    pub async fn register_client(
-        &self,
-        remote_port: u16,
-        hostname: Option<String>,
-        control_sender: ControlMessageSender,
-    ) -> bool {
-        let hostname_clone = hostname.clone();
-        let mut ports = self.ports.lock().await;
-        if ports.contains_key(&remote_port) {
-            return false;
-        }
-        ports.insert(
-            remote_port,
-            PortInfo::Tunnel(ClientInfo {
-                remote_port,
-                hostname,
-                control_sender,
-            }),
-        );
-
-        // Record client connection in database
-        if let Some(db) = &self.db {
-            let db = db.clone();
-            tokio::spawn(async move {
-                let _ = db.record_client_connect(remote_port, hostname_clone).await;
-            });
-        }
-
-        true
-    }
-
-    pub async fn get_client(&self, remote_port: u16) -> Option<ClientInfo> {
-        let ports = self.ports.lock().await;
-        match ports.get(&remote_port) {
-            Some(PortInfo::Tunnel(info)) => Some(info.clone()),
-            _ => None,
-        }
-    }
-
-    pub async fn remove_client(&self, remote_port: u16) {
-        // Abort the listener task so the port is freed
-        let task = {
-            let mut tasks = self.listener_tasks.lock().await;
-            tasks.remove(&remote_port)
-        };
-        if let Some(handle) = task {
-            handle.abort();
-            info!("Aborted listener task for port {}", remote_port);
-        }
-
-        let mut ports = self.ports.lock().await;
-        ports.remove(&remote_port);
-
-        // Also clean up quality data when client is removed
-        self.quality_store.remove_port(remote_port).await;
-        self.remove_quality_tracker(remote_port).await;
-
-        // Record client disconnection in database
-        if let Some(db) = &self.db {
-            let db = db.clone();
-            tokio::spawn(async move {
-                let _ = db.record_client_disconnect(remote_port).await;
-            });
+    /// Wire up the ClientConnector to ReverseProxyState after the server
+    /// has started. Called from `bin/server.rs` after `with_db()`.
+    pub async fn wire_up_client_connector(&self) {
+        if let Some(registry) = &self.client_registry {
+            let cc = std::sync::Arc::new(
+                crate::server::reverse_proxy::connector::ClientConnector::new(registry.clone()),
+            );
+            self.proxy_state.set_client_connector(cc).await;
+            info!("ClientConnector registered into ReverseProxyState");
         }
     }
 
@@ -474,37 +404,15 @@ impl ServerState {
         ports.remove(&port).is_some()
     }
 
-    pub async fn add_active_connection(
-        &self,
-        connection_id: u64,
-        remote_port: u16,
-        user_writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>>,
-    ) {
-        let mut active_connections = self.active_connections.lock().await;
-        active_connections.insert(
-            connection_id,
-            ActiveConnection {
-                user_writer,
-                remote_port,
-            },
-        );
-    }
-
-    /// Get the number of active connections for a specific port
+    /// Get the number of active connections for a specific port (SS/Trojan only)
     pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
-        let active_connections = self.active_connections.lock().await;
-        let tunnel_count = active_connections
-            .values()
-            .filter(|conn| conn.remote_port == remote_port)
-            .count();
-
         let ss_connections = self.ss_active_connections.lock().await;
         let ss_count = ss_connections.get(&remote_port).copied().unwrap_or(0);
 
         let trojan_connections = self.trojan_active_connections.lock().await;
         let trojan_count = trojan_connections.get(&remote_port).copied().unwrap_or(0);
 
-        tunnel_count + ss_count + trojan_count
+        ss_count + trojan_count
     }
 
     /// Increment active Shadowsocks connections for a port
@@ -575,76 +483,28 @@ impl ServerState {
         }
     }
 
-    pub async fn remove_active_connection(&self, connection_id: u64) {
-        let mut active_connections = self.active_connections.lock().await;
-        active_connections.remove(&connection_id);
+    // API helper methods — kept for backward compat, return empty data since
+    // tunnel-forward clients are now managed via ClientRegistry.
+
+    /// Get all tunnel-forward clients (deprecated, returns empty)
+    pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
+        Vec::new()
     }
 
-    pub async fn deliver_data(&self, connection_id: u64, data: Vec<u8>) -> TunnelResult<()> {
-        let active_connections = self.active_connections.lock().await;
-        if let Some(conn) = active_connections.get(&connection_id) {
-            let mut writer = conn.user_writer.lock().await;
-            let bytes = data.len();
-            let remote_port = conn.remote_port;
-            writer.write_all(&data).await?;
-            writer.flush().await?;
-            drop(writer);
-            drop(active_connections);
-
-            // Record traffic to the correct port
-            self.traffic_store
-                .record_bytes_out(remote_port, bytes as u64)
-                .await;
-            Ok(())
+    /// Get tunnel-forward client count (deprecated, returns 0)
+    pub async fn get_client_count(&self) -> usize {
+        if let Some(ref registry) = self.client_registry {
+            registry.list_online().await.len()
         } else {
-            debug!("No active connection found for id {}", connection_id);
-            Ok(())
+            0
         }
     }
 
-    pub async fn close_connection(&self, connection_id: u64) {
-        let mut active_connections = self.active_connections.lock().await;
-        active_connections.remove(&connection_id);
-    }
-
-    // API helper methods
-    pub async fn get_all_clients(&self) -> Vec<(u16, ClientInfo)> {
-        let ports = self.ports.lock().await;
-        ports
-            .iter()
-            .filter_map(|(port, info)| match info {
-                PortInfo::Tunnel(client_info) => Some((*port, client_info.clone())),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub async fn get_client_count(&self) -> usize {
-        let ports = self.ports.lock().await;
-        ports
-            .values()
-            .filter(|p| matches!(p, PortInfo::Tunnel(_)))
-            .count()
-    }
-
+    /// Get total active connection count (SS + Trojan only)
     pub async fn get_active_connection_count(&self) -> usize {
-        let active_connections = self.active_connections.lock().await;
         let ss_connections = self.ss_active_connections.lock().await;
         let trojan_connections = self.trojan_active_connections.lock().await;
-        active_connections.len()
-            + ss_connections.values().sum::<usize>()
-            + trojan_connections.values().sum::<usize>()
-    }
-
-    pub async fn disconnect_client(&self, remote_port: u16) -> bool {
-        let ports = self.ports.lock().await;
-        if let Some(PortInfo::Tunnel(client)) = ports.get(&remote_port) {
-            // Send Disconnect message to client via the channel
-            let _ = client.control_sender.send(ControlMessage::Disconnect).await;
-            true
-        } else {
-            false
-        }
+        ss_connections.values().sum::<usize>() + trojan_connections.values().sum::<usize>()
     }
 
     /// Get or create quality tracker for a port
@@ -779,1038 +639,206 @@ impl ServerState {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn test_server_state_new() {
-        let state = ServerState::new();
-        assert_eq!(state.get_client_count().await, 0);
-        assert_eq!(state.get_active_connection_count().await, 0);
-    }
-
-    // Helper to create a test message sender
-    fn create_test_sender() -> ControlMessageSender {
-        let (sender, _) = mpsc::channel(32);
-        sender
-    }
-
-    #[tokio::test]
-    async fn test_register_and_get_client() {
-        let state = ServerState::new();
-
-        let sender = create_test_sender();
-
-        // Register client
-        let registered = state.register_client(8080, None, sender.clone()).await;
-        assert!(registered);
-        assert_eq!(state.get_client_count().await, 1);
-
-        // Get client
-        let client = state.get_client(8080).await;
-        assert!(client.is_some());
-
-        // Register same port again should fail
-        let registered = state.register_client(8080, None, sender).await;
-        assert!(!registered);
-    }
-
-    #[tokio::test]
-    async fn test_remove_client() {
-        let state = ServerState::new();
-
-        let sender = create_test_sender();
-        state.register_client(8080, None, sender).await;
-        assert_eq!(state.get_client_count().await, 1);
-
-        state.remove_client(8080).await;
-        assert_eq!(state.get_client_count().await, 0);
-        assert!(state.get_client(8080).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_remove_nonexistent_client() {
-        let state = ServerState::new();
-        // Should not panic
-        state.remove_client(9999).await;
-    }
-
-    #[tokio::test]
-    async fn test_get_all_clients() {
-        let state = ServerState::new();
-
-        let sender = create_test_sender();
-
-        state.register_client(8080, None, sender.clone()).await;
-        state.register_client(9000, None, sender).await;
-
-        let clients = state.get_all_clients().await;
-        assert_eq!(clients.len(), 2);
-        let ports: Vec<u16> = clients.iter().map(|(p, _)| *p).collect();
-        assert!(ports.contains(&8080));
-        assert!(ports.contains(&9000));
-    }
-
-    #[tokio::test]
-    async fn test_active_connections() {
-        let state = ServerState::new();
-
-        // For active connections, we still need a boxed writer - use a vec as mock
-        let mock_writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = Box::new(Vec::new());
-        let writer_arc = Arc::new(Mutex::new(mock_writer));
-
-        state.add_active_connection(42, 8080, writer_arc).await;
-        assert_eq!(state.get_active_connection_count().await, 1);
-        assert_eq!(state.get_connection_count_for_port(8080).await, 1);
-
-        state.remove_active_connection(42).await;
-        assert_eq!(state.get_active_connection_count().await, 0);
-        assert_eq!(state.get_connection_count_for_port(8080).await, 0);
-    }
-
-    #[tokio::test]
-    async fn test_connection_count_for_nonexistent_port() {
-        let state = ServerState::new();
-        assert_eq!(state.get_connection_count_for_port(9999).await, 0);
-    }
-
-    #[tokio::test]
-    async fn test_server_state_clone() {
-        let state = ServerState::new();
-
-        let sender = create_test_sender();
-        state.register_client(8080, None, sender).await;
-
-        let cloned = state.clone();
-        assert_eq!(cloned.get_client_count().await, 1);
-    }
-
-    #[tokio::test]
-    async fn test_remove_nonexistent_connection() {
-        let state = ServerState::new();
-        // Should not panic
-        state.remove_active_connection(9999).await;
-        state.close_connection(9999).await;
-    }
-
-    #[tokio::test]
-    async fn test_disconnect_nonexistent_client() {
-        let state = ServerState::new();
-        let result = state.disconnect_client(9999).await;
-        assert!(!result);
-    }
-}
-
-#[cfg(test)]
-mod ss_integration_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_can_register_both_tunnel_and_shadowsocks() {
-        let state = ServerState::new();
-
-        // Register a tunnel port
-        let (sender, _) = tokio::sync::mpsc::channel(1);
-        assert!(
-            state
-                .register_client(8080, Some("test-host".to_string()), sender.clone())
-                .await
-        );
-
-        // Register a shadowsocks port
-        assert!(
-            state
-                .register_shadowsocks(8388, "aes-256-gcm".to_string(), "test-pass".to_string())
-                .await
-        );
-
-        // Verify both are registered
-        let clients = state.get_all_clients().await;
-        assert_eq!(clients.len(), 1);
-        assert_eq!(clients[0].0, 8080);
-
-        let ss_ports = state.get_shadowsocks_ports().await;
-        assert_eq!(ss_ports.len(), 1);
-        assert_eq!(ss_ports[0], 8388);
-
-        // Can get port info for both
-        assert!(state.get_port(8080).await.is_some());
-        assert!(state.get_port(8388).await.is_some());
-
-        // Check port types
-        assert!(!state.is_shadowsocks_port(8080).await);
-        assert!(state.is_shadowsocks_port(8388).await);
-    }
-
-    #[tokio::test]
-    async fn test_port_type_detection() {
-        let state = ServerState::new();
-
-        // Test empty
-        assert!(!state.is_shadowsocks_port(9999).await);
-
-        // Register tunnel
-        let (sender, _) = tokio::sync::mpsc::channel(1);
-        state.register_client(9000, None, sender.clone()).await;
-        assert!(!state.is_shadowsocks_port(9000).await);
-
-        // Register SS
-        state
-            .register_shadowsocks(9001, "aes-256-gcm".to_string(), "pass".to_string())
-            .await;
-        assert!(state.is_shadowsocks_port(9001).await);
-    }
-
-    #[tokio::test]
-    async fn test_unregister_port() {
-        let state = ServerState::new();
-
-        // Register both
-        let (sender, _) = tokio::sync::mpsc::channel(1);
-        state.register_client(9002, None, sender.clone()).await;
-        state
-            .register_shadowsocks(9003, "aes-256-gcm".to_string(), "pass".to_string())
-            .await;
-
-        // Both exist
-        assert!(state.get_port(9002).await.is_some());
-        assert!(state.get_port(9003).await.is_some());
-
-        // Unregister tunnel
-        assert!(state.unregister_port(9002).await);
-        assert!(state.get_port(9002).await.is_none());
-
-        // Unregister SS
-        assert!(state.unregister_port(9003).await);
-        assert!(state.get_port(9003).await.is_none());
-
-        // Unregister non-existent
-        assert!(!state.unregister_port(9999).await);
-    }
-
-    #[tokio::test]
-    async fn test_cannot_register_duplicate_port_both_types() {
-        let state = ServerState::new();
-        let (sender, _) = tokio::sync::mpsc::channel(1);
-
-        // Register tunnel first
-        assert!(state.register_client(8080, None, sender.clone()).await);
-        // Cannot register SS on same port
-        assert!(
-            !state
-                .register_shadowsocks(8080, "aes-256-gcm".into(), "pass".into())
-                .await
-        );
-
-        // Create new state, reverse order
-        let state2 = ServerState::new();
-        assert!(
-            state2
-                .register_shadowsocks(8081, "aes-256-gcm".into(), "pass".into())
-                .await
-        );
-        // Cannot register tunnel on same port
-        assert!(!state2.register_client(8081, None, sender.clone()).await);
-    }
-}
-
-/// Handle a single control connection from client (supports both plain TCP and TLS)
-async fn handle_control_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    config: ServerConfig,
+/// Handle a single control connection from a client using the new
+/// ClientRegistry + v2 protocol (spec §3.2).
+///
+/// This replaces the old `handle_control_connection` which used port-based
+/// tunnel-forward registration.
+async fn handle_client_connection(
+    reader: impl AsyncRead + Unpin + Send,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
     state: ServerState,
-    stream: S,
-    peer_addr: std::net::SocketAddr,
 ) -> TunnelResult<()> {
-    // Split into read and write halves
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let registry = state
+        .client_registry
+        .as_ref()
+        .ok_or_else(|| TunnelError::Protocol("server has no client registry".into()))?
+        .clone();
 
-    // Create message channel for sending messages to client
-    // The writer task receives messages and writes them to the stream
-    let (sender, mut receiver) = mpsc::channel::<ControlMessage>(32);
+    let mut reader = reader;
+    let mut writer = writer;
 
-    // Spawn writer task - handles all message sending
+    // 1. Expect Register
+    let first = ControlMessage::read_from_stream(&mut reader)
+        .await?
+        .ok_or_else(|| TunnelError::Protocol("connection closed before Register".into()))?;
+
+    let (client_name, hostname, client_version, password) = match first {
+        ControlMessage::Register {
+            protocol_version,
+            client_name,
+            password,
+            client_version,
+        } => {
+            if protocol_version != 2 {
+                let resp = ControlMessage::RegisterResponse {
+                    success: false,
+                    message: format!(
+                        "unsupported protocol_version {protocol_version}, want 2"
+                    ),
+                };
+                let _ = resp.write_to_stream(&mut writer).await;
+                return Err(TunnelError::Protocol("protocol version mismatch".into()));
+            }
+            (client_name, None::<String>, Some(client_version), password)
+        }
+        other => {
+            return Err(TunnelError::Protocol(format!(
+                "expected Register, got {other:?}"
+            )));
+        }
+    };
+
+    // Sender channel (Server -> client)
+    let (send_tx, mut send_rx) = mpsc::channel::<ControlMessage>(32);
+
+    // Try to register with the ClientRegistry
+    let entry = match registry
+        .register(
+            &client_name,
+            hostname,
+            client_version,
+            &password,
+            send_tx.clone(),
+        )
+        .await
+    {
+        Ok(e) => e,
+        Err(err) => {
+            let resp = ControlMessage::RegisterResponse {
+                success: false,
+                message: err.to_string(),
+            };
+            let _ = resp.write_to_stream(&mut writer).await;
+            return Err(TunnelError::ControlChannel(err.to_string()));
+        }
+    };
+
+    let resp = ControlMessage::RegisterResponse {
+        success: true,
+        message: String::new(),
+    };
+    resp.write_to_stream(&mut writer).await?;
+
+    // Writer task: pump send_rx -> wire
     tokio::spawn(async move {
-        while let Some(msg) = receiver.recv().await {
+        while let Some(msg) = send_rx.recv().await {
             if let Err(e) = msg.write_to_stream(&mut writer).await {
-                debug!("Failed to write control message: {}", e);
+                tracing::debug!("control write ended: {e}");
                 break;
             }
         }
     });
 
-    // Track all registered ports for this connection
-    let mut registered_ports = Vec::new();
-    let mut deferred_msg: Option<ControlMessage> = None;
-
-    // Process registration phase - client may send multiple Register messages
-    info!("Waiting for client registration...");
-
-    loop {
-        let msg = match ControlMessage::read_from_stream(&mut reader).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => {
-                if registered_ports.is_empty() {
-                    return Err(TunnelError::Protocol(
-                        "Connection closed before registration".into(),
-                    ));
-                } else {
-                    break;
-                }
-            }
-            Err(e) => {
-                if registered_ports.is_empty() {
-                    return Err(e);
-                } else {
-                    error!("Error during registration phase: {}", e);
-                    break;
-                }
-            }
-        };
-
-        match msg {
-            ControlMessage::Register {
-                remote_port,
-                hostname,
-                auth_token: client_auth_token,
-            } => {
-                info!(
-                    "Received registration request for port {} from hostname {:?}",
-                    remote_port, hostname
-                );
-
-                // Validate authentication token if server requires it
-                if let Some(ref expected_token) = config.client_auth_token {
-                    match client_auth_token {
-                        Some(ref token) if token == expected_token => {
-                            debug!("Client authentication successful");
-                        }
-                        Some(_) => {
-                            warn!(
-                                "Client authentication failed from {}: invalid token",
-                                peer_addr
-                            );
-                            let _ = sender
-                                .send(ControlMessage::RegisterResponse {
-                                    success: false,
-                                    message: "Invalid authentication token".into(),
-                                })
-                                .await;
-                            continue;
-                        }
-                        None => {
-                            warn!("Client authentication failed from {}: token required but not provided", peer_addr);
-                            let _ = sender
-                                .send(ControlMessage::RegisterResponse {
-                                    success: false,
-                                    message: "Authentication token required".into(),
-                                })
-                                .await;
-                            continue;
-                        }
-                    }
-                }
-
-                // First, remove any existing client on this port (cleanup from previous connection)
-                state.remove_client(remote_port).await;
-
-                // Now register the new client (clone sender for each registration)
-                let registered = state
-                    .register_client(remote_port, hostname.clone(), sender.clone())
-                    .await;
-
-                if !registered {
-                    let _ = sender
-                        .send(ControlMessage::RegisterResponse {
-                            success: false,
-                            message: format!("Port {} already registered", remote_port),
-                        })
-                        .await;
-                    continue;
-                }
-
-                // Send registration success
-                sender
-                    .send(ControlMessage::RegisterResponse {
-                        success: true,
-                        message: "Registered successfully".into(),
-                    })
-                    .await
-                    .map_err(|_| {
-                        TunnelError::Protocol("Failed to send registration response".into())
-                    })?;
-
-                info!("Client registered for port {}", remote_port);
-                registered_ports.push(remote_port);
-
-                // Auto-register DNS record for tunnel port if DNS is enabled
-                if let Some(ref dns_registry) = state.dns_registry {
-                    let fqdn = dns_registry
-                        .register_tunnel_default(remote_port, None)
-                        .await;
-                    info!("DNS auto-registered: {}", fqdn);
-                }
-
-                // Spawn the listener task for the remote port
-                let state_clone = state.clone();
-                let state_for_remove = state.clone();
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = listener::run_listener(state_clone, remote_port).await {
-                        error!("Listener for port {} failed: {}", remote_port, e);
-                    }
-                    state_for_remove.remove_client(remote_port).await;
-                    info!("Client unregistered from port {}", remote_port);
-                });
-                // Store the handle so we can abort it on disconnect
-                {
-                    let mut tasks = state.listener_tasks.lock().await;
-                    tasks.insert(remote_port, handle);
-                }
-            }
-            ControlMessage::Ping {
-                seq,
-                timestamp_micros,
-            } => {
-                // Ping received during registration phase
-                if !registered_ports.is_empty() {
-                    // Process quality update (same as main-loop Ping handling)
-                    let now = Utc::now();
-                    let now_micros = std::time::SystemTime::now()
+    // 2. Reader loop: dispatch to registry active_connections / heartbeat / etc.
+    let name_for_cleanup = entry.name.clone();
+    let cleanup_registry = registry.clone();
+    let result: TunnelResult<()> = async {
+        loop {
+            let msg = match ControlMessage::read_from_stream(&mut reader).await? {
+                Some(m) => m,
+                None => break,
+            };
+            match msg {
+                ControlMessage::Ping {
+                    seq,
+                    timestamp_micros,
+                } => {
+                    let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_micros() as u64)
                         .unwrap_or(0);
-                    let rtt_ms = if now_micros > timestamp_micros {
-                        (now_micros - timestamp_micros) as f32 / 1000.0
-                    } else {
-                        0.0
-                    };
-
-                    for &port in &registered_ports {
-                        let mut tracker = state.get_or_create_quality_tracker(port).await;
-                        let (lost, loss_rate) = tracker.record_ping(seq);
-                        tracker.record_rtt(rtt_ms);
-
-                        let avg_rtt = tracker.get_avg_rtt();
-                        let min_rtt = tracker.get_min_rtt();
-                        let max_rtt = tracker.get_max_rtt();
-                        let quality_score = calculate_quality_score(avg_rtt, loss_rate);
-                        let thresholds = QualityThresholds::default();
-                        let (is_warning, is_critical) =
-                            check_warnings(avg_rtt, loss_rate, &thresholds);
-
-                        let quality = ConnectionQuality {
-                            last_rtt_ms: rtt_ms,
-                            avg_rtt_ms: avg_rtt,
-                            min_rtt_ms: min_rtt,
-                            max_rtt_ms: max_rtt,
-                            loss_rate,
-                            consecutive_losses: lost,
-                            bytes_in_per_sec: 0.0,
-                            bytes_out_per_sec: 0.0,
-                            quality_score,
-                            last_update: now,
-                            is_warning,
-                            is_critical,
-                        };
-
-                        state.quality_store.update_quality(port, quality).await;
-
-                        // Add historical sample on first ping (minute boundary check)
-                        let current_minute = now.minute();
-                        if tracker.last_sample_minute != current_minute {
-                            let sample = QualitySample {
-                                timestamp: now,
-                                avg_rtt_ms: avg_rtt,
-                                loss_rate,
-                                bytes_in_per_sec: 0.0,
-                                bytes_out_per_sec: 0.0,
-                                quality_score,
-                            };
-                            state.quality_store.add_sample(port, sample).await;
-                            tracker.last_sample_minute = current_minute;
-                        }
-
-                        state.update_quality_tracker(port, tracker).await;
-                    }
-
-                    // Send pong response
-                    let pong_timestamp_micros = now_micros;
-                    let _ = sender
+                    let _ = entry
+                        .control_sender
                         .send(ControlMessage::Pong {
                             seq,
                             ping_timestamp_micros: timestamp_micros,
-                            pong_timestamp_micros,
+                            pong_timestamp_micros: now,
                         })
                         .await;
-
-                    info!(
-                        "Registration phase complete (received Ping), {} ports registered",
-                        registered_ports.len()
-                    );
-                    break;
-                } else {
-                    // No ports registered yet, but still allow registration to complete
-                    // (e.g. mesh-only clients)
-                    info!("Registration phase complete (received Ping), 0 ports registered");
-                    break;
+                    // Best-effort touch last_seen
+                    if let Some(reg) = state.client_registry.as_ref() {
+                        let _ = reg.db().touch_client_last_seen(&entry.name).await;
+                    }
                 }
-            }
-            ControlMessage::LogBatch { .. } => {
-                // Log batches during registration phase are silently dropped
-                // (no ports registered yet, so no source context)
-            }
-            _ => {
-                // If we have registered ports, this is the end of registration phase.
-                // Also allow registration to complete with 0 ports (e.g. mesh-only clients).
-                info!(
-                    "Registration phase complete, {} ports registered",
-                    registered_ports.len()
-                );
-                deferred_msg = Some(msg);
-                break;
+                ControlMessage::TunnelOpenResult {
+                    connection_id,
+                    success,
+                    error,
+                } => {
+                    let mut conns = entry.active_connections.lock().await;
+                    if let Some(active) = conns.get_mut(&connection_id) {
+                        if let Some(tx) = active.open_result.take() {
+                            let outcome = if success {
+                                TunnelOpenOutcome::Ok
+                            } else {
+                                TunnelOpenOutcome::Failed(error.unwrap_or_default())
+                            };
+                            let _ = tx.send(outcome);
+                        }
+                    }
+                    if !success {
+                        conns.remove(&connection_id);
+                    }
+                }
+                ControlMessage::Data {
+                    connection_id,
+                    data,
+                } => {
+                    let conns = entry.active_connections.lock().await;
+                    if let Some(active) = conns.get(&connection_id) {
+                        let _ = active.inbound.send(data).await;
+                    }
+                }
+                ControlMessage::Close { connection_id } => {
+                    let mut conns = entry.active_connections.lock().await;
+                    conns.remove(&connection_id);
+                }
+                ControlMessage::LogBatch { entries: log_entries } => {
+                    if let Some(ref log_store) = state.log_store {
+                        let source_prefix = format!("client:{}", entry.name);
+                        for e in log_entries {
+                            log_store.send(crate::server::logs::LogEntry {
+                                id: 0,
+                                timestamp: e.timestamp,
+                                level: e.level,
+                                source: source_prefix.clone(),
+                                target: e.target,
+                                message: e.message,
+                            });
+                        }
+                    }
+                }
+                // Mesh variants: forward to mesh_manager
+                m @ (ControlMessage::MeshJoin { .. }
+                | ControlMessage::MeshLeave { .. }
+                | ControlMessage::MeshMemberList { .. }
+                | ControlMessage::MeshConnect { .. }
+                | ControlMessage::P2PRequest { .. }
+                | ControlMessage::P2PResponse { .. }
+                | ControlMessage::P2PResult { .. }
+                | ControlMessage::MeshRelay { .. }
+                | ControlMessage::MeshRegisterServices { .. }) => {
+                    tracing::debug!("mesh msg received from '{}': {:?}", entry.name, m);
+                }
+                other => {
+                    tracing::warn!("unexpected msg from client '{}': {:?}", entry.name, other);
+                }
             }
         }
+        Ok(())
     }
+    .await;
 
-    // Derive client name from the first registered port's hostname
-    let client_name = if let Some(&port) = registered_ports.first() {
-        state
-            .get_client(port)
-            .await
-            .and_then(|c| c.hostname)
-            .unwrap_or_else(|| format!("port-{}", port))
-    } else {
-        "unknown".to_string()
-    };
-    let mut mesh_client_name = client_name.clone();
-
-    // Main loop: keep connection alive and process messages (heartbeats, data routing)
-    let result = loop {
-        let msg = if let Some(deferred) = deferred_msg.take() {
-            deferred
-        } else {
-            match ControlMessage::read_from_stream(&mut reader).await {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    break Ok(());
-                }
-                Err(e) => {
-                    error!("Error reading from control channel: {}", e);
-                    break Err(e);
-                }
-            }
-        };
-
-        match msg {
-            ControlMessage::Register {
-                remote_port,
-                hostname,
-                auth_token: client_auth_token,
-            } => {
-                // Handle late registration (client might send more Register messages later)
-                info!(
-                    "Received late registration request for port {} from hostname {:?}",
-                    remote_port, hostname
-                );
-
-                // Validate authentication token if server requires it
-                if let Some(ref expected_token) = config.client_auth_token {
-                    match client_auth_token {
-                        Some(ref token) if token == expected_token => {
-                            debug!("Client authentication successful");
-                        }
-                        Some(_) => {
-                            warn!(
-                                "Client authentication failed from {}: invalid token",
-                                peer_addr
-                            );
-                            let _ = sender
-                                .send(ControlMessage::RegisterResponse {
-                                    success: false,
-                                    message: "Invalid authentication token".into(),
-                                })
-                                .await;
-                            continue;
-                        }
-                        None => {
-                            warn!("Client authentication failed from {}: token required but not provided", peer_addr);
-                            let _ = sender
-                                .send(ControlMessage::RegisterResponse {
-                                    success: false,
-                                    message: "Authentication token required".into(),
-                                })
-                                .await;
-                            continue;
-                        }
-                    }
-                }
-
-                // First, remove any existing client on this port
-                state.remove_client(remote_port).await;
-
-                // Now register the new client
-                let registered = state
-                    .register_client(remote_port, hostname.clone(), sender.clone())
-                    .await;
-
-                if !registered {
-                    let _ = sender
-                        .send(ControlMessage::RegisterResponse {
-                            success: false,
-                            message: format!("Port {} already registered", remote_port),
-                        })
-                        .await;
-                } else {
-                    // Send registration success
-                    sender
-                        .send(ControlMessage::RegisterResponse {
-                            success: true,
-                            message: "Registered successfully".into(),
-                        })
-                        .await
-                        .map_err(|_| {
-                            TunnelError::Protocol("Failed to send registration response".into())
-                        })?;
-
-                    info!("Client registered for port {}", remote_port);
-                    registered_ports.push(remote_port);
-
-                    // Auto-register DNS record for tunnel port if DNS is enabled
-                    if let Some(ref dns_registry) = state.dns_registry {
-                        let fqdn = dns_registry
-                            .register_tunnel_default(remote_port, None)
-                            .await;
-                        info!("DNS auto-registered: {}", fqdn);
-                    }
-
-                    // Spawn the listener task
-                    let state_clone = state.clone();
-                    let state_for_remove = state.clone();
-                    let handle = tokio::spawn(async move {
-                        if let Err(e) = listener::run_listener(state_clone, remote_port).await {
-                            error!("Listener for port {} failed: {}", remote_port, e);
-                        }
-                        state_for_remove.remove_client(remote_port).await;
-                        info!("Client unregistered from port {}", remote_port);
-                    });
-                    // Store handle to allow abort on disconnect
-                    {
-                        let mut tasks = state.listener_tasks.lock().await;
-                        tasks.insert(remote_port, handle);
-                    }
-                }
-            }
-            ControlMessage::Ping {
-                seq,
-                timestamp_micros,
-            } => {
-                // Calculate RTT using server time
-                let now = Utc::now();
-                let now_micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as u64)
-                    .unwrap_or(0);
-                let rtt_ms = if now_micros > timestamp_micros {
-                    (now_micros - timestamp_micros) as f32 / 1000.0
-                } else {
-                    0.0 // Clock went backwards, ignore
-                };
-
-                tracing::debug!(
-                    "Processing Ping seq={} for {} ports, rtt={:.1}ms, minute={}",
-                    seq,
-                    registered_ports.len(),
-                    rtt_ms,
-                    now.minute()
-                );
-
-                // Iterate all registered ports for this connection and update quality
-                for &port in &registered_ports {
-                    // Get or create quality tracker
-                    let mut tracker = state.get_or_create_quality_tracker(port).await;
-
-                    // Record ping and calculate loss
-                    let (lost, loss_rate) = tracker.record_ping(seq);
-
-                    // Record RTT
-                    tracker.record_rtt(rtt_ms);
-
-                    // Calculate statistics
-                    let avg_rtt = tracker.get_avg_rtt();
-                    let min_rtt = tracker.get_min_rtt();
-                    let max_rtt = tracker.get_max_rtt();
-
-                    // Calculate quality score
-                    let quality_score = calculate_quality_score(avg_rtt, loss_rate);
-
-                    // Check warnings
-                    let thresholds = QualityThresholds::default();
-                    let (is_warning, is_critical) = check_warnings(avg_rtt, loss_rate, &thresholds);
-
-                    // Get throughput from TrafficStore (simplified)
-                    // For now we use 0 since we don't have per-second calculation yet
-                    let (bytes_in_per_sec, bytes_out_per_sec) = (0.0, 0.0);
-
-                    // Update real-time quality data
-                    let quality = ConnectionQuality {
-                        last_rtt_ms: rtt_ms,
-                        avg_rtt_ms: avg_rtt,
-                        min_rtt_ms: min_rtt,
-                        max_rtt_ms: max_rtt,
-                        loss_rate,
-                        consecutive_losses: lost,
-                        bytes_in_per_sec,
-                        bytes_out_per_sec,
-                        quality_score,
-                        last_update: now,
-                        is_warning,
-                        is_critical,
-                    };
-
-                    state.quality_store.update_quality(port, quality).await;
-
-                    // Add historical sample once per minute
-                    let current_minute = now.minute();
-                    if tracker.last_sample_minute != current_minute {
-                        tracing::info!(
-                                    "Adding quality sample for port {}: last_sample_minute={}, current_minute={}",
-                                    port, tracker.last_sample_minute, current_minute
-                                );
-                        let sample = QualitySample {
-                            timestamp: now,
-                            avg_rtt_ms: avg_rtt,
-                            loss_rate,
-                            bytes_in_per_sec,
-                            bytes_out_per_sec,
-                            quality_score,
-                        };
-                        state.quality_store.add_sample(port, sample).await;
-                        tracker.last_sample_minute = current_minute;
-                    }
-
-                    state.update_quality_tracker(port, tracker).await;
-                }
-
-                // Send pong response
-                let pong_timestamp_micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros() as u64)
-                    .unwrap_or(0);
-                let _ = sender
-                    .send(ControlMessage::Pong {
-                        seq,
-                        ping_timestamp_micros: timestamp_micros,
-                        pong_timestamp_micros,
-                    })
-                    .await;
-            }
-            ControlMessage::Pong { .. } => {
-                // Ignore, pong is only server -> client
-            }
-            ControlMessage::LogBatch { entries } => {
-                if let Some(ref log_store) = state.log_store {
-                    // Find hostname from first registered port
-                    let hostname = if let Some(&port) = registered_ports.first() {
-                        state.get_client(port).await.and_then(|c| c.hostname)
-                    } else {
-                        None
-                    };
-                    let source_prefix = format!(
-                        "client:{}:{}",
-                        hostname.as_deref().unwrap_or("unknown"),
-                        registered_ports.first().copied().unwrap_or(0)
-                    );
-
-                    for entry in entries {
-                        log_store.send(crate::server::logs::LogEntry {
-                            id: 0,
-                            timestamp: entry.timestamp,
-                            level: entry.level,
-                            source: source_prefix.clone(),
-                            target: entry.target,
-                            message: entry.message,
-                        });
-                    }
-                }
-            }
-            ControlMessage::Data {
-                connection_id,
-                data,
-            } => {
-                // Deliver data from client to user connection
-                if let Err(e) = state.deliver_data(connection_id, data).await {
-                    warn!(
-                        "Failed to deliver data to connection {}: {}",
-                        connection_id, e
-                    );
-                }
-            }
-            ControlMessage::ConnectionReady { .. } => {
-                debug!("Connection ready");
-            }
-            ControlMessage::Close { connection_id } => {
-                state.close_connection(connection_id).await;
-                debug!("Connection {} closed by client", connection_id);
-            }
-            ControlMessage::Disconnect => {
-                warn!("Received unexpected Disconnect from client");
-            }
-            ControlMessage::MeshJoin {
-                mesh_id,
-                client_name: msg_client_name,
-            } => {
-                mesh_client_name = msg_client_name;
-                info!("Client '{}' joining mesh '{}'", mesh_client_name, mesh_id);
-                // Register client for relay
-                state
-                    .mesh_manager
-                    .register_client(&mesh_client_name, sender.clone())
-                    .await;
-                // Join the mesh
-                let members = state
-                    .mesh_manager
-                    .join_mesh(&mesh_id, &mesh_client_name)
-                    .await;
-                // Send member list back to requester
-                let _ = sender
-                    .send(ControlMessage::MeshMemberList {
-                        mesh_id: mesh_id.clone(),
-                        members,
-                    })
-                    .await;
-                // Notify other members of new joiner (re-fetch updated list)
-                let updated = state
-                    .mesh_manager
-                    .join_mesh(&mesh_id, &mesh_client_name)
-                    .await;
-                let notify_msg = ControlMessage::MeshMemberList {
-                    mesh_id: mesh_id.clone(),
-                    members: updated,
-                };
-                state
-                    .mesh_manager
-                    .broadcast_to_mesh(&mesh_id, notify_msg, Some(&mesh_client_name))
-                    .await;
-            }
-            ControlMessage::MeshLeave { mesh_id } => {
-                info!("Client '{}' leaving mesh '{}'", mesh_client_name, mesh_id);
-                let members = state
-                    .mesh_manager
-                    .leave_mesh(&mesh_id, &mesh_client_name)
-                    .await;
-                // Notify remaining members
-                let notify_msg = ControlMessage::MeshMemberList {
-                    mesh_id: mesh_id.clone(),
-                    members,
-                };
-                state
-                    .mesh_manager
-                    .broadcast_to_mesh(&mesh_id, notify_msg, None)
-                    .await;
-                // Cleanup DNS records for this mesh
-                if let Some(ref dns_registry) = state.dns_registry {
-                    dns_registry.unregister_mesh_client(&mesh_id).await;
-                }
-            }
-            ControlMessage::MeshConnect {
-                target_client,
-                service_name,
-            } => {
-                debug!(
-                    "Mesh connect request: {} -> {} (service: {})",
-                    mesh_client_name, target_client, service_name
-                );
-                // Forward to target
-                if state
-                    .mesh_manager
-                    .send_to_client(
-                        &target_client,
-                        ControlMessage::MeshConnect {
-                            target_client: mesh_client_name.clone(),
-                            service_name: service_name.clone(),
-                        },
-                    )
-                    .await
-                {
-                    debug!("Forwarded mesh connect request to {}", target_client);
-                } else {
-                    warn!(
-                        "Target client '{}' not reachable for mesh connect",
-                        target_client
-                    );
-                }
-            }
-            ControlMessage::MeshMemberList { .. } => {
-                warn!(
-                    "Received unexpected MeshMemberList from client '{}' (server->client message)",
-                    mesh_client_name
-                );
-            }
-            ControlMessage::P2PRequest {
-                target_client,
-                local_addr,
-            } => {
-                debug!(
-                    "P2P request: {} -> {} (addr: {})",
-                    mesh_client_name, target_client, local_addr
-                );
-                // Forward P2P request to target with requester's address
-                state
-                    .mesh_manager
-                    .send_to_client(
-                        &target_client,
-                        ControlMessage::P2PResponse {
-                            target_client: mesh_client_name.clone(),
-                            remote_addr: local_addr,
-                        },
-                    )
-                    .await;
-            }
-            ControlMessage::P2PResponse { .. } => {
-                warn!(
-                    "Received unexpected P2PResponse from client '{}' (server->client message)",
-                    mesh_client_name
-                );
-            }
-            ControlMessage::P2PResult {
-                target_client,
-                success,
-            } => {
-                if success {
-                    info!(
-                        "P2P connection established between '{}' and '{}'",
-                        mesh_client_name, target_client
-                    );
-                } else {
-                    info!(
-                        "P2P hole punch failed between '{}' and '{}', will use relay",
-                        mesh_client_name, target_client
-                    );
-                }
-            }
-            ControlMessage::MeshRelay {
-                target_client,
-                data,
-            } => {
-                if let Err(e) = state
-                    .mesh_manager
-                    .relay
-                    .relay_data(&mesh_client_name, &target_client, data)
-                    .await
-                {
-                    warn!(
-                        "Mesh relay failed from '{}' to '{}': {}",
-                        mesh_client_name, target_client, e
-                    );
-                }
-            }
-            ControlMessage::MeshRegisterServices { mesh_id, services } => {
-                info!(
-                    "Registering {} services for client '{}' in mesh '{}'",
-                    services.len(),
-                    mesh_client_name,
-                    mesh_id
-                );
-                let mesh_services: Vec<crate::common::MeshService> = services
-                    .iter()
-                    .map(|s| crate::common::MeshService {
-                        name: s.name.clone(),
-                        protocol: s.protocol.clone(),
-                        local_addr: s.local_addr.clone(),
-                    })
-                    .collect();
-                state
-                    .mesh_manager
-                    .register_services(&mesh_id, &mesh_client_name, mesh_services)
-                    .await;
-
-                // Auto-register DNS records for mesh services if DNS is enabled
-                if let Some(ref dns_registry) = state.dns_registry {
-                    for s in &services {
-                        // Parse port from local_addr (e.g., "localhost:3306" → 3306)
-                        if let Some(port_str) = s.local_addr.rsplit(':').next() {
-                            if let Ok(port) = port_str.parse::<u16>() {
-                                dns_registry
-                                    .register_mesh_service(
-                                        &mesh_id,
-                                        &s.name,
-                                        &s.protocol,
-                                        &peer_addr.ip().to_string(),
-                                        port,
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            }
-            ControlMessage::RegisterResponse { .. } => {
-                warn!("Received unexpected RegisterResponse from client");
-            }
-            ControlMessage::NewConnection { .. } => {
-                warn!("Received unexpected NewConnection from client");
-            }
-        }
-    };
-
-    // Cleanup: remove all registered clients when control connection closes
-    for &remote_port in &registered_ports {
-        state.remove_client(remote_port).await;
-        state.remove_quality_tracker(remote_port).await;
-        info!(
-            "Client unregistered from port {} (control connection closed)",
-            remote_port
-        );
-    }
-
-    // Cleanup mesh: leave each mesh with broadcast to remaining members
-    let meshes = state
-        .mesh_manager
-        .router
-        .lock()
-        .await
-        .get_client_meshes(&mesh_client_name);
-    for mesh_id in &meshes {
-        let members = state
-            .mesh_manager
-            .leave_mesh(mesh_id, &mesh_client_name)
-            .await;
-        // Notify remaining members of the departure
-        let notify_msg = ControlMessage::MeshMemberList {
-            mesh_id: mesh_id.clone(),
-            members,
-        };
-        state
-            .mesh_manager
-            .broadcast_to_mesh(mesh_id, notify_msg, None)
-            .await;
-        info!(
-            "Client '{}' removed from mesh '{}' (disconnected)",
-            mesh_client_name, mesh_id
-        );
-    }
-    // Unregister from relay and clients map (router already cleaned by leave_mesh above)
-    state
-        .mesh_manager
-        .unregister_client(&mesh_client_name)
+    // 3. Cleanup: remove from registry
+    cleanup_registry
+        .disconnect(&name_for_cleanup, "connection closed")
         .await;
-
-    // Cleanup DNS records
-    if let Some(ref dns_registry) = state.dns_registry {
-        for &remote_port in &registered_ports {
-            let dns_name = format!("port-{}", remote_port);
-            dns_registry.unregister_tunnel(&dns_name, remote_port).await;
-        }
-        for mesh_id in &meshes {
-            dns_registry.unregister_mesh_client(mesh_id).await;
-        }
-    }
-
     result
 }
 
 /// Start the main server
+#[allow(clippy::too_many_lines)]
 pub async fn run_server(
     config: ServerConfig,
     state: ServerState,
@@ -1844,7 +872,6 @@ pub async fn run_server(
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        let config_clone = config.clone();
         let state_clone = state.clone();
         let tls_acceptor_clone = tls_acceptor.clone();
         let tls_config_rx_clone = tls_config_rx.clone();
@@ -1859,7 +886,8 @@ pub async fn run_server(
                 match acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         debug!("TLS handshake successful with {}", addr);
-                        handle_control_connection(config_clone, state_clone, tls_stream, addr).await
+                        let (reader, writer) = tokio::io::split(tls_stream);
+                        handle_client_connection(reader, writer, state_clone).await
                     }
                     Err(e) => {
                         warn!("TLS handshake failed with {}: {}", addr, e);
@@ -1874,7 +902,8 @@ pub async fn run_server(
                 match tls_acceptor.accept(stream).await {
                     Ok(tls_stream) => {
                         debug!("TLS handshake successful with {}", addr);
-                        handle_control_connection(config_clone, state_clone, tls_stream, addr).await
+                        let (reader, writer) = tokio::io::split(tls_stream);
+                        handle_client_connection(reader, writer, state_clone).await
                     }
                     Err(e) => {
                         warn!("TLS handshake failed with {}: {}", addr, e);
@@ -1883,13 +912,149 @@ pub async fn run_server(
                 }
             } else {
                 // No TLS
-                handle_control_connection(config_clone, state_clone, stream, addr).await
+                let (reader, writer) = tokio::io::split(stream);
+                handle_client_connection(reader, writer, state_clone).await
             };
 
             if let Err(e) = result {
                 warn!("Control connection error from {}: {}", addr, e);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_server_state_new() {
+        let state = ServerState::new();
+        assert_eq!(state.get_client_count().await, 0);
+        assert_eq!(state.get_active_connection_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_state_clone() {
+        let state = ServerState::new();
+        let cloned = state.clone();
+        assert_eq!(cloned.get_client_count().await, 0);
+    }
+}
+
+#[cfg(test)]
+mod ss_integration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_register_shadowsocks_and_trojan() {
+        let state = ServerState::new();
+
+        // Register a shadowsocks port
+        assert!(
+            state
+                .register_shadowsocks(8388, "aes-256-gcm".to_string(), "test-pass".to_string())
+                .await
+        );
+
+        // Verify SS registered
+        let ss_ports = state.get_shadowsocks_ports().await;
+        assert_eq!(ss_ports.len(), 1);
+        assert_eq!(ss_ports[0], 8388);
+        assert!(state.is_shadowsocks_port(8388).await);
+
+        // Register a Trojan port
+        assert!(
+            state
+                .register_trojan(443, "tj-pass".to_string(), "127.0.0.1:80".to_string())
+                .await
+        );
+
+        let trojan_ports = state.get_trojan_ports().await;
+        assert_eq!(trojan_ports.len(), 1);
+        assert_eq!(trojan_ports[0], 443);
+        assert!(state.is_trojan_port(443).await);
+
+        // Both ports should be accessible via get_port
+        assert!(state.get_port(8388).await.is_some());
+        assert!(state.get_port(443).await.is_some());
+
+        // Port not registered
+        assert!(!state.is_shadowsocks_port(443).await);
+        assert!(!state.is_trojan_port(8388).await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_port() {
+        let state = ServerState::new();
+
+        state
+            .register_shadowsocks(9003, "aes-256-gcm".to_string(), "pass".to_string())
+            .await;
+
+        assert!(state.get_port(9003).await.is_some());
+
+        assert!(state.unregister_port(9003).await);
+        assert!(state.get_port(9003).await.is_none());
+
+        // Unregister non-existent
+        assert!(!state.unregister_port(9999).await);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_register_duplicate_shadowsocks() {
+        let state = ServerState::new();
+
+        assert!(
+            state
+                .register_shadowsocks(8080, "aes-256-gcm".into(), "pass".into())
+                .await
+        );
+        // Cannot register SS on same port
+        assert!(
+            !state
+                .register_shadowsocks(8080, "chacha20-ietf-poly1305".into(), "other".into())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_count_for_port() {
+        let state = ServerState::new();
+        assert_eq!(state.get_connection_count_for_port(9999).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_ss_trojan_connection_counts() {
+        let state = ServerState::new();
+
+        state.increment_ss_connections(8388).await;
+        state.increment_ss_connections(8388).await;
+        assert_eq!(state.get_connection_count_for_port(8388).await, 2);
+
+        state.increment_trojan_connections(443).await;
+        assert_eq!(state.get_connection_count_for_port(443).await, 1);
+
+        state.decrement_ss_connections(8388).await;
+        assert_eq!(state.get_connection_count_for_port(8388).await, 1);
+
+        state.decrement_ss_connections(8388).await;
+        assert_eq!(state.get_connection_count_for_port(8388).await, 0);
+
+        // Decrement below zero should be safe
+        state.decrement_ss_connections(8388).await;
+        assert_eq!(state.get_connection_count_for_port(8388).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_connection_count() {
+        let state = ServerState::new();
+        assert_eq!(state.get_active_connection_count().await, 0);
+
+        state.increment_ss_connections(8388).await;
+        state.increment_trojan_connections(443).await;
+        state.increment_trojan_connections(443).await;
+        assert_eq!(state.get_active_connection_count().await, 3);
     }
 }
 

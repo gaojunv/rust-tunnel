@@ -1,8 +1,9 @@
 use std::io::IsTerminal;
 use std::time::Duration;
 
-use rust_tunnel::client::{control, ClientConfig};
-use rust_tunnel::common::{init_logging_with_level, TunnelResult};
+use rust_tunnel::client::control;
+use rust_tunnel::client::ClientConfig;
+use rust_tunnel::common::{init_logging_with_level, TunnelError, TunnelResult};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 30;
@@ -27,23 +28,23 @@ async fn main() {
 async fn run() -> TunnelResult<()> {
     let config = ClientConfig::load().map_err(std::io::Error::other)?;
     init_logging_with_level(&config.log);
-    let forwards = config
-        .parse_forwards()
-        .expect("Invalid forward configuration");
     tracing::info!(
-        "Starting rust-tunnel client, connecting to server {}, {} forward rules configured",
-        config.server,
-        forwards.len()
+        "Starting rust-tunnel client, connecting to server {}",
+        config.server
     );
 
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
 
     loop {
-        match control::run_client(config.clone(), forwards.clone()).await {
+        match control::run_client(config.clone()).await {
             Ok(()) => {
                 tracing::warn!("Control connection closed.");
                 // Connection was established successfully before dropping — reset backoff
                 backoff_secs = INITIAL_BACKOFF_SECS;
+            }
+            Err(TunnelError::ControlChannel(msg)) if msg.contains("register failed") => {
+                tracing::error!("registration rejected by server: {msg}");
+                std::process::exit(2);
             }
             Err(e) => {
                 tracing::warn!("Connection error: {}.", e);

@@ -2,6 +2,7 @@ pub mod acme;
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod client_registry;
 pub mod control;
 pub mod db;
 pub mod dns;
@@ -14,6 +15,7 @@ pub mod quality;
 pub mod reverse_proxy;
 pub mod shadowsocks;
 pub mod trojan;
+pub mod tunnel_stream;
 
 #[cfg(test)]
 mod shadowsocks_test;

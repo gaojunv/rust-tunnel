@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Timelike, Utc};
@@ -16,6 +16,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+
+pub mod clients;
+pub mod server_auth;
 
 use crate::common::DnsRecord;
 use crate::server::acme::CertificateProvider;
@@ -487,19 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_client_response_serialize() {
-        let response = ClientResponse {
-            port: 8080,
-            hostname: Some("test-host".into()),
-            connection_count: 3,
-            quality: None,
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("8080"));
-        assert!(json.contains("test-host"));
-    }
-
-    #[test]
     fn test_shadowsocks_config_serialize() {
         let config = ShadowsocksConfig {
             enabled: true,
@@ -720,15 +710,6 @@ pub struct LoginResponse {
     pub auth_required: bool,
 }
 
-/// Client response for API
-#[derive(Debug, Serialize)]
-pub struct ClientResponse {
-    pub port: u16,
-    pub hostname: Option<String>,
-    pub connection_count: usize,
-    pub quality: Option<ConnectionQuality>,
-}
-
 /// Server metrics
 #[derive(Debug, Serialize)]
 pub struct ServerMetrics {
@@ -919,66 +900,6 @@ async fn login(
 // Logout handler (client just discards token)
 async fn logout() -> impl IntoResponse {
     StatusCode::OK
-}
-
-// List all clients
-async fn list_clients(State(state): State<ApiState>) -> Json<Vec<ClientResponse>> {
-    let clients = state.server_state.get_all_clients().await;
-    let mut response = Vec::with_capacity(clients.len() + 1);
-
-    // Tunnel clients
-    for (port, info) in clients {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: info.hostname,
-            connection_count,
-            quality,
-        });
-    }
-
-    // Shadowsocks ports — show them in the client list so SS activity is visible
-    let ss_ports = state.server_state.get_shadowsocks_ports().await;
-    for port in ss_ports {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: Some("[Shadowsocks]".to_string()),
-            connection_count,
-            quality,
-        });
-    }
-
-    // Trojan ports — show them in the client list
-    let trojan_ports = state.server_state.get_trojan_ports().await;
-    for port in trojan_ports {
-        let connection_count = state.server_state.get_connection_count_for_port(port).await;
-        let quality = state.server_state.quality_store.get_quality(port).await;
-        response.push(ClientResponse {
-            port,
-            hostname: Some("[Trojan]".to_string()),
-            connection_count,
-            quality,
-        });
-    }
-
-    Json(response)
-}
-
-// Disconnect client
-async fn disconnect_client(
-    State(state): State<ApiState>,
-    Path(port): Path<u16>,
-) -> impl IntoResponse {
-    let success = state.server_state.disconnect_client(port).await;
-    if success {
-        state.server_state.traffic_store.remove_port(port).await;
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    }
 }
 
 // Get traffic for all clients
@@ -2015,6 +1936,11 @@ async fn create_proxy_rule(
         cert_status: None,
     };
 
+    if let Err(e) = crate::server::reverse_proxy::validate_rule_for_save(&rule) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    crate::server::reverse_proxy::sanitize_rule(&mut rule);
+
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,
         state.server_state.proxy_state.cert_manager(),
@@ -2163,6 +2089,11 @@ async fn update_proxy_rule(
         created_at: previous.created_at.clone(),
         cert_status: None,
     };
+
+    if let Err(e) = crate::server::reverse_proxy::validate_rule_for_save(&rule) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    crate::server::reverse_proxy::sanitize_rule(&mut rule);
 
     let cert_status = crate::server::reverse_proxy::resolve_cert_source_for_rule(
         &rule,
@@ -2886,8 +2817,18 @@ pub async fn run_api_server(
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
         .route("/api/logout", post(logout))
-        .route("/api/clients", get(list_clients))
-        .route("/api/clients/:port", delete(disconnect_client))
+        .route("/api/clients", get(clients::list_clients))
+        .route(
+            "/api/clients/:name",
+            patch(clients::patch_client_note).delete(clients::delete_client),
+        )
+        .route("/api/clients/:name/kick", post(clients::kick_client))
+        // Server auth token management
+        .route(
+            "/api/server-auth",
+            get(server_auth::get_auth).put(server_auth::put_auth),
+        )
+        .route("/api/server-auth/rotate", post(server_auth::rotate_auth))
         .route("/api/traffic", get(get_traffic))
         .route("/api/traffic/:port", get(get_port_traffic))
         .route("/api/metrics", get(get_metrics))

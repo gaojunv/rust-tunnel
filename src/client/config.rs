@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser};
+use clap::Parser;
 use figment::{
     providers::{Format, Toml},
     Figment,
@@ -17,14 +17,13 @@ pub struct ClientCli {
     #[clap(long)]
     pub server: Option<String>,
 
-    /// Forward rule: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT
-    /// Example: 8080:localhost:80
-    #[clap(long = "forward", action = ArgAction::Append)]
-    pub forwards: Vec<String>,
+    /// Client name (default: system hostname)
+    #[clap(long = "name")]
+    pub name: Option<String>,
 
-    /// Authentication token for server (required if server enables client auth)
-    #[clap(long = "auth-token")]
-    pub auth_token: Option<String>,
+    /// Password (a.k.a. auth token) sent to the server
+    #[clap(long = "password")]
+    pub password: Option<String>,
 
     /// Enable TLS encryption for control channel (should match server setting)
     #[clap(long = "tls")]
@@ -50,7 +49,7 @@ pub struct ClientCli {
 
     /// Mesh service definitions: NAME:PROTOCOL:LOCAL_ADDR
     /// Example: db:mysql:localhost:3306
-    #[clap(long = "mesh-service", action = ArgAction::Append)]
+    #[clap(long = "mesh-service", action = clap::ArgAction::Append)]
     pub mesh_services: Vec<String>,
 
     /// Log level (trace, debug, info, warn, error)
@@ -61,8 +60,8 @@ pub struct ClientCli {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ClientConfigFile {
     pub server: Option<String>,
-    pub forwards: Option<Vec<String>>,
-    pub auth_token: Option<String>,
+    pub name: Option<String>,
+    pub password: Option<String>,
     pub tls: Option<bool>,
     pub tls_server_name: Option<String>,
     pub tls_insecure: Option<bool>,
@@ -75,15 +74,14 @@ pub struct ClientConfigFile {
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub server: String,
-    pub forwards: Vec<String>,
+    pub name: Option<String>,
+    pub password: String,
     /// Mesh network ID to join
     pub mesh: Option<String>,
     /// Mesh client display name in the mesh network
     pub mesh_name: Option<String>,
     /// Mesh service definitions: NAME:PROTOCOL:LOCAL_ADDR
     pub mesh_services: Vec<String>,
-    /// Authentication token for server (required if server enables client auth)
-    pub auth_token: Option<String>,
     /// Enable TLS encryption for control channel
     pub tls: bool,
     /// TLS server name for SNI
@@ -97,11 +95,11 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             server: String::new(),
-            forwards: Vec::new(),
+            name: None,
+            password: String::new(),
             mesh: None,
             mesh_name: None,
             mesh_services: Vec::new(),
-            auth_token: None,
             tls: true, // TLS enabled by default for security
             tls_server_name: None,
             tls_insecure: true, // Accept self-signed certs by default (TOFU mode)
@@ -130,11 +128,11 @@ impl ClientConfig {
                 if let Some(v) = file_config.server {
                     config.server = v;
                 }
-                if let Some(v) = file_config.forwards {
-                    config.forwards = v;
+                if let Some(v) = file_config.name {
+                    config.name = Some(v);
                 }
-                if let Some(v) = file_config.auth_token {
-                    config.auth_token = Some(v);
+                if let Some(v) = file_config.password {
+                    config.password = v;
                 }
                 if let Some(v) = file_config.tls {
                     config.tls = v;
@@ -166,12 +164,11 @@ impl ClientConfig {
         if let Ok(v) = std::env::var("SERVER_ADDR") {
             config.server = v;
         }
-        if let Ok(v) = std::env::var("FORWARDS") {
-            // Split comma-separated forwards
-            config.forwards = v.split(',').map(|s| s.trim().to_string()).collect();
+        if let Ok(v) = std::env::var("NAME") {
+            config.name = Some(v);
         }
-        if let Ok(v) = std::env::var("AUTH_TOKEN") {
-            config.auth_token = Some(v);
+        if let Ok(v) = std::env::var("PASSWORD") {
+            config.password = v;
         }
         if let Ok(v) = std::env::var("TLS") {
             config.tls = v.to_lowercase() == "true" || v == "1";
@@ -199,11 +196,11 @@ impl ClientConfig {
         if let Some(v) = cli.server {
             config.server = v;
         }
-        if !cli.forwards.is_empty() {
-            config.forwards = cli.forwards;
+        if let Some(v) = cli.name {
+            config.name = Some(v);
         }
-        if let Some(v) = cli.auth_token {
-            config.auth_token = Some(v);
+        if let Some(v) = cli.password {
+            config.password = v;
         }
         if let Some(v) = cli.tls {
             config.tls = v;
@@ -234,62 +231,14 @@ impl ClientConfig {
                     .to_string(),
             );
         }
+        if config.password.is_empty() {
+            return Err(
+                "Password is required. Use --password, PASSWORD env, or set in config file"
+                    .to_string(),
+            );
+        }
 
         Ok(config)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ForwardRule {
-    pub remote_port: u16,
-    pub local_addr: String,
-    /// Custom DNS name for this forward (e.g. "webapp" -> webapp.tunnel.local)
-    pub dns_name: Option<String>,
-}
-
-impl ClientConfig {
-    pub fn parse_forwards(&self) -> Result<Vec<ForwardRule>, String> {
-        let mut rules = Vec::new();
-        for forward in &self.forwards {
-            // Use rsplitn to split from the end: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT
-            // This allows LOCAL_HOST to contain colons (IPv6)
-            let mut parts = forward.rsplitn(2, ':');
-            let local_port_str = parts.next().ok_or_else(|| {
-                format!(
-                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
-                    forward
-                )
-            })?;
-            let remaining = parts.next().ok_or_else(|| {
-                format!(
-                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
-                    forward
-                )
-            })?;
-
-            let mut parts2 = remaining.splitn(2, ':');
-            let remote_port_str = parts2.next().unwrap();
-            let local_host = parts2.next().ok_or_else(|| {
-                format!(
-                    "Invalid forward format: '{}', expected: REMOTE_PORT:LOCAL_HOST:LOCAL_PORT",
-                    forward
-                )
-            })?;
-
-            let remote_port = remote_port_str
-                .parse::<u16>()
-                .map_err(|e| format!("Invalid remote port: {}", e))?;
-            let local_port = local_port_str
-                .parse::<u16>()
-                .map_err(|e| format!("Invalid local port: {}", e))?;
-            let local_addr = format!("{}:{}", local_host, local_port);
-            rules.push(ForwardRule {
-                remote_port,
-                local_addr,
-                dns_name: None,
-            });
-        }
-        Ok(rules)
     }
 }
 
@@ -301,8 +250,8 @@ mod tests {
     fn test_default_config() {
         let config = ClientConfig::default();
         assert_eq!(config.server, "");
-        assert!(config.forwards.is_empty());
-        assert!(config.auth_token.is_none());
+        assert!(config.password.is_empty());
+        assert!(config.name.is_none());
         assert!(config.tls); // TLS enabled by default
         assert!(config.tls_insecure); // Accept self-signed certs by default
         assert_eq!(config.log, "info");
@@ -313,8 +262,8 @@ mod tests {
         let cli = ClientCli {
             config_file: None,
             server: Some("localhost:8080".to_string()),
-            forwards: vec!["8080:localhost:80".to_string()],
-            auth_token: Some("secret-token".to_string()),
+            name: Some("test-client".to_string()),
+            password: Some("secret-token".to_string()),
             tls: Some(true),
             tls_server_name: Some("tunnel.example.com".to_string()),
             tls_insecure: Some(true),
@@ -326,8 +275,8 @@ mod tests {
 
         let config = ClientConfig::from_cli(cli).unwrap();
         assert_eq!(config.server, "localhost:8080");
-        assert_eq!(config.forwards, vec!["8080:localhost:80"]);
-        assert_eq!(config.auth_token, Some("secret-token".to_string()));
+        assert_eq!(config.name, Some("test-client".to_string()));
+        assert_eq!(config.password, "secret-token");
         assert!(config.tls);
         assert_eq!(
             config.tls_server_name,
@@ -342,8 +291,8 @@ mod tests {
         let cli = ClientCli {
             config_file: None,
             server: None,
-            forwards: vec![],
-            auth_token: None,
+            name: None,
+            password: None,
             tls: None,
             tls_server_name: None,
             tls_insecure: None,
@@ -359,114 +308,52 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_forwards_single() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["8080:localhost:80".into()],
-            auth_token: None,
-            tls: true,
+    fn test_password_required() {
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("host:8080".into()),
+            password: None,
+            name: None,
+            tls: None,
             tls_server_name: None,
-            tls_insecure: true,
+            tls_insecure: None,
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
-            log: "info".into(),
+            log: None,
         };
-
-        let rules = config.parse_forwards().unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].remote_port, 8080);
-        assert_eq!(rules[0].local_addr, "localhost:80");
+        let err = ClientConfig::from_cli(cli).unwrap_err();
+        assert!(err.contains("password"));
     }
 
     #[test]
-    fn test_parse_forwards_multiple() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["8080:localhost:80".into(), "9000:127.0.0.1:3000".into()],
-            auth_token: None,
-            tls: true,
+    fn test_name_defaults_to_none_in_from_cli() {
+        // If name absent, from_cli leaves it None; run_client is where hostname
+        // is resolved. Assert None here.
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("host:8080".into()),
+            password: Some("pw".into()),
+            name: None,
+            tls: None,
             tls_server_name: None,
-            tls_insecure: true,
+            tls_insecure: None,
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
-            log: "info".into(),
+            log: None,
         };
-
-        let rules = config.parse_forwards().unwrap();
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].remote_port, 8080);
-        assert_eq!(rules[0].local_addr, "localhost:80");
-        assert_eq!(rules[1].remote_port, 9000);
-        assert_eq!(rules[1].local_addr, "127.0.0.1:3000");
-    }
-
-    #[test]
-    fn test_parse_forwards_empty() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec![],
-            auth_token: None,
-            tls: true,
-            tls_server_name: None,
-            tls_insecure: true,
-            mesh: None,
-            mesh_name: None,
-            mesh_services: vec![],
-            log: "info".into(),
-        };
-
-        let rules = config.parse_forwards().unwrap();
-        assert!(rules.is_empty());
-    }
-
-    #[test]
-    fn test_parse_forwards_ipv6() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["8080:::1:80".into()],
-            auth_token: None,
-            tls: true,
-            tls_server_name: None,
-            tls_insecure: true,
-            mesh: None,
-            mesh_name: None,
-            mesh_services: vec![],
-            log: "info".into(),
-        };
-
-        let rules = config.parse_forwards().unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].remote_port, 8080);
-        assert_eq!(rules[0].local_addr, "::1:80");
-    }
-
-    #[test]
-    fn test_parse_forwards_invalid_format() {
-        let config = ClientConfig {
-            server: "localhost:8080".into(),
-            forwards: vec!["invalid".into()],
-            auth_token: None,
-            tls: true,
-            tls_server_name: None,
-            tls_insecure: true,
-            mesh: None,
-            mesh_name: None,
-            mesh_services: vec![],
-            log: "info".into(),
-        };
-
-        let result = config.parse_forwards();
-        assert!(result.is_err());
+        let cfg = ClientConfig::from_cli(cli).unwrap();
+        assert!(cfg.name.is_none());
+        assert_eq!(cfg.password, "pw");
     }
 
     #[test]
     fn test_config_clone() {
         let config = ClientConfig {
             server: "localhost:8080".into(),
-            forwards: vec!["8080:localhost:80".into()],
-            auth_token: Some("secret".to_string()),
+            name: Some("my-client".to_string()),
+            password: "secret".to_string(),
             tls: true,
             tls_server_name: Some("test-server".to_string()),
             tls_insecure: true,
@@ -478,8 +365,8 @@ mod tests {
 
         let cloned = config.clone();
         assert_eq!(config.server, cloned.server);
-        assert_eq!(config.forwards, cloned.forwards);
-        assert_eq!(config.auth_token, cloned.auth_token);
+        assert_eq!(config.name, cloned.name);
+        assert_eq!(config.password, cloned.password);
         assert_eq!(config.tls, cloned.tls);
         assert_eq!(config.tls_server_name, cloned.tls_server_name);
         assert_eq!(config.tls_insecure, cloned.tls_insecure);
@@ -490,26 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_rule_clone() {
-        let rule = ForwardRule {
-            remote_port: 8080,
-            local_addr: "localhost:80".into(),
-            dns_name: Some("webapp".to_string()),
-        };
-
-        let cloned = rule.clone();
-        assert_eq!(rule.remote_port, cloned.remote_port);
-        assert_eq!(rule.local_addr, cloned.local_addr);
-        assert_eq!(rule.dns_name, cloned.dns_name);
-    }
-
-    #[test]
     fn test_config_file_not_found() {
         let cli = ClientCli {
             config_file: Some("/nonexistent/config.toml".to_string()),
             server: Some("test".to_string()),
-            forwards: vec![],
-            auth_token: None,
+            name: None,
+            password: None,
             tls: None,
             tls_server_name: None,
             tls_insecure: None,

@@ -11,6 +11,7 @@ import TrojanPage from './pages/TrojanPage';
 import ReverseProxyPage from './pages/ReverseProxyPage';
 import AcmePage from './pages/AcmePage';
 import LogsPage from './pages/LogsPage';
+import ClientsPage from './pages/ClientsPage';
 import ClientDetailPage from './pages/ClientDetailPage';
 import SettingsPage from './pages/SettingsPage';
 import AppLayout from './components/layout/AppLayout';
@@ -54,6 +55,7 @@ const router = createBrowserRouter([
           { path: '/shadowsocks', element: <ShadowsocksPage /> },
           { path: '/trojan', element: <TrojanPage /> },
           { path: '/proxy', element: <ReverseProxyPage /> },
+          { path: '/clients', element: <ClientsPage /> },
           { path: '/acme', element: <AcmePage /> },
           { path: '/logs', element: <LogsPage /> },
           { path: '/clients/:port', element: <ClientDetailPage /> },

@@ -101,11 +101,16 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
     }
   };
 
-  const getBackendCount = (rule: ProxyRule) => {
-    if (rule.type === 'tcp' || rule.type === 'udp') {
-      return rule.routes?.[0]?.backends?.length ?? 0;
-    }
-    return rule.routes?.reduce((sum, r) => sum + r.backends.length, 0) ?? 0;
+  const getBackendSummary = (rule: ProxyRule): string => {
+    const backends = rule.routes?.flatMap((r) => r.backends) ?? [];
+    if (backends.length === 0) return '0 backends';
+    const parts = backends.map((b) => {
+      if (b.kind === 'client') {
+        return `client://${b.client_name ?? '?'} → ${b.addr}`;
+      }
+      return b.addr;
+    });
+    return parts.join(', ');
   };
 
   return (
@@ -163,8 +168,8 @@ export function ProxyRuleTable({ rules, isLoading, onEdit, onToggleEnabled }: Pr
                   <TableCell>
                     <CertStatusBadge status={rule.cert_status} />
                   </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {getBackendCount(rule)} backend(s)
+                  <TableCell className="max-w-[200px] truncate text-muted-foreground" title={getBackendSummary(rule)}>
+                    {getBackendSummary(rule)}
                   </TableCell>
                   <TableCell>
                     <Switch

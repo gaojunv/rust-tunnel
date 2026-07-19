@@ -5,9 +5,8 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::common::{ControlMessage, TunnelError, TunnelResult};
+use crate::common::{TunnelError, TunnelResult};
 use crate::server::control::{PortInfo, ServerState};
-use crate::server::proxy;
 use crate::server::proxy::proxy_ss_connection;
 use crate::server::proxy::proxy_trojan_connection;
 use crate::server::shadowsocks::handle_ss_handshake;
@@ -18,32 +17,6 @@ fn generate_connection_id() -> u64 {
     rand::thread_rng().gen()
 }
 
-/// Run the listener for a specific remote port
-pub async fn run_listener(state: ServerState, remote_port: u16) -> TunnelResult<()> {
-    let bind_addr = format!("0.0.0.0:{}", remote_port);
-    let listener = TcpListener::bind(&bind_addr).await?;
-    info!("Started listening for public connections on {}", bind_addr);
-
-    loop {
-        let (inbound, client_addr) = listener.accept().await?;
-        debug!("New public connection from {}", client_addr);
-
-        let connection_id = generate_connection_id();
-        let state_clone = state.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_inbound_connection(state_clone, remote_port, connection_id, inbound).await
-            {
-                warn!(
-                    "Failed to handle inbound connection {}: {}",
-                    connection_id, e
-                );
-            }
-        });
-    }
-}
-
 /// Start Shadowsocks listener if enabled
 pub async fn start_shadowsocks_listener(
     state: ServerState,
@@ -51,7 +24,6 @@ pub async fn start_shadowsocks_listener(
     cipher: String,
     password: String,
 ) -> TunnelResult<()> {
-    // Register SS port in ServerState
     if !state.register_shadowsocks(port, cipher, password).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
@@ -60,8 +32,22 @@ pub async fn start_shadowsocks_listener(
         .into());
     }
 
-    // Start the listener (reuses existing run_listener logic)
-    run_listener(state, port).await
+    let bind_addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    info!("Shadowsocks listener started on {}", bind_addr);
+
+    loop {
+        let (inbound, client_addr) = listener.accept().await?;
+        debug!("New SS connection from {}", client_addr);
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let connection_id = generate_connection_id();
+            if let Err(e) = handle_inbound_connection(state_clone, port, connection_id, inbound).await
+            {
+                debug!("SS connection error: {}", e);
+            }
+        });
+    }
 }
 
 /// Start Shadowsocks listener with abort support
@@ -315,27 +301,6 @@ async fn handle_inbound_connection(
     };
 
     match port_info {
-        PortInfo::Tunnel(client_info) => {
-            // Existing tunnel proxy logic
-            debug!("Handling Tunnel connection on port {}", remote_port);
-            // Notify client about the new connection
-            client_info
-                .control_sender
-                .send(ControlMessage::NewConnection {
-                    connection_id,
-                    remote_port,
-                })
-                .await
-                .map_err(|e| std::io::Error::other(format!("Failed to send message: {}", e)))?;
-            proxy::proxy_user_connection(
-                connection_id,
-                remote_port,
-                user_stream,
-                client_info,
-                state,
-            )
-            .await;
-        }
         PortInfo::Shadowsocks {
             cipher, password, ..
         } => {

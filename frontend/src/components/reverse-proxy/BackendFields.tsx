@@ -1,3 +1,4 @@
+import { useQuery } from '@tanstack/react-query';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import {
@@ -8,6 +9,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertTriangle, Plus, Trash2 } from 'lucide-react';
+import { clientsApi } from '@/api/client';
 import type { Backend, BackendScheme, BackendProtocol } from '@/types';
 
 interface BackendFieldsProps {
@@ -16,8 +18,13 @@ interface BackendFieldsProps {
 }
 
 export function BackendFields({ backends, onChange }: BackendFieldsProps) {
+  const { data: clientsData = [] } = useQuery({
+    queryKey: ['clients'],
+    queryFn: clientsApi.list,
+  });
+
   const addBackend = () => {
-    onChange([...backends, { addr: '', weight: 100 }]);
+    onChange([...backends, { kind: 'direct', addr: '', weight: 100, client_name: null }]);
   };
 
   const removeBackend = (index: number) => {
@@ -27,7 +34,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
   const updateBackend = (
     index: number,
     field: keyof Backend,
-    value: string | number,
+    value: string | number | null,
   ) => {
     const updated = backends.map((b, i) =>
       i === index ? { ...b, [field]: value } : b
@@ -44,6 +51,52 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
         const showH2cHint = protocol === 'http2' && scheme === 'http';
         return (
           <div key={index} className="space-y-3 rounded-lg border bg-muted/30 p-3">
+            {/* Kind radio */}
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={backend.kind === 'direct'}
+                  onChange={() =>
+                    updateBackend(index, 'kind', 'direct')
+                  }
+                  className="h-3.5 w-3.5"
+                />
+                Direct
+              </label>
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={backend.kind === 'client'}
+                  onChange={() => updateBackend(index, 'kind', 'client')}
+                  className="h-3.5 w-3.5"
+                />
+                Client
+              </label>
+            </div>
+            {/* Client name field (only for client kind) */}
+            {backend.kind === 'client' && (
+              <div>
+                <label className="mb-1 block text-xs text-muted-foreground">Client Name</label>
+                <input
+                  list="clients-datalist"
+                  value={backend.client_name ?? ''}
+                  onChange={(e) =>
+                    updateBackend(index, 'client_name', e.target.value || null)
+                  }
+                  placeholder="Select or type a client name"
+                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                />
+                <datalist id="clients-datalist">
+                  {clientsData.map((c) => (
+                    <option key={c.name} value={c.name}>
+                      {c.online ? 'online' : 'offline'} {c.hostname ?? ''}
+                    </option>
+                  ))}
+                </datalist>
+              </div>
+            )}
+            {/* Addr + Weight row */}
             <div className="flex items-center gap-2">
               <Input
                 value={backend.addr}
