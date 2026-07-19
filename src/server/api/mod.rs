@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Timelike, Utc};
@@ -16,6 +16,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+
+pub mod clients;
+pub mod server_auth;
 
 use crate::common::DnsRecord;
 use crate::server::acme::CertificateProvider;
@@ -2896,8 +2899,12 @@ pub async fn run_api_server(
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
         .route("/api/logout", post(logout))
-        .route("/api/clients", get(list_clients))
-        .route("/api/clients/:port", delete(disconnect_client))
+        .route("/api/clients", get(clients::list_clients))
+        .route(
+            "/api/clients/:name",
+            patch(clients::patch_client_note).delete(clients::delete_client),
+        )
+        .route("/api/clients/:name/kick", post(clients::kick_client))
         .route("/api/traffic", get(get_traffic))
         .route("/api/traffic/:port", get(get_port_traffic))
         .route("/api/metrics", get(get_metrics))
