@@ -244,6 +244,22 @@ pub fn record_traffic(
     entry.connections += connections;
 }
 
+/// Trojan SNI 分流表项：反代共享监听器嗅探到匹配的 SNI 时，
+/// 不终止该连接的 TLS，直接交给 `listener::handle_trojan_connection` 处理。
+pub struct TrojanSniEntry {
+    /// 匹配的 SNI 域名（小写）
+    pub domain: String,
+    /// 生效的反代共享监听地址（如 "0.0.0.0:443"）
+    pub listen_addr: String,
+    /// Trojan 端口（共享模式下不真实 bind，仅用于连接统计/流量记账）
+    pub trojan_port: u16,
+    pub password: String,
+    pub fallback: String,
+    /// Trojan 的 TLS 配置 watch channel（证书热更新）
+    pub tls_config_rx: tokio::sync::watch::Receiver<Arc<rustls::ServerConfig>>,
+    pub state: crate::server::control::ServerState,
+}
+
 /// State for the reverse proxy module
 #[derive(Clone)]
 pub struct ReverseProxyState {
@@ -268,6 +284,9 @@ pub struct ReverseProxyState {
     pub direct_connector: Arc<connector::DirectConnector>,
     /// Optional client connector — Some(_) once ClientRegistry is wired in.
     pub client_connector: Arc<tokio::sync::RwLock<Option<Arc<connector::ClientConnector>>>>,
+    /// Trojan SNI 分流表项（ArcSwap 热替换）：SNI 命中 domain 时，
+    /// 对应 listen_addr 的共享监听器把连接交给 Trojan 处理。None = 独立监听模式。
+    pub trojan_sni: Arc<arc_swap::ArcSwap<Option<Arc<TrojanSniEntry>>>>,
 }
 
 /// Compute the cert coverage source for a rule at save time.
@@ -395,6 +414,7 @@ impl ReverseProxyState {
             cert_manager: None,
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
+            trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         }
     }
 
@@ -411,6 +431,7 @@ impl ReverseProxyState {
             cert_manager: None,
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
+            trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
         }
     }
 
@@ -423,6 +444,37 @@ impl ReverseProxyState {
     #[must_use]
     pub fn cert_manager(&self) -> Option<&Arc<crate::server::acme::CertificateManager>> {
         self.cert_manager.as_ref()
+    }
+
+    /// 设置/清除 Trojan SNI 分流表项（热替换，无需重建监听器）。
+    pub fn set_trojan_sni(&self, entry: Option<TrojanSniEntry>) {
+        self.trojan_sni.store(Arc::new(entry.map(Arc::new)));
+    }
+
+    /// 取该监听地址生效的 Trojan 分流表项。
+    pub fn trojan_sni_entry(&self, listen_addr: &str) -> Option<Arc<TrojanSniEntry>> {
+        let snap = self.trojan_sni.load();
+        match snap.as_ref() {
+            Some(e) if e.listen_addr == listen_addr => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    /// 查找指定端口上启用的 HTTP 反代规则对应的 listen 地址与 TLS 状态。
+    /// 返回 `Some((listen_addr, tls_enabled))`；该端口无任何启用的 HTTP 规则时返回 `None`。
+    pub async fn http_listen_addr_for_port(&self, port: u16) -> Option<(String, bool)> {
+        let rules = self.rules.lock().await;
+        rules
+            .values()
+            .filter(|r| r.enabled && r.rule_type == RuleType::Http)
+            .find(|r| {
+                r.listen
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    == Some(port)
+            })
+            .map(|r| (r.listen.clone(), r.tls.as_ref().is_some_and(|t| t.enabled)))
     }
 
     /// Backwards-compatible accessor returning the manager as a trait object.
@@ -1191,5 +1243,77 @@ mod mod_tests {
         };
         sanitize_rule(&mut rule);
         assert!(rule.routes[0].backends[0].client_name.is_none());
+    }
+}
+
+#[cfg(test)]
+mod trojan_sni_tests {
+    use super::*;
+
+    fn make_entry(domain: &str, listen_addr: &str) -> TrojanSniEntry {
+        // 构造一个最小的 ServerConfig 占位（tls_config_rx 的类型是 Receiver<Arc<ServerConfig>>）
+        let cfg = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(
+                    crate::server::reverse_proxy::sni_resolver::SniCertResolver::new(Arc::new(
+                        crate::server::acme::CertificateManager::new("/tmp/nonexistent-test-dir"),
+                    )),
+                )),
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(cfg);
+        TrojanSniEntry {
+            domain: domain.to_string(),
+            listen_addr: listen_addr.to_string(),
+            trojan_port: 443,
+            password: "p".to_string(),
+            fallback: "127.0.0.1:80".to_string(),
+            tls_config_rx: rx,
+            state: crate::server::control::ServerState::new(),
+        }
+    }
+
+    #[test]
+    fn trojan_sni_entry_matches_listen_addr() {
+        let state = ReverseProxyState::new();
+        assert!(state.trojan_sni_entry("0.0.0.0:443").is_none());
+
+        state.set_trojan_sni(Some(make_entry("trojan.example.com", "0.0.0.0:443")));
+        let hit = state.trojan_sni_entry("0.0.0.0:443").expect("should hit");
+        assert_eq!(hit.domain, "trojan.example.com");
+        // 其他监听地址不命中
+        assert!(state.trojan_sni_entry("0.0.0.0:8443").is_none());
+
+        state.set_trojan_sni(None);
+        assert!(state.trojan_sni_entry("0.0.0.0:443").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_listen_addr_for_port_reports_tls() {
+        let state = ReverseProxyState::new();
+        assert!(state.http_listen_addr_for_port(443).await.is_none());
+
+        let tls_rule = ProxyRule {
+            id: "r1".into(),
+            name: "r1".into(),
+            rule_type: RuleType::Http,
+            listen: "0.0.0.0:443".into(),
+            domains: vec!["a.example.com".into()],
+            routes: vec![],
+            tls: Some(ProxyTlsConfig {
+                enabled: true,
+                acme: false,
+                domain: Some("a.example.com".into()),
+            }),
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        };
+        state.rules.lock().await.insert("r1".into(), tls_rule);
+        assert_eq!(
+            state.http_listen_addr_for_port(443).await,
+            Some(("0.0.0.0:443".to_string(), true))
+        );
+        assert!(state.http_listen_addr_for_port(8443).await.is_none());
     }
 }

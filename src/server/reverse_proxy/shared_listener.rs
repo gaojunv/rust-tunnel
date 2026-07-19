@@ -16,8 +16,9 @@ use tracing::{debug, info, warn};
 use super::error::ReconcileError;
 use super::handler::{handle_proxy_request_unified, RouteSource};
 use super::router::RouteTable;
+use super::sni_sniff;
 use super::upstream::UpstreamClient;
-use super::{ProxyRule, ReverseProxyState, RuleType};
+use super::{ProxyRule, ReverseProxyState, RuleType, TrojanSniEntry};
 use crate::server::acme::CertificateManager;
 
 pub struct SharedListener {
@@ -77,6 +78,7 @@ impl SharedListener {
 
         let route_table_for_task = route_table.clone();
         let listen_addr_for_log = listen_addr.clone();
+        let listen_addr_for_match = listen_addr.clone();
 
         let handle = tokio::spawn(async move {
             info!(
@@ -107,8 +109,10 @@ impl SharedListener {
                         let acceptor = tls_acceptor.clone();
                         let upstream_c = upstream_for_task.clone();
                         let ps = proxy_state.clone();
+                        // 每连接取一次分流表项快照（ArcSwap 热替换，无需重建监听器）
+                        let trojan_entry = proxy_state.trojan_sni_entry(&listen_addr_for_match);
                         tokio::spawn(async move {
-                            handle_one_connection(stream, peer, acceptor, table, upstream_c, ps)
+                            handle_one_connection(stream, peer, acceptor, table, upstream_c, ps, trojan_entry)
                                 .await;
                         });
                     }
@@ -161,14 +165,38 @@ impl SharedListener {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_one_connection(
     stream: tokio::net::TcpStream,
-    _peer: SocketAddr,
+    peer: SocketAddr,
     acceptor: Option<TlsAcceptor>,
     route_table: Arc<ArcSwap<RouteTable>>,
     upstream: Arc<UpstreamClient>,
     proxy_state: Arc<ReverseProxyState>,
+    trojan_entry: Option<Arc<TrojanSniEntry>>,
 ) {
+    // Trojan SNI 分流：仅在 TLS 监听器上嗅探。命中 trojan 域名时本监听器
+    // 不终止 TLS，直接交给 Trojan 处理（Trojan 自己终止 TLS）；
+    // 解析失败/非 TLS/未命中一律走原有 HTTP 路径。
+    if let (Some(entry), Some(_)) = (&trojan_entry, &acceptor) {
+        if let Some(sni) = sni_sniff::sniff_sni(&stream).await {
+            if sni == entry.domain {
+                debug!(peer = %peer, sni = %sni, "SNI 命中 trojan 域名，分流给 Trojan");
+                crate::server::listener::handle_trojan_connection(
+                    stream,
+                    peer,
+                    entry.trojan_port,
+                    entry.password.clone(),
+                    entry.fallback.clone(),
+                    entry.tls_config_rx.clone(),
+                    entry.state.clone(),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
     let source = RouteSource(route_table);
     let app: Router = Router::new()
         .fallback(any(handle_proxy_request_unified))
@@ -188,7 +216,7 @@ async fn handle_one_connection(
                 .1
                 .alpn_protocol()
                 .map(|p| String::from_utf8_lossy(p).into_owned());
-            debug!(peer = %_peer, alpn = ?alpn, "tls handshake ok");
+            debug!(peer = %peer, alpn = ?alpn, "tls handshake ok");
 
             let io = hyper_util::rt::TokioIo::new(tls_stream);
             let service = hyper_util::service::TowerToHyperService::new(app.into_service());
