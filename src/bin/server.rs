@@ -115,6 +115,47 @@ async fn main() -> TunnelResult<()> {
     // Wire up ClientConnector to ReverseProxyState so client-kind backends work
     state.wire_up_client_connector().await;
 
+    // Seed server_auth table: if empty, use CLI --auth-token or generate random.
+    {
+        let existing = db
+            .load_server_auth()
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to load server_auth: {e}");
+                None
+            });
+        match (existing, config.client_auth_token.as_deref()) {
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    "--auth-token / CLIENT_TOKEN provided but server_auth already set; ignoring CLI value"
+                );
+            }
+            (Some(t), None) => {
+                tracing::info!("loaded existing client token from DB (len={})", t.len());
+            }
+            (None, Some(cli_token)) => {
+                db.save_server_auth(cli_token)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("save initial auth token: {e}"))?;
+                tracing::info!("seeded client token from CLI/env");
+            }
+            (None, None) => {
+                use base64::Engine;
+                use rand::RngCore;
+                let mut bytes = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                let token =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+                db.save_server_auth(&token)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("save generated auth token: {e}"))?;
+                tracing::info!(
+                    "generated random client token; new clients must use: {token}"
+                );
+            }
+        }
+    }
+
     // Load or seed dynamic config from DB
     let dynamic_config =
         rust_tunnel::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
