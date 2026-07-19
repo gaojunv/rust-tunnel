@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { StatCard } from '@/components/shared/StatCard';
+import { TrafficAreaChart } from '@/components/charts/TrafficAreaChart';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { clientsApi } from '@/api/client';
 import { useMetrics } from '@/api/hooks';
@@ -74,6 +75,9 @@ export default function DashboardPage() {
           icon={<ArrowUp className="h-4 w-4" />}
         />
       </div>
+
+      {/* Traffic Chart */}
+      <TrafficAreaChart />
 
       {/* Client List */}
       <Card>

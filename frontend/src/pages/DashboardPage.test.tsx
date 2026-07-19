@@ -50,9 +50,28 @@ describe('DashboardPage', () => {
   beforeEach(() => {
     listSpy.mockReset();
     getSpy.mockReset();
+    Object.defineProperty(window, 'matchMedia', {
+      writable: true,
+      value: vi.fn().mockImplementation((query: string) => ({
+        matches: false,
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
     getSpy.mockImplementation((url: string) => {
       if (url === '/metrics') {
         return Promise.resolve(metricsResponse);
+      }
+      if (url === '/traffic') {
+        return Promise.resolve({
+          ...emptyResponse,
+          data: [],
+        });
       }
       return Promise.resolve(emptyResponse);
     });

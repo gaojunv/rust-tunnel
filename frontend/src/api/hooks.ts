@@ -4,6 +4,7 @@ import {
   getMetrics,
   getPortQuality,
   getPortTraffic,
+  getTraffic,
   getAllQuality,
   getShadowsocksConfig,
   updateShadowsocksConfig,
@@ -68,6 +69,14 @@ export function useTraffic(port: number, _hours = 24) {
     queryKey: ['traffic', port, _hours],
     queryFn: () => getPortTraffic(port),
     enabled: port > 0,
+  });
+}
+
+export function useAllTraffic() {
+  return useQuery({
+    queryKey: ['traffic', 'all'],
+    queryFn: () => getTraffic(),
+    refetchInterval: 30000,
   });
 }
 
