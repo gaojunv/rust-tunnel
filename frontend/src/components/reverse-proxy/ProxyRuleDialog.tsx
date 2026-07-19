@@ -16,6 +16,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { AlertTriangle } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { clientsApi } from '@/api/client';
 import { useCreateProxyRule, useUpdateProxyRule } from '@/api/hooks';
 import { HttpRouteFields } from './HttpRouteFields';
 import type { ProxyRule, RuleType, Route, ProxyTlsConfig, CreateProxyRuleRequest } from '@/types';
@@ -40,6 +42,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
   const createMutation = useCreateProxyRule();
   const updateMutation = useUpdateProxyRule();
   const [form, setForm] = useState(emptyForm);
+  const { data: clientsData = [] } = useQuery({
+    queryKey: ['clients'],
+    queryFn: clientsApi.list,
+  });
 
   useEffect(() => {
     if (editingRule) {
@@ -103,6 +109,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
   };
 
   const mutation = editingRule ? updateMutation : createMutation;
+  const tcpBackend = form.routes?.[0]?.backends?.[0];
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -166,17 +173,102 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
           {/* TCP/UDP backend */}
           {(form.type === 'tcp' || form.type === 'udp') && (
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Backend Address</label>
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Backend</label>
+              {/* Kind radio */}
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="radio"
+                    checked={tcpBackend?.kind !== 'client'}
+                    onChange={() =>
+                      setForm({
+                        ...form,
+                        routes: [
+                          {
+                            path: '/',
+                            backends: [{
+                              kind: 'direct',
+                              addr: tcpBackend?.addr ?? '',
+                              weight: 100,
+                              client_name: null,
+                            }],
+                            load_balancing: 'round_robin',
+                          },
+                        ],
+                      })
+                    }
+                    className="h-3.5 w-3.5"
+                  />
+                  Direct
+                </label>
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input
+                    type="radio"
+                    checked={tcpBackend?.kind === 'client'}
+                    onChange={() =>
+                      setForm({
+                        ...form,
+                        routes: [
+                          {
+                            path: '/',
+                            backends: [{
+                              kind: 'client',
+                              addr: tcpBackend?.addr ?? '',
+                              weight: 100,
+                              client_name: '',
+                            }],
+                            load_balancing: 'round_robin',
+                          },
+                        ],
+                      })
+                    }
+                    className="h-3.5 w-3.5"
+                  />
+                  Client
+                </label>
+              </div>
+              {/* Client name field */}
+              {tcpBackend?.kind === 'client' && (
+                <div>
+                  <label className="mb-1 block text-xs text-muted-foreground">Client Name</label>
+                  <input
+                    list="tcp-clients-datalist"
+                    value={tcpBackend.client_name ?? ''}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        routes: [
+                          {
+                            path: '/',
+                            backends: [{ ...tcpBackend, client_name: e.target.value || null }],
+                            load_balancing: 'round_robin',
+                          },
+                        ],
+                      })
+                    }
+                    placeholder="Select or type a client name"
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  />
+                  <datalist id="tcp-clients-datalist">
+                    {clientsData.map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.online ? 'online' : 'offline'} {c.hostname ?? ''}
+                      </option>
+                    ))}
+                  </datalist>
+                </div>
+              )}
+              {/* Backend address */}
               <Input
-                value={form.routes?.[0]?.backends?.[0]?.addr ?? ''}
+                value={tcpBackend?.addr ?? ''}
                 onChange={(e) =>
                   setForm({
                     ...form,
                     routes: [
                       {
                         path: '/',
-                        backends: [{ addr: e.target.value, weight: 100 }],
+                        backends: [{ ...(tcpBackend ?? { kind: 'direct', weight: 100, client_name: null }), addr: e.target.value }],
                         load_balancing: 'round_robin',
                       },
                     ],

@@ -32,7 +32,7 @@ export function HttpRouteFields({
   const addRoute = () => {
     onRoutesChange([
       ...routes,
-      { path: '/', backends: [{ addr: '', weight: 100 }], load_balancing: 'round_robin' },
+      { path: '/', backends: [{ kind: 'direct', addr: '', weight: 100, client_name: null }], load_balancing: 'round_robin' },
     ]);
   };
 
