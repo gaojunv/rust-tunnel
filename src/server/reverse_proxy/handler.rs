@@ -547,13 +547,24 @@ async fn handle_client_backend(
     });
 
     // Rewrite the request URI to relative form for the tunneled backend
-    let upstream_req = match build_upstream_request(req, &backend) {
+    let mut upstream_req = match build_upstream_request(req, &backend) {
         Ok(r) => r,
         Err(e) => {
             state.decrement_connections(&rule_id).await;
             return error_response(&e);
         }
     };
+
+    // For direct http1::handshake (not through a proxy), hyper's Client expects
+    // the URI in origin-form (e.g. "/path?query"), not absolute-form. Rewrite.
+    {
+        let pq = upstream_req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        *upstream_req.uri_mut() = pq.parse().unwrap_or_else(|_| upstream_req.uri().clone());
+    }
 
     match sender.send_request(upstream_req).await {
         Ok(resp) => {
