@@ -92,9 +92,14 @@ impl TcpProxy {
                         tokio::spawn(async move {
                             state.increment_connections(&rule_id).await;
 
-                            if let Err(e) =
-                                handle_tcp_connection(stream, peer_addr, state.clone(), backend, tls_acceptor)
-                                    .await
+                            if let Err(e) = handle_tcp_connection(
+                                stream,
+                                peer_addr,
+                                state.clone(),
+                                backend,
+                                tls_acceptor,
+                            )
+                            .await
                             {
                                 debug!("TCP connection error from {}: {}", peer_addr, e);
                             }
@@ -139,9 +144,10 @@ async fn handle_tcp_connection(
             }
         };
 
-        let (bytes_c2b, bytes_b2c) = tokio::io::copy_bidirectional(&mut tls_stream, &mut *backend_stream)
-            .await
-            .unwrap_or((0, 0));
+        let (bytes_c2b, bytes_b2c) =
+            tokio::io::copy_bidirectional(&mut tls_stream, &mut *backend_stream)
+                .await
+                .unwrap_or((0, 0));
         debug!(
             "TCP TLS connection closed from {}: {} bytes client->backend, {} bytes backend->client",
             peer_addr, bytes_c2b, bytes_b2c
@@ -149,9 +155,10 @@ async fn handle_tcp_connection(
     } else {
         // Plain TCP: direct bidirectional copy
         let mut client_stream = client_stream;
-        let (bytes_c2b, bytes_b2c) = tokio::io::copy_bidirectional(&mut client_stream, &mut *backend_stream)
-            .await
-            .unwrap_or((0, 0));
+        let (bytes_c2b, bytes_b2c) =
+            tokio::io::copy_bidirectional(&mut client_stream, &mut *backend_stream)
+                .await
+                .unwrap_or((0, 0));
         debug!(
             "TCP connection closed from {}: {} bytes client->backend, {} bytes backend->client",
             peer_addr, bytes_c2b, bytes_b2c

@@ -73,13 +73,14 @@ pub async fn delete_client_impl(reg: &ClientRegistry, name: &str) -> Result<(), 
 // ---- Axum handlers ----
 // Use ApiState from the parent module (consistent with existing handlers)
 
-pub async fn list_clients(
-    State(state): State<super::ApiState>,
-) -> Response {
+pub async fn list_clients(State(state): State<super::ApiState>) -> Response {
     let reg = match state.server_state.client_registry.as_ref() {
         Some(r) => r.clone(),
         None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "server has no client registry")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server has no client registry",
+            )
                 .into_response();
         }
     };
@@ -118,7 +119,10 @@ pub async fn delete_client(
     let reg = match state.server_state.client_registry.as_ref() {
         Some(r) => r.clone(),
         None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "server has no client registry")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server has no client registry",
+            )
                 .into_response();
         }
     };
@@ -136,16 +140,15 @@ pub async fn kick_client(
     let reg = match state.server_state.client_registry.as_ref() {
         Some(r) => r.clone(),
         None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "server has no client registry")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server has no client registry",
+            )
                 .into_response();
         }
     };
     if reg.get(&name).await.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("client '{name}' not online"),
-        )
-            .into_response();
+        return (StatusCode::NOT_FOUND, format!("client '{name}' not online")).into_response();
     }
     reg.disconnect(&name, "kicked").await;
     StatusCode::NO_CONTENT.into_response()
@@ -206,8 +209,19 @@ mod tests {
         }])
         .to_string();
         db.save_proxy_rule(
-            "r1", "web", "http", "0.0.0.0:80", None, Some(&routes_json),
-            false, false, None, true, None, None, None,
+            "r1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            Some(&routes_json),
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();

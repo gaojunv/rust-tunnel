@@ -72,10 +72,7 @@ pub async fn handle_open_tunnel(
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Error reading from connection {}: {}",
-                            connection_id, e
-                        );
+                        warn!("Error reading from connection {}: {}", connection_id, e);
                         break;
                     }
                 }

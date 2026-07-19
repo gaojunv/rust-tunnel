@@ -5,8 +5,7 @@ use rust_tunnel::client::config::ClientConfig;
 use rust_tunnel::client::control::run_client;
 use rust_tunnel::server::auth::AuthConfig;
 use rust_tunnel::server::reverse_proxy::{
-    Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
-    tcp_proxy::TcpProxy,
+    tcp_proxy::TcpProxy, Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
 };
 use rust_tunnel::server::{api, control, Database, ServerConfig};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -201,14 +200,14 @@ impl TestHarness {
     /// In the v2 protocol, clients do not specify forward rules — they just
     /// register with a name + password. Tunnel listeners are set up separately
     /// via `start_tcp_tunnel`.
-    pub fn spawn_client(
-        &mut self,
-        client_name: Option<&str>,
-    ) -> tokio::task::AbortHandle {
+    pub fn spawn_client(&mut self, client_name: Option<&str>) -> tokio::task::AbortHandle {
         let name = client_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| "test-client".to_string());
-        let password = self.client_password.clone().unwrap_or_else(|| "test-password".to_string());
+        let password = self
+            .client_password
+            .clone()
+            .unwrap_or_else(|| "test-password".to_string());
         let client_config = ClientConfig {
             server: self.control_addr.to_string(),
             name: Some(name),
@@ -235,12 +234,7 @@ impl TestHarness {
     ///
     /// Uses the server's `TcpProxy` + `ClientConnector` so traffic flows
     /// through the control-channel tunnel.
-    pub async fn start_tcp_tunnel(
-        &self,
-        listen_port: u16,
-        target_addr: &str,
-        client_name: &str,
-    ) {
+    pub async fn start_tcp_tunnel(&self, listen_port: u16, target_addr: &str, client_name: &str) {
         let backend = Backend {
             kind: BackendKind::Client,
             addr: target_addr.to_string(),

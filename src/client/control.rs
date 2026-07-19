@@ -204,12 +204,9 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         state.add_pending_connection(connection_id).await;
                         let state_clone = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = proxy::handle_open_tunnel(
-                                state_clone,
-                                connection_id,
-                                target_addr,
-                            )
-                            .await
+                            if let Err(e) =
+                                proxy::handle_open_tunnel(state_clone, connection_id, target_addr)
+                                    .await
                             {
                                 warn!("Failed to handle OpenTunnel {}: {}", connection_id, e);
                             }
@@ -334,10 +331,7 @@ pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
     info!("Sent Register to server (name='{client_name}')");
 
     match ControlMessage::read_from_stream(&mut reader).await {
-        Ok(Some(ControlMessage::RegisterResponse {
-            success: true,
-            ..
-        })) => {
+        Ok(Some(ControlMessage::RegisterResponse { success: true, .. })) => {
             info!("registered as '{client_name}'");
         }
         Ok(Some(ControlMessage::RegisterResponse {

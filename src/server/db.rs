@@ -1988,11 +1988,15 @@ impl Database {
             let id: String = row.get("id");
             let name: String = row.get("name");
             let routes_json: Option<String> = row.get("routes");
-            let Some(routes_json) = routes_json else { continue };
+            let Some(routes_json) = routes_json else {
+                continue;
+            };
             let Ok(routes) = serde_json::from_str::<serde_json::Value>(&routes_json) else {
                 continue;
             };
-            let Some(arr) = routes.as_array() else { continue };
+            let Some(arr) = routes.as_array() else {
+                continue;
+            };
             let mut hit = false;
             'route: for r in arr {
                 let Some(backends) = r.get("backends").and_then(|v| v.as_array()) else {
@@ -2642,8 +2646,12 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_and_list_clients() {
         let db = Database::new(":memory:").await.unwrap();
-        db.upsert_client("home-nas", Some("nas.local")).await.unwrap();
-        db.upsert_client("home-nas", Some("nas.local")).await.unwrap(); // idempotent
+        db.upsert_client("home-nas", Some("nas.local"))
+            .await
+            .unwrap();
+        db.upsert_client("home-nas", Some("nas.local"))
+            .await
+            .unwrap(); // idempotent
         db.upsert_client("office-pc", None).await.unwrap();
 
         let list = db.list_clients().await.unwrap();
@@ -2656,10 +2664,20 @@ mod tests {
     async fn test_touch_client_last_seen() {
         let db = Database::new(":memory:").await.unwrap();
         db.upsert_client("home-nas", None).await.unwrap();
-        let before = db.get_client("home-nas").await.unwrap().unwrap().last_seen_at;
+        let before = db
+            .get_client("home-nas")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_seen_at;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         db.touch_client_last_seen("home-nas").await.unwrap();
-        let after = db.get_client("home-nas").await.unwrap().unwrap().last_seen_at;
+        let after = db
+            .get_client("home-nas")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_seen_at;
         assert!(after > before);
     }
 
@@ -2667,13 +2685,26 @@ mod tests {
     async fn test_update_client_note() {
         let db = Database::new(":memory:").await.unwrap();
         db.upsert_client("home-nas", None).await.unwrap();
-        db.update_client_note("home-nas", Some("primary")).await.unwrap();
+        db.update_client_note("home-nas", Some("primary"))
+            .await
+            .unwrap();
         assert_eq!(
-            db.get_client("home-nas").await.unwrap().unwrap().note.as_deref(),
+            db.get_client("home-nas")
+                .await
+                .unwrap()
+                .unwrap()
+                .note
+                .as_deref(),
             Some("primary")
         );
         db.update_client_note("home-nas", None).await.unwrap();
-        assert!(db.get_client("home-nas").await.unwrap().unwrap().note.is_none());
+        assert!(db
+            .get_client("home-nas")
+            .await
+            .unwrap()
+            .unwrap()
+            .note
+            .is_none());
     }
 
     #[tokio::test]
@@ -2690,9 +2721,15 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         assert!(db.load_server_auth().await.unwrap().is_none());
         db.save_server_auth("token-abc").await.unwrap();
-        assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-abc"));
+        assert_eq!(
+            db.load_server_auth().await.unwrap().as_deref(),
+            Some("token-abc")
+        );
         db.save_server_auth("token-def").await.unwrap();
-        assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("token-def"));
+        assert_eq!(
+            db.load_server_auth().await.unwrap().as_deref(),
+            Some("token-def")
+        );
     }
 
     #[tokio::test]
@@ -2711,14 +2748,26 @@ mod tests {
                 ],
                 "load_balancing": "round_robin"
             }
-        ]).to_string();
+        ])
+        .to_string();
 
         db.save_proxy_rule(
-            "rule-1", "web", "http", "0.0.0.0:80",
-            None, Some(&routes_json),
-            false, false, None, true,
-            None, None, None,
-        ).await.unwrap();
+            "rule-1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            Some(&routes_json),
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let refs = db.rules_referencing_client("home-nas").await.unwrap();
         assert_eq!(refs.len(), 1);
@@ -2739,14 +2788,30 @@ mod tests {
                   "weight": 100, "protocol": "http1", "scheme": "http" }
             ],
             "load_balancing": "round_robin"
-        }]).to_string();
+        }])
+        .to_string();
         db.save_proxy_rule(
-            "r1", "web", "http", "0.0.0.0:80",
-            None, Some(&routes_json),
-            false, false, None, true,
-            None, None, None,
-        ).await.unwrap();
-        assert!(db.rules_referencing_client("anything").await.unwrap().is_empty());
+            "r1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            Some(&routes_json),
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .rules_referencing_client("anything")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -2754,12 +2819,27 @@ mod tests {
         // rule with routes = NULL (e.g. tcp rule)
         let db = Database::new(":memory:").await.unwrap();
         db.save_proxy_rule(
-            "r1", "tcp-rule", "tcp", "0.0.0.0:9000",
-            None, None,
-            false, false, None, true,
-            None, None, None,
-        ).await.unwrap();
-        assert!(db.rules_referencing_client("anyone").await.unwrap().is_empty());
+            "r1",
+            "tcp-rule",
+            "tcp",
+            "0.0.0.0:9000",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .rules_referencing_client("anyone")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod connector;
 pub mod error;
 pub mod handler;
 pub mod router;
@@ -6,7 +7,6 @@ pub mod shared_listener;
 pub mod sni_resolver;
 pub mod tcp_proxy;
 pub mod upstream;
-pub mod connector;
 
 #[cfg(test)]
 mod http2_test;
@@ -342,7 +342,11 @@ pub fn validate_rule_for_save(rule: &ProxyRule) -> Result<(), String> {
                         return Err("client backend requires non-empty client_name".into());
                     }
                     // parse host:port
-                    if b.addr.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).is_none() {
+                    if b.addr
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse::<u16>().ok())
+                        .is_none()
+                    {
                         return Err(format!(
                             "client backend addr '{}' is not a valid host:port",
                             b.addr
@@ -441,7 +445,9 @@ impl ReverseProxyState {
         backend: &Backend,
     ) -> std::io::Result<Arc<dyn connector::Connector>> {
         match backend.kind {
-            BackendKind::Direct => Ok(self.direct_connector.clone() as Arc<dyn connector::Connector>),
+            BackendKind::Direct => {
+                Ok(self.direct_connector.clone() as Arc<dyn connector::Connector>)
+            }
             BackendKind::Client => {
                 let guard = self.client_connector.read().await;
                 guard
@@ -1003,14 +1009,21 @@ mod mod_tests {
 
     #[test]
     fn backend_kind_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&BackendKind::Direct).unwrap(), "\"direct\"");
-        assert_eq!(serde_json::to_string(&BackendKind::Client).unwrap(), "\"client\"");
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Direct).unwrap(),
+            "\"direct\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Client).unwrap(),
+            "\"client\""
+        );
     }
 
     #[test]
     fn validate_rule_rejects_client_backend_missing_name() {
         let rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Http,
             listen: "0.0.0.0:80".into(),
             domains: vec!["x.com".into()],
@@ -1026,7 +1039,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         let err = validate_rule_for_save(&rule).expect_err("should reject");
         assert!(err.contains("client_name"));
@@ -1035,7 +1051,8 @@ mod mod_tests {
     #[test]
     fn validate_rule_rejects_client_backend_bad_addr() {
         let rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Http,
             listen: "0.0.0.0:80".into(),
             domains: vec!["x.com".into()],
@@ -1051,7 +1068,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         let err = validate_rule_for_save(&rule).expect_err("should reject bad addr");
         assert!(err.contains("not a valid host:port"));
@@ -1060,7 +1080,8 @@ mod mod_tests {
     #[test]
     fn validate_rule_rejects_udp_client_backend() {
         let rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Udp,
             listen: "0.0.0.0:53".into(),
             domains: vec![],
@@ -1076,7 +1097,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         let err = validate_rule_for_save(&rule).expect_err("should reject UDP client");
         assert!(err.contains("UDP"));
@@ -1085,7 +1109,8 @@ mod mod_tests {
     #[test]
     fn validate_rule_rejects_http2_client_backend() {
         let rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Http,
             listen: "0.0.0.0:80".into(),
             domains: vec!["x.com".into()],
@@ -1101,7 +1126,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         let err = validate_rule_for_save(&rule).expect_err("should reject HTTP/2 client");
         assert!(err.contains("HTTP/2"));
@@ -1110,7 +1138,8 @@ mod mod_tests {
     #[test]
     fn validate_rule_direct_backend_ok() {
         let rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Http,
             listen: "0.0.0.0:80".into(),
             domains: vec!["x.com".into()],
@@ -1126,7 +1155,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         assert!(validate_rule_for_save(&rule).is_ok());
     }
@@ -1134,7 +1166,8 @@ mod mod_tests {
     #[test]
     fn sanitize_rule_zeroes_client_name_on_direct() {
         let mut rule = ProxyRule {
-            id: "r".into(), name: "r".into(),
+            id: "r".into(),
+            name: "r".into(),
             rule_type: RuleType::Http,
             listen: "0.0.0.0:80".into(),
             domains: vec!["x.com".into()],
@@ -1150,7 +1183,10 @@ mod mod_tests {
                 }],
                 load_balancing: LoadBalancing::default(),
             }],
-            tls: None, enabled: true, created_at: None, cert_status: None,
+            tls: None,
+            enabled: true,
+            created_at: None,
+            cert_status: None,
         };
         sanitize_rule(&mut rule);
         assert!(rule.routes[0].backends[0].client_name.is_none());

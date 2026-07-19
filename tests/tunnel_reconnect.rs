@@ -53,10 +53,7 @@ async fn client_reregisters_after_admin_disconnect() {
 
         // Admin-triggered kick via the REST API (by client name, not port).
         let status = api
-            .post_json(
-                "/api/clients/reconnect-client/kick",
-                serde_json::json!({}),
-            )
+            .post_json("/api/clients/reconnect-client/kick", serde_json::json!({}))
             .await
             .0;
         assert!(status.is_success(), "kick API returned {status}");

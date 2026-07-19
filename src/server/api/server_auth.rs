@@ -126,9 +126,6 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("old").await.unwrap();
         set_impl(&db, "new").await.unwrap();
-        assert_eq!(
-            db.load_server_auth().await.unwrap().as_deref(),
-            Some("new")
-        );
+        assert_eq!(db.load_server_auth().await.unwrap().as_deref(), Some("new"));
     }
 }

@@ -369,8 +369,8 @@ impl ReverseProxyState {
 mod tests {
     use super::*;
     use crate::server::reverse_proxy::{
-        Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig,
-        Route, RuleType,
+        Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule,
+        ProxyTlsConfig, Route, RuleType,
     };
 
     fn http_rule(id: &str, listen: &str, domain: &str, tls: bool) -> ProxyRule {

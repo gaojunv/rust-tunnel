@@ -18,9 +18,7 @@ use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
 use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
-use crate::server::quality::{
-    ConnectionQuality, QualitySample, QualityStore, QualityTracker,
-};
+use crate::server::quality::{ConnectionQuality, QualitySample, QualityStore, QualityTracker};
 use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::ServerConfig;
 use chrono::Utc;
@@ -673,9 +671,7 @@ async fn handle_client_connection(
             if protocol_version != 2 {
                 let resp = ControlMessage::RegisterResponse {
                     success: false,
-                    message: format!(
-                        "unsupported protocol_version {protocol_version}, want 2"
-                    ),
+                    message: format!("unsupported protocol_version {protocol_version}, want 2"),
                 };
                 let _ = resp.write_to_stream(&mut writer).await;
                 return Err(TunnelError::Protocol("protocol version mismatch".into()));
@@ -794,7 +790,9 @@ async fn handle_client_connection(
                     let mut conns = entry.active_connections.lock().await;
                     conns.remove(&connection_id);
                 }
-                ControlMessage::LogBatch { entries: log_entries } => {
+                ControlMessage::LogBatch {
+                    entries: log_entries,
+                } => {
                     if let Some(ref log_store) = state.log_store {
                         let source_prefix = format!("client:{}", entry.name);
                         for e in log_entries {

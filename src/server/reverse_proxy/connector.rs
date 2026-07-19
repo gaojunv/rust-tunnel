@@ -69,9 +69,15 @@ impl Connector for ClientConnector {
             ));
         }
         let client_name = backend.client_name.as_deref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "client backend missing client_name")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "client backend missing client_name",
+            )
         })?;
-        let stream = self.registry.open_tunnel(client_name, &backend.addr).await?;
+        let stream = self
+            .registry
+            .open_tunnel(client_name, &backend.addr)
+            .await?;
         Ok(Box::new(stream))
     }
 }
@@ -159,7 +165,10 @@ mod tests {
                             }
                         }
                     }
-                    ControlMessage::Data { connection_id, data } => {
+                    ControlMessage::Data {
+                        connection_id,
+                        data,
+                    } => {
                         let conns = entry_for_client.active_connections.lock().await;
                         if let Some(active) = conns.get(&connection_id) {
                             let _ = active.inbound.send(data).await;

@@ -132,10 +132,7 @@ async fn traffic_bucket_appears_after_transfer() {
         harness.spawn_client(Some("traffic-client"));
 
         let api = harness.api_client();
-        harness
-            .wait_client_count(&api, 1)
-            .await
-            .expect("register");
+        harness.wait_client_count(&api, 1).await.expect("register");
 
         // Start TCP tunnel on server side so traffic can flow through.
         harness

@@ -150,10 +150,7 @@ impl AsyncWrite for ClientTunnelStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if self.closed {
             return Poll::Ready(Ok(()));
         }
@@ -178,7 +175,9 @@ impl Drop for ClientTunnelStream {
         let cid = self.connection_id;
         // Spawn so we don't require sync availability of a runtime handle.
         tokio::spawn(async move {
-            let _ = sender.send(ControlMessage::Close { connection_id: cid }).await;
+            let _ = sender
+                .send(ControlMessage::Close { connection_id: cid })
+                .await;
         });
     }
 }
@@ -202,7 +201,10 @@ mod tests {
 
         let msg = ctl_rx.recv().await.unwrap();
         match msg {
-            ControlMessage::Data { connection_id, data } => {
+            ControlMessage::Data {
+                connection_id,
+                data,
+            } => {
                 assert_eq!(connection_id, 42);
                 assert_eq!(data, b"hello");
             }
@@ -238,8 +240,14 @@ mod tests {
         let second = ctl_rx.recv().await.unwrap();
         match (first, second) {
             (
-                ControlMessage::Data { connection_id: c1, data: d1 },
-                ControlMessage::Data { connection_id: c2, data: d2 },
+                ControlMessage::Data {
+                    connection_id: c1,
+                    data: d1,
+                },
+                ControlMessage::Data {
+                    connection_id: c2,
+                    data: d2,
+                },
             ) => {
                 assert_eq!(c1, 7);
                 assert_eq!(c2, 7);

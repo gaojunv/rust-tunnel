@@ -14,7 +14,9 @@ use tracing::error;
 
 use super::router::RouteTable;
 use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
-use super::{record_traffic, Backend, BackendKind, BackendProtocol, ReverseProxyState, TrafficPending};
+use super::{
+    record_traffic, Backend, BackendKind, BackendProtocol, ReverseProxyState, TrafficPending,
+};
 
 use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
@@ -35,11 +37,7 @@ pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 /// The third element is `Arc<ReverseProxyState>` which provides access to
 /// `connection_counts`, `traffic_pending`, and the `ClientConnector` for
 /// client-kind backends.
-pub type ProxyState = (
-    RouteSource,
-    Arc<UpstreamClient>,
-    Arc<ReverseProxyState>,
-);
+pub type ProxyState = (RouteSource, Arc<UpstreamClient>, Arc<ReverseProxyState>);
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
 /// and must be stripped by any intermediary.
@@ -329,7 +327,9 @@ pub async fn handle_proxy_request_unified(
             }
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("websocket upgrade to client backend not yet supported"))
+                .body(Body::from(
+                    "websocket upgrade to client backend not yet supported",
+                ))
                 .unwrap();
         }
         // HTTP/2 not supported for client backends
@@ -498,7 +498,12 @@ async fn handle_client_backend(
 
     // Wrap request body to count bytes_in
     let (parts, body) = req.into_parts();
-    let counted = Body::new(count_body(body, traffic_pending.clone(), rule_id.clone(), true));
+    let counted = Body::new(count_body(
+        body,
+        traffic_pending.clone(),
+        rule_id.clone(),
+        true,
+    ));
     let req = Request::from_parts(parts, counted);
 
     // Dial via ClientConnector
@@ -737,11 +742,7 @@ mod tests {
         // 3. Build the axum Router with the unified handler and bind it.
         let app = Router::new()
             .fallback(axum::routing::any(handle_proxy_request_unified))
-            .with_state((
-                source,
-                upstream,
-                proxy_state,
-            ));
+            .with_state((source, upstream, proxy_state));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -839,11 +840,7 @@ mod tests {
 
         let app = Router::new()
             .fallback(any(handle_proxy_request_unified))
-            .with_state((
-                source,
-                upstream,
-                proxy_state,
-            ));
+            .with_state((source, upstream, proxy_state));
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr: SocketAddr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -946,11 +943,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((
-            source,
-            upstream,
-            proxy_state,
-        ));
+        let state = State((source, upstream, proxy_state));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(
@@ -1211,11 +1204,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let state = State((
-            source,
-            upstream,
-            proxy_state,
-        ));
+        let state = State((source, upstream, proxy_state));
         let resp = handle_proxy_request_unified(state, req).await;
 
         assert_eq!(resp.status(), 200);

@@ -1,8 +1,8 @@
 pub mod acme;
 pub mod api;
 pub mod auth;
-pub mod config;
 pub mod client_registry;
+pub mod config;
 pub mod control;
 pub mod db;
 pub mod dns;

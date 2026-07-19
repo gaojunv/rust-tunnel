@@ -66,9 +66,16 @@ pub enum ControlMessage {
         pong_timestamp_micros: u64,
     },
     /// Client requests to open a tunnel to a local target
-    OpenTunnel { connection_id: u64, target_addr: String },
+    OpenTunnel {
+        connection_id: u64,
+        target_addr: String,
+    },
     /// Server response to a tunnel open request
-    TunnelOpenResult { connection_id: u64, success: bool, error: Option<String> },
+    TunnelOpenResult {
+        connection_id: u64,
+        success: bool,
+        error: Option<String>,
+    },
     /// Mesh network registration (client -> server)
     MeshJoin {
         mesh_id: String,
@@ -190,7 +197,12 @@ mod tests {
         let bytes = msg.serialize().unwrap();
         let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
         match decoded {
-            ControlMessage::Register { protocol_version, client_name, password, client_version } => {
+            ControlMessage::Register {
+                protocol_version,
+                client_name,
+                password,
+                client_version,
+            } => {
                 assert_eq!(protocol_version, 2);
                 assert_eq!(client_name, "home-nas");
                 assert_eq!(password, "secret");
@@ -209,7 +221,10 @@ mod tests {
         let bytes = msg.serialize().unwrap();
         let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
         match decoded {
-            ControlMessage::OpenTunnel { connection_id, target_addr } => {
+            ControlMessage::OpenTunnel {
+                connection_id,
+                target_addr,
+            } => {
                 assert_eq!(connection_id, 42);
                 assert_eq!(target_addr, "127.0.0.1:80");
             }
@@ -227,7 +242,11 @@ mod tests {
         let bytes = msg.serialize().unwrap();
         let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
         match decoded {
-            ControlMessage::TunnelOpenResult { connection_id, success, error } => {
+            ControlMessage::TunnelOpenResult {
+                connection_id,
+                success,
+                error,
+            } => {
                 assert_eq!(connection_id, 42);
                 assert!(!success);
                 assert_eq!(error.as_deref(), Some("connection refused"));
@@ -238,7 +257,9 @@ mod tests {
 
     #[test]
     fn test_disconnect_with_reason_roundtrip() {
-        let msg = ControlMessage::Disconnect { reason: "replaced".into() };
+        let msg = ControlMessage::Disconnect {
+            reason: "replaced".into(),
+        };
         let bytes = msg.serialize().unwrap();
         let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
         match decoded {

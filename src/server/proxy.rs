@@ -369,5 +369,4 @@ mod tests {
         // After removal, port should be gone
         assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
     }
-
-    }
+}

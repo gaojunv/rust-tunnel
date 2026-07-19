@@ -42,7 +42,8 @@ pub async fn start_shadowsocks_listener(
         let state_clone = state.clone();
         tokio::spawn(async move {
             let connection_id = generate_connection_id();
-            if let Err(e) = handle_inbound_connection(state_clone, port, connection_id, inbound).await
+            if let Err(e) =
+                handle_inbound_connection(state_clone, port, connection_id, inbound).await
             {
                 debug!("SS connection error: {}", e);
             }

@@ -99,7 +99,11 @@ impl ClientRegistry {
         sender: ControlSender,
     ) -> Result<Arc<ClientEntry>, RegisterError> {
         // 1. Auth
-        let stored = self.db.load_server_auth().await.map_err(RegisterError::DbError)?;
+        let stored = self
+            .db
+            .load_server_auth()
+            .await
+            .map_err(RegisterError::DbError)?;
         match stored {
             Some(token) if token == password => {}
             _ => return Err(RegisterError::AuthFailed),
@@ -192,7 +196,10 @@ impl ClientRegistry {
         use std::time::Duration;
 
         let entry = self.get(client_name).await.ok_or_else(|| {
-            Error::new(ErrorKind::NotConnected, format!("client '{client_name}' offline"))
+            Error::new(
+                ErrorKind::NotConnected,
+                format!("client '{client_name}' offline"),
+            )
         })?;
 
         // Random cid; collision is astronomically unlikely for u64.
@@ -231,7 +238,10 @@ impl ClientRegistry {
                 // Clean up connection entry on timeout
                 let mut conns = entry.active_connections.lock().await;
                 conns.remove(&cid);
-                return Err(Error::new(ErrorKind::TimedOut, "OpenTunnel timed out after 5s"));
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "OpenTunnel timed out after 5s",
+                ));
             }
         };
 
@@ -239,18 +249,19 @@ impl ClientRegistry {
         let outcome = match outcome {
             Ok(v) => v,
             Err(_) => {
-                return Err(Error::new(ErrorKind::BrokenPipe, "open_result channel dropped"));
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "open_result channel dropped",
+                ));
             }
         };
 
         match outcome {
-            TunnelOpenOutcome::Ok => {
-                Ok(crate::server::tunnel_stream::ClientTunnelStream::new(
-                    cid,
-                    entry.control_sender.clone(),
-                    inbound_rx,
-                ))
-            }
+            TunnelOpenOutcome::Ok => Ok(crate::server::tunnel_stream::ClientTunnelStream::new(
+                cid,
+                entry.control_sender.clone(),
+                inbound_rx,
+            )),
             TunnelOpenOutcome::Failed(err) => {
                 // Clean up connection entry on failure
                 let mut conns = entry.active_connections.lock().await;
@@ -278,7 +289,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(32);
         let entry = registry
-            .register("home-nas", Some("nas.local".into()), Some("0.4.0".into()), "secret", tx)
+            .register(
+                "home-nas",
+                Some("nas.local".into()),
+                Some("0.4.0".into()),
+                "secret",
+                tx,
+            )
             .await
             .expect("register should succeed");
         assert_eq!(entry.name, "home-nas");
@@ -334,11 +351,10 @@ mod tests {
             .await
             .unwrap();
 
-        let received =
-            tokio::time::timeout(std::time::Duration::from_millis(500), rx1.recv())
-                .await
-                .expect("timed out waiting for Disconnect on old sender")
-                .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx1.recv())
+            .await
+            .expect("timed out waiting for Disconnect on old sender")
+            .expect("channel closed");
         match received {
             ControlMessage::Disconnect { reason } => assert_eq!(reason, "replaced"),
             other => panic!("expected Disconnect, got {other:?}"),
@@ -360,11 +376,10 @@ mod tests {
             .unwrap();
         registry.disconnect("home-nas", "kicked").await;
 
-        let received =
-            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-                .await
-                .expect("timed out")
-                .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
         match received {
             ControlMessage::Disconnect { reason } => assert_eq!(reason, "kicked"),
             _ => panic!("wrong message"),
