@@ -7,6 +7,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { QualityScoreSparkline } from '@/components/charts/QualityScoreSparkline';
 import { StatCard } from '@/components/shared/StatCard';
 import { QualityBadge } from '@/components/shared/QualityBadge';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -95,6 +96,7 @@ export default function QualityPage() {
                     <div className="mt-1 text-2xl font-bold tabular-nums">
                       {client.score}
                     </div>
+                    <QualityScoreSparkline port={client.port} />
                   </div>
                 )
               )}
