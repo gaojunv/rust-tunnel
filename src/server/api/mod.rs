@@ -1304,7 +1304,7 @@ async fn update_trojan_config(
     // Save to DB（单份配置语义：整表替换，避免修改端口时残留旧行）
     if let Some(db) = state.server_state.db() {
         if let Err(e) = db
-            .replace_trojan_config(port, password, fallback, enabled)
+            .replace_trojan_config(port, password, fallback, enabled, "")
             .await
         {
             return (
@@ -1323,6 +1323,7 @@ async fn update_trojan_config(
             port,
             password: password.to_string(),
             fallback: fallback.to_string(),
+            domain: String::new(),
         });
     }
 

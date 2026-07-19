@@ -21,6 +21,8 @@ pub struct TrojanDynamicConfig {
     pub port: u16,
     pub password: String,
     pub fallback: String,
+    /// SNI/ACME 域名；空串 = 不用 ACME 证书、不参与反代 SNI 分流
+    pub domain: String,
 }
 
 /// Reverse proxy dynamic settings
@@ -115,6 +117,7 @@ impl DynamicConfig {
                     port: c.port as u16,
                     password: c.password.clone(),
                     fallback: c.fallback.clone(),
+                    domain: c.domain.clone(),
                 })
             }
             _ => {
@@ -128,6 +131,7 @@ impl DynamicConfig {
                                 password,
                                 &server_config.trojan_fallback,
                                 true,
+                                "",
                             )
                             .await;
                         Some(TrojanDynamicConfig {
@@ -135,6 +139,7 @@ impl DynamicConfig {
                             port,
                             password: password.clone(),
                             fallback: server_config.trojan_fallback.clone(),
+                            domain: String::new(),
                         })
                     } else {
                         None

@@ -174,6 +174,7 @@ impl Database {
                 password TEXT NOT NULL,
                 fallback TEXT NOT NULL DEFAULT '127.0.0.1:80',
                 enabled INTEGER NOT NULL DEFAULT 1,
+                domain TEXT NOT NULL DEFAULT '',
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )
@@ -181,6 +182,18 @@ impl Database {
         )
         .execute(pool)
         .await?;
+
+        // Migrate: 旧库补 domain 列（幂等——报 "duplicate column" 时忽略）
+        if let Err(e) =
+            sqlx::query("ALTER TABLE trojan_config ADD COLUMN domain TEXT NOT NULL DEFAULT ''")
+                .execute(pool)
+                .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(e);
+            }
+        }
 
         // Server logs table
         sqlx::query(
@@ -945,17 +958,19 @@ impl Database {
         password: &str,
         fallback: &str,
         enabled: bool,
+        domain: &str,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
 
         sqlx::query(
             r#"
-            INSERT INTO trojan_config (port, password, fallback, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO trojan_config (port, password, fallback, enabled, domain, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(port) DO UPDATE SET
                 password = excluded.password,
                 fallback = excluded.fallback,
                 enabled = excluded.enabled,
+                domain = excluded.domain,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -963,6 +978,7 @@ impl Database {
         .bind(password)
         .bind(fallback)
         .bind(enabled as i32)
+        .bind(domain)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -981,6 +997,7 @@ impl Database {
         password: &str,
         fallback: &str,
         enabled: bool,
+        domain: &str,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
 
@@ -990,14 +1007,15 @@ impl Database {
             .await?;
         sqlx::query(
             r#"
-            INSERT INTO trojan_config (port, password, fallback, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO trojan_config (port, password, fallback, enabled, domain, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(port as i32)
         .bind(password)
         .bind(fallback)
         .bind(enabled as i32)
+        .bind(domain)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -1011,7 +1029,7 @@ impl Database {
     pub async fn load_trojan_configs(&self) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, TrojanConfigRecord>(
             r#"
-            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             ORDER BY port
             "#,
@@ -1028,7 +1046,7 @@ impl Database {
     ) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, TrojanConfigRecord>(
             r#"
-            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             WHERE enabled = 1
             ORDER BY port
@@ -1047,7 +1065,7 @@ impl Database {
     ) -> Result<Option<TrojanConfigRecord>, sqlx::Error> {
         let record = sqlx::query_as::<_, TrojanConfigRecord>(
             r#"
-            SELECT id, port, password, fallback, enabled, created_at, updated_at
+            SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             WHERE port = ?
             "#,
@@ -2085,6 +2103,7 @@ pub struct TrojanConfigRecord {
     pub password: String,
     pub fallback: String,
     pub enabled: i32,
+    pub domain: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -2522,11 +2541,11 @@ mod tests {
     async fn test_replace_trojan_config_single_row() {
         let db = create_test_db().await;
 
-        db.save_trojan_config(443, "pass1", "127.0.0.1:80", true)
+        db.save_trojan_config(443, "pass1", "127.0.0.1:80", true, "")
             .await
             .unwrap();
         // 修改端口：整表替换，不应残留旧行
-        db.replace_trojan_config(8443, "pass2", "127.0.0.1:8080", false)
+        db.replace_trojan_config(8443, "pass2", "127.0.0.1:8080", false, "")
             .await
             .unwrap();
 
@@ -2904,5 +2923,81 @@ mod cert_status_migration_tests {
         assert_eq!(r.cert_source.as_deref(), Some("exact"));
         assert_eq!(r.cert_covering_domain.as_deref(), Some("a.example.com"));
         assert!(r.cert_status_updated_at.is_some());
+    }
+
+    /// 旧库（无 domain 列）经 Database::new 迁移后应自动补上 domain 列，
+    /// 存量行 domain 默认 ''。
+    #[tokio::test]
+    async fn trojan_config_domain_column_migration() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db_path = tempdir.path().join("migrate.db");
+
+        // 用旧 schema（无 domain 列）手工建表并插入一行
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query(
+                r#"
+                CREATE TABLE trojan_config (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    port INTEGER NOT NULL UNIQUE,
+                    password TEXT NOT NULL,
+                    fallback TEXT NOT NULL DEFAULT '127.0.0.1:80',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO trojan_config (port, password, fallback, enabled, created_at, updated_at) \
+                 VALUES (1443, 'old-pass', '127.0.0.1:80', 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let db = Database::new(db_path.to_str().unwrap()).await.unwrap();
+        let configs = db.load_trojan_configs().await.unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].port, 1443);
+        assert_eq!(configs[0].domain, "", "迁移后存量行 domain 应为空串");
+    }
+
+    /// domain 随 save/replace/load 完整往返。
+    #[tokio::test]
+    async fn trojan_config_domain_roundtrip() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db_path = tempdir.path().join("roundtrip.db");
+        let db = Database::new(db_path.to_str().unwrap()).await.unwrap();
+
+        db.save_trojan_config(443, "pass1", "127.0.0.1:80", true, "trojan.example.com")
+            .await
+            .unwrap();
+        let cfg = db.get_trojan_config(443).await.unwrap().unwrap();
+        assert_eq!(cfg.domain, "trojan.example.com");
+
+        // replace 整表替换语义保留，domain 一并更新
+        db.replace_trojan_config(8443, "pass2", "127.0.0.1:8080", false, "t2.example.com")
+            .await
+            .unwrap();
+        let all = db.load_trojan_configs().await.unwrap();
+        assert_eq!(all.len(), 1, "replace 后表中应只有一份配置");
+        assert_eq!(all[0].port, 8443);
+        assert_eq!(all[0].domain, "t2.example.com");
+        assert_eq!(all[0].enabled, 0);
+
+        let enabled = db.load_enabled_trojan_configs().await.unwrap();
+        assert!(
+            enabled.is_empty(),
+            "enabled=0 的行不应出现在 enabled 查询里"
+        );
     }
 }
