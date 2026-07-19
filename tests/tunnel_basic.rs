@@ -4,7 +4,6 @@
 mod common;
 
 use common::{spawn_echo, wait_until, HarnessOpts, TestHarness};
-use rust_tunnel::client::config::ForwardRule;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,17 +21,18 @@ async fn tunnel_forwards_bytes_bidirectionally() {
         let echo_addr = spawn_echo().await;
         let remote_port = harness.exposed_ports[0];
 
-        harness.spawn_client(vec![ForwardRule {
-            remote_port,
-            local_addr: echo_addr.to_string(),
-            dns_name: None,
-        }]);
+        harness.spawn_client(Some("basic-client"));
 
         let api = harness.api_client();
         harness
             .wait_client_count(&api, 1)
             .await
             .expect("client did not register");
+
+        // Start TCP tunnel listener on the server side.
+        harness
+            .start_tcp_tunnel(remote_port, &echo_addr.to_string(), "basic-client")
+            .await;
 
         // Wait for the listener to be actually bound on the exposed port.
         wait_until("exposed port open", || async {
@@ -77,14 +77,14 @@ async fn tunnel_forwards_with_tls_disabled() {
         let echo_addr = spawn_echo().await;
         let remote_port = harness.exposed_ports[0];
 
-        harness.spawn_client(vec![ForwardRule {
-            remote_port,
-            local_addr: echo_addr.to_string(),
-            dns_name: None,
-        }]);
+        harness.spawn_client(Some("tls-disabled-client"));
 
         let api = harness.api_client();
         harness.wait_client_count(&api, 1).await.expect("register");
+
+        harness
+            .start_tcp_tunnel(remote_port, &echo_addr.to_string(), "tls-disabled-client")
+            .await;
 
         wait_until("exposed port open", || async {
             TcpStream::connect(("127.0.0.1", remote_port))
@@ -123,18 +123,13 @@ async fn tunnel_multi_port() {
         let port_a = harness.exposed_ports[0];
         let port_b = harness.exposed_ports[1];
 
-        harness.spawn_client(vec![
-            ForwardRule {
-                remote_port: port_a,
-                local_addr: echo_a.to_string(),
-                dns_name: None,
-            },
-            ForwardRule {
-                remote_port: port_b,
-                local_addr: echo_b.to_string(),
-                dns_name: None,
-            },
-        ]);
+        harness.spawn_client(Some("multi-client"));
+        harness
+            .start_tcp_tunnel(port_a, &echo_a.to_string(), "multi-client")
+            .await;
+        harness
+            .start_tcp_tunnel(port_b, &echo_b.to_string(), "multi-client")
+            .await;
 
         let api = harness.api_client();
         harness.wait_client_count(&api, 1).await.expect("register");

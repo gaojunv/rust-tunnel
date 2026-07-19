@@ -1,9 +1,13 @@
 //! In-process server+client harness. Each `TestHarness::spawn` yields a fully
 //! isolated server (fresh tempdir, random ports) that lives until drop.
 
-use rust_tunnel::client::config::{ClientConfig, ForwardRule};
+use rust_tunnel::client::config::ClientConfig;
 use rust_tunnel::client::control::run_client;
 use rust_tunnel::server::auth::AuthConfig;
+use rust_tunnel::server::reverse_proxy::{
+    Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
+    tcp_proxy::TcpProxy,
+};
 use rust_tunnel::server::{api, control, Database, ServerConfig};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use tempfile::TempDir;
@@ -17,7 +21,10 @@ use super::retry::wait_until;
 pub struct HarnessOpts {
     pub tls: bool,
     pub admin_password: Option<String>,
-    pub client_auth_token: Option<String>,
+    /// Password used by test clients to authenticate with the server.
+    pub client_password: Option<String>,
+    /// Default client name used by `spawn_client`.
+    pub client_name: Option<String>,
     /// Number of tunneled ports the harness should pre-reserve for tests.
     pub exposed_port_count: usize,
 }
@@ -28,8 +35,10 @@ pub struct TestHarness {
     pub api_base: String,
     pub exposed_ports: Vec<u16>,
     pub admin_password: Option<String>,
-    pub client_auth_token: Option<String>,
+    pub client_password: Option<String>,
     pub tls: bool,
+    /// Clone of the server's `ReverseProxyState`, for starting tunnel listeners.
+    pub proxy_state: ReverseProxyState,
     server_task: JoinHandle<()>,
     api_task: JoinHandle<()>,
     client_tasks: Vec<JoinHandle<()>>,
@@ -72,7 +81,7 @@ impl TestHarness {
             api_addr: api_addr.clone(),
             admin_password: opts.admin_password.clone(),
             jwt_secret: Some("test-jwt-secret-do-not-use-in-prod".to_string()),
-            client_auth_token: opts.client_auth_token.clone(),
+            client_auth_token: opts.client_password.clone(),
             tls: opts.tls,
             tls_cert: cert_path.to_string_lossy().to_string(),
             tls_key: key_path.to_string_lossy().to_string(),
@@ -111,6 +120,21 @@ impl TestHarness {
 
         let db = Database::new(&config.db_path).await.expect("db new");
         let state = control::ServerState::with_db(db);
+        // Seed a server_auth row so clients can authenticate.
+        let client_pw = opts
+            .client_password
+            .clone()
+            .unwrap_or_else(|| "test-password".to_string());
+        state
+            .db()
+            .expect("db")
+            .save_server_auth(&client_pw)
+            .await
+            .expect("seed server_auth");
+        // Wire up the ClientConnector so reverse-proxy rules can reach tunnel clients.
+        state.wire_up_client_connector().await;
+        let proxy_state = state.proxy_state.clone();
+
         let auth_config = AuthConfig::new(config.admin_password.clone(), config.jwt_secret.clone());
 
         let control_state = state.clone();
@@ -160,7 +184,8 @@ impl TestHarness {
             api_base,
             exposed_ports,
             admin_password: opts.admin_password,
-            client_auth_token: opts.client_auth_token,
+            client_password: opts.client_password,
+            proxy_state,
             tls: opts.tls,
             server_task,
             api_task,
@@ -172,17 +197,25 @@ impl TestHarness {
     /// Returns an `AbortHandle` that the caller can use to kill the client
     /// mid-test (e.g. to test reconnect). The harness itself also holds an
     /// abort handle for cleanup on drop.
-    pub fn spawn_client(&mut self, forwards: Vec<ForwardRule>) -> tokio::task::AbortHandle {
+    ///
+    /// In the v2 protocol, clients do not specify forward rules — they just
+    /// register with a name + password. Tunnel listeners are set up separately
+    /// via `start_tcp_tunnel`.
+    pub fn spawn_client(
+        &mut self,
+        client_name: Option<&str>,
+    ) -> tokio::task::AbortHandle {
+        let name = client_name
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "test-client".to_string());
+        let password = self.client_password.clone().unwrap_or_else(|| "test-password".to_string());
         let client_config = ClientConfig {
             server: self.control_addr.to_string(),
-            forwards: forwards
-                .iter()
-                .map(|f| format!("{}:{}", f.remote_port, f.local_addr))
-                .collect(),
+            name: Some(name),
+            password,
             mesh: None,
             mesh_name: None,
             mesh_services: Vec::new(),
-            auth_token: self.client_auth_token.clone(),
             tls: self.tls,
             tls_server_name: Some("localhost".to_string()),
             tls_insecure: true,
@@ -190,11 +223,40 @@ impl TestHarness {
         };
 
         let handle = tokio::spawn(async move {
-            let _ = run_client(client_config, forwards).await;
+            let _ = run_client(client_config).await;
         });
         let abort = handle.abort_handle();
         self.client_tasks.push(handle);
         abort
+    }
+
+    /// Start a TCP tunnel listener on `listen_port` that forwards to
+    /// `target_addr` (a host:port reachable from the named client).
+    ///
+    /// Uses the server's `TcpProxy` + `ClientConnector` so traffic flows
+    /// through the control-channel tunnel.
+    pub async fn start_tcp_tunnel(
+        &self,
+        listen_port: u16,
+        target_addr: &str,
+        client_name: &str,
+    ) {
+        let backend = Backend {
+            kind: BackendKind::Client,
+            addr: target_addr.to_string(),
+            client_name: Some(client_name.to_string()),
+            weight: 100,
+            protocol: BackendProtocol::Http1,
+            scheme: BackendScheme::Http,
+        };
+        let tcp_proxy = TcpProxy::new(self.proxy_state.clone());
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}")
+            .parse()
+            .expect("parse listen addr");
+        tcp_proxy
+            .start(addr, backend, format!("test-tunnel-{listen_port}"))
+            .await
+            .expect("start tcp tunnel");
     }
 
     /// Convenience: assert that at least `at_least` clients are registered via /api/clients.
@@ -213,7 +275,11 @@ impl TestHarness {
                     *last_status.lock().unwrap() = Some(status);
                     return None;
                 }
-                let n = body.as_array().map(|a| a.len()).unwrap_or(0);
+                let n = body
+                    .get("clients")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 if n >= at_least {
                     Some(())
                 } else {
