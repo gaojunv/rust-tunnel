@@ -6,6 +6,12 @@ import { Switch } from '@/components/ui/switch';
 import { useTrojanConfig, useUpdateTrojanConfig, useAcmeStatus } from '@/api/hooks';
 import { Info, ShieldCheck } from 'lucide-react';
 
+const CERT_SOURCE_LABELS: Record<string, string> = {
+  acme_exact: 'ACME certificate (exact match)',
+  acme_wildcard: 'ACME wildcard certificate',
+  self_signed: 'Self-signed certificate (fallback)',
+};
+
 export default function TrojanConfigCard() {
   const { data: tjConfig, isLoading } = useTrojanConfig();
   const { data: acmeStatus } = useAcmeStatus();
@@ -15,12 +21,14 @@ export default function TrojanConfigCard() {
   const [tjPort, setTjPort] = useState('443');
   const [tjPassword, setTjPassword] = useState('');
   const [tjFallback, setTjFallback] = useState('127.0.0.1:80');
+  const [tjDomain, setTjDomain] = useState('');
 
   useEffect(() => {
     if (tjConfig) {
       setTjEnabled(tjConfig.enabled ?? false);
       setTjPort(tjConfig.port?.toString() ?? '443');
       setTjFallback(tjConfig.fallback ?? '127.0.0.1:80');
+      setTjDomain(tjConfig.domain ?? '');
       // Password not returned from API for security
     }
   }, [tjConfig]);
@@ -34,12 +42,17 @@ export default function TrojanConfigCard() {
       port: parseInt(tjPort, 10),
       ...(tjPassword && { password: tjPassword }),
       fallback: tjFallback || undefined,
+      domain: tjDomain.trim(),
     });
   };
 
   if (isLoading) {
     return <div className="py-8 text-center text-muted-foreground">Loading...</div>;
   }
+
+  const certSourceLabel = tjConfig?.cert_source
+    ? CERT_SOURCE_LABELS[tjConfig.cert_source] ?? tjConfig.cert_source
+    : null;
 
   return (
     <Card>
@@ -58,7 +71,7 @@ export default function TrojanConfigCard() {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <label className="text-sm font-medium">Port</label>
             <Input
@@ -67,6 +80,18 @@ export default function TrojanConfigCard() {
               onChange={(e) => setTjPort(e.target.value)}
               placeholder="443"
             />
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Domain</label>
+            <Input
+              value={tjDomain}
+              onChange={(e) => setTjDomain(e.target.value)}
+              placeholder="trojan.example.com (optional)"
+            />
+            <p className="text-xs text-muted-foreground">
+              Used for ACME certificate lookup and SNI-based port sharing. Leave empty to use a
+              self-signed certificate.
+            </p>
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Password</label>
@@ -98,22 +123,37 @@ export default function TrojanConfigCard() {
           <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
           <div className="text-sm text-muted-foreground">
             <p className="mb-1 font-medium text-foreground">TLS Certificate</p>
+            {certSourceLabel && (
+              <p className="mb-1">
+                Current: <span className="font-medium text-foreground">{certSourceLabel}</span>
+                {tjConfig?.cert_source === 'self_signed' && tjConfig.domain && (
+                  <span className="text-amber-500">
+                    {' '}
+                    — no ACME certificate matches this domain. Issue one via ACME to use a trusted
+                    certificate.
+                  </span>
+                )}
+              </p>
+            )}
+            {tjConfig?.shared && (
+              <p className="mb-1 text-emerald-500">
+                Sharing the reverse proxy port — TLS connections are dispatched by SNI to Trojan or
+                HTTP routes.
+              </p>
+            )}
             <p>
-              Trojan requires TLS. The certificate is managed via{' '}
+              Trojan requires TLS. When a domain is set, the matching{' '}
               <a
                 href="/acme"
                 className="font-medium text-primary underline underline-offset-4 hover:text-primary/80"
               >
                 ACME
-              </a>
-              .{' '}
-              {acmeStatus?.enabled ? (
-                <span className="text-emerald-500">
-                  ACME is enabled. Trojan will use the certificate for the configured domain.
-                </span>
-              ) : (
+              </a>{' '}
+              certificate (including one-level wildcard) is used; otherwise a self-signed
+              certificate is generated.{' '}
+              {!acmeStatus?.enabled && (
                 <span className="text-amber-500">
-                  ⚠ ACME is not enabled. Enable ACME first to use Trojan.
+                  ACME is not enabled — Trojan will fall back to a self-signed certificate.
                 </span>
               )}
             </p>

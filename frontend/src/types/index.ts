@@ -102,6 +102,9 @@ export interface TrojanConfig {
   enabled: boolean;
   port?: number;
   fallback?: string;
+  domain?: string;
+  cert_source?: 'acme_exact' | 'acme_wildcard' | 'self_signed';
+  shared?: boolean;
 }
 
 // Trojan statistics
