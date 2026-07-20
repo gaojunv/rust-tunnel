@@ -3214,17 +3214,28 @@ pub async fn run_api_server(
             get(server_auth::get_auth).put(server_auth::put_auth),
         )
         .route("/api/server-auth/rotate", post(server_auth::rotate_auth))
+        .route("/api/traffic", get(get_traffic))
+        .route("/api/traffic/:port", get(get_port_traffic))
+        .route("/api/metrics", get(get_metrics))
         // Quality monitoring endpoints
+        .route("/api/quality/all", get(get_all_quality))
+        .route("/api/quality/:port", get(get_port_quality))
+        .route("/api/quality/:port/history", get(get_quality_history))
+        .route("/api/quality/warnings", get(get_quality_warnings))
         // Shadowsocks management endpoints
         .route(
             "/api/shadowsocks",
             get(get_shadowsocks_config).post(update_shadowsocks_config),
         )
+        .route("/api/shadowsocks/stats", get(get_shadowsocks_stats))
+        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality))
         // Trojan management endpoints
         .route(
             "/api/trojan",
             get(get_trojan_config).post(update_trojan_config),
         )
+        .route("/api/trojan/stats", get(get_trojan_stats))
+        .route("/api/trojan/quality", get(get_trojan_quality))
         // Mesh network endpoints
         .route("/api/mesh", get(list_meshes))
         .route("/api/mesh/:id", get(get_mesh))
@@ -3247,6 +3258,7 @@ pub async fn run_api_server(
             "/api/proxy/rules/:id",
             put(update_proxy_rule).delete(delete_proxy_rule),
         )
+        .route("/api/proxy/stats", get(get_proxy_stats))
         // ACME certificate management endpoints
         .route("/api/acme/status", get(get_acme_status))
         .route(

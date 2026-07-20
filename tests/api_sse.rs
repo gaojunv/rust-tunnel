@@ -116,6 +116,36 @@ async fn sse_streams_log_entries() {
     result.expect("test timed out");
 }
 
+/// Regression: `/api/traffic` must be a registered route returning
+/// `Vec<PortTraffic>` as a JSON array. The frontend dashboard chart calls
+/// `.map()` on this response; when the route is missing the request falls
+/// through to the SPA static fallback (or 404s), yielding a non-array body
+/// and crashing the page with "e.map is not a function".
+#[tokio::test(flavor = "multi_thread")]
+async fn traffic_endpoint_returns_json_array() {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let harness = TestHarness::spawn(HarnessOpts {
+            tls: false,
+            exposed_port_count: 1,
+            ..HarnessOpts::default()
+        })
+        .await;
+
+        let api = harness.api_client();
+        let (status, body) = api.get_json("/api/traffic").await;
+        assert!(
+            status.is_success(),
+            "/api/traffic should return 2xx, got {status}"
+        );
+        assert!(
+            body.is_array(),
+            "/api/traffic must return a JSON array (Vec<PortTraffic>), got: {body}"
+        );
+    })
+    .await;
+    result.expect("test timed out");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "traffic store not yet wired for v2 ClientTunnelStream/TcpProxy path"]
 async fn traffic_bucket_appears_after_transfer() {
