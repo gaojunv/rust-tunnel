@@ -25,7 +25,7 @@ rust-tunnel 是一个基于 Rust 的**内网穿透工具**，采用客户端-服
 - 异步运行时 Tokio（full features）；错误处理：二进制用 `anyhow`，库用 `thiserror`（`TunnelError`）
 - 控制消息：`bincode` 序列化 + 长度前缀帧（最大 1MB）；API：`serde_json`
 - Web 框架 Axum 0.7 + tower-http（CORS、fs）；SSE 日志流
-- TLS：rustls 0.22 + tokio-rustls + rcgen（自动生成 ECDSA P-256 自签名证书）
+- TLS：rustls 0.22 + tokio-rustls + rcgen（自动生成 Ed25519 自签名证书）
 - 数据库：sqlx 0.7 + SQLite（WAL 模式）
 - 配置：clap 4（CLI）+ figment（TOML + 环境变量）
 - 其他：shadowsocks crate、hickory-proto（DNS）、instant-acme（ACME）、jsonwebtoken
@@ -107,10 +107,11 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `dynamic_config.rs` — DB 支持的运行时动态配置（SS/Trojan/反代/DNS）
 - `quality.rs` — RTT/丢包/吞吐量追踪、评分、告警（内存保留 60 分钟，DB 保留 24 小时）
 - `logs.rs` — 自定义 tracing Layer，日志写入内存 + SQLite，API 分页/过滤
-- `shadowsocks.rs` / `trojan.rs` — 内置代理服务器（配套测试在 `shadowsocks_test.rs`、`trojan_test.rs`）
+- `shadowsocks.rs` / `trojan.rs` — 内置代理服务器（Trojan 的 listener 在 `listener.rs`，连接处理已提取为 `handle_trojan_connection`；配套测试在 `shadowsocks_test.rs`、`trojan_test.rs`）
+- `trojan_runtime.rs` — Trojan 统一启动/模式管理（ACME 证书解析、共享/独立模式判定、证书热更新）
 - `mesh/` — Mesh 组网（`router.rs` 路由表、`relay.rs` 中继、`stun.rs`）
 - `dns/` — 嵌入式权威 DNS 服务器（UDP，`registry.rs` 记录注册表、`zone.rs` 区域）
-- `reverse_proxy/` — 反向代理（`handler.rs`、`router.rs`、`sni_resolver.rs`、`tcp_proxy.rs`、`upstream.rs`、`shared_listener.rs`）
+- `reverse_proxy/` — 反向代理（`handler.rs`、`router.rs`、`sni_resolver.rs`、`sni_sniff.rs`（TLS ClientHello SNI 嗅探）、`tcp_proxy.rs`、`upstream.rs`、`shared_listener.rs`）
 - `acme/` — ACME 证书管理（`manager.rs`、`client.rs`、`challenge.rs`、`provider.rs`、`storage.rs`、`dns/`）
 
 ### `src/client/` — 客户端实现
@@ -183,7 +184,7 @@ cargo test --test tunnel_basic        # 指定文件
 
 ## 安全注意事项
 
-- 控制通道 **TLS 默认开启**；服务器无证书时自动生成自签名证书（ECDSA P-256，1 年有效期）存于 `./data/tls/`。客户端默认 TOFU（`tls_insecure = true`）自动接受自签名证书，生产环境应使用受信证书并关闭 `tls_insecure`。
+- 控制通道 **TLS 默认开启**；服务器无证书时自动生成自签名证书（Ed25519，1 年有效期）存于 `./data/tls/`。客户端默认 TOFU（`tls_insecure = true`）自动接受自签名证书，生产环境应使用受信证书并关闭 `tls_insecure`。
 - `admin_password`、`jwt_secret`、`client_auth_token`、SS/Trojan 密码均为敏感配置。**不要把真实凭据提交进仓库**（`server.toml`、`client.toml`、`.env`、`data/` 已 gitignore；提交配置只改 `config/*.example.toml`）。
 - 未设置 `jwt_secret` 时服务器会自动生成，重启后旧 token 全部失效——这是预期行为。
 - 密钥派生、认证等加密逻辑（SS 的 EVP_BytesToKey、Trojan 的 SHA-224）修改需格外谨慎，有独立测试文件覆盖。

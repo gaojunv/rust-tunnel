@@ -59,7 +59,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 **`src/common/`** — 共享协议和基础设施工具
 - `protocol.rs` — `ControlMessage` 枚举，长度前缀 bincode 序列化（最大 1MB）
 - `error.rs` — `TunnelError`（10 个变体）和 `TunnelResult`
-- `tls.rs` — 自签名证书生成（ECDSA P-256）、TOFU/安全模式客户端配置
+- `tls.rs` — 自签名证书生成（Ed25519）、TOFU/安全模式客户端配置
 - `logging.rs` — 日志初始化
 
 **`src/server/`** — 服务器实现
