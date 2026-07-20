@@ -1,4 +1,5 @@
 use super::{Backend, ReverseProxyState};
+use crate::server::stats::EntityType;
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -91,6 +92,10 @@ impl TcpProxy {
 
                         tokio::spawn(async move {
                             state.increment_connections(&rule_id).await;
+                            // 统一统计：proxy 桶活跃连接 +1
+                            state
+                                .stats_collector
+                                .incr_conns(EntityType::Proxy, &rule_id);
 
                             if let Err(e) = handle_tcp_connection(
                                 stream,
@@ -98,6 +103,7 @@ impl TcpProxy {
                                 state.clone(),
                                 backend,
                                 tls_acceptor,
+                                rule_id.clone(),
                             )
                             .await
                             {
@@ -105,6 +111,10 @@ impl TcpProxy {
                             }
 
                             state.decrement_connections(&rule_id).await;
+                            // 统一统计：proxy 桶活跃连接 -1（覆盖正常与错误退出）
+                            state
+                                .stats_collector
+                                .decr_conns(EntityType::Proxy, &rule_id);
                         });
                     }
                     Err(e) => {
@@ -129,12 +139,14 @@ async fn handle_tcp_connection(
     state: ReverseProxyState,
     backend: Backend,
     tls_acceptor: Option<TlsAcceptor>,
+    rule_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dial backend via appropriate connector
     let connector = state.connector_for(&backend).await?;
     let mut backend_stream = connector.connect(&backend).await?;
 
-    if let Some(acceptor) = tls_acceptor {
+    // (client→backend, backend→client) 双向字节数，连接结束时统一入账
+    let (bytes_c2b, bytes_b2c) = if let Some(acceptor) = tls_acceptor {
         // TLS termination: accept TLS, then bidirectional copy with backend
         let mut tls_stream = match acceptor.accept(client_stream).await {
             Ok(s) => s,
@@ -152,6 +164,7 @@ async fn handle_tcp_connection(
             "TCP TLS connection closed from {}: {} bytes client->backend, {} bytes backend->client",
             peer_addr, bytes_c2b, bytes_b2c
         );
+        (bytes_c2b, bytes_b2c)
     } else {
         // Plain TCP: direct bidirectional copy
         let mut client_stream = client_stream;
@@ -163,7 +176,13 @@ async fn handle_tcp_connection(
             "TCP connection closed from {}: {} bytes client->backend, {} bytes backend->client",
             peer_addr, bytes_c2b, bytes_b2c
         );
-    }
+        (bytes_c2b, bytes_b2c)
+    };
+
+    // 统一统计：双向字节一次性入账（bytes_in = 客户端→后端，bytes_out = 后端→客户端）
+    state
+        .stats_collector
+        .record_bytes(EntityType::Proxy, &rule_id, bytes_c2b, bytes_b2c);
 
     // Ensure backend stream is properly closed
     let _ = backend_stream.shutdown().await;
@@ -203,6 +222,16 @@ impl UdpProxy {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, peer_addr)) => {
                         state.increment_connections(&rule_id_clone).await;
+                        // 统一统计：每个数据报视为一次"连接"，请求字节立即入账
+                        state
+                            .stats_collector
+                            .incr_conns(EntityType::Proxy, &rule_id_clone);
+                        state.stats_collector.record_bytes(
+                            EntityType::Proxy,
+                            &rule_id_clone,
+                            len as u64,
+                            0,
+                        );
 
                         // Forward to backend
                         if let Ok(backend_socket) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
@@ -218,6 +247,13 @@ impl UdpProxy {
                                         result = backend_socket.recv_from(&mut response_buf) => {
                                             if let Ok((resp_len, _)) = result {
                                                 let _ = socket.send_to(&response_buf[..resp_len], peer_addr).await;
+                                                // 统一统计：后端响应字节入账
+                                                state.stats_collector.record_bytes(
+                                                    EntityType::Proxy,
+                                                    &rule_id_clone,
+                                                    0,
+                                                    resp_len as u64,
+                                                );
                                             }
                                         }
                                         _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
@@ -229,6 +265,9 @@ impl UdpProxy {
                         }
 
                         state.decrement_connections(&rule_id_clone).await;
+                        state
+                            .stats_collector
+                            .decr_conns(EntityType::Proxy, &rule_id_clone);
                     }
                     Err(e) => {
                         error!("UDP receive error: {}", e);

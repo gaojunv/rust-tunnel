@@ -444,6 +444,13 @@ impl ReverseProxyState {
         self.cert_manager = Some(manager);
     }
 
+    /// 挂上统一统计采集器（与 `ServerState.stats_collector` 共享同一实例）。
+    /// 默认构造时是独立的 `StatsCollector::new(None)` 占位，不注入则埋点数据
+    /// 不会出现在 `/api/stats/*` 中。
+    pub fn set_stats_collector(&mut self, sc: crate::server::stats::StatsCollector) {
+        self.stats_collector = sc;
+    }
+
     /// Get the concrete certificate manager.
     #[must_use]
     pub fn cert_manager(&self) -> Option<&Arc<crate::server::acme::CertificateManager>> {

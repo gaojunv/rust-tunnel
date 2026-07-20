@@ -300,7 +300,7 @@ impl Default for ServerState {
 impl ServerState {
     /// Create a new server state without database (for backwards compatibility)
     pub fn new() -> Self {
-        Self {
+        let mut state = Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -340,7 +340,12 @@ impl ServerState {
             tls_cert_path: "./data/tls/cert.pem".to_string(),
             tls_key_path: "./data/tls/key.pem".to_string(),
             trojan_runtime: Arc::new(RwLock::new(TrojanRuntimeStatus::default())),
-        }
+        };
+        // 反代状态挂上同一个统计采集器：proxy 埋点才能汇总到 /api/stats/*
+        state
+            .proxy_state
+            .set_stats_collector(state.stats_collector.clone());
+        state
     }
 
     /// Create a new server state with database
@@ -390,6 +395,10 @@ impl ServerState {
         if let Some(registry) = state.client_registry.as_mut() {
             registry.set_stats_collector(state.stats_collector.clone());
         }
+        // 反代状态挂上同一个统计采集器：proxy 埋点才能汇总到 /api/stats/*
+        state
+            .proxy_state
+            .set_stats_collector(state.stats_collector.clone());
         state
     }
 

@@ -17,6 +17,7 @@ use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
 use super::{
     record_traffic, Backend, BackendKind, BackendProtocol, ReverseProxyState, TrafficPending,
 };
+use crate::server::stats::{EntityType, StatsCollector};
 
 use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
@@ -156,9 +157,12 @@ pub fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
 /// rule's pending traffic (`is_in = true` counts bytes_in — client to
 /// backend; otherwise bytes_out — backend to client). Recording is live: the
 /// periodic flush task picks the deltas up without waiting for the body to end.
+///
+/// 同一份字节同时写入统一统计采集器（StatsCollector，proxy 桶）。
 fn count_body<B>(
     body: B,
     pending: TrafficPending,
+    stats: StatsCollector,
     rule_id: String,
     is_in: bool,
 ) -> impl HttpBody<Data = Bytes, Error = B::Error> + Send
@@ -170,8 +174,10 @@ where
             let n = data.len() as u64;
             if is_in {
                 record_traffic(&pending, &rule_id, n, 0, 0);
+                stats.record_bytes(EntityType::Proxy, &rule_id, n, 0);
             } else {
                 record_traffic(&pending, &rule_id, 0, n, 0);
+                stats.record_bytes(EntityType::Proxy, &rule_id, 0, n);
             }
         }
         frame
@@ -242,6 +248,7 @@ fn build_upstream_request(
 fn build_downstream_response(
     resp: hyper::Response<hyper::body::Incoming>,
     pending: TrafficPending,
+    stats: StatsCollector,
     rule_id: String,
 ) -> Response {
     let (mut parts, incoming) = resp.into_parts();
@@ -250,7 +257,7 @@ fn build_downstream_response(
     // negotiated upgrade tokens and treats it as a protocol error.
     let preserve_upgrade = parts.status == StatusCode::SWITCHING_PROTOCOLS;
     parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
-    let axum_body = Body::new(count_body(incoming, pending, rule_id, false));
+    let axum_body = Body::new(count_body(incoming, pending, stats, rule_id, false));
     Response::from_parts(parts, axum_body)
 }
 
@@ -288,6 +295,7 @@ pub async fn handle_proxy_request_unified(
 ) -> Response {
     let connection_counts = proxy_state.connection_counts.clone();
     let traffic_pending = proxy_state.traffic_pending.clone();
+    let stats = proxy_state.stats_collector.clone();
     // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
     // h1 requests may put it in either the URI (absolute-form) or a Host header.
     let host = req
@@ -323,6 +331,8 @@ pub async fn handle_proxy_request_unified(
     }
     // Count this request as one connection in the traffic accumulator
     record_traffic(&traffic_pending, &rule_id, 0, 0, 1);
+    // 统一统计：proxy 桶活跃连接 +1
+    stats.incr_conns(EntityType::Proxy, &rule_id);
 
     // Decrement on scope exit (deferred via clone)
     let rule_id_for_decrement = rule_id.clone();
@@ -339,6 +349,7 @@ pub async fn handle_proxy_request_unified(
                     *c -= 1;
                 }
             }
+            stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("HTTP/2 to client backend not yet supported"))
@@ -369,6 +380,7 @@ pub async fn handle_proxy_request_unified(
         let counted = Body::new(count_body(
             body,
             traffic_pending.clone(),
+            stats.clone(),
             rule_id.clone(),
             true,
         ));
@@ -385,6 +397,7 @@ pub async fn handle_proxy_request_unified(
                     *c -= 1;
                 }
             }
+            stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             return error_response(&e);
         }
     };
@@ -403,6 +416,7 @@ pub async fn handle_proxy_request_unified(
                     let rid = rule_id_for_decrement.clone();
                     let cc = counts_for_decrement.clone();
                     let tp = traffic_pending.clone();
+                    let sc = stats.clone();
                     tokio::spawn(async move {
                         let (client_up, server_up) =
                             match tokio::try_join!(client_upgrade, upstream_upgrade) {
@@ -416,6 +430,7 @@ pub async fn handle_proxy_request_unified(
                                             *c -= 1;
                                         }
                                     }
+                                    sc.decr_conns(EntityType::Proxy, &rid);
                                     return;
                                 }
                             };
@@ -428,6 +443,7 @@ pub async fn handle_proxy_request_unified(
                             // (client→backend, backend→client) = (bytes_in, bytes_out)
                             Ok((to_backend, to_client)) => {
                                 record_traffic(&tp, &rid, to_backend, to_client, 0);
+                                sc.record_bytes(EntityType::Proxy, &rid, to_backend, to_client);
                             }
                             Err(e) => {
                                 tracing::debug!("ws bidirectional copy ended: {e}");
@@ -440,6 +456,7 @@ pub async fn handle_proxy_request_unified(
                                 *c -= 1;
                             }
                         }
+                        sc.decr_conns(EntityType::Proxy, &rid);
                     });
                 }
             }
@@ -451,8 +468,14 @@ pub async fn handle_proxy_request_unified(
                         *c -= 1;
                     }
                 }
+                stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             }
-            build_downstream_response(resp, traffic_pending.clone(), rule_id.clone())
+            build_downstream_response(
+                resp,
+                traffic_pending.clone(),
+                stats.clone(),
+                rule_id.clone(),
+            )
         }
         Err(e) => {
             // Decrement on upstream error
@@ -462,6 +485,7 @@ pub async fn handle_proxy_request_unified(
                     *c -= 1;
                 }
             }
+            stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             error!(
                 error = %error_chain(&e),
                 backend = %backend.addr,
@@ -499,6 +523,9 @@ async fn handle_client_backend(
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
 
+    // 统一统计采集器（与 ReverseProxyState 共享）
+    let stats = state.stats_collector.clone();
+
     // Capture the downstream OnUpgrade future BEFORE `req` is consumed —
     // hyper's upgrade handle is one-shot per request. The handle is stored
     // in the request extensions, so it survives `into_parts` below.
@@ -514,6 +541,7 @@ async fn handle_client_backend(
     let counted = Body::new(count_body(
         body,
         traffic_pending.clone(),
+        stats.clone(),
         rule_id.clone(),
         true,
     ));
@@ -524,6 +552,7 @@ async fn handle_client_backend(
         Ok(c) => c,
         Err(e) => {
             state.decrement_connections(&rule_id).await;
+            stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("connector unavailable: {e}")))
@@ -534,6 +563,7 @@ async fn handle_client_backend(
         Ok(s) => s,
         Err(e) => {
             state.decrement_connections(&rule_id).await;
+            stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("client backend dial failed: {e}")))
@@ -552,6 +582,7 @@ async fn handle_client_backend(
         Ok(pair) => pair,
         Err(e) => {
             state.decrement_connections(&rule_id).await;
+            stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("http1 handshake failed: {e}")))
@@ -580,6 +611,7 @@ async fn handle_client_backend(
         Ok(r) => r,
         Err(e) => {
             state.decrement_connections(&rule_id).await;
+            stats.decr_conns(EntityType::Proxy, &rule_id);
             return error_response(&e);
         }
     };
@@ -607,6 +639,7 @@ async fn handle_client_backend(
                 let rid = rule_id.clone();
                 let cc = state.connection_counts.clone();
                 let tp = traffic_pending.clone();
+                let sc = stats.clone();
                 tokio::spawn(async move {
                     let (client_up, server_up) =
                         match tokio::try_join!(client_upgrade, upstream_upgrade) {
@@ -619,6 +652,7 @@ async fn handle_client_backend(
                                         *c -= 1;
                                     }
                                 }
+                                sc.decr_conns(EntityType::Proxy, &rid);
                                 return;
                             }
                         };
@@ -631,6 +665,7 @@ async fn handle_client_backend(
                         // (client→backend, backend→client) = (bytes_in, bytes_out)
                         Ok((to_backend, to_client)) => {
                             record_traffic(&tp, &rid, to_backend, to_client, 0);
+                            sc.record_bytes(EntityType::Proxy, &rid, to_backend, to_client);
                         }
                         Err(e) => {
                             tracing::debug!("ws bidirectional copy ended: {e}");
@@ -642,15 +677,18 @@ async fn handle_client_backend(
                             *c -= 1;
                         }
                     }
+                    sc.decr_conns(EntityType::Proxy, &rid);
                 });
             }
             if !is_ws {
                 state.decrement_connections(&rule_id).await;
+                stats.decr_conns(EntityType::Proxy, &rule_id);
             }
-            build_downstream_response(resp, traffic_pending, rule_id)
+            build_downstream_response(resp, traffic_pending, stats.clone(), rule_id)
         }
         Err(e) => {
             state.decrement_connections(&rule_id).await;
+            stats.decr_conns(EntityType::Proxy, &rule_id);
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from(format!("upstream request failed: {e}")))
