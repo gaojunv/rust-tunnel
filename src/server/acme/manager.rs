@@ -402,23 +402,28 @@ impl CertificateManager {
     ///
     /// Returns an error if the certificate cannot be loaded from disk or parsed.
     pub async fn load_issued_certificate(&self, domain: &str) -> Result<CertEntry> {
+        // 磁盘读取沿用传入域名（ACME 客户端按原样写盘）；
+        // 缓存 key 与事件 domain 小写归一，与 add_certificate /
+        // find_covering_cert / resolve_certified_key 的不变量一致，
+        // 否则大小写混合域名签发后写入成功却永远查不到。
         let cached = self
             .build_cached_cert(domain)
             .context("Failed to load issued certificate from storage")?;
         let certified_key = super::provider::build_certified_key(&cached.entry)
             .context("Failed to build CertifiedKey for issued cert")?;
         let entry = cached.entry.clone();
+        let domain = domain.to_ascii_lowercase();
         {
             let mut cache = self.cache.write().await;
-            cache.insert(domain.to_string(), cached);
+            cache.insert(domain.clone(), cached);
             let old_snap = self.certified_key_cache.load();
             let mut new_map = (**old_snap).clone();
-            new_map.insert(domain.to_string(), certified_key);
+            new_map.insert(domain.clone(), certified_key);
             self.certified_key_cache.store(Arc::new(new_map));
         }
 
         self.broadcast_event(CertEvent::Issued {
-            domain: domain.to_string(),
+            domain: domain.clone(),
         });
 
         info!("Loaded issued certificate for domain: {}", domain);
@@ -847,6 +852,40 @@ mod tests {
         match rx.try_recv() {
             Ok(CertEvent::Issued { domain }) => {
                 assert_eq!(domain, "new.example.com")
+            }
+            _ => panic!("expected Issued event"),
+        }
+    }
+
+    /// 大小写混合域名签发后：缓存 key 小写归一，find_covering_cert /
+    /// resolve_certified_key（查找一律 lowercase）能命中，事件 domain 同为小写。
+    #[tokio::test]
+    async fn load_issued_certificate_normalizes_mixed_case_domain() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
+        let mut rx = mgr.subscribe();
+
+        // ACME 客户端按传入域名原样写盘
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+        let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = CertificateParams::new(vec!["Mixed.Example.com".to_string()]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        mgr.storage
+            .save_certificate("Mixed.Example.com", &cert.pem(), &kp.serialize_pem(), None)
+            .unwrap();
+
+        mgr.load_issued_certificate("Mixed.Example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.find_covering_cert("mixed.example.com").await,
+            Some(crate::server::acme::provider::CertCoverage::Exact)
+        );
+        assert!(mgr.resolve_certified_key("mixed.example.com").is_some());
+        match rx.try_recv() {
+            Ok(CertEvent::Issued { domain }) => {
+                assert_eq!(domain, "mixed.example.com")
             }
             _ => panic!("expected Issued event"),
         }

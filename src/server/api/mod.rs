@@ -651,6 +651,69 @@ mod tests {
         // Verify ACME client is initialized
         assert!(server_state.acme_client.read().await.is_some());
     }
+
+    fn trojan_test_api_state(
+        trojan: Option<crate::server::dynamic_config::TrojanDynamicConfig>,
+    ) -> ApiState {
+        let server_state = ServerState::new();
+        // 直接写内存中的 dynamic_config（与 set_dynamic_config 等效，免去构造全量结构）
+        if let Ok(mut dc) = server_state.dynamic_config.try_write() {
+            dc.trojan = trojan;
+        }
+        ApiState {
+            server_state,
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        }
+    }
+
+    /// 共享模式（与反代复用端口，不 register_trojan）下 stats 回退
+    /// dynamic_config 端口读取记账数据；enabled/port 反映实际运行状态。
+    #[tokio::test]
+    async fn test_trojan_stats_shared_mode_fallback() {
+        let port = 1443;
+        let state =
+            trojan_test_api_state(Some(crate::server::dynamic_config::TrojanDynamicConfig {
+                enabled: true,
+                port,
+                password: "p".to_string(),
+                fallback: "127.0.0.1:80".to_string(),
+                domain: "t.example.com".to_string(),
+            }));
+        // 共享模式：端口未注册，但流量与连接数按 trojan_port 记账
+        state
+            .server_state
+            .traffic_store
+            .record_bytes_in(port, 100)
+            .await;
+        state
+            .server_state
+            .traffic_store
+            .record_bytes_out(port, 40)
+            .await;
+        state.server_state.increment_trojan_connections(port).await;
+        state.server_state.trojan_runtime.write().await.cert_source =
+            Some("self_signed".to_string());
+
+        let Json(stats) = get_trojan_stats(State(state)).await;
+        assert!(stats.enabled);
+        assert_eq!(stats.port, Some(port));
+        assert_eq!(stats.total_bytes_in, 100);
+        assert_eq!(stats.total_bytes_out, 40);
+        assert_eq!(stats.active_connections, 1);
+    }
+
+    /// trojan 未配置/未运行时 stats 返回 disabled 且为零值。
+    #[tokio::test]
+    async fn test_trojan_stats_disabled_is_zero() {
+        let state = trojan_test_api_state(None);
+        let Json(stats) = get_trojan_stats(State(state)).await;
+        assert!(!stats.enabled);
+        assert_eq!(stats.port, None);
+        assert_eq!(stats.total_bytes_in, 0);
+        assert_eq!(stats.total_bytes_out, 0);
+        assert_eq!(stats.active_connections, 0);
+    }
 }
 
 /// Log entry response
@@ -1235,9 +1298,33 @@ async fn get_trojan_config(State(state): State<ApiState>) -> Json<TrojanConfig> 
     })
 }
 
+/// Trojan 记账端口：优先取独立监听注册（`register_trojan`）的端口；
+/// 共享模式（与反代复用端口）下不注册端口，回退到 dynamic_config 中
+/// enabled 的 trojan 端口——流量与连接数仍按该端口记账（见 proxy.rs）。
+async fn trojan_accounting_ports(server_state: &ServerState) -> Vec<u16> {
+    let ports = server_state.get_trojan_ports().await;
+    if !ports.is_empty() {
+        return ports;
+    }
+    let dc = server_state.dynamic_config.read().await;
+    match dc.trojan.as_ref() {
+        Some(t) if t.enabled => vec![t.port],
+        _ => Vec::new(),
+    }
+}
+
 // Get Trojan traffic statistics
 async fn get_trojan_stats(State(state): State<ApiState>) -> Json<TrojanStats> {
-    let trojan_ports = state.server_state.get_trojan_ports().await;
+    let trojan_ports = trojan_accounting_ports(&state.server_state).await;
+    // 运行状态以 trojan_runtime 为准：apply_trojan_config 运行时写入
+    // cert_source（共享/独立两种模式都会写），停止时清空
+    let running = state
+        .server_state
+        .trojan_runtime
+        .read()
+        .await
+        .cert_source
+        .is_some();
 
     let mut total_bytes_in = 0;
     let mut total_bytes_out = 0;
@@ -1257,8 +1344,12 @@ async fn get_trojan_stats(State(state): State<ApiState>) -> Json<TrojanStats> {
     }
 
     Json(TrojanStats {
-        enabled: !trojan_ports.is_empty(),
-        port: trojan_ports.first().copied(),
+        enabled: running,
+        port: if running {
+            trojan_ports.first().copied()
+        } else {
+            None
+        },
         total_bytes_in,
         total_bytes_out,
         active_connections,
@@ -1267,7 +1358,7 @@ async fn get_trojan_stats(State(state): State<ApiState>) -> Json<TrojanStats> {
 
 // Get Trojan quality data
 async fn get_trojan_quality(State(state): State<ApiState>) -> Json<Vec<TrojanQuality>> {
-    let trojan_ports = state.server_state.get_trojan_ports().await;
+    let trojan_ports = trojan_accounting_ports(&state.server_state).await;
     let mut result = Vec::with_capacity(trojan_ports.len());
 
     for port in trojan_ports {
