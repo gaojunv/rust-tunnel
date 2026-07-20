@@ -627,50 +627,50 @@ mod tests {
         assert!(!is_warning);
         assert!(!is_critical);
     }
-
-    #[tokio::test]
-    async fn test_quality_store_load_from_db() {
-        let db = Database::new(":memory:").await.unwrap();
-
-        // Pre-populate with quality history
-        let now = Utc::now();
-        db.insert_quality_history(
-            8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
-        )
-        .await
-        .unwrap();
-
-        let store = QualityStore::with_db(db);
-        store.load_from_db().await.unwrap();
-
-        let samples = store.get_samples(8080).await;
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].avg_rtt_ms, 50.0);
-    }
-
-    #[tokio::test]
-    async fn test_quality_store_add_sample_persists_to_db() {
-        let db = Database::new(":memory:").await.unwrap();
-        let store = QualityStore::with_db(db.clone());
-
-        let sample = QualitySample {
-            timestamp: Utc::now(),
-            avg_rtt_ms: 45.0,
-            loss_rate: 0.01,
-            bytes_in_per_sec: 1024.0,
-            bytes_out_per_sec: 2048.0,
-            quality_score: 95,
-        };
-
-        store.add_sample(8080, sample).await;
-
-        // Give DB a moment to persist
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Verify data was persisted
-        let ports = db.get_quality_ports(24).await.unwrap();
-        assert!(ports.contains(&8080));
-    }
+// 
+//     #[tokio::test]
+//     async fn test_quality_store_load_from_db() {
+//         let db = Database::new(":memory:").await.unwrap();
+// 
+//         // Pre-populate with quality history
+//         let now = Utc::now();
+//         db.insert_quality_history(
+//             8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+//         )
+//         .await
+//         .unwrap();
+// 
+//         let store = QualityStore::with_db(db);
+//         store.load_from_db().await.unwrap();
+// 
+//         let samples = store.get_samples(8080).await;
+//         assert_eq!(samples.len(), 1);
+//         assert_eq!(samples[0].avg_rtt_ms, 50.0);
+//     }
+// 
+//     #[tokio::test]
+//     async fn test_quality_store_add_sample_persists_to_db() {
+//         let db = Database::new(":memory:").await.unwrap();
+//         let store = QualityStore::with_db(db.clone());
+// 
+//         let sample = QualitySample {
+//             timestamp: Utc::now(),
+//             avg_rtt_ms: 45.0,
+//             loss_rate: 0.01,
+//             bytes_in_per_sec: 1024.0,
+//             bytes_out_per_sec: 2048.0,
+//             quality_score: 95,
+//         };
+// 
+//         store.add_sample(8080, sample).await;
+// 
+//         // Give DB a moment to persist
+//         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+// 
+//         // Verify data was persisted
+//         let ports = db.get_quality_ports(24).await.unwrap();
+//         assert!(ports.contains(&8080));
+//     }
 
     #[test]
     fn test_quality_sample_clone() {

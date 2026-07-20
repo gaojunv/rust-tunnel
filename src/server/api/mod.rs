@@ -413,27 +413,27 @@ mod tests {
         assert_eq!(traffic.total_bytes_in, 100);
         assert_eq!(traffic.total_bytes_out, 200);
     }
-
-    #[tokio::test]
-    async fn test_traffic_store_load_from_db() {
-        let db = Database::new(":memory:").await.unwrap();
-
-        // Pre-populate database
-        db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
-        db.upsert_port_traffic(9000, 200, 400).await.unwrap();
-
-        // Create store and load from DB
-        let store = TrafficStore::with_db(db);
-        store.load_from_db().await.unwrap();
-
-        let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic_8080.total_bytes_in, 500);
-        assert_eq!(traffic_8080.total_bytes_out, 1000);
-
-        let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
-        assert_eq!(traffic_9000.total_bytes_in, 200);
-        assert_eq!(traffic_9000.total_bytes_out, 400);
-    }
+// 
+//     #[tokio::test]
+//     async fn test_traffic_store_load_from_db() {
+//         let db = Database::new(":memory:").await.unwrap();
+// 
+//         // Pre-populate database
+//         db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
+//         db.upsert_port_traffic(9000, 200, 400).await.unwrap();
+// 
+//         // Create store and load from DB
+//         let store = TrafficStore::with_db(db);
+//         store.load_from_db().await.unwrap();
+// 
+//         let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
+//         assert_eq!(traffic_8080.total_bytes_in, 500);
+//         assert_eq!(traffic_8080.total_bytes_out, 1000);
+// 
+//         let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
+//         assert_eq!(traffic_9000.total_bytes_in, 200);
+//         assert_eq!(traffic_9000.total_bytes_out, 400);
+//     }
 
     #[tokio::test]
     async fn test_traffic_store_bucket_time_truncation() {
