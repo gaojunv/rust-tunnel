@@ -91,7 +91,6 @@ impl TcpProxy {
                         let tls_acceptor = tls_acceptor.clone();
 
                         tokio::spawn(async move {
-                            state.increment_connections(&rule_id).await;
                             // 统一统计：proxy 桶活跃连接 +1
                             state
                                 .stats_collector
@@ -110,7 +109,6 @@ impl TcpProxy {
                                 debug!("TCP connection error from {}: {}", peer_addr, e);
                             }
 
-                            state.decrement_connections(&rule_id).await;
                             // 统一统计：proxy 桶活跃连接 -1（覆盖正常与错误退出）
                             state
                                 .stats_collector
@@ -221,7 +219,6 @@ impl UdpProxy {
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, peer_addr)) => {
-                        state.increment_connections(&rule_id_clone).await;
                         // 统一统计：每个数据报视为一次"连接"，请求字节立即入账
                         state
                             .stats_collector
@@ -264,7 +261,6 @@ impl UdpProxy {
                             }
                         }
 
-                        state.decrement_connections(&rule_id_clone).await;
                         state
                             .stats_collector
                             .decr_conns(EntityType::Proxy, &rule_id_clone);

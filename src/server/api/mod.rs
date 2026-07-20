@@ -1,4 +1,3 @@
-use crate::server::quality::{ConnectionQuality, QualitySample};
 use axum::{
     body::Body,
     extract::{Path, Query, State},
@@ -8,13 +7,10 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use chrono::{DateTime, Timelike, Utc};
 #[cfg(feature = "embed-frontend")]
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod clients;
@@ -23,8 +19,7 @@ pub mod server_auth;
 use crate::common::DnsRecord;
 use crate::server::auth::{auth_middleware, create_token, AuthConfig};
 use crate::server::control::ServerState;
-use crate::server::db::Database;
-use crate::server::reverse_proxy::{ProxyRule, ProxyStats};
+use crate::server::reverse_proxy::ProxyRule;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use std::time::Duration;
 
@@ -34,432 +29,11 @@ use std::time::Duration;
 #[folder = "frontend-dist/"]
 struct FrontendAssets;
 
-/// Traffic record for a single time bucket
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrafficBucket {
-    pub timestamp: DateTime<Utc>,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-}
-
-/// Traffic statistics for a port
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortTraffic {
-    pub port: u16,
-    pub total_bytes_in: u64,
-    pub total_bytes_out: u64,
-    pub buckets: VecDeque<TrafficBucket>,
-}
-
-/// Traffic store to track network statistics
-#[derive(Clone)]
-pub struct TrafficStore {
-    inner: Arc<Mutex<std::collections::HashMap<u16, PortTraffic>>>,
-    db: Option<Database>,
-    /// Ports that have been updated since the last DB flush
-    dirty_ports: Arc<std::sync::Mutex<std::collections::HashSet<u16>>>,
-}
-
-impl Default for TrafficStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TrafficStore {
-    /// Create a new traffic store without database (for backwards compatibility)
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            db: None,
-            dirty_ports: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        }
-    }
-
-    /// Create a new traffic store with database persistence
-    pub fn with_db(db: Database) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            db: Some(db),
-            dirty_ports: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        }
-    }
-
-    /// Load traffic data from database
-    pub async fn load_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(db) = &self.db {
-            let mut store = self.inner.lock().await;
-
-            // Load port traffic aggregates
-            let port_records = db.load_port_traffic().await?;
-            let bucket_records = db.load_recent_buckets(24).await?;
-
-            // Build port traffic entries
-            for record in port_records {
-                let port = record.port as u16;
-                let port_traffic = PortTraffic {
-                    port,
-                    total_bytes_in: record.total_bytes_in as u64,
-                    total_bytes_out: record.total_bytes_out as u64,
-                    buckets: VecDeque::new(),
-                };
-                store.insert(port, port_traffic);
-            }
-
-            // Add buckets to respective ports
-            for bucket in bucket_records {
-                let port = bucket.port as u16;
-                if let Some(port_traffic) = store.get_mut(&port) {
-                    port_traffic.buckets.push_back(TrafficBucket {
-                        timestamp: bucket.timestamp,
-                        bytes_in: bucket.bytes_in as u64,
-                        bytes_out: bucket.bytes_out as u64,
-                    });
-                }
-            }
-
-            // Ensure buckets are within 24h limit for each port
-            for port_traffic in store.values_mut() {
-                while port_traffic.buckets.len() > 1440 {
-                    port_traffic.buckets.pop_front();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Record incoming bytes (from user to server)
-    pub async fn record_bytes_in(&self, port: u16, bytes: u64) {
-        {
-            let mut store = self.inner.lock().await;
-            let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
-                port,
-                total_bytes_in: 0,
-                total_bytes_out: 0,
-                buckets: VecDeque::new(),
-            });
-            port_traffic.total_bytes_in += bytes;
-            Self::add_to_bucket(port_traffic, bytes, 0);
-        }
-        // Mark port as dirty for periodic batch flush (no immediate DB write)
-        if let Ok(mut dirty) = self.dirty_ports.lock() {
-            dirty.insert(port);
-        }
-    }
-
-    /// Record outgoing bytes (from server to user)
-    pub async fn record_bytes_out(&self, port: u16, bytes: u64) {
-        {
-            let mut store = self.inner.lock().await;
-            let port_traffic = store.entry(port).or_insert_with(|| PortTraffic {
-                port,
-                total_bytes_in: 0,
-                total_bytes_out: 0,
-                buckets: VecDeque::new(),
-            });
-            port_traffic.total_bytes_out += bytes;
-            Self::add_to_bucket(port_traffic, 0, bytes);
-        }
-        // Mark port as dirty for periodic batch flush
-        if let Ok(mut dirty) = self.dirty_ports.lock() {
-            dirty.insert(port);
-        }
-    }
-
-    /// Flush dirty traffic data to the database.
-    /// Called periodically by the background flush task and on graceful shutdown.
-    pub async fn flush_to_db(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let db = match &self.db {
-            Some(db) => db.clone(),
-            None => return Ok(()),
-        };
-
-        // Atomically take the set of dirty ports
-        let dirty_ports: std::collections::HashSet<u16> = {
-            let mut dirty = self.dirty_ports.lock().unwrap();
-            std::mem::take(&mut *dirty)
-        };
-
-        if dirty_ports.is_empty() {
-            return Ok(());
-        }
-
-        // Snapshot in-memory data for dirty ports (brief lock)
-        let snapshots: Vec<(u16, PortTraffic)> = {
-            let store = self.inner.lock().await;
-            dirty_ports
-                .iter()
-                .filter_map(|&port| store.get(&port).map(|pt| (port, pt.clone())))
-                .collect()
-        };
-
-        // Write snapshots to DB without holding the in-memory lock
-        for (port, port_traffic) in snapshots {
-            if let Err(e) = db
-                .replace_port_traffic(
-                    port,
-                    port_traffic.total_bytes_in,
-                    port_traffic.total_bytes_out,
-                )
-                .await
-            {
-                tracing::warn!("Failed to flush port_traffic for port {}: {}", port, e);
-            }
-            for bucket in &port_traffic.buckets {
-                if let Err(e) = db
-                    .replace_traffic_bucket(
-                        port,
-                        bucket.timestamp,
-                        bucket.bytes_in,
-                        bucket.bytes_out,
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to flush traffic_bucket for port {}: {}", port, e);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Start the background task that periodically flushes traffic data to the database.
-    pub fn start_flush_task(&self) {
-        let store = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if let Err(e) = store.flush_to_db().await {
-                    tracing::warn!("Failed to flush traffic data to DB: {}", e);
-                }
-            }
-        });
-    }
-
-    fn add_to_bucket(
-        port_traffic: &mut PortTraffic,
-        bytes_in: u64,
-        bytes_out: u64,
-    ) -> DateTime<Utc> {
-        let now = Utc::now();
-        // Truncate to minute
-        let bucket_time = now - chrono::Duration::seconds(now.second() as i64);
-
-        // Check if we have a bucket for this minute
-        if let Some(last) = port_traffic.buckets.back_mut() {
-            if last.timestamp == bucket_time {
-                last.bytes_in += bytes_in;
-                last.bytes_out += bytes_out;
-                return bucket_time;
-            }
-        }
-
-        // Add new bucket
-        port_traffic.buckets.push_back(TrafficBucket {
-            timestamp: bucket_time,
-            bytes_in,
-            bytes_out,
-        });
-
-        // Keep only last 24 hours (1440 buckets)
-        while port_traffic.buckets.len() > 1440 {
-            port_traffic.buckets.pop_front();
-        }
-
-        bucket_time
-    }
-
-    /// Get traffic for all ports
-    pub async fn get_all_traffic(&self) -> Vec<PortTraffic> {
-        let store = self.inner.lock().await;
-        store.values().cloned().collect()
-    }
-
-    /// Get traffic for specific port
-    pub async fn get_port_traffic(&self, port: u16) -> Option<PortTraffic> {
-        let store = self.inner.lock().await;
-        store.get(&port).cloned()
-    }
-
-    /// Remove traffic data for a port (when client disconnects)
-    /// Note: This only removes from in-memory cache, database history is preserved
-    pub async fn remove_port(&self, port: u16) {
-        let mut store = self.inner.lock().await;
-        store.remove(&port);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_traffic_store_new() {
-        let store = TrafficStore::new();
-        let traffic = store.get_all_traffic().await;
-        assert!(traffic.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_record_bytes_in() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.port, 8080);
-        assert_eq!(traffic.total_bytes_in, 100);
-        assert_eq!(traffic.total_bytes_out, 0);
-        assert_eq!(traffic.buckets.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_record_bytes_out() {
-        let store = TrafficStore::new();
-        store.record_bytes_out(8080, 200).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.port, 8080);
-        assert_eq!(traffic.total_bytes_in, 0);
-        assert_eq!(traffic.total_bytes_out, 200);
-        assert_eq!(traffic.buckets.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_record_multiple_ports() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-        store.record_bytes_out(9000, 200).await;
-
-        let all_traffic = store.get_all_traffic().await;
-        assert_eq!(all_traffic.len(), 2);
-
-        let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic_8080.total_bytes_in, 100);
-
-        let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
-        assert_eq!(traffic_9000.total_bytes_out, 200);
-    }
-
-    #[tokio::test]
-    async fn test_record_accumulates() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-        store.record_bytes_in(8080, 200).await;
-        store.record_bytes_out(8080, 50).await;
-        store.record_bytes_out(8080, 75).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.total_bytes_in, 300);
-        assert_eq!(traffic.total_bytes_out, 125);
-    }
-
-    #[tokio::test]
-    async fn test_get_nonexistent_port() {
-        let store = TrafficStore::new();
-        let traffic = store.get_port_traffic(9999).await;
-        assert!(traffic.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_remove_port() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-        assert!(store.get_port_traffic(8080).await.is_some());
-
-        store.remove_port(8080).await;
-        assert!(store.get_port_traffic(8080).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_remove_nonexistent_port() {
-        let store = TrafficStore::new();
-        // Should not panic
-        store.remove_port(9999).await;
-    }
-
-    #[tokio::test]
-    async fn test_bucket_creation() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.buckets.len(), 1);
-
-        let bucket = &traffic.buckets[0];
-        assert_eq!(bucket.bytes_in, 100);
-        assert_eq!(bucket.bytes_out, 0);
-    }
-
-    #[tokio::test]
-    async fn test_traffic_store_clone() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-
-        let cloned = store.clone();
-        let traffic = cloned.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.total_bytes_in, 100);
-    }
-
-    #[tokio::test]
-    async fn test_traffic_store_with_db() {
-        let db = Database::new(":memory:").await.unwrap();
-        let store = TrafficStore::with_db(db);
-
-        store.record_bytes_in(8080, 100).await;
-        store.record_bytes_out(8080, 200).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.total_bytes_in, 100);
-        assert_eq!(traffic.total_bytes_out, 200);
-    }
-    //
-    //     #[tokio::test]
-    //     async fn test_traffic_store_load_from_db() {
-    //         let db = Database::new(":memory:").await.unwrap();
-    //
-    //         // Pre-populate database
-    //         db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
-    //         db.upsert_port_traffic(9000, 200, 400).await.unwrap();
-    //
-    //         // Create store and load from DB
-    //         let store = TrafficStore::with_db(db);
-    //         store.load_from_db().await.unwrap();
-    //
-    //         let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
-    //         assert_eq!(traffic_8080.total_bytes_in, 500);
-    //         assert_eq!(traffic_8080.total_bytes_out, 1000);
-    //
-    //         let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
-    //         assert_eq!(traffic_9000.total_bytes_in, 200);
-    //         assert_eq!(traffic_9000.total_bytes_out, 400);
-    //     }
-
-    #[tokio::test]
-    async fn test_traffic_store_bucket_time_truncation() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 100).await;
-        store.record_bytes_in(8080, 50).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        // Both should typically be in the same minute bucket
-        // Total should always be correct regardless
-        assert_eq!(traffic.total_bytes_in, 150);
-        // If both landed in the same bucket, there should be 1 bucket with 150 bytes
-        // If they landed in different buckets (second boundary), there could be 2
-        let total_bucket_bytes: u64 = traffic.buckets.iter().map(|b| b.bytes_in).sum();
-        assert_eq!(total_bucket_bytes, 150);
-    }
-
-    #[tokio::test]
-    async fn test_traffic_store_zero_bytes() {
-        let store = TrafficStore::new();
-        store.record_bytes_in(8080, 0).await;
-
-        let traffic = store.get_port_traffic(8080).await.unwrap();
-        assert_eq!(traffic.total_bytes_in, 0);
-        assert_eq!(traffic.buckets.len(), 1);
-    }
+    use crate::server::db::Database;
+    use chrono::Timelike;
 
     #[tokio::test]
     async fn test_health_response() {
@@ -476,19 +50,6 @@ mod tests {
     }
 
     #[test]
-    fn test_server_metrics_serialize() {
-        let metrics = ServerMetrics {
-            client_count: 5,
-            active_connection_count: 10,
-            total_bytes_in: 1000,
-            total_bytes_out: 2000,
-        };
-        let json = serde_json::to_string(&metrics).unwrap();
-        assert!(json.contains("client_count"));
-        assert!(json.contains("1000"));
-    }
-
-    #[test]
     fn test_shadowsocks_config_serialize() {
         let config = ShadowsocksConfig {
             enabled: true,
@@ -498,19 +59,6 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("8388"));
         assert!(json.contains("aes-256-gcm"));
-    }
-
-    #[test]
-    fn test_shadowsocks_stats_serialize() {
-        let stats = ShadowsocksStats {
-            enabled: true,
-            port: Some(8388),
-            total_bytes_in: 1000,
-            total_bytes_out: 2000,
-            active_connections: 5,
-        };
-        let json = serde_json::to_string(&stats).unwrap();
-        assert!(json.contains("active_connections"));
     }
 
     #[tokio::test]
@@ -652,69 +200,6 @@ mod tests {
         assert!(server_state.acme_client.read().await.is_some());
     }
 
-    fn trojan_test_api_state(
-        trojan: Option<crate::server::dynamic_config::TrojanDynamicConfig>,
-    ) -> ApiState {
-        let server_state = ServerState::new();
-        // 直接写内存中的 dynamic_config（与 set_dynamic_config 等效，免去构造全量结构）
-        if let Ok(mut dc) = server_state.dynamic_config.try_write() {
-            dc.trojan = trojan;
-        }
-        ApiState {
-            server_state,
-            auth_config: Arc::new(AuthConfig::new(None, None)),
-            log_store: None,
-        }
-    }
-
-    /// 共享模式（与反代复用端口，不 register_trojan）下 stats 回退
-    /// dynamic_config 端口读取记账数据；enabled/port 反映实际运行状态。
-    #[tokio::test]
-    async fn test_trojan_stats_shared_mode_fallback() {
-        let port = 1443;
-        let state =
-            trojan_test_api_state(Some(crate::server::dynamic_config::TrojanDynamicConfig {
-                enabled: true,
-                port,
-                password: "p".to_string(),
-                fallback: "127.0.0.1:80".to_string(),
-                domain: "t.example.com".to_string(),
-            }));
-        // 共享模式：端口未注册，但流量与连接数按 trojan_port 记账
-        state
-            .server_state
-            .traffic_store
-            .record_bytes_in(port, 100)
-            .await;
-        state
-            .server_state
-            .traffic_store
-            .record_bytes_out(port, 40)
-            .await;
-        state.server_state.increment_trojan_connections(port).await;
-        state.server_state.trojan_runtime.write().await.cert_source =
-            Some("self_signed".to_string());
-
-        let Json(stats) = get_trojan_stats(State(state)).await;
-        assert!(stats.enabled);
-        assert_eq!(stats.port, Some(port));
-        assert_eq!(stats.total_bytes_in, 100);
-        assert_eq!(stats.total_bytes_out, 40);
-        assert_eq!(stats.active_connections, 1);
-    }
-
-    /// trojan 未配置/未运行时 stats 返回 disabled 且为零值。
-    #[tokio::test]
-    async fn test_trojan_stats_disabled_is_zero() {
-        let state = trojan_test_api_state(None);
-        let Json(stats) = get_trojan_stats(State(state)).await;
-        assert!(!stats.enabled);
-        assert_eq!(stats.port, None);
-        assert_eq!(stats.total_bytes_in, 0);
-        assert_eq!(stats.total_bytes_out, 0);
-        assert_eq!(stats.active_connections, 0);
-    }
-
     // ── Stats unified API tests ──────────────────────────────────
 
     #[tokio::test]
@@ -725,10 +210,7 @@ mod tests {
             log_store: None,
         };
         let response = get_stats_summary(State(state)).await;
-        let body = response.into_response().into_body();
-        // body is a boxed body — let's just verify it doesn't panic
-        // and the handler returns a valid response
-        let _ = body;
+        assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -750,8 +232,7 @@ mod tests {
             log_store: None,
         };
         let response = get_stats_summary(State(state)).await;
-        let bytes = response.into_response().into_body();
-        let _ = bytes;
+        assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -762,9 +243,9 @@ mod tests {
             auth_config: Arc::new(AuthConfig::new(None, None)),
             log_store: None,
         };
-        // Just verify the handler doesn't panic with an empty state
+        // Verify the handler doesn't panic with an empty state
         let response = get_stats_summary(State(state)).await;
-        assert!(true, "get_stats_summary should not panic");
+        assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -914,50 +395,10 @@ pub struct LoginResponse {
     pub auth_required: bool,
 }
 
-/// Server metrics
-#[derive(Debug, Serialize)]
-pub struct ServerMetrics {
-    pub client_count: usize,
-    pub active_connection_count: usize,
-    pub total_bytes_in: u64,
-    pub total_bytes_out: u64,
-}
-
 /// Health check response
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-}
-
-/// Client with quality data
-#[derive(Debug, Serialize)]
-pub struct ClientWithQuality {
-    pub port: u16,
-    pub hostname: Option<String>,
-    pub quality: ConnectionQuality,
-}
-
-/// Port quality response with history
-#[derive(Debug, Serialize)]
-pub struct PortQualityResponse {
-    pub current: ConnectionQuality,
-    pub history: Vec<QualitySample>,
-}
-
-/// Quality warning
-#[derive(Debug, Serialize)]
-pub struct QualityWarning {
-    pub port: u16,
-    pub hostname: Option<String>,
-    pub quality: ConnectionQuality,
-    pub warning_type: String,
-}
-
-/// Query parameters for history
-#[derive(Debug, Deserialize)]
-pub struct QualityHistoryQuery {
-    pub start: Option<String>,
-    pub end: Option<String>,
 }
 
 /// Shadowsocks configuration
@@ -966,24 +407,6 @@ pub struct ShadowsocksConfig {
     pub enabled: bool,
     pub port: Option<u16>,
     pub cipher: Option<String>,
-}
-
-/// Shadowsocks statistics
-#[derive(Debug, Serialize)]
-pub struct ShadowsocksStats {
-    pub enabled: bool,
-    pub port: Option<u16>,
-    pub total_bytes_in: u64,
-    pub total_bytes_out: u64,
-    pub active_connections: usize,
-}
-
-/// Shadowsocks quality response
-#[derive(Debug, Serialize)]
-pub struct ShadowsocksQuality {
-    pub port: u16,
-    pub quality: ConnectionQuality,
-    pub history: Vec<QualitySample>,
 }
 
 /// Trojan configuration
@@ -997,24 +420,6 @@ pub struct TrojanConfig {
     pub cert_source: Option<String>,
     /// true = 与反代共享端口（SNI 分流）；false = 独立监听
     pub shared: bool,
-}
-
-/// Trojan statistics
-#[derive(Debug, Serialize)]
-pub struct TrojanStats {
-    pub enabled: bool,
-    pub port: Option<u16>,
-    pub total_bytes_in: u64,
-    pub total_bytes_out: u64,
-    pub active_connections: usize,
-}
-
-/// Trojan quality response
-#[derive(Debug, Serialize)]
-pub struct TrojanQuality {
-    pub port: u16,
-    pub quality: ConnectionQuality,
-    pub history: Vec<QualitySample>,
 }
 
 /// Mesh network info response
@@ -1111,47 +516,9 @@ async fn logout() -> impl IntoResponse {
     StatusCode::OK
 }
 
-// Get traffic for all clients
-async fn get_traffic(State(state): State<ApiState>) -> Json<Vec<PortTraffic>> {
-    Json(state.server_state.traffic_store.get_all_traffic().await)
-}
-
-// Get traffic for specific port
-async fn get_port_traffic(
-    State(state): State<ApiState>,
-    Path(port): Path<u16>,
-) -> impl IntoResponse {
-    match state
-        .server_state
-        .traffic_store
-        .get_port_traffic(port)
-        .await
-    {
-        Some(traffic) => Json(traffic).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
 // Health check
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
-}
-
-// Get server metrics
-async fn get_metrics(State(state): State<ApiState>) -> Json<ServerMetrics> {
-    let client_count = state.server_state.get_client_count().await;
-    let active_connection_count = state.server_state.get_active_connection_count().await;
-
-    let traffic = state.server_state.traffic_store.get_all_traffic().await;
-    let total_bytes_in = traffic.iter().map(|t| t.total_bytes_in).sum();
-    let total_bytes_out = traffic.iter().map(|t| t.total_bytes_out).sum();
-
-    Json(ServerMetrics {
-        client_count,
-        active_connection_count,
-        total_bytes_in,
-        total_bytes_out,
-    })
 }
 
 /// Serve embedded static files for frontend
@@ -1184,79 +551,6 @@ async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
     }
 }
 
-// Get all clients with quality data
-async fn get_all_quality(State(state): State<ApiState>) -> Json<Vec<ClientWithQuality>> {
-    let clients = state.server_state.get_all_clients().await;
-    let mut result = Vec::with_capacity(clients.len());
-
-    for (port, info) in clients {
-        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
-            result.push(ClientWithQuality {
-                port,
-                hostname: info.hostname,
-                quality,
-            });
-        }
-    }
-
-    Json(result)
-}
-
-// Get quality data for a single port
-async fn get_port_quality(
-    State(state): State<ApiState>,
-    Path(port): Path<u16>,
-) -> impl IntoResponse {
-    let current = state.server_state.quality_store.get_quality(port).await;
-    let history = state.server_state.quality_store.get_samples(port).await;
-
-    match current {
-        Some(current) => Json(PortQualityResponse { current, history }).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-// Get quality history for a port (with optional time range)
-async fn get_quality_history(
-    State(state): State<ApiState>,
-    Path(port): Path<u16>,
-    Query(_params): Query<QualityHistoryQuery>,
-) -> Json<Vec<QualitySample>> {
-    // For now, just return in-memory samples (last 60 minutes)
-    // Future: support database queries for longer time ranges
-    let samples = state.server_state.quality_store.get_samples(port).await;
-    Json(samples)
-}
-
-// Get current quality warnings
-async fn get_quality_warnings(State(state): State<ApiState>) -> Json<Vec<QualityWarning>> {
-    let clients = state.server_state.get_all_clients().await;
-    let mut warnings = Vec::new();
-
-    for (port, info) in clients {
-        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
-            let warning_type = if quality.is_critical {
-                Some("critical".to_string())
-            } else if quality.is_warning {
-                Some("warning".to_string())
-            } else {
-                None
-            };
-
-            if let Some(warning_type) = warning_type {
-                warnings.push(QualityWarning {
-                    port,
-                    hostname: info.hostname,
-                    quality,
-                    warning_type,
-                });
-            }
-        }
-    }
-
-    Json(warnings)
-}
-
 // Get Shadowsocks configuration
 async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<ShadowsocksConfig> {
     // Get all SS ports
@@ -1275,55 +569,6 @@ async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<Shadowsoc
         port,
         cipher,
     })
-}
-
-// Get Shadowsocks traffic statistics
-async fn get_shadowsocks_stats(State(state): State<ApiState>) -> Json<ShadowsocksStats> {
-    let ss_ports = state.server_state.get_shadowsocks_ports().await;
-
-    let mut total_bytes_in = 0;
-    let mut total_bytes_out = 0;
-    let mut active_connections = 0;
-
-    for &port in &ss_ports {
-        if let Some(traffic) = state
-            .server_state
-            .traffic_store
-            .get_port_traffic(port)
-            .await
-        {
-            total_bytes_in += traffic.total_bytes_in;
-            total_bytes_out += traffic.total_bytes_out;
-        }
-        active_connections += state.server_state.get_connection_count_for_port(port).await;
-    }
-
-    Json(ShadowsocksStats {
-        enabled: !ss_ports.is_empty(),
-        port: ss_ports.first().copied(),
-        total_bytes_in,
-        total_bytes_out,
-        active_connections,
-    })
-}
-
-// Get Shadowsocks quality data
-async fn get_shadowsocks_quality(State(state): State<ApiState>) -> Json<Vec<ShadowsocksQuality>> {
-    let ss_ports = state.server_state.get_shadowsocks_ports().await;
-    let mut result = Vec::with_capacity(ss_ports.len());
-
-    for port in ss_ports {
-        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
-            let history = state.server_state.quality_store.get_samples(port).await;
-            result.push(ShadowsocksQuality {
-                port,
-                quality,
-                history,
-            });
-        }
-    }
-
-    Json(result)
 }
 
 // Update Shadowsocks configuration (start/stop/modify)
@@ -1438,83 +683,6 @@ async fn get_trojan_config(State(state): State<ApiState>) -> Json<TrojanConfig> 
         cert_source: rt.cert_source.clone(),
         shared: rt.shared,
     })
-}
-
-/// Trojan 记账端口：优先取独立监听注册（`register_trojan`）的端口；
-/// 共享模式（与反代复用端口）下不注册端口，回退到 dynamic_config 中
-/// enabled 的 trojan 端口——流量与连接数仍按该端口记账（见 proxy.rs）。
-async fn trojan_accounting_ports(server_state: &ServerState) -> Vec<u16> {
-    let ports = server_state.get_trojan_ports().await;
-    if !ports.is_empty() {
-        return ports;
-    }
-    let dc = server_state.dynamic_config.read().await;
-    match dc.trojan.as_ref() {
-        Some(t) if t.enabled => vec![t.port],
-        _ => Vec::new(),
-    }
-}
-
-// Get Trojan traffic statistics
-async fn get_trojan_stats(State(state): State<ApiState>) -> Json<TrojanStats> {
-    let trojan_ports = trojan_accounting_ports(&state.server_state).await;
-    // 运行状态以 trojan_runtime 为准：apply_trojan_config 运行时写入
-    // cert_source（共享/独立两种模式都会写），停止时清空
-    let running = state
-        .server_state
-        .trojan_runtime
-        .read()
-        .await
-        .cert_source
-        .is_some();
-
-    let mut total_bytes_in = 0;
-    let mut total_bytes_out = 0;
-    let mut active_connections = 0;
-
-    for &port in &trojan_ports {
-        if let Some(traffic) = state
-            .server_state
-            .traffic_store
-            .get_port_traffic(port)
-            .await
-        {
-            total_bytes_in += traffic.total_bytes_in;
-            total_bytes_out += traffic.total_bytes_out;
-        }
-        active_connections += state.server_state.get_connection_count_for_port(port).await;
-    }
-
-    Json(TrojanStats {
-        enabled: running,
-        port: if running {
-            trojan_ports.first().copied()
-        } else {
-            None
-        },
-        total_bytes_in,
-        total_bytes_out,
-        active_connections,
-    })
-}
-
-// Get Trojan quality data
-async fn get_trojan_quality(State(state): State<ApiState>) -> Json<Vec<TrojanQuality>> {
-    let trojan_ports = trojan_accounting_ports(&state.server_state).await;
-    let mut result = Vec::with_capacity(trojan_ports.len());
-
-    for port in trojan_ports {
-        if let Some(quality) = state.server_state.quality_store.get_quality(port).await {
-            let history = state.server_state.quality_store.get_samples(port).await;
-            result.push(TrojanQuality {
-                port,
-                quality,
-                history,
-            });
-        }
-    }
-
-    Json(result)
 }
 
 // Update Trojan configuration (start/stop/modify)
@@ -2604,50 +1772,6 @@ async fn sse_stats_stream(
         .into_response()
 }
 
-// GET /api/proxy/stats — get proxy statistics
-async fn get_proxy_stats(State(state): State<ApiState>) -> impl IntoResponse {
-    // Try to get stats from database if available
-    if let Some(db) = state.server_state.get_db() {
-        match db.get_proxy_stats().await {
-            Ok((total_rules, active_rules, total_connections, bytes_in, bytes_out)) => {
-                return Json(ProxyStats {
-                    total_rules,
-                    active_rules,
-                    total_connections,
-                    bytes_in,
-                    bytes_out,
-                })
-                .into_response();
-            }
-            Err(e) => {
-                tracing::warn!("Failed to get proxy stats from database: {}", e);
-            }
-        }
-    }
-
-    // Fallback to in-memory stats
-    let rules = state.server_state.proxy_state.rules.lock().await;
-    let total_rules = rules.len() as i64;
-    let active_rules = rules.values().filter(|r| r.enabled).count() as i64;
-
-    let connection_counts = state
-        .server_state
-        .proxy_state
-        .connection_counts
-        .lock()
-        .await;
-    let active_connections: u64 = connection_counts.values().sum();
-
-    Json(ProxyStats {
-        total_rules,
-        active_rules,
-        total_connections: active_connections as i64,
-        bytes_in: 0,
-        bytes_out: 0,
-    })
-    .into_response()
-}
-
 // ── ACME Certificate Management Endpoints ──────────────────────────
 
 // GET /api/acme/certificates — list all certificates
@@ -3214,28 +2338,16 @@ pub async fn run_api_server(
             get(server_auth::get_auth).put(server_auth::put_auth),
         )
         .route("/api/server-auth/rotate", post(server_auth::rotate_auth))
-        .route("/api/traffic", get(get_traffic))
-        .route("/api/traffic/:port", get(get_port_traffic))
-        .route("/api/metrics", get(get_metrics))
-        // Quality monitoring endpoints
-        .route("/api/quality/all", get(get_all_quality))
-        .route("/api/quality/:port", get(get_port_quality))
-        .route("/api/quality/:port/history", get(get_quality_history))
-        .route("/api/quality/warnings", get(get_quality_warnings))
         // Shadowsocks management endpoints
         .route(
             "/api/shadowsocks",
             get(get_shadowsocks_config).post(update_shadowsocks_config),
         )
-        .route("/api/shadowsocks/stats", get(get_shadowsocks_stats))
-        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality))
         // Trojan management endpoints
         .route(
             "/api/trojan",
             get(get_trojan_config).post(update_trojan_config),
         )
-        .route("/api/trojan/stats", get(get_trojan_stats))
-        .route("/api/trojan/quality", get(get_trojan_quality))
         // Mesh network endpoints
         .route("/api/mesh", get(list_meshes))
         .route("/api/mesh/:id", get(get_mesh))
@@ -3258,7 +2370,6 @@ pub async fn run_api_server(
             "/api/proxy/rules/:id",
             put(update_proxy_rule).delete(delete_proxy_rule),
         )
-        .route("/api/proxy/stats", get(get_proxy_stats))
         // ACME certificate management endpoints
         .route("/api/acme/status", get(get_acme_status))
         .route(

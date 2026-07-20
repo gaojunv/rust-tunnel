@@ -1,12 +1,11 @@
-//! Integration tests: /api/logs SSE stream and /api/traffic bucket API.
+//! Integration tests: /api/logs SSE stream and the unified stats API.
 //!
 //! Route verification:
-//!   * SSE: `/api/logs/stream` — src/server/api.rs:1601 (public route; token
-//!     auth only when password is enabled). Emits named `event: log` frames
-//!     whose `data:` is a JSON object with `message`, `level`, `source`, etc.
-//!   * Traffic: `/api/traffic` returns `Vec<PortTraffic>` where each item is
-//!     `{ port, total_bytes_in, total_bytes_out, buckets }`
-//!     (src/server/api.rs:43-48 + 825).
+//!   * SSE: `/api/logs/stream` — public route; token auth only when password
+//!     is enabled. Emits named `event: log` frames whose `data:` is a JSON
+//!     object with `message`, `level`, `source`, etc.
+//!   * Stats: `/api/stats/summary` returns the unified StatsSummary JSON;
+//!     the removed legacy `/api/traffic` endpoint must 404.
 //!
 //! Log-plumbing note: the test harness only calls `run_server` /
 //! `run_api_server`, neither of which install a tracing subscriber. The
@@ -22,11 +21,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{spawn_echo, wait_until, HarnessOpts, TestHarness};
+use common::{HarnessOpts, TestHarness};
 use futures_util::StreamExt;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 const SSE_MARKER: &str = "integration-test-sse-marker-abc123";
 
@@ -116,13 +113,11 @@ async fn sse_streams_log_entries() {
     result.expect("test timed out");
 }
 
-/// Regression: `/api/traffic` must be a registered route returning
-/// `Vec<PortTraffic>` as a JSON array. The frontend dashboard chart calls
-/// `.map()` on this response; when the route is missing the request falls
-/// through to the SPA static fallback (or 404s), yielding a non-array body
-/// and crashing the page with "e.map is not a function".
+/// The legacy `/api/traffic` endpoint was removed in the stats unification;
+/// it must now 404, and its replacement `/api/stats/summary` must serve the
+/// unified StatsSummary JSON object.
 #[tokio::test(flavor = "multi_thread")]
-async fn traffic_endpoint_returns_json_array() {
+async fn legacy_traffic_endpoint_removed_stats_summary_serves() {
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         let harness = TestHarness::spawn(HarnessOpts {
             tls: false,
@@ -132,109 +127,29 @@ async fn traffic_endpoint_returns_json_array() {
         .await;
 
         let api = harness.api_client();
-        let (status, body) = api.get_json("/api/traffic").await;
+
+        let (status, _body) = api.get_json("/api/traffic").await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::NOT_FOUND,
+            "legacy /api/traffic should be gone, got {status}"
+        );
+
+        let (status, body) = api.get_json("/api/stats/summary").await;
         assert!(
             status.is_success(),
-            "/api/traffic should return 2xx, got {status}"
+            "/api/stats/summary should return 2xx, got {status}"
         );
         assert!(
-            body.is_array(),
-            "/api/traffic must return a JSON array (Vec<PortTraffic>), got: {body}"
+            body.is_object(),
+            "/api/stats/summary must return a JSON object (StatsSummary), got: {body}"
         );
-    })
-    .await;
-    result.expect("test timed out");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "traffic store not yet wired for v2 ClientTunnelStream/TcpProxy path"]
-async fn traffic_bucket_appears_after_transfer() {
-    let result = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut harness = TestHarness::spawn(HarnessOpts {
-            tls: false,
-            exposed_port_count: 1,
-            ..HarnessOpts::default()
-        })
-        .await;
-
-        let echo_addr = spawn_echo().await;
-        let remote_port = harness.exposed_ports[0];
-        harness.spawn_client(Some("traffic-client"));
-
-        let api = harness.api_client();
-        harness.wait_client_count(&api, 1).await.expect("register");
-
-        // Start TCP tunnel on server side so traffic can flow through.
-        harness
-            .start_tcp_tunnel(remote_port, &echo_addr.to_string(), "traffic-client")
-            .await;
-
-        wait_until("port open", || async {
-            TcpStream::connect(("127.0.0.1", remote_port))
-                .await
-                .ok()
-                .map(|_| ())
-        })
-        .await
-        .expect("port never opened");
-
-        // Push 64 KiB through the tunnel and read it back.
-        let mut sock = TcpStream::connect(("127.0.0.1", remote_port))
-            .await
-            .unwrap();
-        let payload = vec![0xAAu8; 65_536];
-        sock.write_all(&payload).await.unwrap();
-        let mut recv = vec![0u8; payload.len()];
-        sock.read_exact(&mut recv).await.unwrap();
-        assert_eq!(recv, payload);
-        drop(sock);
-
-        // Verify the traffic store has recorded non-zero bytes for our
-        // port. Actual field names on `PortTraffic` (src/server/api.rs:43-48)
-        // are `total_bytes_in` / `total_bytes_out`.
-        let bytes = wait_until("traffic recorded", || async {
-            let (status, body) = api.get_json("/api/traffic").await;
-            if !status.is_success() {
-                return None;
-            }
-            let arr = body.as_array()?;
-            for item in arr {
-                let port = item.get("port").and_then(|v| v.as_u64())?;
-                if port as u16 != remote_port {
-                    continue;
-                }
-                let bin = item
-                    .get("total_bytes_in")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let bout = item
-                    .get("total_bytes_out")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if bin > 0 && bout > 0 {
-                    return Some((bin, bout));
-                }
-            }
-            None
-        })
-        .await
-        .expect("no traffic bucket ever recorded for our port");
-
-        // Sanity: both directions should reflect at least the payload size.
-        // The store increments per-chunk copied by tokio::io::copy so we
-        // shouldn't have lost bytes.
-        assert!(
-            bytes.0 as usize >= payload.len(),
-            "total_bytes_in ({}) < payload ({})",
-            bytes.0,
-            payload.len()
-        );
-        assert!(
-            bytes.1 as usize >= payload.len(),
-            "total_bytes_out ({}) < payload ({})",
-            bytes.1,
-            payload.len()
-        );
+        for field in ["clients", "proxy", "shadowsocks", "trojan"] {
+            assert!(
+                body.get(field).is_some(),
+                "/api/stats/summary missing field {field}, got: {body}"
+            );
+        }
     })
     .await;
     result.expect("test timed out");

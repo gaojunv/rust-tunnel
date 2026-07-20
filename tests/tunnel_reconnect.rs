@@ -96,56 +96,6 @@ async fn client_reregisters_after_admin_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "quality tracking not yet wired for v2 ClientTunnelStream/TcpProxy path"]
-async fn heartbeat_measures_rtt() {
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut harness = TestHarness::spawn(HarnessOpts {
-            tls: false,
-            exposed_port_count: 1,
-            ..HarnessOpts::default()
-        })
-        .await;
-
-        let echo_addr = spawn_echo().await;
-        let remote_port = harness.exposed_ports[0];
-        harness.spawn_client(Some("heartbeat-client"));
-        harness
-            .start_tcp_tunnel(remote_port, &echo_addr.to_string(), "heartbeat-client")
-            .await;
-
-        let api = harness.api_client();
-        harness.wait_client_count(&api, 1).await.expect("register");
-
-        // Endpoint verified against src/server/api.rs:1613 — the route is
-        // `/api/quality/:port` (not `/api/quality/ports/:port` as the plan
-        // draft suggested). The response is `PortQualityResponse { current,
-        // history }` (src/server/api.rs:614-619) where `current` is a
-        // `ConnectionQuality` whose RTT is exposed as `last_rtt_ms` /
-        // `avg_rtt_ms` (src/server/quality.rs:30-52).
-        wait_until("rtt sample", || async {
-            let (status, body) = api.get_json(&format!("/api/quality/{remote_port}")).await;
-            if !status.is_success() {
-                return None;
-            }
-            let rtt = body
-                .get("current")
-                .and_then(|c| c.get("last_rtt_ms"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            if rtt > 0.0 {
-                Some(rtt)
-            } else {
-                None
-            }
-        })
-        .await
-        .expect("no RTT sample ever recorded — check heartbeat interval / field name");
-    })
-    .await;
-    result.expect("test timed out");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn server_restart_survives_reregistration() {
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         let mut harness1 = TestHarness::spawn(HarnessOpts {

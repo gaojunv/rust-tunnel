@@ -195,23 +195,6 @@ async fn main() -> TunnelResult<()> {
         init_logging_with_level(&config.log);
     }
 
-    // Load historical data from database
-    if let Err(e) = state.traffic_store.load_from_db().await {
-        tracing::warn!(
-            "Failed to load historical traffic data from database: {}",
-            e
-        );
-    } else {
-        tracing::info!("Loaded historical traffic data from database");
-    }
-
-    // Load quality history data from database
-    if let Err(e) = state.quality_store.load_from_db().await {
-        tracing::warn!("Failed to load quality history data from database: {}", e);
-    } else {
-        tracing::info!("Loaded quality history data from database");
-    }
-
     // Create auth config
     let auth_config =
         auth::AuthConfig::new(config.admin_password.clone(), config.jwt_secret.clone());
@@ -606,25 +589,12 @@ async fn main() -> TunnelResult<()> {
             if let Err(e) = db_for_cleanup.cleanup_old_logs(seven_days_ago).await {
                 tracing::warn!("Failed to cleanup old logs: {}", e);
             }
-            // Remove quality history older than 24 hours
-            let twenty_four_hours_ago = chrono::Utc::now() - chrono::Duration::hours(24);
-            if let Err(e) = db_for_cleanup
-                .cleanup_old_quality_history(twenty_four_hours_ago)
-                .await
-            {
-                tracing::warn!("Failed to cleanup old quality history: {}", e);
-            }
         }
     });
 
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down...");
-
-    // Final flush of traffic data to ensure persistence
-    if let Err(e) = state.traffic_store.flush_to_db().await {
-        tracing::warn!("Failed to flush traffic data during shutdown: {}", e);
-    }
 
     Ok(())
 }

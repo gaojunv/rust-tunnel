@@ -9,7 +9,7 @@ rust-tunnel 是一个基于 Rust 的**内网穿透工具**，采用客户端-服
 项目配有 React/TypeScript 的 Web 管理界面（嵌入服务器二进制中），并提供：
 
 - 多端口转发、心跳保活、断线自动重连
-- 实时连接质量监控（RTT、丢包率、质量评分 0-100、阈值告警）
+- 统一统计系统（StatsCollector）：client/proxy/shadowsocks/trojan 四类实体的流量与连接数，分钟级快照持久化到 `stats_snapshots` 表，API 查询/汇总/SSE 实时推送
 - 内置 Shadowsocks 代理（AES-256-GCM / ChaCha20-Poly1305）
 - 内置 Trojan 代理（TLS 必需、SHA-224 认证、认证失败回退）
 - Mesh 组网：STUN（RFC 5389）打洞、P2P 直连与中继、服务注册
@@ -53,7 +53,7 @@ cargo clippy --tests -- -D warnings   # 与 CI 一致的 Lint（另有若干 -A 
 cargo fmt --all                # 格式化（CI 检查 --check）
 cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
 cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 9000:localhost:80
-cargo run --bin checkdb        # SQLite 质量历史诊断工具
+cargo run --bin checkdb        # SQLite stats_snapshots 诊断工具
 ```
 
 Cargo feature：`embed-frontend` — 通过 `rust-embed` 将 `frontend-dist/` 嵌入服务器二进制。不带该 feature 构建时静态页面路由不生效（见 `src/server/api.rs` 中的 `#[cfg(feature = "embed-frontend")]`）。
@@ -98,14 +98,14 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### `src/server/` — 服务器实现
 
-- `control.rs` — `ServerState`：客户端注册、多端口管理、心跳质量监控；`run_server` 入口
+- `control.rs` — `ServerState`：客户端注册、多端口管理、心跳；`run_server` 入口
 - `listener.rs` / `proxy.rs` — 暴露端口监听、每连接双向 `tokio::io::copy` 转发
-- `api.rs` — Axum REST API + SSE 日志流 + `TrafficStore` + 嵌入式前端
+- `api.rs`（`api/mod.rs`）— Axum REST API + SSE 日志流 + 嵌入式前端
 - `auth.rs` — JWT 认证中间件
-- `db.rs` — SQLite（WAL）：16 张表，含 `port_traffic`、`traffic_buckets`、`client_sessions`、`connection_quality_history`、`shadowsocks_config`、`trojan_config`、`server_logs`、`mesh_networks`、`mesh_services`、`proxy_rules`、`proxy_traffic`、`acme_certificates`、`acme_challenges`、`reverse_proxy_config`、`dns_config`、`server_settings`
+- `db.rs` — SQLite（WAL）：15 张表，含 `client_sessions`、`shadowsocks_config`、`trojan_config`、`server_logs`、`mesh_networks`、`mesh_services`、`proxy_rules`、`stats_snapshots`、`acme_certificates`、`acme_challenges`、`reverse_proxy_config`、`dns_config`、`server_settings`、`clients`、`server_auth`（旧统计表 `port_traffic`/`traffic_buckets`/`proxy_traffic`/`connection_quality_history` 已在 schema v2 中 DROP，由 `stats_snapshots` 取代）
 - `config.rs` — clap + figment 三级配置
 - `dynamic_config.rs` — DB 支持的运行时动态配置（SS/Trojan/反代/DNS）
-- `quality.rs` — RTT/丢包/吞吐量追踪、评分、告警（内存保留 60 分钟，DB 保留 24 小时）
+- `stats.rs` — 统一统计采集器 `StatsCollector`：内存累加 + 速率计算 + 分钟级快照写 `stats_snapshots` + broadcast 推送
 - `logs.rs` — 自定义 tracing Layer，日志写入内存 + SQLite，API 分页/过滤
 - `shadowsocks.rs` / `trojan.rs` — 内置代理服务器（Trojan 的 listener 在 `listener.rs`，连接处理已提取为 `handle_trojan_connection`；配套测试在 `shadowsocks_test.rs`、`trojan_test.rs`）
 - `trojan_runtime.rs` — Trojan 统一启动/模式管理（ACME 证书解析、共享/独立模式判定、证书热更新）
@@ -176,10 +176,10 @@ cargo test --test tunnel_basic        # 指定文件
 
 ## API 概览
 
-完整路由定义见 `src/server/api.rs`（约 2900 行处的 Router 构建）。
+完整路由定义见 `src/server/api/mod.rs`（Router 构建在 `run_api_server` 中）。
 
-- 公开：`POST /api/login`、`GET /api/health`、`GET /api/logs/stream`（SSE）
-- 受保护（设置了 `admin_password` 时需 JWT Bearer）：`/api/clients`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/mesh*`、`/api/dns/*`、`/api/logs*`、`/api/proxy/*`（反向代理）、`/api/acme/*`、`/api/settings*`、`POST /api/logout`
+- 公开：`POST /api/login`、`GET /api/health`、`GET /api/stats/query`、`GET /api/stats/summary`、`GET /api/stats/stream`（SSE）、`GET /api/logs/stream`（SSE）
+- 受保护（设置了 `admin_password` 时需 JWT Bearer）：`/api/clients`、`/api/shadowsocks`、`/api/trojan`、`/api/mesh*`、`/api/dns/*`、`/api/logs*`、`/api/proxy/rules*`（反向代理）、`/api/acme/*`、`/api/settings*`、`POST /api/logout`
 - 静态前端：`/*path` → `serve_static`
 
 ## 安全注意事项

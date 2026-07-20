@@ -709,60 +709,6 @@ mod integration_tests {
 
     #[tokio::test]
     #[ignore]
-    async fn test_trojan_traffic_statistics() {
-        let (echo_port, echo_handle) = start_echo_server().await;
-        let state = ServerState::new();
-        let trojan_port = find_available_port().await;
-
-        let (_acceptor, server_handle, _tmp_dir) =
-            start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
-        wait_for_port(trojan_port, Duration::from_secs(5)).await;
-
-        // Send data through the proxy
-        let payload = b"traffic-test-data-here";
-        let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
-        stream.write_all(payload).await.unwrap();
-        let mut buf = vec![0u8; payload.len()];
-        stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, payload);
-
-        // Shutdown write side gracefully so copy_bidirectional completes with Ok
-        stream.shutdown().await.ok();
-        // Read until EOF to ensure server side sees clean close
-        let mut drain = [0u8; 64];
-        let _ = stream.read(&mut drain).await;
-
-        // Wait for stats update
-
-        // Wait with retry for traffic data to appear
-        let mut traffic_found = false;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let all_traffic = state.traffic_store.get_all_traffic().await;
-            if let Some(t) = all_traffic.iter().find(|t| t.port == trojan_port) {
-                // Note: total_bytes_in = client_to_target (upload via copy_bidirectional)
-                // total_bytes_out = target_to_client (download via copy_bidirectional)
-                // The initial payload is forwarded before copy_bidirectional starts,
-                // so total_bytes_in may be 0 while total_bytes_out contains the echo.
-                // Just verify that some traffic was recorded.
-                if t.total_bytes_in > 0 || t.total_bytes_out > 0 {
-                    traffic_found = true;
-                    break;
-                }
-            }
-        }
-        assert!(
-            traffic_found,
-            "Traffic data never appeared for port {}",
-            trojan_port
-        );
-
-        server_handle.abort();
-        echo_handle.abort();
-    }
-
-    #[tokio::test]
-    #[ignore]
     async fn test_trojan_initial_payload() {
         let (echo_port, echo_handle) = start_echo_server().await;
         let state = ServerState::new();

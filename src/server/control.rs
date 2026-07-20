@@ -12,16 +12,13 @@ use tracing::{debug, info, warn};
 use crate::common::{
     create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
 };
-use crate::server::api::TrafficStore;
 use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
 use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;
 use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
-use crate::server::quality::{ConnectionQuality, QualitySample, QualityStore, QualityTracker};
 use crate::server::reverse_proxy::ReverseProxyState;
 use crate::server::ServerConfig;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// Sender for control messages - can be shared across tasks
@@ -243,16 +240,10 @@ pub struct ServerState {
     ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Active Trojan connections per port
     trojan_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
-    /// Traffic statistics store
-    pub traffic_store: TrafficStore,
+    /// Unified statistics collector (traffic / connections for all entity types)
     pub stats_collector: crate::server::stats::StatsCollector,
-    /// Unified statistics collector (replaces TrafficStore + QualityStore)
     /// Database connection (optional)
     db: Option<Database>,
-    /// Connection quality store
-    pub quality_store: QualityStore,
-    /// Quality trackers per port
-    quality_trackers: Arc<Mutex<HashMap<u16, QualityTracker>>>,
     /// Log store for capturing and broadcasting logs
     pub log_store: Option<crate::server::logs::LogStore>,
     /// Mesh network manager
@@ -304,10 +295,7 @@ impl ServerState {
             ports: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
-            traffic_store: TrafficStore::new(),
-            quality_store: QualityStore::new(),
             stats_collector: crate::server::stats::StatsCollector::new(None),
-            quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             log_store: None,
             mesh_manager: MeshManager::new(),
@@ -354,10 +342,7 @@ impl ServerState {
             ports: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
-            traffic_store: TrafficStore::with_db(db.clone()),
-            quality_store: QualityStore::with_db(db.clone()),
             stats_collector: crate::server::stats::StatsCollector::new(Some(db.clone())),
-            quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db.clone()),
             log_store: Some(crate::server::logs::LogStore::new(Some(db.clone()))),
             mesh_manager: MeshManager::new(),
@@ -545,24 +530,6 @@ impl ServerState {
         ss_connections.values().sum::<usize>() + trojan_connections.values().sum::<usize>()
     }
 
-    /// Get or create quality tracker for a port
-    pub async fn get_or_create_quality_tracker(&self, port: u16) -> QualityTracker {
-        let mut trackers = self.quality_trackers.lock().await;
-        trackers.entry(port).or_default().clone()
-    }
-
-    /// Update quality tracker for a port
-    pub async fn update_quality_tracker(&self, port: u16, tracker: QualityTracker) {
-        let mut trackers = self.quality_trackers.lock().await;
-        trackers.insert(port, tracker);
-    }
-
-    /// Remove quality tracker for a port (client disconnect)
-    pub async fn remove_quality_tracker(&self, port: u16) {
-        let mut trackers = self.quality_trackers.lock().await;
-        trackers.remove(&port);
-    }
-
     /// Get all Shadowsocks ports
     pub async fn get_shadowsocks_ports(&self) -> Vec<u16> {
         let ports = self.ports.lock().await;
@@ -579,62 +546,6 @@ impl ServerState {
     pub async fn is_shadowsocks_port(&self, port: u16) -> bool {
         let ports = self.ports.lock().await;
         matches!(ports.get(&port), Some(PortInfo::Shadowsocks { .. }))
-    }
-
-    /// Sample quality for proxy ports (Shadowsocks / Trojan) based on traffic throughput.
-    /// Called periodically — reads recent traffic buckets and generates quality samples.
-    pub async fn sample_proxy_quality(&self) {
-        let now = Utc::now();
-        let ss_ports = self.get_shadowsocks_ports().await;
-        let trojan_ports = self.get_trojan_ports().await;
-
-        for port in ss_ports.iter().chain(trojan_ports.iter()) {
-            let (bytes_in_per_sec, bytes_out_per_sec) =
-                if let Some(traffic) = self.traffic_store.get_port_traffic(*port).await {
-                    // Compute throughput from the most recent bucket
-                    let (recent_in, recent_out) = traffic
-                        .buckets
-                        .back()
-                        .map(|b| (b.bytes_in as f64, b.bytes_out as f64))
-                        .unwrap_or((0.0, 0.0));
-                    // Approximate per-second rate: bucket covers ~60 seconds
-                    (recent_in / 60.0, recent_out / 60.0)
-                } else {
-                    (0.0, 0.0)
-                };
-
-            // Quality score: based on whether there's active traffic
-            let active = bytes_in_per_sec > 0.0 || bytes_out_per_sec > 0.0;
-            let quality_score: u8 = if active { 100 } else { 50 };
-
-            let quality = ConnectionQuality {
-                last_rtt_ms: 0.0,
-                avg_rtt_ms: 0.0,
-                min_rtt_ms: 0.0,
-                max_rtt_ms: 0.0,
-                loss_rate: 0.0,
-                consecutive_losses: 0,
-                bytes_in_per_sec,
-                bytes_out_per_sec,
-                quality_score,
-                last_update: now,
-                is_warning: false,
-                is_critical: false,
-            };
-
-            self.quality_store.update_quality(*port, quality).await;
-
-            // Add historical sample once per minute
-            let sample = QualitySample {
-                timestamp: now,
-                avg_rtt_ms: 0.0,
-                loss_rate: 0.0,
-                bytes_in_per_sec,
-                bytes_out_per_sec,
-                quality_score,
-            };
-            self.quality_store.add_sample(*port, sample).await;
-        }
     }
 
     /// Set the ACME client for this server state

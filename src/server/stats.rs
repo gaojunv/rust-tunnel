@@ -70,8 +70,6 @@ struct EntityStats {
     bytes_out_rate: f64,
     /// Recent RTT samples in ms
     rtt_samples: VecDeque<f64>,
-    /// Recent retransmit counts for loss estimation
-    retrans_samples: VecDeque<u64>,
     active_conns: u64,
 }
 
@@ -84,7 +82,6 @@ impl EntityStats {
             bytes_in_rate: 0.0,
             bytes_out_rate: 0.0,
             rtt_samples: VecDeque::with_capacity(60),
-            retrans_samples: VecDeque::with_capacity(60),
             active_conns: 0,
         }
     }

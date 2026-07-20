@@ -9,77 +9,6 @@ use crate::server::shadowsocks::{ProxyServerStream, SSConnectionContext};
 use crate::server::stats::EntityType;
 use crate::server::trojan::{TrojanCommand, TrojanConnectionContext};
 
-/// Bidirectional copy between two streams with traffic accounting.
-///
-/// Uses `copy_bidirectional` which properly handles TCP shutdown: when one direction
-/// observes EOF, it calls `shutdown()` on the opposing writer so the other direction
-/// unblocks instead of hanging indefinitely.
-pub async fn copy_bidirectional_with_stats(
-    _connection_id: u64,
-    port: u16,
-    mut client_stream: TcpStream,
-    mut target_stream: TcpStream,
-    state: ServerState,
-) -> TunnelResult<(u64, u64)> {
-    use crate::server::shadowsocks::copy_bidirectional;
-
-    let (client_to_target, target_to_client) =
-        copy_bidirectional(&mut client_stream, &mut target_stream).await?;
-
-    state
-        .traffic_store
-        .record_bytes_in(port, client_to_target)
-        .await;
-    state
-        .traffic_store
-        .record_bytes_out(port, target_to_client)
-        .await;
-
-    Ok((client_to_target, target_to_client))
-}
-
-/// Update quality metrics for SS connection
-async fn update_ss_quality(
-    state: &ServerState,
-    port: u16,
-    connect_time_ms: u64,
-    bytes_in: u64,
-    bytes_out: u64,
-    elapsed_secs: f64,
-) {
-    use crate::server::quality::{
-        calculate_quality_score, check_warnings, ConnectionQuality, QualityThresholds,
-    };
-    use chrono::Utc;
-
-    let mut quality = ConnectionQuality {
-        last_rtt_ms: connect_time_ms as f32,
-        avg_rtt_ms: connect_time_ms as f32,
-        min_rtt_ms: connect_time_ms as f32,
-        max_rtt_ms: connect_time_ms as f32,
-        ..Default::default()
-    };
-
-    // Calculate throughput
-    if elapsed_secs > 0.0 {
-        quality.bytes_in_per_sec = bytes_in as f64 / elapsed_secs;
-        quality.bytes_out_per_sec = bytes_out as f64 / elapsed_secs;
-    }
-
-    // Calculate quality score
-    quality.quality_score = calculate_quality_score(quality.avg_rtt_ms, quality.loss_rate);
-
-    // Check warnings
-    let thresholds = QualityThresholds::default();
-    let (is_warning, is_critical) =
-        check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
-    quality.is_warning = is_warning;
-    quality.is_critical = is_critical;
-    quality.last_update = Utc::now();
-
-    state.quality_store.update_quality(port, quality).await;
-}
-
 /// Bidirectional copy with Shadowsocks encryption/decryption using ProxyServerStream.
 ///
 /// Uses `copy_encrypted_bidirectional` which properly handles TCP shutdown: when one
@@ -87,10 +16,10 @@ async fn update_ss_quality(
 /// direction unblocks instead of hanging indefinitely.
 async fn copy_bidirectional_with_ss_crypto(
     _connection_id: u64,
-    port: u16,
+    _port: u16,
     mut proxy_stream: ProxyServerStream<TcpStream>,
     mut target_stream: TcpStream,
-    state: ServerState,
+    _state: ServerState,
 ) -> TunnelResult<(u64, u64)> {
     use crate::server::shadowsocks::{copy_encrypted_bidirectional, CipherKind};
 
@@ -101,15 +30,6 @@ async fn copy_bidirectional_with_ss_crypto(
         &mut target_stream,
     )
     .await?;
-
-    state
-        .traffic_store
-        .record_bytes_in(port, encrypted_to_plain)
-        .await;
-    state
-        .traffic_store
-        .record_bytes_out(port, plain_to_encrypted)
-        .await;
 
     Ok((encrypted_to_plain, plain_to_encrypted))
 }
@@ -178,8 +98,7 @@ pub async fn proxy_ss_connection(
 
     match result {
         Ok((uploaded, downloaded)) => {
-            let elapsed = proxy_start.elapsed();
-            let elapsed_secs = elapsed.as_secs_f64();
+            let elapsed_secs = proxy_start.elapsed().as_secs_f64();
 
             debug!(
                 "SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
@@ -193,17 +112,6 @@ pub async fn proxy_ss_connection(
                 uploaded,
                 downloaded,
             );
-
-            // Update quality metrics
-            update_ss_quality(
-                &state,
-                ss_port,
-                connect_time_ms,
-                uploaded,
-                downloaded,
-                elapsed_secs,
-            )
-            .await;
         }
         Err(e) => {
             warn!("SS connection {} error: {}", connection_id, e);
@@ -301,8 +209,7 @@ pub async fn proxy_trojan_connection(
 
     match result {
         Ok((client_to_target, target_to_client)) => {
-            let elapsed = proxy_start.elapsed();
-            let elapsed_secs = elapsed.as_secs_f64();
+            let elapsed_secs = proxy_start.elapsed().as_secs_f64();
 
             debug!(
                 "Trojan connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
@@ -316,104 +223,9 @@ pub async fn proxy_trojan_connection(
                 client_to_target,
                 target_to_client,
             );
-
-            state
-                .traffic_store
-                .record_bytes_in(trojan_port, client_to_target)
-                .await;
-            state
-                .traffic_store
-                .record_bytes_out(trojan_port, target_to_client)
-                .await;
-
-            // Update quality metrics
-            update_trojan_quality(
-                &state,
-                trojan_port,
-                connect_time_ms,
-                client_to_target,
-                target_to_client,
-                elapsed_secs,
-            )
-            .await;
         }
         Err(e) => {
             warn!("Trojan connection {} error: {}", connection_id, e);
         }
-    }
-}
-
-/// Update quality metrics for Trojan connection
-async fn update_trojan_quality(
-    state: &ServerState,
-    port: u16,
-    connect_time_ms: u64,
-    bytes_in: u64,
-    bytes_out: u64,
-    elapsed_secs: f64,
-) {
-    use crate::server::quality::{
-        calculate_quality_score, check_warnings, ConnectionQuality, QualityThresholds,
-    };
-    use chrono::Utc;
-
-    let mut quality = ConnectionQuality {
-        last_rtt_ms: connect_time_ms as f32,
-        avg_rtt_ms: connect_time_ms as f32,
-        min_rtt_ms: connect_time_ms as f32,
-        max_rtt_ms: connect_time_ms as f32,
-        ..Default::default()
-    };
-
-    if elapsed_secs > 0.0 {
-        quality.bytes_in_per_sec = bytes_in as f64 / elapsed_secs;
-        quality.bytes_out_per_sec = bytes_out as f64 / elapsed_secs;
-    }
-
-    quality.quality_score = calculate_quality_score(quality.avg_rtt_ms, quality.loss_rate);
-
-    let thresholds = QualityThresholds::default();
-    let (is_warning, is_critical) =
-        check_warnings(quality.avg_rtt_ms, quality.loss_rate, &thresholds);
-    quality.is_warning = is_warning;
-    quality.is_critical = is_critical;
-    quality.last_update = Utc::now();
-
-    state.quality_store.update_quality(port, quality).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::server::control::ServerState;
-
-    #[tokio::test]
-    async fn test_ss_traffic_statistics() {
-        let state = ServerState::new();
-
-        // Register a shadowsocks port
-        assert!(
-            state
-                .register_shadowsocks(8388, "aes-256-gcm".into(), "password".into())
-                .await
-        );
-
-        // Check initial traffic doesn't exist (zero effective)
-        assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
-
-        // Record some traffic manually (this is what copy_bidirectional_with_stats does)
-        state.traffic_store.record_bytes_in(8388, 1000).await;
-        state.traffic_store.record_bytes_out(8388, 2000).await;
-
-        // Check stats are updated
-        let traffic = state.traffic_store.get_port_traffic(8388).await.unwrap();
-        assert_eq!(traffic.total_bytes_in, 1000);
-        assert_eq!(traffic.total_bytes_out, 2000);
-
-        // Remove the port
-        assert!(state.unregister_port(8388).await);
-        state.traffic_store.remove_port(8388).await;
-
-        // After removal, port should be gone
-        assert!(state.traffic_store.get_port_traffic(8388).await.is_none());
     }
 }

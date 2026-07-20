@@ -1,6 +1,5 @@
 //! Unified HTTP proxy request handler.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -14,16 +13,11 @@ use tracing::error;
 
 use super::router::RouteTable;
 use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
-use super::{
-    record_traffic, Backend, BackendKind, BackendProtocol, ReverseProxyState, TrafficPending,
-};
+use super::{Backend, BackendKind, BackendProtocol, ReverseProxyState};
 use crate::server::stats::{EntityType, StatsCollector};
 
 use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
-
-/// Per-rule connection counter shared with `ReverseProxyState`.
-pub type ConnectionCounts = Arc<tokio::sync::Mutex<HashMap<String, u64>>>;
 
 /// Where the handler pulls its routing decision from.
 ///
@@ -36,8 +30,7 @@ pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 /// State injected into the axum Router.
 ///
 /// The third element is `Arc<ReverseProxyState>` which provides access to
-/// `connection_counts`, `traffic_pending`, and the `ClientConnector` for
-/// client-kind backends.
+/// the `StatsCollector` and the `ClientConnector` for client-kind backends.
 pub type ProxyState = (RouteSource, Arc<UpstreamClient>, Arc<ReverseProxyState>);
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
@@ -153,15 +146,12 @@ pub fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("websocket"))
 }
 
-/// Wrap a body so each data frame's length is accumulated into the matched
-/// rule's pending traffic (`is_in = true` counts bytes_in — client to
-/// backend; otherwise bytes_out — backend to client). Recording is live: the
-/// periodic flush task picks the deltas up without waiting for the body to end.
-///
-/// 同一份字节同时写入统一统计采集器（StatsCollector，proxy 桶）。
+/// Wrap a body so each data frame's length is recorded into the unified
+/// stats collector (`is_in = true` counts bytes_in — client to backend;
+/// otherwise bytes_out — backend to client). Recording is live: the periodic
+/// snapshot flush picks the deltas up without waiting for the body to end.
 fn count_body<B>(
     body: B,
-    pending: TrafficPending,
     stats: StatsCollector,
     rule_id: String,
     is_in: bool,
@@ -173,10 +163,8 @@ where
         if let Some(data) = frame.data_ref() {
             let n = data.len() as u64;
             if is_in {
-                record_traffic(&pending, &rule_id, n, 0, 0);
                 stats.record_bytes(EntityType::Proxy, &rule_id, n, 0);
             } else {
-                record_traffic(&pending, &rule_id, 0, n, 0);
                 stats.record_bytes(EntityType::Proxy, &rule_id, 0, n);
             }
         }
@@ -244,10 +232,9 @@ fn build_upstream_request(
 
 /// Convert the hyper response returned by `UpstreamClient` back to an axum
 /// `Response<Body>`. Streams the body without buffering, counting response
-/// bytes into the rule's traffic accumulator.
+/// bytes into the stats collector.
 fn build_downstream_response(
     resp: hyper::Response<hyper::body::Incoming>,
-    pending: TrafficPending,
     stats: StatsCollector,
     rule_id: String,
 ) -> Response {
@@ -257,7 +244,7 @@ fn build_downstream_response(
     // negotiated upgrade tokens and treats it as a protocol error.
     let preserve_upgrade = parts.status == StatusCode::SWITCHING_PROTOCOLS;
     parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
-    let axum_body = Body::new(count_body(incoming, pending, stats, rule_id, false));
+    let axum_body = Body::new(count_body(incoming, stats, rule_id, false));
     Response::from_parts(parts, axum_body)
 }
 
@@ -293,8 +280,6 @@ pub async fn handle_proxy_request_unified(
     State((source, upstream, proxy_state)): State<ProxyState>,
     mut req: Request<Body>,
 ) -> Response {
-    let connection_counts = proxy_state.connection_counts.clone();
-    let traffic_pending = proxy_state.traffic_pending.clone();
     let stats = proxy_state.stats_collector.clone();
     // h2 requests carry the authority in `:authority` (surfaced as Uri::host());
     // h1 requests may put it in either the URI (absolute-form) or a Host header.
@@ -325,44 +310,23 @@ pub async fn handle_proxy_request_unified(
     };
 
     // Track connection for stats
-    {
-        let mut counts = connection_counts.lock().await;
-        *counts.entry(rule_id.clone()).or_insert(0) += 1;
-    }
-    // Count this request as one connection in the traffic accumulator
-    record_traffic(&traffic_pending, &rule_id, 0, 0, 1);
-    // 统一统计：proxy 桶活跃连接 +1
     stats.incr_conns(EntityType::Proxy, &rule_id);
 
     // Decrement on scope exit (deferred via clone)
     let rule_id_for_decrement = rule_id.clone();
-    let counts_for_decrement = connection_counts.clone();
 
     // Client backend fork: bypass the shared UpstreamClient and dial
     // through the ClientConnector tunnel.
     if backend.kind == BackendKind::Client {
         // HTTP/2 not supported for client backends
         if backend.protocol != BackendProtocol::Http1 {
-            let mut counts = counts_for_decrement.lock().await;
-            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
-                if *c > 0 {
-                    *c -= 1;
-                }
-            }
             stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("HTTP/2 to client backend not yet supported"))
                 .unwrap();
         }
-        return handle_client_backend(
-            proxy_state,
-            req,
-            backend,
-            rule_id_for_decrement,
-            traffic_pending.clone(),
-        )
-        .await;
+        return handle_client_backend(proxy_state, req, backend, rule_id_for_decrement).await;
     }
 
     // WebSocket upgrade path: capture the downstream OnUpgrade future BEFORE
@@ -377,13 +341,7 @@ pub async fn handle_proxy_request_unified(
     // Wrap the request body to count bytes sent to the backend (bytes_in)
     let req = {
         let (parts, body) = req.into_parts();
-        let counted = Body::new(count_body(
-            body,
-            traffic_pending.clone(),
-            stats.clone(),
-            rule_id.clone(),
-            true,
-        ));
+        let counted = Body::new(count_body(body, stats.clone(), rule_id.clone(), true));
         Request::from_parts(parts, counted)
     };
 
@@ -391,12 +349,6 @@ pub async fn handle_proxy_request_unified(
         Ok(r) => r,
         Err(e) => {
             // Decrement on build error
-            let mut counts = counts_for_decrement.lock().await;
-            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
-                if *c > 0 {
-                    *c -= 1;
-                }
-            }
             stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             return error_response(&e);
         }
@@ -414,8 +366,6 @@ pub async fn handle_proxy_request_unified(
                     // constraint as the downstream side.
                     let upstream_upgrade = hyper::upgrade::on(&mut resp);
                     let rid = rule_id_for_decrement.clone();
-                    let cc = counts_for_decrement.clone();
-                    let tp = traffic_pending.clone();
                     let sc = stats.clone();
                     tokio::spawn(async move {
                         let (client_up, server_up) =
@@ -424,12 +374,6 @@ pub async fn handle_proxy_request_unified(
                                 Err(e) => {
                                     tracing::debug!("ws upgrade join failed: {e}");
                                     // Decrement on WS join failure
-                                    let mut counts = cc.lock().await;
-                                    if let Some(c) = counts.get_mut(&rid) {
-                                        if *c > 0 {
-                                            *c -= 1;
-                                        }
-                                    }
                                     sc.decr_conns(EntityType::Proxy, &rid);
                                     return;
                                 }
@@ -442,7 +386,6 @@ pub async fn handle_proxy_request_unified(
                         match tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await {
                             // (client→backend, backend→client) = (bytes_in, bytes_out)
                             Ok((to_backend, to_client)) => {
-                                record_traffic(&tp, &rid, to_backend, to_client, 0);
                                 sc.record_bytes(EntityType::Proxy, &rid, to_backend, to_client);
                             }
                             Err(e) => {
@@ -450,41 +393,18 @@ pub async fn handle_proxy_request_unified(
                             }
                         }
                         // Decrement on WS tunnel close
-                        let mut counts = cc.lock().await;
-                        if let Some(c) = counts.get_mut(&rid) {
-                            if *c > 0 {
-                                *c -= 1;
-                            }
-                        }
                         sc.decr_conns(EntityType::Proxy, &rid);
                     });
                 }
             }
             if !is_ws {
                 // Decrement for regular (non-WS) responses
-                let mut counts = counts_for_decrement.lock().await;
-                if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
-                    if *c > 0 {
-                        *c -= 1;
-                    }
-                }
                 stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             }
-            build_downstream_response(
-                resp,
-                traffic_pending.clone(),
-                stats.clone(),
-                rule_id.clone(),
-            )
+            build_downstream_response(resp, stats.clone(), rule_id.clone())
         }
         Err(e) => {
             // Decrement on upstream error
-            let mut counts = counts_for_decrement.lock().await;
-            if let Some(c) = counts.get_mut(&rule_id_for_decrement) {
-                if *c > 0 {
-                    *c -= 1;
-                }
-            }
             stats.decr_conns(EntityType::Proxy, &rule_id_for_decrement);
             error!(
                 error = %error_chain(&e),
@@ -518,7 +438,6 @@ async fn handle_client_backend(
     req: Request<Body>,
     backend: Backend,
     rule_id: String,
-    traffic_pending: TrafficPending,
 ) -> Response {
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
@@ -538,20 +457,13 @@ async fn handle_client_backend(
 
     // Wrap request body to count bytes_in
     let (parts, body) = req.into_parts();
-    let counted = Body::new(count_body(
-        body,
-        traffic_pending.clone(),
-        stats.clone(),
-        rule_id.clone(),
-        true,
-    ));
+    let counted = Body::new(count_body(body, stats.clone(), rule_id.clone(), true));
     let req = Request::from_parts(parts, counted);
 
     // Dial via ClientConnector
     let connector = match state.connector_for(&backend).await {
         Ok(c) => c,
         Err(e) => {
-            state.decrement_connections(&rule_id).await;
             stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -562,7 +474,6 @@ async fn handle_client_backend(
     let stream = match connector.connect(&backend).await {
         Ok(s) => s,
         Err(e) => {
-            state.decrement_connections(&rule_id).await;
             stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -581,7 +492,6 @@ async fn handle_client_backend(
     {
         Ok(pair) => pair,
         Err(e) => {
-            state.decrement_connections(&rule_id).await;
             stats.decr_conns(EntityType::Proxy, &rule_id);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -610,7 +520,6 @@ async fn handle_client_backend(
     let mut upstream_req = match build_upstream_request(req, &backend) {
         Ok(r) => r,
         Err(e) => {
-            state.decrement_connections(&rule_id).await;
             stats.decr_conns(EntityType::Proxy, &rule_id);
             return error_response(&e);
         }
@@ -637,8 +546,6 @@ async fn handle_client_backend(
                 let upstream_upgrade = hyper::upgrade::on(&mut resp);
                 let client_upgrade = downstream_upgrade.expect("checked above");
                 let rid = rule_id.clone();
-                let cc = state.connection_counts.clone();
-                let tp = traffic_pending.clone();
                 let sc = stats.clone();
                 tokio::spawn(async move {
                     let (client_up, server_up) =
@@ -646,12 +553,6 @@ async fn handle_client_backend(
                             Ok(pair) => pair,
                             Err(e) => {
                                 tracing::debug!("ws upgrade join failed: {e}");
-                                let mut counts = cc.lock().await;
-                                if let Some(c) = counts.get_mut(&rid) {
-                                    if *c > 0 {
-                                        *c -= 1;
-                                    }
-                                }
                                 sc.decr_conns(EntityType::Proxy, &rid);
                                 return;
                             }
@@ -664,30 +565,21 @@ async fn handle_client_backend(
                     match tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await {
                         // (client→backend, backend→client) = (bytes_in, bytes_out)
                         Ok((to_backend, to_client)) => {
-                            record_traffic(&tp, &rid, to_backend, to_client, 0);
                             sc.record_bytes(EntityType::Proxy, &rid, to_backend, to_client);
                         }
                         Err(e) => {
                             tracing::debug!("ws bidirectional copy ended: {e}");
                         }
                     }
-                    let mut counts = cc.lock().await;
-                    if let Some(c) = counts.get_mut(&rid) {
-                        if *c > 0 {
-                            *c -= 1;
-                        }
-                    }
                     sc.decr_conns(EntityType::Proxy, &rid);
                 });
             }
             if !is_ws {
-                state.decrement_connections(&rule_id).await;
                 stats.decr_conns(EntityType::Proxy, &rule_id);
             }
-            build_downstream_response(resp, traffic_pending, stats.clone(), rule_id)
+            build_downstream_response(resp, stats.clone(), rule_id)
         }
         Err(e) => {
-            state.decrement_connections(&rule_id).await;
             stats.decr_conns(EntityType::Proxy, &rule_id);
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -1667,7 +1559,7 @@ mod tests {
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
         let proxy_state = Arc::new(ReverseProxyState::new());
-        let traffic_pending = proxy_state.traffic_pending.clone();
+        let stats = proxy_state.stats_collector.clone();
 
         let req: AxumRequest<Body> = AxumRequest::builder()
             .method("POST")
@@ -1684,11 +1576,15 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"hello world");
 
-        let map = traffic_pending.lock().unwrap();
-        let delta = map.get("r1").expect("traffic recorded for rule r1");
-        assert_eq!(delta.connections, 1);
-        assert_eq!(delta.bytes_in, 3, "request body bytes counted");
-        assert_eq!(delta.bytes_out, 11, "response body bytes counted");
+        let summary = stats.get_summary();
+        assert_eq!(
+            summary.proxy.total_bytes_in, 3,
+            "request body bytes counted"
+        );
+        assert_eq!(
+            summary.proxy.total_bytes_out, 11,
+            "response body bytes counted"
+        );
     }
 
     // ---- Client backend tests ----
