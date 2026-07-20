@@ -35,7 +35,13 @@ class StatsStream {
     this.es.onerror = () => {
       this.es?.close();
       this.es = null;
-      setTimeout(() => this.connect(entityType), 3000);
+      setTimeout(() => {
+        // 重连前确认还有订阅者，避免最后一个 unsub 后仍建立无监听者连接
+        const hasListeners = [...this.listeners.values()].some((s) => s.size > 0);
+        if (hasListeners) {
+          this.connect(entityType);
+        }
+      }, 3000);
     };
   }
 

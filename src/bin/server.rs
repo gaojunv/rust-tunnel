@@ -561,19 +561,6 @@ async fn main() -> TunnelResult<()> {
         }
     });
 
-    // Stats snapshots cleanup every 30 min
-    let db_for_sc = db.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1800));
-        loop {
-            interval.tick().await;
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
-            if let Err(e) = db_for_sc.cleanup_old_stats_snapshots(cutoff).await {
-                tracing::warn!("Failed to cleanup stats snapshots: {}", e);
-            }
-        }
-    });
-
     // Start periodic cleanup of old data (every hour)
     let db_for_cleanup = db.clone();
     tokio::spawn(async move {

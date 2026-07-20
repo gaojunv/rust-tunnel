@@ -293,7 +293,7 @@ export function useUpdateDnsConfig() {
 
 import { statsStream } from './statsStream';
 import type { StatsSnapshot, StatsSummary } from '@/types';
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
 export function useStatsQuery(
   entityType?: string[],
@@ -329,24 +329,17 @@ export function useStatsSummary() {
 
 export function useStatsStream(entityType?: string) {
   const queryClient = useQueryClient();
+  const lastInvalidateRef = useRef(0);
 
   useEffect(() => {
-    const unsub = statsStream.subscribe(entityType, (snap) => {
-      queryClient.setQueryData(['stats', 'summary'], (old: StatsSummary | undefined) => {
-        if (!old) return old;
-        const key = snap.entity_type === 'client' ? 'clients' : snap.entity_type;
-        const bucket = old[key as keyof StatsSummary];
-        if (!bucket) return old;
-        return {
-          ...old,
-          [key]: {
-            ...bucket,
-            total_bytes_in: Math.max(bucket.total_bytes_in, snap.bytes_in),
-            total_bytes_out: Math.max(bucket.total_bytes_out, snap.bytes_out),
-            total_conns: snap.active_conns,
-          },
-        };
-      });
+    // SSE 快照为单实体粒度，直接覆盖聚合桶会得到错误总数。
+    // 改为节流 invalidate：距上次 ≥10s 才让 summary 从服务端重新聚合。
+    const unsub = statsStream.subscribe(entityType, () => {
+      const now = Date.now();
+      if (now - lastInvalidateRef.current >= 10_000) {
+        lastInvalidateRef.current = now;
+        queryClient.invalidateQueries({ queryKey: ['stats', 'summary'] });
+      }
     });
     return unsub;
   }, [entityType, queryClient]);

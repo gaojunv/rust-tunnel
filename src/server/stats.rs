@@ -248,7 +248,7 @@ impl StatsCollector {
         if let Some(ref db) = self.db {
             for snap in &snapshots {
                 if let Err(e) = sqlx::query(
-                    r#"INSERT INTO stats_snapshots
+                    r#"INSERT OR REPLACE INTO stats_snapshots
                        (entity_type, entity_id, timestamp, bytes_in, bytes_out,
                         bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
@@ -425,5 +425,30 @@ mod tests {
         c.record_bytes(EntityType::Proxy, "r1", 0, 0);
         let summary = c.get_summary();
         assert_eq!(summary.proxy.entity_count, 0);
+    }
+
+    /// 同一 entity 同一分钟内 flush 两次：INSERT OR REPLACE 应替换旧行而不是
+    /// 报主键冲突（服务重启后启动 flush 与重启前同一分钟的行撞主键的场景）。
+    #[tokio::test]
+    async fn flush_twice_same_minute_replaces_row() {
+        let db = crate::server::db::Database::new(":memory:")
+            .await
+            .expect("in-memory db");
+        let c = StatsCollector::new(Some(db.clone()));
+        c.record_bytes(EntityType::Proxy, "r1", 100, 200);
+
+        c.flush().await;
+        c.record_bytes(EntityType::Proxy, "r1", 50, 50);
+        c.flush().await;
+
+        let (count, bytes_in): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(bytes_in), 0) FROM stats_snapshots
+             WHERE entity_type = 'proxy' AND entity_id = 'r1'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("query count");
+        assert_eq!(count, 1, "second flush must REPLACE, not conflict");
+        assert_eq!(bytes_in, 150, "row should hold the latest flush values");
     }
 }

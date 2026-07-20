@@ -1728,9 +1728,14 @@ async fn sse_stats_stream(
 ) -> impl IntoResponse {
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
-        if !token.is_empty()
-            && crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_err()
-        {
+
+        let is_valid = if !token.is_empty() {
+            crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_ok()
+        } else {
+            false
+        };
+
+        if !is_valid {
             return axum::response::Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(Body::from("Unauthorized"))
@@ -2318,14 +2323,15 @@ pub async fn run_api_server(
     let public_routes = Router::new()
         .route("/api/login", post(login))
         .route("/api/health", get(health))
-        .route("/api/stats/query", get(get_stats_query))
-        .route("/api/stats/summary", get(get_stats_summary))
         .route("/api/stats/stream", get(sse_stats_stream))
         .route("/api/logs/stream", get(sse_log_stream));
 
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
         .route("/api/logout", post(logout))
+        // Stats query endpoints (SSE stream is in public_routes — uses ?token= query param)
+        .route("/api/stats/query", get(get_stats_query))
+        .route("/api/stats/summary", get(get_stats_summary))
         .route("/api/clients", get(clients::list_clients))
         .route(
             "/api/clients/:name",
