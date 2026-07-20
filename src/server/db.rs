@@ -10,7 +10,7 @@ use std::str::FromStr;
 /// Database wrapper for persistence
 #[derive(Clone)]
 pub struct Database {
-    pool: Pool<Sqlite>,
+    pub(crate) pool: Pool<Sqlite>,
 }
 
 impl Database {
