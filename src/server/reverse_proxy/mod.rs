@@ -274,6 +274,8 @@ pub struct ReverseProxyState {
     pub connection_counts: Arc<Mutex<HashMap<String, u64>>>,
     /// Traffic accumulator per rule, flushed to DB periodically
     pub traffic_pending: TrafficPending,
+    /// Stats collector reference (set after construction)
+    pub stats_collector: crate::server::stats::StatsCollector,
     /// Per-listen_addr async mutex to serialize reconcile calls.
     pub reconcile_locks: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Database reference
@@ -410,6 +412,7 @@ impl ReverseProxyState {
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
             traffic_pending: Arc::new(StdMutex::new(HashMap::new())),
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
+            stats_collector: crate::server::stats::StatsCollector::new(None),
             db: None,
             cert_manager: None,
             direct_connector: Arc::new(connector::DirectConnector),
@@ -427,6 +430,7 @@ impl ReverseProxyState {
             connection_counts: Arc::new(Mutex::new(HashMap::new())),
             traffic_pending: Arc::new(StdMutex::new(HashMap::new())),
             reconcile_locks: Arc::new(StdMutex::new(HashMap::new())),
+            stats_collector: crate::server::stats::StatsCollector::new(None),
             db: Some(db),
             cert_manager: None,
             direct_connector: Arc::new(connector::DirectConnector),

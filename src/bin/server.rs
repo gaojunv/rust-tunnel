@@ -539,19 +539,52 @@ async fn main() -> TunnelResult<()> {
         }
     });
 
-    // Start periodic DB flush for traffic data (every 30 seconds)
-    state.traffic_store.start_flush_task();
+    // ── StatsCollector background tasks ──
+    let sc = state.stats_collector.clone();
 
-    // Start periodic DB flush for reverse proxy traffic stats (every 30 seconds)
-    state.proxy_state.start_traffic_flush_task();
+    // Task: rate recalculation every 5 seconds
+    let sc_rates = sc.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            sc_rates.tick_rates();
+        }
+    });
 
-    // Start periodic quality sampling for Shadowsocks / Trojan ports (every 60 seconds)
-    let quality_state = state.clone();
+    // Task: flush snapshots to DB + broadcast every 60 seconds
+    let sc_flush = sc.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            quality_state.sample_proxy_quality().await;
+            sc_flush.flush().await;
+        }
+    });
+
+    // Task: cleanup old stats snapshots every 30 minutes
+    let db_for_stats_cleanup = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
+            if let Err(e) = db_for_stats_cleanup.cleanup_old_stats_snapshots(seven_days_ago).await {
+                tracing::warn!("Failed to cleanup old stats snapshots: {}", e);
+            }
+        }
+    });
+
+    // Stats snapshots cleanup every 30 min
+    let db_for_sc = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1800));
+        loop {
+            interval.tick().await;
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+            if let Err(e) = db_for_sc.cleanup_old_stats_snapshots(cutoff).await {
+                tracing::warn!("Failed to cleanup stats snapshots: {}", e);
+            }
         }
     });
 

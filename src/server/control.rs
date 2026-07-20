@@ -245,6 +245,8 @@ pub struct ServerState {
     trojan_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Traffic statistics store
     pub traffic_store: TrafficStore,
+    pub stats_collector: crate::server::stats::StatsCollector,
+    /// Unified statistics collector (replaces TrafficStore + QualityStore)
     /// Database connection (optional)
     db: Option<Database>,
     /// Connection quality store
@@ -304,6 +306,7 @@ impl ServerState {
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::new(),
             quality_store: QualityStore::new(),
+            stats_collector: crate::server::stats::StatsCollector::new(None),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: None,
             log_store: None,
@@ -348,6 +351,7 @@ impl ServerState {
             trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
             traffic_store: TrafficStore::with_db(db.clone()),
             quality_store: QualityStore::with_db(db.clone()),
+            stats_collector: crate::server::stats::StatsCollector::new(Some(db.clone())),
             quality_trackers: Arc::new(Mutex::new(HashMap::new())),
             db: Some(db.clone()),
             log_store: Some(crate::server::logs::LogStore::new(Some(db.clone()))),

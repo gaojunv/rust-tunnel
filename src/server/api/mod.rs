@@ -2333,6 +2333,106 @@ async fn delete_proxy_rule(
     Json(serde_json::json!({ "deleted": id })).into_response()
 }
 
+// ── Stats Unified API ────────────────────────────────────────────
+
+use crate::server::stats::StatsSnapshot;
+
+#[derive(Debug, Deserialize)]
+struct StatsQueryParams {
+    entity_type: Option<Vec<String>>,
+    entity_id: Option<Vec<String>>,
+    start: String,
+    end: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsStreamQuery {
+    entity_type: Option<String>,
+    token: Option<String>,
+}
+
+// GET /api/stats/query
+async fn get_stats_query(
+    State(state): State<ApiState>,
+    Query(params): Query<StatsQueryParams>,
+) -> impl IntoResponse {
+    let start = match chrono::DateTime::parse_from_rfc3339(&params.start) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid start: {}", e)}))).into_response(),
+    };
+    let end = match chrono::DateTime::parse_from_rfc3339(&params.end) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid end: {}", e)}))).into_response(),
+    };
+    if (end - start) > chrono::Duration::days(7) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Range <= 7 days"}))).into_response();
+    }
+    let entity_types = params.entity_type.unwrap_or_default();
+    let entity_ids = params.entity_id.unwrap_or_default();
+    let db = match state.server_state.get_db() {
+        Some(db) => db,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No DB"}))).into_response(),
+    };
+    match db.query_stats_snapshots(&entity_types, &entity_ids, start, end).await {
+        Ok(snapshots) => Json(serde_json::json!({"snapshots": snapshots})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// GET /api/stats/summary
+async fn get_stats_summary(
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    Json(state.server_state.stats_collector.get_summary()).into_response()
+}
+
+// GET /api/stats/stream
+async fn sse_stats_stream(
+    State(state): State<ApiState>,
+    Query(params): Query<StatsStreamQuery>,
+) -> impl IntoResponse {
+    if state.auth_config.is_enabled() {
+        let token = params.token.as_deref().unwrap_or("");
+        if !token.is_empty() && crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_err() {
+            return axum::response::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("Unauthorized"))
+                .unwrap();
+        }
+    }
+    let entity_type_filter = params.entity_type;
+    let mut rx = state.server_state.stats_collector.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                Ok(Ok(snapshot)) => {
+                    if let Some(ref et) = entity_type_filter {
+                        if snapshot.entity_type != *et { continue; }
+                    }
+                    let json = serde_json::to_string(&snapshot).unwrap_or_default();
+                    yield Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().event("snapshot").data(json),
+                    );
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().event("sync").data(format!(r#"{{"lagged":{}}}"#, n)),
+                    );
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        axum::response::sse::Event::default().event("ping").data(""),
+                    );
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(30)))
+        .into_response()
+}
+
 // GET /api/proxy/stats — get proxy statistics
 async fn get_proxy_stats(State(state): State<ApiState>) -> impl IntoResponse {
     // Try to get stats from database if available
@@ -2923,6 +3023,9 @@ pub async fn run_api_server(
     let public_routes = Router::new()
         .route("/api/login", post(login))
         .route("/api/health", get(health))
+        .route("/api/stats/query", get(get_stats_query))
+        .route("/api/stats/summary", get(get_stats_summary))
+        .route("/api/stats/stream", get(sse_stats_stream))
         .route("/api/logs/stream", get(sse_log_stream));
 
     // Protected routes (require auth only when password is set)
@@ -2940,28 +3043,17 @@ pub async fn run_api_server(
             get(server_auth::get_auth).put(server_auth::put_auth),
         )
         .route("/api/server-auth/rotate", post(server_auth::rotate_auth))
-        .route("/api/traffic", get(get_traffic))
-        .route("/api/traffic/:port", get(get_port_traffic))
-        .route("/api/metrics", get(get_metrics))
         // Quality monitoring endpoints
-        .route("/api/quality/all", get(get_all_quality))
-        .route("/api/quality/:port", get(get_port_quality))
-        .route("/api/quality/:port/history", get(get_quality_history))
-        .route("/api/quality/warnings", get(get_quality_warnings))
         // Shadowsocks management endpoints
         .route(
             "/api/shadowsocks",
             get(get_shadowsocks_config).post(update_shadowsocks_config),
         )
-        .route("/api/shadowsocks/stats", get(get_shadowsocks_stats))
-        .route("/api/shadowsocks/quality", get(get_shadowsocks_quality))
         // Trojan management endpoints
         .route(
             "/api/trojan",
             get(get_trojan_config).post(update_trojan_config),
         )
-        .route("/api/trojan/stats", get(get_trojan_stats))
-        .route("/api/trojan/quality", get(get_trojan_quality))
         // Mesh network endpoints
         .route("/api/mesh", get(list_meshes))
         .route("/api/mesh/:id", get(get_mesh))
@@ -2984,7 +3076,6 @@ pub async fn run_api_server(
             "/api/proxy/rules/:id",
             put(update_proxy_rule).delete(delete_proxy_rule),
         )
-        .route("/api/proxy/stats", get(get_proxy_stats))
         // ACME certificate management endpoints
         .route("/api/acme/status", get(get_acme_status))
         .route(

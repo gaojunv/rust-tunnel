@@ -2151,7 +2151,7 @@ pub struct ProxyRuleRecord {
 }
 
 /// DB row mirroring stats_snapshots
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
 pub struct StatsSnapshotRow {
     pub entity_type: String,
     pub entity_id: String,
