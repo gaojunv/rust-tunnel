@@ -6,6 +6,7 @@ use tracing::{debug, error, warn};
 use crate::common::TunnelResult;
 use crate::server::control::ServerState;
 use crate::server::shadowsocks::{ProxyServerStream, SSConnectionContext};
+use crate::server::stats::EntityType;
 use crate::server::trojan::{TrojanCommand, TrojanConnectionContext};
 
 /// Bidirectional copy between two streams with traffic accounting.
@@ -128,6 +129,11 @@ pub async fn proxy_ss_connection(
 
     // Increment active SS connection count
     state.increment_ss_connections(ss_port).await;
+    // 统一统计：shadowsocks 桶活跃连接 +1（entity_id 约定为 ss:{port}）
+    let entity_id = format!("ss:{}", ss_port);
+    state
+        .stats_collector
+        .incr_conns(EntityType::Shadowsocks, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
     let start = Instant::now();
@@ -138,6 +144,10 @@ pub async fn proxy_ss_connection(
         Err(e) => {
             error!("Failed to connect to target {}: {}", ss_ctx.target_addr, e);
             state.decrement_ss_connections(ss_port).await;
+            // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Shadowsocks, &entity_id);
             return;
         }
     };
@@ -161,6 +171,10 @@ pub async fn proxy_ss_connection(
 
     // Decrement active SS connection count (always run)
     state.decrement_ss_connections(ss_port).await;
+    // 统一统计：活跃连接 -1（覆盖正常与错误退出）
+    state
+        .stats_collector
+        .decr_conns(EntityType::Shadowsocks, &entity_id);
 
     match result {
         Ok((uploaded, downloaded)) => {
@@ -170,6 +184,14 @@ pub async fn proxy_ss_connection(
             debug!(
                 "SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
                 connection_id, uploaded, downloaded, elapsed_secs
+            );
+
+            // 统一统计：双向字节一次性入账（bytes_in = 客户端→目标，bytes_out = 目标→客户端）
+            state.stats_collector.record_bytes(
+                EntityType::Shadowsocks,
+                &entity_id,
+                uploaded,
+                downloaded,
             );
 
             // Update quality metrics
@@ -215,6 +237,11 @@ pub async fn proxy_trojan_connection(
 
     // Increment active Trojan connection count
     state.increment_trojan_connections(trojan_port).await;
+    // 统一统计：trojan 桶活跃连接 +1（entity_id 约定为 trojan:{port}）
+    let entity_id = format!("trojan:{}", trojan_port);
+    state
+        .stats_collector
+        .incr_conns(EntityType::Trojan, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
     let start = Instant::now();
@@ -228,6 +255,10 @@ pub async fn proxy_trojan_connection(
                 trojan_ctx.target_addr, e
             );
             state.decrement_trojan_connections(trojan_port).await;
+            // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Trojan, &entity_id);
             return;
         }
     };
@@ -248,6 +279,10 @@ pub async fn proxy_trojan_connection(
                 connection_id, e
             );
             state.decrement_trojan_connections(trojan_port).await;
+            // 统一统计：活跃连接 -1（覆盖初始负载写失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Trojan, &entity_id);
             return;
         }
     }
@@ -259,6 +294,10 @@ pub async fn proxy_trojan_connection(
 
     // Decrement active Trojan connection count
     state.decrement_trojan_connections(trojan_port).await;
+    // 统一统计：活跃连接 -1（覆盖正常与错误退出）
+    state
+        .stats_collector
+        .decr_conns(EntityType::Trojan, &entity_id);
 
     match result {
         Ok((client_to_target, target_to_client)) => {
@@ -268,6 +307,14 @@ pub async fn proxy_trojan_connection(
             debug!(
                 "Trojan connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
                 connection_id, client_to_target, target_to_client, elapsed_secs
+            );
+
+            // 统一统计：双向字节一次性入账（bytes_in = 客户端→目标，bytes_out = 目标→客户端）
+            state.stats_collector.record_bytes(
+                EntityType::Trojan,
+                &entity_id,
+                client_to_target,
+                target_to_client,
             );
 
             state

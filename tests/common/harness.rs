@@ -38,6 +38,9 @@ pub struct TestHarness {
     pub tls: bool,
     /// Clone of the server's `ReverseProxyState`, for starting tunnel listeners.
     pub proxy_state: ReverseProxyState,
+    /// Clone of the server's `ServerState`, for starting SS/Trojan listeners
+    /// that share the same `StatsCollector` as the API.
+    pub server_state: control::ServerState,
     server_task: JoinHandle<()>,
     api_task: JoinHandle<()>,
     client_tasks: Vec<JoinHandle<()>>,
@@ -185,6 +188,7 @@ impl TestHarness {
             admin_password: opts.admin_password,
             client_password: opts.client_password,
             proxy_state,
+            server_state: state,
             tls: opts.tls,
             server_task,
             api_task,
