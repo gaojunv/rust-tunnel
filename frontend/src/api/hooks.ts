@@ -410,3 +410,63 @@ export function useUpdateDnsConfig() {
     },
   });
 }
+
+// ── Unified Stats Hooks ─────────────────────────────────────────
+
+import { statsStream } from './statsStream';
+import type { StatsSnapshot, StatsSummary } from '@/types';
+import { useEffect } from 'react';
+
+export function useStatsQuery(
+  entityType?: string[],
+  entityId?: string[],
+  start?: string,
+  end?: string,
+) {
+  return useQuery({
+    queryKey: ['stats', 'query', entityType, entityId, start, end],
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      entityType?.forEach((et) => params.append('entity_type', et));
+      entityId?.forEach((eid) => params.append('entity_id', eid));
+      if (start) params.set('start', start);
+      if (end) params.set('end', end);
+      const { default: api } = await import('./client');
+      const res = await api.get<{ snapshots: StatsSnapshot[] }>(`/api/stats/query?${params}`);
+      return res.data.snapshots;
+    },
+    enabled: !!start && !!end,
+  });
+}
+
+export function useStatsSummary() {
+  return useQuery({
+    queryKey: ['stats', 'summary'],
+    queryFn: async () => {
+      const { default: api } = await import('./client');
+      const res = await api.get<StatsSummary>('/api/stats/summary');
+      return res.data;
+    },
+    refetchInterval: 60_000,
+  });
+}
+
+export function useStatsStream(entityType?: string) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    const unsub = statsStream.subscribe(entityType, (snap) => {
+      queryClient.setQueryData(['stats', 'summary'], (old: StatsSummary | undefined) => {
+        if (!old) return old;
+        const bucket = old[snap.entity_type as keyof StatsSummary];
+        if (bucket) {
+          bucket.total_bytes_in = Math.max(bucket.total_bytes_in, snap.bytes_in);
+          bucket.total_bytes_out = Math.max(bucket.total_bytes_out, snap.bytes_out);
+          bucket.total_conns = snap.active_conns;
+        }
+        return { ...old };
+      });
+    });
+    return unsub;
+  }, [entityType, queryClient]);
+}

@@ -349,3 +349,32 @@ export interface DnsSettings {
   tunnel_domain: string;
   mesh_domain: string;
 }
+
+// === Unified Stats ===
+
+export interface StatsSnapshot {
+  entity_type: 'client' | 'proxy' | 'shadowsocks' | 'trojan';
+  entity_id: string;
+  timestamp: string;
+  bytes_in: number;
+  bytes_out: number;
+  bytes_in_rate: number;
+  bytes_out_rate: number;
+  rtt_ms: number | null;
+  loss_pct: number | null;
+  active_conns: number;
+}
+
+export interface EntitySummary {
+  total_bytes_in: number;
+  total_bytes_out: number;
+  total_conns: number;
+  entity_count: number;
+}
+
+export interface StatsSummary {
+  clients: EntitySummary;
+  proxy: EntitySummary;
+  shadowsocks: EntitySummary;
+  trojan: EntitySummary;
+}
