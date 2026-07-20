@@ -187,6 +187,9 @@ pub fn create_insecure_client_config() -> TunnelResult<Arc<ClientConfig>> {
                 rustls::SignatureScheme::RSA_PSS_SHA512,
                 rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
                 rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                // 服务器自动生成的自签名证书为 Ed25519（generate_self_signed_cert），
+                // 缺少该 scheme 会导致 NoSignatureSchemesInCommon 握手失败
+                rustls::SignatureScheme::ED25519,
             ]
         }
     }
