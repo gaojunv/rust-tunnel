@@ -457,13 +457,18 @@ export function useStatsStream(entityType?: string) {
     const unsub = statsStream.subscribe(entityType, (snap) => {
       queryClient.setQueryData(['stats', 'summary'], (old: StatsSummary | undefined) => {
         if (!old) return old;
-        const bucket = old[snap.entity_type as keyof StatsSummary];
-        if (bucket) {
-          bucket.total_bytes_in = Math.max(bucket.total_bytes_in, snap.bytes_in);
-          bucket.total_bytes_out = Math.max(bucket.total_bytes_out, snap.bytes_out);
-          bucket.total_conns = snap.active_conns;
-        }
-        return { ...old };
+        const key = snap.entity_type === 'client' ? 'clients' : snap.entity_type;
+        const bucket = old[key as keyof StatsSummary];
+        if (!bucket) return old;
+        return {
+          ...old,
+          [key]: {
+            ...bucket,
+            total_bytes_in: Math.max(bucket.total_bytes_in, snap.bytes_in),
+            total_bytes_out: Math.max(bucket.total_bytes_out, snap.bytes_out),
+            total_conns: snap.active_conns,
+          },
+        };
       });
     });
     return unsub;

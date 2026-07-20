@@ -16,7 +16,7 @@ class StatsStream {
   }
 
   private connect(entityType?: string): void {
-    const token = localStorage.getItem('token') || '';
+    const token = localStorage.getItem('auth_token') || '';
     let url = `/api/stats/stream?token=${encodeURIComponent(token)}`;
     if (entityType) {
       url += `&entity_type=${encodeURIComponent(entityType)}`;

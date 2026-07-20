@@ -75,6 +75,15 @@ describe('DashboardPage', () => {
       }
       return Promise.resolve(emptyResponse);
     });
+    vi.stubGlobal(
+      'EventSource',
+      class {
+        readyState = 1;
+        onerror = null;
+        addEventListener = vi.fn();
+        close = vi.fn();
+      }
+    );
   });
 
   it('renders clients without crashing when backend returns wrapped clients', async () => {

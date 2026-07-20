@@ -14,21 +14,70 @@ import { StatCard } from '@/components/shared/StatCard';
 import { TrafficAreaChart } from '@/components/charts/TrafficAreaChart';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { clientsApi } from '@/api/client';
-import { useMetrics } from '@/api/hooks';
+import { useMetrics, useStatsSummary, useStatsStream } from '@/api/hooks';
+import { formatBytes } from '@/utils/format';
 import {
   Users,
   Activity,
   ArrowDown,
   ArrowUp,
   ExternalLink,
+  Network,
+  Shield,
+  Globe,
 } from 'lucide-react';
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+function StatsOverview() {
+  const { data: summary, isLoading } = useStatsSummary();
+  useStatsStream();
+
+  const cards = [
+    {
+      title: 'Clients',
+      icon: <Users className="h-4 w-4" />,
+      entity: summary?.clients,
+    },
+    {
+      title: 'Reverse Proxy',
+      icon: <Network className="h-4 w-4" />,
+      entity: summary?.proxy,
+    },
+    {
+      title: 'Shadowsocks',
+      icon: <Shield className="h-4 w-4" />,
+      entity: summary?.shadowsocks,
+    },
+    {
+      title: 'Trojan',
+      icon: <Globe className="h-4 w-4" />,
+      entity: summary?.trojan,
+    },
+  ];
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
+      {cards.map((card) => (
+        <StatCard
+          key={card.title}
+          title={card.title}
+          value={
+            isLoading
+              ? '—'
+              : formatBytes(
+                  (card.entity?.total_bytes_in ?? 0) +
+                    (card.entity?.total_bytes_out ?? 0)
+                )
+          }
+          description={
+            isLoading
+              ? undefined
+              : `${card.entity?.total_conns ?? 0} connections · ${card.entity?.entity_count ?? 0} entities`
+          }
+          icon={card.icon}
+        />
+      ))}
+    </div>
+  );
 }
 
 export default function DashboardPage() {
@@ -51,6 +100,9 @@ export default function DashboardPage() {
         title="Dashboard"
         description="Overview of your tunnel connections"
       />
+
+      {/* Unified Stats Overview */}
+      <StatsOverview />
 
       {/* Stats Grid */}
       <div className="grid gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
