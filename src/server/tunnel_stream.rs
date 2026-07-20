@@ -23,11 +23,18 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::common::ControlMessage;
+use crate::server::stats::{EntityType, StatsCollector};
 
 /// Max payload of a single `Data` message. Chosen well under the 1 MiB
 /// serialize cap in `common::protocol` so header/framing overhead fits
 /// comfortably, and aligned with `tokio::io::copy` default buffer size.
 const MAX_CHUNK: usize = 64 * 1024;
+
+/// 绑定的统计上下文：按 client_name 记录流量与连接数。
+struct StreamStats {
+    collector: StatsCollector,
+    entity_id: String,
+}
 
 pub struct ClientTunnelStream {
     connection_id: u64,
@@ -39,6 +46,8 @@ pub struct ClientTunnelStream {
     /// Set once `poll_shutdown` or drop has emitted `Close`. Subsequent writes
     /// return `BrokenPipe`, subsequent shutdowns are no-ops.
     closed: bool,
+    /// 统计上下文（None = 不记录，测试用）
+    stats: Option<StreamStats>,
 }
 
 impl ClientTunnelStream {
@@ -54,6 +63,28 @@ impl ClientTunnelStream {
             inbound,
             read_remainder: Vec::new(),
             closed: false,
+            stats: None,
+        }
+    }
+
+    /// 绑定统计上下文：绑定即视为 tunnel 打开（incr_conns），Drop 时
+    /// 视为关闭（decr_conns），读写时按 client_name 累计流量。
+    #[must_use]
+    pub fn with_stats(mut self, collector: StatsCollector, client_name: &str) -> Self {
+        collector.incr_conns(EntityType::Client, client_name);
+        self.stats = Some(StreamStats {
+            collector,
+            entity_id: client_name.to_string(),
+        });
+        self
+    }
+
+    /// 服务器 → 客户端方向的字节（bytes_out）
+    fn record_bytes_out(&self, n: u64) {
+        if let Some(stats) = &self.stats {
+            stats
+                .collector
+                .record_bytes(EntityType::Client, &stats.entity_id, 0, n);
         }
     }
 }
@@ -64,27 +95,41 @@ impl AsyncRead for ClientTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
         // Drain leftover from a previous partial read first.
-        if !self.read_remainder.is_empty() {
+        let result = if !self.read_remainder.is_empty() {
             let n = std::cmp::min(self.read_remainder.len(), buf.remaining());
             buf.put_slice(&self.read_remainder[..n]);
             self.read_remainder.drain(..n);
-            return Poll::Ready(Ok(()));
-        }
-        match self.inbound.poll_recv(cx) {
-            Poll::Ready(Some(mut bytes)) => {
-                let n = std::cmp::min(bytes.len(), buf.remaining());
-                buf.put_slice(&bytes[..n]);
-                if n < bytes.len() {
-                    bytes.drain(..n);
-                    self.read_remainder = bytes;
+            Poll::Ready(Ok(()))
+        } else {
+            match self.inbound.poll_recv(cx) {
+                Poll::Ready(Some(mut bytes)) => {
+                    let n = std::cmp::min(bytes.len(), buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        bytes.drain(..n);
+                        self.read_remainder = bytes;
+                    }
+                    Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Ok(()))
+                // Inbound channel closed → EOF: leave buf untouched, return Ok(())
+                Poll::Ready(None) => Poll::Ready(Ok(())),
+                Poll::Pending => Poll::Pending,
             }
-            // Inbound channel closed → EOF: leave buf untouched, return Ok(())
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
+        };
+        // 客户端 → 服务器方向的字节（bytes_in）
+        if let Poll::Ready(Ok(())) = &result {
+            let n = (buf.filled().len() - filled_before) as u64;
+            if n > 0 {
+                if let Some(stats) = &self.stats {
+                    stats
+                        .collector
+                        .record_bytes(EntityType::Client, &stats.entity_id, n, 0);
+                }
+            }
         }
+        result
     }
 }
 
@@ -111,6 +156,7 @@ impl AsyncWrite for ClientTunnelStream {
                     connection_id: cid,
                     data: buf[..chunk_len].to_vec(),
                 });
+                this.record_bytes_out(chunk_len as u64);
                 return Poll::Ready(Ok(chunk_len));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -134,6 +180,7 @@ impl AsyncWrite for ClientTunnelStream {
                     connection_id: cid,
                     data: buf[..chunk_len].to_vec(),
                 });
+                this.record_bytes_out(chunk_len as u64);
                 Poll::Ready(Ok(chunk_len))
             }
             Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
@@ -167,6 +214,12 @@ impl AsyncWrite for ClientTunnelStream {
 
 impl Drop for ClientTunnelStream {
     fn drop(&mut self) {
+        // tunnel 关闭：无论何种退出路径都 decr_conns（与 with_stats 的 incr 配对）
+        if let Some(stats) = &self.stats {
+            stats
+                .collector
+                .decr_conns(EntityType::Client, &stats.entity_id);
+        }
         if self.closed {
             return;
         }
@@ -338,5 +391,44 @@ mod tests {
         let mut buf = [0u8; 3];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"bar");
+    }
+
+    /// with_stats 绑定即 incr_conns，Drop 时 decr_conns（覆盖所有退出路径）。
+    #[tokio::test]
+    async fn test_stats_incr_on_bind_decr_on_drop() {
+        use crate::server::stats::StatsCollector;
+        let collector = StatsCollector::new(None);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(8);
+        let stream =
+            ClientTunnelStream::new(1, ctl_tx, inbound_rx).with_stats(collector.clone(), "c1");
+        assert_eq!(collector.get_summary().clients.total_conns, 1);
+        drop(stream);
+        assert_eq!(collector.get_summary().clients.total_conns, 0);
+    }
+
+    /// 读写双向流量按 client_name 累计到 StatsCollector。
+    #[tokio::test]
+    async fn test_stats_bytes_recorded_on_read_write() {
+        use crate::server::stats::StatsCollector;
+        let collector = StatsCollector::new(None);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let (inbound_tx, inbound_rx) = mpsc::channel(8);
+        let mut stream =
+            ClientTunnelStream::new(1, ctl_tx, inbound_rx).with_stats(collector.clone(), "c1");
+
+        // 服务器 → 客户端（bytes_out）
+        stream.write_all(b"hello").await.unwrap();
+        let _ = ctl_rx.recv().await;
+
+        // 客户端 → 服务器（bytes_in）
+        inbound_tx.send(b"world".to_vec()).await.unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+
+        let summary = collector.get_summary();
+        assert_eq!(summary.clients.total_bytes_out, 5);
+        assert_eq!(summary.clients.total_bytes_in, 5);
+        assert_eq!(summary.clients.entity_count, 1);
     }
 }

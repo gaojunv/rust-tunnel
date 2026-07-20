@@ -74,6 +74,8 @@ pub struct ClientEntry {
 pub struct ClientRegistry {
     entries: Arc<RwLock<HashMap<String, Arc<ClientEntry>>>>,
     db: Database,
+    /// 统一统计采集器（None = 不记录，测试默认）
+    stats_collector: Option<crate::server::stats::StatsCollector>,
 }
 
 impl ClientRegistry {
@@ -81,7 +83,14 @@ impl ClientRegistry {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             db,
+            stats_collector: None,
         }
+    }
+
+    /// 挂上统一统计采集器；之后的 open_tunnel 会按 client_name 记录
+    /// 连接数与流量。
+    pub fn set_stats_collector(&mut self, collector: crate::server::stats::StatsCollector) {
+        self.stats_collector = Some(collector);
     }
 
     /// Register a client. On success returns the entry; if a same-name entry
@@ -257,11 +266,19 @@ impl ClientRegistry {
         };
 
         match outcome {
-            TunnelOpenOutcome::Ok => Ok(crate::server::tunnel_stream::ClientTunnelStream::new(
-                cid,
-                entry.control_sender.clone(),
-                inbound_rx,
-            )),
+            TunnelOpenOutcome::Ok => {
+                let stream = crate::server::tunnel_stream::ClientTunnelStream::new(
+                    cid,
+                    entry.control_sender.clone(),
+                    inbound_rx,
+                );
+                // 挂上统计：tunnel 打开计数 + 后续双向流量按 client_name 累计
+                let stream = match &self.stats_collector {
+                    Some(collector) => stream.with_stats(collector.clone(), client_name),
+                    None => stream,
+                };
+                Ok(stream)
+            }
             TunnelOpenOutcome::Failed(err) => {
                 // Clean up connection entry on failure
                 let mut conns = entry.active_connections.lock().await;
