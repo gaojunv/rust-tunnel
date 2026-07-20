@@ -56,36 +56,17 @@ impl Database {
             .execute(pool)
             .await?;
 
-        // Port traffic aggregate table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS port_traffic (
-                port INTEGER PRIMARY KEY,
-                total_bytes_in BIGINT NOT NULL DEFAULT 0,
-                total_bytes_out BIGINT NOT NULL DEFAULT 0,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Traffic buckets (minute-level)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS traffic_buckets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                port INTEGER NOT NULL,
-                timestamp DATETIME NOT NULL,
-                bytes_in BIGINT NOT NULL DEFAULT 0,
-                bytes_out BIGINT NOT NULL DEFAULT 0,
-                UNIQUE(port, timestamp)
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
+        // Schema v2 migration: drop legacy stats tables replaced by stats_snapshots
+        for tbl in &[
+            "traffic_buckets",
+            "port_traffic",
+            "proxy_traffic",
+            "connection_quality_history",
+        ] {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {}", tbl))
+                .execute(pool)
+                .await?;
+        }
 
         // Client session history
         sqlx::query(
@@ -103,51 +84,10 @@ impl Database {
         .execute(pool)
         .await?;
 
-        // Connection quality history
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS connection_quality_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                port INTEGER NOT NULL,
-                timestamp TEXT NOT NULL,
-                avg_rtt_ms REAL NOT NULL,
-                min_rtt_ms REAL NOT NULL,
-                max_rtt_ms REAL NOT NULL,
-                loss_rate REAL NOT NULL,
-                bytes_in_per_sec REAL NOT NULL,
-                bytes_out_per_sec REAL NOT NULL,
-                quality_score INTEGER NOT NULL,
-                is_warning INTEGER NOT NULL,
-                is_critical INTEGER NOT NULL
-            )
-            "#,
-        )
-        .execute(pool)
-        .await?;
-
         // Create indexes
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_traffic_buckets_port ON traffic_buckets(port)")
-            .execute(pool)
-            .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_traffic_buckets_timestamp ON traffic_buckets(timestamp)",
-        )
-        .execute(pool)
-        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_client_sessions_port ON client_sessions(port)")
             .execute(pool)
             .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_quality_port ON connection_quality_history(port)",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_quality_timestamp ON connection_quality_history(timestamp)",
-        )
-        .execute(pool)
-        .await?;
-
         // Shadowsocks configuration table
         sqlx::query(
             r#"
@@ -303,25 +243,33 @@ impl Database {
             .execute(pool)
             .await?;
 
-        // Proxy traffic statistics table
+        // ── Unified stats snapshots (replaces proxy_traffic / connection_quality_history) ──
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS proxy_traffic (
-                rule_id TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                bytes_in BIGINT NOT NULL DEFAULT 0,
-                bytes_out BIGINT NOT NULL DEFAULT 0,
-                connections INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (rule_id, timestamp),
-                FOREIGN KEY (rule_id) REFERENCES proxy_rules(id) ON DELETE CASCADE
+            CREATE TABLE IF NOT EXISTS stats_snapshots (
+                entity_type  TEXT NOT NULL,
+                entity_id    TEXT NOT NULL,
+                timestamp    DATETIME NOT NULL,
+                bytes_in     BIGINT NOT NULL DEFAULT 0,
+                bytes_out    BIGINT NOT NULL DEFAULT 0,
+                bytes_in_rate  REAL NOT NULL DEFAULT 0.0,
+                bytes_out_rate REAL NOT NULL DEFAULT 0.0,
+                rtt_ms       REAL,
+                loss_pct     REAL,
+                active_conns INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (entity_type, entity_id, timestamp)
             )
             "#,
         )
         .execute(pool)
         .await?;
-
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_proxy_traffic_timestamp ON proxy_traffic(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_stats_snapshots_type ON stats_snapshots(entity_type, timestamp)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_stats_snapshots_entity ON stats_snapshots(entity_type, entity_id, timestamp)",
         )
         .execute(pool)
         .await?;
@@ -1542,6 +1490,59 @@ impl Database {
     }
 
     // ============================================================
+    // Stats snapshots methods
+    // ============================================================
+
+    /// Query stats snapshots within a time range, optionally filtered.
+    pub async fn query_stats_snapshots(
+        &self,
+        entity_types: &[String],
+        entity_ids: &[String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<StatsSnapshotRow>, sqlx::Error> {
+        let mut sql = String::from(
+            "SELECT entity_type, entity_id, timestamp, bytes_in, bytes_out, \
+             bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns \
+             FROM stats_snapshots WHERE timestamp >= ? AND timestamp <= ?",
+        );
+        let mut param_idx = 3;
+        if !entity_types.is_empty() {
+            let placeholders: Vec<String> =
+                (0..entity_types.len()).map(|i| format!("?{}", param_idx + i)).collect();
+            sql.push_str(&format!(" AND entity_type IN ({})", placeholders.join(",")));
+            param_idx += entity_types.len();
+        }
+        if !entity_ids.is_empty() {
+            let placeholders: Vec<String> =
+                (0..entity_ids.len()).map(|i| format!("?{}", param_idx + i)).collect();
+            sql.push_str(&format!(" AND entity_id IN ({})", placeholders.join(",")));
+        }
+        sql.push_str(" ORDER BY timestamp");
+
+        let mut query = sqlx::query_as::<_, StatsSnapshotRow>(&sql).bind(start).bind(end);
+        for et in entity_types {
+            query = query.bind(et);
+        }
+        for eid in entity_ids {
+            query = query.bind(eid);
+        }
+        query.fetch_all(&self.pool).await
+    }
+
+    /// Delete stats snapshots older than the given timestamp.
+    pub async fn cleanup_old_stats_snapshots(
+        &self,
+        before: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM stats_snapshots WHERE timestamp < ?")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    // ============================================================
     // ACME Certificate methods
     // ============================================================
 
@@ -2147,6 +2148,21 @@ pub struct ProxyRuleRecord {
     pub cert_source: Option<String>,
     pub cert_covering_domain: Option<String>,
     pub cert_status_updated_at: Option<DateTime<Utc>>,
+}
+
+/// DB row mirroring stats_snapshots
+#[derive(Debug, Clone, FromRow)]
+pub struct StatsSnapshotRow {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub bytes_in: i64,
+    pub bytes_out: i64,
+    pub bytes_in_rate: f64,
+    pub bytes_out_rate: f64,
+    pub rtt_ms: Option<f64>,
+    pub loss_pct: Option<f64>,
+    pub active_conns: i32,
 }
 
 /// Proxy traffic record from database
