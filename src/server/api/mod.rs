@@ -413,27 +413,27 @@ mod tests {
         assert_eq!(traffic.total_bytes_in, 100);
         assert_eq!(traffic.total_bytes_out, 200);
     }
-// 
-//     #[tokio::test]
-//     async fn test_traffic_store_load_from_db() {
-//         let db = Database::new(":memory:").await.unwrap();
-// 
-//         // Pre-populate database
-//         db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
-//         db.upsert_port_traffic(9000, 200, 400).await.unwrap();
-// 
-//         // Create store and load from DB
-//         let store = TrafficStore::with_db(db);
-//         store.load_from_db().await.unwrap();
-// 
-//         let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
-//         assert_eq!(traffic_8080.total_bytes_in, 500);
-//         assert_eq!(traffic_8080.total_bytes_out, 1000);
-// 
-//         let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
-//         assert_eq!(traffic_9000.total_bytes_in, 200);
-//         assert_eq!(traffic_9000.total_bytes_out, 400);
-//     }
+    //
+    //     #[tokio::test]
+    //     async fn test_traffic_store_load_from_db() {
+    //         let db = Database::new(":memory:").await.unwrap();
+    //
+    //         // Pre-populate database
+    //         db.upsert_port_traffic(8080, 500, 1000).await.unwrap();
+    //         db.upsert_port_traffic(9000, 200, 400).await.unwrap();
+    //
+    //         // Create store and load from DB
+    //         let store = TrafficStore::with_db(db);
+    //         store.load_from_db().await.unwrap();
+    //
+    //         let traffic_8080 = store.get_port_traffic(8080).await.unwrap();
+    //         assert_eq!(traffic_8080.total_bytes_in, 500);
+    //         assert_eq!(traffic_8080.total_bytes_out, 1000);
+    //
+    //         let traffic_9000 = store.get_port_traffic(9000).await.unwrap();
+    //         assert_eq!(traffic_9000.total_bytes_in, 200);
+    //         assert_eq!(traffic_9000.total_bytes_out, 400);
+    //     }
 
     #[tokio::test]
     async fn test_traffic_store_bucket_time_truncation() {
@@ -740,10 +740,9 @@ mod tests {
             100,
             200,
         );
-        server_state.stats_collector.incr_conns(
-            crate::server::stats::EntityType::Client,
-            "home-nas",
-        );
+        server_state
+            .stats_collector
+            .incr_conns(crate::server::stats::EntityType::Client, "home-nas");
 
         let state = ApiState {
             server_state,
@@ -857,7 +856,6 @@ mod tests {
         let resp = response.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-
 }
 
 /// Log entry response
@@ -2479,8 +2477,6 @@ async fn delete_proxy_rule(
 
 // ── Stats Unified API ────────────────────────────────────────────
 
-use crate::server::stats::StatsSnapshot;
-
 #[derive(Debug, Deserialize)]
 struct StatsQueryParams {
     entity_type: Option<Vec<String>>,
@@ -2502,31 +2498,58 @@ async fn get_stats_query(
 ) -> impl IntoResponse {
     let start = match chrono::DateTime::parse_from_rfc3339(&params.start) {
         Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid start: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid start: {}", e)})),
+            )
+                .into_response()
+        }
     };
     let end = match chrono::DateTime::parse_from_rfc3339(&params.end) {
         Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid end: {}", e)}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid end: {}", e)})),
+            )
+                .into_response()
+        }
     };
     if (end - start) > chrono::Duration::days(7) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Range <= 7 days"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Range <= 7 days"})),
+        )
+            .into_response();
     }
     let entity_types = params.entity_type.unwrap_or_default();
     let entity_ids = params.entity_id.unwrap_or_default();
     let db = match state.server_state.get_db() {
         Some(db) => db,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "No DB"}))).into_response(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "No DB"})),
+            )
+                .into_response()
+        }
     };
-    match db.query_stats_snapshots(&entity_types, &entity_ids, start, end).await {
+    match db
+        .query_stats_snapshots(&entity_types, &entity_ids, start, end)
+        .await
+    {
         Ok(snapshots) => Json(serde_json::json!({"snapshots": snapshots})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // GET /api/stats/summary
-async fn get_stats_summary(
-    State(state): State<ApiState>,
-) -> impl IntoResponse {
+async fn get_stats_summary(State(state): State<ApiState>) -> impl IntoResponse {
     Json(state.server_state.stats_collector.get_summary()).into_response()
 }
 
@@ -2537,7 +2560,9 @@ async fn sse_stats_stream(
 ) -> impl IntoResponse {
     if state.auth_config.is_enabled() {
         let token = params.token.as_deref().unwrap_or("");
-        if !token.is_empty() && crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_err() {
+        if !token.is_empty()
+            && crate::server::auth::validate_token(token, &state.auth_config.jwt_secret).is_err()
+        {
             return axum::response::Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .body(Body::from("Unauthorized"))
@@ -2573,7 +2598,9 @@ async fn sse_stats_stream(
         }
     };
     axum::response::sse::Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(30)))
+        .keep_alive(
+            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(30)),
+        )
         .into_response()
 }
 

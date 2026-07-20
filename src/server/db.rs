@@ -1508,19 +1508,23 @@ impl Database {
         );
         let mut param_idx = 3;
         if !entity_types.is_empty() {
-            let placeholders: Vec<String> =
-                (0..entity_types.len()).map(|i| format!("?{}", param_idx + i)).collect();
+            let placeholders: Vec<String> = (0..entity_types.len())
+                .map(|i| format!("?{}", param_idx + i))
+                .collect();
             sql.push_str(&format!(" AND entity_type IN ({})", placeholders.join(",")));
             param_idx += entity_types.len();
         }
         if !entity_ids.is_empty() {
-            let placeholders: Vec<String> =
-                (0..entity_ids.len()).map(|i| format!("?{}", param_idx + i)).collect();
+            let placeholders: Vec<String> = (0..entity_ids.len())
+                .map(|i| format!("?{}", param_idx + i))
+                .collect();
             sql.push_str(&format!(" AND entity_id IN ({})", placeholders.join(",")));
         }
         sql.push_str(" ORDER BY timestamp");
 
-        let mut query = sqlx::query_as::<_, StatsSnapshotRow>(&sql).bind(start).bind(end);
+        let mut query = sqlx::query_as::<_, StatsSnapshotRow>(&sql)
+            .bind(start)
+            .bind(end);
         for et in entity_types {
             query = query.bind(et);
         }
@@ -2236,7 +2240,7 @@ mod tests {
             .await
             .expect("Failed to create in-memory database")
     }
-// 
+    //
 
     #[tokio::test]
     async fn test_stats_snapshots_empty_query() {
@@ -2257,7 +2261,8 @@ mod tests {
     async fn test_stats_snapshots_filter_by_type() {
         let db = create_test_db().await;
         let now = chrono::Utc::now();
-        let ts = now - chrono::Duration::seconds(now.second() as i64)
+        let ts = now
+            - chrono::Duration::seconds(now.second() as i64)
             - chrono::Duration::nanoseconds(now.nanosecond() as i64);
         // Insert test data directly
         sqlx::query(
@@ -2310,7 +2315,8 @@ mod tests {
     async fn test_stats_snapshots_filter_by_id() {
         let db = create_test_db().await;
         let now = chrono::Utc::now();
-        let ts = now - chrono::Duration::seconds(now.second() as i64)
+        let ts = now
+            - chrono::Duration::seconds(now.second() as i64)
             - chrono::Duration::nanoseconds(now.nanosecond() as i64);
         sqlx::query(
             "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2427,93 +2433,93 @@ mod tests {
         assert_eq!(rows[0].entity_id, "rule2");
     }
 
-//     #[tokio::test]
-//     async fn test_database_new() {
-//         let db = create_test_db().await;
-//         // Verify it works by doing a simple operation
-//         db.upsert_port_traffic(8080, 0, 0).await.unwrap();
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_upsert_port_traffic_insert() {
-//         let db = create_test_db().await;
-// 
-//         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
-// 
-//         let records = db.load_port_traffic().await.unwrap();
-//         assert_eq!(records.len(), 1);
-//         assert_eq!(records[0].port, 8080);
-//         assert_eq!(records[0].total_bytes_in, 100);
-//         assert_eq!(records[0].total_bytes_out, 200);
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_upsert_port_traffic_update() {
-//         let db = create_test_db().await;
-// 
-//         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
-//         db.upsert_port_traffic(8080, 50, 75).await.unwrap();
-// 
-//         let records = db.load_port_traffic().await.unwrap();
-//         assert_eq!(records.len(), 1);
-//         assert_eq!(records[0].total_bytes_in, 150); // 100 + 50
-//         assert_eq!(records[0].total_bytes_out, 275); // 200 + 75
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_upsert_port_traffic_multiple_ports() {
-//         let db = create_test_db().await;
-// 
-//         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
-//         db.upsert_port_traffic(9000, 300, 400).await.unwrap();
-// 
-//         let records = db.load_port_traffic().await.unwrap();
-//         assert_eq!(records.len(), 2);
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_get_port_aggregates() {
-//         let db = create_test_db().await;
-// 
-//         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
-// 
-//         let result = db.get_port_aggregates(8080).await.unwrap();
-//         assert!(result.is_some());
-//         let (bytes_in, bytes_out) = result.unwrap();
-//         assert_eq!(bytes_in, 100);
-//         assert_eq!(bytes_out, 200);
-// 
-//         let result = db.get_port_aggregates(9999).await.unwrap();
-//         assert!(result.is_none());
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_upsert_traffic_bucket() {
-//         let db = create_test_db().await;
-// 
-//         let ts = Utc::now();
-//         db.upsert_traffic_bucket(8080, ts, 100, 200).await.unwrap();
-// 
-//         let records = db.load_recent_buckets(24).await.unwrap();
-//         assert_eq!(records.len(), 1);
-//         assert_eq!(records[0].port, 8080);
-//         assert_eq!(records[0].bytes_in, 100);
-//         assert_eq!(records[0].bytes_out, 200);
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_upsert_traffic_bucket_accumulate() {
-//         let db = create_test_db().await;
-// 
-//         let ts = Utc::now();
-//         db.upsert_traffic_bucket(8080, ts, 100, 200).await.unwrap();
-//         db.upsert_traffic_bucket(8080, ts, 50, 75).await.unwrap();
-// 
-//         let records = db.load_recent_buckets(24).await.unwrap();
-//         assert_eq!(records.len(), 1);
-//         assert_eq!(records[0].bytes_in, 150);
-//         assert_eq!(records[0].bytes_out, 275);
-//     }
+    //     #[tokio::test]
+    //     async fn test_database_new() {
+    //         let db = create_test_db().await;
+    //         // Verify it works by doing a simple operation
+    //         db.upsert_port_traffic(8080, 0, 0).await.unwrap();
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_upsert_port_traffic_insert() {
+    //         let db = create_test_db().await;
+    //
+    //         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
+    //
+    //         let records = db.load_port_traffic().await.unwrap();
+    //         assert_eq!(records.len(), 1);
+    //         assert_eq!(records[0].port, 8080);
+    //         assert_eq!(records[0].total_bytes_in, 100);
+    //         assert_eq!(records[0].total_bytes_out, 200);
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_upsert_port_traffic_update() {
+    //         let db = create_test_db().await;
+    //
+    //         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
+    //         db.upsert_port_traffic(8080, 50, 75).await.unwrap();
+    //
+    //         let records = db.load_port_traffic().await.unwrap();
+    //         assert_eq!(records.len(), 1);
+    //         assert_eq!(records[0].total_bytes_in, 150); // 100 + 50
+    //         assert_eq!(records[0].total_bytes_out, 275); // 200 + 75
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_upsert_port_traffic_multiple_ports() {
+    //         let db = create_test_db().await;
+    //
+    //         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
+    //         db.upsert_port_traffic(9000, 300, 400).await.unwrap();
+    //
+    //         let records = db.load_port_traffic().await.unwrap();
+    //         assert_eq!(records.len(), 2);
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_get_port_aggregates() {
+    //         let db = create_test_db().await;
+    //
+    //         db.upsert_port_traffic(8080, 100, 200).await.unwrap();
+    //
+    //         let result = db.get_port_aggregates(8080).await.unwrap();
+    //         assert!(result.is_some());
+    //         let (bytes_in, bytes_out) = result.unwrap();
+    //         assert_eq!(bytes_in, 100);
+    //         assert_eq!(bytes_out, 200);
+    //
+    //         let result = db.get_port_aggregates(9999).await.unwrap();
+    //         assert!(result.is_none());
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_upsert_traffic_bucket() {
+    //         let db = create_test_db().await;
+    //
+    //         let ts = Utc::now();
+    //         db.upsert_traffic_bucket(8080, ts, 100, 200).await.unwrap();
+    //
+    //         let records = db.load_recent_buckets(24).await.unwrap();
+    //         assert_eq!(records.len(), 1);
+    //         assert_eq!(records[0].port, 8080);
+    //         assert_eq!(records[0].bytes_in, 100);
+    //         assert_eq!(records[0].bytes_out, 200);
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_upsert_traffic_bucket_accumulate() {
+    //         let db = create_test_db().await;
+    //
+    //         let ts = Utc::now();
+    //         db.upsert_traffic_bucket(8080, ts, 100, 200).await.unwrap();
+    //         db.upsert_traffic_bucket(8080, ts, 50, 75).await.unwrap();
+    //
+    //         let records = db.load_recent_buckets(24).await.unwrap();
+    //         assert_eq!(records.len(), 1);
+    //         assert_eq!(records[0].bytes_in, 150);
+    //         assert_eq!(records[0].bytes_out, 275);
+    //     }
 
     #[tokio::test]
     async fn test_record_client_connect_and_disconnect() {
@@ -2535,122 +2541,122 @@ mod tests {
 
         db.record_client_connect(8080, None).await.unwrap();
     }
-// 
-//     #[tokio::test]
-//     async fn test_load_recent_buckets_empty() {
-//         let db = create_test_db().await;
-// 
-//         let records = db.load_recent_buckets(24).await.unwrap();
-//         assert!(records.is_empty());
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_load_port_traffic_empty() {
-//         let db = create_test_db().await;
-// 
-//         let records = db.load_port_traffic().await.unwrap();
-//         assert!(records.is_empty());
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_insert_and_get_quality_history() {
-//         let db = create_test_db().await;
-// 
-//         let now = Utc::now();
-//         db.insert_quality_history(
-//             8080, now, 50.0,   // avg_rtt_ms
-//             30.0,   // min_rtt_ms
-//             100.0,  // max_rtt_ms
-//             0.02,   // loss_rate
-//             1024.0, // bytes_in_per_sec
-//             2048.0, // bytes_out_per_sec
-//             95,     // quality_score
-//             false,  // is_warning
-//             false,  // is_critical
-//         )
-//         .await
-//         .unwrap();
-// 
-//         let start = now - chrono::Duration::hours(1);
-//         let end = now + chrono::Duration::hours(1);
-//         let samples = db.get_quality_history(8080, start, end).await.unwrap();
-//         assert_eq!(samples.len(), 1);
-//         assert_eq!(samples[0].avg_rtt_ms, 50.0);
-//         assert_eq!(samples[0].loss_rate, 0.02);
-//         assert_eq!(samples[0].quality_score, 95);
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_get_quality_history_empty() {
-//         let db = create_test_db().await;
-// 
-//         let now = Utc::now();
-//         let samples = db
-//             .get_quality_history(8080, now - chrono::Duration::hours(1), now)
-//             .await
-//             .unwrap();
-//         assert!(samples.is_empty());
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_get_quality_ports() {
-//         let db = create_test_db().await;
-// 
-//         let now = Utc::now();
-//         db.insert_quality_history(
-//             8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
-//         )
-//         .await
-//         .unwrap();
-//         db.insert_quality_history(
-//             9000, now, 60.0, 40.0, 120.0, 0.05, 2048.0, 4096.0, 90, true, false,
-//         )
-//         .await
-//         .unwrap();
-// 
-//         let ports = db.get_quality_ports(24).await.unwrap();
-//         assert_eq!(ports.len(), 2);
-//         assert!(ports.contains(&8080));
-//         assert!(ports.contains(&9000));
-//     }
-// 
-//     #[tokio::test]
-//     async fn test_cleanup_old_quality_history() {
-//         let db = create_test_db().await;
-// 
-//         let old_time = Utc::now() - chrono::Duration::hours(48);
-//         let recent_time = Utc::now();
-// 
-//         db.insert_quality_history(
-//             8080, old_time, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
-//         )
-//         .await
-//         .unwrap();
-//         db.insert_quality_history(
-//             8080,
-//             recent_time,
-//             60.0,
-//             40.0,
-//             120.0,
-//             0.05,
-//             2048.0,
-//             4096.0,
-//             90,
-//             true,
-//             false,
-//         )
-//         .await
-//         .unwrap();
-// 
-//         // Cleanup records older than 24 hours
-//         let cutoff = Utc::now() - chrono::Duration::hours(24);
-//         db.cleanup_old_quality_history(cutoff).await.unwrap();
-// 
-//         let start = old_time - chrono::Duration::hours(1);
-//         let end = recent_time + chrono::Duration::hours(1);
-//         let samples = db.get_quality_history(8080, start, end).await.unwrap();
-//         assert_eq!(samples.len(), 1); // Only the recent one should remain
-//     }
+    //
+    //     #[tokio::test]
+    //     async fn test_load_recent_buckets_empty() {
+    //         let db = create_test_db().await;
+    //
+    //         let records = db.load_recent_buckets(24).await.unwrap();
+    //         assert!(records.is_empty());
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_load_port_traffic_empty() {
+    //         let db = create_test_db().await;
+    //
+    //         let records = db.load_port_traffic().await.unwrap();
+    //         assert!(records.is_empty());
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_insert_and_get_quality_history() {
+    //         let db = create_test_db().await;
+    //
+    //         let now = Utc::now();
+    //         db.insert_quality_history(
+    //             8080, now, 50.0,   // avg_rtt_ms
+    //             30.0,   // min_rtt_ms
+    //             100.0,  // max_rtt_ms
+    //             0.02,   // loss_rate
+    //             1024.0, // bytes_in_per_sec
+    //             2048.0, // bytes_out_per_sec
+    //             95,     // quality_score
+    //             false,  // is_warning
+    //             false,  // is_critical
+    //         )
+    //         .await
+    //         .unwrap();
+    //
+    //         let start = now - chrono::Duration::hours(1);
+    //         let end = now + chrono::Duration::hours(1);
+    //         let samples = db.get_quality_history(8080, start, end).await.unwrap();
+    //         assert_eq!(samples.len(), 1);
+    //         assert_eq!(samples[0].avg_rtt_ms, 50.0);
+    //         assert_eq!(samples[0].loss_rate, 0.02);
+    //         assert_eq!(samples[0].quality_score, 95);
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_get_quality_history_empty() {
+    //         let db = create_test_db().await;
+    //
+    //         let now = Utc::now();
+    //         let samples = db
+    //             .get_quality_history(8080, now - chrono::Duration::hours(1), now)
+    //             .await
+    //             .unwrap();
+    //         assert!(samples.is_empty());
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_get_quality_ports() {
+    //         let db = create_test_db().await;
+    //
+    //         let now = Utc::now();
+    //         db.insert_quality_history(
+    //             8080, now, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+    //         )
+    //         .await
+    //         .unwrap();
+    //         db.insert_quality_history(
+    //             9000, now, 60.0, 40.0, 120.0, 0.05, 2048.0, 4096.0, 90, true, false,
+    //         )
+    //         .await
+    //         .unwrap();
+    //
+    //         let ports = db.get_quality_ports(24).await.unwrap();
+    //         assert_eq!(ports.len(), 2);
+    //         assert!(ports.contains(&8080));
+    //         assert!(ports.contains(&9000));
+    //     }
+    //
+    //     #[tokio::test]
+    //     async fn test_cleanup_old_quality_history() {
+    //         let db = create_test_db().await;
+    //
+    //         let old_time = Utc::now() - chrono::Duration::hours(48);
+    //         let recent_time = Utc::now();
+    //
+    //         db.insert_quality_history(
+    //             8080, old_time, 50.0, 30.0, 100.0, 0.02, 1024.0, 2048.0, 95, false, false,
+    //         )
+    //         .await
+    //         .unwrap();
+    //         db.insert_quality_history(
+    //             8080,
+    //             recent_time,
+    //             60.0,
+    //             40.0,
+    //             120.0,
+    //             0.05,
+    //             2048.0,
+    //             4096.0,
+    //             90,
+    //             true,
+    //             false,
+    //         )
+    //         .await
+    //         .unwrap();
+    //
+    //         // Cleanup records older than 24 hours
+    //         let cutoff = Utc::now() - chrono::Duration::hours(24);
+    //         db.cleanup_old_quality_history(cutoff).await.unwrap();
+    //
+    //         let start = old_time - chrono::Duration::hours(1);
+    //         let end = recent_time + chrono::Duration::hours(1);
+    //         let samples = db.get_quality_history(8080, start, end).await.unwrap();
+    //         assert_eq!(samples.len(), 1); // Only the recent one should remain
+    //     }
 
     #[tokio::test]
     async fn test_shadowsocks_config_crud() {

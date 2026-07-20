@@ -569,7 +569,10 @@ async fn main() -> TunnelResult<()> {
         loop {
             interval.tick().await;
             let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
-            if let Err(e) = db_for_stats_cleanup.cleanup_old_stats_snapshots(seven_days_ago).await {
+            if let Err(e) = db_for_stats_cleanup
+                .cleanup_old_stats_snapshots(seven_days_ago)
+                .await
+            {
                 tracing::warn!("Failed to cleanup old stats snapshots: {}", e);
             }
         }

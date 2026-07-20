@@ -994,47 +994,47 @@ mod mod_tests {
         assert_eq!(r1.connections, 1);
         assert_eq!(map.get("r2").unwrap().connections, 2);
     }
-// 
-//     #[tokio::test]
-//     async fn flush_traffic_to_db_persists_and_drains() {
-//         let db = crate::server::db::Database::new(":memory:").await.unwrap();
-//         let state = ReverseProxyState::with_db(db.clone());
-// 
-//         // proxy_traffic has a FK to proxy_rules — the rule must exist first
-//         let rule = ProxyRule {
-//             id: "r1".into(),
-//             name: "r1".into(),
-//             rule_type: RuleType::Http,
-//             listen: "0.0.0.0:80".into(),
-//             domains: vec![],
-//             routes: vec![],
-//             tls: None,
-//             enabled: true,
-//             created_at: None,
-//             cert_status: None,
-//         };
-//         state.save_rule(&rule).await.unwrap();
-// 
-//         state.record_traffic("r1", 100, 200, 2);
-//         state.record_traffic("r1", 10, 20, 0);
-//         state.flush_traffic_to_db().await.unwrap();
-// 
-//         // Pending map must be drained after a successful flush
-//         assert!(state.traffic_pending.lock().unwrap().is_empty());
-// 
-//         let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
-//         assert_eq!(total_connections, 2);
-//         assert_eq!(bytes_in, 110);
-//         assert_eq!(bytes_out, 220);
-// 
-//         // A second flush within the same minute merges into the same bucket row
-//         state.record_traffic("r1", 5, 5, 1);
-//         state.flush_traffic_to_db().await.unwrap();
-//         let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
-//         assert_eq!(total_connections, 3);
-//         assert_eq!(bytes_in, 115);
-//         assert_eq!(bytes_out, 225);
-//     }
+    //
+    //     #[tokio::test]
+    //     async fn flush_traffic_to_db_persists_and_drains() {
+    //         let db = crate::server::db::Database::new(":memory:").await.unwrap();
+    //         let state = ReverseProxyState::with_db(db.clone());
+    //
+    //         // proxy_traffic has a FK to proxy_rules — the rule must exist first
+    //         let rule = ProxyRule {
+    //             id: "r1".into(),
+    //             name: "r1".into(),
+    //             rule_type: RuleType::Http,
+    //             listen: "0.0.0.0:80".into(),
+    //             domains: vec![],
+    //             routes: vec![],
+    //             tls: None,
+    //             enabled: true,
+    //             created_at: None,
+    //             cert_status: None,
+    //         };
+    //         state.save_rule(&rule).await.unwrap();
+    //
+    //         state.record_traffic("r1", 100, 200, 2);
+    //         state.record_traffic("r1", 10, 20, 0);
+    //         state.flush_traffic_to_db().await.unwrap();
+    //
+    //         // Pending map must be drained after a successful flush
+    //         assert!(state.traffic_pending.lock().unwrap().is_empty());
+    //
+    //         let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
+    //         assert_eq!(total_connections, 2);
+    //         assert_eq!(bytes_in, 110);
+    //         assert_eq!(bytes_out, 220);
+    //
+    //         // A second flush within the same minute merges into the same bucket row
+    //         state.record_traffic("r1", 5, 5, 1);
+    //         state.flush_traffic_to_db().await.unwrap();
+    //         let (_, _, total_connections, bytes_in, bytes_out) = db.get_proxy_stats().await.unwrap();
+    //         assert_eq!(total_connections, 3);
+    //         assert_eq!(bytes_in, 115);
+    //         assert_eq!(bytes_out, 225);
+    //     }
 
     #[test]
     fn backend_kind_defaults_to_direct_on_missing() {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Instant;
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -92,9 +92,14 @@ impl EntityStats {
     fn record_bytes(&mut self, bytes_in: u64, bytes_out: u64) {
         self.bytes_in += bytes_in;
         self.bytes_out += bytes_out;
-        self.rate_window.push_back((Instant::now(), self.bytes_in, self.bytes_out));
+        self.rate_window
+            .push_back((Instant::now(), self.bytes_in, self.bytes_out));
         let cutoff = Instant::now() - std::time::Duration::from_secs(60);
-        while self.rate_window.front().map_or(false, |(t, _, _)| *t < cutoff) {
+        while self
+            .rate_window
+            .front()
+            .is_some_and(|(t, _, _)| *t < cutoff)
+        {
             self.rate_window.pop_front();
         }
     }
@@ -125,7 +130,12 @@ impl EntityStats {
         Some(sorted[sorted.len() / 2])
     }
 
-    fn snapshot(&self, entity_type: EntityType, entity_id: &str, ts: DateTime<Utc>) -> StatsSnapshot {
+    fn snapshot(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        ts: DateTime<Utc>,
+    ) -> StatsSnapshot {
         StatsSnapshot {
             entity_type: entity_type.as_str().to_string(),
             entity_id: entity_id.to_string(),
@@ -170,7 +180,13 @@ impl StatsCollector {
     // ── Recording API (called from connection handlers) ───────────
 
     /// Record traffic bytes for an entity.
-    pub fn record_bytes(&self, entity_type: EntityType, entity_id: &str, bytes_in: u64, bytes_out: u64) {
+    pub fn record_bytes(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) {
         if bytes_in == 0 && bytes_out == 0 {
             return;
         }
@@ -184,7 +200,9 @@ impl StatsCollector {
     pub fn record_rtt(&self, entity_type: EntityType, entity_id: &str, rtt_ms: f64) {
         let key = (entity_type, entity_id.to_string());
         let mut map = self.inner.lock().unwrap();
-        map.entry(key).or_insert_with(EntityStats::new).push_rtt(rtt_ms);
+        map.entry(key)
+            .or_insert_with(EntityStats::new)
+            .push_rtt(rtt_ms);
     }
 
     /// Increment active connection count.
