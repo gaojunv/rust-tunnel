@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  api,
   login,
   getMetrics,
   getPortQuality,
@@ -431,7 +432,6 @@ export function useStatsQuery(
       entityId?.forEach((eid) => params.append('entity_id', eid));
       if (start) params.set('start', start);
       if (end) params.set('end', end);
-      const { default: api } = await import('./client');
       const res = await api.get<{ snapshots: StatsSnapshot[] }>(`/api/stats/query?${params}`);
       return res.data.snapshots;
     },
@@ -443,7 +443,6 @@ export function useStatsSummary() {
   return useQuery({
     queryKey: ['stats', 'summary'],
     queryFn: async () => {
-      const { default: api } = await import('./client');
       const res = await api.get<StatsSummary>('/api/stats/summary');
       return res.data;
     },
