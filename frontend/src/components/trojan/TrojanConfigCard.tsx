@@ -100,6 +100,7 @@ export default function TrojanConfigCard() {
               value={tjPassword}
               onChange={(e) => setTjPassword(e.target.value)}
               placeholder={tjConfig?.enabled ? '••••••••' : 'Enter password'}
+              autoComplete="new-password"
             />
             <p className="text-xs text-muted-foreground">
               {tjConfig?.enabled ? 'Leave blank to keep current password' : 'Required to enable'}

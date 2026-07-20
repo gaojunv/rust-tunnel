@@ -31,12 +31,31 @@ pub trait CertificateProvider: Send + Sync {
     async fn get_tls_server_config(&self, domain: &str) -> Option<Arc<ServerConfig>>;
 }
 
+/// 合并叶子证书与中间证书链 PEM。
+///
+/// ACME 签发时叶子证书存 cert.pem、中间证书存 chain.pem，
+/// 构建 TLS 配置时必须拼接完整链，否则只发叶子证书，
+/// 严格校验的客户端无法构建到根 CA 的链路（握手失败）。
+fn full_chain_pem(entry: &CertEntry) -> String {
+    match &entry.chain_pem {
+        Some(chain) if !chain.trim().is_empty() => {
+            let mut pem = entry.cert_pem.clone();
+            if !pem.ends_with('\n') {
+                pem.push('\n');
+            }
+            pem.push_str(chain);
+            pem
+        }
+        _ => entry.cert_pem.clone(),
+    }
+}
+
 /// Helper function to create ServerConfig from CertEntry
 pub fn create_server_config_from_entry(entry: &CertEntry) -> anyhow::Result<Arc<ServerConfig>> {
     use rustls_pemfile::certs;
 
-    // Parse certificate chain
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut entry.cert_pem.as_bytes())
+    // Parse certificate chain（叶子 + 中间证书）
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut full_chain_pem(entry).as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
 
@@ -81,7 +100,7 @@ pub fn build_certified_key(
     use rustls_pemfile::certs;
     use std::sync::Arc;
 
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut entry.cert_pem.as_bytes())
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut full_chain_pem(entry).as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
 
@@ -132,5 +151,52 @@ mod provider_tests {
             source: CertSource::Manual,
         };
         assert!(build_certified_key(&entry).is_err());
+    }
+
+    // 回归：ACME 签发时叶子存 cert.pem、中间证书存 chain.pem，
+    // 构建 TLS 配置必须拼接完整链，否则客户端无法验证到根 CA
+    #[test]
+    fn test_build_certified_key_includes_chain_pem() {
+        let (leaf_pem, key_pem) = gen_self_signed_pem();
+        let (intermediate_pem, _) = gen_self_signed_pem();
+        let entry = CertEntry {
+            cert_pem: leaf_pem,
+            key_pem,
+            chain_pem: Some(intermediate_pem),
+            expires_at: None,
+            source: CertSource::Acme,
+        };
+        let ck = build_certified_key(&entry).expect("should build CertifiedKey");
+        assert_eq!(ck.cert.len(), 2, "应包含叶子证书 + 中间证书");
+    }
+
+    #[test]
+    fn test_create_server_config_includes_chain_pem() {
+        let (leaf_pem, key_pem) = gen_self_signed_pem();
+        let (intermediate_pem, _) = gen_self_signed_pem();
+        let entry = CertEntry {
+            cert_pem: leaf_pem,
+            key_pem,
+            chain_pem: Some(intermediate_pem),
+            expires_at: None,
+            source: CertSource::Acme,
+        };
+        // ServerConfig 不暴露证书列表，通过合并函数间接验证
+        let pem = full_chain_pem(&entry);
+        let count = rustls_pemfile::certs(&mut pem.as_bytes()).count();
+        assert_eq!(count, 2, "合并后应包含 2 张证书");
+        assert!(create_server_config_from_entry(&entry).is_ok());
+    }
+
+    #[test]
+    fn test_full_chain_pem_ignores_empty_chain() {
+        let entry = CertEntry {
+            cert_pem: "leaf\n".to_string(),
+            key_pem: String::new(),
+            chain_pem: Some("   \n".to_string()),
+            expires_at: None,
+            source: CertSource::Manual,
+        };
+        assert_eq!(full_chain_pem(&entry), "leaf\n");
     }
 }
