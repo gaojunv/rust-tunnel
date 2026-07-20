@@ -11,46 +11,55 @@ import {
 } from '@/components/ui/chart';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
-import { useAllTraffic } from '@/api/hooks';
-import { formatBytes } from '@/utils/format';
+import { useStatsQuery } from '@/api/hooks';
+import { formatBps } from '@/utils/format';
 import { ChartEmpty } from './ChartEmpty';
 
+const ENTITY_TYPES = ['client', 'proxy', 'shadowsocks', 'trojan'];
+
 export const TrafficAreaChart = () => {
-  const { data: traffic = [] } = useAllTraffic();
   const { range, preset, presets, setPreset, setCustomRange } = useTimeRange();
 
-  const ports = useMemo(
-    () => traffic.map((t) => t.port).sort((a, b) => a - b),
-    [traffic],
+  const startIso = useMemo(() => new Date(range.startMs).toISOString(), [range.startMs]);
+  const endIso = useMemo(() => new Date(range.endMs).toISOString(), [range.endMs]);
+  const { data: snapshots = [] } = useStatsQuery(ENTITY_TYPES, undefined, startIso, endIso);
+
+  const entities = useMemo(
+    () => Array.from(new Set(snapshots.map((s) => s.entity_id))).sort(),
+    [snapshots],
+  );
+
+  const seriesKeys = useMemo(
+    () => entities.map((_, idx) => `entity_${idx}`),
+    [entities],
   );
 
   const chartConfig = useMemo<ChartConfig>(() => {
     const config: ChartConfig = {};
-    ports.forEach((port, idx) => {
-      config[`port_${port}`] = {
-        label: `Port ${port}`,
+    entities.forEach((entityId, idx) => {
+      config[seriesKeys[idx]] = {
+        label: entityId,
         color: `hsl(var(--chart-${(idx % 5) + 1}))`,
       };
     });
     return config;
-  }, [ports]);
+  }, [entities, seriesKeys]);
 
   const chartData = useMemo(() => {
+    const keyOf = new Map(entities.map((id, idx) => [id, seriesKeys[idx]]));
     const timeMap = new Map<number, Record<string, number | string>>();
-    for (const portTraffic of traffic) {
-      for (const bucket of portTraffic.buckets) {
-        const ts = new Date(bucket.timestamp).getTime();
-        if (ts < range.startMs || ts > range.endMs) continue;
-        if (!timeMap.has(ts)) {
-          timeMap.set(ts, { time: ts });
-        }
-        timeMap.get(ts)![`port_${portTraffic.port}`] = bucket.bytes_in + bucket.bytes_out;
+    for (const snap of snapshots) {
+      const ts = new Date(snap.timestamp).getTime();
+      if (!timeMap.has(ts)) {
+        timeMap.set(ts, { time: ts });
       }
+      timeMap.get(ts)![keyOf.get(snap.entity_id)!] =
+        snap.bytes_in_rate + snap.bytes_out_rate;
     }
     return Array.from(timeMap.values()).sort(
       (a, b) => (a.time as number) - (b.time as number),
     );
-  }, [traffic, range]);
+  }, [snapshots, entities, seriesKeys]);
 
   return (
     <Card>
@@ -86,7 +95,7 @@ export const TrafficAreaChart = () => {
                 axisLine={false}
                 tickMargin={8}
                 width={70}
-                tickFormatter={formatBytes}
+                tickFormatter={formatBps}
               />
               <ChartTooltip
                 content={
@@ -104,7 +113,7 @@ export const TrafficAreaChart = () => {
                             {chartConfig[key]?.label ?? key}
                           </span>
                           <span className="font-mono font-medium tabular-nums text-foreground">
-                            {formatBytes(Number(value))}
+                            {formatBps(Number(value))}
                           </span>
                         </div>
                       );
@@ -113,14 +122,14 @@ export const TrafficAreaChart = () => {
                 }
               />
               <ChartLegend content={<ChartLegendContent />} />
-              {ports.map((port) => (
+              {seriesKeys.map((key) => (
                 <Area
-                  key={port}
+                  key={key}
                   type="monotone"
-                  dataKey={`port_${port}`}
+                  dataKey={key}
                   stackId="total"
-                  stroke={`var(--color-port_${port})`}
-                  fill={`var(--color-port_${port})`}
+                  stroke={`var(--color-${key})`}
+                  fill={`var(--color-${key})`}
                   fillOpacity={0.4}
                   strokeWidth={1.5}
                   dot={false}

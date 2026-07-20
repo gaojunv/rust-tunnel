@@ -1,9 +1,9 @@
+import { useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { MetricAreaChart } from '@/components/charts/MetricAreaChart';
-import { QualityHistoryCharts } from '@/components/charts/QualityHistoryCharts';
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useTrojanConfig, useTrojanStats, useTrojanQuality } from '@/api/hooks';
+import { useTrojanConfig, useStatsSummary, useStatsQuery } from '@/api/hooks';
 import TrojanConfigCard from '@/components/trojan/TrojanConfigCard';
 import { formatBytes, formatBps } from '@/utils/format';
 import {
@@ -12,19 +12,32 @@ import {
   ArrowUp,
   Signal,
   Users,
-  Activity,
 } from 'lucide-react';
 
 export default function TrojanPage() {
   const { data: config } = useTrojanConfig();
-  const { data: stats } = useTrojanStats();
-  const { data: qualityData } = useTrojanQuality();
+  const { data: summary } = useStatsSummary();
+  const stats = summary?.trojan;
 
-  const qualityHistory = qualityData?.[0]?.history ?? [];
-  const chartData = qualityHistory.map((sample) => ({
-    timestamp: sample.timestamp,
-    bytes_in: sample.bytes_in_per_sec,
-    bytes_out: sample.bytes_out_per_sec,
+  const port = config?.port;
+  const { startIso, endIso } = useMemo(() => {
+    const end = Date.now();
+    return {
+      startIso: new Date(end - 6 * 60 * 60 * 1000).toISOString(),
+      endIso: new Date(end).toISOString(),
+    };
+  }, []);
+  const { data: snapshots = [] } = useStatsQuery(
+    ['trojan'],
+    port ? [`trojan:${port}`] : undefined,
+    port ? startIso : undefined,
+    port ? endIso : undefined,
+  );
+
+  const chartData = snapshots.map((snap) => ({
+    timestamp: snap.timestamp,
+    bytes_in: snap.bytes_in_rate,
+    bytes_out: snap.bytes_out_rate,
   }));
 
   return (
@@ -53,7 +66,7 @@ export default function TrojanPage() {
         />
         <StatCard
           title="Active Connections"
-          value={stats?.active_connections ?? 0}
+          value={stats?.total_conns ?? 0}
           icon={<Users className="h-4 w-4" />}
         />
       </div>
@@ -80,19 +93,6 @@ export default function TrojanPage() {
             className="h-[250px] w-full sm:h-[300px]"
             emptyText="No throughput data available"
           />
-        </CardContent>
-      </Card>
-
-      {/* Quality History Chart */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Activity className="h-5 w-5" />
-            Quality History
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <QualityHistoryCharts history={qualityHistory} />
         </CardContent>
       </Card>
     </div>

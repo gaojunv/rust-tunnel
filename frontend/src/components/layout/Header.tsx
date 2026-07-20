@@ -20,7 +20,6 @@ import { ThemeToggle } from '@/components/shared/ThemeToggle';
 import { Logo } from '@/components/shared/Logo';
 import {
   LayoutDashboard,
-  Signal,
   Network,
   Globe,
   Shield,
@@ -55,7 +54,6 @@ const navGroups: NavGroup[] = [
   {
     label: 'Network',
     items: [
-      { label: 'Quality', icon: <Signal className="h-4 w-4" />, href: '/quality' },
       { label: 'Clients', icon: <Network className="h-4 w-4" />, href: '/clients' },
       { label: 'Mesh', icon: <Network className="h-4 w-4" />, href: '/mesh' },
       { label: 'DNS', icon: <Globe className="h-4 w-4" />, href: '/dns' },

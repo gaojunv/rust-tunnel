@@ -14,7 +14,7 @@ import { StatCard } from '@/components/shared/StatCard';
 import { TrafficAreaChart } from '@/components/charts/TrafficAreaChart';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { clientsApi } from '@/api/client';
-import { useMetrics, useStatsSummary, useStatsStream } from '@/api/hooks';
+import { useStatsSummary, useStatsStream } from '@/api/hooks';
 import { formatBytes } from '@/utils/format';
 import {
   Users,
@@ -87,12 +87,15 @@ export default function DashboardPage() {
     queryFn: () => clientsApi.list(),
     refetchInterval: 5000,
   });
-  const { data: metrics, isLoading: metricsLoading } = useMetrics();
+  const { data: summary } = useStatsSummary();
 
   const connectedClients = clients.filter((c) => c.online).length;
-  const activeConnections = metrics?.active_connection_count ?? 0;
-  const totalBytesIn = metrics?.total_bytes_in ?? 0;
-  const totalBytesOut = metrics?.total_bytes_out ?? 0;
+  const entities = summary
+    ? [summary.clients, summary.proxy, summary.shadowsocks, summary.trojan]
+    : [];
+  const activeConnections = entities.reduce((sum, e) => sum + e.total_conns, 0);
+  const totalBytesIn = entities.reduce((sum, e) => sum + e.total_bytes_in, 0);
+  const totalBytesOut = entities.reduce((sum, e) => sum + e.total_bytes_out, 0);
 
   return (
     <div className="space-y-6">
@@ -137,7 +140,7 @@ export default function DashboardPage() {
           <CardTitle>Clients</CardTitle>
         </CardHeader>
         <CardContent>
-          {clientsLoading || metricsLoading ? (
+          {clientsLoading ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
               Loading...
             </div>

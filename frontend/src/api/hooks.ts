@@ -2,26 +2,16 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   api,
   login,
-  getMetrics,
-  getPortQuality,
-  getPortTraffic,
-  getTraffic,
-  getAllQuality,
   getShadowsocksConfig,
   updateShadowsocksConfig,
-  getShadowsocksStats,
-  getShadowsocksQuality,
   getTrojanConfig,
   updateTrojanConfig,
-  getTrojanStats,
-  getTrojanQuality,
   getLogs,
   setLogsLevel,
   getProxyRules,
   createProxyRule,
   updateProxyRule,
   deleteProxyRule,
-  getProxyStats,
   getAcmeStatus,
   getAcmeConfig,
   updateAcmeConfig,
@@ -48,79 +38,6 @@ import type {
   DnsSettings,
 } from '../types';
 
-export function useMetrics() {
-  return useQuery({
-    queryKey: ['metrics'],
-    queryFn: () => getMetrics(),
-    refetchInterval: 5000,
-  });
-}
-
-export function useQuality(port: number) {
-  return useQuery({
-    queryKey: ['quality', port],
-    queryFn: () => getPortQuality(port),
-    enabled: port > 0,
-    refetchInterval: 10000,
-  });
-}
-
-export function useTraffic(port: number, _hours = 24) {
-  return useQuery({
-    queryKey: ['traffic', port, _hours],
-    queryFn: () => getPortTraffic(port),
-    enabled: port > 0,
-  });
-}
-
-export function useAllTraffic() {
-  return useQuery({
-    queryKey: ['traffic', 'all'],
-    queryFn: () => getTraffic(),
-    refetchInterval: 30000,
-  });
-}
-
-export function useQualitySummary() {
-  return useQuery({
-    queryKey: ['quality-summary'],
-    queryFn: async () => {
-      const clients = await getAllQuality();
-      const totalConnections = clients.length;
-      const warningCount = clients.filter(
-        (c) => c.quality.is_warning || c.quality.is_critical
-      ).length;
-      const averageScore =
-        totalConnections > 0
-          ? clients.reduce((sum, c) => sum + c.quality.quality_score, 0) / totalConnections
-          : 0;
-
-      const mappedClients = clients.map((c) => ({
-        port: c.port,
-        hostname: c.hostname,
-        score: c.quality.quality_score,
-        rtt: c.quality.avg_rtt_ms,
-        loss: c.quality.loss_rate * 100,
-        is_warning: c.quality.is_warning,
-        is_critical: c.quality.is_critical,
-      }));
-
-      const worst = [...mappedClients]
-        .sort((a, b) => a.score - b.score)
-        .slice(0, 10);
-
-      return {
-        total_connections: totalConnections,
-        warning_count: warningCount,
-        average_score: averageScore,
-        clients: mappedClients,
-        worst,
-      };
-    },
-    refetchInterval: 10000,
-  });
-}
-
 // Shadowsocks hooks
 export function useShadowsocksConfig() {
   return useQuery({
@@ -136,24 +53,8 @@ export function useUpdateShadowsocksConfig() {
       updateShadowsocksConfig(config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['shadowsocks-config'] });
-      queryClient.invalidateQueries({ queryKey: ['shadowsocks-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
-  });
-}
-
-export function useShadowsocksStats() {
-  return useQuery({
-    queryKey: ['shadowsocks-stats'],
-    queryFn: () => getShadowsocksStats(),
-    refetchInterval: 5000,
-  });
-}
-
-export function useShadowsocksQuality() {
-  return useQuery({
-    queryKey: ['shadowsocks-quality'],
-    queryFn: () => getShadowsocksQuality(),
-    refetchInterval: 10000,
   });
 }
 
@@ -177,24 +78,8 @@ export function useUpdateTrojanConfig() {
     }) => updateTrojanConfig(config),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['trojan-config'] });
-      queryClient.invalidateQueries({ queryKey: ['trojan-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
-  });
-}
-
-export function useTrojanStats() {
-  return useQuery({
-    queryKey: ['trojan-stats'],
-    queryFn: () => getTrojanStats(),
-    refetchInterval: 5000,
-  });
-}
-
-export function useTrojanQuality() {
-  return useQuery({
-    queryKey: ['trojan-quality'],
-    queryFn: () => getTrojanQuality(),
-    refetchInterval: 10000,
   });
 }
 
@@ -230,21 +115,13 @@ export function useProxyRules() {
   });
 }
 
-export function useProxyStats() {
-  return useQuery({
-    queryKey: ['proxy-stats'],
-    queryFn: () => getProxyStats(),
-    refetchInterval: 10000,
-  });
-}
-
 export function useCreateProxyRule() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (data: CreateProxyRuleRequest) => createProxyRule(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
-      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
   });
 }
@@ -256,7 +133,7 @@ export function useUpdateProxyRule() {
       updateProxyRule(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
-      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
   });
 }
@@ -267,7 +144,7 @@ export function useDeleteProxyRule() {
     mutationFn: (id: string) => deleteProxyRule(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['proxy-rules'] });
-      queryClient.invalidateQueries({ queryKey: ['proxy-stats'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
     },
   });
 }
@@ -432,7 +309,7 @@ export function useStatsQuery(
       entityId?.forEach((eid) => params.append('entity_id', eid));
       if (start) params.set('start', start);
       if (end) params.set('end', end);
-      const res = await api.get<{ snapshots: StatsSnapshot[] }>(`/api/stats/query?${params}`);
+      const res = await api.get<{ snapshots: StatsSnapshot[] }>(`/stats/query?${params}`);
       return res.data.snapshots;
     },
     enabled: !!start && !!end,
@@ -443,7 +320,7 @@ export function useStatsSummary() {
   return useQuery({
     queryKey: ['stats', 'summary'],
     queryFn: async () => {
-      const res = await api.get<StatsSummary>('/api/stats/summary');
+      const res = await api.get<StatsSummary>('/stats/summary');
       return res.data;
     },
     refetchInterval: 60_000,

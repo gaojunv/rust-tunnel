@@ -1,23 +1,37 @@
+import { useMemo } from 'react';
 import { StatCard } from '@/components/shared/StatCard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { MetricAreaChart } from '@/components/charts/MetricAreaChart';
-import { QualityHistoryCharts } from '@/components/charts/QualityHistoryCharts';
-import { useShadowsocksConfig, useShadowsocksStats, useShadowsocksQuality } from '@/api/hooks';
+import { useShadowsocksConfig, useStatsSummary, useStatsQuery } from '@/api/hooks';
 import ShadowsocksConfigCard from '@/components/shadowsocks/ShadowsocksConfigCard';
 import { formatBytes, formatBps } from '@/utils/format';
-import { Shield, ArrowDown, ArrowUp, Signal } from 'lucide-react';
+import { Shield, ArrowDown, ArrowUp, Signal, Users } from 'lucide-react';
 
 export default function ShadowsocksPage() {
   const { data: config } = useShadowsocksConfig();
-  const { data: stats } = useShadowsocksStats();
-  const { data: qualityData } = useShadowsocksQuality();
+  const { data: summary } = useStatsSummary();
+  const stats = summary?.shadowsocks;
 
-  const qualityHistory = qualityData?.[0]?.history ?? [];
-  const chartData = qualityHistory.map((sample) => ({
-    timestamp: sample.timestamp,
-    bytes_in: sample.bytes_in_per_sec,
-    bytes_out: sample.bytes_out_per_sec,
+  const port = config?.port;
+  const { startIso, endIso } = useMemo(() => {
+    const end = Date.now();
+    return {
+      startIso: new Date(end - 6 * 60 * 60 * 1000).toISOString(),
+      endIso: new Date(end).toISOString(),
+    };
+  }, []);
+  const { data: snapshots = [] } = useStatsQuery(
+    ['shadowsocks'],
+    port ? [`ss:${port}`] : undefined,
+    port ? startIso : undefined,
+    port ? endIso : undefined,
+  );
+
+  const chartData = snapshots.map((snap) => ({
+    timestamp: snap.timestamp,
+    bytes_in: snap.bytes_in_rate,
+    bytes_out: snap.bytes_out_rate,
   }));
 
   return (
@@ -28,7 +42,7 @@ export default function ShadowsocksPage() {
       />
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-4">
         <StatCard
           title="Status"
           value={config?.enabled ? 'Active' : 'Inactive'}
@@ -43,6 +57,11 @@ export default function ShadowsocksPage() {
           title="Bytes Out"
           value={formatBytes(stats?.total_bytes_out ?? 0)}
           icon={<ArrowUp className="h-4 w-4" />}
+        />
+        <StatCard
+          title="Active Connections"
+          value={stats?.total_conns ?? 0}
+          icon={<Users className="h-4 w-4" />}
         />
       </div>
 
@@ -68,19 +87,6 @@ export default function ShadowsocksPage() {
             className="h-[250px] w-full sm:h-[300px]"
             emptyText="No throughput data available"
           />
-        </CardContent>
-      </Card>
-
-      {/* Quality History */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Signal className="h-5 w-5" />
-            Connection Quality
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <QualityHistoryCharts history={qualityHistory} />
         </CardContent>
       </Card>
     </div>

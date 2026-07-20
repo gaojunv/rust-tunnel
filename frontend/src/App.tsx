@@ -3,7 +3,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ThemeProvider } from './theme/ThemeProvider';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
-import QualityPage from './pages/QualityPage';
 import MeshPage from './pages/MeshPage';
 import DnsPage from './pages/DnsPage';
 import ShadowsocksPage from './pages/ShadowsocksPage';
@@ -49,7 +48,6 @@ const router = createBrowserRouter([
         children: [
           { path: '/', element: <Navigate to="/dashboard" replace /> },
           { path: '/dashboard', element: <DashboardPage /> },
-          { path: '/quality', element: <QualityPage /> },
           { path: '/mesh', element: <MeshPage /> },
           { path: '/dns', element: <DnsPage /> },
           { path: '/shadowsocks', element: <ShadowsocksPage /> },

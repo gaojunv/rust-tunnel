@@ -1,26 +1,15 @@
 import axios from 'axios';
 import type {
-  PortTraffic,
-  ServerMetrics,
   LoginRequest,
   LoginResponse,
-  QualitySample,
-  ClientWithQuality,
-  PortQualityResponse,
-  QualityWarning,
   ShadowsocksConfig,
-  ShadowsocksStats,
-  ShadowsocksQuality,
   TrojanConfig,
-  TrojanStats,
-  TrojanQuality,
   LogEntry,
   MeshNetworkResponse,
   MeshServiceResponse,
   DnsRecordResponse,
   AddDnsRecordRequest,
   ProxyRule,
-  ProxyStats,
   CreateProxyRuleRequest,
   UpdateProxyRuleRequest,
   AcmeStatus,
@@ -78,47 +67,9 @@ export const logout = async (): Promise<void> => {
   localStorage.removeItem('auth_token');
 };
 
-// Traffic API
-export const getTraffic = async (): Promise<PortTraffic[]> => {
-  const response = await api.get<PortTraffic[]>('/traffic');
-  return response.data;
-};
-
-export const getPortTraffic = async (port: number): Promise<PortTraffic> => {
-  const response = await api.get<PortTraffic>(`/traffic/${port}`);
-  return response.data;
-};
-
-// Metrics API
-export const getMetrics = async (): Promise<ServerMetrics> => {
-  const response = await api.get<ServerMetrics>('/metrics');
-  return response.data;
-};
-
 // Health check
 export const checkHealth = async (): Promise<{ status: string }> => {
   const response = await api.get('/health');
-  return response.data;
-};
-
-// Quality API
-export const getAllQuality = async (): Promise<ClientWithQuality[]> => {
-  const response = await api.get<ClientWithQuality[]>('/quality/all');
-  return response.data;
-};
-
-export const getPortQuality = async (port: number): Promise<PortQualityResponse> => {
-  const response = await api.get<PortQualityResponse>(`/quality/${port}`);
-  return response.data;
-};
-
-export const getQualityHistory = async (port: number): Promise<QualitySample[]> => {
-  const response = await api.get<QualitySample[]>(`/quality/${port}/history`);
-  return response.data;
-};
-
-export const getQualityWarnings = async (): Promise<QualityWarning[]> => {
-  const response = await api.get<QualityWarning[]>('/quality/warnings');
   return response.data;
 };
 
@@ -138,16 +89,6 @@ export const updateShadowsocksConfig = async (config: Partial<ShadowsocksConfig>
   return response.data;
 };
 
-export const getShadowsocksStats = async (): Promise<ShadowsocksStats> => {
-  const response = await api.get<ShadowsocksStats>('/shadowsocks/stats');
-  return response.data;
-};
-
-export const getShadowsocksQuality = async (): Promise<ShadowsocksQuality[]> => {
-  const response = await api.get<ShadowsocksQuality[]>('/shadowsocks/quality');
-  return response.data;
-};
-
 // Trojan API
 export const getTrojanConfig = async (): Promise<TrojanConfig> => {
   const response = await api.get<TrojanConfig>('/trojan');
@@ -156,16 +97,6 @@ export const getTrojanConfig = async (): Promise<TrojanConfig> => {
 
 export const updateTrojanConfig = async (config: Partial<TrojanConfig>): Promise<TrojanConfig> => {
   const response = await api.post<TrojanConfig>('/trojan', config);
-  return response.data;
-};
-
-export const getTrojanStats = async (): Promise<TrojanStats> => {
-  const response = await api.get<TrojanStats>('/trojan/stats');
-  return response.data;
-};
-
-export const getTrojanQuality = async (): Promise<TrojanQuality[]> => {
-  const response = await api.get<TrojanQuality[]>('/trojan/quality');
   return response.data;
 };
 
@@ -270,11 +201,6 @@ export const updateProxyRule = async (id: string, data: UpdateProxyRuleRequest):
 
 export const deleteProxyRule = async (id: string): Promise<void> => {
   await api.delete(`/proxy/rules/${id}`);
-};
-
-export const getProxyStats = async (): Promise<ProxyStats> => {
-  const response = await api.get<ProxyStats>('/proxy/stats');
-  return response.data;
 };
 
 // ACME API

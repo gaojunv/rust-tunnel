@@ -23,12 +23,19 @@ const renderPage = () => {
   );
 };
 
-const metricsResponse = {
+const entitySummary = {
+  total_bytes_in: 0,
+  total_bytes_out: 0,
+  total_conns: 0,
+  entity_count: 0,
+};
+
+const statsSummaryResponse = {
   data: {
-    client_count: 1,
-    active_connection_count: 0,
-    total_bytes_in: 0,
-    total_bytes_out: 0,
+    clients: { ...entitySummary, entity_count: 1 },
+    proxy: entitySummary,
+    shadowsocks: entitySummary,
+    trojan: entitySummary,
   },
   status: 200,
   statusText: 'OK',
@@ -64,13 +71,13 @@ describe('DashboardPage', () => {
       })),
     });
     getSpy.mockImplementation((url: string) => {
-      if (url === '/metrics') {
-        return Promise.resolve(metricsResponse);
+      if (url === '/stats/summary') {
+        return Promise.resolve(statsSummaryResponse);
       }
-      if (url === '/traffic') {
+      if (typeof url === 'string' && url.startsWith('/stats/query')) {
         return Promise.resolve({
           ...emptyResponse,
-          data: [],
+          data: { snapshots: [] },
         });
       }
       return Promise.resolve(emptyResponse);
