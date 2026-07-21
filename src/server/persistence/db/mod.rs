@@ -9,6 +9,7 @@ pub mod clients;
 pub mod records;
 pub mod schema;
 pub mod server_auth;
+pub mod shadowsocks;
 pub mod stats;
 pub use records::*;
 
