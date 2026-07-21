@@ -46,6 +46,8 @@ get_if_addrs = "0.5.3"
 
 # Web framework
 axum = { version = "0.7", features = ["json"] }
+# serde_html_form 版 Query 提取器，支持重复的查询参数（如 entity_type=a&entity_type=b）
+axum-extra = { version = "0.9", features = ["query"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 async-stream = "0.3"
 

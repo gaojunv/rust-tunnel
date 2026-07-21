@@ -260,7 +260,7 @@ mod tests {
         // Query with invalid params should return error
         let response = get_stats_query(
             State(state),
-            Query(StatsQueryParams {
+            axum_extra::extract::Query(StatsQueryParams {
                 entity_type: None,
                 entity_id: None,
                 start: "not-a-date".to_string(),
@@ -283,7 +283,7 @@ mod tests {
         };
         let response = get_stats_query(
             State(state),
-            Query(StatsQueryParams {
+            axum_extra::extract::Query(StatsQueryParams {
                 entity_type: None,
                 entity_id: None,
                 start: "2026-01-01T00:00:00Z".to_string(),
@@ -326,7 +326,7 @@ mod tests {
         };
         let response = get_stats_query(
             State(state),
-            Query(StatsQueryParams {
+            axum_extra::extract::Query(StatsQueryParams {
                 entity_type: Some(vec!["shadowsocks".to_string()]),
                 entity_id: None,
                 start: (ts - chrono::Duration::minutes(1)).to_rfc3339(),
@@ -1660,9 +1660,11 @@ struct StatsStreamQuery {
 }
 
 // GET /api/stats/query
+// 注意：必须使用 axum_extra 的 Query（serde_html_form），axum 自带的 Query
+// （serde_urlencoded）不支持重复的查询参数（entity_type=a&entity_type=b）。
 async fn get_stats_query(
     State(state): State<ApiState>,
-    Query(params): Query<StatsQueryParams>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<StatsQueryParams>,
 ) -> impl IntoResponse {
     let start = match chrono::DateTime::parse_from_rfc3339(&params.start) {
         Ok(dt) => dt.with_timezone(&chrono::Utc),

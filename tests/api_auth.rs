@@ -122,6 +122,13 @@ async fn stats_endpoints_require_auth_when_enabled() {
             StatusCode::OK,
             "/api/stats/query with token must be 200"
         );
+        // 重复的 entity_type 参数（前端 Dashboard 的用法）也必须能解析。
+        assert_eq!(
+            api.get_status("/api/stats/query?entity_type=client&entity_type=proxy&entity_type=shadowsocks&entity_type=trojan&start=2026-07-20T00:00:00Z&end=2026-07-21T00:00:00Z")
+                .await,
+            StatusCode::OK,
+            "/api/stats/query with repeated entity_type must be 200"
+        );
     })
     .await;
     result.expect("test timed out");
