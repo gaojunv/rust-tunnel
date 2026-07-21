@@ -1,5 +1,5 @@
 pub mod acme;
-pub mod api;
+pub use mgmt::api;
 pub mod client_registry;
 pub mod config;
 pub mod control;
