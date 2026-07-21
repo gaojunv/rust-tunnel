@@ -1,5 +1,10 @@
 //! Unified HTTP proxy request handler.
 
+mod client_backend;
+mod downstream_response;
+mod upstream_request;
+mod websocket;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -7,17 +12,18 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
-use http_body_util::BodyExt;
 use hyper::Request;
 use tracing::error;
 
 use super::router::RouteTable;
-use super::upstream::{ProxyBody, ProxyError, UpstreamClient};
-use super::{Backend, BackendKind, BackendProtocol, ReverseProxyState};
-use crate::server::stats::{EntityType, StatsCollector};
+use super::upstream::UpstreamClient;
+use super::{BackendKind, BackendProtocol, ReverseProxyState};
+use crate::server::stats::EntityType;
 
-use hyper::body::{Body as HttpBody, Bytes};
-use hyper::header::{HeaderMap, HeaderValue};
+use client_backend::{handle_client_backend, host_without_port, resolve_backend};
+use downstream_response::{build_downstream_response, error_chain, error_response};
+use upstream_request::{build_upstream_request, count_body};
+use websocket::is_websocket_upgrade;
 
 /// Where the handler pulls its routing decision from.
 ///
@@ -32,247 +38,6 @@ pub struct RouteSource(pub Arc<ArcSwap<RouteTable>>);
 /// The third element is `Arc<ReverseProxyState>` which provides access to
 /// the `StatsCollector` and the `ClientConnector` for client-kind backends.
 pub type ProxyState = (RouteSource, Arc<UpstreamClient>, Arc<ReverseProxyState>);
-
-/// Per RFC 7230 §6.1, these headers apply to the immediate connection only
-/// and must be stripped by any intermediary.
-const STATIC_HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-];
-
-/// Return a copy of `headers` with hop-by-hop entries removed.
-///
-/// Also honors `Connection: X-Custom-Hop` by removing every header name listed
-/// in a `Connection` value.
-///
-/// When `preserve_upgrade` is `true`, the `Upgrade` and `Connection` headers
-/// are retained verbatim so a WebSocket (or other Upgrade-based protocol)
-/// handshake can pass through end-to-end (RFC 6455 §1.7, RFC 7230 §6.7).
-/// Other hop-by-hop tokens listed in `Connection` (e.g. `keep-alive`) are
-/// still stripped as separate headers.
-#[must_use]
-pub fn strip_hop_by_hop(
-    headers: &HeaderMap<HeaderValue>,
-    preserve_upgrade: bool,
-) -> HeaderMap<HeaderValue> {
-    let mut extra: Vec<String> = Vec::new();
-    for conn in headers.get_all(hyper::header::CONNECTION) {
-        if let Ok(s) = conn.to_str() {
-            for tok in s.split(',') {
-                let t = tok.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                // On a WS upgrade, the "upgrade" token inside Connection is
-                // the marker that keeps the tunnel alive — don't treat it
-                // as a hop name to strip.
-                if preserve_upgrade && t.eq_ignore_ascii_case("upgrade") {
-                    continue;
-                }
-                extra.push(t.to_ascii_lowercase());
-            }
-        }
-    }
-
-    let mut out = HeaderMap::with_capacity(headers.len());
-    for (name, value) in headers {
-        let n = name.as_str();
-        if STATIC_HOP_BY_HOP.contains(&n) {
-            if preserve_upgrade && (n == "connection" || n == "upgrade") {
-                // fall through and retain
-            } else {
-                continue;
-            }
-        }
-        if extra.iter().any(|h| h == n) {
-            continue;
-        }
-        out.append(name.clone(), value.clone());
-    }
-    out
-}
-
-/// Walk `err.source()` chain to build a string like:
-///   "outer message | caused by: middle | caused by: inner"
-///
-/// Useful when the top-level error variant hides the real cause several
-/// layers down (e.g. hyper-util's `SendRequest` wrapping `hyper::Error`).
-fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut parts = vec![err.to_string()];
-    let mut cursor: Option<&(dyn std::error::Error + 'static)> = err.source();
-    while let Some(e) = cursor {
-        parts.push(format!("caused by: {e}"));
-        cursor = e.source();
-    }
-    parts.join(" | ")
-}
-
-/// Resolve the target backend for a request. Returns the matched rule id and
-/// the selected backend, or `None` when no route matches (caller should reply
-/// 404).
-///
-/// Both listener types (legacy per-rule and shared) go through this — legacy
-/// listeners just build a one-rule table. `RouteTable::match_http_request`
-/// already honors `rule.enabled`, longest-prefix matching, and the route's
-/// configured load balancing algorithm.
-async fn resolve_backend(
-    source: &RouteSource,
-    host: &str,
-    path: &str,
-) -> Option<(String, Backend)> {
-    let snap = source.0.load();
-    snap.match_http_request(host, path)
-        .await
-        .map(|(rule, _, backend)| (rule.id.clone(), backend.clone()))
-}
-
-/// Return true if the given headers announce a WebSocket-style upgrade
-/// (i.e. carry `Upgrade: websocket`, case-insensitive).
-///
-/// Used both on the request side (to decide whether to preserve
-/// hop-by-hop headers when forwarding) and on the response side (to
-/// spot the 101 that must be forwarded verbatim).
-#[must_use]
-pub fn is_websocket_upgrade(headers: &HeaderMap<HeaderValue>) -> bool {
-    headers
-        .get(hyper::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|s| s.eq_ignore_ascii_case("websocket"))
-}
-
-/// Wrap a body so each data frame's length is recorded into the unified
-/// stats collector (`is_in = true` counts bytes_in — client to backend;
-/// otherwise bytes_out — backend to client). Recording is live: the periodic
-/// snapshot flush picks the deltas up without waiting for the body to end.
-fn count_body<B>(
-    body: B,
-    stats: StatsCollector,
-    rule_id: String,
-    is_in: bool,
-) -> impl HttpBody<Data = Bytes, Error = B::Error> + Send
-where
-    B: HttpBody<Data = Bytes> + Send,
-{
-    body.map_frame(move |frame| {
-        if let Some(data) = frame.data_ref() {
-            let n = data.len() as u64;
-            if is_in {
-                stats.record_bytes(EntityType::Proxy, &rule_id, n, 0);
-            } else {
-                stats.record_bytes(EntityType::Proxy, &rule_id, 0, n);
-            }
-        }
-        frame
-    })
-}
-
-/// Build the outgoing upstream Request from the incoming axum Request.
-///
-/// - Rewrites URI to `http://<backend.addr><path?query>`
-/// - Preserves method, headers (after hop-by-hop stripping)
-/// - Boxes the body without buffering — streams through
-fn build_upstream_request(
-    req: Request<Body>,
-    backend: &Backend,
-) -> Result<Request<ProxyBody>, ProxyError> {
-    let (mut parts, body) = req.into_parts();
-    let pq = parts
-        .uri
-        .path_and_query()
-        .map(hyper::http::uri::PathAndQuery::as_str)
-        .unwrap_or("/");
-    use super::{BackendProtocol, BackendScheme};
-    let scheme = match backend.scheme {
-        BackendScheme::Http => "http",
-        BackendScheme::Https => "https",
-    };
-    let uri: hyper::Uri = format!("{scheme}://{}{}", backend.addr, pq)
-        .parse()
-        .map_err(|e| ProxyError::BadBackendAddr(format!("{e}")))?;
-    parts.uri = uri;
-    let preserve_upgrade = is_websocket_upgrade(&parts.headers);
-    parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
-    // Rewrite Host to the backend authority (standard reverse-proxy behavior,
-    // cf. nginx `proxy_set_header Host $proxy_host`). Forwarding the public
-    // domain verbatim makes Host-sensitive upstreams (ALLOWED_HOSTS checks,
-    // dev servers, virtual-host routers) reject the request, often with 400.
-    if let Ok(host) = HeaderValue::from_str(&backend.addr) {
-        parts.headers.insert(hyper::header::HOST, host);
-    }
-    // On WebSocket upgrades, keep Origin consistent with the rewritten Host:
-    // WS servers commonly reject handshakes whose Origin host differs from
-    // the request Host (e.g. gorilla/websocket's default CheckOrigin).
-    // Only rewrite when an Origin header is actually present.
-    if preserve_upgrade && parts.headers.contains_key(hyper::header::ORIGIN) {
-        if let Ok(origin) = HeaderValue::from_str(&format!("{scheme}://{}", backend.addr)) {
-            parts.headers.insert(hyper::header::ORIGIN, origin);
-        }
-    }
-    // Normalize the request version to match the outgoing client's protocol.
-    // The incoming downstream version may be HTTP/2 (from the h2 listener) or
-    // HTTP/1.1; the upstream client is protocol-locked at build time, so we
-    // must align the request version with the target client, otherwise
-    // hyper-util returns UserUnsupportedVersion.
-    parts.version = match backend.protocol {
-        BackendProtocol::Http1 => hyper::Version::HTTP_11,
-        BackendProtocol::Http2 => hyper::Version::HTTP_2,
-    };
-
-    let boxed: ProxyBody = body
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))
-        .boxed_unsync();
-    Ok(Request::from_parts(parts, boxed))
-}
-
-/// Convert the hyper response returned by `UpstreamClient` back to an axum
-/// `Response<Body>`. Streams the body without buffering, counting response
-/// bytes into the stats collector.
-fn build_downstream_response(
-    resp: hyper::Response<hyper::body::Incoming>,
-    stats: StatsCollector,
-    rule_id: String,
-) -> Response {
-    let (mut parts, incoming) = resp.into_parts();
-    // Preserve Upgrade/Connection on a 101 so the caller can complete the
-    // WebSocket handshake — otherwise the browser sees the switch but no
-    // negotiated upgrade tokens and treats it as a protocol error.
-    let preserve_upgrade = parts.status == StatusCode::SWITCHING_PROTOCOLS;
-    parts.headers = strip_hop_by_hop(&parts.headers, preserve_upgrade);
-    let axum_body = Body::new(count_body(incoming, stats, rule_id, false));
-    Response::from_parts(parts, axum_body)
-}
-
-fn error_response(err: &ProxyError) -> Response {
-    let (status, body) = match err {
-        ProxyError::BadBackendAddr(_) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}")),
-        ProxyError::Connect(_) | ProxyError::Request(_) | ProxyError::Body(_) => {
-            (StatusCode::BAD_GATEWAY, format!("{err}"))
-        }
-    };
-    Response::builder()
-        .status(status)
-        .body(Body::from(body))
-        .unwrap()
-}
-
-/// Strip the port (if any) from a Host header value.
-///
-/// Handles bracketed IPv6 literals per RFC 7230 §5.4 (`[::1]:8080` → `::1`).
-fn host_without_port(raw: &str) -> &str {
-    if let Some(rest) = raw.strip_prefix('[') {
-        // Bracketed IPv6 literal; the closing ']' terminates the host.
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        // Plain hostname or IPv4; first ':' terminates the host.
-        raw.split(':').next().unwrap_or(raw)
-    }
-}
 
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
@@ -422,176 +187,11 @@ pub async fn handle_proxy_request_unified(
     }
 }
 
-/// Client backend handler: dials through the ClientConnector tunnel,
-/// performs an HTTP/1.1 handshake, sends the rewritten request, and
-/// returns the response.
-///
-/// This path is used when `backend.kind == Client`. It bypasses the
-/// shared `UpstreamClient` and opens a fresh `ClientTunnelStream` for
-/// each request (no connection pooling in this first version).
-///
-/// WebSocket upgrades are supported: on a 101 the upgraded downstream and
-/// upstream IOs are bridged with `copy_bidirectional`, raw bytes flowing
-/// through the control-channel tunnel.
-async fn handle_client_backend(
-    state: Arc<ReverseProxyState>,
-    req: Request<Body>,
-    backend: Backend,
-    rule_id: String,
-) -> Response {
-    use hyper::client::conn::http1;
-    use hyper_util::rt::TokioIo;
-
-    // 统一统计采集器（与 ReverseProxyState 共享）
-    let stats = state.stats_collector.clone();
-
-    // Capture the downstream OnUpgrade future BEFORE `req` is consumed —
-    // hyper's upgrade handle is one-shot per request. The handle is stored
-    // in the request extensions, so it survives `into_parts` below.
-    let mut req = req;
-    let downstream_upgrade = if is_websocket_upgrade(req.headers()) {
-        Some(hyper::upgrade::on(&mut req))
-    } else {
-        None
-    };
-
-    // Wrap request body to count bytes_in
-    let (parts, body) = req.into_parts();
-    let counted = Body::new(count_body(body, stats.clone(), rule_id.clone(), true));
-    let req = Request::from_parts(parts, counted);
-
-    // Dial via ClientConnector
-    let connector = match state.connector_for(&backend).await {
-        Ok(c) => c,
-        Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("connector unavailable: {e}")))
-                .unwrap();
-        }
-    };
-    let stream = match connector.connect(&backend).await {
-        Ok(s) => s,
-        Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("client backend dial failed: {e}")))
-                .unwrap();
-        }
-    };
-    let io = TokioIo::new(stream);
-
-    // HTTP/1.1 handshake
-    let (mut sender, conn) = match http1::Builder::new()
-        .preserve_header_case(true)
-        .title_case_headers(true)
-        .handshake(io)
-        .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("http1 handshake failed: {e}")))
-                .unwrap();
-        }
-    };
-    let ws_potential = downstream_upgrade.is_some();
-    if ws_potential {
-        // `with_upgrades` keeps the Upgraded IO alive after the 101 so the
-        // raw byte stream can be bridged below.
-        tokio::spawn(async move {
-            if let Err(e) = conn.with_upgrades().await {
-                tracing::debug!("client backend conn ended: {e}");
-            }
-        });
-    } else {
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!("client backend conn ended: {e}");
-            }
-        });
-    }
-
-    // Rewrite the request URI to relative form for the tunneled backend
-    let mut upstream_req = match build_upstream_request(req, &backend) {
-        Ok(r) => r,
-        Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
-            return error_response(&e);
-        }
-    };
-
-    // For direct http1::handshake (not through a proxy), hyper's Client expects
-    // the URI in origin-form (e.g. "/path?query"), not absolute-form. Rewrite.
-    {
-        let pq = upstream_req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        *upstream_req.uri_mut() = pq.parse().unwrap_or_else(|_| upstream_req.uri().clone());
-    }
-
-    match sender.send_request(upstream_req).await {
-        Ok(mut resp) => {
-            let is_ws = ws_potential && resp.status() == StatusCode::SWITCHING_PROTOCOLS;
-            if is_ws {
-                // Take the upstream upgrade handle before `resp` is consumed
-                // by `build_downstream_response` — same one-shot constraint
-                // as the downstream side.
-                let upstream_upgrade = hyper::upgrade::on(&mut resp);
-                let client_upgrade = downstream_upgrade.expect("checked above");
-                let rid = rule_id.clone();
-                let sc = stats.clone();
-                tokio::spawn(async move {
-                    let (client_up, server_up) =
-                        match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                tracing::debug!("ws upgrade join failed: {e}");
-                                sc.decr_conns(EntityType::Proxy, &rid);
-                                return;
-                            }
-                        };
-                    // hyper 1.x's `Upgraded` implements hyper's own Read/Write
-                    // traits; wrap with TokioIo so it satisfies tokio's
-                    // AsyncRead + AsyncWrite for copy_bidirectional.
-                    let mut client_io = TokioIo::new(client_up);
-                    let mut server_io = TokioIo::new(server_up);
-                    match tokio::io::copy_bidirectional(&mut client_io, &mut server_io).await {
-                        // (client→backend, backend→client) = (bytes_in, bytes_out)
-                        Ok((to_backend, to_client)) => {
-                            sc.record_bytes(EntityType::Proxy, &rid, to_backend, to_client);
-                        }
-                        Err(e) => {
-                            tracing::debug!("ws bidirectional copy ended: {e}");
-                        }
-                    }
-                    sc.decr_conns(EntityType::Proxy, &rid);
-                });
-            }
-            if !is_ws {
-                stats.decr_conns(EntityType::Proxy, &rule_id);
-            }
-            build_downstream_response(resp, stats.clone(), rule_id)
-        }
-        Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("upstream request failed: {e}")))
-                .unwrap()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::upstream_request::strip_hop_by_hop;
+    use http_body_util::BodyExt;
     use hyper::header::{HeaderMap, HeaderValue};
 
     fn hv(s: &str) -> HeaderValue {
@@ -1725,6 +1325,8 @@ mod http2_tests {
 
     use axum::routing::any;
     use axum::Router;
+    use http_body_util::BodyExt;
+    use hyper::body::Bytes;
     use hyper_util::rt::TokioExecutor;
     use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::ServerName;
@@ -1734,7 +1336,7 @@ mod http2_tests {
     use crate::server::acme::{CertEntry, CertSource, CertificateManager};
     use crate::server::reverse_proxy::shared_listener::SharedListener;
     use crate::server::reverse_proxy::{
-        BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route, RuleType,
+        Backend, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route, RuleType,
     };
 
     /// Register a self-signed cert for the given domain in the manager.
