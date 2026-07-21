@@ -41,3 +41,22 @@ pub async fn logout() -> impl IntoResponse {
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_health_response() {
+        let response = HealthResponse { status: "ok" };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("ok"));
+    }
+
+    #[test]
+    fn test_login_request_deserialize() {
+        let json = r#"{"password":"secret"}"#;
+        let req: LoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.password, "secret");
+    }
+}

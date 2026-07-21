@@ -39,31 +39,6 @@ mod tests {
     use crate::server::db::Database;
     use chrono::Timelike;
 
-    #[tokio::test]
-    async fn test_health_response() {
-        let response = HealthResponse { status: "ok" };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("ok"));
-    }
-
-    #[test]
-    fn test_login_request_deserialize() {
-        let json = r#"{"password":"secret"}"#;
-        let req: LoginRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.password, "secret");
-    }
-
-    #[test]
-    fn test_shadowsocks_config_serialize() {
-        let config = ShadowsocksConfig {
-            enabled: true,
-            port: Some(8388),
-            cipher: Some("aes-256-gcm".into()),
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        assert!(json.contains("8388"));
-        assert!(json.contains("aes-256-gcm"));
-    }
 
 
     // ── Stats unified API tests ──────────────────────────────────

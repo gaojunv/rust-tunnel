@@ -110,3 +110,20 @@ pub async fn update_shadowsocks_config(
 
     Json(serde_json::json!({"status": "ok", "enabled": enabled, "port": port})).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shadowsocks_config_serialize() {
+        let config = ShadowsocksConfig {
+            enabled: true,
+            port: Some(8388),
+            cipher: Some("aes-256-gcm".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("8388"));
+        assert!(json.contains("aes-256-gcm"));
+    }
+}
