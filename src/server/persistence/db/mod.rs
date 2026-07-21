@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 pub mod acme;
 pub mod clients;
+pub mod mesh;
 pub mod proxy_rules;
 pub mod records;
 pub mod schema;
