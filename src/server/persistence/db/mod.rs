@@ -11,6 +11,7 @@ pub mod schema;
 pub mod server_auth;
 pub mod shadowsocks;
 pub mod stats;
+pub mod trojan;
 pub use records::*;
 
 /// Database wrapper for persistence
