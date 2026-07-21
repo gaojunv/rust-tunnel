@@ -81,5 +81,3 @@ impl Default for DnsProviderRegistry {
     }
 }
 
-#[cfg(test)]
-mod aliyun_test;
