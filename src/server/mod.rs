@@ -1,8 +1,10 @@
 pub mod acme;
 pub use mgmt::api;
-pub mod client_registry;
 pub mod config;
 pub mod control;
+pub mod control_plane;
+pub use control_plane::client_registry;
+pub use control_plane::tunnel_stream;
 pub use persistence::db as db;
 pub mod persistence;
 pub mod dns;
@@ -18,7 +20,6 @@ pub mod reverse_proxy;
 pub mod shadowsocks;
 pub mod trojan;
 pub mod trojan_runtime;
-pub mod tunnel_stream;
 
 pub use config::*;
 pub use db::Database;
