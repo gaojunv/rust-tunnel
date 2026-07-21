@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 pub mod records;
 pub mod schema;
+pub mod stats;
 pub use records::*;
 
 /// Database wrapper for persistence
