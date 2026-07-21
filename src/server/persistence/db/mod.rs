@@ -14,6 +14,7 @@ pub mod proxy_rules;
 pub mod records;
 pub mod reverse_proxy;
 pub mod schema;
+pub mod settings;
 pub mod server_auth;
 pub mod shadowsocks;
 pub mod stats;
