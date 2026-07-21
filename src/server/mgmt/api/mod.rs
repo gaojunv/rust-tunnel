@@ -15,6 +15,7 @@ pub mod clients;
 pub mod dto;
 pub mod login;
 pub mod logs;
+pub mod mesh;
 pub mod server_auth;
 pub mod shadowsocks;
 pub mod static_files;
@@ -364,103 +365,6 @@ struct UpdateAcmeConfigRequest {
 struct CertificateRequest {
     /// 挑战类型: "http-01" 或 "dns-01"
     challenge_type: Option<String>,
-}
-
-// ── Mesh Network Endpoints ─────────────────────────────────────────
-
-// GET /api/mesh — list all meshes
-async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
-    let networks = state.server_state.mesh_manager.list_networks().await;
-    let response: Vec<MeshNetworkResponse> = networks
-        .into_iter()
-        .map(|(id, members)| {
-            let services: Vec<MeshServiceResponse> = members
-                .iter()
-                .flat_map(|m| {
-                    m.services.iter().map(|s| MeshServiceResponse {
-                        service_name: s.name.clone(),
-                        protocol: s.protocol.clone(),
-                        local_addr: s.local_addr.clone(),
-                        client_name: m.client_name.clone(),
-                    })
-                })
-                .collect();
-
-            MeshNetworkResponse {
-                id,
-                members: members
-                    .iter()
-                    .map(|m| MeshMemberResponse {
-                        client_name: m.client_name.clone(),
-                        public_addr: m.public_addr.clone(),
-                        p2p_available: m.p2p_available,
-                        online: true,
-                    })
-                    .collect(),
-                services,
-            }
-        })
-        .collect();
-    Json(response)
-}
-
-// GET /api/mesh/:id — mesh detail
-async fn get_mesh(State(state): State<ApiState>, Path(mesh_id): Path<String>) -> impl IntoResponse {
-    match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
-        Some(members) => {
-            let services: Vec<MeshServiceResponse> = members
-                .iter()
-                .flat_map(|m| {
-                    m.services.iter().map(|s| MeshServiceResponse {
-                        service_name: s.name.clone(),
-                        protocol: s.protocol.clone(),
-                        local_addr: s.local_addr.clone(),
-                        client_name: m.client_name.clone(),
-                    })
-                })
-                .collect();
-
-            Json(MeshNetworkResponse {
-                id: mesh_id,
-                members: members
-                    .iter()
-                    .map(|m| MeshMemberResponse {
-                        client_name: m.client_name.clone(),
-                        public_addr: m.public_addr.clone(),
-                        p2p_available: m.p2p_available,
-                        online: true,
-                    })
-                    .collect(),
-                services,
-            })
-            .into_response()
-        }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-// GET /api/mesh/:id/services — mesh services
-async fn get_mesh_services(
-    State(state): State<ApiState>,
-    Path(mesh_id): Path<String>,
-) -> impl IntoResponse {
-    match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
-        Some(members) => {
-            let services: Vec<MeshServiceResponse> = members
-                .iter()
-                .flat_map(|m| {
-                    m.services.iter().map(|s| MeshServiceResponse {
-                        service_name: s.name.clone(),
-                        protocol: s.protocol.clone(),
-                        local_addr: s.local_addr.clone(),
-                        client_name: m.client_name.clone(),
-                    })
-                })
-                .collect();
-            Json(services).into_response()
-        }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 // ── DNS Management Endpoints ───────────────────────────────────────
@@ -1492,9 +1396,9 @@ pub async fn run_api_server(
             get(trojan::get_trojan_config).post(trojan::update_trojan_config),
         )
         // Mesh network endpoints
-        .route("/api/mesh", get(list_meshes))
-        .route("/api/mesh/:id", get(get_mesh))
-        .route("/api/mesh/:id/services", get(get_mesh_services))
+        .route("/api/mesh", get(mesh::list_meshes))
+        .route("/api/mesh/:id", get(mesh::get_mesh))
+        .route("/api/mesh/:id/services", get(mesh::get_mesh_services))
         // DNS management endpoints
         .route(
             "/api/dns/records",
