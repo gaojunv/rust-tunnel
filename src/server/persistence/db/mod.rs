@@ -5,7 +5,9 @@ use sqlx::{
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod records;
 pub mod schema;
+pub use records::*;
 
 /// Database wrapper for persistence
 #[derive(Clone)]
