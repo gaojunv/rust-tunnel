@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub mod clients;
 pub mod records;
 pub mod schema;
+pub mod server_auth;
 pub mod stats;
 pub use records::*;
 
