@@ -5,6 +5,7 @@ pub mod client_registry;
 pub mod config;
 pub mod control;
 pub mod db;
+pub mod persistence;
 pub mod dns;
 pub mod dynamic_config;
 pub mod listener;
