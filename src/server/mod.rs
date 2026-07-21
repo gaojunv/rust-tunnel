@@ -1,8 +1,8 @@
 pub mod acme;
 pub use mgmt::api;
 pub mod config;
-pub mod control;
 pub mod control_plane;
+pub use control_plane as control;
 pub use control_plane::client_registry;
 pub use control_plane::tunnel_stream;
 pub use persistence::db as db;

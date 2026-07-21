@@ -13,15 +13,8 @@ use crate::server::dynamic_config::DynamicConfig;
 use crate::server::mesh::MeshManager;
 use crate::server::reverse_proxy::ReverseProxyState;
 
-// Re-export types moved to control_plane/ so that
-// `crate::server::control::PortInfo` (etc.) paths remain valid for external
-// callers until all references are migrated to the control_plane path.
-pub use crate::server::control_plane::acme_config::{AcmeConfigInfo, AcmeFullConfig};
-pub use crate::server::control_plane::port_info::{ClientInfo, PortInfo, PortType, TrojanRuntimeStatus};
-
-// Re-export run_server so that `crate::server::control::run_server` still works
-// for external callers (bin/server.rs uses `control::run_server`).
-pub use crate::server::control_plane::server::run_server;
+use super::acme_config::{AcmeConfigInfo, AcmeFullConfig};
+use super::port_info::{ClientInfo, PortInfo, TrojanRuntimeStatus};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
