@@ -4,7 +4,7 @@ pub mod auth;
 pub mod client_registry;
 pub mod config;
 pub mod control;
-pub mod db;
+pub use persistence::db as db;
 pub mod persistence;
 pub mod dns;
 pub mod dynamic_config;

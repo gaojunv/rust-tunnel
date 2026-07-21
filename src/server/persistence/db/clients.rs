@@ -246,4 +246,123 @@ mod tests {
             .note
             .is_none());
     }
+
+    #[tokio::test]
+    async fn test_delete_client() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.upsert_client("home-nas", None).await.unwrap();
+        db.delete_client("home-nas").await.unwrap();
+        let list = db.list_clients().await.unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client() {
+        let db = Database::new(":memory:").await.unwrap();
+
+        // route JSON: 一个 backend 指向 home-nas，一个 direct
+        let routes_json = serde_json::json!([
+            {
+                "path": "/",
+                "backends": [
+                    { "kind": "client", "addr": "localhost:80", "client_name": "home-nas",
+                      "weight": 100, "protocol": "http1", "scheme": "http" },
+                    { "kind": "direct", "addr": "10.0.0.1:80",
+                      "weight": 100, "protocol": "http1", "scheme": "http" }
+                ],
+                "load_balancing": "round_robin"
+            }
+        ])
+        .to_string();
+
+        db.save_proxy_rule(
+            "rule-1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            Some(&routes_json),
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let refs = db.rules_referencing_client("home-nas").await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "rule-1");
+        assert_eq!(refs[0].1, "web");
+
+        let refs = db.rules_referencing_client("nonexistent").await.unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client_ignores_direct_only() {
+        let db = Database::new(":memory:").await.unwrap();
+        let routes_json = serde_json::json!([{
+            "path": "/",
+            "backends": [
+                { "kind": "direct", "addr": "10.0.0.1:80",
+                  "weight": 100, "protocol": "http1", "scheme": "http" }
+            ],
+            "load_balancing": "round_robin"
+        }])
+        .to_string();
+        db.save_proxy_rule(
+            "r1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            Some(&routes_json),
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .rules_referencing_client("anything")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rules_referencing_client_null_routes() {
+        // rule with routes = NULL (e.g. tcp rule)
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_proxy_rule(
+            "r1",
+            "tcp-rule",
+            "tcp",
+            "0.0.0.0:9000",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .rules_referencing_client("anyone")
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }
