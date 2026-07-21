@@ -18,9 +18,6 @@ pub mod trojan;
 pub mod trojan_runtime;
 pub mod tunnel_stream;
 
-#[cfg(test)]
-mod trojan_test;
-
 pub use config::*;
 pub use db::Database;
 pub use dns::registry::DnsRegistry;
