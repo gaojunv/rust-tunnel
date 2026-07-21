@@ -129,8 +129,8 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ## 测试
 
-所有测试为单元测试，位于 `src/` 内（`#[cfg(test)] mod tests`）。无 `tests/` 集成测试目录。
-协议专属测试在独立文件：`src/server/shadowsocks_test.rs`、`src/server/trojan_test.rs`。
+- **单元测试**：位于 `src/` 内，源文件末尾 `#[cfg(test)] mod tests`（协议专属测试如 shadowsocks/trojan/http2/aliyun 均已合并回各自实现文件）。
+- **集成测试**：位于顶层 `tests/`，以黑盒 API/协议流程为主（`tunnel_basic.rs`、`api_auth.rs`、`stats_*.rs` 等）。
 
 ## CI/CD
 
