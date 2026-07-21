@@ -19,9 +19,6 @@ pub mod trojan_runtime;
 pub mod tunnel_stream;
 
 #[cfg(test)]
-mod shadowsocks_test;
-
-#[cfg(test)]
 mod trojan_test;
 
 pub use config::*;

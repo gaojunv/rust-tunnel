@@ -1964,7 +1964,7 @@ mod tests {
                 "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind("proxy")
-            .bind(&format!("rule{}", idx))
+            .bind(format!("rule{}", idx))
             .bind(ts)
             .bind(idx as i64 * 100)
             .bind(0_i64)
