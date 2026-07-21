@@ -5,6 +5,7 @@ use sqlx::{
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod acme;
 pub mod clients;
 pub mod proxy_rules;
 pub mod records;
