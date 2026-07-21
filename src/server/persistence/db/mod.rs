@@ -7,9 +7,11 @@ use std::str::FromStr;
 
 pub mod acme;
 pub mod clients;
+pub mod dns;
 pub mod mesh;
 pub mod proxy_rules;
 pub mod records;
+pub mod reverse_proxy;
 pub mod schema;
 pub mod server_auth;
 pub mod shadowsocks;
