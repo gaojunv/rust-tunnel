@@ -5,6 +5,7 @@ use sqlx::{
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod clients;
 pub mod records;
 pub mod schema;
 pub mod stats;
