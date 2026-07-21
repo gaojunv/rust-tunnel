@@ -7,27 +7,24 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-#[cfg(feature = "embed-frontend")]
-use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod clients;
+pub mod dto;
+pub mod login;
 pub mod server_auth;
+pub mod static_files;
+
+pub use dto::*;
 
 use crate::common::DnsRecord;
-use crate::server::auth::{auth_middleware, create_token, AuthConfig};
+use crate::server::auth::{auth_middleware, AuthConfig};
 use crate::server::control::ServerState;
 use crate::server::reverse_proxy::ProxyRule;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use std::time::Duration;
-
-/// Embedded frontend assets
-#[cfg(feature = "embed-frontend")]
-#[derive(RustEmbed)]
-#[folder = "frontend-dist/"]
-struct FrontendAssets;
 
 #[cfg(test)]
 mod tests {
@@ -339,128 +336,12 @@ mod tests {
     }
 }
 
-/// Log entry response
-#[derive(Debug, Serialize)]
-pub struct LogEntryResponse {
-    pub id: i64,
-    pub timestamp: i64,
-    pub level: String,
-    pub source: String,
-    pub target: String,
-    pub message: String,
-}
-
-/// Query parameters for GET /api/logs
-#[derive(Debug, Deserialize)]
-pub struct LogsQuery {
-    pub level: Option<String>,
-    pub source: Option<String>,
-    pub search: Option<String>,
-    pub limit: Option<u32>,
-    pub before_id: Option<i64>,
-}
-
-/// Request body for PUT /api/logs/level
-#[derive(Debug, Deserialize)]
-pub struct SetLevelRequest {
-    pub level: String,
-}
-
-/// SSE query params (for token-based auth)
-#[derive(Debug, Deserialize)]
-pub struct SseQuery {
-    pub level: Option<String>,
-    pub source: Option<String>,
-    pub token: Option<String>,
-}
-
 /// API state shared across all handlers
 #[derive(Clone)]
 pub struct ApiState {
     pub server_state: ServerState,
     pub auth_config: Arc<AuthConfig>,
     pub log_store: Option<crate::server::logs::LogStore>,
-}
-
-/// Login request
-#[derive(Debug, Deserialize)]
-pub struct LoginRequest {
-    pub password: String,
-}
-
-/// Login response
-#[derive(Debug, Serialize)]
-pub struct LoginResponse {
-    pub token: String,
-    pub auth_required: bool,
-}
-
-/// Health check response
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-}
-
-/// Shadowsocks configuration
-#[derive(Debug, Serialize)]
-pub struct ShadowsocksConfig {
-    pub enabled: bool,
-    pub port: Option<u16>,
-    pub cipher: Option<String>,
-}
-
-/// Trojan configuration
-#[derive(Debug, Serialize)]
-pub struct TrojanConfig {
-    pub enabled: bool,
-    pub port: Option<u16>,
-    pub fallback: Option<String>,
-    pub domain: Option<String>,
-    /// 证书来源："acme_exact" | "acme_wildcard" | "self_signed"；未运行时为 null
-    pub cert_source: Option<String>,
-    /// true = 与反代共享端口（SNI 分流）；false = 独立监听
-    pub shared: bool,
-}
-
-/// Mesh network info response
-#[derive(Debug, Serialize)]
-pub struct MeshNetworkResponse {
-    pub id: String,
-    pub members: Vec<MeshMemberResponse>,
-    pub services: Vec<MeshServiceResponse>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MeshMemberResponse {
-    pub client_name: String,
-    pub public_addr: Option<String>,
-    pub p2p_available: bool,
-    pub online: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MeshServiceResponse {
-    pub service_name: String,
-    pub protocol: String,
-    pub local_addr: String,
-    pub client_name: String,
-}
-
-/// DNS record response
-#[derive(Debug, Serialize)]
-pub struct DnsRecordResponse {
-    pub name: String,
-    pub record_type: String,
-    pub value: String,
-}
-
-/// Request to add a manual DNS record
-#[derive(Debug, Deserialize)]
-pub struct AddDnsRecordRequest {
-    pub name: String,
-    pub record_type: String,
-    pub value: String,
-    pub port: Option<u16>,
 }
 
 /// Request body for PUT /api/acme/config
@@ -480,75 +361,6 @@ struct UpdateAcmeConfigRequest {
 struct CertificateRequest {
     /// 挑战类型: "http-01" 或 "dns-01"
     challenge_type: Option<String>,
-}
-
-// Login handler
-async fn login(
-    State(state): State<ApiState>,
-    Json(request): Json<LoginRequest>,
-) -> impl IntoResponse {
-    if !state.auth_config.is_enabled() {
-        let token = create_token(&state.auth_config.jwt_secret)
-            .unwrap_or_else(|_| "dummy-token".to_string());
-        return Json(LoginResponse {
-            token,
-            auth_required: false,
-        })
-        .into_response();
-    }
-
-    if state.auth_config.verify_password(&request.password) {
-        match create_token(&state.auth_config.jwt_secret) {
-            Ok(token) => Json(LoginResponse {
-                token,
-                auth_required: true,
-            })
-            .into_response(),
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create token").into_response(),
-        }
-    } else {
-        (StatusCode::UNAUTHORIZED, "Invalid password").into_response()
-    }
-}
-
-// Logout handler (client just discards token)
-async fn logout() -> impl IntoResponse {
-    StatusCode::OK
-}
-
-// Health check
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
-}
-
-/// Serve embedded static files for frontend
-#[cfg(feature = "embed-frontend")]
-async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
-    let path = if path.is_empty() { "index.html" } else { &path };
-
-    match FrontendAssets::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            axum::http::Response::builder()
-                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
-                .body(Body::from(content.data))
-                .unwrap()
-        }
-        None => {
-            // Fallback to index.html for SPA routing
-            if let Some(index) = FrontendAssets::get("index.html") {
-                axum::http::Response::builder()
-                    .header(axum::http::header::CONTENT_TYPE, "text/html")
-                    .body(Body::from(index.data))
-                    .unwrap()
-            } else {
-                axum::http::Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("Not found"))
-                    .unwrap()
-            }
-        }
-    }
 }
 
 // Get Shadowsocks configuration
@@ -2323,14 +2135,14 @@ pub async fn run_api_server(
 
     // Public routes (no auth required) — SSE uses ?token= query param for auth
     let public_routes = Router::new()
-        .route("/api/login", post(login))
-        .route("/api/health", get(health))
+        .route("/api/login", post(login::login))
+        .route("/api/health", get(login::health))
         .route("/api/stats/stream", get(sse_stats_stream))
         .route("/api/logs/stream", get(sse_log_stream));
 
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
-        .route("/api/logout", post(logout))
+        .route("/api/logout", post(login::logout))
         // Stats query endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/stats/query", get(get_stats_query))
         .route("/api/stats/summary", get(get_stats_summary))
@@ -2428,9 +2240,9 @@ pub async fn run_api_server(
     let static_routes = Router::new()
         .route(
             "/",
-            get(|| async { serve_static(Path("".to_string())).await }),
+            get(|| async { static_files::serve_static(Path("".to_string())).await }),
         )
-        .route("/*path", get(serve_static));
+        .route("/*path", get(static_files::serve_static));
 
     let app = Router::new().merge(public_routes).merge(protected_routes);
 
