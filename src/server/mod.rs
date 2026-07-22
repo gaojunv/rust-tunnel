@@ -15,11 +15,12 @@ pub use mgmt::auth;
 pub use mgmt::dynamic_config;
 pub use mgmt::logs;
 pub use mgmt::stats;
+pub mod protocols;
+pub use protocols::reverse_proxy;
+pub use protocols::shadowsocks;
+pub use protocols::trojan;
+pub use protocols::trojan_runtime;
 pub mod proxy;
-pub mod reverse_proxy;
-pub mod shadowsocks;
-pub mod trojan;
-pub mod trojan_runtime;
 
 pub use config::*;
 pub use db::Database;
