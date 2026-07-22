@@ -1,7 +1,12 @@
 use crate::common::{TunnelError, TunnelResult};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpStream;
 use tracing::debug;
+use tracing::{error, warn};
+
+use crate::server::control::ServerState;
+use crate::server::stats::EntityType;
 
 // Re-export shadowsocks types
 pub use shadowsocks::{
@@ -125,6 +130,116 @@ pub async fn handle_ss_handshake(
     };
 
     Ok((ctx, proxy_stream))
+}
+
+/// Bidirectional copy with Shadowsocks encryption/decryption using ProxyServerStream.
+///
+/// Uses `copy_encrypted_bidirectional` which properly handles TCP shutdown: when one
+/// direction observes EOF, it calls `shutdown()` on the opposing writer so the other
+/// direction unblocks instead of hanging indefinitely.
+async fn copy_bidirectional_with_ss_crypto(
+    _connection_id: u64,
+    _port: u16,
+    mut proxy_stream: ProxyServerStream<TcpStream>,
+    mut target_stream: TcpStream,
+    _state: ServerState,
+) -> TunnelResult<(u64, u64)> {
+    use crate::server::shadowsocks::{copy_encrypted_bidirectional, CipherKind};
+
+    // encrypted_to_plain: client -> target (upload), plain_to_encrypted: target -> client (download)
+    let (encrypted_to_plain, plain_to_encrypted) = copy_encrypted_bidirectional(
+        CipherKind::AES_256_GCM,
+        &mut proxy_stream,
+        &mut target_stream,
+    )
+    .await?;
+
+    Ok((encrypted_to_plain, plain_to_encrypted))
+}
+
+/// Proxy a Shadowsocks connection to target
+pub async fn proxy_ss_connection(
+    connection_id: u64,
+    ss_port: u16,
+    proxy_stream: ProxyServerStream<TcpStream>,
+    ss_ctx: SSConnectionContext,
+    state: ServerState,
+) {
+    debug!(
+        "Starting SS proxy for connection {}, target {}",
+        connection_id, ss_ctx.target_addr
+    );
+
+    // Increment active SS connection count
+    state.increment_ss_connections(ss_port).await;
+    // 统一统计：shadowsocks 桶活跃连接 +1（entity_id 约定为 ss:{port}）
+    let entity_id = format!("ss:{}", ss_port);
+    state
+        .stats_collector
+        .incr_conns(EntityType::Shadowsocks, &entity_id);
+
+    // Record start time for measuring connection setup time (RTT estimate)
+    let start = Instant::now();
+
+    // Connect to target server
+    let target_stream = match TcpStream::connect(&ss_ctx.target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to connect to target {}: {}", ss_ctx.target_addr, e);
+            state.decrement_ss_connections(ss_port).await;
+            // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Shadowsocks, &entity_id);
+            return;
+        }
+    };
+
+    // Calculate connection establishment time as RTT estimate
+    let connect_time_ms = start.elapsed().as_millis() as u64;
+    debug!(
+        "Connected to target {} for SS connection {} in {}ms",
+        ss_ctx.target_addr, connection_id, connect_time_ms
+    );
+
+    let proxy_start = Instant::now();
+    let result = copy_bidirectional_with_ss_crypto(
+        connection_id,
+        ss_port,
+        proxy_stream,
+        target_stream,
+        state.clone(),
+    )
+    .await;
+
+    // Decrement active SS connection count (always run)
+    state.decrement_ss_connections(ss_port).await;
+    // 统一统计：活跃连接 -1（覆盖正常与错误退出）
+    state
+        .stats_collector
+        .decr_conns(EntityType::Shadowsocks, &entity_id);
+
+    match result {
+        Ok((uploaded, downloaded)) => {
+            let elapsed_secs = proxy_start.elapsed().as_secs_f64();
+
+            debug!(
+                "SS connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
+                connection_id, uploaded, downloaded, elapsed_secs
+            );
+
+            // 统一统计：双向字节一次性入账（bytes_in = 客户端->目标，bytes_out = 目标->客户端）
+            state.stats_collector.record_bytes(
+                EntityType::Shadowsocks,
+                &entity_id,
+                uploaded,
+                downloaded,
+            );
+        }
+        Err(e) => {
+            warn!("SS connection {} error: {}", connection_id, e);
+        }
+    }
 }
 
 #[cfg(test)]

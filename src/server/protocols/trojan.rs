@@ -1,10 +1,13 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::common::{TunnelError, TunnelResult};
+use crate::server::control::ServerState;
+use crate::server::stats::EntityType;
 
 /// Trojan command types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +376,117 @@ pub fn validate_trojan_domain(domain: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Proxy a Trojan connection to target.
+/// Trojan data is already decrypted by TLS, so we just do raw TCP bidirectional copy.
+pub async fn proxy_trojan_connection(
+    connection_id: u64,
+    trojan_port: u16,
+    mut tls_stream: TlsStream<TcpStream>,
+    trojan_ctx: TrojanConnectionContext,
+    initial_payload: Vec<u8>,
+    state: ServerState,
+) {
+    debug!(
+        "Starting Trojan proxy for connection {}, target {}",
+        connection_id, trojan_ctx.target_addr
+    );
+
+    // Reject UDP ASSOCIATE — only CONNECT is supported
+    if trojan_ctx.command == TrojanCommand::UdpAssociate {
+        warn!(
+            "Trojan UDP ASSOCIATE is not supported for connection {}",
+            connection_id
+        );
+        return;
+    }
+
+    // Increment active Trojan connection count
+    state.increment_trojan_connections(trojan_port).await;
+    // 统一统计：trojan 桶活跃连接 +1（entity_id 约定为 trojan:{port}）
+    let entity_id = format!("trojan:{}", trojan_port);
+    state
+        .stats_collector
+        .incr_conns(EntityType::Trojan, &entity_id);
+
+    // Record start time for measuring connection setup time (RTT estimate)
+    let start = Instant::now();
+
+    // Connect to target server
+    let mut target_stream = match TcpStream::connect(&trojan_ctx.target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                "Failed to connect to target {}: {}",
+                trojan_ctx.target_addr, e
+            );
+            state.decrement_trojan_connections(trojan_port).await;
+            // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Trojan, &entity_id);
+            return;
+        }
+    };
+
+    let connect_time_ms = start.elapsed().as_millis() as u64;
+    debug!(
+        "Connected to target {} for Trojan connection {} in {}ms",
+        trojan_ctx.target_addr, connection_id, connect_time_ms
+    );
+
+    // Write any initial payload from the Trojan handshake
+    if !initial_payload.is_empty() {
+        if let Err(e) =
+            tokio::io::AsyncWriteExt::write_all(&mut target_stream, &initial_payload).await
+        {
+            warn!(
+                "Failed to write initial payload for Trojan connection {}: {}",
+                connection_id, e
+            );
+            state.decrement_trojan_connections(trojan_port).await;
+            // 统一统计：活跃连接 -1（覆盖初始负载写失败的错误退出路径）
+            state
+                .stats_collector
+                .decr_conns(EntityType::Trojan, &entity_id);
+            return;
+        }
+    }
+
+    let proxy_start = Instant::now();
+
+    // Bidirectional copy: TLS stream (already decrypted) <-> target TCP stream
+    let result = tokio::io::copy_bidirectional(&mut tls_stream, &mut target_stream).await;
+
+    // Decrement active Trojan connection count
+    state.decrement_trojan_connections(trojan_port).await;
+    // 统一统计：活跃连接 -1（覆盖正常与错误退出）
+    state
+        .stats_collector
+        .decr_conns(EntityType::Trojan, &entity_id);
+
+    match result {
+        Ok((client_to_target, target_to_client)) => {
+            let elapsed_secs = proxy_start.elapsed().as_secs_f64();
+
+            debug!(
+                "Trojan connection {} completed: uploaded {} bytes, downloaded {} bytes in {:.2}s",
+                connection_id, client_to_target, target_to_client, elapsed_secs
+            );
+
+            // 统一统计：双向字节一次性入账（bytes_in = 客户端->目标，bytes_out = 目标->客户端）
+            state.stats_collector.record_bytes(
+                EntityType::Trojan,
+                &entity_id,
+                client_to_target,
+                target_to_client,
+            );
+        }
+        Err(e) => {
+            warn!("Trojan connection {} error: {}", connection_id, e);
+        }
+    }
 }
 
 #[cfg(test)]

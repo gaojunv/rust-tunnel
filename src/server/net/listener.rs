@@ -7,8 +7,8 @@ use tracing::{debug, info, warn};
 
 use crate::common::{TunnelError, TunnelResult};
 use crate::server::control::{PortInfo, ServerState};
-use crate::server::proxy::proxy_ss_connection;
-use crate::server::proxy::proxy_trojan_connection;
+use crate::server::protocols::shadowsocks::proxy_ss_connection;
+use crate::server::protocols::trojan::proxy_trojan_connection;
 use crate::server::shadowsocks::handle_ss_handshake;
 use crate::server::trojan::{handle_trojan_fallback, handle_trojan_handshake};
 

@@ -22,7 +22,6 @@ pub use protocols::reverse_proxy;
 pub use protocols::shadowsocks;
 pub use protocols::trojan;
 pub use protocols::trojan_runtime;
-pub mod proxy;
 
 pub use config::*;
 pub use db::Database;
