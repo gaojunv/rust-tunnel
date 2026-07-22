@@ -24,7 +24,7 @@ pub use llm::*;
 pub use records::*;
 
 /// Database wrapper for persistence
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Database {
     pub(crate) pool: Pool<Sqlite>,
 }
