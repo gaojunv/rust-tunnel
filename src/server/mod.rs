@@ -1,4 +1,5 @@
-pub mod acme;
+pub mod pki;
+pub use pki::acme;
 pub use mgmt::api;
 pub mod config;
 pub mod control_plane;
