@@ -9,6 +9,7 @@ import {
   type ChartConfig,
 } from '@/components/ui/chart';
 import { ChartEmpty } from './ChartEmpty';
+import { createYAxisTick } from './yAxisTick';
 
 export interface MetricSeries {
   dataKey: string;
@@ -84,7 +85,7 @@ export const MetricAreaChart = ({
           axisLine={false}
           tickMargin={8}
           width={70}
-          tickFormatter={(v: number) => yFormatter(v)}
+          tick={createYAxisTick(yFormatter)}
         />
         <ChartTooltip
           content={

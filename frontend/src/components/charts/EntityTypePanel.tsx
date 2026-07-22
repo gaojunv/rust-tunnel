@@ -13,6 +13,7 @@ import { useEntityLabel, type EntityType } from '@/hooks/useEntityLabel';
 import { formatBps } from '@/utils/format';
 import type { StatsSnapshot } from '@/types';
 import { ChartEmpty } from './ChartEmpty';
+import { createYAxisTick } from './yAxisTick';
 
 interface EntityTypePanelProps {
   type: EntityType;
@@ -90,7 +91,7 @@ export const EntityTypePanel = ({ type, titleLabel, snapshots }: EntityTypePanel
                 axisLine={false}
                 tickMargin={8}
                 width={70}
-                tickFormatter={formatBps}
+                tick={createYAxisTick(formatBps)}
               />
               <ChartTooltip
                 content={
