@@ -9,6 +9,7 @@ use crate::server::reverse_proxy::rules::{
     resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
     RuleCertStatus, RuleType, TrojanSniEntry,
 };
+use crate::server::llm::LlmState;
 use crate::server::stats::StatsCollector;
 
 /// State for the reverse proxy module
@@ -36,6 +37,8 @@ pub struct ReverseProxyState {
     /// Trojan SNI 分流表项（ArcSwap 热替换）：SNI 命中 domain 时，
     /// 对应 listen_addr 的共享监听器把连接交给 Trojan 处理。None = 独立监听模式。
     pub trojan_sni: Arc<arc_swap::ArcSwap<Option<Arc<TrojanSniEntry>>>>,
+    /// LLM Gateway state (set when LLM is configured).
+    pub llm_state: Arc<tokio::sync::RwLock<Option<Arc<LlmState>>>>,
 }
 
 impl ReverseProxyState {
@@ -52,6 +55,7 @@ impl ReverseProxyState {
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
             trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            llm_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -68,6 +72,7 @@ impl ReverseProxyState {
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
             trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
+            llm_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
