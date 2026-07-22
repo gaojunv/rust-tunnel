@@ -16,6 +16,7 @@ pub mod acme;
 pub mod clients;
 pub mod dns;
 pub mod dto;
+pub mod llm;
 pub mod login;
 pub mod logs;
 pub mod mesh;
@@ -294,6 +295,29 @@ pub async fn run_api_server(
         .route(
             "/api/acme/challenge-status/:domain",
             get(acme::get_challenge_status),
+        )
+        // LLM Gateway management endpoints
+        .route("/api/llm/gateway", get(llm::get_gateway_config).put(llm::update_gateway_config))
+        .route("/api/llm/providers", get(llm::list_providers).post(llm::create_provider))
+        .route(
+            "/api/llm/providers/:id",
+            put(llm::update_provider)
+                .patch(llm::toggle_provider)
+                .delete(llm::delete_provider),
+        )
+        .route(
+            "/api/llm/providers/:provider_id/models",
+            get(llm::list_provider_models).post(llm::add_model),
+        )
+        .route("/api/llm/models", get(llm::list_all_models))
+        .route(
+            "/api/llm/models/:id",
+            put(llm::update_model).delete(llm::delete_model),
+        )
+        .route("/api/llm/api-keys", get(llm::list_api_keys).post(llm::create_api_key))
+        .route(
+            "/api/llm/api-keys/:id",
+            patch(llm::toggle_api_key).delete(llm::delete_api_key),
         )
         // Settings endpoints
         .route("/api/settings", get(settings::get_settings))
