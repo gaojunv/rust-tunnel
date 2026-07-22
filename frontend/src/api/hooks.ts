@@ -27,6 +27,21 @@ import {
   updateReverseProxyConfig,
   getDnsConfig,
   updateDnsConfig,
+  getLlmGatewayConfig,
+  updateLlmGatewayConfig,
+  listLlmProviders,
+  createLlmProvider,
+  updateLlmProvider,
+  toggleLlmProvider,
+  deleteLlmProvider,
+  listProviderModels,
+  addModel,
+  updateModel,
+  deleteModel,
+  listLlmApiKeys,
+  createLlmApiKey,
+  toggleLlmApiKey,
+  deleteLlmApiKey,
 } from './client';
 import type {
   LoginRequest,
@@ -36,6 +51,9 @@ import type {
   DnsProviderConfig,
   ReverseProxySettings,
   DnsSettings,
+  CreateProviderRequest,
+  CreateModelRequest,
+  LlmGatewayConfig,
 } from '../types';
 
 // Shadowsocks hooks
@@ -343,4 +361,123 @@ export function useStatsStream(entityType?: string) {
     });
     return unsub;
   }, [entityType, queryClient]);
+}
+
+// ── LLM Gateway ──────────────────────────────────────────────
+
+export function useLlmGatewayConfig() {
+  return useQuery({
+    queryKey: ['llm-gateway-config'],
+    queryFn: () => getLlmGatewayConfig(),
+  });
+}
+
+export function useUpdateLlmGatewayConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (config: Partial<LlmGatewayConfig>) => updateLlmGatewayConfig(config),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-gateway-config'] }),
+  });
+}
+
+// ── Providers ────────────────────────────────────────────────
+
+export function useLlmProviders() {
+  return useQuery({ queryKey: ['llm-providers'], queryFn: () => listLlmProviders() });
+}
+
+export function useCreateLlmProvider() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: CreateProviderRequest) => createLlmProvider(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
+  });
+}
+
+export function useUpdateLlmProvider() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & CreateProviderRequest) => updateLlmProvider(id, req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
+  });
+}
+
+export function useToggleLlmProvider() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleLlmProvider(id, enabled),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
+  });
+}
+
+export function useDeleteLlmProvider() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteLlmProvider(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-providers'] }),
+  });
+}
+
+// ── Models ───────────────────────────────────────────────────
+
+export function useProviderModels(providerId: string) {
+  return useQuery({
+    queryKey: ['llm-models', providerId],
+    queryFn: () => listProviderModels(providerId),
+    enabled: !!providerId,
+  });
+}
+
+export function useAddModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ providerId, ...req }: { providerId: string } & CreateModelRequest) => addModel(providerId, req),
+    onSuccess: (_data, vars) => qc.invalidateQueries({ queryKey: ['llm-models', vars.providerId] }),
+  });
+}
+
+export function useUpdateModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & CreateModelRequest) => updateModel(id, req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
+  });
+}
+
+export function useDeleteModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteModel(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
+  });
+}
+
+// ── API Keys ─────────────────────────────────────────────────
+
+export function useLlmApiKeys() {
+  return useQuery({ queryKey: ['llm-api-keys'], queryFn: () => listLlmApiKeys() });
+}
+
+export function useCreateLlmApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => createLlmApiKey(name),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
+}
+
+export function useToggleLlmApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleLlmApiKey(id, enabled),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
+}
+
+export function useDeleteLlmApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteLlmApiKey(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
 }

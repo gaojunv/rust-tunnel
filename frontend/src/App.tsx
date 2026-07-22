@@ -13,6 +13,7 @@ import LogsPage from './pages/LogsPage';
 import ClientsPage from './pages/ClientsPage';
 import ClientDetailPage from './pages/ClientDetailPage';
 import SettingsPage from './pages/SettingsPage';
+import LLMPage from './pages/LLMPage';
 import AppLayout from './components/layout/AppLayout';
 import './index.css';
 
@@ -57,6 +58,7 @@ const router = createBrowserRouter([
           { path: '/acme', element: <AcmePage /> },
           { path: '/logs', element: <LogsPage /> },
           { path: '/clients/:name', element: <ClientDetailPage /> },
+          { path: '/llm', element: <LLMPage /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },
