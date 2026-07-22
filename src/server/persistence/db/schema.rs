@@ -158,7 +158,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS proxy_rules (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp')),
+                // NOTE: Rust validation is the true enforcer for existing databases
+                type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp', 'llm')),
                 listen_addr TEXT NOT NULL,
                 domains TEXT,
                 routes TEXT,
@@ -358,6 +359,68 @@ impl Database {
                 id           INTEGER PRIMARY KEY CHECK(id = 1),
                 client_token TEXT NOT NULL,
                 updated_at   DATETIME NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // ============================================================
+        // LLM Gateway tables
+        // ============================================================
+
+        // LLM providers table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL CHECK(provider_type IN ('deepseek', 'volcengine', 'kimi', 'mimo')),
+                base_url TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                extra_config TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // LLM models table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_models (
+                id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
+                model_name TEXT NOT NULL,
+                alias TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider_id)")
+            .execute(pool)
+            .await?;
+
+        // LLM API keys table (gateway-level keys for external callers)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_api_keys (
+                id TEXT PRIMARY KEY,
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_used_at TEXT
             )
             "#,
         )
