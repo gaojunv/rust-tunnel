@@ -271,3 +271,67 @@ export interface StatsSummary {
   shadowsocks: EntitySummary;
   trojan: EntitySummary;
 }
+
+// === LLM Gateway ===
+
+export type ProviderType = 'deepseek' | 'volcengine' | 'kimi' | 'mimo';
+
+export interface LlmGatewayConfig {
+  enabled: boolean;
+  domain: string;
+  listen: string;
+  tls_enabled: boolean;
+  tls_acme: boolean;
+}
+
+export interface LlmProvider {
+  id: string;
+  name: string;
+  provider_type: ProviderType;
+  base_url: string;
+  extra_config?: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateProviderRequest {
+  name: string;
+  provider_type: ProviderType;
+  base_url: string;
+  api_key: string;
+  extra_config?: string | null;
+}
+
+export interface LlmModel {
+  id: string;
+  provider_id: string;
+  model_name: string;
+  alias: string;
+  tags: string[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateModelRequest {
+  model_name: string;
+  alias?: string;
+  tags?: string[];
+}
+
+export interface LlmApiKey {
+  id: string;
+  key_prefix: string;
+  name: string;
+  enabled: boolean;
+  created_at: string;
+  last_used_at?: string | null;
+}
+
+export interface CreateApiKeyResponse {
+  id: string;
+  key: string;
+  key_prefix: string;
+  name: string;
+}

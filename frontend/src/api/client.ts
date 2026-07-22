@@ -23,6 +23,13 @@ import type {
   DnsSettings,
   Client,
   ServerAuthView,
+  LlmProvider,
+  CreateProviderRequest,
+  LlmModel,
+  CreateModelRequest,
+  LlmApiKey,
+  CreateApiKeyResponse,
+  LlmGatewayConfig,
 } from '../types';
 
 const API_BASE = '/api';
@@ -278,3 +285,83 @@ export const getDnsConfig = async (): Promise<DnsSettings> => {
 export const updateDnsConfig = async (config: DnsSettings): Promise<void> => {
   await api.put('/settings/dns', config);
 };
+
+// ── LLM Gateway ──────────────────────────────────────────────
+
+export async function getLlmGatewayConfig(): Promise<LlmGatewayConfig> {
+  const { data } = await api.get('/llm/gateway');
+  return data;
+}
+
+export async function updateLlmGatewayConfig(config: Partial<LlmGatewayConfig>): Promise<void> {
+  await api.put('/llm/gateway', config);
+}
+
+// ── Providers ────────────────────────────────────────────────
+
+export async function listLlmProviders(): Promise<LlmProvider[]> {
+  const { data } = await api.get('/llm/providers');
+  return data.providers;
+}
+
+export async function createLlmProvider(req: CreateProviderRequest): Promise<{ id: string }> {
+  const { data } = await api.post('/llm/providers', req);
+  return data;
+}
+
+export async function updateLlmProvider(id: string, req: CreateProviderRequest): Promise<void> {
+  await api.put(`/llm/providers/${id}`, req);
+}
+
+export async function toggleLlmProvider(id: string, enabled: boolean): Promise<void> {
+  await api.patch(`/llm/providers/${id}`, { enabled });
+}
+
+export async function deleteLlmProvider(id: string): Promise<void> {
+  await api.delete(`/llm/providers/${id}`);
+}
+
+// ── Models ───────────────────────────────────────────────────
+
+export async function listProviderModels(providerId: string): Promise<LlmModel[]> {
+  const { data } = await api.get(`/llm/providers/${providerId}/models`);
+  return data.models;
+}
+
+export async function listAllLlmModels(): Promise<LlmModel[]> {
+  const { data } = await api.get('/llm/models');
+  return data.models;
+}
+
+export async function addModel(providerId: string, req: CreateModelRequest): Promise<{ id: string }> {
+  const { data } = await api.post(`/llm/providers/${providerId}/models`, req);
+  return data;
+}
+
+export async function updateModel(id: string, req: CreateModelRequest): Promise<void> {
+  await api.put(`/llm/models/${id}`, req);
+}
+
+export async function deleteModel(id: string): Promise<void> {
+  await api.delete(`/llm/models/${id}`);
+}
+
+// ── API Keys ─────────────────────────────────────────────────
+
+export async function listLlmApiKeys(): Promise<LlmApiKey[]> {
+  const { data } = await api.get('/llm/api-keys');
+  return data.api_keys;
+}
+
+export async function createLlmApiKey(name: string): Promise<CreateApiKeyResponse> {
+  const { data } = await api.post('/llm/api-keys', { name });
+  return data;
+}
+
+export async function toggleLlmApiKey(id: string, enabled: boolean): Promise<void> {
+  await api.patch(`/llm/api-keys/${id}`, { enabled });
+}
+
+export async function deleteLlmApiKey(id: string): Promise<void> {
+  await api.delete(`/llm/api-keys/${id}`);
+}
