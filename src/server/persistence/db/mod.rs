@@ -18,7 +18,9 @@ pub mod server_auth;
 pub mod settings;
 pub mod shadowsocks;
 pub mod stats;
+pub mod llm;
 pub mod trojan;
+pub use llm::*;
 pub use records::*;
 
 /// Database wrapper for persistence
