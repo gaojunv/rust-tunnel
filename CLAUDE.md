@@ -63,18 +63,22 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `logging.rs` — 日志初始化
 
 **`src/server/`** — 服务器实现
-- `control.rs` — `ServerState`：控制连接接收、`ClientRegistry` 管理、消息分发（OpenTunnel/Data/Close）、心跳质量监控、SS/Trojan 端口追踪
-- `client_registry.rs` — 客户端名录（在线/离线）、注册认证、踢人、`open_tunnel` 拨号入口
-- `tunnel_stream.rs` — `ClientTunnelStream`：基于控制通道的 `AsyncRead+AsyncWrite`，`write→Data{bytes}` / `read←Data{bytes}` / `drop→Close`
-- `api/` — Axum API 路由（`mod.rs` + `clients.rs` + `server_auth.rs`）+ `rust-embed` 嵌入前端 + `TrafficStore` 指标
-- `auth.rs` — JWT 认证
-- `db.rs` — SQLite（WAL 模式）：流量、质量、会话、clients、server_auth、SS/Trojan 配置、日志持久化
-- `config.rs` — Clap + figment（TOML）+ 环境变量，三级优先级
-- `quality.rs` — 实时质量监控：RTT/丢包/吞吐量追踪、评分（0-100）、阈值告警、历史采样（内存 60 分钟，数据库 24 小时）
-- `reverse_proxy/` — 反向代理子系统，含 `mod.rs`（规则、校验、状态）、`connector.rs`（`Connector` trait + `DirectConnector` + `ClientConnector`）、`handler.rs`（HTTP 请求处理）、`tcp_proxy.rs`（TCP 透明代理）、`upstream.rs`（直连 HTTP 客户端池）、`router.rs`（host/路径路由表）、`shared_listener.rs`（多规则共享端口）、`sni_resolver.rs`（TLS SNI 分发）、`error.rs`（ReconcileError）
-- `shadowsocks.rs` — 内置 SS 代理：`shadowsocks-rust` crate，AES-256-GCM / ChaCha20-Poly1305，EVP_BytesToKey 密钥派生
-- `trojan.rs` — 内置 Trojan 代理：TLS 必需、SHA-224 认证、增量解析（`ParseResult`）、认证失败回退
-- `logs.rs` — 自定义 tracing Layer，捕获日志到内存 + SQLite，API 支持分页/过滤
+- `control_plane/` — 控制通道、`ServerState`、`ClientRegistry` 管理、消息分发、心跳质量监控、SS/Trojan 端口追踪
+- `protocols/` — 代理协议实现：
+  - `shadowsocks.rs` — 内置 SS 代理：`shadowsocks-rust` crate，AES-256-GCM / ChaCha20-Poly1305，EVP_BytesToKey 密钥派生
+  - `trojan.rs` — 内置 Trojan 代理：TLS 必需、SHA-224 认证、增量解析（`ParseResult`）、认证失败回退
+  - `trojan_runtime.rs` — SS/Trojan 运行时管理与连接生命周期
+  - `reverse_proxy/` — 反向代理子系统，含规则、路由、HTTP/TCP handler、Connector trait、直连/隧道连接、SNI 分发
+- `persistence/` — 数据持久化（SQLite WAL 模式）：流量、质量、会话、clients、SS/Trojan 配置、日志
+- `mgmt/` — 管理面：
+  - `api/` — Axum API 路由 + `rust-embed` 嵌入前端
+  - `auth.rs` — JWT 认证
+  - `logs.rs` — 自定义 tracing Layer，捕获日志到内存 + SQLite，API 支持分页/过滤
+  - `stats.rs` — 实时质量监控、RTT/丢包/吞吐量追踪、评分（0-100）、阈值告警、历史采样
+  - `dynamic_config.rs` — 动态配置管理
+- `pki/` — 证书与 ACME 自动续签
+- `net/` — 网络基建（listener/dns/mesh）
+- `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
 
 **`src/client/`** — 客户端实现（零配置范式的端侧）
 - `control.rs` — 建立控制连接、TLS、密码认证、`Register{protocol_version:2, name, password, version}`、`ClientState`（pending→active 连接管理）、分发 `OpenTunnel`/`Data`/`Close`/`Disconnect`
@@ -99,7 +103,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
-- 完整列表见 `src/server/api/mod.rs`
+- 完整列表见 `src/server/mgmt/api/mod.rs`
 
 ## 代码模式
 
@@ -110,7 +114,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - 状态共享：`Arc<Mutex<T>>`、`tokio::sync::Mutex`
 - 数据库：sqlx + SQLite（WAL 模式）
 - TLS：rustls + tokio-rustls + rcgen（自签名证书）
-- 配置：Clap（CLI）+ figment（TOML + 环境变量），三级优先级：CLI > 环境变量 > 配置文件 > 默认值
+- 配置：Clap（CLI）+ figment（TOML + 环境变量），三级优先级：CLI > 环境变量 > 配置文件 > 默认值（`src/server/config/`）
 - 质量监控：基于心跳的 RTT 测量，通过序列号追踪丢包
 - Lint：项目配置为 `clippy::pedantic`
 
