@@ -198,6 +198,10 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // Migration: old DBs have CHECK(type IN ('http','tcp','udp')) without 'llm'.
+        // Test if 'llm' is accepted and rebuild the table if not.
+        Self::migrate_proxy_rules_check_for_llm(pool).await?;
+
         // ── Unified stats snapshots (replaces proxy_traffic / connection_quality_history) ──
         sqlx::query(
             r#"
@@ -427,5 +431,105 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Migrate old proxy_rules CHECK constraint to include 'llm'.
+    /// Idempotent: tests if 'llm' type is accepted; if so, no-op.
+    async fn migrate_proxy_rules_check_for_llm(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        // Test if the current CHECK accepts 'llm'
+        let probe_id = "__migration_probe_llm_check__";
+        let test_result = sqlx::query(
+            "INSERT INTO proxy_rules (id, name, type, listen_addr, created_at, updated_at)
+             VALUES (?, 'probe', 'llm', '127.0.0.1:1', datetime('now'), datetime('now'))",
+        )
+        .bind(probe_id)
+        .execute(pool)
+        .await;
+
+        match test_result {
+            Ok(_) => {
+                // CHECK already accepts 'llm' — clean up probe and return
+                sqlx::query("DELETE FROM proxy_rules WHERE id = ?")
+                    .bind(probe_id)
+                    .execute(pool)
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("CHECK constraint failed") {
+                    return Err(e);
+                }
+                // Fall through to migration
+            }
+        }
+
+        // Run migration: rebuild table with updated CHECK
+        sqlx::query("BEGIN EXCLUSIVE").execute(pool).await?;
+        let result = async {
+            // Create new table with updated CHECK (including 'llm')
+            sqlx::query(
+                r#"
+                CREATE TABLE proxy_rules_new (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp', 'llm')),
+                    listen_addr TEXT NOT NULL,
+                    domains TEXT,
+                    routes TEXT,
+                    tls_enabled INTEGER NOT NULL DEFAULT 0,
+                    tls_acme INTEGER NOT NULL DEFAULT 0,
+                    tls_domain TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    cert_source TEXT,
+                    cert_covering_domain TEXT,
+                    cert_status_updated_at DATETIME
+                )
+                "#,
+            )
+            .execute(pool)
+            .await?;
+
+            // Copy existing data
+            sqlx::query(
+                "INSERT INTO proxy_rules_new SELECT * FROM proxy_rules",
+            )
+            .execute(pool)
+            .await?;
+
+            // Drop old table and rename new
+            sqlx::query("DROP TABLE proxy_rules").execute(pool).await?;
+            sqlx::query("ALTER TABLE proxy_rules_new RENAME TO proxy_rules")
+                .execute(pool)
+                .await?;
+
+            // Recreate indexes
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)",
+            )
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_proxy_rules_enabled ON proxy_rules(enabled)",
+            )
+            .execute(pool)
+            .await?;
+
+            Ok::<_, sqlx::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(pool).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(pool).await;
+                Err(e)
+            }
+        }
     }
 }

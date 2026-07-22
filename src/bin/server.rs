@@ -324,6 +324,11 @@ async fn main() -> TunnelResult<()> {
     if let Err(e) = state.proxy_state.load_from_db().await {
         tracing::warn!("Failed to load proxy rules from DB: {}", e);
     }
+
+    // Initialize LLM Gateway state after proxy rules are loaded from DB.
+    // This must happen before any reconcile so that Llm rules are handled.
+    state.proxy_state.init_llm_state(state.db().cloned()).await;
+
     {
         let addrs = state.proxy_state.distinct_http_listen_addrs().await;
         for addr in addrs {

@@ -47,7 +47,47 @@ pub async fn update_gateway_config(
         tls_acme,
     };
 
-    // Update in-memory gateway config
+    let rule_id = "__llm_gateway__".to_string();
+    let tls = if tls_enabled {
+        Some(crate::server::reverse_proxy::ProxyTlsConfig {
+            enabled: true,
+            acme: tls_acme,
+            domain: Some(domain.clone()),
+        })
+    } else {
+        None
+    };
+
+    let rule = crate::server::reverse_proxy::ProxyRule {
+        id: rule_id.clone(),
+        name: "LLM Gateway".into(),
+        rule_type: crate::server::reverse_proxy::RuleType::Llm,
+        listen: listen.clone(),
+        domains: vec![domain.clone()],
+        routes: vec![],
+        tls,
+        enabled,
+        created_at: None,
+        cert_status: None,
+    };
+
+    // Step 1: Persist to DB first (fail early if DB is unavailable)
+    if let Err(e) = state.server_state.proxy_state.save_rule(&rule).await {
+        tracing::error!("Failed to persist LLM gateway rule: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist gateway config: {}", e),
+        )
+            .into_response();
+    }
+
+    // Step 2: Update in-memory rules
+    {
+        let mut rules = state.server_state.proxy_state.rules.lock().await;
+        rules.insert(rule_id.clone(), rule);
+    }
+
+    // Step 3: Update in-memory gateway config
     {
         let llm_guard = state.server_state.proxy_state.llm_state.read().await;
         if let Some(llm) = llm_guard.as_ref() {
@@ -55,52 +95,9 @@ pub async fn update_gateway_config(
         }
     }
 
-    // Create/update internal ProxyRule for the LLM gateway
-    if enabled {
-        let rule_id = "__llm_gateway__".to_string();
-        let tls = if tls_enabled {
-            Some(crate::server::reverse_proxy::ProxyTlsConfig {
-                enabled: true,
-                acme: tls_acme,
-                domain: Some(domain.clone()),
-            })
-        } else {
-            None
-        };
-
-        let rule = crate::server::reverse_proxy::ProxyRule {
-            id: rule_id.clone(),
-            name: "LLM Gateway".into(),
-            rule_type: crate::server::reverse_proxy::RuleType::Llm,
-            listen: listen.clone(),
-            domains: vec![domain.clone()],
-            routes: vec![],
-            tls,
-            enabled: true,
-            created_at: None,
-            cert_status: None,
-        };
-
-        {
-            let mut rules = state.server_state.proxy_state.rules.lock().await;
-            rules.insert(rule_id, rule);
-        }
-
-        // Reconcile the listener
-        if let Err(e) = state.server_state.proxy_state.reconcile_http_listener(&listen).await {
-            tracing::error!("Failed to reconcile LLM listener: {}", e);
-        }
-    } else {
-        // Disable: remove the internal rule
-        let listen = {
-            let mut rules = state.server_state.proxy_state.rules.lock().await;
-            let old_rule = rules.remove("__llm_gateway__");
-            drop(rules);
-            old_rule.map(|r| r.listen).unwrap_or(listen)
-        };
-        if let Err(e) = state.server_state.proxy_state.reconcile_http_listener(&listen).await {
-            tracing::error!("Failed to reconcile LLM listener after disable: {}", e);
-        }
+    // Step 4: Reconcile listener
+    if let Err(e) = state.server_state.proxy_state.reconcile_http_listener(&listen).await {
+        tracing::error!("Failed to reconcile LLM listener: {}", e);
     }
 
     Json(serde_json::json!({"status": "ok"})).into_response()

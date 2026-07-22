@@ -9,7 +9,7 @@ use crate::server::reverse_proxy::rules::{
     resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
     RuleCertStatus, RuleType, TrojanSniEntry,
 };
-use crate::server::llm::LlmState;
+use crate::server::llm::{LlmGatewayConfig, LlmState};
 use crate::server::stats::StatsCollector;
 
 /// State for the reverse proxy module
@@ -74,6 +74,40 @@ impl ReverseProxyState {
             trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
             llm_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Initialize the LlmState from the in-memory `__llm_gateway__` rule (if any).
+    /// Called during server startup after rules are loaded from DB.
+    pub async fn init_llm_state(&self, db: Option<Database>) {
+        let gateway_rule = {
+            let rules = self.rules.lock().await;
+            rules.get("__llm_gateway__").cloned()
+        };
+
+        let llm = LlmState::new(db);
+
+        // Derive gateway config from the ProxyRule
+        if let Some(rule) = gateway_rule {
+            let tls = rule.tls.as_ref();
+            let config = LlmGatewayConfig {
+                enabled: rule.enabled,
+                domain: rule.domains.first().cloned().unwrap_or_default(),
+                listen: rule.listen.clone(),
+                tls_enabled: tls.is_some_and(|t| t.enabled),
+                tls_acme: tls.is_some_and(|t| t.acme),
+            };
+            *llm.gateway_config.write().await = Some(config);
+        } else {
+            *llm.gateway_config.write().await = Some(LlmGatewayConfig {
+                enabled: false,
+                domain: String::new(),
+                listen: "0.0.0.0:443".to_string(),
+                tls_enabled: false,
+                tls_acme: false,
+            });
+        }
+
+        *self.llm_state.write().await = Some(Arc::new(llm));
     }
 
     /// Set the concrete certificate manager for TLS termination and coverage queries.
@@ -490,5 +524,97 @@ mod tests {
             Some(("0.0.0.0:443".to_string(), true))
         );
         assert!(state.http_listen_addr_for_port(8443).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn init_llm_state_from_gateway_rule() {
+        let state = ReverseProxyState::new();
+
+        // Before init, llm_state should be None
+        assert!(state.llm_state.read().await.is_none());
+
+        // Insert a gateway rule
+        let mut rules = state.rules.lock().await;
+        rules.insert(
+            "__llm_gateway__".into(),
+            ProxyRule {
+                id: "__llm_gateway__".into(),
+                name: "LLM Gateway".into(),
+                rule_type: RuleType::Llm,
+                listen: "0.0.0.0:443".into(),
+                domains: vec!["llm.example.com".into()],
+                routes: vec![],
+                tls: Some(ProxyTlsConfig {
+                    enabled: true,
+                    acme: true,
+                    domain: Some("llm.example.com".into()),
+                }),
+                enabled: true,
+                created_at: None,
+                cert_status: None,
+            },
+        );
+        drop(rules);
+
+        // Initialize LlmState (without DB)
+        state.init_llm_state(None).await;
+
+        let llm_guard = state.llm_state.read().await;
+        assert!(llm_guard.is_some(), "llm_state should be initialized");
+        let llm = llm_guard.as_ref().unwrap();
+        let cfg = llm.gateway_config.read().await;
+        let cfg = cfg.as_ref().expect("gateway config should be loaded");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.domain, "llm.example.com");
+        assert_eq!(cfg.listen, "0.0.0.0:443");
+        assert!(cfg.tls_enabled);
+        assert!(cfg.tls_acme);
+    }
+
+    #[tokio::test]
+    async fn init_llm_state_no_gateway_rule() {
+        let state = ReverseProxyState::new();
+        // No gateway rule — llm_state should still be initialized (disabled)
+        state.init_llm_state(None).await;
+        let llm_guard = state.llm_state.read().await;
+        assert!(llm_guard.is_some(), "llm_state should always be initialized for API access");
+        let llm = llm_guard.as_ref().unwrap();
+        let cfg = llm.gateway_config.read().await;
+        let cfg = cfg.as_ref().expect("gateway config should exist");
+        assert!(!cfg.enabled, "should be disabled by default");
+    }
+
+    #[tokio::test]
+    async fn init_llm_state_disabled_gateway() {
+        let state = ReverseProxyState::new();
+
+        let mut rules = state.rules.lock().await;
+        rules.insert(
+            "__llm_gateway__".into(),
+            ProxyRule {
+                id: "__llm_gateway__".into(),
+                name: "LLM Gateway".into(),
+                rule_type: RuleType::Llm,
+                listen: "0.0.0.0:443".into(),
+                domains: vec!["llm.example.com".into()],
+                routes: vec![],
+                tls: None,
+                enabled: false,
+                created_at: None,
+                cert_status: None,
+            },
+        );
+        drop(rules);
+
+        state.init_llm_state(None).await;
+
+        // Even if the rule exists but is disabled, llm_state should be initialized
+        // (the enabled flag is checked per-request)
+        let llm_guard = state.llm_state.read().await;
+        assert!(llm_guard.is_some());
+        let llm = llm_guard.as_ref().unwrap();
+        let cfg = llm.gateway_config.read().await;
+        let cfg = cfg.as_ref().expect("gateway config should exist");
+        assert!(!cfg.enabled);
     }
 }

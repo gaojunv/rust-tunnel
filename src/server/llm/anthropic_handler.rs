@@ -10,6 +10,27 @@ use super::router::resolve_model;
 use super::upstream::{call_upstream, error_response};
 use super::{ChatCompletionRequest, ChatMessage};
 
+/// Extract text content from an Anthropic message's content field,
+/// which can be either a plain string or an array of content blocks.
+fn extract_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let parts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|block| {
+                    block.get("type")
+                        .and_then(|t| t.as_str())
+                        .filter(|t| *t == "text")
+                        .and(block.get("text").and_then(|t| t.as_str()))
+                })
+                .collect();
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
 /// Convert Anthropic Messages request to unified ChatCompletionRequest.
 fn anthropic_to_openai(body: &serde_json::Value) -> Result<ChatCompletionRequest, String> {
     let anthropic_model = body.get("model")
@@ -18,16 +39,34 @@ fn anthropic_to_openai(body: &serde_json::Value) -> Result<ChatCompletionRequest
 
     let messages_raw = body.get("messages")
         .ok_or("messages is required")?;
-    let messages: Vec<ChatMessage> = serde_json::from_value(messages_raw.clone())
-        .map_err(|e| format!("invalid messages: {}", e))?;
+
+    // Parse Anthropic messages with flexible content field (string or content blocks)
+    let messages: Vec<ChatMessage> = messages_raw
+        .as_array()
+        .ok_or("messages must be an array")?
+        .iter()
+        .map(|msg| {
+            let role = msg.get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("user")
+                .to_string();
+            let content = msg.get("content")
+                .map(extract_content)
+                .unwrap_or_default();
+            ChatMessage { role, content }
+        })
+        .collect();
 
     // Anthropic uses system as a top-level field, not a message role
     let mut all_messages = Vec::new();
-    if let Some(system) = body.get("system").and_then(|v| v.as_str()) {
-        all_messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: system.to_string(),
-        });
+    if let Some(system) = body.get("system") {
+        let system_text = extract_content(system);
+        if !system_text.is_empty() {
+            all_messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: system_text,
+            });
+        }
     }
     all_messages.extend(messages);
 
@@ -49,6 +88,11 @@ pub async fn handle_messages(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Validate Host header matches configured LLM domain
+    if !super::openai_handler::validate_host(&state.llm, &headers).await {
+        return error_response(StatusCode::NOT_FOUND, "Not found".into(), "invalid_request_error");
+    }
+
     // Validate API key
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     if validate_api_key(&state.llm, auth).await.is_none() {
@@ -208,5 +252,61 @@ mod tests {
         let result = anthropic_to_openai(&input).unwrap();
         assert_eq!(result.temperature, Some(0.7));
         assert_eq!(result.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn test_anthropic_content_blocks() {
+        // Anthropic SDK sends content as an array of content blocks
+        let input = serde_json::json!({
+            "model": "claude-3-opus",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Hello"},
+                        {"type": "text", "text": "World"}
+                    ]
+                }
+            ],
+            "stream": false,
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, "user");
+        assert_eq!(result.messages[0].content, "Hello\nWorld");
+    }
+
+    #[test]
+    fn test_anthropic_mixed_content_single_text_block() {
+        // Single text block should work too
+        let input = serde_json::json!({
+            "model": "test",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Just one block"}
+                    ]
+                }
+            ],
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        assert_eq!(result.messages[0].content, "Just one block");
+    }
+
+    #[test]
+    fn test_anthropic_content_string_still_works() {
+        // Plain string content should still work
+        let input = serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "plain string"}
+            ],
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        assert_eq!(result.messages[0].content, "plain string");
     }
 }

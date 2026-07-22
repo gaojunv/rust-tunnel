@@ -390,7 +390,7 @@ impl ReverseProxyState {
             let rules = self.rules.lock().await;
             rules
                 .values()
-                .filter(|r| r.enabled && r.rule_type == RuleType::Http && r.listen == listen_addr)
+                .filter(|r| r.enabled && (r.rule_type == RuleType::Http || r.rule_type == RuleType::Llm) && r.listen == listen_addr)
                 .cloned()
                 .collect()
         };
@@ -470,7 +470,7 @@ impl ReverseProxyState {
         let rules = self.rules.lock().await;
         let mut set: HashSet<String> = HashSet::new();
         for r in rules.values() {
-            if r.rule_type == RuleType::Http {
+            if r.rule_type == RuleType::Http || r.rule_type == RuleType::Llm {
                 set.insert(r.listen.clone());
             }
         }
@@ -664,6 +664,100 @@ mod tests {
         {
             state.rules.lock().await.clear();
         }
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+    }
+
+    fn llm_rule(id: &str, listen: &str, domain: &str, tls: bool) -> ProxyRule {
+        ProxyRule {
+            id: id.into(),
+            name: id.into(),
+            rule_type: RuleType::Llm,
+            listen: listen.into(),
+            domains: vec![domain.into()],
+            routes: vec![],
+            tls: if tls {
+                Some(ProxyTlsConfig {
+                    enabled: true,
+                    acme: false,
+                    domain: Some(domain.into()),
+                })
+            } else {
+                None
+            },
+            enabled: true,
+            created_at: None,
+            cert_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_llm_rule_starts_listener() {
+        let state = ReverseProxyState::new();
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen_addr = format!("127.0.0.1:{port}");
+        let rule = llm_rule("llm1", &listen_addr, "llm.example.com", false);
+
+        state.rules.lock().await.insert("llm1".into(), rule);
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+        assert!(state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
+
+        // Cleanup
+        state.rules.lock().await.remove("llm1");
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+        assert!(!state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
+    }
+
+    #[tokio::test]
+    async fn distinct_listen_addrs_includes_llm_rules() {
+        let state = ReverseProxyState::new();
+
+        let http_rule = http_rule("h1", "0.0.0.0:8443", "api.example.com", false);
+        let llm_rule = llm_rule("l1", "0.0.0.0:8444", "llm.example.com", false);
+
+        state.rules.lock().await.insert("h1".into(), http_rule);
+        state.rules.lock().await.insert("l1".into(), llm_rule);
+
+        let addrs = state.distinct_http_listen_addrs().await;
+        assert!(addrs.contains(&"0.0.0.0:8443".to_string()), "HTTP rule address should be present");
+        assert!(addrs.contains(&"0.0.0.0:8444".to_string()), "LLM rule address should be present");
+    }
+
+    #[tokio::test]
+    async fn reconcile_llm_and_http_on_same_port() {
+        let state = ReverseProxyState::new();
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let listen_addr = format!("127.0.0.1:{port}");
+
+        let http_rule = http_rule("h1", &listen_addr, "api.example.com", false);
+        let llm_rule = llm_rule("l1", &listen_addr, "llm.example.com", false);
+
+        state.rules.lock().await.insert("h1".into(), http_rule);
+        state.rules.lock().await.insert("l1".into(), llm_rule);
+
+        // Both rules on same port with same TLS mode should work
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+        assert!(state
+            .shared_listeners
+            .lock()
+            .await
+            .contains_key(&listen_addr));
+
+        // Cleanup
+        state.rules.lock().await.clear();
         state.reconcile_http_listener(&listen_addr).await.unwrap();
     }
 

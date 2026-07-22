@@ -42,6 +42,7 @@ pub async fn resolve_model(
 }
 
 /// Get list of all enabled models (for /v1/models).
+/// Only returns models whose provider is also enabled.
 pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.as_ref().ok_or("database not available")?;
 
@@ -55,6 +56,12 @@ pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::V
         .await
         .map_err(|e| format!("database error: {}", e))?;
 
+    let enabled_providers: std::collections::HashSet<String> = providers
+        .iter()
+        .filter(|p| p.enabled != 0)
+        .map(|p| p.id.clone())
+        .collect();
+
     let provider_map: std::collections::HashMap<String, String> = providers
         .iter()
         .map(|p| (p.id.clone(), p.name.clone()))
@@ -62,7 +69,7 @@ pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::V
 
     let result: Vec<serde_json::Value> = models
         .into_iter()
-        .filter(|m| m.enabled != 0)
+        .filter(|m| m.enabled != 0 && enabled_providers.contains(&m.provider_id))
         .map(|m| {
             serde_json::json!({
                 "id": if m.alias.is_empty() { &m.model_name } else { &m.alias },

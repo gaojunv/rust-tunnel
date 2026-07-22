@@ -364,7 +364,9 @@ pub async fn delete_proxy_rule(
         Some(r) => r,
     };
 
-    if deleted.rule_type != crate::server::reverse_proxy::RuleType::Http {
+    if deleted.rule_type != crate::server::reverse_proxy::RuleType::Http
+        && deleted.rule_type != crate::server::reverse_proxy::RuleType::Llm
+    {
         let listener_handle = {
             let mut listeners = state.server_state.proxy_state.tcp_listeners.lock().await;
             listeners.remove(&id)
@@ -378,7 +380,9 @@ pub async fn delete_proxy_rule(
         tracing::error!("Failed to delete proxy rule from database: {}", e);
     }
 
-    if deleted.rule_type == crate::server::reverse_proxy::RuleType::Http {
+    if deleted.rule_type == crate::server::reverse_proxy::RuleType::Http
+        || deleted.rule_type == crate::server::reverse_proxy::RuleType::Llm
+    {
         if let Err(e) = state
             .server_state
             .proxy_state
