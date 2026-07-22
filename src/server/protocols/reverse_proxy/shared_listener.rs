@@ -6,7 +6,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::{routing::any, Router};
+use axum::{
+    routing::{any, get, post},
+    Router,
+};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -192,6 +195,88 @@ async fn handle_one_connection(
                     entry.state.clone(),
                 )
                 .await;
+                return;
+            }
+        }
+    }
+
+    // ── LLM Gateway dispatch ───────────────────────────────────────
+    {
+        let llm_guard = proxy_state.llm_state.read().await;
+        if let Some(llm_state) = llm_guard.as_ref() {
+            let gateway_enabled = llm_state
+                .gateway_config
+                .read()
+                .await
+                .as_ref()
+                .map(|gc| gc.enabled)
+                .unwrap_or(false);
+
+            if gateway_enabled {
+                let llm_handler_state = crate::server::llm::openai_handler::LlmHandlerState {
+                    llm: llm_state.clone(),
+                };
+
+                let source = RouteSource(route_table.clone());
+
+                // LLM routes with their own state
+                let llm_routes = Router::new()
+                    .route(
+                        "/v1/models",
+                        get(crate::server::llm::openai_handler::handle_list_models),
+                    )
+                    .route(
+                        "/v1/chat/completions",
+                        post(crate::server::llm::openai_handler::handle_chat_completions),
+                    )
+                    .route(
+                        "/v1/messages",
+                        post(crate::server::llm::anthropic_handler::handle_messages),
+                    )
+                    .with_state(llm_handler_state);
+
+                // Proxy fallback with its own state
+                let proxy_routes = Router::new()
+                    .fallback(any(handle_proxy_request_unified))
+                    .with_state((source, upstream.clone(), proxy_state.clone()));
+
+                let app = llm_routes.merge(proxy_routes);
+
+                match acceptor {
+                    Some(acc) => {
+                        let tls_stream = match acc.accept(stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                debug!("TLS handshake failed: {}", e);
+                                return;
+                            }
+                        };
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let service =
+                            hyper_util::service::TowerToHyperService::new(app.into_service());
+                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                        {
+                            debug!("HTTPS connection error: {}", e);
+                        }
+                    }
+                    None => {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let service =
+                            hyper_util::service::TowerToHyperService::new(app.into_service());
+                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection_with_upgrades(io, service)
+                        .await
+                        {
+                            debug!("HTTP connection error: {}", e);
+                        }
+                    }
+                }
                 return;
             }
         }
