@@ -5,7 +5,10 @@ export const formatBytes = (bytes: number): string => {
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  const value = bytes / Math.pow(k, i);
+  // 精度随量级递减，避免 "683.59 KB" 这类过长标签挤压坐标轴
+  const decimals = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return parseFloat(value.toFixed(decimals)) + ' ' + sizes[i];
 };
 
 export const formatBps = (bytesPerSec: number): string =>
