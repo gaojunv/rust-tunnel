@@ -22,7 +22,7 @@ export const TrafficAreaChart = () => {
   const startIso = useMemo(() => new Date(range.startMs).toISOString(), [range.startMs]);
   const endIso = useMemo(() => new Date(range.endMs).toISOString(), [range.endMs]);
   const { data: snapshots = [] } = useStatsQuery(
-    [...ENTITY_TYPES],
+    ENTITY_TYPES as unknown as string[],
     undefined,
     startIso,
     endIso,
