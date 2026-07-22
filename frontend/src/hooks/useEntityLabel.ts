@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useMemo } from 'react';
 import { useProxyRules } from '@/api/hooks';
 import type { StatsSnapshot } from '@/types';
 
@@ -15,24 +15,59 @@ export type EntityType = StatsSnapshot['entity_type'];
  *  - trojan:      "trojan:<port>" → "Trojan (port <port>)"，无法解析端口则原样
  */
 export function useEntityLabel(): (type: EntityType, id: string) => string {
-  // Task 1 暂不使用 rules，Task 2 补上
-  useProxyRules();
+  const { data: rules } = useProxyRules();
 
-  return useCallback((type, id) => {
-    switch (type) {
-      case 'client':
-        return id;
-      case 'shadowsocks':
-        return formatPortLabel(id, 'shadowsocks:', 'Shadowsocks');
-      case 'trojan':
-        return formatPortLabel(id, 'trojan:', 'Trojan');
-      case 'proxy':
-        // Task 2 中实现
-        return id;
-      default:
-        return id;
+  // 预计算：proxy id → 最终 label（含重名去重）
+  const proxyLabels = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!rules) return map;
+
+    // 按 name 分组
+    const byName = new Map<string, string[]>();
+    for (const r of rules) {
+      const ids = byName.get(r.name) ?? [];
+      ids.push(r.id);
+      byName.set(r.name, ids);
     }
-  }, []);
+
+    // 生成最终 label
+    for (const r of rules) {
+      const sameName = byName.get(r.name) ?? [];
+      if (sameName.length <= 1) {
+        map.set(r.id, r.name);
+      } else {
+        const idx = sameName.indexOf(r.id);
+        if (idx === 0) {
+          map.set(r.id, r.name);
+        } else {
+          map.set(r.id, `${r.name} (${r.id.slice(0, 6)})`);
+        }
+      }
+    }
+    return map;
+  }, [rules]);
+
+  return useCallback(
+    (type, id) => {
+      switch (type) {
+        case 'client':
+          return id;
+        case 'shadowsocks':
+          return formatPortLabel(id, 'shadowsocks:', 'Shadowsocks');
+        case 'trojan':
+          return formatPortLabel(id, 'trojan:', 'Trojan');
+        case 'proxy': {
+          const mapped = proxyLabels.get(id);
+          if (mapped) return mapped;
+          // 未命中：id 超过 8 字符则截断加省略号
+          return id.length > 8 ? `${id.slice(0, 8)}…` : id;
+        }
+        default:
+          return id;
+      }
+    },
+    [proxyLabels],
+  );
 }
 
 function formatPortLabel(id: string, prefix: string, kindLabel: string): string {
