@@ -297,8 +297,14 @@ pub async fn run_api_server(
             get(acme::get_challenge_status),
         )
         // LLM Gateway management endpoints
-        .route("/api/llm/gateway", get(llm::get_gateway_config).put(llm::update_gateway_config))
-        .route("/api/llm/providers", get(llm::list_providers).post(llm::create_provider))
+        .route(
+            "/api/llm/gateway",
+            get(llm::get_gateway_config).put(llm::update_gateway_config),
+        )
+        .route(
+            "/api/llm/providers",
+            get(llm::list_providers).post(llm::create_provider),
+        )
         .route(
             "/api/llm/providers/:id",
             put(llm::update_provider)
@@ -314,7 +320,10 @@ pub async fn run_api_server(
             "/api/llm/models/:id",
             put(llm::update_model).delete(llm::delete_model),
         )
-        .route("/api/llm/api-keys", get(llm::list_api_keys).post(llm::create_api_key))
+        .route(
+            "/api/llm/api-keys",
+            get(llm::list_api_keys).post(llm::create_api_key),
+        )
         .route(
             "/api/llm/api-keys/:id",
             patch(llm::toggle_api_key).delete(llm::delete_api_key),

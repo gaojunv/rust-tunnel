@@ -4,12 +4,12 @@ use tokio::sync::Mutex;
 
 use crate::server::acme::{CertificateManager, CertificateProvider};
 use crate::server::db::Database;
+use crate::server::llm::{LlmGatewayConfig, LlmState};
 use crate::server::reverse_proxy::connector;
 use crate::server::reverse_proxy::rules::{
     resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
     RuleCertStatus, RuleType, TrojanSniEntry,
 };
-use crate::server::llm::{LlmGatewayConfig, LlmState};
 use crate::server::stats::StatsCollector;
 
 /// State for the reverse proxy module
@@ -78,13 +78,15 @@ impl ReverseProxyState {
 
     /// Initialize the LlmState from the in-memory `__llm_gateway__` rule (if any).
     /// Called during server startup after rules are loaded from DB.
-    pub async fn init_llm_state(&self, db: Option<Database>) {
+    /// `master_key` 用于提供商 API Key 的落库加解密；None 表示不加解密（明文兼容）。
+    pub async fn init_llm_state(&self, db: Option<Database>, master_key: Option<[u8; 32]>) {
         let gateway_rule = {
             let rules = self.rules.lock().await;
             rules.get("__llm_gateway__").cloned()
         };
 
-        let llm = LlmState::new(db);
+        let cipher = master_key.map(crate::server::llm::crypto::LlmCipher::from_master_key);
+        let llm = LlmState::new(db, cipher);
 
         // Derive gateway config from the ProxyRule
         if let Some(rule) = gateway_rule {
@@ -557,7 +559,7 @@ mod tests {
         drop(rules);
 
         // Initialize LlmState (without DB)
-        state.init_llm_state(None).await;
+        state.init_llm_state(None, None).await;
 
         let llm_guard = state.llm_state.read().await;
         assert!(llm_guard.is_some(), "llm_state should be initialized");
@@ -575,9 +577,12 @@ mod tests {
     async fn init_llm_state_no_gateway_rule() {
         let state = ReverseProxyState::new();
         // No gateway rule — llm_state should still be initialized (disabled)
-        state.init_llm_state(None).await;
+        state.init_llm_state(None, None).await;
         let llm_guard = state.llm_state.read().await;
-        assert!(llm_guard.is_some(), "llm_state should always be initialized for API access");
+        assert!(
+            llm_guard.is_some(),
+            "llm_state should always be initialized for API access"
+        );
         let llm = llm_guard.as_ref().unwrap();
         let cfg = llm.gateway_config.read().await;
         let cfg = cfg.as_ref().expect("gateway config should exist");
@@ -606,7 +611,7 @@ mod tests {
         );
         drop(rules);
 
-        state.init_llm_state(None).await;
+        state.init_llm_state(None, None).await;
 
         // Even if the rule exists but is disabled, llm_state should be initialized
         // (the enabled flag is checked per-request)

@@ -327,7 +327,22 @@ async fn main() -> TunnelResult<()> {
 
     // Initialize LLM Gateway state after proxy rules are loaded from DB.
     // This must happen before any reconcile so that Llm rules are handled.
-    state.proxy_state.init_llm_state(state.db().cloned()).await;
+    // 主密钥用于提供商 API Key 的落库加密（AES-256-GCM），存放于 DB 同目录。
+    let llm_master_key =
+        match rust_tunnel::server::llm::crypto::load_or_create_master_key(&config.db_path) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(
+                "Failed to load LLM master key, provider API keys will be stored unencrypted: {}",
+                e
+            );
+                None
+            }
+        };
+    state
+        .proxy_state
+        .init_llm_state(state.db().cloned(), llm_master_key)
+        .await;
 
     {
         let addrs = state.proxy_state.distinct_http_listen_addrs().await;

@@ -95,6 +95,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+aes-gcm = "0.10"
 
 # DNS protocol types
 hickory-proto = "0.24"

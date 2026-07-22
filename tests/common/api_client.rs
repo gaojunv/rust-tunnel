@@ -62,11 +62,30 @@ impl ApiClient {
     /// POST a JSON body, returning `(status, body)`.
     /// Injects `Authorization: Bearer <token>` if a token is stored.
     pub async fn post_json(&self, path: &str, body: Value) -> (StatusCode, Value) {
-        let mut req = self.http.post(format!("{}{}", self.base, path));
+        self.send_json(reqwest::Method::POST, path, body).await
+    }
+
+    /// PUT a JSON body, returning `(status, body)`.
+    pub async fn put_json(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        self.send_json(reqwest::Method::PUT, path, body).await
+    }
+
+    /// PATCH a JSON body, returning `(status, body)`.
+    pub async fn patch_json(&self, path: &str, body: Value) -> (StatusCode, Value) {
+        self.send_json(reqwest::Method::PATCH, path, body).await
+    }
+
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut req = self.http.request(method, format!("{}{}", self.base, path));
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
-        let resp = req.json(&body).send().await.expect("post send");
+        let resp = req.json(&body).send().await.expect("send json");
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
         (status, body)

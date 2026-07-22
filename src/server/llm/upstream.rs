@@ -62,10 +62,12 @@ pub async fn call_upstream(
         .header("Content-Type", "application/json")
         .json(&req_body);
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Upstream connection failed: {}", e)))?;
+    let resp = req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream connection failed: {}", e),
+        )
+    })?;
 
     let status = resp.status();
 
@@ -81,15 +83,11 @@ pub async fn call_upstream(
 
     if request.stream {
         // SSE streaming relay: forward the upstream SSE stream as-is.
-        let byte_stream = resp
-            .bytes_stream()
-            .map(|result| {
-                result
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|e| {
-                        std::io::Error::other(e.to_string())
-                    })
-            });
+        let byte_stream = resp.bytes_stream().map(|result| {
+            result
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
 
         let body = Body::from_stream(byte_stream);
         Ok(Response::builder()
@@ -102,7 +100,10 @@ pub async fn call_upstream(
     } else {
         // Non-streaming: return upstream response body as-is.
         let body_bytes = resp.bytes().await.map_err(|e| {
-            (StatusCode::BAD_GATEWAY, format!("Failed to read upstream response: {}", e))
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read upstream response: {}", e),
+            )
         })?;
 
         let body = Body::from(body_bytes.to_vec());
@@ -129,13 +130,34 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
         .unwrap()
 }
 
+/// Build a 404 "model not found" response that carries the available model list,
+/// per spec: 未匹配 → 返回 404，body 中包含可用模型列表。
+pub fn model_not_found_response(message: String, available_models: Vec<String>) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "available_models": available_models,
+        }
+    });
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_error_response_contains_openai_format() {
-        let resp = error_response(StatusCode::UNAUTHORIZED, "Invalid key".into(), "authentication_error");
+        let resp = error_response(
+            StatusCode::UNAUTHORIZED,
+            "Invalid key".into(),
+            "authentication_error",
+        );
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -164,7 +186,11 @@ mod tests {
             // Connection refused should be 502
             assert_eq!(status, StatusCode::BAD_GATEWAY);
             // Error message should NOT contain the API key
-            assert!(!msg.contains("test-key"), "API key should not be in error message: {}", msg);
+            assert!(
+                !msg.contains("test-key"),
+                "API key should not be in error message: {}",
+                msg
+            );
         });
     }
 

@@ -42,11 +42,9 @@ pub struct LlmApiKeyRecord {
 
 impl Database {
     pub async fn llm_list_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
-        sqlx::query_as::<_, LlmProviderRecord>(
-            "SELECT * FROM llm_providers ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as::<_, LlmProviderRecord>("SELECT * FROM llm_providers ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn llm_list_enabled_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
@@ -57,13 +55,14 @@ impl Database {
         .await
     }
 
-    pub async fn llm_get_provider(&self, id: &str) -> Result<Option<LlmProviderRecord>, sqlx::Error> {
-        sqlx::query_as::<_, LlmProviderRecord>(
-            "SELECT * FROM llm_providers WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
+    pub async fn llm_get_provider(
+        &self,
+        id: &str,
+    ) -> Result<Option<LlmProviderRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmProviderRecord>("SELECT * FROM llm_providers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -113,22 +112,22 @@ impl Database {
     }
 
     pub async fn llm_toggle_provider(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE llm_providers SET enabled = ?, updated_at = datetime('now') WHERE id = ?")
-            .bind(enabled as i32)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE llm_providers SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(enabled as i32)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     // ── Model CRUD ───────────────────────────────────────────────
 
     pub async fn llm_list_models(&self) -> Result<Vec<LlmModelRecord>, sqlx::Error> {
-        sqlx::query_as::<_, LlmModelRecord>(
-            "SELECT * FROM llm_models ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn llm_list_models_for_provider(
@@ -148,8 +147,10 @@ impl Database {
         name_or_alias: &str,
     ) -> Result<Option<LlmModelRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelRecord>(
-            "SELECT * FROM llm_models WHERE enabled = 1 AND (model_name = ? OR alias = ?) LIMIT 1",
+            "SELECT * FROM llm_models WHERE enabled = 1 AND (model_name = ? OR alias = ?) \
+             ORDER BY (model_name = ?) DESC LIMIT 1",
         )
+        .bind(name_or_alias)
         .bind(name_or_alias)
         .bind(name_or_alias)
         .fetch_optional(&self.pool)
@@ -218,11 +219,9 @@ impl Database {
     // ── API Key CRUD ─────────────────────────────────────────────
 
     pub async fn llm_list_api_keys(&self) -> Result<Vec<LlmApiKeyRecord>, sqlx::Error> {
-        sqlx::query_as::<_, LlmApiKeyRecord>(
-            "SELECT * FROM llm_api_keys ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as::<_, LlmApiKeyRecord>("SELECT * FROM llm_api_keys ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn llm_find_api_key_by_hash(
@@ -302,7 +301,17 @@ mod tests {
 
         // Create
         let id = uuid::Uuid::new_v4().to_string();
-        db.llm_save_provider(&id, "TestDeepSeek", "deepseek", "https://api.deepseek.com", "sk-test", None::<&str>, true).await.unwrap();
+        db.llm_save_provider(
+            &id,
+            "TestDeepSeek",
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-test",
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
 
         // List
         let providers = db.llm_list_providers().await.unwrap();
@@ -332,11 +341,23 @@ mod tests {
         let (db, _tmp) = fresh_db().await;
 
         let pid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_provider(&pid, "Test", "deepseek", "https://api.deepseek.com", "sk-test", None::<&str>, true).await.unwrap();
+        db.llm_save_provider(
+            &pid,
+            "Test",
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-test",
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
 
         // Add model
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast", "[\"coding\"]", true).await.unwrap();
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast", "[\"coding\"]", true)
+            .await
+            .unwrap();
 
         // List models for provider
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
@@ -345,30 +366,86 @@ mod tests {
         assert_eq!(models[0].alias, "fast");
 
         // Find by name
-        let found = db.llm_find_model_by_name_or_alias("deepseek-chat").await.unwrap().unwrap();
+        let found = db
+            .llm_find_model_by_name_or_alias("deepseek-chat")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, mid);
 
         // Find by alias
-        let found = db.llm_find_model_by_name_or_alias("fast").await.unwrap().unwrap();
+        let found = db
+            .llm_find_model_by_name_or_alias("fast")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, mid);
 
         // Find non-existent
-        assert!(db.llm_find_model_by_name_or_alias("nonexistent").await.unwrap().is_none());
+        assert!(db
+            .llm_find_model_by_name_or_alias("nonexistent")
+            .await
+            .unwrap()
+            .is_none());
 
         // Update model
-        db.llm_update_model(&mid, "deepseek-chat", "fast-v2", "[\"coding\",\"cheap\"]").await.unwrap();
+        db.llm_update_model(&mid, "deepseek-chat", "fast-v2", "[\"coding\",\"cheap\"]")
+            .await
+            .unwrap();
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
         assert_eq!(models[0].alias, "fast-v2");
 
         // Delete model
         db.llm_delete_model(&mid).await.unwrap();
-        assert!(db.llm_list_models_for_provider(&pid).await.unwrap().is_empty());
+        assert!(db
+            .llm_list_models_for_provider(&pid)
+            .await
+            .unwrap()
+            .is_empty());
 
         // Cascade delete: delete provider should delete models
         let mid2 = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid2, &pid, "deepseek-r1", "", "[]", true).await.unwrap();
+        db.llm_save_model(&mid2, &pid, "deepseek-r1", "", "[]", true)
+            .await
+            .unwrap();
         db.llm_delete_provider(&pid).await.unwrap();
         assert!(db.llm_list_models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_model_prefers_exact_name_over_alias() {
+        let (db, _tmp) = fresh_db().await;
+
+        let p1 = uuid::Uuid::new_v4().to_string();
+        let p2 = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(&p1, "P1", "deepseek", "https://a", "k", None::<&str>, true)
+            .await
+            .unwrap();
+        db.llm_save_provider(&p2, "P2", "kimi", "https://b", "k", None::<&str>, true)
+            .await
+            .unwrap();
+
+        // 先插入“别名冲突”的模型，制造无序查询返回它的机会
+        let alias_model = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&alias_model, &p2, "moonshot-v1-8k", "fast", "[]", true)
+            .await
+            .unwrap();
+        // 后插入“名称精确匹配”的模型
+        let name_model = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&name_model, &p1, "fast", "", "[]", true)
+            .await
+            .unwrap();
+
+        // spec: 优先精确匹配 model_name，其次匹配 alias
+        let found = db
+            .llm_find_model_by_name_or_alias("fast")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.id, name_model,
+            "model_name 精确匹配应优先于 alias 匹配"
+        );
     }
 
     #[tokio::test]
@@ -376,7 +453,9 @@ mod tests {
         let (db, _tmp) = fresh_db().await;
 
         let id = uuid::Uuid::new_v4().to_string();
-        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor").await.unwrap();
+        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor")
+            .await
+            .unwrap();
 
         let keys = db.llm_list_api_keys().await.unwrap();
         assert_eq!(keys.len(), 1);
@@ -384,15 +463,27 @@ mod tests {
         assert_eq!(keys[0].key_prefix, "sk-abc...xyz");
 
         // Find by hash
-        let found = db.llm_find_api_key_by_hash("hash123").await.unwrap().unwrap();
+        let found = db
+            .llm_find_api_key_by_hash("hash123")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.id, id);
 
         // Wrong hash
-        assert!(db.llm_find_api_key_by_hash("wrong").await.unwrap().is_none());
+        assert!(db
+            .llm_find_api_key_by_hash("wrong")
+            .await
+            .unwrap()
+            .is_none());
 
         // Toggle
         db.llm_toggle_api_key(&id, false).await.unwrap();
-        assert!(db.llm_find_api_key_by_hash("hash123").await.unwrap().is_none());
+        assert!(db
+            .llm_find_api_key_by_hash("hash123")
+            .await
+            .unwrap()
+            .is_none());
 
         // Touch
         db.llm_toggle_api_key(&id, true).await.unwrap();

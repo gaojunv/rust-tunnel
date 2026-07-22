@@ -2,7 +2,10 @@ use crate::server::llm::LlmState;
 
 /// Validate a gateway API key from the Authorization header.
 /// Returns Some((key_id, key_name)) if valid, None if invalid/missing.
-pub async fn validate_api_key(state: &LlmState, auth_header: Option<&str>) -> Option<(String, String)> {
+pub async fn validate_api_key(
+    state: &LlmState,
+    auth_header: Option<&str>,
+) -> Option<(String, String)> {
     let header = auth_header?;
     let token = header.strip_prefix("Bearer ")?.trim();
 

@@ -135,6 +135,13 @@ impl TestHarness {
             .expect("seed server_auth");
         // Wire up the ClientConnector so reverse-proxy rules can reach tunnel clients.
         state.wire_up_client_connector().await;
+        // Initialize LLM gateway state (mirrors src/bin/server.rs startup):
+        // no gateway rule exists yet → disabled; fixed test master key enables
+        // provider API key encryption at rest.
+        state
+            .proxy_state
+            .init_llm_state(state.db().cloned(), Some([42u8; 32]))
+            .await;
         let proxy_state = state.proxy_state.clone();
 
         let auth_config = AuthConfig::new(config.admin_password.clone(), config.jwt_secret.clone());

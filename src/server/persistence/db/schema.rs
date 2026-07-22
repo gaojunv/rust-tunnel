@@ -409,9 +409,11 @@ impl Database {
         .execute(pool)
         .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider_id)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_llm_models_provider ON llm_models(provider_id)",
+        )
+        .execute(pool)
+        .await?;
 
         // LLM API keys table (gateway-level keys for external callers)
         sqlx::query(
@@ -493,11 +495,9 @@ impl Database {
             .await?;
 
             // Copy existing data
-            sqlx::query(
-                "INSERT INTO proxy_rules_new SELECT * FROM proxy_rules",
-            )
-            .execute(pool)
-            .await?;
+            sqlx::query("INSERT INTO proxy_rules_new SELECT * FROM proxy_rules")
+                .execute(pool)
+                .await?;
 
             // Drop old table and rename new
             sqlx::query("DROP TABLE proxy_rules").execute(pool).await?;
@@ -506,11 +506,9 @@ impl Database {
                 .await?;
 
             // Recreate indexes
-            sqlx::query(
-                "CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)",
-            )
-            .execute(pool)
-            .await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)")
+                .execute(pool)
+                .await?;
             sqlx::query(
                 "CREATE INDEX IF NOT EXISTS idx_proxy_rules_enabled ON proxy_rules(enabled)",
             )

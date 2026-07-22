@@ -130,7 +130,17 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `persistence/` — 持久化
   - `db/mod.rs` — `Database` 封装与 `Pool<Sqlite>`。
   - `db/schema.rs` — 表结构初始化与迁移（WAL、列迁移、旧表清理）。
-  - `db/{clients,logs,settings,shadowsocks,trojan,acme,mesh,proxy_rules,reverse_proxy,records,stats,server_auth,dns}.rs` — 各领域 DB 操作。
+  - `db/{clients,logs,settings,shadowsocks,trojan,acme,mesh,proxy_rules,reverse_proxy,records,stats,server_auth,dns,llm}.rs` — 各领域 DB 操作。
+- `llm/` — LLM 网关（设计见 `docs/superpowers/specs/2026-07-22-llm-gateway-design.md`）
+  - `mod.rs` — 类型定义与 `LlmState`（DB 引用、Gateway 配置、字段加密器）。
+  - `auth.rs` — 网关对外 API Key 生成（sk- 前缀）与 SHA-256 哈希校验。
+  - `crypto.rs` — 提供商 API Key 的 AES-256-GCM 落库加密；主密钥存于 DB 同目录 `llm_master.key`（0600），密文带 `enc:v1:` 前缀，无前缀按历史明文兼容。
+  - `provider.rs` — provider_type 校验与各类型默认 Base URL。
+  - `router.rs` — 请求路由：model 名/别名解析 → 提供商（解密 API Key）。
+  - `openai_handler.rs` — `/v1/chat/completions`、`/v1/models`。
+  - `anthropic_handler.rs` — `/v1/messages`（请求/响应格式互转）。
+  - `upstream.rs` — 上游 HTTP 调用与 SSE 透传、OpenAI 格式错误响应。
+  - `format.rs` — OpenAI ↔ Anthropic 格式互转与流式 SSE 翻译器。
 - `protocols/` — 协议实现
   - `shadowsocks.rs` — Shadowsocks 服务器握手与连接代理。
   - `trojan.rs` — Trojan 握手、认证、代理、回退。
@@ -209,7 +219,7 @@ cargo test --tests                    # 全部集成测试
 cargo test --test tunnel_basic        # 指定文件
 ```
 
-测试文件：`tunnel_basic.rs`（双向转发、多端口）、`tunnel_reconnect.rs`（断开重连、心跳）、`api_auth.rs`（登录/Bearer 校验）、`api_sse.rs`（SSE 日志流、统计流）、`config_persist.rs`（SS/Trojan 配置修改后同库重启持久化）、`stats_client.rs`、`stats_proxy.rs`、`stats_ss_trojan.rs`、`trojan_domain.rs`。共享工具在 `tests/common/`（`TestHarness`、带 JWT 的 reqwest 封装、echo 服务、`wait_until` 指数退避）。
+测试文件：`tunnel_basic.rs`（双向转发、多端口）、`tunnel_reconnect.rs`（断开重连、心跳）、`api_auth.rs`（登录/Bearer 校验）、`api_sse.rs`（SSE 日志流、统计流）、`config_persist.rs`（SS/Trojan 配置修改后同库重启持久化）、`stats_client.rs`、`stats_proxy.rs`、`stats_ss_trojan.rs`、`trojan_domain.rs`、`llm_gateway.rs`（LLM 网关：管理 API CRUD、加密落库、OpenAI/Anthropic 端到端 mock 上游、同端口共存、配置恢复）。共享工具在 `tests/common/`（`TestHarness`、带 JWT 的 reqwest 封装、echo 服务、`wait_until` 指数退避）。
 
 **集成测试硬性规矩**（来自 `tests/README.md`，写新用例必须遵守）：
 
@@ -241,6 +251,7 @@ cargo test --test tunnel_basic        # 指定文件
   - `/api/proxy/rules*`（反向代理规则与全局配置）
   - `/api/acme/*`（ACME 状态、配置、证书、DNS 提供商、挑战状态）
   - `/api/settings*`（通用设置、反代配置、DNS 配置）
+  - `/api/llm/*`（LLM 网关：Gateway 配置、providers/models/api-keys CRUD）
 - 静态前端：`/*path` → `serve_static`（仅在 `embed-frontend` feature 启用时）。
 
 ## 代码风格与约定

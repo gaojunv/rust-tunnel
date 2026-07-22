@@ -7,8 +7,12 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use axum::{
-    routing::{any, get, post},
-    Router,
+    body::Body,
+    extract::State,
+    http::{Method, Request, StatusCode},
+    response::Response,
+    routing::any,
+    Json, Router,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -17,7 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use super::error::ReconcileError;
-use super::handler::{handle_proxy_request_unified, RouteSource};
+use super::handler::{handle_proxy_request_unified, ProxyState, RouteSource};
 use super::router::RouteTable;
 use super::sni_sniff;
 use super::upstream::UpstreamClient;
@@ -200,91 +204,9 @@ async fn handle_one_connection(
         }
     }
 
-    // ── LLM Gateway dispatch ───────────────────────────────────────
-    {
-        let llm_guard = proxy_state.llm_state.read().await;
-        if let Some(llm_state) = llm_guard.as_ref() {
-            let gateway_enabled = llm_state
-                .gateway_config
-                .read()
-                .await
-                .as_ref()
-                .map(|gc| gc.enabled)
-                .unwrap_or(false);
-
-            if gateway_enabled {
-                let llm_handler_state = crate::server::llm::openai_handler::LlmHandlerState {
-                    llm: llm_state.clone(),
-                };
-
-                let source = RouteSource(route_table.clone());
-
-                // LLM routes with their own state
-                let llm_routes = Router::new()
-                    .route(
-                        "/v1/models",
-                        get(crate::server::llm::openai_handler::handle_list_models),
-                    )
-                    .route(
-                        "/v1/chat/completions",
-                        post(crate::server::llm::openai_handler::handle_chat_completions),
-                    )
-                    .route(
-                        "/v1/messages",
-                        post(crate::server::llm::anthropic_handler::handle_messages),
-                    )
-                    .with_state(llm_handler_state);
-
-                // Proxy fallback with its own state
-                let proxy_routes = Router::new()
-                    .fallback(any(handle_proxy_request_unified))
-                    .with_state((source, upstream.clone(), proxy_state.clone()));
-
-                let app = llm_routes.merge(proxy_routes);
-
-                match acceptor {
-                    Some(acc) => {
-                        let tls_stream = match acc.accept(stream).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                debug!("TLS handshake failed: {}", e);
-                                return;
-                            }
-                        };
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
-                        let service =
-                            hyper_util::service::TowerToHyperService::new(app.into_service());
-                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                        {
-                            debug!("HTTPS connection error: {}", e);
-                        }
-                    }
-                    None => {
-                        let io = hyper_util::rt::TokioIo::new(stream);
-                        let service =
-                            hyper_util::service::TowerToHyperService::new(app.into_service());
-                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection_with_upgrades(io, service)
-                        .await
-                        {
-                            debug!("HTTP connection error: {}", e);
-                        }
-                    }
-                }
-                return;
-            }
-        }
-    }
-
     let source = RouteSource(route_table);
     let app: Router = Router::new()
-        .fallback(any(handle_proxy_request_unified))
+        .fallback(any(llm_aware_proxy_dispatch))
         .with_state((source, upstream, proxy_state));
 
     match acceptor {
@@ -324,6 +246,104 @@ async fn handle_one_connection(
                 debug!("HTTP connection error: {}", e);
             }
         }
+    }
+}
+
+/// LLM-aware fallback：仅当请求 Host 匹配已启用的 LLM Gateway 域名、且路径是
+/// LLM 对外端点时，才把请求交给 LLM handler；其余请求一律走普通反代处理。
+/// 这样 LLM 规则与普通 HTTP 规则可以共存于同一监听端口，互不抢占。
+async fn llm_aware_proxy_dispatch(
+    State((source, upstream, proxy_state)): State<ProxyState>,
+    req: Request<Body>,
+) -> Response {
+    // 在任何 await 之前同步提取判定所需的数据：
+    // `&Request<Body>` 不是 Send（Body 不 Sync），不能跨 await 持有。
+    let is_llm_endpoint = matches!(
+        (req.method(), req.uri().path()),
+        (&Method::GET, "/v1/models")
+            | (&Method::POST, "/v1/chat/completions")
+            | (&Method::POST, "/v1/messages")
+    );
+    // h2 的 authority 在 URI 中；h1 可能在 URI（absolute-form）或 Host 头。
+    let host = req
+        .uri()
+        .host()
+        .map(str::to_string)
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.split(':').next().unwrap_or(s).to_string())
+        })
+        .unwrap_or_default();
+
+    if is_llm_endpoint {
+        if let Some(llm) = match_llm_gateway(&proxy_state, &host).await {
+            return llm_handle(llm, req).await;
+        }
+    }
+    handle_proxy_request_unified(State((source, upstream, proxy_state)), req).await
+}
+
+/// 判断指向 `host` 的请求是否应由 LLM Gateway 处理；是则返回对应的 `LlmState`。
+async fn match_llm_gateway(
+    proxy_state: &Arc<ReverseProxyState>,
+    host: &str,
+) -> Option<Arc<crate::server::llm::LlmState>> {
+    let llm_guard = proxy_state.llm_state.read().await;
+    let llm = llm_guard.as_ref()?;
+    let cfg = llm.gateway_config.read().await;
+    let cfg = cfg.as_ref()?;
+    if !cfg.enabled || cfg.domain.is_empty() {
+        return None;
+    }
+
+    if host == cfg.domain {
+        Some(llm.clone())
+    } else {
+        None
+    }
+}
+
+/// 把已匹配 LLM Gateway 的请求分发给对应的 handler。
+async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) -> Response {
+    use crate::server::llm::{anthropic_handler, openai_handler, upstream::error_response};
+
+    let state = openai_handler::LlmHandlerState { llm };
+    let is_models = req.uri().path() == "/v1/models";
+    let is_messages = req.uri().path() == "/v1/messages";
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+
+    if is_models {
+        return openai_handler::handle_list_models(State(state), headers).await;
+    }
+
+    let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {}", e),
+                "invalid_request_error",
+            )
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid JSON body: {}", e),
+                "invalid_request_error",
+            )
+        }
+    };
+
+    if is_messages {
+        anthropic_handler::handle_messages(State(state), headers, Json(json)).await
+    } else {
+        openai_handler::handle_chat_completions(State(state), headers, Json(json)).await
     }
 }
 
@@ -390,7 +410,11 @@ impl ReverseProxyState {
             let rules = self.rules.lock().await;
             rules
                 .values()
-                .filter(|r| r.enabled && (r.rule_type == RuleType::Http || r.rule_type == RuleType::Llm) && r.listen == listen_addr)
+                .filter(|r| {
+                    r.enabled
+                        && (r.rule_type == RuleType::Http || r.rule_type == RuleType::Llm)
+                        && r.listen == listen_addr
+                })
                 .cloned()
                 .collect()
         };
@@ -690,6 +714,102 @@ mod tests {
         }
     }
 
+    /// LLM gateway 启用后，同监听器上其他域名的 /v1/* 请求仍应走反代后端，
+    /// 只有 LLM 域名自己的 /v1/* 请求才交给 LLM handler。
+    #[tokio::test]
+    async fn llm_gateway_does_not_hijack_other_domains() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock backend A: replies "A\n" to anything (including /v1/chat/completions)
+        let backend_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = backend_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = backend_a.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nA\n")
+                        .await;
+                });
+            }
+        });
+
+        let listen_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listen_probe.local_addr().unwrap().port();
+        drop(listen_probe);
+        let listen_addr = format!("127.0.0.1:{listen_port}");
+
+        let state = ReverseProxyState::new();
+        // HTTP rule: a.local → backend A
+        let mut rule_a = http_rule("a", &listen_addr, "a.local", false);
+        rule_a.routes[0].backends[0].addr = a_addr.to_string();
+        state.rules.lock().await.insert("a".into(), rule_a);
+        // LLM rule on the same port for llm.local
+        state.rules.lock().await.insert(
+            "__llm_gateway__".into(),
+            llm_rule("__llm_gateway__", &listen_addr, "llm.local", false),
+        );
+
+        // Enable the LLM gateway for domain llm.local
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            domain: "llm.local".into(),
+            listen: listen_addr.clone(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        // 1) Other domain's /v1/chat/completions must reach the proxy backend,
+        //    not be intercepted by the LLM gateway.
+        let resp = client
+            .post(format!("http://{listen_addr}/v1/chat/completions"))
+            .header("Host", "a.local")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.text().await.unwrap().starts_with('A'),
+            "request to a.local should hit proxy backend, not LLM gateway"
+        );
+
+        // 2) The LLM domain itself IS handled by the gateway
+        //    (no API key configured → 401 from the LLM handler).
+        let resp = client
+            .post(format!("http://{listen_addr}/v1/chat/completions"))
+            .header("Host", "llm.local")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // 3) Non-/v1 paths on the LLM domain fall through to normal proxy
+        //    handling (no matching rule → proxy's own error, not LLM 401).
+        let resp = client
+            .post(format!("http://{listen_addr}/v1/models"))
+            .header("Host", "a.local")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Cleanup
+        {
+            state.rules.lock().await.clear();
+        }
+        state.reconcile_http_listener(&listen_addr).await.unwrap();
+    }
+
     #[tokio::test]
     async fn reconcile_llm_rule_starts_listener() {
         let state = ReverseProxyState::new();
@@ -729,8 +849,14 @@ mod tests {
         state.rules.lock().await.insert("l1".into(), llm_rule);
 
         let addrs = state.distinct_http_listen_addrs().await;
-        assert!(addrs.contains(&"0.0.0.0:8443".to_string()), "HTTP rule address should be present");
-        assert!(addrs.contains(&"0.0.0.0:8444".to_string()), "LLM rule address should be present");
+        assert!(
+            addrs.contains(&"0.0.0.0:8443".to_string()),
+            "HTTP rule address should be present"
+        );
+        assert!(
+            addrs.contains(&"0.0.0.0:8444".to_string()),
+            "LLM rule address should be present"
+        );
     }
 
     #[tokio::test]

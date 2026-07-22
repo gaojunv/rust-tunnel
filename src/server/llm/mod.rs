@@ -1,8 +1,10 @@
+pub mod anthropic_handler;
 pub mod auth;
+pub mod crypto;
+pub mod format;
+pub mod openai_handler;
 pub mod provider;
 pub mod router;
-pub mod openai_handler;
-pub mod anthropic_handler;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -90,7 +92,7 @@ pub struct CreateApiKeyRequest {
 #[derive(Debug, serde::Serialize)]
 pub struct CreateApiKeyResponse {
     pub id: String,
-    pub key: String,       // full key — show once!
+    pub key: String, // full key — show once!
     pub key_prefix: String,
     pub name: String,
 }
@@ -161,13 +163,19 @@ pub struct LlmState {
     pub db: Option<Database>,
     /// Gateway config (domain, TLS settings).
     pub gateway_config: Arc<RwLock<Option<LlmGatewayConfig>>>,
+    /// 字段加密器（提供商 API Key 等敏感字段的落库加密）；None 表示未配置主密钥。
+    pub cipher: Option<crate::server::llm::crypto::LlmCipher>,
 }
 
 impl LlmState {
-    pub fn new(db: Option<Database>) -> Self {
+    pub fn new(
+        db: Option<Database>,
+        cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    ) -> Self {
         Self {
             db,
             gateway_config: Arc::new(RwLock::new(None)),
+            cipher,
         }
     }
 }

@@ -19,7 +19,8 @@ fn extract_content(content: &serde_json::Value) -> String {
             let parts: Vec<&str> = blocks
                 .iter()
                 .filter_map(|block| {
-                    block.get("type")
+                    block
+                        .get("type")
                         .and_then(|t| t.as_str())
                         .filter(|t| *t == "text")
                         .and(block.get("text").and_then(|t| t.as_str()))
@@ -33,12 +34,12 @@ fn extract_content(content: &serde_json::Value) -> String {
 
 /// Convert Anthropic Messages request to unified ChatCompletionRequest.
 fn anthropic_to_openai(body: &serde_json::Value) -> Result<ChatCompletionRequest, String> {
-    let anthropic_model = body.get("model")
+    let anthropic_model = body
+        .get("model")
         .and_then(|v| v.as_str())
         .ok_or("model is required")?;
 
-    let messages_raw = body.get("messages")
-        .ok_or("messages is required")?;
+    let messages_raw = body.get("messages").ok_or("messages is required")?;
 
     // Parse Anthropic messages with flexible content field (string or content blocks)
     let messages: Vec<ChatMessage> = messages_raw
@@ -46,13 +47,12 @@ fn anthropic_to_openai(body: &serde_json::Value) -> Result<ChatCompletionRequest
         .ok_or("messages must be an array")?
         .iter()
         .map(|msg| {
-            let role = msg.get("role")
+            let role = msg
+                .get("role")
                 .and_then(|v| v.as_str())
                 .unwrap_or("user")
                 .to_string();
-            let content = msg.get("content")
-                .map(extract_content)
-                .unwrap_or_default();
+            let content = msg.get("content").map(extract_content).unwrap_or_default();
             ChatMessage { role, content }
         })
         .collect();
@@ -70,14 +70,23 @@ fn anthropic_to_openai(body: &serde_json::Value) -> Result<ChatCompletionRequest
     }
     all_messages.extend(messages);
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     Ok(ChatCompletionRequest {
         model: anthropic_model.to_string(),
         messages: all_messages,
         stream,
-        max_tokens: body.get("max_tokens").and_then(|v| v.as_u64()).map(|v| v as u32),
-        temperature: body.get("temperature").and_then(|v| v.as_f64()).map(|v| v as f32),
+        max_tokens: body
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        temperature: body
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
         top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
     })
 }
@@ -90,13 +99,23 @@ pub async fn handle_messages(
 ) -> Response {
     // Validate Host header matches configured LLM domain
     if !super::openai_handler::validate_host(&state.llm, &headers).await {
-        return error_response(StatusCode::NOT_FOUND, "Not found".into(), "invalid_request_error");
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "Not found".into(),
+            "invalid_request_error",
+        );
     }
 
     // Validate API key
-    let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
     if validate_api_key(&state.llm, auth).await.is_none() {
-        return error_response(StatusCode::UNAUTHORIZED, "Invalid API key".into(), "authentication_error");
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "Invalid API key".into(),
+            "authentication_error",
+        );
     }
 
     // Convert Anthropic → OpenAI format
@@ -108,7 +127,7 @@ pub async fn handle_messages(
     // Resolve model → provider
     let (provider, actual_model) = match resolve_model(&state.llm, &request.model).await {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::NOT_FOUND, e, "invalid_request_error"),
+        Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
     };
 
     // Use actual upstream model name
@@ -118,16 +137,49 @@ pub async fn handle_messages(
     // Call upstream (providers use OpenAI format)
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
-            // For non-streaming responses, convert OpenAI format → Anthropic format
+            // 响应需要转回 Anthropic 格式：非流式整体转换，流式逐 chunk 转换
             if !request.stream {
                 convert_openai_to_anthropic_response(resp).await
             } else {
-                // For streaming, relay SSE as-is
-                resp
+                convert_openai_stream_to_anthropic(resp)
             }
         }
         Err((status, msg)) => error_response(status, msg, "upstream_error"),
     }
+}
+
+/// 流式：把上游 OpenAI SSE 响应体逐 chunk 转换为 Anthropic SSE 事件流。
+fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
+    use futures_util::StreamExt;
+
+    let byte_stream = openai_resp.into_body().into_data_stream();
+    let translator = std::sync::Arc::new(std::sync::Mutex::new(
+        super::format::AnthropicSseTranslator::new(),
+    ));
+    let out = byte_stream.filter_map(move |chunk| {
+        let translator = translator.clone();
+        async move {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = translator.lock().unwrap().push(&bytes);
+                    if converted.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(converted))
+                    }
+                }
+                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(out))
+        .unwrap()
 }
 
 /// Convert OpenAI chat completion response to Anthropic Messages format.
@@ -149,31 +201,7 @@ async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response
     };
 
     // Build Anthropic-format response
-    let content: Vec<serde_json::Value> = openai["choices"]
-        .as_array()
-        .map(|choices| {
-            choices.iter().map(|c| {
-                serde_json::json!({
-                    "type": "text",
-                    "text": c["message"]["content"].as_str().unwrap_or(""),
-                })
-            }).collect()
-        })
-        .unwrap_or_default();
-
-    let anthropic_resp = serde_json::json!({
-        "id": openai["id"].as_str().unwrap_or(""),
-        "type": "message",
-        "role": "assistant",
-        "content": content,
-        "model": openai["model"].as_str().unwrap_or(""),
-        "stop_reason": openai["choices"][0]["finish_reason"].as_str().unwrap_or("stop"),
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": openai["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            "output_tokens": openai["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-        },
-    });
+    let anthropic_resp = super::format::openai_response_to_anthropic(&openai);
 
     Response::builder()
         .status(status)
@@ -308,5 +336,72 @@ mod tests {
 
         let result = anthropic_to_openai(&input).unwrap();
         assert_eq!(result.messages[0].content, "plain string");
+    }
+
+    #[tokio::test]
+    async fn test_openai_to_anthropic_maps_stop_reason() {
+        // OpenAI finish_reason "stop" 必须映射为 Anthropic 的 "end_turn"
+        let openai_body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&openai_body).unwrap()))
+            .unwrap();
+
+        let converted = convert_openai_to_anthropic_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["content"][0]["text"], "hi");
+        assert_eq!(v["usage"]["input_tokens"], 3);
+        assert_eq!(v["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_openai_stream_converted_to_anthropic_events() {
+        // 流式 Anthropic 请求必须收到 Anthropic SSE 事件，而不是 OpenAI chunk
+        let upstream_sse = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(upstream_sse))
+            .unwrap();
+
+        let converted = convert_openai_stream_to_anthropic(resp);
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("event: message_start"),
+            "missing message_start:\n{text}"
+        );
+        assert!(
+            text.contains("event: content_block_delta"),
+            "missing delta:\n{text}"
+        );
+        assert!(text.contains("\"text\":\"Hello\""), "missing text:\n{text}");
+        assert!(
+            text.contains("event: message_stop"),
+            "missing message_stop:\n{text}"
+        );
+        // 不应残留 OpenAI 格式
+        assert!(!text.contains("chat.completion.chunk"));
+        assert!(!text.contains("[DONE]"));
     }
 }
