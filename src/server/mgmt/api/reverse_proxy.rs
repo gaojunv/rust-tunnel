@@ -63,10 +63,11 @@ pub async fn create_proxy_rule(
         "http" => crate::server::reverse_proxy::RuleType::Http,
         "tcp" => crate::server::reverse_proxy::RuleType::Tcp,
         "udp" => crate::server::reverse_proxy::RuleType::Udp,
+        "llm" => crate::server::reverse_proxy::RuleType::Llm,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
+                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp, llm" })),
             )
                 .into_response();
         }
@@ -207,10 +208,11 @@ pub async fn update_proxy_rule(
         "http" => crate::server::reverse_proxy::RuleType::Http,
         "tcp" => crate::server::reverse_proxy::RuleType::Tcp,
         "udp" => crate::server::reverse_proxy::RuleType::Udp,
+        "llm" => crate::server::reverse_proxy::RuleType::Llm,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp" })),
+                Json(serde_json::json!({ "error": "Invalid rule type. Use: http, tcp, udp, llm" })),
             )
                 .into_response();
         }

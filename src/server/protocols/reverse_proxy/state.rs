@@ -209,6 +209,7 @@ impl ReverseProxyState {
                         "http" => RuleType::Http,
                         "tcp" => RuleType::Tcp,
                         "udp" => RuleType::Udp,
+                        "llm" => RuleType::Llm,
                         _ => continue,
                     },
                     listen: record.listen_addr,

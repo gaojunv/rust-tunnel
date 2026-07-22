@@ -21,6 +21,7 @@ pub enum RuleType {
     Http,
     Tcp,
     Udp,
+    Llm,
 }
 
 impl std::fmt::Display for RuleType {
@@ -29,6 +30,7 @@ impl std::fmt::Display for RuleType {
             Self::Http => write!(f, "http"),
             Self::Tcp => write!(f, "tcp"),
             Self::Udp => write!(f, "udp"),
+            Self::Llm => write!(f, "llm"),
         }
     }
 }
@@ -259,6 +261,13 @@ pub async fn resolve_cert_source_for_rule(
 /// Validate a rule about to be persisted. See spec §2.5.
 /// Returns Err(message) on the first failing constraint.
 pub fn validate_rule_for_save(rule: &ProxyRule) -> Result<(), String> {
+    // LLM rules have no routes/backends — skip route validation
+    if rule.rule_type == RuleType::Llm {
+        if rule.domains.is_empty() {
+            return Err("LLM rule requires at least one domain".into());
+        }
+        return Ok(());
+    }
     for route in &rule.routes {
         for b in &route.backends {
             match b.kind {
