@@ -317,6 +317,8 @@ pub async fn run_api_server(
 
     // Static file service for frontend (embedded)
     #[cfg(feature = "embed-frontend")]
+    use axum::extract::Path;
+    #[cfg(feature = "embed-frontend")]
     let static_routes = Router::new()
         .route(
             "/",
