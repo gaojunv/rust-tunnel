@@ -63,7 +63,7 @@ pub async fn call_upstream(
                 result
                     .map(|bytes| bytes.to_vec())
                     .map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        std::io::Error::other(e.to_string())
                     })
             });
 

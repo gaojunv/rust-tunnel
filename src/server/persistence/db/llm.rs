@@ -66,6 +66,7 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn llm_save_provider(
         &self,
         id: &str,
