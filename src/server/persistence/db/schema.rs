@@ -158,7 +158,6 @@ impl Database {
             CREATE TABLE IF NOT EXISTS proxy_rules (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                // NOTE: Rust validation is the true enforcer for existing databases
                 type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp', 'llm')),
                 listen_addr TEXT NOT NULL,
                 domains TEXT,

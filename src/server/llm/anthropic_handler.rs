@@ -162,4 +162,51 @@ mod tests {
         assert!(!result.stream);
         assert_eq!(result.max_tokens, Some(1024));
     }
+
+    #[test]
+    fn test_anthropic_to_openai_without_system() {
+        let input = serde_json::json!({
+            "model": "claude-sonnet",
+            "messages": [
+                {"role": "user", "content": "Hi"}
+            ],
+            "stream": true,
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].role, "user");
+        assert!(result.stream);
+        assert_eq!(result.max_tokens, None);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_missing_model() {
+        let input = serde_json::json!({
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+        assert!(anthropic_to_openai(&input).is_err());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_missing_messages() {
+        let input = serde_json::json!({
+            "model": "test",
+        });
+        assert!(anthropic_to_openai(&input).is_err());
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_with_temperature() {
+        let input = serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "temperature": 0.7,
+            "top_p": 0.9,
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        assert_eq!(result.temperature, Some(0.7));
+        assert_eq!(result.top_p, Some(0.9));
+    }
 }

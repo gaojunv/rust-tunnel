@@ -78,3 +78,18 @@ pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::V
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::llm::LlmState;
+
+    #[test]
+    fn test_resolve_without_db_returns_error() {
+        let state = LlmState::new(None);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(resolve_model(&state, "any-model"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("database not available"));
+    }
+}

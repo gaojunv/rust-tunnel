@@ -284,3 +284,124 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::server::db::Database;
+
+    async fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("test.db");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        (db, tmp)
+    }
+
+    #[tokio::test]
+    async fn test_provider_crud() {
+        let (db, _tmp) = fresh_db().await;
+
+        // Create
+        let id = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(&id, "TestDeepSeek", "deepseek", "https://api.deepseek.com", "sk-test", None::<&str>, true).await.unwrap();
+
+        // List
+        let providers = db.llm_list_providers().await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "TestDeepSeek");
+
+        // Get
+        let p = db.llm_get_provider(&id).await.unwrap().unwrap();
+        assert_eq!(p.api_key, "sk-test");
+
+        // Toggle
+        db.llm_toggle_provider(&id, false).await.unwrap();
+        let p = db.llm_get_provider(&id).await.unwrap().unwrap();
+        assert_eq!(p.enabled, 0);
+
+        // List enabled
+        let enabled = db.llm_list_enabled_providers().await.unwrap();
+        assert!(enabled.is_empty());
+
+        // Delete
+        db.llm_delete_provider(&id).await.unwrap();
+        assert!(db.llm_get_provider(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_model_crud() {
+        let (db, _tmp) = fresh_db().await;
+
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(&pid, "Test", "deepseek", "https://api.deepseek.com", "sk-test", None::<&str>, true).await.unwrap();
+
+        // Add model
+        let mid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast", "[\"coding\"]", true).await.unwrap();
+
+        // List models for provider
+        let models = db.llm_list_models_for_provider(&pid).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model_name, "deepseek-chat");
+        assert_eq!(models[0].alias, "fast");
+
+        // Find by name
+        let found = db.llm_find_model_by_name_or_alias("deepseek-chat").await.unwrap().unwrap();
+        assert_eq!(found.id, mid);
+
+        // Find by alias
+        let found = db.llm_find_model_by_name_or_alias("fast").await.unwrap().unwrap();
+        assert_eq!(found.id, mid);
+
+        // Find non-existent
+        assert!(db.llm_find_model_by_name_or_alias("nonexistent").await.unwrap().is_none());
+
+        // Update model
+        db.llm_update_model(&mid, "deepseek-chat", "fast-v2", "[\"coding\",\"cheap\"]").await.unwrap();
+        let models = db.llm_list_models_for_provider(&pid).await.unwrap();
+        assert_eq!(models[0].alias, "fast-v2");
+
+        // Delete model
+        db.llm_delete_model(&mid).await.unwrap();
+        assert!(db.llm_list_models_for_provider(&pid).await.unwrap().is_empty());
+
+        // Cascade delete: delete provider should delete models
+        let mid2 = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&mid2, &pid, "deepseek-r1", "", "[]", true).await.unwrap();
+        db.llm_delete_provider(&pid).await.unwrap();
+        assert!(db.llm_list_models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_api_key_crud() {
+        let (db, _tmp) = fresh_db().await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor").await.unwrap();
+
+        let keys = db.llm_list_api_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].name, "Cursor");
+        assert_eq!(keys[0].key_prefix, "sk-abc...xyz");
+
+        // Find by hash
+        let found = db.llm_find_api_key_by_hash("hash123").await.unwrap().unwrap();
+        assert_eq!(found.id, id);
+
+        // Wrong hash
+        assert!(db.llm_find_api_key_by_hash("wrong").await.unwrap().is_none());
+
+        // Toggle
+        db.llm_toggle_api_key(&id, false).await.unwrap();
+        assert!(db.llm_find_api_key_by_hash("hash123").await.unwrap().is_none());
+
+        // Touch
+        db.llm_toggle_api_key(&id, true).await.unwrap();
+        db.llm_touch_api_key(&id).await.unwrap();
+        let keys = db.llm_list_api_keys().await.unwrap();
+        assert!(keys[0].last_used_at.is_some());
+
+        // Delete
+        db.llm_delete_api_key(&id).await.unwrap();
+        assert!(db.llm_list_api_keys().await.unwrap().is_empty());
+    }
+}

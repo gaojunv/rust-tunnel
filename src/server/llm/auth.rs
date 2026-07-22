@@ -49,3 +49,40 @@ pub fn generate_api_key() -> (String, String, String) {
     let prefix = format!("{}...{}", &key[..8], &key[key.len() - 4..]);
     (key, hash, prefix)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_api_key_format() {
+        let (key, hash, prefix) = generate_api_key();
+
+        // Key format: sk- + 48 hex chars = 51 chars
+        assert!(key.starts_with("sk-"));
+        assert_eq!(key.len(), 51);
+
+        // Hash is 64 hex chars (SHA-256)
+        assert_eq!(hash.len(), 64);
+
+        // Prefix format: sk-xxxx...xxxx (first 8 chars ... last 4 chars)
+        assert!(prefix.starts_with("sk-"));
+        assert!(prefix.contains("..."));
+        assert_eq!(prefix.len(), 15); // sk-xxxxx...xxxx
+    }
+
+    #[test]
+    fn test_generated_key_validates() {
+        let (key, hash, _prefix) = generate_api_key();
+        let computed = sha256_hex(&key);
+        assert_eq!(computed, hash);
+    }
+
+    #[test]
+    fn test_different_keys_have_different_hashes() {
+        let (key1, hash1, _) = generate_api_key();
+        let (key2, hash2, _) = generate_api_key();
+        assert_ne!(key1, key2);
+        assert_ne!(hash1, hash2);
+    }
+}
