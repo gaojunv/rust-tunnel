@@ -56,7 +56,7 @@ hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2", "server", "server-auto"] }
 hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "rustls-native-certs"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Embed frontend assets
 rust-embed = { version = "8.0", features = ["axum"], optional = true }
@@ -101,6 +101,7 @@ hickory-proto = "0.24"
 
 # Async trait support
 async-trait = "0.1"
+futures-util = "0.3"
 
 # ACME protocol support
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
