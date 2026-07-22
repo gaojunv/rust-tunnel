@@ -6,8 +6,8 @@ use crate::server::acme::{CertificateManager, CertificateProvider};
 use crate::server::db::Database;
 use crate::server::reverse_proxy::connector;
 use crate::server::reverse_proxy::rules::{
-    resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule,
-    ProxyTlsConfig, RuleCertStatus, RuleType, TrojanSniEntry,
+    resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
+    RuleCertStatus, RuleType, TrojanSniEntry,
 };
 use crate::server::stats::StatsCollector;
 
@@ -299,10 +299,7 @@ impl ReverseProxyState {
 
     /// Recompute cert_status for every TLS-enabled rule. Called from the
     /// cert_event_reactor after CertEvent::Issued/Renewed/Expired.
-    pub async fn refresh_all_cert_status(
-        &self,
-        cert_manager: &Arc<CertificateManager>,
-    ) {
+    pub async fn refresh_all_cert_status(&self, cert_manager: &Arc<CertificateManager>) {
         // Snapshot rules to compute outside the lock
         let snapshot: Vec<ProxyRule> = {
             let rules = self.rules.lock().await;
@@ -366,9 +363,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_all_cert_status_updates_pending_to_wildcard() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let mgr = Arc::new(CertificateManager::new(
-            temp_dir.path().to_str().unwrap(),
-        ));
+        let mgr = Arc::new(CertificateManager::new(temp_dir.path().to_str().unwrap()));
 
         let state = ReverseProxyState::new();
         // Insert a rule referencing api.example.com, TLS enabled but no cert yet -> PendingIssuance

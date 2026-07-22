@@ -375,9 +375,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_cert_source_pending_when_no_cert() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let mgr = Arc::new(CertificateManager::new(
-            temp_dir.path().to_str().unwrap(),
-        ));
+        let mgr = Arc::new(CertificateManager::new(temp_dir.path().to_str().unwrap()));
 
         let rule = ProxyRule {
             id: "r1".into(),

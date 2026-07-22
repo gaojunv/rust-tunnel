@@ -1,8 +1,8 @@
 use axum::body::Body;
+use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Bytes};
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::Request;
-use http_body_util::BodyExt;
 
 use super::super::upstream::{ProxyBody, ProxyError};
 use super::super::Backend;

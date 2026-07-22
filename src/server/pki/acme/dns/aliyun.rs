@@ -477,7 +477,8 @@ mod aliyun_tests {
             // 解析证书验证域名和有效期
             let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
                 .expect("Failed to parse cert PEM");
-            let (_, cert) = X509Certificate::from_der(&pem.contents).expect("Failed to parse cert DER");
+            let (_, cert) =
+                X509Certificate::from_der(&pem.contents).expect("Failed to parse cert DER");
 
             // 验证证书 SAN 包含通配符域名
             let san = cert

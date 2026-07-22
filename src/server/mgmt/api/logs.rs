@@ -2,14 +2,20 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::StatusCode,
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     Json,
 };
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::{ApiState, dto::{LogEntryResponse, LogsQuery, SetLevelRequest, SseQuery}};
+use super::{
+    dto::{LogEntryResponse, LogsQuery, SetLevelRequest, SseQuery},
+    ApiState,
+};
 
 // ── Log Viewer Endpoints ──────────────────────────────────────────
 
@@ -282,9 +288,7 @@ pub async fn put_logs_level(
         }
     };
 
-    log_store
-        .level
-        .store(level_u8, Ordering::Relaxed);
+    log_store.level.store(level_u8, Ordering::Relaxed);
     tracing::info!("Log level changed to {}", body.level.to_lowercase());
 
     // Persist to DB

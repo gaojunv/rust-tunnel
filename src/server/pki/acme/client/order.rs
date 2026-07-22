@@ -208,8 +208,8 @@ impl AcmeClient {
             .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
-        let expires_at =
-            cert_utils::parse_certificate_expiry(&cert_chain).context("Failed to parse issued certificate")?;
+        let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)
+            .context("Failed to parse issued certificate")?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = cert_utils::split_certificate_chain(&cert_chain);
@@ -501,8 +501,8 @@ impl AcmeClient {
             .context("Failed to download certificate after finalization")?;
 
         // Parse the certificate to get expiry date
-        let expires_at =
-            cert_utils::parse_certificate_expiry(&cert_chain).context("Failed to parse issued certificate")?;
+        let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)
+            .context("Failed to parse issued certificate")?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = cert_utils::split_certificate_chain(&cert_chain);

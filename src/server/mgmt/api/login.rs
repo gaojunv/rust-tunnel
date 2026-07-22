@@ -1,6 +1,9 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
-use super::{dto::{HealthResponse, LoginRequest, LoginResponse}, ApiState};
+use super::{
+    dto::{HealthResponse, LoginRequest, LoginResponse},
+    ApiState,
+};
 use crate::server::auth::create_token;
 
 // Login handler

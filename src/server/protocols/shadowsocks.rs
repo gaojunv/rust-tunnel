@@ -429,7 +429,12 @@ mod tests {
     }
 
     /// Spawn `ss-local` as a child process.
-    fn start_ss_local(ss_server_port: u16, socks5_port: u16, cipher: &str, password: &str) -> Child {
+    fn start_ss_local(
+        ss_server_port: u16,
+        socks5_port: u16,
+        cipher: &str,
+        password: &str,
+    ) -> Child {
         Command::new("ss-local")
             .args([
                 "-s",
@@ -541,7 +546,8 @@ mod tests {
 
             let kind = parse_cipher_kind(cipher).unwrap();
             let server_addr: std::net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
-            let cfg = ::shadowsocks::config::ServerConfig::new(server_addr, password, kind).unwrap();
+            let cfg =
+                ::shadowsocks::config::ServerConfig::new(server_addr, password, kind).unwrap();
             assert_eq!(key, cfg.key());
         }
     }

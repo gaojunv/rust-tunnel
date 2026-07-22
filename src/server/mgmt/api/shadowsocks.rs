@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
-use super::{ApiState, dto::ShadowsocksConfig};
+use super::{dto::ShadowsocksConfig, ApiState};
 
 // Get Shadowsocks configuration
 pub async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<ShadowsocksConfig> {

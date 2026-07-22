@@ -15,13 +15,13 @@ use tower_http::cors::{Any, CorsLayer};
 pub mod acme;
 pub mod clients;
 pub mod dns;
-pub mod reverse_proxy;
-pub mod settings;
 pub mod dto;
 pub mod login;
 pub mod logs;
 pub mod mesh;
+pub mod reverse_proxy;
 pub mod server_auth;
+pub mod settings;
 pub mod shadowsocks;
 pub mod static_files;
 pub mod stats;
@@ -34,12 +34,10 @@ use crate::server::control::ServerState;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::stats;
+    use super::*;
     use crate::server::db::Database;
     use chrono::Timelike;
-
-
 
     // ── Stats unified API tests ──────────────────────────────────
 
@@ -188,8 +186,6 @@ pub struct ApiState {
     pub log_store: Option<crate::server::logs::LogStore>,
 }
 
-
-
 /// Create and run the API server
 pub async fn run_api_server(
     api_addr: String,
@@ -260,7 +256,10 @@ pub async fn run_api_server(
         .route("/api/dns/records/:name", delete(dns::delete_dns_record))
         // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/logs", get(logs::get_logs))
-        .route("/api/logs/level", get(logs::get_logs_level).put(logs::put_logs_level))
+        .route(
+            "/api/logs/level",
+            get(logs::get_logs_level).put(logs::put_logs_level),
+        )
         // Proxy rules management endpoints
         .route(
             "/api/proxy/rules",
@@ -300,7 +299,8 @@ pub async fn run_api_server(
         .route("/api/settings", get(settings::get_settings))
         .route(
             "/api/settings/reverse-proxy",
-            get(reverse_proxy::get_reverse_proxy_config).put(reverse_proxy::update_reverse_proxy_config),
+            get(reverse_proxy::get_reverse_proxy_config)
+                .put(reverse_proxy::update_reverse_proxy_config),
         )
         .route(
             "/api/settings/dns",

@@ -83,29 +83,22 @@ pub async fn request_acme_certificate(
             let dns_config = state.server_state.dns_provider_config.read().await;
             match dns_config.as_ref() {
                 Some(config) => {
-                    let solver: Arc<dyn crate::server::acme::dns::DnsChallengeSolver> =
-                        match config.provider {
-                            crate::server::acme::dns::DnsProvider::Aliyun => Arc::new(
-                                crate::server::acme::dns::aliyun::AliyunDnsSolver::new(config),
-                            ),
-                            crate::server::acme::dns::DnsProvider::Cloudflare => {
-                                Arc::new(
-                                    crate::server::acme::dns::cloudflare::CloudflareDnsSolver::new(
-                                        config,
-                                    ),
-                                )
-                            }
-                            crate::server::acme::dns::DnsProvider::TencentCloud => {
-                                Arc::new(
-                                    crate::server::acme::dns::tencent::TencentDnsSolver::new(
-                                        config,
-                                    ),
-                                )
-                            }
-                            crate::server::acme::dns::DnsProvider::Custom => Arc::new(
-                                crate::server::acme::dns::custom::CustomDnsSolver::new(config),
-                            ),
-                        };
+                    let solver: Arc<dyn crate::server::acme::dns::DnsChallengeSolver> = match config
+                        .provider
+                    {
+                        crate::server::acme::dns::DnsProvider::Aliyun => Arc::new(
+                            crate::server::acme::dns::aliyun::AliyunDnsSolver::new(config),
+                        ),
+                        crate::server::acme::dns::DnsProvider::Cloudflare => Arc::new(
+                            crate::server::acme::dns::cloudflare::CloudflareDnsSolver::new(config),
+                        ),
+                        crate::server::acme::dns::DnsProvider::TencentCloud => Arc::new(
+                            crate::server::acme::dns::tencent::TencentDnsSolver::new(config),
+                        ),
+                        crate::server::acme::dns::DnsProvider::Custom => Arc::new(
+                            crate::server::acme::dns::custom::CustomDnsSolver::new(config),
+                        ),
+                    };
                     client.request_certificate_with_dns(&domain, solver).await
                 }
                 None => {

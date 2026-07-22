@@ -6,8 +6,8 @@ use axum::{
 };
 
 use super::{
-    ApiState,
     dto::{MeshMemberResponse, MeshNetworkResponse, MeshServiceResponse},
+    ApiState,
 };
 
 // ── Mesh Network Endpoints ─────────────────────────────────────────
@@ -49,7 +49,10 @@ pub async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 // GET /api/mesh/:id — mesh detail
-pub async fn get_mesh(State(state): State<ApiState>, Path(mesh_id): Path<String>) -> impl IntoResponse {
+pub async fn get_mesh(
+    State(state): State<ApiState>,
+    Path(mesh_id): Path<String>,
+) -> impl IntoResponse {
     match state.server_state.mesh_manager.get_mesh(&mesh_id).await {
         Some(members) => {
             let services: Vec<MeshServiceResponse> = members

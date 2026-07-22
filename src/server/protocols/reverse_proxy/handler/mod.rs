@@ -189,8 +189,8 @@ pub async fn handle_proxy_request_unified(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::upstream_request::strip_hop_by_hop;
+    use super::*;
     use http_body_util::BodyExt;
     use hyper::header::{HeaderMap, HeaderValue};
 
@@ -1378,7 +1378,8 @@ mod http2_tests {
                 _: &[u8],
                 _: &rustls::pki_types::CertificateDer<'_>,
                 _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             fn verify_tls13_signature(
@@ -1386,7 +1387,8 @@ mod http2_tests {
                 _: &[u8],
                 _: &rustls::pki_types::CertificateDer<'_>,
                 _: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -1523,9 +1525,9 @@ mod http2_tests {
                 tokio::spawn(async move {
                     let io = hyper_util::rt::TokioIo::new(stream);
                     let svc = hyper::service::service_fn(|_req| async {
-                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
-                            "h2c ok",
-                        ))))
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from("h2c ok"),
+                        )))
                     });
                     let _ = h2_server::Builder::new(TokioExecutor::new())
                         .serve_connection(io, svc)

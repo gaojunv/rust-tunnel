@@ -972,7 +972,9 @@ mod legacy_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::client::TlsStream;
 
-    use crate::common::{create_insecure_client_config, create_server_config, load_or_generate_cert};
+    use crate::common::{
+        create_insecure_client_config, create_server_config, load_or_generate_cert,
+    };
     use crate::server::control::ServerState;
     use crate::server::listener;
     use crate::server::trojan::sha224_hex;
@@ -1294,7 +1296,8 @@ mod legacy_tests {
                 start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
-            let response = trojan_send_recv(trojan_port, "testpass", echo_port, b"hello trojan").await;
+            let response =
+                trojan_send_recv(trojan_port, "testpass", echo_port, b"hello trojan").await;
             assert_eq!(response, b"hello trojan");
 
             server_handle.abort();
@@ -1450,7 +1453,8 @@ mod legacy_tests {
             let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
                 .await
                 .unwrap();
-            let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            let server_name =
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
             let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
 
             // Send Trojan header with wrong password
@@ -1465,7 +1469,8 @@ mod legacy_tests {
             // The server should fall back — we should be able to read something
             // (the fallback server's response)
             let mut buf = [0u8; 64];
-            let result = tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await;
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await;
             // The connection should either get fallback data or be closed by the server
             // Either way, the key property is that the server doesn't panic
             match result {
@@ -1603,7 +1608,8 @@ mod legacy_tests {
             let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
                 .await
                 .unwrap();
-            let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            let server_name =
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
             let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
 
             let header = build_trojan_header(
@@ -1685,7 +1691,8 @@ mod legacy_tests {
             let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
                 .await
                 .unwrap();
-            let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            let server_name =
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
             let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
 
             // Build header with initial payload appended

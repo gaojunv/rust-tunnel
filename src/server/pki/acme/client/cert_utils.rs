@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use x509_parser::prelude::*;
 
 /// Parse a PEM certificate chain and extract the expiry date of the first (leaf) certificate
-pub(super) fn parse_certificate_expiry(cert_chain_pem: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+pub(super) fn parse_certificate_expiry(
+    cert_chain_pem: &str,
+) -> Result<chrono::DateTime<chrono::Utc>> {
     // Parse the PEM data
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_chain_pem.as_bytes())
         .context("Failed to parse certificate PEM")?;

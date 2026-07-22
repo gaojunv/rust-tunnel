@@ -1,8 +1,8 @@
 use chrono::Utc;
 use sqlx::Row;
 
-use super::Database;
 use super::records::ClientRecord;
+use super::Database;
 
 impl Database {
     /// Record client connection

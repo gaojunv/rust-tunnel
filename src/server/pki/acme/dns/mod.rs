@@ -80,4 +80,3 @@ impl Default for DnsProviderRegistry {
         Self::new()
     }
 }
-
