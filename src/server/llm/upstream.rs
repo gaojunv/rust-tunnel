@@ -125,6 +125,103 @@ pub async fn call_upstream(
     }
 }
 
+/// 透传原始请求到上游 Anthropic 端点，不做格式转换。
+///
+/// 认证策略：同时支持 `x-api-key`（Anthropic 原生）和 `Authorization: Bearer`（OpenAI 风格）。
+/// 先尝试 `x-api-key`，若返回 401 则回退到 Bearer 头重试。
+pub async fn call_upstream_raw(
+    base_url: &str,
+    api_key: &str,
+    path: &str,
+    body: &serde_json::Value,
+    is_stream: bool,
+) -> Result<Response, (StatusCode, String)> {
+    let client = &*UPSTREAM_CLIENT;
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+
+    // 先用 x-api-key 头尝试
+    let resp = client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream connection failed: {}", e),
+            )
+        })?;
+
+    // 如果 401，回退到 Bearer 头重试
+    let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Upstream connection failed: {}", e),
+                )
+            })?
+    } else {
+        resp
+    };
+
+    let status = resp.status();
+
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        let sanitized = sanitize_error_message(&body_text);
+        return Err((
+            status,
+            format!("Upstream error {}: {}", status.as_u16(), sanitized),
+        ));
+    }
+
+    if is_stream {
+        let byte_stream = resp.bytes_stream().map(|result| {
+            result
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+
+        let body = Body::from_stream(byte_stream);
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .header("Connection", "keep-alive")
+            .body(body)
+            .unwrap())
+    } else {
+        let body_bytes = resp.bytes().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read upstream response: {}", e),
+            )
+        })?;
+
+        let body = Body::from(body_bytes.to_vec());
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .unwrap())
+    }
+}
+
 /// Build an OpenAI-format error response.
 pub fn error_response(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({

@@ -35,6 +35,8 @@ pub struct ProviderConfig {
     #[serde(skip_serializing)]
     pub api_key: String,
     pub extra_config: Option<String>,
+    /// Anthropic Messages API base URL; `None` = 不支持 Anthropic 协议。
+    pub anthropic_base_url: Option<String>,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -48,6 +50,8 @@ pub struct ProviderRequest {
     pub base_url: String,
     pub api_key: String,
     pub extra_config: Option<String>,
+    /// Anthropic Messages API base URL; 留空或 null 表示不支持。
+    pub anthropic_base_url: Option<String>,
 }
 
 /// Model configuration.

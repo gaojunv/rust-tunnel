@@ -195,6 +195,7 @@ mod tests {
             "https://api.deepseek.com",
             "sk-upstream",
             None::<&str>,
+            None::<&str>,
             true,
         )
         .await

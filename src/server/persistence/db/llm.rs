@@ -10,6 +10,7 @@ pub struct LlmProviderRecord {
     pub base_url: String,
     pub api_key: String,
     pub extra_config: Option<String>,
+    pub anthropic_base_url: Option<String>,
     pub enabled: i32,
     pub created_at: String,
     pub updated_at: String,
@@ -74,18 +75,20 @@ impl Database {
         base_url: &str,
         api_key: &str,
         extra_config: Option<&str>,
+        anthropic_base_url: Option<&str>,
         enabled: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO llm_providers (id, name, provider_type, base_url, api_key, extra_config, enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            INSERT INTO llm_providers (id, name, provider_type, base_url, api_key, extra_config, anthropic_base_url, enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 provider_type = excluded.provider_type,
                 base_url = excluded.base_url,
                 api_key = excluded.api_key,
                 extra_config = excluded.extra_config,
+                anthropic_base_url = excluded.anthropic_base_url,
                 enabled = excluded.enabled,
                 updated_at = datetime('now')
             "#,
@@ -96,6 +99,7 @@ impl Database {
         .bind(base_url)
         .bind(api_key)
         .bind(extra_config)
+        .bind(anthropic_base_url)
         .bind(enabled as i32)
         .execute(&self.pool)
         .await?;
@@ -308,6 +312,7 @@ mod tests {
             "https://api.deepseek.com",
             "sk-test",
             None::<&str>,
+            None::<&str>,
             true,
         )
         .await
@@ -347,6 +352,7 @@ mod tests {
             "deepseek",
             "https://api.deepseek.com",
             "sk-test",
+            None::<&str>,
             None::<&str>,
             true,
         )
@@ -418,10 +424,10 @@ mod tests {
 
         let p1 = uuid::Uuid::new_v4().to_string();
         let p2 = uuid::Uuid::new_v4().to_string();
-        db.llm_save_provider(&p1, "P1", "deepseek", "https://a", "k", None::<&str>, true)
+        db.llm_save_provider(&p1, "P1", "deepseek", "https://a", "k", None::<&str>, None::<&str>, true)
             .await
             .unwrap();
-        db.llm_save_provider(&p2, "P2", "kimi", "https://b", "k", None::<&str>, true)
+        db.llm_save_provider(&p2, "P2", "kimi", "https://b", "k", None::<&str>, None::<&str>, true)
             .await
             .unwrap();
 

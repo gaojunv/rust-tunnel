@@ -94,6 +94,10 @@ export default function ProviderCard({ provider, onEdit }: Props) {
       {expanded && (
         <CardContent>
           <div className="space-y-2">
+            <div className="text-xs text-muted-foreground">Base URL: {provider.base_url}</div>
+            {provider.anthropic_base_url && <div className="text-xs text-muted-foreground">Anthropic URL: {provider.anthropic_base_url}</div>}
+          </div>
+          <div className="space-y-2 mt-3">
             <div className="flex gap-2">
               <Input placeholder="Model name (e.g., deepseek-chat)" value={newModelName} onChange={(e) => setNewModelName(e.target.value)} className="flex-1" />
               <Button size="sm" onClick={() => { if (newModelName.trim()) { addModelMutation.mutate({ providerId: provider.id, model_name: newModelName.trim() }); setNewModelName(''); } }} disabled={addModelMutation.isPending}>

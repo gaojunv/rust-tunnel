@@ -144,6 +144,7 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
             base_url: r.base_url,
             api_key: String::new(),
             extra_config: r.extra_config,
+            anthropic_base_url: r.anthropic_base_url,
             enabled: r.enabled != 0,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -197,6 +198,7 @@ pub async fn create_provider(
             &base_url,
             &api_key,
             extra_config.as_deref(),
+            body.anthropic_base_url.as_deref(),
             true,
         )
         .await
@@ -265,6 +267,11 @@ pub async fn update_provider(
         None => existing.extra_config.clone(),
         Some(ec) => Some(encrypt_field(cipher.as_ref(), ec)),
     };
+    // anthropic_base_url: None 表示不修改，Some 表示更新（含清空）
+    let anthropic_base_url = body
+        .anthropic_base_url
+        .as_deref()
+        .or(existing.anthropic_base_url.as_deref());
 
     if let Err(e) = db
         .llm_save_provider(
@@ -274,6 +281,7 @@ pub async fn update_provider(
             &base_url,
             &api_key,
             extra_config.as_deref(),
+            anthropic_base_url,
             enabled,
         )
         .await

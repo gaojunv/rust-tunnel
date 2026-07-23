@@ -1,6 +1,7 @@
 //! 提供商管理逻辑：类型校验与默认端点（spec §Provider Type 对接约定）。
 //!
 //! 四个提供商均为 OpenAI 兼容格式，差异只在默认 Base URL 与认证字段。
+//! 每个提供商可额外配置 `anthropic_base_url`，用于 Anthropic 协议透传。
 
 /// 合法的 provider_type 列表
 pub const VALID_PROVIDER_TYPES: [&str; 4] = ["deepseek", "volcengine", "kimi", "mimo"];

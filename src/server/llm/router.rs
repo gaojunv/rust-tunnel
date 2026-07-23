@@ -63,6 +63,7 @@ pub async fn resolve_model(
         base_url: provider_record.base_url,
         api_key,
         extra_config: provider_record.extra_config,
+        anthropic_base_url: provider_record.anthropic_base_url,
         enabled: provider_record.enabled != 0,
         created_at: provider_record.created_at,
         updated_at: provider_record.updated_at,
@@ -176,6 +177,7 @@ mod tests {
             "https://api.deepseek.com",
             &encrypted,
             None::<&str>,
+            None::<&str>,
             true,
         )
         .await
@@ -213,6 +215,7 @@ mod tests {
             "https://api.deepseek.com",
             "sk-plain",
             None::<&str>,
+            None::<&str>,
             true,
         )
         .await
@@ -245,6 +248,7 @@ mod tests {
             "deepseek",
             "https://api.deepseek.com",
             "k",
+            None::<&str>,
             None::<&str>,
             false,
         )

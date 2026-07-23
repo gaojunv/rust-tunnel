@@ -258,6 +258,9 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
 }
 
 /// POST /v1/messages — Anthropic Messages API.
+///
+/// 当 provider 配置了 `anthropic_base_url` 时，直接透传原始 Anthropic 请求到上游，
+/// 不做任何格式转换；否则回退到 OpenAI 格式转换路径。
 pub async fn handle_messages(
     State(state): State<LlmHandlerState>,
     headers: HeaderMap,
@@ -284,26 +287,57 @@ pub async fn handle_messages(
         );
     }
 
-    // Convert Anthropic → OpenAI format
+    // 提取 model 名用于路由解析
+    let model = match body.get("model").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "model is required".into(),
+                "invalid_request_error",
+            )
+        }
+    };
+
+    // Resolve model → provider
+    let (provider, actual_model) = match resolve_model(&state.llm, &model).await {
+        Ok(r) => r,
+        Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
+    };
+
+    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // ── 直通路径：provider 配置了 anthropic_base_url ──
+    if let Some(ref anthropic_url) = provider.anthropic_base_url {
+        // 替换 model 为实际上游名称
+        let mut body = body;
+        body["model"] = serde_json::Value::String(actual_model);
+
+        return match super::upstream::call_upstream_raw(
+            anthropic_url,
+            &provider.api_key,
+            "/v1/messages",
+            &body,
+            is_stream,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err((status, msg)) => error_response(status, msg, "upstream_error"),
+        };
+    }
+
+    // ── 回退路径：转成 OpenAI 格式发到 base_url ──
     let request = match anthropic_to_openai(&body) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
     };
 
-    // Resolve model → provider
-    let (provider, actual_model) = match resolve_model(&state.llm, &request.model).await {
-        Ok(r) => r,
-        Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
-    };
-
-    // Use actual upstream model name
     let mut request = request;
     request.model = actual_model;
 
-    // Call upstream (providers use OpenAI format)
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
-            // 响应需要转回 Anthropic 格式：非流式整体转换，流式逐 chunk 转换
             if !request.stream {
                 convert_openai_to_anthropic_response(resp).await
             } else {

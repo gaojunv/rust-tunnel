@@ -24,13 +24,14 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
   const [providerType, setProviderType] = useState<ProviderType>('deepseek');
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('');
 
   const existing = providerId ? providers?.find((p) => p.id === providerId) : null;
 
   useEffect(() => {
     if (open) {
-      if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); }
-      else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); }
+      if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); setAnthropicBaseUrl(existing.anthropic_base_url || ''); }
+      else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); setAnthropicBaseUrl(''); }
     }
   }, [open, existing]);
 
@@ -48,12 +49,13 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
             </Select>
           </div>
           <div className="space-y-2"><Label>Base URL</Label><Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></div>
+          <div className="space-y-2"><Label>Anthropic Base URL (可选)</Label><Input value={anthropicBaseUrl} onChange={(e) => setAnthropicBaseUrl(e.target.value)} placeholder="留空则 Anthropic 请求会转为 OpenAI 格式" /></div>
           <div className="space-y-2"><Label>API Key</Label><Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={existing ? 'Leave blank to keep current' : 'sk-...'} /></div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button onClick={() => {
-            const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey };
+            const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey, anthropic_base_url: anthropicBaseUrl || null };
             if (existing) { updateMutation.mutate({ id: existing.id, ...req }, { onSuccess: onClose }); }
             else { createMutation.mutate(req, { onSuccess: onClose }); }
           }} disabled={createMutation.isPending || updateMutation.isPending}>Save</Button>

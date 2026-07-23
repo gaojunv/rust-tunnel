@@ -382,6 +382,7 @@ impl Database {
                 base_url TEXT NOT NULL,
                 api_key TEXT NOT NULL DEFAULT '',
                 extra_config TEXT,
+                anthropic_base_url TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -431,6 +432,9 @@ impl Database {
         )
         .execute(pool)
         .await?;
+
+        // Migration: old DBs lack anthropic_base_url column on llm_providers.
+        Self::migrate_llm_providers_add_anthropic_url(pool).await?;
 
         Ok(())
     }
@@ -519,5 +523,26 @@ impl Database {
         // 任一步失败时 tx 在 drop 时自动回滚，不会残留中间表或悬挂锁
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Migration: old DBs lack `anthropic_base_url` column on `llm_providers`.
+    /// Idempotent: tries ALTER TABLE; ignores "duplicate column" error.
+    async fn migrate_llm_providers_add_anthropic_url(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_providers ADD COLUMN anthropic_base_url TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("duplicate column") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }

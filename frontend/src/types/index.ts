@@ -290,6 +290,7 @@ export interface LlmProvider {
   provider_type: ProviderType;
   base_url: string;
   extra_config?: string | null;
+  anthropic_base_url?: string | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -301,6 +302,7 @@ export interface CreateProviderRequest {
   base_url: string;
   api_key: string;
   extra_config?: string | null;
+  anthropic_base_url?: string | null;
 }
 
 export interface LlmModel {
