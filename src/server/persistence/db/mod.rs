@@ -132,6 +132,79 @@ mod cert_status_migration_tests {
         assert!(r.cert_status_updated_at.is_some());
     }
 
+    /// 旧库（proxy_rules 的 CHECK 不含 'llm'）经 Database::new 迁移后应重建表
+    /// 并接受 'llm' 类型。回归：迁移曾把 BEGIN EXCLUSIVE 等多语句打散在连接池上，
+    /// 不同连接互相锁死报 "database is locked"，进程启动即退出。
+    #[tokio::test]
+    async fn migration_rebuilds_proxy_rules_check_for_llm() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db_path = tempdir.path().join("migrate_llm_check.db");
+
+        // 用旧 schema（CHECK 不含 'llm'）手工建表并插入一行存量数据
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true);
+            let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+            sqlx::query(
+                r#"
+                CREATE TABLE proxy_rules (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp')),
+                    listen_addr TEXT NOT NULL,
+                    domains TEXT,
+                    routes TEXT,
+                    tls_enabled INTEGER NOT NULL DEFAULT 0,
+                    tls_acme INTEGER NOT NULL DEFAULT 0,
+                    tls_domain TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    cert_source TEXT,
+                    cert_covering_domain TEXT,
+                    cert_status_updated_at DATETIME
+                )
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO proxy_rules (id, name, type, listen_addr, created_at, updated_at) \
+                 VALUES ('r-old', 'old-rule', 'http', '0.0.0.0:8080', '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        // Database::new 必须成功完成迁移（此前报 database is locked）
+        let db = Database::new(db_path.to_str().unwrap()).await.unwrap();
+
+        // 迁移后 'llm' 类型可插入，存量行保留
+        sqlx::query(
+            "INSERT INTO proxy_rules (id, name, type, listen_addr, created_at, updated_at) \
+             VALUES ('r-llm', 'llm-rule', 'llm', '0.0.0.0:9000', datetime('now'), datetime('now'))",
+        )
+        .execute(db.pool())
+        .await
+        .expect("迁移后 proxy_rules 应接受 'llm' 类型");
+
+        let rules = db.load_proxy_rules().await.unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().any(|r| r.id == "r-old"), "存量行应保留");
+        // 不应残留迁移中间表
+        let leftover: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'proxy_rules_new%'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(leftover.is_empty(), "不应残留 proxy_rules_new 中间表");
+    }
+
     /// 旧库（无 domain 列）经 Database::new 迁移后应自动补上 domain 列，
     /// 存量行 domain 默认 ''。
     #[tokio::test]

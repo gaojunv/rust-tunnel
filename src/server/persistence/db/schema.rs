@@ -466,68 +466,58 @@ impl Database {
             }
         }
 
-        // Run migration: rebuild table with updated CHECK
-        sqlx::query("BEGIN EXCLUSIVE").execute(pool).await?;
-        let result = async {
-            // Create new table with updated CHECK (including 'llm')
-            sqlx::query(
-                r#"
-                CREATE TABLE proxy_rules_new (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp', 'llm')),
-                    listen_addr TEXT NOT NULL,
-                    domains TEXT,
-                    routes TEXT,
-                    tls_enabled INTEGER NOT NULL DEFAULT 0,
-                    tls_acme INTEGER NOT NULL DEFAULT 0,
-                    tls_domain TEXT,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at DATETIME NOT NULL,
-                    updated_at DATETIME NOT NULL,
-                    cert_source TEXT,
-                    cert_covering_domain TEXT,
-                    cert_status_updated_at DATETIME
-                )
-                "#,
+        // Run migration: rebuild table with updated CHECK.
+        // 必须在单个事务（同一条连接）内完成——此前用 pool 逐条 execute，
+        // BEGIN EXCLUSIVE 与后续语句落到不同连接，互相锁死报 "database is locked"。
+        let mut tx = pool.begin().await?;
+        // Create new table with updated CHECK (including 'llm')
+        sqlx::query(
+            r#"
+            CREATE TABLE proxy_rules_new (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('http', 'tcp', 'udp', 'llm')),
+                listen_addr TEXT NOT NULL,
+                domains TEXT,
+                routes TEXT,
+                tls_enabled INTEGER NOT NULL DEFAULT 0,
+                tls_acme INTEGER NOT NULL DEFAULT 0,
+                tls_domain TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                cert_source TEXT,
+                cert_covering_domain TEXT,
+                cert_status_updated_at DATETIME
             )
-            .execute(pool)
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // Copy existing data
+        sqlx::query("INSERT INTO proxy_rules_new SELECT * FROM proxy_rules")
+            .execute(&mut *tx)
             .await?;
 
-            // Copy existing data
-            sqlx::query("INSERT INTO proxy_rules_new SELECT * FROM proxy_rules")
-                .execute(pool)
-                .await?;
-
-            // Drop old table and rename new
-            sqlx::query("DROP TABLE proxy_rules").execute(pool).await?;
-            sqlx::query("ALTER TABLE proxy_rules_new RENAME TO proxy_rules")
-                .execute(pool)
-                .await?;
-
-            // Recreate indexes
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)")
-                .execute(pool)
-                .await?;
-            sqlx::query(
-                "CREATE INDEX IF NOT EXISTS idx_proxy_rules_enabled ON proxy_rules(enabled)",
-            )
-            .execute(pool)
+        // Drop old table and rename new
+        sqlx::query("DROP TABLE proxy_rules")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("ALTER TABLE proxy_rules_new RENAME TO proxy_rules")
+            .execute(&mut *tx)
             .await?;
 
-            Ok::<_, sqlx::Error>(())
-        }
-        .await;
+        // Recreate indexes
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_type ON proxy_rules(type)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxy_rules_enabled ON proxy_rules(enabled)")
+            .execute(&mut *tx)
+            .await?;
 
-        match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(pool).await?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(pool).await;
-                Err(e)
-            }
-        }
+        // 任一步失败时 tx 在 drop 时自动回滚，不会残留中间表或悬挂锁
+        tx.commit().await?;
+        Ok(())
     }
 }
