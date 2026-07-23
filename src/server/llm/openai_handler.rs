@@ -158,6 +158,12 @@ pub async fn handle_chat_completions(
             .and_then(|v| v.as_f64())
             .map(|v| v as f32),
         top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+        // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
+        tools: body
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .cloned(),
+        tool_choice: body.get("tool_choice").cloned(),
     };
 
     // Call upstream

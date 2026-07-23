@@ -17,21 +17,36 @@ pub fn map_stop_reason(openai: &str) -> String {
 }
 
 /// 非流式：OpenAI chat.completion 响应 JSON → Anthropic Messages 响应 JSON。
+///
+/// 除了 `message.content` 转成 `text` 块外，`message.tool_calls` 数组会被展开为
+/// Anthropic 的 `tool_use` content 块（`arguments` 字符串 parse 回对象）。
 pub fn openai_response_to_anthropic(openai: &Value) -> Value {
-    let content: Vec<Value> = openai["choices"]
-        .as_array()
-        .map(|choices| {
-            choices
-                .iter()
-                .map(|c| {
-                    json!({
-                        "type": "text",
-                        "text": c["message"]["content"].as_str().unwrap_or(""),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut content: Vec<Value> = Vec::new();
+
+    // text 块（如果有）
+    if let Some(text) = openai["choices"][0]["message"]["content"].as_str() {
+        if !text.is_empty() {
+            content.push(json!({ "type": "text", "text": text }));
+        }
+    }
+
+    // tool_use 块（如果有）
+    if let Some(calls) = openai["choices"][0]["message"]["tool_calls"].as_array() {
+        for call in calls {
+            let id = call["id"].as_str().unwrap_or("");
+            let name = call["function"]["name"].as_str().unwrap_or("");
+            let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+            // OpenAI 的 arguments 是 JSON 字符串；Anthropic 的 input 是对象。
+            let input: Value =
+                serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
 
     let finish_reason = openai["choices"][0]["finish_reason"]
         .as_str()
@@ -56,15 +71,24 @@ pub fn openai_response_to_anthropic(openai: &Value) -> Value {
 ///
 /// 用法：对上游每个字节块调用 [`push`](Self::push)，把返回的字节直接发给客户端。
 /// 内部缓冲跨 chunk 边界的不完整行。
+///
+/// **多 content block 处理**：
+/// - 文本内容（`delta.content`）始终占 Anthropic block index 0（若出现）；
+/// - 每个 tool_call 按上游 `delta.tool_calls[i].index` 首次出现顺序分配 index 1、2、...；
+/// - 所有已开启的 block 会在 message_stop 前逐个发送 `content_block_stop`。
 pub struct AnthropicSseTranslator {
     /// 尚未遇到换行符的不完整数据
     line_buf: String,
     /// message_start 是否已发送
     started: bool,
-    /// content_block 是否处于打开状态
-    block_open: bool,
     /// message_stop 是否已发送
     closed: bool,
+    /// 文本 block 是否已发送 content_block_start（占据 anthropic index 0）
+    text_block_open: bool,
+    /// 上游 tool_call index → 分配的 anthropic block index
+    tool_blocks: std::collections::HashMap<u64, u32>,
+    /// 下一个可分配的 anthropic block index（text 用 0；tool 从 1 起，除非无 text）
+    next_block_index: u32,
 }
 
 impl Default for AnthropicSseTranslator {
@@ -78,8 +102,13 @@ impl AnthropicSseTranslator {
         Self {
             line_buf: String::new(),
             started: false,
-            block_open: false,
             closed: false,
+            text_block_open: false,
+            tool_blocks: std::collections::HashMap::new(),
+            // text block（若出现）用 0；tool block 用 1、2、... —— 若最终无 text，
+            // Anthropic 允许 tool_use block 从任何 index 开始，因此从 0 起也可以。
+            // 这里选择：text 出现即占 0，tool 从 next_block_index 起（初始 1）。
+            next_block_index: 1,
         }
     }
 
@@ -130,25 +159,76 @@ impl AnthropicSseTranslator {
                 },
             });
             push_event(out, "message_start", &msg);
-
-            let block_start = json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            });
-            push_event(out, "content_block_start", &block_start);
-            self.block_open = true;
         }
 
         // 文本增量
         if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
             if !text.is_empty() {
+                if !self.text_block_open {
+                    self.text_block_open = true;
+                    let block_start = json!({
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    });
+                    push_event(out, "content_block_start", &block_start);
+                }
                 let delta = json!({
                     "type": "content_block_delta",
                     "index": 0,
                     "delta": {"type": "text_delta", "text": text},
                 });
                 push_event(out, "content_block_delta", &delta);
+            }
+        }
+
+        // 工具调用增量
+        if let Some(calls) = chunk["choices"][0]["delta"]["tool_calls"].as_array() {
+            for call in calls {
+                // 上游 index：OpenAI 流式规定用 index 标识哪个 tool_call；缺省当 0。
+                let up_idx = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                // 首次出现：分配 anthropic block index 并发 content_block_start
+                let anthropic_idx = if let Some(idx) = self.tool_blocks.get(&up_idx) {
+                    *idx
+                } else {
+                    let idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.tool_blocks.insert(up_idx, idx);
+                    let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let block_start = json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": {},
+                        },
+                    });
+                    push_event(out, "content_block_start", &block_start);
+                    idx
+                };
+
+                // arguments 增量 → Anthropic input_json_delta
+                if let Some(args) = call
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !args.is_empty() {
+                        let delta = json!({
+                            "type": "content_block_delta",
+                            "index": anthropic_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": args},
+                        });
+                        push_event(out, "content_block_delta", &delta);
+                    }
+                }
             }
         }
 
@@ -159,21 +239,34 @@ impl AnthropicSseTranslator {
         }
     }
 
-    /// 发送收尾事件（content_block_stop / message_delta / message_stop）。幂等。
+    /// 发送收尾事件（所有已开启 block 的 content_block_stop → message_delta → message_stop）。幂等。
     fn close(&mut self, stop_reason: &str, output_tokens: u64, out: &mut String) {
         if self.closed || !self.started {
             return;
         }
         self.closed = true;
 
-        if self.block_open {
-            self.block_open = false;
+        // 关闭 text block（若开启过）
+        if self.text_block_open {
+            self.text_block_open = false;
             let block_stop = json!({
                 "type": "content_block_stop",
                 "index": 0,
             });
             push_event(out, "content_block_stop", &block_stop);
         }
+
+        // 关闭所有 tool blocks，按 anthropic index 顺序发送
+        let mut indices: Vec<u32> = self.tool_blocks.values().copied().collect();
+        indices.sort_unstable();
+        for idx in indices {
+            let block_stop = json!({
+                "type": "content_block_stop",
+                "index": idx,
+            });
+            push_event(out, "content_block_stop", &block_stop);
+        }
+        self.tool_blocks.clear();
 
         let msg_delta = json!({
             "type": "message_delta",
@@ -378,5 +471,211 @@ mod tests {
         let out = String::from_utf8(t.push(chunk.as_bytes())).unwrap();
         assert!(out.contains("\"input_tokens\":7"));
         assert!(out.contains("\"output_tokens\":3"));
+    }
+
+    // ── 工具调用：非流式 ──────────────────────────────────────
+
+    #[test]
+    fn non_stream_response_tool_calls_expanded() {
+        // OpenAI 的 message.tool_calls 应展开为 Anthropic tool_use 块，
+        // arguments 字符串 parse 回 input 对象；stop_reason = tool_use。
+        let openai = json!({
+            "id": "chatcmpl-t1",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"loc\":\"SF\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8}
+        });
+        let a = openai_response_to_anthropic(&openai);
+        assert_eq!(a["stop_reason"], "tool_use");
+        let content = a["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_1");
+        assert_eq!(content[0]["name"], "get_weather");
+        assert_eq!(content[0]["input"]["loc"], "SF");
+    }
+
+    #[test]
+    fn non_stream_response_text_and_tool_call_coexist() {
+        let openai = json!({
+            "id": "x", "model": "m",
+            "choices": [{
+                "message": {
+                    "content": "sure",
+                    "tool_calls": [{
+                        "id": "c1", "type": "function",
+                        "function": {"name": "t", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let a = openai_response_to_anthropic(&openai);
+        let content = a["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "sure");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    // ── 工具调用：流式 ────────────────────────────────────────
+
+    fn openai_tool_chunk(
+        index: u64,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+        finish: Option<&str>,
+    ) -> String {
+        let mut func = serde_json::Map::new();
+        if let Some(n) = name {
+            func.insert("name".to_string(), json!(n));
+        }
+        if let Some(a) = arguments {
+            func.insert("arguments".to_string(), json!(a));
+        }
+        let mut call = serde_json::Map::new();
+        call.insert("index".to_string(), json!(index));
+        if let Some(i) = id {
+            call.insert("id".to_string(), json!(i));
+        }
+        if !func.is_empty() {
+            call.insert("function".to_string(), Value::Object(func));
+        }
+        let chunk = json!({
+            "id": "c1",
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [Value::Object(call)]},
+                "finish_reason": finish
+            }]
+        });
+        format!("data: {}\n\n", chunk)
+    }
+
+    #[test]
+    fn stream_single_tool_call_argument_deltas() {
+        // 单个 tool_call，分多次 arguments 增量 → input_json_delta 序列。
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        // 首块：id + name + arguments 部分
+        all.extend(t.push(
+            openai_tool_chunk(0, Some("call_a"), Some("get_x"), Some("{\"a\":"), None).as_bytes(),
+        ));
+        // 后续 arguments 增量
+        all.extend(t.push(openai_tool_chunk(0, None, None, Some("1}"), None).as_bytes()));
+        // 结束
+        all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+
+        // 首个 tool_use content_block_start，index=1（因为无 text，从 next_block_index=1 开始）
+        assert!(text.contains("event: content_block_start"));
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("\"id\":\"call_a\""));
+        assert!(text.contains("\"name\":\"get_x\""));
+        // input_json_delta 两段 partial_json
+        assert!(text.contains("\"type\":\"input_json_delta\""));
+        assert!(text.contains("\"partial_json\":\"{\\\"a\\\":\""));
+        assert!(text.contains("\"partial_json\":\"1}\""));
+        // 收尾
+        assert!(text.contains("event: content_block_stop"));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
+        assert!(text.contains("event: message_stop"));
+        // 不应意外开启 text block
+        assert!(!text.contains("\"type\":\"text\""));
+    }
+
+    #[test]
+    fn stream_text_plus_tool_call_indices_correct() {
+        // 文本 + tool_call：text 占 index 0，tool 从 index 1。
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        all.extend(t.push(openai_chunk("hello", None).as_bytes()));
+        all.extend(t.push(
+            openai_tool_chunk(0, Some("c1"), Some("f"), Some("{}"), None).as_bytes(),
+        ));
+        all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+
+        let events = parse_sse_events(&text);
+        // 找到两个 content_block_start 事件
+        let starts: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "expected 2 block_start, got:\n{text}");
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[0]["content_block"]["type"], "text");
+        assert_eq!(starts[1]["index"], 1);
+        assert_eq!(starts[1]["content_block"]["type"], "tool_use");
+
+        // 两个 block 都要 content_block_stop
+        let stops: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_stop")
+            .collect();
+        let stop_indices: Vec<u64> =
+            stops.iter().map(|s| s["index"].as_u64().unwrap()).collect();
+        assert!(stop_indices.contains(&0), "missing stop for text block");
+        assert!(stop_indices.contains(&1), "missing stop for tool block");
+    }
+
+    #[test]
+    fn stream_two_parallel_tool_calls() {
+        // 两个并行 tool_call（上游 index 0 / 1），分别对应 anthropic block 1 / 2。
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        all.extend(t.push(
+            openai_tool_chunk(0, Some("a"), Some("fa"), Some("{}"), None).as_bytes(),
+        ));
+        all.extend(t.push(
+            openai_tool_chunk(1, Some("b"), Some("fb"), Some("{}"), None).as_bytes(),
+        ));
+        all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+
+        let events = parse_sse_events(&text);
+        let starts: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "expected 2 tool block_start:\n{text}");
+        assert_eq!(starts[0]["index"], 1);
+        assert_eq!(starts[0]["content_block"]["id"], "a");
+        assert_eq!(starts[1]["index"], 2);
+        assert_eq!(starts[1]["content_block"]["id"], "b");
+
+        // block_stop 顺序按 index 升序
+        let stops: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_stop")
+            .map(|s| s["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(stops, vec![1, 2], "block_stop must be ascending: {stops:?}");
+    }
+
+    /// 解析 SSE 文本为事件 JSON 列表（丢弃 event: 前缀行）。
+    fn parse_sse_events(text: &str) -> Vec<Value> {
+        text.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|s| *s != "[DONE]")
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
     }
 }

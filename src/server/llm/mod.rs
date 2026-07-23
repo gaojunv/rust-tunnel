@@ -100,10 +100,35 @@ pub struct CreateApiKeyResponse {
 // ── Chat types (internal representation) ──────────────────────
 
 /// Unified chat message (both OpenAI and Anthropic map to this).
+///
+/// 序列化形式对齐 OpenAI Chat Completions 消息：
+/// - `content` 允许缺省（assistant 的 tool_calls 消息通常 content=null）；
+/// - `tool_calls` 承载 assistant 的工具调用请求；
+/// - `tool_call_id` / `name` 用于 `role="tool"` 的结果消息。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// 构造仅含文本的消息（保留旧调用点的便利）。
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
 }
 
 /// Unified chat completion request.
@@ -115,6 +140,12 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// OpenAI functions 格式的工具声明；透传给上游。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI `tool_choice`：`"auto"` / `"required"` / `{type:"function", function:{name}}`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

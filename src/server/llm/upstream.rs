@@ -42,19 +42,29 @@ pub async fn call_upstream(
 
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
-    let req_body = serde_json::json!({
+    // 构造上游请求体：可选字段仅在有值时挂上，避免部分上游对 null 敏感。
+    // messages 直接用带 skip_serializing_if 的 ChatMessage 序列化，工具字段
+    // （tool_calls / tool_call_id / name）能一并透传。
+    let mut req_body = serde_json::json!({
         "model": request.model,
-        "messages": request.messages.iter().map(|m| {
-            serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            })
-        }).collect::<Vec<_>>(),
+        "messages": request.messages,
         "stream": request.stream,
-        "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
     });
+    if let Some(v) = request.max_tokens {
+        req_body["max_tokens"] = v.into();
+    }
+    if let Some(v) = request.temperature {
+        req_body["temperature"] = v.into();
+    }
+    if let Some(v) = request.top_p {
+        req_body["top_p"] = v.into();
+    }
+    if let Some(tools) = &request.tools {
+        req_body["tools"] = serde_json::Value::Array(tools.clone());
+    }
+    if let Some(choice) = &request.tool_choice {
+        req_body["tool_choice"] = choice.clone();
+    }
 
     let req = client
         .post(&url)
@@ -178,6 +188,8 @@ mod tests {
                     max_tokens: None,
                     temperature: None,
                     top_p: None,
+                    tools: None,
+                    tool_choice: None,
                 },
             )
             .await;
