@@ -5,7 +5,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::auth::validate_api_key;
 use super::router::{list_available_models, resolve_model};
 use super::upstream::{call_upstream, error_response};
 use super::{ChatCompletionRequest, ChatMessage, LlmState};
@@ -55,10 +54,10 @@ pub async fn handle_list_models(
     }
 
     // Validate API key
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if validate_api_key(&state.llm, auth).await.is_none() {
+    if super::auth::authenticate(&state.llm, &headers)
+        .await
+        .is_none()
+    {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
@@ -92,10 +91,10 @@ pub async fn handle_chat_completions(
     }
 
     // Validate API key
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if validate_api_key(&state.llm, auth).await.is_none() {
+    if super::auth::authenticate(&state.llm, &headers)
+        .await
+        .is_none()
+    {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
@@ -281,6 +280,22 @@ mod tests {
         assert_eq!(data.len(), 1);
         assert_eq!(data[0]["id"], "fast-model");
         assert_eq!(data[0]["object"], "model");
+    }
+
+    #[tokio::test]
+    async fn test_x_api_key_header_authenticates() {
+        // Anthropic 原生认证方式：x-api-key 头应与 Authorization: Bearer 等效。
+        let (state, key, _tmp) = state_with_db().await;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_str(&key).unwrap());
+        let resp = handle_list_models(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+            }),
+            headers,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

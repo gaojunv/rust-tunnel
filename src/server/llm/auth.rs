@@ -1,14 +1,40 @@
+use axum::http::{header, HeaderMap};
+
 use crate::server::llm::LlmState;
 
-/// Validate a gateway API key from the Authorization header.
-/// Returns Some((key_id, key_name)) if valid, None if invalid/missing.
-pub async fn validate_api_key(
-    state: &LlmState,
-    auth_header: Option<&str>,
-) -> Option<(String, String)> {
-    let header = auth_header?;
-    let token = header.strip_prefix("Bearer ")?.trim();
+/// 从请求头提取网关 API Key：
+/// 优先 `Authorization: Bearer <key>`（OpenAI 风格），
+/// 其次 `x-api-key: <key>`（Anthropic 原生风格）。
+pub fn extract_api_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(t) = v.strip_prefix("Bearer ") {
+            let t = t.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
 
+/// 校验请求头中的网关 API Key（两种认证头都支持）。
+/// Returns Some((key_id, key_name)) if valid, None if invalid/missing.
+pub async fn authenticate(state: &LlmState, headers: &HeaderMap) -> Option<(String, String)> {
+    let token = extract_api_token(headers)?;
+    validate_api_key(state, &token).await
+}
+
+/// Validate a bare gateway API key token (e.g. "sk-...").
+/// Returns Some((key_id, key_name)) if valid, None if invalid.
+pub async fn validate_api_key(state: &LlmState, token: &str) -> Option<(String, String)> {
     if token.is_empty() {
         return None;
     }
@@ -87,5 +113,36 @@ mod tests {
         let (key2, hash2, _) = generate_api_key();
         assert_ne!(key1, key2);
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_extract_api_token_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer sk-abc".parse().unwrap());
+        assert_eq!(extract_api_token(&headers).as_deref(), Some("sk-abc"));
+    }
+
+    #[test]
+    fn test_extract_api_token_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "sk-xyz".parse().unwrap());
+        assert_eq!(extract_api_token(&headers).as_deref(), Some("sk-xyz"));
+    }
+
+    #[test]
+    fn test_extract_api_token_bearer_preferred_over_x_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer sk-abc".parse().unwrap());
+        headers.insert("x-api-key", "sk-xyz".parse().unwrap());
+        assert_eq!(extract_api_token(&headers).as_deref(), Some("sk-abc"));
+    }
+
+    #[test]
+    fn test_extract_api_token_missing_or_empty() {
+        assert_eq!(extract_api_token(&HeaderMap::new()), None);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer ".parse().unwrap());
+        assert_eq!(extract_api_token(&headers), None);
     }
 }

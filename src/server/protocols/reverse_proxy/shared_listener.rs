@@ -249,8 +249,8 @@ async fn handle_one_connection(
     }
 }
 
-/// LLM-aware fallback：仅当请求 Host 匹配已启用的 LLM Gateway 域名、且路径是
-/// LLM 对外端点时，才把请求交给 LLM handler；其余请求一律走普通反代处理。
+/// LLM-aware fallback：请求 Host 匹配已启用的 LLM Gateway 域名时，一律交给
+/// LLM handler（未识别的路径由网关返回 OpenAI 风格 404）；其余请求走普通反代。
 /// 这样 LLM 规则与普通 HTTP 规则可以共存于同一监听端口，互不抢占。
 async fn llm_aware_proxy_dispatch(
     State((source, upstream, proxy_state)): State<ProxyState>,
@@ -258,12 +258,6 @@ async fn llm_aware_proxy_dispatch(
 ) -> Response {
     // 在任何 await 之前同步提取判定所需的数据：
     // `&Request<Body>` 不是 Send（Body 不 Sync），不能跨 await 持有。
-    let is_llm_endpoint = matches!(
-        (req.method(), req.uri().path()),
-        (&Method::GET, "/v1/models")
-            | (&Method::POST, "/v1/chat/completions")
-            | (&Method::POST, "/v1/messages")
-    );
     // h2 的 authority 在 URI 中；h1 可能在 URI（absolute-form）或 Host 头。
     let host = req
         .uri()
@@ -277,10 +271,8 @@ async fn llm_aware_proxy_dispatch(
         })
         .unwrap_or_default();
 
-    if is_llm_endpoint {
-        if let Some(llm) = match_llm_gateway(&proxy_state, &host).await {
-            return llm_handle(llm, req).await;
-        }
+    if let Some(llm) = match_llm_gateway(&proxy_state, &host).await {
+        return llm_handle(llm, req).await;
     }
     handle_proxy_request_unified(State((source, upstream, proxy_state)), req).await
 }
@@ -310,10 +302,32 @@ async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) 
     use crate::server::llm::{anthropic_handler, openai_handler, upstream::error_response};
 
     let state = openai_handler::LlmHandlerState { llm };
-    let is_models = req.uri().path() == "/v1/models";
-    let is_messages = req.uri().path() == "/v1/messages";
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let is_models = method == Method::GET && path == "/v1/models";
+    let is_messages = method == Method::POST && path == "/v1/messages";
+    let is_chat_completions = method == Method::POST && path == "/v1/chat/completions";
     let (parts, body) = req.into_parts();
-    let headers = parts.headers;
+    let mut headers = parts.headers;
+
+    // HTTP/2 请求没有 Host 头，authority 由 hyper 映射到 URI；
+    // 下游 handler 的 validate_host 只认 Host 头，这里按 h1 语义补齐。
+    if !headers.contains_key(axum::http::header::HOST) {
+        if let Some(authority) = parts.uri.authority() {
+            if let Ok(value) = axum::http::HeaderValue::from_str(authority.as_str()) {
+                headers.insert(axum::http::header::HOST, value);
+            }
+        }
+    }
+
+    // 网关域名下未识别的路径/方法：返回 OpenAI 风格 404。
+    if !is_models && !is_messages && !is_chat_completions {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "Not found".into(),
+            "invalid_request_error",
+        );
+    }
 
     if is_models {
         return openai_handler::handle_list_models(State(state), headers).await;
@@ -329,6 +343,16 @@ async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) 
             )
         }
     };
+    // JSON 必须是 UTF-8（RFC 8259）。先显式校验，避免 serde_json 抛出
+    // 难以理解的 "invalid unicode code point"——常见于 Windows cmd/PowerShell
+    // 内联中文被按 GBK 编码发出的情况。
+    if std::str::from_utf8(&bytes).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "request body is not valid UTF-8; JSON must be UTF-8 encoded (inline non-ASCII text in terminals like Windows cmd is often not UTF-8 — use \\uXXXX escapes or a UTF-8 file)".into(),
+            "invalid_request_error",
+        );
+    }
     let json: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -793,8 +817,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        // 3) Non-/v1 paths on the LLM domain fall through to normal proxy
-        //    handling (no matching rule → proxy's own error, not LLM 401).
+        // 3) Requests to OTHER domains are never intercepted by the gateway,
+        //    even when the path resembles an LLM endpoint.
         let resp = client
             .post(format!("http://{listen_addr}/v1/models"))
             .header("Host", "a.local")
@@ -808,6 +832,113 @@ mod tests {
             state.rules.lock().await.clear();
         }
         state.reconcile_http_listener(&listen_addr).await.unwrap();
+    }
+
+    /// HTTP/2 请求把 authority 放在 `:authority`（hyper 映射到 URI），不带 Host 头。
+    /// 网关必须同样能识别 LLM 域名，而不是因为缺少 Host 头返回 404。
+    #[tokio::test]
+    async fn llm_gateway_accepts_h2_authority_without_host_header() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            domain: "llm.local".into(),
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // h2 风格请求：authority 在 URI 中，没有 Host 头。
+        // 未配置 API key，host 匹配成功时应返回 401 而不是 404。
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://llm.local/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Host 匹配 LLM 网关域名的请求全部交给网关处理；未识别的路径
+    /// 返回 OpenAI 风格的 404 JSON，而不是反代的 "No route for host"。
+    #[tokio::test]
+    async fn llm_gateway_unknown_path_returns_openai_404() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            domain: "llm.local".into(),
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://llm.local/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("\"error\""),
+            "expected OpenAI-style error JSON, got: {text}"
+        );
+    }
+
+    /// 非 UTF-8 的请求体（如 Windows cmd 内联中文被编成 GBK）应返回
+    /// 明确指出编码问题的 400，而不是 serde_json 的 "invalid unicode code point"。
+    #[tokio::test]
+    async fn llm_gateway_non_utf8_body_gets_clear_error() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            domain: "llm.local".into(),
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // "你好" 的 GBK 编码字节
+        let body = b"{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"\xc4\xe3\xba\xc3\"}]}";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://llm.local/v1/chat/completions")
+            .body(Body::from(&body[..]))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("UTF-8"),
+            "error message should mention UTF-8 encoding, got: {text}"
+        );
     }
 
     #[tokio::test]

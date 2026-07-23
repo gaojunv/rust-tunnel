@@ -1,10 +1,9 @@
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
 
-use super::auth::validate_api_key;
 use super::openai_handler::LlmHandlerState;
 use super::router::resolve_model;
 use super::upstream::{call_upstream, error_response};
@@ -107,10 +106,10 @@ pub async fn handle_messages(
     }
 
     // Validate API key
-    let auth = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if validate_api_key(&state.llm, auth).await.is_none() {
+    if super::auth::authenticate(&state.llm, &headers)
+        .await
+        .is_none()
+    {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
