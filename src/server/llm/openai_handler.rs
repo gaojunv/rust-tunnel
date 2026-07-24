@@ -317,7 +317,8 @@ mod tests {
         let state = LlmState::new(None, None);
         *state.gateway_config.write().await = Some(LlmGatewayConfig {
             enabled: true,
-            domain: String::new(),
+            openai_domain: None,
+            anthropic_domain: None,
             listen: "0.0.0.0:443".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -331,7 +332,8 @@ mod tests {
         let state = LlmState::new(None, None);
         *state.gateway_config.write().await = Some(LlmGatewayConfig {
             enabled: true,
-            domain: "llm.example.com".into(),
+            openai_domain: Some("llm.example.com".into()),
+            anthropic_domain: None,
             listen: "0.0.0.0:443".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -346,7 +348,8 @@ mod tests {
         let state = LlmState::new(None, None);
         *state.gateway_config.write().await = Some(LlmGatewayConfig {
             enabled: true,
-            domain: "llm.example.com".into(),
+            openai_domain: Some("llm.example.com".into()),
+            anthropic_domain: None,
             listen: "0.0.0.0:443".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -361,7 +364,8 @@ mod tests {
         let state = LlmState::new(None, None);
         *state.gateway_config.write().await = Some(LlmGatewayConfig {
             enabled: true,
-            domain: "llm.example.com".into(),
+            openai_domain: Some("llm.example.com".into()),
+            anthropic_domain: None,
             listen: "0.0.0.0:443".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -375,7 +379,8 @@ mod tests {
         let state = LlmState::new(None, None);
         *state.gateway_config.write().await = Some(LlmGatewayConfig {
             enabled: true,
-            domain: "llm.example.com".into(),
+            openai_domain: Some("llm.example.com".into()),
+            anthropic_domain: None,
             listen: "0.0.0.0:443".into(),
             tls_enabled: false,
             tls_acme: false,

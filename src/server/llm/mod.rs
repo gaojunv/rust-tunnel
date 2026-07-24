@@ -14,14 +14,79 @@ use crate::server::db::Database;
 
 // ── Configuration types ───────────────────────────────────────
 
+/// 协议入口标识 — 双域名隔离用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProtocol {
+    OpenAI,
+    Anthropic,
+}
+
 /// Gateway-level configuration (persisted as part of the LLM ProxyRule).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LlmGatewayConfig {
     pub enabled: bool,
-    pub domain: String,
+    /// OpenAI 协议入口域名；None/空 = 不开放 OpenAI 入口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_domain: Option<String>,
+    /// Anthropic 协议入口域名；None/空 = 不开放 Anthropic 入口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_domain: Option<String>,
     pub listen: String,
     pub tls_enabled: bool,
     pub tls_acme: bool,
+}
+
+impl LlmGatewayConfig {
+    /// 校验配置合法性，返回 None 表示合法。
+    /// enabled=true 时至少一个域名非空；两个域名都非空时必须不同。
+    pub fn validate(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let oa = self.openai_domain.as_deref().unwrap_or("");
+        let an = self.anthropic_domain.as_deref().unwrap_or("");
+        if oa.is_empty() && an.is_empty() {
+            return Some("at least one of openai_domain or anthropic_domain is required when enabled".into());
+        }
+        if !oa.is_empty() && !an.is_empty() && oa == an {
+            return Some("openai_domain and anthropic_domain cannot be the same".into());
+        }
+        None
+    }
+
+    /// 根据 host 匹配命中的协议入口；都不匹配返回 None。
+    pub fn match_protocol(&self, host: &str) -> Option<LlmProtocol> {
+        if !self.enabled || host.is_empty() {
+            return None;
+        }
+        if let Some(ref d) = self.openai_domain {
+            if !d.is_empty() && host == d.as_str() {
+                return Some(LlmProtocol::OpenAI);
+            }
+        }
+        if let Some(ref d) = self.anthropic_domain {
+            if !d.is_empty() && host == d.as_str() {
+                return Some(LlmProtocol::Anthropic);
+            }
+        }
+        None
+    }
+
+    /// 收集所有已配置的非空域名（用于 ProxyRule.domains 持久化）。
+    pub fn configured_domains(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(ref d) = self.openai_domain {
+            if !d.is_empty() {
+                v.push(d.clone());
+            }
+        }
+        if let Some(ref d) = self.anthropic_domain {
+            if !d.is_empty() {
+                v.push(d.clone());
+            }
+        }
+        v
+    }
 }
 
 /// Provider configuration (mirrors LlmProviderRecord for API responses).
