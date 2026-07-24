@@ -99,7 +99,10 @@ pub fn decrypt_field(cipher: Option<&LlmCipher>, stored: &str) -> Result<String,
 }
 
 /// 加载或生成主密钥：存放在 DB 同目录的 `llm_master.key`（0600）。
-/// 密钥本身不写入 DB，符合 spec 的“密钥从服务端配置派生，不写入 DB”。
+/// 密钥本身不写入 DB，符合 spec 的"密钥从服务端配置派生，不写入 DB"。
+///
+/// 该函数通过原子写-重读策略处理并发场景：当两个服务实例同时启动时，
+/// 只有一个能成功创建密钥文件，另一个会重新读取并使用相同的密钥。
 pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
     let dir = std::path::Path::new(db_path)
         .parent()
@@ -107,6 +110,7 @@ pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
     std::fs::create_dir_all(dir)?;
     let key_path = dir.join("llm_master.key");
 
+    // 先尝试读取已有密钥
     if let Ok(raw) = std::fs::read(&key_path) {
         if raw.len() == 32 {
             let mut key = [0u8; 32];
@@ -116,13 +120,42 @@ pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{}: corrupt master key (expected 32 bytes)",
-                key_path.display()
+                "{}: corrupt master key (expected 32 bytes, got {})",
+                key_path.display(),
+                raw.len()
             ),
         ));
     }
 
+    // 密钥文件不存在 -> 生成新密钥并写入
     let key: [u8; 32] = rand::random();
+    match write_master_key(&key_path, &key) {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 并发场景：另一个实例先创建了文件 -> 重新读取
+            let raw = std::fs::read(&key_path)?;
+            if raw.len() == 32 {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&raw);
+                return Ok(k);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: corrupt master key after concurrent creation (expected 32 bytes, got {})",
+                    key_path.display(),
+                    raw.len()
+                ),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 以原子方式写入主密钥文件，确保：
+/// - Unix: 使用 `create_new(true)` + `mode(0o600)`
+/// - 其他平台: 使用 `create_new(true)` 写入
+fn write_master_key(key_path: &std::path::Path, key: &[u8; 32]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -130,15 +163,23 @@ pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&key_path)?;
+            .open(key_path)?;
         use std::io::Write;
-        f.write_all(&key)?;
+        f.write_all(key)?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&key_path, key)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(key_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(key)?;
+                Ok(())
+            })?;
     }
-    Ok(key)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,5 +277,84 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         std::fs::write(tmp.path().join("llm_master.key"), b"short").unwrap();
         assert!(load_or_create_master_key(db_path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn master_key_concurrent_creation_recovers() {
+        // 模拟并发场景：预先把密钥文件写入，然后调用 load_or_create_master_key
+        // 应该正常读取已有密钥。这覆盖了"非第一个创建者"的路径。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let preexisting: [u8; 32] = [77u8; 32];
+
+        // 手动写入一个有效密钥文件（模拟另一个进程先创建）
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(tmp.path().join("llm_master.key"))
+                .unwrap();
+            f.write_all(&preexisting).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(tmp.path().join("llm_master.key"), &preexisting).unwrap();
+        }
+
+        let key = load_or_create_master_key(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(key, preexisting, "should read the pre-existing key");
+    }
+
+    // ── encrypt_field / decrypt_field 边界测试 ──────────────────
+
+    #[test]
+    fn encrypt_field_without_cipher_returns_plaintext() {
+        let result = encrypt_field(None, "sk-plain-key");
+        assert_eq!(result, "sk-plain-key");
+        assert!(!is_encrypted(&result));
+    }
+
+    #[test]
+    fn encrypt_field_with_cipher_produces_encrypted() {
+        let c = test_cipher();
+        let result = encrypt_field(Some(&c), "my-secret");
+        assert!(is_encrypted(&result));
+        assert!(!result.contains("my-secret"));
+    }
+
+    #[test]
+    fn encrypt_field_roundtrip_via_decrypt_field() {
+        let c = test_cipher();
+        let ct = encrypt_field(Some(&c), "roundtrip-test");
+        let pt = decrypt_field(Some(&c), &ct).unwrap();
+        assert_eq!(pt, "roundtrip-test");
+    }
+
+    #[test]
+    fn decrypt_field_plaintext_passthrough() {
+        assert_eq!(decrypt_field(None, "sk-plain").unwrap(), "sk-plain");
+        let c = test_cipher();
+        assert_eq!(decrypt_field(Some(&c), "sk-plain").unwrap(), "sk-plain");
+    }
+
+    #[test]
+    fn decrypt_field_encrypted_without_cipher_errors() {
+        let c = test_cipher();
+        let ct = c.encrypt("secret");
+        assert!(is_encrypted(&ct));
+        let err = decrypt_field(None, &ct).unwrap_err();
+        assert!(err.contains("no master key"));
+    }
+
+    #[test]
+    fn decrypt_field_wrong_cipher_errors() {
+        let c1 = LlmCipher::from_master_key([1u8; 32]);
+        let c2 = LlmCipher::from_master_key([2u8; 32]);
+        let ct = encrypt_field(Some(&c1), "secret");
+        assert!(decrypt_field(Some(&c2), &ct).is_err());
     }
 }

@@ -19,16 +19,74 @@ static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 
 /// Strip potential secrets (API keys, tokens) from upstream error messages.
 fn sanitize_error_message(body: &str) -> String {
-    // Truncate long error messages to 500 chars max
-    let truncated = if body.len() > 500 {
-        format!("{}...", &body[..500])
+    // Truncate at a valid UTF-8 character boundary (max 500 chars).
+    let end = if body.len() <= 500 {
+        body.len()
+    } else {
+        // Find the last complete char boundary at or before byte 500.
+        // floor_char_boundary is stabilized in Rust 1.79+; we implement manually
+        // to stay compatible.
+        let mut boundary = 500;
+        while boundary > 0 && !body.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        boundary
+    };
+
+    let truncated = if end < body.len() {
+        format!("{}...", &body[..end])
     } else {
         body.to_string()
     };
-    // Redact common API key patterns
-    truncated
-        .replace("sk-", "sk-***")
-        .replace("Bearer ", "Bearer ***")
+
+    // Redact patterns (best-effort — not a security guarantee):
+    // - `sk-<hex/alphanumeric>` → `sk-***`
+    // - `Bearer <token>` (case-insensitive prefix) → `Bearer ***`
+    //
+    // We walk bytes and do manual substring matching to avoid pulling in `regex`.
+    let bytes = truncated.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut pos = 0;
+
+    while pos < n {
+        // ── Check for `Bearer ` / `bearer ` ──
+        let remaining = &truncated[pos..];
+        if remaining.len() > 7 {
+            let lower = remaining[..7].to_ascii_lowercase();
+            if lower == "bearer " {
+                // Skip the "Bearer " / "bearer " prefix.
+                pos += 7;
+                // Skip the token.
+                while pos < n && !bytes[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+                out.push_str("Bearer ***");
+                continue;
+            }
+        }
+
+        // ── Check for `sk-` followed by alphanumeric ──
+        if pos + 3 <= n && bytes[pos] == b's' && bytes[pos + 1] == b'k' && bytes[pos + 2] == b'-'
+        {
+            let mut key_end = pos + 3;
+            while key_end < n && bytes[key_end].is_ascii_alphanumeric() && key_end - pos <= 67 {
+                key_end += 1;
+            }
+            if key_end > pos + 3 {
+                out.push_str("sk-***");
+                pos = key_end;
+                continue;
+            }
+        }
+
+        // ── Regular character ──
+        let ch = truncated[pos..].chars().next().unwrap();
+        out.push(ch);
+        pos += ch.len_utf8();
+    }
+
+    out
 }
 
 /// Call an upstream LLM provider with OpenAI-compatible format.
@@ -92,37 +150,45 @@ pub async fn call_upstream(
     }
 
     if request.stream {
-        // SSE streaming relay: forward the upstream SSE stream as-is.
-        let byte_stream = resp.bytes_stream().map(|result| {
-            result
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        });
-
-        let body = Body::from_stream(byte_stream);
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive")
-            .body(body)
-            .unwrap())
+        relay_upstream_stream(resp).await
     } else {
-        // Non-streaming: return upstream response body as-is.
-        let body_bytes = resp.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to read upstream response: {}", e),
-            )
-        })?;
-
-        let body = Body::from(body_bytes.to_vec());
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .unwrap())
+        relay_upstream_body(resp).await
     }
+}
+
+/// Relay a streaming (SSE) upstream response to the client.
+async fn relay_upstream_stream(resp: reqwest::Response) -> Result<Response, (StatusCode, String)> {
+    let byte_stream = resp.bytes_stream().map(|result| {
+        result
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    });
+
+    let body = Body::from_stream(byte_stream);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap())
+}
+
+/// Relay a non-streaming upstream response body to the client.
+async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (StatusCode, String)> {
+    let body_bytes = resp.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read upstream response: {}", e),
+        )
+    })?;
+
+    let body = Body::from(body_bytes.to_vec());
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .unwrap())
 }
 
 /// 透传原始请求到上游 Anthropic 端点，不做格式转换。
@@ -191,34 +257,9 @@ pub async fn call_upstream_raw(
     }
 
     if is_stream {
-        let byte_stream = resp.bytes_stream().map(|result| {
-            result
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| std::io::Error::other(e.to_string()))
-        });
-
-        let body = Body::from_stream(byte_stream);
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive")
-            .body(body)
-            .unwrap())
+        relay_upstream_stream(resp).await
     } else {
-        let body_bytes = resp.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to read upstream response: {}", e),
-            )
-        })?;
-
-        let body = Body::from(body_bytes.to_vec());
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .unwrap())
+        relay_upstream_body(resp).await
     }
 }
 
@@ -310,5 +351,117 @@ mod tests {
         let msg = "Upstream connection failed: connection refused";
         // Generic error messages should not contain sk- patterns
         assert!(!msg.contains("sk-"));
+    }
+
+    // ── sanitize_error_message tests ────────────────────────────
+
+    #[test]
+    fn sanitize_short_message_passes_through() {
+        let input = "A simple error message";
+        let result = sanitize_error_message(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_truncates_long_message() {
+        let long = "x".repeat(1000);
+        let result = sanitize_error_message(&long);
+        assert!(result.len() <= 510); // 500 chars + "..." + some overhead
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn sanitize_truncation_is_utf8_safe() {
+        // Build a string where byte 500 falls inside a multi-byte character
+        let mut s = String::from("a".repeat(499));
+        s.push('\u{4E2D}'); // 3-byte char at position 499
+        s.push_str("end");
+        let result = sanitize_error_message(&s);
+        // Must not panic and must produce valid UTF-8
+        assert!(result.ends_with("..."));
+        // The 3-byte char at position 499 should either be fully included or excluded
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn sanitize_redacts_sk_key() {
+        let input = "Error: invalid api key sk-abc123def456 for request";
+        let result = sanitize_error_message(input);
+        assert!(!result.contains("sk-abc123def456"));
+        assert!(result.contains("sk-***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_bearer_token() {
+        let input = "Unauthorized: Bearer eyJhbGciOiJIUzI1NiJ9.token.payload";
+        let result = sanitize_error_message(input);
+        assert!(!result.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(result.contains("Bearer ***"));
+    }
+
+    #[test]
+    fn sanitize_redacts_lowercase_bearer() {
+        let input = "unauthorized: bearer abcdefgh12345678";
+        let result = sanitize_error_message(input);
+        assert!(!result.contains("abcdefgh12345678"));
+        assert!(result.contains("Bearer ***"));
+    }
+
+    #[test]
+    fn sanitize_handles_multiple_keys() {
+        let input =
+            "Key sk-aaa111bbb222 and Bearer token123456789 for endpoint";
+        let result = sanitize_error_message(input);
+        assert!(!result.contains("sk-aaa111bbb222"));
+        assert!(!result.contains("token123456789"));
+        assert_eq!(
+            result.matches("sk-***").count(),
+            1,
+            "should have one sk-***"
+        );
+        assert_eq!(
+            result.matches("Bearer ***").count(),
+            1,
+            "should have one Bearer ***"
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_non_secret_content() {
+        let input = "HTTP 502 Bad Gateway: upstream server returned error";
+        let result = sanitize_error_message(input);
+        assert!(result.contains("Bad Gateway"));
+        assert!(result.contains("upstream server"));
+    }
+
+    #[test]
+    fn sanitize_does_not_false_positive_on_unrelated_text() {
+        // Text without any "sk-" or "Bearer" patterns should pass through unchanged.
+        let input = "HTTP 502: task description processing failed";
+        let result = sanitize_error_message(input);
+        assert!(result.contains("task description"));
+        assert!(result.contains("processing failed"));
+    }
+
+    #[test]
+    fn sanitize_sk_without_alphanumeric_suffix_not_redacted() {
+        // "sk-" without alphanumeric followers should not be redacted
+        let input = "prefix sk- suffix";
+        let result = sanitize_error_message(input);
+        // "sk-" followed by a space (not alphanumeric) => not redacted
+        assert!(result.contains("sk-"));
+    }
+
+    #[test]
+    fn sanitize_empty_string_ok() {
+        assert_eq!(sanitize_error_message(""), "");
+    }
+
+    #[test]
+    fn sanitize_exactly_500_chars_not_truncated() {
+        let s = "x".repeat(500);
+        let result = sanitize_error_message(&s);
+        assert!(!result.ends_with("..."));
+        assert_eq!(result.len(), 500);
     }
 }
