@@ -278,6 +278,26 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
         .unwrap()
 }
 
+/// Build an Anthropic-format error response for Anthropic-protocol domains.
+pub fn error_response_anthropic(
+    status: StatusCode,
+    message: String,
+    error_type: &str,
+) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
 /// Build a 404 "model not found" response that carries the available model list,
 /// per spec: 未匹配 → 返回 404，body 中包含可用模型列表。
 pub fn model_not_found_response(message: String, available_models: Vec<String>) -> Response {
@@ -307,6 +327,24 @@ mod tests {
             "authentication_error",
         );
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_error_response_anthropic_format() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let resp = error_response_anthropic(
+            StatusCode::NOT_FOUND,
+            "Not found".into(),
+            "invalid_request_error",
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = rt.block_on(async {
+            axum::body::to_bytes(resp.into_body(), 1024).await.unwrap()
+        });
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error"); // Anthropic top-level type
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "Not found");
     }
 
     #[test]
