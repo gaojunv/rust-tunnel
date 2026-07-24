@@ -38,30 +38,55 @@ pub async fn update_gateway_config(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let enabled = body["enabled"].as_bool().unwrap_or(false);
-    let domain = body["domain"].as_str().unwrap_or("").to_string();
+
+    // 字段名改为 openai_domain / anthropic_domain；兼容旧 domain 字段
+    let openai_domain = body["openai_domain"]
+        .as_str()
+        .or_else(|| body["domain"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let openai_domain = if openai_domain.is_empty() {
+        None
+    } else {
+        Some(openai_domain)
+    };
+    let anthropic_domain = body["anthropic_domain"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let anthropic_domain = if anthropic_domain.is_empty() {
+        None
+    } else {
+        Some(anthropic_domain)
+    };
+
     let listen = body["listen"].as_str().unwrap_or("0.0.0.0:443").to_string();
     let tls_enabled = body["tls_enabled"].as_bool().unwrap_or(false);
     let tls_acme = body["tls_acme"].as_bool().unwrap_or(false);
 
-    if enabled && domain.is_empty() {
-        return (StatusCode::BAD_REQUEST, "domain is required when enabled").into_response();
-    }
-
     let config = LlmGatewayConfig {
         enabled,
-        openai_domain: Some(domain.clone()),
-        anthropic_domain: None,
+        openai_domain: openai_domain.clone(),
+        anthropic_domain: anthropic_domain.clone(),
         listen: listen.clone(),
         tls_enabled,
         tls_acme,
     };
+
+    // 校验
+    if let Some(err) = config.validate() {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+
+    // 收集所有配置的域名
+    let domains = config.configured_domains();
 
     let rule_id = "__llm_gateway__".to_string();
     let tls = if tls_enabled {
         Some(crate::server::reverse_proxy::ProxyTlsConfig {
             enabled: true,
             acme: tls_acme,
-            domain: Some(domain.clone()),
+            domain: openai_domain.clone(),
         })
     } else {
         None
@@ -72,7 +97,7 @@ pub async fn update_gateway_config(
         name: "LLM Gateway".into(),
         rule_type: crate::server::reverse_proxy::RuleType::Llm,
         listen: listen.clone(),
-        domains: vec![domain.clone()],
+        domains,
         routes: vec![],
         tls,
         enabled,

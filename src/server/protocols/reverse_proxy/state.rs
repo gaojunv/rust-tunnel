@@ -91,10 +91,19 @@ impl ReverseProxyState {
         // Derive gateway config from the ProxyRule
         if let Some(rule) = gateway_rule {
             let tls = rule.tls.as_ref();
+            let (openai_domain, anthropic_domain) = if rule.domains.len() >= 2 {
+                (
+                    Some(rule.domains[0].clone()).filter(|d| !d.is_empty()),
+                    Some(rule.domains[1].clone()).filter(|d| !d.is_empty()),
+                )
+            } else {
+                let old = rule.domains.first().cloned().filter(|d| !d.is_empty());
+                (old, None)
+            };
             let config = LlmGatewayConfig {
                 enabled: rule.enabled,
-                openai_domain: rule.domains.first().cloned(),
-                anthropic_domain: None,
+                openai_domain,
+                anthropic_domain,
                 listen: rule.listen.clone(),
                 tls_enabled: tls.is_some_and(|t| t.enabled),
                 tls_acme: tls.is_some_and(|t| t.acme),

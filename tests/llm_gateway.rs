@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const GW_DOMAIN: &str = "llm.test";
+const ANTHROPIC_DOMAIN: &str = "anthropic.test";
 const UPSTREAM_KEY: &str = "sk-upstream-secret";
 
 // ── Mock 上游 LLM 提供商 ────────────────────────────────────────
@@ -165,21 +166,27 @@ struct GatewayEnv {
 
 /// 完整搭建：gateway 配置 + provider + model(alias=fast-model) + 网关 API key，
 /// 并等待 LLM 监听器就绪。
-async fn setup_gateway(harness: &TestHarness, api: &common::api_client::ApiClient) -> GatewayEnv {
+/// `anthropic_domain` 为 None 时不配置 Anthropic 入口。
+async fn setup_gateway(
+    harness: &TestHarness,
+    api: &common::api_client::ApiClient,
+    anthropic_domain: Option<&str>,
+) -> GatewayEnv {
     let gateway_port = harness.exposed_ports[0];
     let upstream = MockUpstream::start().await;
 
     // Gateway 配置（内部创建 type=llm 的 ProxyRule 并 reconcile）
+    let mut gw_body = json!({
+        "enabled": true,
+        "openai_domain": GW_DOMAIN,
+        "listen": format!("127.0.0.1:{gateway_port}"),
+        "tls_enabled": false,
+    });
+    if let Some(ad) = anthropic_domain {
+        gw_body["anthropic_domain"] = json!(ad);
+    }
     let (status, body) = api
-        .put_json(
-            "/api/llm/gateway",
-            json!({
-                "enabled": true,
-                "domain": GW_DOMAIN,
-                "listen": format!("127.0.0.1:{gateway_port}"),
-                "tls_enabled": false,
-            }),
-        )
+        .put_json("/api/llm/gateway", gw_body)
         .await;
     assert!(status.is_success(), "PUT gateway failed: {status} {body}");
 
@@ -281,7 +288,7 @@ async fn llm_mgmt_crud_flow() {
                 "/api/llm/gateway",
                 json!({
                     "enabled": true,
-                    "domain": GW_DOMAIN,
+                    "openai_domain": GW_DOMAIN,
                     "listen": format!("127.0.0.1:{gw_port}"),
                     "tls_enabled": false,
                 }),
@@ -292,7 +299,7 @@ async fn llm_mgmt_crud_flow() {
         let (status, body) = api.get_json("/api/llm/gateway").await;
         assert!(status.is_success());
         assert_eq!(body["enabled"], true);
-        assert_eq!(body["domain"], GW_DOMAIN);
+        assert_eq!(body["openai_domain"], GW_DOMAIN);
 
         // enabled 时必须给域名
         let (status, _) = api
@@ -483,7 +490,7 @@ async fn llm_chat_completions_e2e() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         // 别名路由
         let resp = gateway_client()
@@ -552,7 +559,7 @@ async fn llm_gateway_auth_enforcement() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         // 无 Authorization → 401 OpenAI 格式错误
         let resp = gateway_client()
@@ -624,7 +631,7 @@ async fn llm_model_not_found_lists_available() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         let resp = gateway_client()
             .post(format!("http://127.0.0.1:{}/v1/chat/completions", env.gateway_port))
@@ -659,7 +666,7 @@ async fn llm_list_models_endpoint() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         let resp = gateway_client()
             .get(format!("http://127.0.0.1:{}/v1/models", env.gateway_port))
@@ -709,11 +716,11 @@ async fn llm_anthropic_messages_non_stream() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, Some(ANTHROPIC_DOMAIN)).await;
 
         let resp = gateway_client()
             .post(format!("http://127.0.0.1:{}/v1/messages", env.gateway_port))
-            .header("Host", GW_DOMAIN)
+            .header("Host", ANTHROPIC_DOMAIN)
             .header("anthropic-version", "2023-06-01")
             .bearer_auth(&env.gateway_key)
             .json(&json!({
@@ -761,11 +768,11 @@ async fn llm_anthropic_messages_streaming() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, Some(ANTHROPIC_DOMAIN)).await;
 
         let resp = gateway_client()
             .post(format!("http://127.0.0.1:{}/v1/messages", env.gateway_port))
-            .header("Host", GW_DOMAIN)
+            .header("Host", ANTHROPIC_DOMAIN)
             .header("anthropic-version", "2023-06-01")
             .bearer_auth(&env.gateway_key)
             .json(&json!({
@@ -835,7 +842,7 @@ async fn llm_openai_streaming_passthrough() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         let resp = gateway_client()
             .post(format!(
@@ -885,7 +892,7 @@ async fn llm_gateway_coexists_with_http_rule() {
         })
         .await;
         let api = harness.api_client();
-        let env = setup_gateway(&harness, &api).await;
+        let env = setup_gateway(&harness, &api, None).await;
 
         // 普通 HTTP 后端
         let web_backend = MockUpstream::start().await;
@@ -978,7 +985,7 @@ async fn llm_gateway_config_restored_from_rule() {
                 "/api/llm/gateway",
                 json!({
                     "enabled": true,
-                    "domain": GW_DOMAIN,
+                    "openai_domain": GW_DOMAIN,
                     "listen": format!("127.0.0.1:{gw_port}"),
                     "tls_enabled": false,
                 }),
@@ -1013,7 +1020,7 @@ async fn llm_gateway_config_restored_from_rule() {
         let (status, body) = api.get_json("/api/llm/gateway").await;
         assert!(status.is_success());
         assert_eq!(body["enabled"], true);
-        assert_eq!(body["domain"], GW_DOMAIN);
+        assert_eq!(body["openai_domain"], GW_DOMAIN);
         assert_eq!(body["listen"], format!("127.0.0.1:{gw_port}"));
     })
     .await
