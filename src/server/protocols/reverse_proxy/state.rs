@@ -93,7 +93,8 @@ impl ReverseProxyState {
             let tls = rule.tls.as_ref();
             let config = LlmGatewayConfig {
                 enabled: rule.enabled,
-                domain: rule.domains.first().cloned().unwrap_or_default(),
+                openai_domain: rule.domains.first().cloned(),
+                anthropic_domain: None,
                 listen: rule.listen.clone(),
                 tls_enabled: tls.is_some_and(|t| t.enabled),
                 tls_acme: tls.is_some_and(|t| t.acme),
@@ -102,7 +103,8 @@ impl ReverseProxyState {
         } else {
             *llm.gateway_config.write().await = Some(LlmGatewayConfig {
                 enabled: false,
-                domain: String::new(),
+                openai_domain: None,
+                anthropic_domain: None,
                 listen: "0.0.0.0:443".to_string(),
                 tls_enabled: false,
                 tls_acme: false,
@@ -567,7 +569,7 @@ mod tests {
         let cfg = llm.gateway_config.read().await;
         let cfg = cfg.as_ref().expect("gateway config should be loaded");
         assert!(cfg.enabled);
-        assert_eq!(cfg.domain, "llm.example.com");
+        assert_eq!(cfg.openai_domain.as_deref(), Some("llm.example.com"));
         assert_eq!(cfg.listen, "0.0.0.0:443");
         assert!(cfg.tls_enabled);
         assert!(cfg.tls_acme);

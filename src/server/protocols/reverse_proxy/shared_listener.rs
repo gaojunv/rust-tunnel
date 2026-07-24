@@ -271,35 +271,33 @@ async fn llm_aware_proxy_dispatch(
         })
         .unwrap_or_default();
 
-    if let Some(llm) = match_llm_gateway(&proxy_state, &host).await {
-        return llm_handle(llm, req).await;
+    if let Some((llm, protocol)) = match_llm_gateway(&proxy_state, &host).await {
+        return llm_handle(llm, protocol, req).await;
     }
     handle_proxy_request_unified(State((source, upstream, proxy_state)), req).await
 }
 
-/// 判断指向 `host` 的请求是否应由 LLM Gateway 处理；是则返回对应的 `LlmState`。
+/// 判断指向 `host` 的请求是否应由 LLM Gateway 处理；是则返回对应的 `LlmState` 和命中的协议。
 async fn match_llm_gateway(
     proxy_state: &Arc<ReverseProxyState>,
     host: &str,
-) -> Option<Arc<crate::server::llm::LlmState>> {
+) -> Option<(Arc<crate::server::llm::LlmState>, crate::server::llm::LlmProtocol)> {
     let llm_guard = proxy_state.llm_state.read().await;
     let llm = llm_guard.as_ref()?;
     let cfg = llm.gateway_config.read().await;
     let cfg = cfg.as_ref()?;
-    if !cfg.enabled || cfg.domain.is_empty() {
-        return None;
-    }
-
-    if host == cfg.domain {
-        Some(llm.clone())
-    } else {
-        None
-    }
+    cfg.match_protocol(host).map(|proto| (llm.clone(), proto))
 }
 
 /// 把已匹配 LLM Gateway 的请求分发给对应的 handler。
-async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) -> Response {
-    use crate::server::llm::{anthropic_handler, openai_handler, upstream::error_response};
+/// 按命中的协议入口严格限制接受的路径，跨协议路径返回协议各自的 404 风格。
+async fn llm_handle(
+    llm: Arc<crate::server::llm::LlmState>,
+    protocol: crate::server::llm::LlmProtocol,
+    req: Request<Body>,
+) -> Response {
+    use crate::server::llm::LlmProtocol;
+    use crate::server::llm::{anthropic_handler, openai_handler, upstream};
 
     let state = openai_handler::LlmHandlerState { llm };
     let method = req.method().clone();
@@ -320,13 +318,19 @@ async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) 
         }
     }
 
-    // 网关域名下未识别的路径/方法：返回 OpenAI 风格 404。
-    if !is_models && !is_messages && !is_chat_completions {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "Not found".into(),
-            "invalid_request_error",
-        );
+    // 严格协议隔离：按入口协议判定允许的路径
+    let allowed = match protocol {
+        LlmProtocol::OpenAI => is_models || is_chat_completions,
+        LlmProtocol::Anthropic => is_models || is_messages,
+    };
+
+    if !allowed {
+        let etype = "invalid_request_error";
+        let msg = "Not found".to_string();
+        return match protocol {
+            LlmProtocol::OpenAI => upstream::error_response(StatusCode::NOT_FOUND, msg, etype),
+            LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::NOT_FOUND, msg, etype),
+        };
     }
 
     if is_models {
@@ -336,31 +340,28 @@ async fn llm_handle(llm: Arc<crate::server::llm::LlmState>, req: Request<Body>) 
     let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {}", e),
-                "invalid_request_error",
-            )
+            let msg = format!("failed to read request body: {}", e);
+            return match protocol {
+                LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+            };
         }
     };
-    // JSON 必须是 UTF-8（RFC 8259）。先显式校验，避免 serde_json 抛出
-    // 难以理解的 "invalid unicode code point"——常见于 Windows cmd/PowerShell
-    // 内联中文被按 GBK 编码发出的情况。
     if std::str::from_utf8(&bytes).is_err() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "request body is not valid UTF-8; JSON must be UTF-8 encoded (inline non-ASCII text in terminals like Windows cmd is often not UTF-8 — use \\uXXXX escapes or a UTF-8 file)".into(),
-            "invalid_request_error",
-        );
+        let msg = "request body is not valid UTF-8; JSON must be UTF-8 encoded (inline non-ASCII text in terminals like Windows cmd is often not UTF-8 — use \\uXXXX escapes or a UTF-8 file)".into();
+        return match protocol {
+            LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+            LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+        };
     }
     let json: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!("invalid JSON body: {}", e),
-                "invalid_request_error",
-            )
+            let msg = format!("invalid JSON body: {}", e);
+            return match protocol {
+                LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+            };
         }
     };
 
@@ -780,7 +781,8 @@ mod tests {
         let llm = crate::server::llm::LlmState::new(None, None);
         *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
             enabled: true,
-            domain: "llm.local".into(),
+            openai_domain: Some("llm.local".into()),
+            anthropic_domain: None,
             listen: listen_addr.clone(),
             tls_enabled: false,
             tls_acme: false,
@@ -842,7 +844,8 @@ mod tests {
         let llm = crate::server::llm::LlmState::new(None, None);
         *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
             enabled: true,
-            domain: "llm.local".into(),
+            openai_domain: Some("llm.local".into()),
+            anthropic_domain: None,
             listen: "127.0.0.1:1".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -873,7 +876,8 @@ mod tests {
         let llm = crate::server::llm::LlmState::new(None, None);
         *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
             enabled: true,
-            domain: "llm.local".into(),
+            openai_domain: Some("llm.local".into()),
+            anthropic_domain: None,
             listen: "127.0.0.1:1".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -910,7 +914,8 @@ mod tests {
         let llm = crate::server::llm::LlmState::new(None, None);
         *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
             enabled: true,
-            domain: "llm.local".into(),
+            openai_domain: Some("llm.local".into()),
+            anthropic_domain: None,
             listen: "127.0.0.1:1".into(),
             tls_enabled: false,
             tls_acme: false,
@@ -1045,6 +1050,158 @@ mod tests {
             .lock()
             .await
             .contains_key(&listen_addr));
+    }
+
+    /// openai 域名不收 Anthropic /v1/messages → 返回 OpenAI 风格 404。
+    #[tokio::test]
+    async fn llm_openai_domain_rejects_anthropic_messages() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("openai.local".into()),
+            anthropic_domain: None,
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://openai.local/v1/messages")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // OpenAI 风格 404：顶层有 error 字段
+        assert!(
+            v.get("error").is_some(),
+            "expected OpenAI error format, got: {v}"
+        );
+    }
+
+    /// anthropic 域名不收 OpenAI /v1/chat/completions → 返回 Anthropic 风格 404。
+    #[tokio::test]
+    async fn llm_anthropic_domain_rejects_openai_chat_completions() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            openai_domain: None,
+            anthropic_domain: Some("anthropic.local".into()),
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://anthropic.local/v1/chat/completions")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Anthropic 风格 404：顶层有 type: "error"
+        assert_eq!(
+            v["type"], "error",
+            "expected Anthropic error format, got: {v}"
+        );
+    }
+
+    /// 两个域名都配置时各走各的协议。
+    #[tokio::test]
+    async fn llm_dual_domain_both_routes_correctly() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: Some("an.local".into()),
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // OpenAI 域名 → /v1/chat/completions 接受（无 API key → 401）
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://oa.local/v1/chat/completions")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((
+            source.clone(),
+            upstream.clone(),
+            Arc::new(state.clone()),
+        )), req)
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Anthropic 域名 → /v1/messages 接受（无 API key → 401）
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://an.local/v1/messages")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req)
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 配置不存在的域名不命中 LLM gateway。
+    #[tokio::test]
+    async fn llm_unconfigured_domain_not_matched() {
+        let state = ReverseProxyState::new();
+        let llm = crate::server::llm::LlmState::new(None, None);
+        *llm.gateway_config.write().await = Some(crate::server::llm::LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: None,
+            listen: "127.0.0.1:1".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+        *state.llm_state.write().await = Some(Arc::new(llm));
+
+        let source = RouteSource(Arc::new(ArcSwap::from_pointee(RouteTable::from_rules(
+            vec![],
+        ))));
+        let upstream = Arc::new(UpstreamClient::new());
+
+        // 未配 anthropic_domain → "/v1/messages" 也不会命中 LLM，走反代
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://an.local/v1/messages")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
+        // 普通反代没有路由 → No route for host
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
 

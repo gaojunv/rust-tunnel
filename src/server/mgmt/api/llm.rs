@@ -49,7 +49,8 @@ pub async fn update_gateway_config(
 
     let config = LlmGatewayConfig {
         enabled,
-        domain: domain.clone(),
+        openai_domain: Some(domain.clone()),
+        anthropic_domain: None,
         listen: listen.clone(),
         tls_enabled,
         tls_acme,
