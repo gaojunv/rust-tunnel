@@ -278,7 +278,8 @@ export type ProviderType = 'deepseek' | 'volcengine' | 'kimi' | 'mimo';
 
 export interface LlmGatewayConfig {
   enabled: boolean;
-  domain: string;
+  openai_domain: string;
+  anthropic_domain: string;
   listen: string;
   tls_enabled: boolean;
   tls_acme: boolean;

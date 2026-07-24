@@ -10,7 +10,8 @@ export default function GatewayTab() {
   const { data: config, isLoading } = useLlmGatewayConfig();
   const updateMutation = useUpdateLlmGatewayConfig();
   const [enabled, setEnabled] = useState(false);
-  const [domain, setDomain] = useState('');
+  const [openaiDomain, setOpenaiDomain] = useState('');
+  const [anthropicDomain, setAnthropicDomain] = useState('');
   const [listen, setListen] = useState('0.0.0.0:443');
   const [tlsEnabled, setTlsEnabled] = useState(true);
   const [tlsAcme, setTlsAcme] = useState(false);
@@ -18,7 +19,8 @@ export default function GatewayTab() {
   useEffect(() => {
     if (config) {
       setEnabled(config.enabled);
-      setDomain(config.domain || '');
+      setOpenaiDomain(config.openai_domain || '');
+      setAnthropicDomain(config.anthropic_domain || '');
       setListen(config.listen || '0.0.0.0:443');
       setTlsEnabled(config.tls_enabled ?? true);
       setTlsAcme(config.tls_acme ?? false);
@@ -36,8 +38,28 @@ export default function GatewayTab() {
           <Switch checked={enabled} onCheckedChange={setEnabled} />
         </div>
         <div className="space-y-2">
-          <Label>Domain</Label>
-          <Input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="llm.example.com" disabled={!enabled} />
+          <Label>OpenAI Domain</Label>
+          <Input
+            value={openaiDomain}
+            onChange={(e) => setOpenaiDomain(e.target.value)}
+            placeholder="openai.example.com"
+            disabled={!enabled}
+          />
+          <p className="text-xs text-muted-foreground">
+            Accepts /v1/chat/completions, /v1/models
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label>Anthropic Domain</Label>
+          <Input
+            value={anthropicDomain}
+            onChange={(e) => setAnthropicDomain(e.target.value)}
+            placeholder="anthropic.example.com"
+            disabled={!enabled}
+          />
+          <p className="text-xs text-muted-foreground">
+            Accepts /v1/messages
+          </p>
         </div>
         <div className="space-y-2">
           <Label>Listen Address</Label>
@@ -53,7 +75,19 @@ export default function GatewayTab() {
             <Switch checked={tlsAcme} onCheckedChange={setTlsAcme} disabled={!enabled} />
           </div>
         )}
-        <Button onClick={() => updateMutation.mutate({ enabled, domain, listen, tls_enabled: tlsEnabled, tls_acme: tlsAcme })} disabled={updateMutation.isPending}>
+        <Button
+          onClick={() =>
+            updateMutation.mutate({
+              enabled,
+              openai_domain: openaiDomain.trim() || null,
+              anthropic_domain: anthropicDomain.trim() || null,
+              listen,
+              tls_enabled: tlsEnabled,
+              tls_acme: tlsAcme,
+            } as any)
+          }
+          disabled={updateMutation.isPending}
+        >
           {updateMutation.isPending ? 'Saving...' : 'Save'}
         </Button>
       </CardContent>
