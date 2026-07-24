@@ -299,7 +299,7 @@ async fn llm_handle(
     use crate::server::llm::LlmProtocol;
     use crate::server::llm::{anthropic_handler, openai_handler, upstream};
 
-    let state = openai_handler::LlmHandlerState { llm };
+    let state = openai_handler::LlmHandlerState { llm, protocol: Some(protocol) };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let is_models = method == Method::GET && path == "/v1/models";

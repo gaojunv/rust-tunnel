@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use super::openai_handler::LlmHandlerState;
 use super::router::resolve_model;
-use super::upstream::{call_upstream, error_response};
+use super::upstream::call_upstream;
 use super::{ChatCompletionRequest, ChatMessage};
 
 /// 拆解 Anthropic 消息 content 字段的结果。
@@ -271,7 +271,7 @@ pub async fn handle_messages(
         .await
         .is_none()
     {
-        return error_response(
+        return state.error_for_protocol(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
             "authentication_error",
@@ -282,7 +282,7 @@ pub async fn handle_messages(
     let model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
-            return error_response(
+            return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "model is required".into(),
                 "invalid_request_error",
@@ -314,14 +314,14 @@ pub async fn handle_messages(
         .await
         {
             Ok(resp) => resp,
-            Err((status, msg)) => error_response(status, msg, "upstream_error"),
+            Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
         };
     }
 
     // ── 回退路径：转成 OpenAI 格式发到 base_url ──
     let request = match anthropic_to_openai(&body) {
         Ok(r) => r,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
+        Err(e) => return state.error_for_protocol(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
     };
 
     let mut request = request;
@@ -335,7 +335,7 @@ pub async fn handle_messages(
                 convert_openai_stream_to_anthropic(resp)
             }
         }
-        Err((status, msg)) => error_response(status, msg, "upstream_error"),
+        Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
     }
 }
 

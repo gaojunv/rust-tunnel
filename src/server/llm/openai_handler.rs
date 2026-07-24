@@ -6,13 +6,32 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use super::router::{list_available_models, resolve_model};
-use super::upstream::{call_upstream, error_response};
-use super::{ChatCompletionRequest, ChatMessage, LlmState};
+use super::upstream::call_upstream;
+use super::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
 
 /// State for LLM request handlers.
 #[derive(Clone)]
 pub struct LlmHandlerState {
     pub llm: Arc<LlmState>,
+    /// Which protocol matched this request; None means "not set" (shouldn't happen).
+    pub protocol: Option<LlmProtocol>,
+}
+
+impl LlmHandlerState {
+    /// Return an error response in the format appropriate for the matched protocol.
+    pub fn error_for_protocol(
+        &self,
+        status: StatusCode,
+        message: String,
+        error_type: &str,
+    ) -> Response {
+        match self.protocol {
+            Some(LlmProtocol::Anthropic) => {
+                super::upstream::error_response_anthropic(status, message, error_type)
+            }
+            _ => super::upstream::error_response(status, message, error_type),
+        }
+    }
 }
 
 /// GET /v1/models — list available models.
@@ -26,7 +45,7 @@ pub async fn handle_list_models(
         .await
         .is_none()
     {
-        return error_response(
+        return state.error_for_protocol(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
             "authentication_error",
@@ -39,7 +58,7 @@ pub async fn handle_list_models(
             "data": models,
         }))
         .into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e, "server_error"),
+        Err(e) => state.error_for_protocol(StatusCode::INTERNAL_SERVER_ERROR, e, "server_error"),
     }
 }
 
@@ -54,7 +73,7 @@ pub async fn handle_chat_completions(
         .await
         .is_none()
     {
-        return error_response(
+        return state.error_for_protocol(
             StatusCode::UNAUTHORIZED,
             "Invalid API key".into(),
             "authentication_error",
@@ -65,7 +84,7 @@ pub async fn handle_chat_completions(
     let model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
-            return error_response(
+            return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "model is required".into(),
                 "invalid_request_error",
@@ -88,7 +107,7 @@ pub async fn handle_chat_completions(
         Some(msgs) => match serde_json::from_value(msgs.clone()) {
             Ok(m) => m,
             Err(e) => {
-                return error_response(
+                return state.error_for_protocol(
                     StatusCode::BAD_REQUEST,
                     format!("invalid messages: {}", e),
                     "invalid_request_error",
@@ -96,7 +115,7 @@ pub async fn handle_chat_completions(
             }
         },
         None => {
-            return error_response(
+            return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "messages is required".into(),
                 "invalid_request_error",
@@ -128,7 +147,7 @@ pub async fn handle_chat_completions(
     // Call upstream
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => resp,
-        Err((status, msg)) => error_response(status, msg, "upstream_error"),
+        Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
     }
 }
 
@@ -188,6 +207,7 @@ mod tests {
         let resp = handle_chat_completions(
             State(LlmHandlerState {
                 llm: std::sync::Arc::new(state),
+                protocol: None,
             }),
             HeaderMap::new(),
             Json(serde_json::json!({"model": "deepseek-chat", "messages": []})),
@@ -202,6 +222,7 @@ mod tests {
         let resp = handle_chat_completions(
             State(LlmHandlerState {
                 llm: std::sync::Arc::new(state),
+                protocol: None,
             }),
             authed_headers(&key),
             Json(serde_json::json!({
@@ -232,6 +253,7 @@ mod tests {
         let resp = handle_list_models(
             State(LlmHandlerState {
                 llm: std::sync::Arc::new(state),
+                protocol: None,
             }),
             authed_headers(&key),
         )
@@ -257,6 +279,7 @@ mod tests {
         let resp = handle_list_models(
             State(LlmHandlerState {
                 llm: std::sync::Arc::new(state),
+                protocol: None,
             }),
             headers,
         )

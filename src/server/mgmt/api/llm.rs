@@ -86,7 +86,7 @@ pub async fn update_gateway_config(
         Some(crate::server::reverse_proxy::ProxyTlsConfig {
             enabled: true,
             acme: tls_acme,
-            domain: openai_domain.clone(),
+            domain: openai_domain.clone().or_else(|| anthropic_domain.clone()),
         })
     } else {
         None

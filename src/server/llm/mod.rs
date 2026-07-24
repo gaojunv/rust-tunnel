@@ -72,20 +72,14 @@ impl LlmGatewayConfig {
         None
     }
 
-    /// 收集所有已配置的非空域名（用于 ProxyRule.domains 持久化）。
+    /// 收集所有已配置的域名（用于 ProxyRule.domains 持久化）。
+    /// 始终返回两个元素：`[openai_domain, anthropic_domain]`，未配置的为空字符串。
+    /// `init_llm_state` 按位置索引还原（domains[0] → openai, domains[1] → anthropic）。
     pub fn configured_domains(&self) -> Vec<String> {
-        let mut v = Vec::new();
-        if let Some(ref d) = self.openai_domain {
-            if !d.is_empty() {
-                v.push(d.clone());
-            }
-        }
-        if let Some(ref d) = self.anthropic_domain {
-            if !d.is_empty() {
-                v.push(d.clone());
-            }
-        }
-        v
+        vec![
+            self.openai_domain.clone().unwrap_or_default(),
+            self.anthropic_domain.clone().unwrap_or_default(),
+        ]
     }
 }
 
@@ -340,6 +334,42 @@ mod tests {
             tls_acme: false,
         };
         assert!(cfg.validate().is_some());
+    }
+
+    #[test]
+    fn test_configured_domains_always_returns_two_elements() {
+        // OpenAI only
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: None,
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert_eq!(cfg.configured_domains(), vec!["oa.local", ""]);
+
+        // Anthropic only
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: None,
+            anthropic_domain: Some("an.local".into()),
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert_eq!(cfg.configured_domains(), vec!["", "an.local"]);
+
+        // Both
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: Some("an.local".into()),
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert_eq!(cfg.configured_domains(), vec!["oa.local", "an.local"]);
     }
 
     #[test]
