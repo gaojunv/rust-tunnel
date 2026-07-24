@@ -54,7 +54,7 @@ export default function ReverseProxyPage() {
       <ProxyStatsCards />
 
       <ProxyRuleTable
-        rules={rules ?? []}
+        rules={(rules ?? []).filter(r => r.id !== '__llm_gateway__')}
         isLoading={isLoading}
         onEdit={handleEdit}
         onToggleEnabled={handleToggleEnabled}

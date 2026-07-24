@@ -6,15 +6,16 @@ import { formatBytes } from '@/utils/format';
 export function ProxyStatsCards() {
   const { data: summary, isLoading } = useStatsSummary();
   const { data: rules = [] } = useProxyRules();
+  const proxyRules = rules.filter((r) => r.id !== '__llm_gateway__');
   const stats = summary?.proxy;
 
-  const activeRules = rules.filter((r) => r.enabled).length;
+  const activeRules = proxyRules.filter((r) => r.enabled).length;
 
   return (
     <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
       <StatCard
         title="Total Rules"
-        value={isLoading ? '—' : rules.length}
+        value={isLoading ? '—' : proxyRules.length}
         icon={<Network className="h-4 w-4" />}
       />
       <StatCard
