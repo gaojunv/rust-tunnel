@@ -26,7 +26,7 @@ pub enum LlmProtocol {
 pub struct LlmGatewayConfig {
     pub enabled: bool,
     /// OpenAI 协议入口域名；None/空 = 不开放 OpenAI 入口。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "domain", skip_serializing_if = "Option::is_none")]
     pub openai_domain: Option<String>,
     /// Anthropic 协议入口域名；None/空 = 不开放 Anthropic 入口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,5 +277,84 @@ impl LlmState {
             gateway_config: Arc::new(RwLock::new(None)),
             cipher,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_legacy_domain_field() {
+        // 旧持久化数据使用 "domain" 字段，应反序列化为 openai_domain
+        let json = r#"{"enabled":true,"domain":"llm.example.com","listen":"0.0.0.0:443","tls_enabled":false,"tls_acme":false}"#;
+        let cfg: LlmGatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.openai_domain.as_deref(), Some("llm.example.com"));
+        assert!(cfg.anthropic_domain.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_new_openai_domain_field() {
+        let json = r#"{"enabled":true,"openai_domain":"oa.example.com","anthropic_domain":"an.example.com","listen":"0.0.0.0:443","tls_enabled":true,"tls_acme":true}"#;
+        let cfg: LlmGatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.openai_domain.as_deref(), Some("oa.example.com"));
+        assert_eq!(cfg.anthropic_domain.as_deref(), Some("an.example.com"));
+    }
+
+    #[test]
+    fn test_validate_rejects_both_empty_when_enabled() {
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: None,
+            anthropic_domain: None,
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert!(cfg.validate().is_some());
+    }
+
+    #[test]
+    fn test_validate_accepts_one_domain() {
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: None,
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert!(cfg.validate().is_none());
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_domains() {
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("same.local".into()),
+            anthropic_domain: Some("same.local".into()),
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert!(cfg.validate().is_some());
+    }
+
+    #[test]
+    fn test_match_protocol_routing() {
+        let cfg = LlmGatewayConfig {
+            enabled: true,
+            openai_domain: Some("oa.local".into()),
+            anthropic_domain: Some("an.local".into()),
+            listen: "0.0.0.0:443".into(),
+            tls_enabled: false,
+            tls_acme: false,
+        };
+        assert_eq!(cfg.match_protocol("oa.local"), Some(LlmProtocol::OpenAI));
+        assert_eq!(cfg.match_protocol("an.local"), Some(LlmProtocol::Anthropic));
+        assert_eq!(cfg.match_protocol("other.local"), None);
+        assert_eq!(cfg.match_protocol(""), None);
     }
 }
