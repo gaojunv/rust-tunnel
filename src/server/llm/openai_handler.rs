@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
@@ -15,43 +15,11 @@ pub struct LlmHandlerState {
     pub llm: Arc<LlmState>,
 }
 
-/// Validate that the request's Host header matches the configured LLM domain.
-/// Returns true if valid or if no domain is configured.
-pub async fn validate_host(state: &LlmState, headers: &HeaderMap) -> bool {
-    let cfg = state.gateway_config.read().await;
-    let cfg = match cfg.as_ref() {
-        Some(c) => c,
-        None => return true,
-    };
-
-    let domain = &cfg.domain;
-    // If no domain is configured, allow all hosts
-    if domain.is_empty() || !cfg.enabled {
-        return true;
-    }
-
-    // Extract Host header (strip port if present)
-    let host = match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        Some(h) => h.split(':').next().unwrap_or(h).to_string(),
-        None => return false,
-    };
-
-    host == *domain
-}
-
 /// GET /v1/models — list available models.
 pub async fn handle_list_models(
     State(state): State<LlmHandlerState>,
     headers: HeaderMap,
 ) -> Response {
-    // Validate Host header matches configured LLM domain
-    if !validate_host(&state.llm, &headers).await {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "Not found".into(),
-            "invalid_request_error",
-        );
-    }
 
     // Validate API key
     if super::auth::authenticate(&state.llm, &headers)
@@ -81,15 +49,6 @@ pub async fn handle_chat_completions(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    // Validate Host header matches configured LLM domain
-    if !validate_host(&state.llm, &headers).await {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "Not found".into(),
-            "invalid_request_error",
-        );
-    }
-
     // Validate API key
     if super::auth::authenticate(&state.llm, &headers)
         .await
@@ -176,7 +135,7 @@ pub async fn handle_chat_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::llm::LlmGatewayConfig;
+    use axum::http::header;
     use axum::http::HeaderValue;
 
     /// 构造带真实临时 DB 的 LlmState，并插入一个启用的 provider+model。
@@ -303,90 +262,5 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_no_config() {
-        let state = LlmState::new(None, None);
-        let headers = HeaderMap::new();
-        assert!(validate_host(&state, &headers).await);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_empty_domain() {
-        let state = LlmState::new(None, None);
-        *state.gateway_config.write().await = Some(LlmGatewayConfig {
-            enabled: true,
-            openai_domain: None,
-            anthropic_domain: None,
-            listen: "0.0.0.0:443".into(),
-            tls_enabled: false,
-            tls_acme: false,
-        });
-        let headers = HeaderMap::new();
-        assert!(validate_host(&state, &headers).await);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_matches() {
-        let state = LlmState::new(None, None);
-        *state.gateway_config.write().await = Some(LlmGatewayConfig {
-            enabled: true,
-            openai_domain: Some("llm.example.com".into()),
-            anthropic_domain: None,
-            listen: "0.0.0.0:443".into(),
-            tls_enabled: false,
-            tls_acme: false,
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("llm.example.com"));
-        assert!(validate_host(&state, &headers).await);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_mismatch() {
-        let state = LlmState::new(None, None);
-        *state.gateway_config.write().await = Some(LlmGatewayConfig {
-            enabled: true,
-            openai_domain: Some("llm.example.com".into()),
-            anthropic_domain: None,
-            listen: "0.0.0.0:443".into(),
-            tls_enabled: false,
-            tls_acme: false,
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("evil.example.com"));
-        assert!(!validate_host(&state, &headers).await);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_no_host_header() {
-        let state = LlmState::new(None, None);
-        *state.gateway_config.write().await = Some(LlmGatewayConfig {
-            enabled: true,
-            openai_domain: Some("llm.example.com".into()),
-            anthropic_domain: None,
-            listen: "0.0.0.0:443".into(),
-            tls_enabled: false,
-            tls_acme: false,
-        });
-        let headers = HeaderMap::new();
-        assert!(!validate_host(&state, &headers).await);
-    }
-
-    #[tokio::test]
-    async fn test_validate_host_with_port() {
-        let state = LlmState::new(None, None);
-        *state.gateway_config.write().await = Some(LlmGatewayConfig {
-            enabled: true,
-            openai_domain: Some("llm.example.com".into()),
-            anthropic_domain: None,
-            listen: "0.0.0.0:443".into(),
-            tls_enabled: false,
-            tls_acme: false,
-        });
-        let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("llm.example.com:443"));
-        assert!(validate_host(&state, &headers).await);
     }
 }

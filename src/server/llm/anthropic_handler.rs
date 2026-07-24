@@ -266,15 +266,6 @@ pub async fn handle_messages(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    // Validate Host header matches configured LLM domain
-    if !super::openai_handler::validate_host(&state.llm, &headers).await {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "Not found".into(),
-            "invalid_request_error",
-        );
-    }
-
     // Validate API key
     if super::auth::authenticate(&state.llm, &headers)
         .await
