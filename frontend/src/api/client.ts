@@ -32,7 +32,7 @@ import type {
   LlmGatewayConfig,
   LlmUsageSummary,
   LlmUsageAggregateRow,
-  LlmUsageLog,
+  LlmUsageLogsResponse,
   UsageGroupBy,
 } from '../types';
 
@@ -394,8 +394,8 @@ export async function getLlmUsageAggregate(
 
 export async function getLlmUsageLogs(
   params: UsageRangeParams & { limit?: number; offset?: number }
-): Promise<LlmUsageLog[]> {
+): Promise<LlmUsageLogsResponse> {
   const { data } = await api.get('/llm/usage/logs', { params });
-  return data.logs;
+  return { logs: data.logs, total: data.total };
 }
 

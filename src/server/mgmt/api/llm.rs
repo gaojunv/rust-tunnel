@@ -611,8 +611,12 @@ pub struct UsageQueryParams {
     pub offset: Option<i64>,
 }
 
-/// 解析并校验时间范围，返回 (start, end) 的 RFC3339 字符串。
+/// 解析并校验时间范围，返回 (start, end) 的 SQLite datetime 格式字符串。
 /// 缺省时回落到最近 24h；范围超过 31 天则报错。
+///
+/// SQLite 的 datetime('now') 存储格式为 "YYYY-MM-DD HH:MM:SS"（无时区），
+/// 而前端传入的是 RFC3339 格式（带T和Z）。为确保字符串比较正确，
+/// 需要转换为 SQLite 兼容格式。
 fn resolve_range(p: &UsageQueryParams) -> Result<(String, String), String> {
     let end = match &p.end {
         Some(s) => chrono::DateTime::parse_from_rfc3339(s)
@@ -632,7 +636,9 @@ fn resolve_range(p: &UsageQueryParams) -> Result<(String, String), String> {
     if (end - start) > chrono::Duration::days(31) {
         return Err("range must be <= 31 days".into());
     }
-    Ok((start.to_rfc3339(), end.to_rfc3339()))
+    // 转换为 SQLite datetime 格式: "YYYY-MM-DD HH:MM:SS"
+    let fmt = "%Y-%m-%d %H:%M:%S";
+    Ok((start.format(fmt).to_string(), end.format(fmt).to_string()))
 }
 
 pub async fn get_usage_summary(
@@ -701,9 +707,18 @@ pub async fn get_usage_logs(
     };
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let offset = params.offset.unwrap_or(0).max(0);
-    match db.llm_query_usage_logs(&start, &end, limit, offset).await {
-        Ok(logs) => Json(serde_json::json!({"logs": logs})).into_response(),
-        Err(e) => (
+
+    // 并行查询日志和总数
+    let (logs_result, count_result) = tokio::join!(
+        db.llm_query_usage_logs(&start, &end, limit, offset),
+        db.llm_count_usage_logs(&start, &end)
+    );
+
+    match (logs_result, count_result) {
+        (Ok(logs), Ok(total)) => {
+            Json(serde_json::json!({"logs": logs, "total": total})).into_response()
+        }
+        (Err(e), _) | (_, Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("DB error: {}", e),
         )

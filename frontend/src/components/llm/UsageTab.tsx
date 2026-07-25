@@ -15,12 +15,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
 import { StatCard } from '@/components/shared/StatCard';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
 import { useLlmUsageSummary, useLlmUsageAggregate, useLlmUsageLogs } from '@/api/hooks';
 import type { UsageGroupBy } from '@/types';
-import { Activity, Coins, CheckCircle2, Database } from 'lucide-react';
+import { Activity, Coins, CheckCircle2, Database, ChevronLeft, ChevronRight } from 'lucide-react';
 
 const GROUP_LABELS: Record<UsageGroupBy, string> = {
   api_key: 'API Key',
@@ -33,9 +34,12 @@ const fmt = (n: number): string => n.toLocaleString('en-US');
 const pct = (num: number, denom: number): string =>
   denom === 0 ? '—' : `${((num / denom) * 100).toFixed(1)}%`;
 
+const PAGE_SIZE = 20;
+
 export default function UsageTab() {
   const { range, preset, presets, setPreset, setCustomRange } = useTimeRange('24h');
   const [groupBy, setGroupBy] = useState<UsageGroupBy>('api_key');
+  const [page, setPage] = useState(0);
 
   // TimeRangeSelector 用 ms；查询接口用 RFC3339 字符串
   const apiRange = useMemo(
@@ -46,9 +50,24 @@ export default function UsageTab() {
     [range.startMs, range.endMs]
   );
 
+  // 时间范围或分组变化时重置页码
+  useMemo(() => {
+    setPage(0);
+  }, [apiRange.start, apiRange.end, groupBy]);
+
   const { data: summary } = useLlmUsageSummary(apiRange);
   const { data: rows, isLoading: rowsLoading } = useLlmUsageAggregate(groupBy, apiRange);
-  const { data: logs, isLoading: logsLoading } = useLlmUsageLogs(apiRange, 50, 0);
+  const { data: logsData, isLoading: logsLoading } = useLlmUsageLogs(
+    apiRange,
+    PAGE_SIZE,
+    page * PAGE_SIZE
+  );
+
+  const logs = logsData?.logs ?? [];
+  const totalLogs = logsData?.total ?? 0;
+  const totalPages = Math.ceil(totalLogs / PAGE_SIZE);
+  const hasNextPage = page < totalPages - 1;
+  const hasPrevPage = page > 0;
 
   const successRate = summary ? pct(summary.success, summary.requests) : '—';
   const cacheRate = summary ? pct(summary.cache_hit_tokens, summary.prompt_tokens) : '—';
@@ -171,8 +190,13 @@ export default function UsageTab() {
 
       {/* 明细请求日志 */}
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle>请求明细</CardTitle>
+          {totalLogs > 0 && (
+            <span className="text-sm text-muted-foreground">
+              共 {fmt(totalLogs)} 条
+            </span>
+          )}
         </CardHeader>
         <CardContent>
           <Table>
@@ -195,7 +219,7 @@ export default function UsageTab() {
                     加载中...
                   </TableCell>
                 </TableRow>
-              ) : !logs || logs.length === 0 ? (
+              ) : logs.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={8} className="text-center text-muted-foreground">
                     该时间范围内暂无请求
@@ -232,6 +256,35 @@ export default function UsageTab() {
               )}
             </TableBody>
           </Table>
+
+          {/* 分页控件 */}
+          {totalPages > 1 && (
+            <div className="mt-4 flex items-center justify-between">
+              <div className="text-sm text-muted-foreground">
+                第 {page + 1} / {totalPages} 页
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!hasPrevPage}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                  上一页
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!hasNextPage}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  下一页
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

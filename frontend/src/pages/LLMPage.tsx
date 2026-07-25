@@ -18,13 +18,14 @@ export default function LLMPage() {
   return (
     <div className="space-y-6">
       <PageHeader title="LLM Gateway" description="Manage AI providers, models, and API keys" />
-      <Tabs defaultValue="gateway">
+      <Tabs defaultValue="usage">
         <TabsList>
+          <TabsTrigger value="usage">Usage</TabsTrigger>
           <TabsTrigger value="gateway">Gateway</TabsTrigger>
           <TabsTrigger value="providers">Providers & Models</TabsTrigger>
           <TabsTrigger value="api-keys">API Keys</TabsTrigger>
-          <TabsTrigger value="usage">Usage</TabsTrigger>
         </TabsList>
+        <TabsContent value="usage" className="mt-4"><UsageTab /></TabsContent>
         <TabsContent value="gateway" className="mt-4"><GatewayTab /></TabsContent>
         <TabsContent value="providers" className="mt-4 space-y-4">
           <div className="flex justify-between items-center">
@@ -41,7 +42,6 @@ export default function LLMPage() {
           <ProviderDialog open={providerDialogOpen} onClose={() => setProviderDialogOpen(false)} providerId={editingProvider} />
         </TabsContent>
         <TabsContent value="api-keys" className="mt-4"><ApiKeyTable /></TabsContent>
-        <TabsContent value="usage" className="mt-4"><UsageTab /></TabsContent>
       </Tabs>
     </div>
   );

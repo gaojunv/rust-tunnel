@@ -31,6 +31,7 @@ import {
   ChevronDown,
   Menu,
   LogOut,
+  Bot,
 } from 'lucide-react';
 
 interface NavItem {
@@ -66,7 +67,12 @@ const navGroups: NavGroup[] = [
       { label: 'Shadowsocks', icon: <Shield className="h-4 w-4" />, href: '/shadowsocks' },
       { label: 'Trojan', icon: <ShieldCheck className="h-4 w-4" />, href: '/trojan' },
       { label: 'ACME Certs', icon: <FileBadge className="h-4 w-4" />, href: '/acme' },
-      { label: 'LLM Gateway', icon: <Network className="h-4 w-4" />, href: '/llm' },
+    ],
+  },
+  {
+    label: 'AI',
+    items: [
+      { label: 'LLM Gateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
     ],
   },
   {

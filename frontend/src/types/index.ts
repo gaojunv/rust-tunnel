@@ -388,3 +388,8 @@ export interface LlmUsageLog {
   error_type: string | null;
 }
 
+export interface LlmUsageLogsResponse {
+  logs: LlmUsageLog[];
+  total: number;
+}
+

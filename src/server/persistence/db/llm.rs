@@ -1,4 +1,5 @@
 use super::Database;
+use chrono::{DateTime, Utc};
 
 // ── Record types ──────────────────────────────────────────────
 
@@ -43,7 +44,7 @@ pub struct LlmApiKeyRecord {
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct LlmUsageLogRecord {
     pub id: String,
-    pub timestamp: String,
+    pub timestamp: DateTime<Utc>,
     pub api_key_id: Option<String>,
     pub api_key_name: String,
     pub provider_id: Option<String>,
@@ -487,6 +488,25 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// 查询时间范围内的用量日志总数。
+    pub async fn llm_count_usage_logs(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM llm_usage_logs
+            WHERE timestamp >= ? AND timestamp <= ?
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
     }
 
     /// 删除早于 `before`（ISO 8601 字符串）的用量日志，返回删除行数。
