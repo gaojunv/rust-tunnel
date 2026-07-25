@@ -114,31 +114,10 @@
     animation: header-flow 8s linear infinite;
   }
 
-  /* 页头光影流动：周期性扫过的高光带 */
-  .header-sheen {
-    background: linear-gradient(
-      100deg,
-      transparent 30%,
-      hsl(var(--primary) / 0.06) 44%,
-      hsl(var(--primary) / 0.14) 50%,
-      hsl(var(--primary) / 0.06) 56%,
-      transparent 70%
-    );
-    animation: header-sheen-sweep 7s ease-in-out infinite;
-  }
 
-  /* 页头光影流动：缓慢漂移的环境辉光 */
-  .header-ambient-glow {
-    background:
-      radial-gradient(ellipse 40% 130% at 25% 0%, hsl(var(--primary) / 0.12), transparent 70%),
-      radial-gradient(ellipse 35% 130% at 75% 0%, hsl(var(--chart-2) / 0.1), transparent 70%);
-    animation: header-glow-drift 12s ease-in-out infinite alternate;
-  }
 
   @media (prefers-reduced-motion: reduce) {
-    .header-light-flow,
-    .header-sheen,
-    .header-ambient-glow {
+    .header-light-flow {
       animation: none;
     }
   }
@@ -153,21 +132,4 @@
   }
 }
 
-@keyframes header-sheen-sweep {
-  0% {
-    transform: translateX(-100%);
-  }
-  45%,
-  100% {
-    transform: translateX(100%);
-  }
-}
 
-@keyframes header-glow-drift {
-  from {
-    transform: translateX(-6%);
-  }
-  to {
-    transform: translateX(6%);
-  }
-}
