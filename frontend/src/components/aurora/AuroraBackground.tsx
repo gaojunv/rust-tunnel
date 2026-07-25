@@ -215,9 +215,10 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
         }
 
         renderer.render(scene, camera);
+        animationId = requestAnimationFrame(animate);
+      } else {
+        animationId = null;
       }
-
-      animationId = requestAnimationFrame(animate);
     };
 
     animationId = requestAnimationFrame(animate);
@@ -235,7 +236,6 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
 
     const resizeObserver = new ResizeObserver(handleResize);
     resizeObserver.observe(container);
-    window.addEventListener('resize', handleResize);
 
     // Visibility handling
     const handleVisibilityChange = () => {
@@ -269,7 +269,6 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
       }
 
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('resize', handleResize);
       reducedMotionQuery.removeEventListener('change', handleReducedMotionChange);
       resizeObserver.disconnect();
 
