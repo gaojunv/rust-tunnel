@@ -2,10 +2,6 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { useTheme } from '@/theme/ThemeProvider';
 
-interface AuroraBackgroundProps {
-  mode: 'fullscreen' | 'contained';
-}
-
 function isMobile(): boolean {
   if (typeof window === 'undefined') return false;
   return (
@@ -36,7 +32,6 @@ const fragmentShader = `
 uniform float uTime;
 uniform vec2 uResolution;
 uniform float uColorMode;
-uniform float uIntensity;
 
 varying vec2 vUv;
 
@@ -169,13 +164,12 @@ void main() {
   vec3 lightCol = lightSky;
 
   // 星点（仅暗色），地平线附近淡出
-  float s = starField(p, uTime) * smoothstep(0.15, 0.55, vUv.y) * uIntensity;
+  float s = starField(p, uTime) * smoothstep(0.15, 0.55, vUv.y);
   darkCol += s * vec3(0.8, 0.85, 1.0);
 
   // 极光：暗色下加法发光；亮色下 alpha 混合（白色背景上加法无法显色）
   for (int i = 1; i >= 0; i--) {
     vec4 a = auroraLayer(p, uTime, float(i), uColorMode);
-    a.a *= uIntensity;
     darkCol += a.rgb * a.a;
     float blend = clamp(a.a * 1.1, 0.0, 0.75);
     lightCol = mix(lightCol, a.rgb, blend);
@@ -194,11 +188,10 @@ void main() {
 }
 `;
 
-export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
+export default function AuroraBackground() {
   const containerRef = useRef<HTMLDivElement>(null);
   const { resolvedTheme } = useTheme();
   const colorModeTargetRef = useRef(resolvedTheme === 'dark' ? 0.0 : 1.0);
-  const modeRef = useRef(mode);
 
   // Initialize WebGL scene
   useEffect(() => {
@@ -220,8 +213,6 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
       uTime: { value: 0.0 },
       uResolution: { value: new THREE.Vector2(container.clientWidth, container.clientHeight) },
       uColorMode: { value: colorModeTargetRef.current },
-      // contained 模式（Header）整体降低极光与星点强度，避免干扰导航文字
-      uIntensity: { value: modeRef.current === 'fullscreen' ? 1.0 : 0.6 },
     };
 
     // Shader material
@@ -339,15 +330,10 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
     colorModeTargetRef.current = resolvedTheme === 'dark' ? 0.0 : 1.0;
   }, [resolvedTheme]);
 
-  const containerClasses =
-    mode === 'fullscreen'
-      ? 'fixed inset-0 pointer-events-none overflow-hidden'
-      : 'absolute inset-0 pointer-events-none overflow-hidden';
-
   return (
     <div
       ref={containerRef}
-      className={containerClasses}
+      className="fixed inset-0 pointer-events-none overflow-hidden"
       aria-hidden="true"
       style={{ zIndex: 0 }}
     />

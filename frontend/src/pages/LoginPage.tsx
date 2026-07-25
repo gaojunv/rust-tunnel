@@ -28,7 +28,7 @@ export default function LoginPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
-      <AuroraBackground mode="fullscreen" />
+      <AuroraBackground />
 
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">

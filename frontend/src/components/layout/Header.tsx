@@ -33,7 +33,7 @@ import {
   LogOut,
   Bot,
 } from 'lucide-react';
-import AuroraBackground from '@/components/aurora/AuroraBackground';
+import DataFlowBackground from '@/components/dataflow/DataFlowBackground';
 
 interface NavItem {
   label: string;
@@ -101,10 +101,10 @@ export function Header({ onLogout }: HeaderProps) {
 
   return (
     <header className="sticky top-0 z-40 border-b bg-card/60 backdrop-blur-xl">
-      {/* 光影流动装饰层（环境辉光 + 扫过高光 + 底部流光渐变线）。
+      {/* 装饰层（数据流光效 + 底部流光渐变线）。
           overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
           弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击 */}
-      <AuroraBackground mode="contained" />
+      <DataFlowBackground />
       <div
         aria-hidden
         className="header-light-flow pointer-events-none absolute inset-x-0 bottom-0 h-[2px] opacity-70"
