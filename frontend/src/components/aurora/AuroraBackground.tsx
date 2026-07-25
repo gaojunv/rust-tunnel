@@ -283,7 +283,7 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
 
       materialRef.current = null;
     };
-  }, [resolvedTheme]);
+  }, []);
 
   // Update color mode uniform when theme changes (without re-creating WebGL)
   useEffect(() => {
