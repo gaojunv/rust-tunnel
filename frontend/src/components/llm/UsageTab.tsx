@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -51,7 +51,7 @@ export default function UsageTab() {
   );
 
   // 时间范围或分组变化时重置页码
-  useMemo(() => {
+  useEffect(() => {
     setPage(0);
   }, [apiRange.start, apiRange.end, groupBy]);
 

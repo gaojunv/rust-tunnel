@@ -36,6 +36,7 @@ const fragmentShader = `
 uniform float uTime;
 uniform vec2 uResolution;
 uniform float uColorMode;
+uniform float uIntensity;
 
 varying vec2 vUv;
 
@@ -61,7 +62,7 @@ float fbm(vec3 p) {
   float value = 0.0;
   float amplitude = 0.5;
   float frequency = 1.0;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     value += amplitude * noise(p * frequency);
     frequency *= 2.0;
     amplitude *= 0.5;
@@ -69,89 +70,135 @@ float fbm(vec3 p) {
   return value;
 }
 
+// 五段高度渐变：亮绿核心 → 青绿 → 蓝紫 → 紫罗兰 → 品红消散
+vec3 gradientColor(float t, vec3 c0, vec3 c1, vec3 c2, vec3 c3, vec3 c4) {
+  vec3 col = mix(c0, c1, smoothstep(0.00, 0.18, t));
+  col = mix(col, c2, smoothstep(0.18, 0.45, t));
+  col = mix(col, c3, smoothstep(0.45, 0.70, t));
+  col = mix(col, c4, smoothstep(0.70, 1.00, t));
+  return col;
+}
+
+vec3 auroraGradient(float t, float mode) {
+  vec3 dark = gradientColor(
+    t,
+    vec3(0.35, 1.00, 0.55),
+    vec3(0.10, 0.85, 0.60),
+    vec3(0.25, 0.45, 0.95),
+    vec3(0.60, 0.25, 0.90),
+    vec3(0.85, 0.30, 0.65)
+  );
+  vec3 light = gradientColor(
+    t,
+    vec3(0.30, 0.85, 0.55),
+    vec3(0.25, 0.75, 0.62),
+    vec3(0.45, 0.50, 0.90),
+    vec3(0.65, 0.42, 0.88),
+    vec3(0.88, 0.48, 0.65)
+  );
+  return mix(dark, light, mode);
+}
+
+// 网格哈希星点，带闪烁
+float starField(vec2 p, float t) {
+  vec2 g = p * 90.0;
+  vec2 cell = floor(g);
+  float rnd = hash(cell.x * 127.1 + cell.y * 311.7);
+  if (rnd < 0.92) return 0.0;
+  vec2 sp = cell + vec2(
+    hash(cell.x * 269.5 + cell.y * 183.3),
+    hash(cell.x * 419.2 + cell.y * 371.9)
+  );
+  vec2 d = g - sp;
+  float bright = (rnd - 0.92) / 0.08;
+  float twinkle = 0.6 + 0.4 * sin(t * (1.0 + bright * 3.0) + rnd * 40.0);
+  return exp(-dot(d, d) * 25.0) * bright * twinkle;
+}
+
+// 单层极光帘幕，返回 (rgb, intensity)
+vec4 auroraLayer(vec2 p, float t, float layer, float mode) {
+  float baseH, amp, freq, speed, seed, rayFreq, raySpeed, height, alpha;
+  if (layer < 0.5) {
+    // 近层：主帘幕
+    baseH = 0.30; amp = 0.15; freq = 1.1; speed = 1.0; seed = 3.7;
+    rayFreq = 7.0; raySpeed = 0.10; height = 0.50; alpha = 0.85;
+  } else {
+    // 远层：更高更淡，提供纵深
+    baseH = 0.44; amp = 0.13; freq = 0.7; speed = 0.6; seed = 11.3;
+    rayFreq = 4.0; raySpeed = 0.06; height = 0.55; alpha = 0.45;
+  }
+
+  float tt = t * speed;
+  // 整帘随高度轻微摇摆
+  float sway = 0.10 * sin(tt * 0.12 + p.y * 2.5 + seed);
+  float x = p.x + sway;
+
+  // 帘幕下缘：大幅波浪 + 细碎涟漪
+  float e = baseH + amp * (fbm(vec3(x * freq + tt * 0.020, seed, tt * 0.05)) - 0.5) * 2.0;
+  e += 0.025 * (fbm(vec3(x * 6.0 + tt * 0.03, seed * 5.0, tt * 0.08)) - 0.5) * 2.0;
+  float d = p.y - e; // 距下缘高度
+  if (d < -0.02 || d > height) return vec4(0.0);
+
+  float hn = clamp(d / height, 0.0, 1.0);
+
+  // 垂直光柱：只随 x 变化的噪声，高对比度
+  float rn = fbm(vec3(x * rayFreq + tt * raySpeed, seed * 3.1, tt * 0.03));
+  float rays = pow(clamp((rn - 0.30) * 2.4, 0.0, 1.0), 1.8);
+  rays *= 1.0 - 0.35 * hn; // 顶部光柱略消散
+
+  // 垂直轮廓：下缘亮边 + 向上指数衰减的帘体
+  float rim = exp(-d * 8.0) * 1.25;
+  float body = exp(-hn * 1.9) * 0.85;
+  float profile = (rim + body) * smoothstep(-0.02, 0.015, d);
+  profile *= 1.0 - smoothstep(0.7, 1.0, hn);
+
+  float inten = profile * (0.12 + 0.88 * rays) * alpha;
+  return vec4(auroraGradient(hn, mode), inten);
+}
+
 void main() {
-  vec2 uv = vUv;
   float aspect = uResolution.x / uResolution.y;
-  vec2 pos = uv * 2.0 - 1.0;
-  pos.x *= aspect;
+  vec2 p = vec2(vUv.x * aspect, vUv.y);
 
-  // Sky gradient
-  vec3 darkSkyTop = vec3(0.008, 0.004, 0.035);
-  vec3 darkSkyBottom = vec3(0.035, 0.015, 0.065);
-  vec3 lightSkyTop = vec3(0.82, 0.78, 0.88);
-  vec3 lightSkyBottom = vec3(0.90, 0.88, 0.94);
+  // 夜空：深蓝渐变 + 地平线微光
+  vec3 darkSky = mix(vec3(0.030, 0.045, 0.085), vec3(0.012, 0.010, 0.045), vUv.y);
+  darkSky += exp(-vUv.y * 5.0) * 0.05 * vec3(0.4, 0.5, 0.9);
+  vec3 lightSky = mix(vec3(0.93, 0.95, 1.00), vec3(0.86, 0.90, 0.98), vUv.y);
 
-  vec3 darkSky = mix(darkSkyBottom, darkSkyTop, uv.y);
-  vec3 lightSky = mix(lightSkyBottom, lightSkyTop, uv.y);
-  vec3 skyColor = mix(darkSky, lightSky, uColorMode);
+  vec3 darkCol = darkSky;
+  vec3 lightCol = lightSky;
 
-  // Aurora band colors: dark mode (high sat) vs light mode (low sat)
-  vec3 darkBands[3];
-  darkBands[0] = vec3(0.40, 0.12, 0.85); // blue-purple
-  darkBands[1] = vec3(0.05, 0.72, 0.48); // mint-green
-  darkBands[2] = vec3(0.85, 0.25, 0.35); // sunset-red
+  // 星点（仅暗色），地平线附近淡出
+  float s = starField(p, uTime) * smoothstep(0.15, 0.55, vUv.y) * uIntensity;
+  darkCol += s * vec3(0.8, 0.85, 1.0);
 
-  vec3 lightBands[3];
-  lightBands[0] = vec3(0.70, 0.58, 0.90); // light purple
-  lightBands[1] = vec3(0.58, 0.78, 0.68); // light mint
-  lightBands[2] = vec3(0.88, 0.68, 0.60); // warm peach
-
-  vec3 auroraColor = vec3(0.0);
-  float totalAlpha = 0.0;
-
-  for (int i = 0; i < 3; i++) {
-    float fi = float(i);
-
-    // Vertical position with sinusoidal drift
-    float yDrift = 0.18 * sin(uTime * 0.10 + fi * 2.094 + pos.x * 0.4);
-    float yBase = -0.25 + fi * 0.28;
-    float yCenter = yBase + yDrift;
-
-    // Aurora curtain shape using FBM noise
-    vec3 noiseCoord = vec3(
-      pos.x * 1.8 + uTime * 0.025,
-      uv.y * 2.5 + uTime * 0.018 + fi * 0.5,
-      fi * 7.0 + uTime * 0.008
-    );
-    float curtain = fbm(noiseCoord);
-
-    // Vertical falloff from band center
-    float yDist = abs(pos.y - yCenter);
-    float verticalFade = smoothstep(0.8, 0.05, yDist);
-
-    float alpha = verticalFade * curtain * 0.7;
-    vec3 bandColor = mix(darkBands[i], lightBands[i], uColorMode);
-    auroraColor += bandColor * alpha;
-    totalAlpha += alpha;
+  // 极光：暗色下加法发光；亮色下 alpha 混合（白色背景上加法无法显色）
+  for (int i = 1; i >= 0; i--) {
+    vec4 a = auroraLayer(p, uTime, float(i), uColorMode);
+    a.a *= uIntensity;
+    darkCol += a.rgb * a.a;
+    float blend = clamp(a.a * 1.1, 0.0, 0.75);
+    lightCol = mix(lightCol, a.rgb, blend);
   }
 
-  // Normalize to prevent over-saturation when bands overlap
-  if (totalAlpha > 0.0) {
-    auroraColor /= max(totalAlpha, 1.0);
-  }
+  // 暗色软色调映射，避免过曝硬切
+  darkCol = 1.0 - exp(-darkCol * 1.15);
 
-  // Composite aurora over sky
-  float mixFactor = min(totalAlpha, 1.0) * 0.85;
-  vec3 finalColor = mix(skyColor, auroraColor, mixFactor);
+  // 轻量暗角（亮色模式几乎不可见）
+  vec2 c = vUv - 0.5;
+  float dd = dot(c, c);
+  darkCol *= 1.0 - dd * 0.55;
+  lightCol *= 1.0 - dd * 0.15;
 
-  // Edge fog (vignette) - smoothstep at 4 edges
-  float fogMargin = 0.12;
-  float edgeFog = 1.0;
-  edgeFog *= smoothstep(0.0, fogMargin, uv.x);
-  edgeFog *= smoothstep(0.0, fogMargin, uv.y);
-  edgeFog *= smoothstep(1.0, 1.0 - fogMargin, uv.x);
-  edgeFog *= smoothstep(1.0, 1.0 - fogMargin, uv.y);
-
-  finalColor *= edgeFog;
-
-  gl_FragColor = vec4(finalColor, 1.0);
+  gl_FragColor = vec4(mix(darkCol, lightCol, uColorMode), 1.0);
 }
 `;
 
 export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const materialRef = useRef<THREE.ShaderMaterial | null>(null);
   const { resolvedTheme } = useTheme();
+  const colorModeTargetRef = useRef(resolvedTheme === 'dark' ? 0.0 : 1.0);
+  const modeRef = useRef(mode);
 
   // Initialize WebGL scene
   useEffect(() => {
@@ -172,7 +219,9 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
     const uniforms = {
       uTime: { value: 0.0 },
       uResolution: { value: new THREE.Vector2(container.clientWidth, container.clientHeight) },
-      uColorMode: { value: resolvedTheme === 'dark' ? 0.0 : 1.0 },
+      uColorMode: { value: colorModeTargetRef.current },
+      // contained 模式（Header）整体降低极光与星点强度，避免干扰导航文字
+      uIntensity: { value: modeRef.current === 'fullscreen' ? 1.0 : 0.6 },
     };
 
     // Shader material
@@ -181,7 +230,6 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
       vertexShader,
       fragmentShader,
     });
-    materialRef.current = material;
 
     // Scene setup
     const scene = new THREE.Scene();
@@ -213,6 +261,10 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
         if (!pausedRef.current) {
           uniforms.uTime.value += delta;
         }
+
+        // 主题切换时 uColorMode 向目标值平滑插值（约 1 秒过渡）
+        const cm = uniforms.uColorMode;
+        cm.value += (colorModeTargetRef.current - cm.value) * Math.min(1, delta * 3.0);
 
         renderer.render(scene, camera);
         animationId = requestAnimationFrame(animate);
@@ -279,16 +331,12 @@ export default function AuroraBackground({ mode }: AuroraBackgroundProps) {
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
-
-      materialRef.current = null;
     };
   }, []);
 
-  // Update color mode uniform when theme changes (without re-creating WebGL)
+  // 主题变化只更新目标值，由渲染循环平滑过渡 uColorMode（不重建 WebGL）
   useEffect(() => {
-    if (materialRef.current) {
-      materialRef.current.uniforms.uColorMode.value = resolvedTheme === 'dark' ? 0.0 : 1.0;
-    }
+    colorModeTargetRef.current = resolvedTheme === 'dark' ? 0.0 : 1.0;
   }, [resolvedTheme]);
 
   const containerClasses =

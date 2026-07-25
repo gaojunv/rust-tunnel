@@ -84,7 +84,7 @@ export default function GatewayTab() {
               listen,
               tls_enabled: tlsEnabled,
               tls_acme: tlsAcme,
-            } as any)
+            })
           }
           disabled={updateMutation.isPending}
         >
