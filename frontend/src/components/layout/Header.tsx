@@ -100,7 +100,7 @@ export function Header({ onLogout }: HeaderProps) {
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    <header className="sticky top-0 z-40 border-b bg-card/60 backdrop-blur-xl">
+    <header className="sticky top-0 z-40 border-b border-border/70 bg-card/60 backdrop-blur-xl shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04),0_10px_30px_-12px_hsl(var(--primary)/0.22),0_2px_8px_-4px_hsl(var(--foreground)/0.08)]">
       {/* 装饰层（数据流光效 + 底部流光渐变线）。
           overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
           弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击 */}

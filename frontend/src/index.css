@@ -116,10 +116,60 @@
 
 
 
+  /* 极光光斑基础样式：PageHeader 氛围背景（颜色由 Tailwind bg- 类提供） */
+  .aurora-blob {
+    position: absolute;
+    border-radius: 9999px;
+    filter: blur(40px);
+    pointer-events: none;
+    will-change: transform;
+  }
+
+  /* 光斑缓慢漂移动画（主/副两个方向，错峰循环） */
+  .animate-aurora {
+    animation: aurora-drift 16s ease-in-out infinite;
+  }
+
+  .animate-aurora-alt {
+    animation: aurora-drift-alt 20s ease-in-out infinite;
+  }
+
+  /* 页头卡片细网格纹理：径向遮罩让网格向边缘淡出 */
+  .grid-texture {
+    background-image:
+      linear-gradient(to right, hsl(var(--foreground) / 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--foreground) / 0.045) 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: radial-gradient(ellipse 85% 90% at 30% 0%, black 30%, transparent 78%);
+    -webkit-mask-image: radial-gradient(ellipse 85% 90% at 30% 0%, black 30%, transparent 78%);
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .header-light-flow {
+    .header-light-flow,
+    .animate-aurora,
+    .animate-aurora-alt {
       animation: none;
     }
+  }
+}
+
+@keyframes aurora-drift {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+  50% {
+    transform: translate(26px, 12px) scale(1.12);
+  }
+}
+
+@keyframes aurora-drift-alt {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1.05);
+  }
+  50% {
+    transform: translate(-22px, -10px) scale(0.94);
   }
 }
 
