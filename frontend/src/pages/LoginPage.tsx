@@ -5,6 +5,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { useLogin } from '@/api/hooks';
 import { Logo } from '@/components/shared/Logo';
+import AuroraBackground from '@/components/aurora/AuroraBackground';
 
 export default function LoginPage() {
   const [password, setPassword] = useState('');
@@ -27,11 +28,7 @@ export default function LoginPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
-      {/* Ambient glow background */}
-      <div className="pointer-events-none absolute inset-0" aria-hidden="true">
-        <div className="absolute left-1/2 top-0 h-72 w-[36rem] -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary/15 blur-3xl" />
-        <div className="absolute bottom-0 right-0 h-80 w-80 translate-x-1/3 translate-y-1/3 rounded-full bg-chart-2/10 blur-3xl" />
-      </div>
+      <AuroraBackground mode="fullscreen" />
 
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">
