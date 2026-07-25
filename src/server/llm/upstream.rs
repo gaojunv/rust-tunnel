@@ -9,9 +9,19 @@ use reqwest::Client;
 use super::ChatCompletionRequest;
 
 /// Reusable HTTP client with connection pooling.
+///
+/// Timeout strategy:
+/// - `connect_timeout`: 30 s — fast failure when the upstream is unreachable.
+/// - `read_timeout`:   300 s (5 min) — detects genuinely hung connections while
+///   allowing very large streaming responses (e.g. long tool-use / task-plan
+///   generations) to complete without a premature "connection closed mid-response"
+///   error.
+/// - No global `timeout` — streaming LLM responses can legitimately take minutes;
+///   the upstream provider enforces its own deadline.
 static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(10)
         .build()
         .expect("failed to build upstream HTTP client")
