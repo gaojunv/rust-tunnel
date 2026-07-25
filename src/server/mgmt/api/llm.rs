@@ -596,3 +596,117 @@ pub async fn delete_api_key(
     }
     StatusCode::OK.into_response()
 }
+
+// ── Usage stats ────────────────────────────────────────────────
+
+/// 用量查询的时间范围参数（RFC3339）。缺省则回落到最近 24 小时。
+#[derive(Debug, serde::Deserialize)]
+pub struct UsageQueryParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    /// 聚合维度：`api_key` / `model` / `provider`（仅 aggregate 端点用）。
+    pub group_by: Option<String>,
+    /// 明细分页（仅 logs 端点用）。
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// 解析并校验时间范围，返回 (start, end) 的 RFC3339 字符串。
+/// 缺省时回落到最近 24h；范围超过 31 天则报错。
+fn resolve_range(p: &UsageQueryParams) -> Result<(String, String), String> {
+    let end = match &p.end {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| format!("invalid end: {e}"))?
+            .with_timezone(&chrono::Utc),
+        None => chrono::Utc::now(),
+    };
+    let start = match &p.start {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| format!("invalid start: {e}"))?
+            .with_timezone(&chrono::Utc),
+        None => end - chrono::Duration::hours(24),
+    };
+    if end < start {
+        return Err("end must be >= start".into());
+    }
+    if (end - start) > chrono::Duration::days(31) {
+        return Err("range must be <= 31 days".into());
+    }
+    Ok((start.to_rfc3339(), end.to_rfc3339()))
+}
+
+pub async fn get_usage_summary(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let (start, end) = match resolve_range(&params) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match db.llm_usage_summary(&start, &end).await {
+        Ok(s) => Json(serde_json::json!({"summary": s})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_usage_aggregate(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let (start, end) = match resolve_range(&params) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let group_by = params.group_by.as_deref().unwrap_or("api_key");
+    if !matches!(group_by, "api_key" | "model" | "provider") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "group_by must be one of: api_key, model, provider",
+        )
+            .into_response();
+    }
+    match db.llm_aggregate_usage(&start, &end, group_by).await {
+        Ok(rows) => Json(serde_json::json!({"group_by": group_by, "rows": rows})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_usage_logs(
+    State(state): State<ApiState>,
+    axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let (start, end) = match resolve_range(&params) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+    match db.llm_query_usage_logs(&start, &end, limit, offset).await {
+        Ok(logs) => Json(serde_json::json!({"logs": logs})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )
+            .into_response(),
+    }
+}

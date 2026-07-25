@@ -338,3 +338,53 @@ export interface CreateApiKeyResponse {
   key_prefix: string;
   name: string;
 }
+
+// === LLM Usage Stats ===
+
+export type UsageGroupBy = 'api_key' | 'model' | 'provider';
+
+export interface LlmUsageSummary {
+  requests: number;
+  success: number;
+  prompt_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface LlmUsageAggregateRow {
+  dimension_id: string | null;
+  dimension_name: string;
+  requests: number;
+  success: number;
+  prompt_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface LlmUsageLog {
+  id: string;
+  timestamp: string;
+  api_key_id: string | null;
+  api_key_name: string;
+  provider_id: string | null;
+  provider_name: string;
+  model_id: string | null;
+  model_name: string;
+  requested_model: string;
+  protocol: string;
+  stream: number;
+  status_code: number;
+  success: number;
+  prompt_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  latency_ms: number;
+  error_type: string | null;
+}
+

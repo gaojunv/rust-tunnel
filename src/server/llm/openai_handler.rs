@@ -69,16 +69,17 @@ pub async fn handle_chat_completions(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     // Validate API key
-    if super::auth::authenticate(&state.llm, &headers)
-        .await
-        .is_none()
-    {
-        return state.error_for_protocol(
-            StatusCode::UNAUTHORIZED,
-            "Invalid API key".into(),
-            "authentication_error",
-        );
-    }
+    let auth = match super::auth::authenticate(&state.llm, &headers).await {
+        Some(a) => a,
+        None => {
+            return state.error_for_protocol(
+                StatusCode::UNAUTHORIZED,
+                "Invalid API key".into(),
+                "authentication_error",
+            )
+        }
+    };
+    let (api_key_id, api_key_name) = auth;
 
     // Extract model name
     let model = match body.get("model").and_then(|v| v.as_str()) {
@@ -93,7 +94,7 @@ pub async fn handle_chat_completions(
     };
 
     // Resolve model → provider
-    let (provider, actual_model) = match resolve_model(&state.llm, &model).await {
+    let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
         Ok(r) => r,
         Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
     };
@@ -124,7 +125,7 @@ pub async fn handle_chat_completions(
     };
 
     let request = ChatCompletionRequest {
-        model: actual_model,
+        model: actual_model.clone(),
         messages,
         stream,
         max_tokens: body
@@ -144,9 +145,24 @@ pub async fn handle_chat_completions(
         tool_choice: body.get("tool_choice").cloned(),
     };
 
+    // 用量采集上下文
+    let ctx = super::usage::UsageContext {
+        api_key_id: Some(api_key_id),
+        api_key_name,
+        provider_id: Some(provider.id.clone()),
+        provider_name: provider.name.clone(),
+        model_id: Some(model_id),
+        model_name: actual_model,
+        requested_model: model,
+        protocol: "openai".into(),
+        stream,
+    };
+    let started = std::time::Instant::now();
+    let db = state.llm.db.clone();
+
     // Call upstream
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
-        Ok(resp) => resp,
+        Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
         Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
     }
 }

@@ -42,6 +42,9 @@ import {
   createLlmApiKey,
   toggleLlmApiKey,
   deleteLlmApiKey,
+  getLlmUsageSummary,
+  getLlmUsageAggregate,
+  getLlmUsageLogs,
 } from './client';
 import type {
   LoginRequest,
@@ -54,6 +57,7 @@ import type {
   CreateProviderRequest,
   CreateModelRequest,
   LlmGatewayConfig,
+  UsageGroupBy,
 } from '../types';
 
 // Shadowsocks hooks
@@ -479,5 +483,33 @@ export function useDeleteLlmApiKey() {
   return useMutation({
     mutationFn: (id: string) => deleteLlmApiKey(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
+}
+
+// ── Usage stats ──────────────────────────────────────────────
+
+interface UsageRange {
+  start: string;
+  end: string;
+}
+
+export function useLlmUsageSummary(range: UsageRange) {
+  return useQuery({
+    queryKey: ['llm-usage-summary', range.start, range.end],
+    queryFn: () => getLlmUsageSummary(range),
+  });
+}
+
+export function useLlmUsageAggregate(groupBy: UsageGroupBy, range: UsageRange) {
+  return useQuery({
+    queryKey: ['llm-usage-aggregate', groupBy, range.start, range.end],
+    queryFn: () => getLlmUsageAggregate(groupBy, range),
+  });
+}
+
+export function useLlmUsageLogs(range: UsageRange, limit = 50, offset = 0) {
+  return useQuery({
+    queryKey: ['llm-usage-logs', range.start, range.end, limit, offset],
+    queryFn: () => getLlmUsageLogs({ ...range, limit, offset }),
   });
 }

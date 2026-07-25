@@ -436,6 +436,56 @@ impl Database {
         // Migration: old DBs lack anthropic_base_url column on llm_providers.
         Self::migrate_llm_providers_add_anthropic_url(pool).await?;
 
+        // LLM usage logs table — one row per gateway request (usage stats).
+        // 冗余存 *_name 列，使 Key/模型/供应商删除后历史记录仍可读。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_usage_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                api_key_id TEXT,
+                api_key_name TEXT NOT NULL DEFAULT '',
+                provider_id TEXT,
+                provider_name TEXT NOT NULL DEFAULT '',
+                model_id TEXT,
+                model_name TEXT NOT NULL DEFAULT '',
+                requested_model TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT 'openai',
+                stream INTEGER NOT NULL DEFAULT 0,
+                status_code INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                error_type TEXT
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage_logs(timestamp)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_llm_usage_api_key ON llm_usage_logs(api_key_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_llm_usage_provider ON llm_usage_logs(provider_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage_logs(model_id)")
+            .execute(pool)
+            .await?;
+
         Ok(())
     }
 

@@ -39,6 +39,82 @@ pub struct LlmApiKeyRecord {
     pub last_used_at: Option<String>,
 }
 
+/// 一条 LLM 网关请求的用量日志。
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct LlmUsageLogRecord {
+    pub id: String,
+    pub timestamp: String,
+    pub api_key_id: Option<String>,
+    pub api_key_name: String,
+    pub provider_id: Option<String>,
+    pub provider_name: String,
+    pub model_id: Option<String>,
+    pub model_name: String,
+    pub requested_model: String,
+    pub protocol: String,
+    pub stream: i32,
+    pub status_code: i32,
+    pub success: i32,
+    pub prompt_tokens: i64,
+    pub cache_hit_tokens: i64,
+    pub cache_miss_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub latency_ms: i64,
+    pub error_type: Option<String>,
+}
+
+/// 待插入的用量日志（各标识可空——认证/路由失败时部分字段缺失）。
+#[derive(Debug, Clone, Default)]
+pub struct LlmUsageInsert {
+    pub api_key_id: Option<String>,
+    pub api_key_name: String,
+    pub provider_id: Option<String>,
+    pub provider_name: String,
+    pub model_id: Option<String>,
+    pub model_name: String,
+    pub requested_model: String,
+    pub protocol: String,
+    pub stream: bool,
+    pub status_code: i32,
+    pub success: bool,
+    pub prompt_tokens: i64,
+    pub cache_hit_tokens: i64,
+    pub cache_miss_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub latency_ms: i64,
+    pub error_type: Option<String>,
+}
+
+/// 一个聚合维度的用量汇总行。
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct LlmUsageAggregateRow {
+    /// 维度标识（api_key_id / model_id / provider_id）；可空表示未归类。
+    pub dimension_id: Option<String>,
+    /// 维度展示名（冗余存的 *_name）。
+    pub dimension_name: String,
+    pub requests: i64,
+    pub success: i64,
+    pub prompt_tokens: i64,
+    pub cache_hit_tokens: i64,
+    pub cache_miss_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// 时间范围内的用量总览。
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct LlmUsageSummary {
+    pub requests: i64,
+    pub success: i64,
+    pub prompt_tokens: i64,
+    pub cache_hit_tokens: i64,
+    pub cache_miss_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
 // ── Provider CRUD ─────────────────────────────────────────────
 
 impl Database {
@@ -286,6 +362,141 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    // ── Usage logs ────────────────────────────────────────────────
+
+    /// 插入一条用量日志。timestamp 由 DB 用 datetime('now') 填充（UTC）。
+    pub async fn llm_insert_usage_log(&self, u: &LlmUsageInsert) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO llm_usage_logs (
+                id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
+                model_id, model_name, requested_model, protocol, stream, status_code,
+                success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+                completion_tokens, total_tokens, latency_ms, error_type
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&u.api_key_id)
+        .bind(&u.api_key_name)
+        .bind(&u.provider_id)
+        .bind(&u.provider_name)
+        .bind(&u.model_id)
+        .bind(&u.model_name)
+        .bind(&u.requested_model)
+        .bind(&u.protocol)
+        .bind(u.stream as i32)
+        .bind(u.status_code)
+        .bind(u.success as i32)
+        .bind(u.prompt_tokens)
+        .bind(u.cache_hit_tokens)
+        .bind(u.cache_miss_tokens)
+        .bind(u.completion_tokens)
+        .bind(u.total_tokens)
+        .bind(u.latency_ms)
+        .bind(&u.error_type)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 时间范围内的用量总览。
+    pub async fn llm_usage_summary(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<LlmUsageSummary, sqlx::Error> {
+        sqlx::query_as::<_, LlmUsageSummary>(
+            r#"
+            SELECT
+                COUNT(*) AS requests,
+                COALESCE(SUM(success), 0) AS success,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit_tokens,
+                COALESCE(SUM(cache_miss_tokens), 0) AS cache_miss_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM llm_usage_logs
+            WHERE timestamp >= ? AND timestamp <= ?
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// 按维度聚合用量。`group_by ∈ {"api_key", "model", "provider"}`。
+    pub async fn llm_aggregate_usage(
+        &self,
+        start: &str,
+        end: &str,
+        group_by: &str,
+    ) -> Result<Vec<LlmUsageAggregateRow>, sqlx::Error> {
+        // 列名不能参数化，白名单映射避免 SQL 注入。
+        let (id_col, name_col) = match group_by {
+            "model" => ("model_id", "model_name"),
+            "provider" => ("provider_id", "provider_name"),
+            _ => ("api_key_id", "api_key_name"),
+        };
+        let sql = format!(
+            r#"
+            SELECT
+                {id_col} AS dimension_id,
+                COALESCE(MAX({name_col}), '') AS dimension_name,
+                COUNT(*) AS requests,
+                COALESCE(SUM(success), 0) AS success,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit_tokens,
+                COALESCE(SUM(cache_miss_tokens), 0) AS cache_miss_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens
+            FROM llm_usage_logs
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY {id_col}
+            ORDER BY total_tokens DESC
+            "#
+        );
+        sqlx::query_as::<_, LlmUsageAggregateRow>(&sql)
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// 分页明细日志（按时间倒序）。
+    pub async fn llm_query_usage_logs(
+        &self,
+        start: &str,
+        end: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<LlmUsageLogRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmUsageLogRecord>(
+            r#"
+            SELECT * FROM llm_usage_logs
+            WHERE timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// 删除早于 `before`（ISO 8601 字符串）的用量日志，返回删除行数。
+    pub async fn cleanup_old_llm_usage_logs(&self, before: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM llm_usage_logs WHERE timestamp < ?")
+            .bind(before)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +711,110 @@ mod tests {
         // Delete
         db.llm_delete_api_key(&id).await.unwrap();
         assert!(db.llm_list_api_keys().await.unwrap().is_empty());
+    }
+
+    // ── Usage logs ────────────────────────────────────────────────
+
+    use super::LlmUsageInsert;
+
+    fn sample_usage(model: &str, prompt: i64, cache_hit: i64, completion: i64) -> LlmUsageInsert {
+        LlmUsageInsert {
+            api_key_id: Some("k1".into()),
+            api_key_name: "Cursor".into(),
+            provider_id: Some("p1".into()),
+            provider_name: "DeepSeek".into(),
+            model_id: Some("m1".into()),
+            model_name: model.into(),
+            requested_model: "fast".into(),
+            protocol: "openai".into(),
+            stream: false,
+            status_code: 200,
+            success: true,
+            prompt_tokens: prompt,
+            cache_hit_tokens: cache_hit,
+            cache_miss_tokens: prompt - cache_hit,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            latency_ms: 123,
+            error_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_usage_insert_summary_and_logs() {
+        let (db, _tmp) = fresh_db().await;
+
+        db.llm_insert_usage_log(&sample_usage("deepseek-chat", 100, 30, 50))
+            .await
+            .unwrap();
+        db.llm_insert_usage_log(&sample_usage("deepseek-chat", 200, 0, 80))
+            .await
+            .unwrap();
+
+        let full = ("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+        let summary = db.llm_usage_summary(full.0, full.1).await.unwrap();
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.success, 2);
+        assert_eq!(summary.prompt_tokens, 300);
+        assert_eq!(summary.cache_hit_tokens, 30);
+        assert_eq!(summary.cache_miss_tokens, 270);
+        assert_eq!(summary.completion_tokens, 130);
+        assert_eq!(summary.total_tokens, 430);
+
+        let logs = db.llm_query_usage_logs(full.0, full.1, 10, 0).await.unwrap();
+        assert_eq!(logs.len(), 2);
+
+        // 分页
+        let page = db.llm_query_usage_logs(full.0, full.1, 1, 0).await.unwrap();
+        assert_eq!(page.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_usage_aggregate_by_dimensions() {
+        let (db, _tmp) = fresh_db().await;
+        db.llm_insert_usage_log(&sample_usage("deepseek-chat", 100, 20, 50))
+            .await
+            .unwrap();
+        db.llm_insert_usage_log(&sample_usage("deepseek-chat", 100, 20, 50))
+            .await
+            .unwrap();
+
+        let full = ("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
+
+        for dim in ["api_key", "model", "provider"] {
+            let rows = db.llm_aggregate_usage(full.0, full.1, dim).await.unwrap();
+            assert_eq!(rows.len(), 1, "dim {dim} should collapse to one group");
+            assert_eq!(rows[0].requests, 2);
+            assert_eq!(rows[0].total_tokens, 300);
+            assert_eq!(rows[0].cache_hit_tokens, 40);
+            assert!(!rows[0].dimension_name.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_usage_cleanup_old_logs() {
+        let (db, _tmp) = fresh_db().await;
+        // 手工插入一条 timestamp 很旧的记录
+        sqlx::query(
+            "INSERT INTO llm_usage_logs (id, timestamp, protocol) VALUES ('old', '2000-01-01T00:00:00Z', 'openai')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.llm_insert_usage_log(&sample_usage("m", 10, 0, 5))
+            .await
+            .unwrap();
+
+        let deleted = db
+            .cleanup_old_llm_usage_logs("2020-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
     }
 }

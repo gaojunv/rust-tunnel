@@ -30,6 +30,10 @@ import type {
   LlmApiKey,
   CreateApiKeyResponse,
   LlmGatewayConfig,
+  LlmUsageSummary,
+  LlmUsageAggregateRow,
+  LlmUsageLog,
+  UsageGroupBy,
 } from '../types';
 
 const API_BASE = '/api';
@@ -365,3 +369,33 @@ export async function toggleLlmApiKey(id: string, enabled: boolean): Promise<voi
 export async function deleteLlmApiKey(id: string): Promise<void> {
   await api.delete(`/llm/api-keys/${id}`);
 }
+
+// ── Usage stats ──────────────────────────────────────────────
+
+interface UsageRangeParams {
+  start?: string;
+  end?: string;
+}
+
+export async function getLlmUsageSummary(params: UsageRangeParams): Promise<LlmUsageSummary> {
+  const { data } = await api.get('/llm/usage/summary', { params });
+  return data.summary;
+}
+
+export async function getLlmUsageAggregate(
+  groupBy: UsageGroupBy,
+  params: UsageRangeParams
+): Promise<LlmUsageAggregateRow[]> {
+  const { data } = await api.get('/llm/usage/aggregate', {
+    params: { ...params, group_by: groupBy },
+  });
+  return data.rows;
+}
+
+export async function getLlmUsageLogs(
+  params: UsageRangeParams & { limit?: number; offset?: number }
+): Promise<LlmUsageLog[]> {
+  const { data } = await api.get('/llm/usage/logs', { params });
+  return data.logs;
+}
+

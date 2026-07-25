@@ -328,6 +328,10 @@ pub async fn run_api_server(
             "/api/llm/api-keys/:id",
             patch(llm::toggle_api_key).delete(llm::delete_api_key),
         )
+        // LLM usage statistics
+        .route("/api/llm/usage/summary", get(llm::get_usage_summary))
+        .route("/api/llm/usage/aggregate", get(llm::get_usage_aggregate))
+        .route("/api/llm/usage/logs", get(llm::get_usage_logs))
         // Settings endpoints
         .route("/api/settings", get(settings::get_settings))
         .route(

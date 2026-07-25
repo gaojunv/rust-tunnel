@@ -24,11 +24,11 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 /// Resolve a model name (or alias) to a ProviderConfig with the actual model_name.
-/// Returns (provider, actual_model_name) or a typed error.
+/// Returns (provider, actual_model_name, model_id) or a typed error.
 pub async fn resolve_model(
     state: &LlmState,
     model: &str,
-) -> Result<(ProviderConfig, String), ResolveError> {
+) -> Result<(ProviderConfig, String, String), ResolveError> {
     let db = state
         .db
         .as_ref()
@@ -69,7 +69,7 @@ pub async fn resolve_model(
         updated_at: provider_record.updated_at,
     };
 
-    Ok((provider, model_record.model_name))
+    Ok((provider, model_record.model_name, model_record.id))
 }
 
 /// 把路由解析错误转成 HTTP 响应。
@@ -192,8 +192,9 @@ mod tests {
         assert!(stored.api_key.starts_with("enc:v1:"));
 
         let state = LlmState::new(Some(db), Some(cipher));
-        let (provider, model) = resolve_model(&state, "deepseek-chat").await.unwrap();
+        let (provider, model, model_id) = resolve_model(&state, "deepseek-chat").await.unwrap();
         assert_eq!(model, "deepseek-chat");
+        assert_eq!(model_id, mid);
         assert_eq!(
             provider.api_key, "sk-real-upstream-key",
             "resolve 应解密出明文 key"
@@ -231,7 +232,7 @@ mod tests {
                 [9u8; 32],
             )),
         );
-        let (provider, _) = resolve_model(&state, "deepseek-chat").await.unwrap();
+        let (provider, _, _) = resolve_model(&state, "deepseek-chat").await.unwrap();
         assert_eq!(provider.api_key, "sk-plain");
     }
 

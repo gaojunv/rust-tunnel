@@ -6,6 +6,7 @@ pub mod openai_handler;
 pub mod provider;
 pub mod router;
 pub mod upstream;
+pub mod usage;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

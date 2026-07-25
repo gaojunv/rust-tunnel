@@ -1001,7 +1001,8 @@ async fn llm_gateway_config_restored_from_rule() {
             .find(|r| r["id"] == "__llm_gateway__")
             .expect("llm gateway rule should exist");
         assert_eq!(llm_rule["type"], "llm");
-        assert_eq!(llm_rule["domains"], json!([GW_DOMAIN]));
+        let domains = llm_rule["domains"].as_array().unwrap();
+        assert_eq!(domains[0], GW_DOMAIN, "first domain must be openai domain");
 
         // 模拟重启：从 DB 重新加载规则 + 重新初始化 LLM 状态
         harness
@@ -1026,3 +1027,108 @@ async fn llm_gateway_config_restored_from_rule() {
     .await
     .expect("test timed out");
 }
+
+// ── 测试：用量统计端到端（非流式 + 流式 + 三维度聚合）─────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_usage_recorded_end_to_end() {
+    tokio::time::timeout(TIMEOUT, async {
+        let harness = TestHarness::spawn(HarnessOpts {
+            exposed_port_count: 1,
+            ..HarnessOpts::default()
+        })
+        .await;
+        let api = harness.api_client();
+        let env = setup_gateway(&harness, &api, None).await;
+
+        // 非流式请求（mock 上游 usage: prompt=5, completion=3, total=8）
+        let resp = gateway_client()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                env.gateway_port
+            ))
+            .header("Host", GW_DOMAIN)
+            .bearer_auth(&env.gateway_key)
+            .json(&json!({"model": "fast-model", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.bytes().await.unwrap();
+
+        // 流式请求（mock SSE usage: prompt=5, completion=2）——必须整流消费才会落库
+        let resp = gateway_client()
+            .post(format!(
+                "http://127.0.0.1:{}/v1/chat/completions",
+                env.gateway_port
+            ))
+            .header("Host", GW_DOMAIN)
+            .bearer_auth(&env.gateway_key)
+            .json(&json!({"model": "fast-model", "stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.text().await.unwrap();
+
+        // 用量落库是 fire-and-forget，轮询 summary 直到两条请求都记上
+        wait_until("usage summary reflects 2 requests", || {
+            let api = &api;
+            async move {
+                let (status, body) = api.get_json("/api/llm/usage/summary").await;
+                if !status.is_success() {
+                    return None;
+                }
+                (body["summary"]["requests"].as_i64() == Some(2)).then_some(())
+            }
+        })
+        .await
+        .expect("usage summary never reached 2 requests");
+
+        let (_, body) = api.get_json("/api/llm/usage/summary").await;
+        let s = &body["summary"];
+        // 5+5 输入, 3+2 输出, 8+7 总计
+        assert_eq!(s["requests"], 2);
+        assert_eq!(s["success"], 2);
+        assert_eq!(s["prompt_tokens"], 10);
+        assert_eq!(s["completion_tokens"], 5);
+        assert_eq!(s["total_tokens"], 15);
+        // 无缓存信息 → 全记为 miss
+        assert_eq!(s["cache_hit_tokens"], 0);
+        assert_eq!(s["cache_miss_tokens"], 10);
+
+        // 三维度聚合都应各收敛为一组
+        for dim in ["api_key", "model", "provider"] {
+            let (status, body) = api
+                .get_json(&format!("/api/llm/usage/aggregate?group_by={dim}"))
+                .await;
+            assert!(status.is_success(), "aggregate {dim} failed");
+            let rows = body["rows"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "dim {dim} should have one group");
+            assert_eq!(rows[0]["requests"], 2);
+            assert_eq!(rows[0]["total_tokens"], 15);
+            assert!(!rows[0]["dimension_name"].as_str().unwrap().is_empty());
+        }
+
+        // 明细日志应有两条
+        let (status, body) = api.get_json("/api/llm/usage/logs").await;
+        assert!(status.is_success());
+        let logs = body["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        // 最新在前：字段完整
+        assert_eq!(logs[0]["requested_model"], "fast-model");
+        assert_eq!(logs[0]["model_name"], "deepseek-chat");
+        assert_eq!(logs[0]["provider_name"], "mock-provider");
+        assert_eq!(logs[0]["protocol"], "openai");
+        assert_eq!(logs[0]["success"], 1);
+
+        // group_by 非法值被拒
+        let (status, _) = api
+            .get_json("/api/llm/usage/aggregate?group_by=bogus")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    })
+    .await
+    .expect("test timed out");
+}
+

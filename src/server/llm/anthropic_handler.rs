@@ -267,16 +267,17 @@ pub async fn handle_messages(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     // Validate API key
-    if super::auth::authenticate(&state.llm, &headers)
-        .await
-        .is_none()
-    {
-        return state.error_for_protocol(
-            StatusCode::UNAUTHORIZED,
-            "Invalid API key".into(),
-            "authentication_error",
-        );
-    }
+    let auth = match super::auth::authenticate(&state.llm, &headers).await {
+        Some(a) => a,
+        None => {
+            return state.error_for_protocol(
+                StatusCode::UNAUTHORIZED,
+                "Invalid API key".into(),
+                "authentication_error",
+            )
+        }
+    };
+    let (api_key_id, api_key_name) = auth;
 
     // 提取 model 名用于路由解析
     let model = match body.get("model").and_then(|v| v.as_str()) {
@@ -291,12 +292,27 @@ pub async fn handle_messages(
     };
 
     // Resolve model → provider
-    let (provider, actual_model) = match resolve_model(&state.llm, &model).await {
+    let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
         Ok(r) => r,
         Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
     };
 
     let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // 用量采集上下文
+    let ctx = super::usage::UsageContext {
+        api_key_id: Some(api_key_id),
+        api_key_name,
+        provider_id: Some(provider.id.clone()),
+        provider_name: provider.name.clone(),
+        model_id: Some(model_id),
+        model_name: actual_model.clone(),
+        requested_model: model,
+        protocol: "anthropic".into(),
+        stream: is_stream,
+    };
+    let started = std::time::Instant::now();
+    let db = state.llm.db.clone();
 
     // ── 直通路径：provider 配置了 anthropic_base_url ──
     if let Some(ref anthropic_url) = provider.anthropic_base_url {
@@ -313,7 +329,7 @@ pub async fn handle_messages(
         )
         .await
         {
-            Ok(resp) => resp,
+            Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
             Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
         };
     }
@@ -329,10 +345,14 @@ pub async fn handle_messages(
 
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
+            // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
+            // 非流式整体转换会消费 body，因此这里在转换后再包一层。
             if !request.stream {
-                convert_openai_to_anthropic_response(resp).await
+                let converted = convert_openai_to_anthropic_response(resp).await;
+                super::usage::wrap_and_record(converted, ctx, db, started).await
             } else {
-                convert_openai_stream_to_anthropic(resp)
+                let converted = convert_openai_stream_to_anthropic(resp);
+                super::usage::wrap_and_record(converted, ctx, db, started).await
             }
         }
         Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),

@@ -123,6 +123,11 @@ pub async fn call_upstream(
     if let Some(choice) = &request.tool_choice {
         req_body["tool_choice"] = choice.clone();
     }
+    // 流式请求注入 stream_options.include_usage=true：OpenAI 系上游（火山/Kimi/Mimo）
+    // 默认流式不返回 usage，注入后才会在末尾 chunk 附带；DeepSeek 默认返回，注入无副作用。
+    if request.stream {
+        req_body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
 
     let req = client
         .post(&url)
