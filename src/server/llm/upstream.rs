@@ -18,10 +18,21 @@ use super::ChatCompletionRequest;
 ///   error.
 /// - No global `timeout` — streaming LLM responses can legitimately take minutes;
 ///   the upstream provider enforces its own deadline.
+///
+/// HTTP/1.1 is forced (not HTTP/2) for two reasons:
+/// 1. **read_timeout accuracy**: reqwest's `read_timeout` resets on every frame,
+///    including HTTP/2 PING frames. Upstream providers that send h2 pings during
+///    long generations would prevent the read timeout from ever firing, masking
+///    a genuinely hung connection. HTTP/1.1 has no such pings.
+/// 2. **Upstream compatibility**: Some LLM provider gateways have aggressive
+///    idle timeouts (~120 s) on HTTP/2 connections. HTTP/1.1 with TCP keepalive
+///    is more resilient to these middlebox timeouts.
 static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
+        .http1_only()
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
         .pool_max_idle_per_host(10)
         .build()
         .expect("failed to build upstream HTTP client")
@@ -171,6 +182,10 @@ pub async fn call_upstream(
 }
 
 /// Relay a streaming (SSE) upstream response to the client.
+///
+/// 当上游连接意外断开（如 LLM 服务商网关 idle timeout），向客户端发送一个
+/// OpenAI 风格的 SSE error chunk 再正常关闭流，而不是让 hyper 在中途截断响应
+/// （客户端收到 "Connection closed mid-response"）。
 async fn relay_upstream_stream(resp: reqwest::Response) -> Result<Response, (StatusCode, String)> {
     let byte_stream = resp.bytes_stream().map(|result| {
         result
