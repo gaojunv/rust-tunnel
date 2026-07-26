@@ -26,7 +26,10 @@ describe('ParticleTitle', () => {
     mockMatchMedia(false);
   });
 
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it('renders a canvas with img role + aria-label and sr-only text when particles are available', () => {
     render(<ParticleTitle text="Clients" />);
@@ -49,5 +52,14 @@ describe('ParticleTitle', () => {
     expect(screen.queryByRole('img')).toBeNull();
     const span = container.querySelector('span.text-gradient');
     expect(span).toBeTruthy();
+  });
+
+  it('respects prefers-reduced-motion: draws one frame without starting rAF loop', () => {
+    vi.stubGlobal('requestAnimationFrame', vi.fn());
+    mockMatchMedia(true);
+    render(<ParticleTitle text="Clients" />);
+    const canvas = screen.getByRole('img', { name: 'Clients' });
+    expect(canvas.tagName).toBe('CANVAS');
+    expect(window.requestAnimationFrame).not.toHaveBeenCalled();
   });
 });
