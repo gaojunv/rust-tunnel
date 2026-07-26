@@ -51,6 +51,7 @@
     "tailwindcss": "^3.4.1",
     "typescript": "^5.2.2",
     "vite": "^5.2.0",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "vitest-canvas-mock": "^1.1.4"
   }
 }
