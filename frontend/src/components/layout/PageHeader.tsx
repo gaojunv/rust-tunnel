@@ -1,4 +1,5 @@
 import { cn } from '@/lib/utils';
+import { ParticleTitle } from '@/components/shared/ParticleTitle';
 
 interface PageHeaderProps {
   title: string;
@@ -29,7 +30,9 @@ export function PageHeader({ title, description, children, className }: PageHead
       </div>
 
       <div className="relative">
-        <h1 className="text-2xl font-bold tracking-tight text-gradient">{title}</h1>
+        <h1 className="text-2xl font-bold tracking-tight">
+          <ParticleTitle text={title} />
+        </h1>
         {description && <p className="text-muted-foreground">{description}</p>}
       </div>
       {children && <div className="relative flex items-center gap-2">{children}</div>}
