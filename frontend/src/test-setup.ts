@@ -29,8 +29,8 @@ class MockTextMetrics implements TextMetrics {
 }
 
 // ---- Minimal ImageData -----------------------------------------------------
-class MockImageData implements ImageData {
-  readonly data: Uint8ClampedArray;
+class MockImageData {
+  readonly data: Uint8ClampedArray<ArrayBuffer>;
   readonly width: number;
   readonly height: number;
   readonly colorSpace: PredefinedColorSpace = 'srgb';
@@ -138,7 +138,7 @@ class MockContext {
     });
   }
 
-  getImageData(x: number, y: number, w: number, h: number): ImageData {
+  getImageData(_x: number, _y: number, w: number, h: number): ImageData {
     const imageData = new MockImageData(w, h);
     const { data } = imageData;
 
@@ -172,7 +172,7 @@ class MockContext {
       }
     }
 
-    return imageData;
+    return imageData as unknown as ImageData;
   }
 
   // ---- Everything else is a no-op -----------------------------------------
@@ -222,9 +222,9 @@ class MockContext {
   createImageData(_imagedata: ImageData): ImageData;
   createImageData(sw: number | ImageData, sh?: number): ImageData {
     if (typeof sw === 'number') {
-      return new MockImageData(sw, sh ?? 0);
+      return new MockImageData(sw, sh ?? 0) as unknown as ImageData;
     }
-    return new MockImageData(sw.width, sw.height);
+    return new MockImageData(sw.width, sw.height) as unknown as ImageData;
   }
   putImageData(
     _imageData: ImageData, _dx: number, _dy: number,
@@ -254,7 +254,7 @@ class MockContext {
     return { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 } as unknown as DOMMatrix;
   }
   getContextAttributes(): CanvasRenderingContext2DSettings {
-    return { alpha: true, willReadFrequently: false };
+    return { alpha: true, willReadFrequently: true };
   }
   roundRect(_x: number, _y: number, _w: number, _h: number, _radii?: number | DOMPointInit | (number | DOMPointInit)[]): void {}
   // Legacy Canvas 2D methods
@@ -301,7 +301,7 @@ if (typeof HTMLCanvasElement !== 'undefined') {
     }
     // Fall back to original for other context types (e.g. webgl)
     return origGetContext.call(this, contextId as Parameters<typeof origGetContext>[0]);
-  };
+  } as unknown as HTMLCanvasElement['getContext'];
 }
 
 // ---- Expose for vitest-canvas-mock compatible API --------------------------

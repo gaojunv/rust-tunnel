@@ -24,7 +24,7 @@ export function sampleTextParticles(text: string, opts: SampleOptions = {}): Tex
   const font = `700 ${fontSizePx * dpr}px ui-sans-serif, system-ui, sans-serif`;
 
   const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return [];
 
   ctx.font = font;
