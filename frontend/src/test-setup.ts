@@ -43,10 +43,7 @@ class MockImageData implements ImageData {
 }
 
 // ---- Minimal CanvasRenderingContext2D mock ----------------------------------
-class MockContext implements CanvasRenderingContext2D {
-  // Satisfy the CanvasRenderingContext2D interface with no-ops
-  [key: string]: unknown;
-
+class MockContext {
   private _canvas: HTMLCanvasElement;
   private _font = '10px sans-serif';
   private _fillStyle: string | CanvasGradient | CanvasPattern = '#000';
@@ -290,20 +287,22 @@ class MockContext implements CanvasRenderingContext2D {
   commit(): void {}
 }
 
-// ---- Hook into HTMLCanvasElement -------------------------------------------
-const origGetContext = HTMLCanvasElement.prototype.getContext;
+// ---- Hook into HTMLCanvasElement (only in jsdom environment) -----------------
+if (typeof HTMLCanvasElement !== 'undefined') {
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
 
-HTMLCanvasElement.prototype.getContext = function (
-  this: HTMLCanvasElement,
-  contextId: string,
-  _options?: unknown,
-): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | ImageBitmapRenderingContext | WebGLRenderingContext | WebGL2RenderingContext | null {
-  if (contextId === '2d') {
-    return new MockContext(this) as unknown as CanvasRenderingContext2D;
-  }
-  // Fall back to original for other context types (e.g. webgl)
-  return origGetContext.call(this, contextId as Parameters<typeof origGetContext>[0]);
-};
+  HTMLCanvasElement.prototype.getContext = function (
+    this: HTMLCanvasElement,
+    contextId: string,
+    _options?: unknown,
+  ): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | ImageBitmapRenderingContext | WebGLRenderingContext | WebGL2RenderingContext | null {
+    if (contextId === '2d') {
+      return new MockContext(this) as unknown as CanvasRenderingContext2D;
+    }
+    // Fall back to original for other context types (e.g. webgl)
+    return origGetContext.call(this, contextId as Parameters<typeof origGetContext>[0]);
+  };
+}
 
 // ---- Expose for vitest-canvas-mock compatible API --------------------------
 export {};

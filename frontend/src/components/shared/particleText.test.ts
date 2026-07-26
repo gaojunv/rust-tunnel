@@ -35,4 +35,24 @@ describe('sampleTextParticles', () => {
       expect(Number.isFinite(p.homeY)).toBe(true);
     }
   });
+
+  it('produces particles in CSS pixel coordinates when dpr > 1', () => {
+    const fontSizePx = 24;
+    const step = 3;
+    const dpr = 2;
+    const text = 'Dashboard';
+    const particles = sampleTextParticles(text, { fontSizePx, step, dpr });
+    // Must still detect particles
+    expect(particles.length).toBeGreaterThan(0);
+    // Output coordinates are CSS pixels (divided by dpr), not physical pixels.
+    // With dpr=2, the physical canvas is 2x but output coords are halved.
+    const maxCssWidth = Math.ceil(fontSizePx * text.length * 0.6) + fontSizePx;
+    const maxCssHeight = Math.ceil(fontSizePx * 1.4) + fontSizePx;
+    for (const p of particles) {
+      expect(p.homeX).toBeLessThanOrEqual(maxCssWidth);
+      expect(p.homeY).toBeLessThanOrEqual(maxCssHeight);
+      expect(Number.isFinite(p.homeX)).toBe(true);
+      expect(Number.isFinite(p.homeY)).toBe(true);
+    }
+  });
 });
