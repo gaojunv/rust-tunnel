@@ -185,9 +185,7 @@ async fn setup_gateway(
     if let Some(ad) = anthropic_domain {
         gw_body["anthropic_domain"] = json!(ad);
     }
-    let (status, body) = api
-        .put_json("/api/llm/gateway", gw_body)
-        .await;
+    let (status, body) = api.put_json("/api/llm/gateway", gw_body).await;
     assert!(status.is_success(), "PUT gateway failed: {status} {body}");
 
     // Provider（base_url 指向 mock 上游）
@@ -1131,4 +1129,3 @@ async fn llm_usage_recorded_end_to_end() {
     .await
     .expect("test timed out");
 }
-

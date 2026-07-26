@@ -39,7 +39,6 @@ pub async fn handle_list_models(
     State(state): State<LlmHandlerState>,
     headers: HeaderMap,
 ) -> Response {
-
     // Validate API key
     if super::auth::authenticate(&state.llm, &headers)
         .await
@@ -72,11 +71,19 @@ pub async fn handle_chat_completions(
     let auth = match super::auth::authenticate(&state.llm, &headers).await {
         Some(a) => a,
         None => {
+            // 记录认证失败
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    protocol: "openai".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
+            }
             return state.error_for_protocol(
                 StatusCode::UNAUTHORIZED,
                 "Invalid API key".into(),
                 "authentication_error",
-            )
+            );
         }
     };
     let (api_key_id, api_key_name) = auth;
@@ -85,18 +92,41 @@ pub async fn handle_chat_completions(
     let model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
+            // 记录请求错误（缺少 model）
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: api_key_name.clone(),
+                    protocol: "openai".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
+            }
             return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "model is required".into(),
                 "invalid_request_error",
-            )
+            );
         }
     };
 
     // Resolve model → provider
     let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
         Ok(r) => r,
-        Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
+        Err(e) => {
+            // 记录路由失败到用量日志
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: api_key_name.clone(),
+                    requested_model: model.clone(),
+                    protocol: "openai".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 404, "model_resolution_error", std::time::Instant::now());
+            }
+            return super::router::resolve_error_response(&state.llm, e).await;
+        }
     };
 
     // Build unified request
@@ -108,19 +138,49 @@ pub async fn handle_chat_completions(
         Some(msgs) => match serde_json::from_value(msgs.clone()) {
             Ok(m) => m,
             Err(e) => {
+                // 记录请求解析错误
+                if let Some(ref db) = state.llm.db {
+                    let ctx = super::usage::UsageContext {
+                        api_key_id: Some(api_key_id.clone()),
+                        api_key_name: api_key_name.clone(),
+                        provider_id: Some(provider.id.clone()),
+                        provider_name: provider.name.clone(),
+                        model_id: Some(model_id.clone()),
+                        model_name: actual_model.clone(),
+                        requested_model: model.clone(),
+                        protocol: "openai".into(),
+                        stream,
+                    };
+                    ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
+                }
                 return state.error_for_protocol(
                     StatusCode::BAD_REQUEST,
                     format!("invalid messages: {}", e),
                     "invalid_request_error",
-                )
+                );
             }
         },
         None => {
+            // 记录请求错误（缺少 messages）
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: api_key_name.clone(),
+                    provider_id: Some(provider.id.clone()),
+                    provider_name: provider.name.clone(),
+                    model_id: Some(model_id.clone()),
+                    model_name: actual_model.clone(),
+                    requested_model: model.clone(),
+                    protocol: "openai".into(),
+                    stream,
+                };
+                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
+            }
             return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "messages is required".into(),
                 "invalid_request_error",
-            )
+            );
         }
     };
 
@@ -138,10 +198,7 @@ pub async fn handle_chat_completions(
             .map(|v| v as f32),
         top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
         // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
-        tools: body
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .cloned(),
+        tools: body.get("tools").and_then(|v| v.as_array()).cloned(),
         tool_choice: body.get("tool_choice").cloned(),
     };
 
@@ -163,7 +220,13 @@ pub async fn handle_chat_completions(
     // Call upstream
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
-        Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
+        Err((status, msg)) => {
+            // 记录失败请求到用量日志，确保请求明细中可见
+            if let Some(ref db) = db {
+                ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+            }
+            state.error_for_protocol(status, msg, "upstream_error")
+        }
     }
 }
 
@@ -301,5 +364,123 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── 失败请求记录到 usage log 的验证 ──────────────────────────
+
+    /// 认证失败必须写入一条 failure 记录到 llm_usage_logs。
+    #[tokio::test]
+    async fn test_auth_failure_is_logged() {
+        let (state, _key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap(); // clone before state is consumed
+
+        let resp = handle_chat_completions(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: None,
+            }),
+            HeaderMap::new(),
+            Json(serde_json::json!({"model": "deepseek-chat", "messages": []})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // fire-and-forget 写入是异步的，稍等一下
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "认证失败应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 401);
+        assert_eq!(logs[0].error_type.as_deref(), Some("authentication_error"));
+    }
+
+    /// 模型未找到必须写入一条 failure 记录到 llm_usage_logs。
+    #[tokio::test]
+    async fn test_model_not_found_is_logged() {
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+
+        let resp = handle_chat_completions(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: None,
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "nonexistent-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "模型未找到应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 404);
+        assert_eq!(
+            logs[0].error_type.as_deref(),
+            Some("model_resolution_error")
+        );
+    }
+
+    /// 上游连接失败（不可达地址）必须写入一条 failure 记录。
+    #[tokio::test]
+    async fn test_upstream_failure_is_logged() {
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+
+        // 把 provider base_url 改为不可达地址，触发上游连接失败 → 502
+        let providers = db.llm_list_providers().await.unwrap();
+        let pid = &providers[0].id;
+        db.llm_save_provider(
+            pid,
+            "DS",
+            "deepseek",
+            "http://127.0.0.1:1", // 没人监听的端口
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_chat_completions(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: None,
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "上游连接失败应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 502);
+        assert_eq!(logs[0].error_type.as_deref(), Some("upstream_error"));
+        // 路由成功的记录应包含 provider/model 标识
+        assert_eq!(logs[0].provider_name, "DS");
+        assert_eq!(logs[0].model_name, "deepseek-chat");
     }
 }

@@ -77,8 +77,7 @@ fn sanitize_error_message(body: &str) -> String {
         }
 
         // ── Check for `sk-` followed by alphanumeric ──
-        if pos + 3 <= n && bytes[pos] == b's' && bytes[pos + 1] == b'k' && bytes[pos + 2] == b'-'
-        {
+        if pos + 3 <= n && bytes[pos] == b's' && bytes[pos + 1] == b'k' && bytes[pos + 2] == b'-' {
             let mut key_end = pos + 3;
             while key_end < n && bytes[key_end].is_ascii_alphanumeric() && key_end - pos <= 67 {
                 key_end += 1;
@@ -294,11 +293,7 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
 }
 
 /// Build an Anthropic-format error response for Anthropic-protocol domains.
-pub fn error_response_anthropic(
-    status: StatusCode,
-    message: String,
-    error_type: &str,
-) -> Response {
+pub fn error_response_anthropic(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
         "error": {
@@ -353,9 +348,8 @@ mod tests {
             "invalid_request_error",
         );
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = rt.block_on(async {
-            axum::body::to_bytes(resp.into_body(), 1024).await.unwrap()
-        });
+        let body =
+            rt.block_on(async { axum::body::to_bytes(resp.into_body(), 1024).await.unwrap() });
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["type"], "error"); // Anthropic top-level type
         assert_eq!(v["error"]["type"], "invalid_request_error");
@@ -426,7 +420,7 @@ mod tests {
     #[test]
     fn sanitize_truncation_is_utf8_safe() {
         // Build a string where byte 500 falls inside a multi-byte character
-        let mut s = String::from("a".repeat(499));
+        let mut s = "a".repeat(499);
         s.push('\u{4E2D}'); // 3-byte char at position 499
         s.push_str("end");
         let result = sanitize_error_message(&s);
@@ -462,8 +456,7 @@ mod tests {
 
     #[test]
     fn sanitize_handles_multiple_keys() {
-        let input =
-            "Key sk-aaa111bbb222 and Bearer token123456789 for endpoint";
+        let input = "Key sk-aaa111bbb222 and Bearer token123456789 for endpoint";
         let result = sanitize_error_message(input);
         assert!(!result.contains("sk-aaa111bbb222"));
         assert!(!result.contains("token123456789"));

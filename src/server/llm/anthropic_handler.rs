@@ -52,7 +52,8 @@ fn parse_anthropic_content(content: &Value) -> ParsedContent {
                         let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                        let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                        let arguments =
+                            serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                         tool_uses.push(json!({
                             "id": id,
                             "type": "function",
@@ -154,9 +155,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         .ok_or("model is required")?;
 
     let messages_raw = body.get("messages").ok_or("messages is required")?;
-    let raw_arr = messages_raw
-        .as_array()
-        .ok_or("messages must be an array")?;
+    let raw_arr = messages_raw.as_array().ok_or("messages must be an array")?;
 
     let mut all_messages: Vec<ChatMessage> = Vec::new();
 
@@ -237,7 +236,9 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         .map(|arr| anthropic_tools_to_openai(arr.as_slice()))
         .filter(|v| !v.is_empty());
 
-    let tool_choice = body.get("tool_choice").and_then(anthropic_tool_choice_to_openai);
+    let tool_choice = body
+        .get("tool_choice")
+        .and_then(anthropic_tool_choice_to_openai);
 
     Ok(ChatCompletionRequest {
         model: anthropic_model.to_string(),
@@ -270,11 +271,19 @@ pub async fn handle_messages(
     let auth = match super::auth::authenticate(&state.llm, &headers).await {
         Some(a) => a,
         None => {
+            // 记录认证失败
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    protocol: "anthropic".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
+            }
             return state.error_for_protocol(
                 StatusCode::UNAUTHORIZED,
                 "Invalid API key".into(),
                 "authentication_error",
-            )
+            );
         }
     };
     let (api_key_id, api_key_name) = auth;
@@ -283,21 +292,47 @@ pub async fn handle_messages(
     let model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
+            // 记录请求错误（缺少 model）
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: api_key_name.clone(),
+                    protocol: "anthropic".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
+            }
             return state.error_for_protocol(
                 StatusCode::BAD_REQUEST,
                 "model is required".into(),
                 "invalid_request_error",
-            )
+            );
         }
     };
 
     // Resolve model → provider
     let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
         Ok(r) => r,
-        Err(e) => return super::router::resolve_error_response(&state.llm, e).await,
+        Err(e) => {
+            // 记录路由失败到用量日志
+            if let Some(ref db) = state.llm.db {
+                let ctx = super::usage::UsageContext {
+                    api_key_id: Some(api_key_id.clone()),
+                    api_key_name: api_key_name.clone(),
+                    requested_model: model.clone(),
+                    protocol: "anthropic".into(),
+                    ..Default::default()
+                };
+                ctx.record_failure(db, 404, "model_resolution_error", std::time::Instant::now());
+            }
+            return super::router::resolve_error_response(&state.llm, e).await;
+        }
     };
 
-    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // 用量采集上下文
     let ctx = super::usage::UsageContext {
@@ -330,14 +365,21 @@ pub async fn handle_messages(
         .await
         {
             Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
-            Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
+            Err((status, msg)) => {
+                if let Some(ref db) = db {
+                    ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+                }
+                state.error_for_protocol(status, msg, "upstream_error")
+            }
         };
     }
 
     // ── 回退路径：转成 OpenAI 格式发到 base_url ──
     let request = match anthropic_to_openai(&body) {
         Ok(r) => r,
-        Err(e) => return state.error_for_protocol(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
+        Err(e) => {
+            return state.error_for_protocol(StatusCode::BAD_REQUEST, e, "invalid_request_error")
+        }
     };
 
     let mut request = request;
@@ -355,7 +397,12 @@ pub async fn handle_messages(
                 super::usage::wrap_and_record(converted, ctx, db, started).await
             }
         }
-        Err((status, msg)) => state.error_for_protocol(status, msg, "upstream_error"),
+        Err((status, msg)) => {
+            if let Some(ref db) = db {
+                ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+            }
+            state.error_for_protocol(status, msg, "upstream_error")
+        }
     }
 }
 
@@ -424,6 +471,7 @@ async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::llm::{LlmProtocol, LlmState};
 
     #[test]
     fn test_anthropic_to_openai_conversion() {
@@ -441,7 +489,10 @@ mod tests {
         assert_eq!(result.model, "claude-3-opus");
         assert_eq!(result.messages.len(), 2); // system + user
         assert_eq!(result.messages[0].role, "system");
-        assert_eq!(result.messages[0].content.as_deref(), Some("You are helpful."));
+        assert_eq!(
+            result.messages[0].content.as_deref(),
+            Some("You are helpful.")
+        );
         assert_eq!(result.messages[1].role, "user");
         assert_eq!(result.messages[1].content.as_deref(), Some("Hello"));
         assert!(!result.stream);
@@ -534,7 +585,10 @@ mod tests {
         });
 
         let result = anthropic_to_openai(&input).unwrap();
-        assert_eq!(result.messages[0].content.as_deref(), Some("Just one block"));
+        assert_eq!(
+            result.messages[0].content.as_deref(),
+            Some("Just one block")
+        );
     }
 
     #[test]
@@ -578,8 +632,14 @@ mod tests {
     #[test]
     fn tool_choice_all_three_forms() {
         for (input_choice, expected) in [
-            (serde_json::json!({"type": "auto"}), serde_json::json!("auto")),
-            (serde_json::json!({"type": "any"}), serde_json::json!("required")),
+            (
+                serde_json::json!({"type": "auto"}),
+                serde_json::json!("auto"),
+            ),
+            (
+                serde_json::json!({"type": "any"}),
+                serde_json::json!("required"),
+            ),
             (
                 serde_json::json!({"type": "tool", "name": "get_x"}),
                 serde_json::json!({"type":"function","function":{"name":"get_x"}}),
@@ -684,9 +744,18 @@ mod tests {
         let r = anthropic_to_openai(&input).unwrap();
         let s = serde_json::to_string(&r).unwrap();
         assert!(!s.contains("\"tools\""), "should not emit tools: {s}");
-        assert!(!s.contains("\"tool_choice\""), "should not emit tool_choice: {s}");
-        assert!(!s.contains("\"tool_calls\""), "should not emit tool_calls: {s}");
-        assert!(!s.contains("\"tool_call_id\""), "should not emit tool_call_id: {s}");
+        assert!(
+            !s.contains("\"tool_choice\""),
+            "should not emit tool_choice: {s}"
+        );
+        assert!(
+            !s.contains("\"tool_calls\""),
+            "should not emit tool_calls: {s}"
+        );
+        assert!(
+            !s.contains("\"tool_call_id\""),
+            "should not emit tool_call_id: {s}"
+        );
     }
 
     #[tokio::test]
@@ -754,5 +823,166 @@ mod tests {
         // 不应残留 OpenAI 格式
         assert!(!text.contains("chat.completion.chunk"));
         assert!(!text.contains("[DONE]"));
+    }
+
+    // ── handle_messages 集成测试（带真实临时 DB）───────────────
+
+    /// 构造带真实临时 DB 的 LlmState，并插入一个启用的 provider+model+api_key。
+    async fn state_with_db() -> (LlmState, String, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(
+            &pid,
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        let mid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+            .await
+            .unwrap();
+
+        let (key, hash, prefix) = crate::server::llm::auth::generate_api_key();
+        let kid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_api_key(&kid, &hash, &prefix, "test")
+            .await
+            .unwrap();
+
+        (LlmState::new(Some(db), None), key, tmp)
+    }
+
+    fn authed_headers(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
+        );
+        headers
+    }
+
+    /// 认证失败必须写入一条 failure 记录到 llm_usage_logs。
+    #[tokio::test]
+    async fn test_auth_failure_is_logged() {
+        let (state, _key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            HeaderMap::new(),
+            Json(serde_json::json!({"model": "deepseek-chat", "messages": [{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "Anthropic 认证失败应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 401);
+        assert_eq!(logs[0].error_type.as_deref(), Some("authentication_error"));
+        assert_eq!(logs[0].protocol, "anthropic");
+    }
+
+    /// 模型未找到必须写入一条 failure 记录。
+    #[tokio::test]
+    async fn test_model_not_found_is_logged() {
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "nonexistent-model",
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "Anthropic 模型未找到应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 404);
+        assert_eq!(
+            logs[0].error_type.as_deref(),
+            Some("model_resolution_error")
+        );
+        assert_eq!(logs[0].protocol, "anthropic");
+    }
+
+    /// 上游连接失败（不可达地址）必须写入一条 failure 记录。
+    #[tokio::test]
+    async fn test_upstream_failure_is_logged() {
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+
+        // 把 provider base_url 改为不可达地址 → 502
+        let providers = db.llm_list_providers().await.unwrap();
+        let pid = &providers[0].id;
+        db.llm_save_provider(
+            pid,
+            "DS",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "Anthropic 上游失败应写入一条 usage log");
+        assert_eq!(logs[0].success, 0);
+        assert_eq!(logs[0].status_code, 502);
+        assert_eq!(logs[0].error_type.as_deref(), Some("upstream_error"));
+        assert_eq!(logs[0].protocol, "anthropic");
     }
 }

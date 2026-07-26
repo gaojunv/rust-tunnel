@@ -37,8 +37,7 @@ pub fn openai_response_to_anthropic(openai: &Value) -> Value {
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
             // OpenAI 的 arguments 是 JSON 字符串；Anthropic 的 input 是对象。
-            let input: Value =
-                serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+            let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
             content.push(json!({
                 "type": "tool_use",
                 "id": id,
@@ -607,9 +606,9 @@ mod tests {
         let mut t = AnthropicSseTranslator::new();
         let mut all = Vec::new();
         all.extend(t.push(openai_chunk("hello", None).as_bytes()));
-        all.extend(t.push(
-            openai_tool_chunk(0, Some("c1"), Some("f"), Some("{}"), None).as_bytes(),
-        ));
+        all.extend(
+            t.push(openai_tool_chunk(0, Some("c1"), Some("f"), Some("{}"), None).as_bytes()),
+        );
         all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
         let text = String::from_utf8(all).unwrap();
 
@@ -630,8 +629,7 @@ mod tests {
             .iter()
             .filter(|e| e["type"] == "content_block_stop")
             .collect();
-        let stop_indices: Vec<u64> =
-            stops.iter().map(|s| s["index"].as_u64().unwrap()).collect();
+        let stop_indices: Vec<u64> = stops.iter().map(|s| s["index"].as_u64().unwrap()).collect();
         assert!(stop_indices.contains(&0), "missing stop for text block");
         assert!(stop_indices.contains(&1), "missing stop for tool block");
     }
@@ -641,12 +639,12 @@ mod tests {
         // 两个并行 tool_call（上游 index 0 / 1），分别对应 anthropic block 1 / 2。
         let mut t = AnthropicSseTranslator::new();
         let mut all = Vec::new();
-        all.extend(t.push(
-            openai_tool_chunk(0, Some("a"), Some("fa"), Some("{}"), None).as_bytes(),
-        ));
-        all.extend(t.push(
-            openai_tool_chunk(1, Some("b"), Some("fb"), Some("{}"), None).as_bytes(),
-        ));
+        all.extend(
+            t.push(openai_tool_chunk(0, Some("a"), Some("fa"), Some("{}"), None).as_bytes()),
+        );
+        all.extend(
+            t.push(openai_tool_chunk(1, Some("b"), Some("fb"), Some("{}"), None).as_bytes()),
+        );
         all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
         let text = String::from_utf8(all).unwrap();
 

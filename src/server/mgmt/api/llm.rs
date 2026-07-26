@@ -50,10 +50,7 @@ pub async fn update_gateway_config(
     } else {
         Some(openai_domain)
     };
-    let anthropic_domain = body["anthropic_domain"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let anthropic_domain = body["anthropic_domain"].as_str().unwrap_or("").to_string();
     let anthropic_domain = if anthropic_domain.is_empty() {
         None
     } else {

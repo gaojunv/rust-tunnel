@@ -491,11 +491,7 @@ impl Database {
     }
 
     /// 查询时间范围内的用量日志总数。
-    pub async fn llm_count_usage_logs(
-        &self,
-        start: &str,
-        end: &str,
-    ) -> Result<i64, sqlx::Error> {
+    pub async fn llm_count_usage_logs(&self, start: &str, end: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT COUNT(*) FROM llm_usage_logs
@@ -655,12 +651,30 @@ mod tests {
 
         let p1 = uuid::Uuid::new_v4().to_string();
         let p2 = uuid::Uuid::new_v4().to_string();
-        db.llm_save_provider(&p1, "P1", "deepseek", "https://a", "k", None::<&str>, None::<&str>, true)
-            .await
-            .unwrap();
-        db.llm_save_provider(&p2, "P2", "kimi", "https://b", "k", None::<&str>, None::<&str>, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            &p1,
+            "P1",
+            "deepseek",
+            "https://a",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_provider(
+            &p2,
+            "P2",
+            "kimi",
+            "https://b",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
 
         // 先插入“别名冲突”的模型，制造无序查询返回它的机会
         let alias_model = uuid::Uuid::new_v4().to_string();
@@ -781,7 +795,10 @@ mod tests {
         assert_eq!(summary.completion_tokens, 130);
         assert_eq!(summary.total_tokens, 430);
 
-        let logs = db.llm_query_usage_logs(full.0, full.1, 10, 0).await.unwrap();
+        let logs = db
+            .llm_query_usage_logs(full.0, full.1, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(logs.len(), 2);
 
         // 分页

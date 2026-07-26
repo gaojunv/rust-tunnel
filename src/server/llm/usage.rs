@@ -78,7 +78,9 @@ pub fn extract_usage(usage: &Value) -> UsageInfo {
     cache_hit = cache_hit.clamp(0, prompt_tokens);
     let cache_miss = prompt_tokens - cache_hit;
 
-    let completion_tokens = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
+    let completion_tokens = get("completion_tokens")
+        .or_else(|| get("output_tokens"))
+        .unwrap_or(0);
     let total_tokens = get("total_tokens").unwrap_or(prompt_tokens + completion_tokens);
 
     UsageInfo {
@@ -92,9 +94,7 @@ pub fn extract_usage(usage: &Value) -> UsageInfo {
 
 /// 从完整（非流式）响应体提取 usage。找不到 `usage` 返回默认零值。
 pub fn extract_usage_from_body(body: &Value) -> UsageInfo {
-    body.get("usage")
-        .map(extract_usage)
-        .unwrap_or_default()
+    body.get("usage").map(extract_usage).unwrap_or_default()
 }
 
 /// 流式 SSE usage 扫描器：逐 chunk 喂入字节，扫描其中携带 usage 的行。
@@ -238,6 +238,29 @@ fn spawn_record(db: Database, insert: LlmUsageInsert) {
             tracing::warn!("failed to record LLM usage log: {}", e);
         }
     });
+}
+
+impl UsageContext {
+    /// 记录一条失败请求（fire-and-forget，写入失败仅记日志）。
+    ///
+    /// 用于上游调用失败、认证失败、路由失败等场景，确保请求明细中
+    /// 能看到失败的请求而不仅仅是成功请求。
+    pub fn record_failure(
+        self,
+        db: &Database,
+        status_code: i32,
+        error_type: &str,
+        started_at: std::time::Instant,
+    ) {
+        let insert = self.into_insert(
+            UsageInfo::default(),
+            status_code,
+            false,
+            started_at.elapsed().as_millis() as i64,
+            Some(error_type.to_string()),
+        );
+        spawn_record(db.clone(), insert);
+    }
 }
 
 /// 包裹上游成功响应，解析 usage 并异步落库，返回可继续发给客户端的响应。

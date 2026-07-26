@@ -281,7 +281,10 @@ async fn llm_aware_proxy_dispatch(
 async fn match_llm_gateway(
     proxy_state: &Arc<ReverseProxyState>,
     host: &str,
-) -> Option<(Arc<crate::server::llm::LlmState>, crate::server::llm::LlmProtocol)> {
+) -> Option<(
+    Arc<crate::server::llm::LlmState>,
+    crate::server::llm::LlmProtocol,
+)> {
     let llm_guard = proxy_state.llm_state.read().await;
     let llm = llm_guard.as_ref()?;
     let cfg = llm.gateway_config.read().await;
@@ -299,7 +302,10 @@ async fn llm_handle(
     use crate::server::llm::LlmProtocol;
     use crate::server::llm::{anthropic_handler, openai_handler, upstream};
 
-    let state = openai_handler::LlmHandlerState { llm, protocol: Some(protocol) };
+    let state = openai_handler::LlmHandlerState {
+        llm,
+        protocol: Some(protocol),
+    };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let is_models = method == Method::GET && path == "/v1/models";
@@ -329,7 +335,9 @@ async fn llm_handle(
         let msg = "Not found".to_string();
         return match protocol {
             LlmProtocol::OpenAI => upstream::error_response(StatusCode::NOT_FOUND, msg, etype),
-            LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::NOT_FOUND, msg, etype),
+            LlmProtocol::Anthropic => {
+                upstream::error_response_anthropic(StatusCode::NOT_FOUND, msg, etype)
+            }
         };
     }
 
@@ -342,16 +350,28 @@ async fn llm_handle(
         Err(e) => {
             let msg = format!("failed to read request body: {}", e);
             return match protocol {
-                LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
-                LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+                LlmProtocol::OpenAI => {
+                    upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+                }
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                    StatusCode::BAD_REQUEST,
+                    msg,
+                    "invalid_request_error",
+                ),
             };
         }
     };
     if std::str::from_utf8(&bytes).is_err() {
         let msg = "request body is not valid UTF-8; JSON must be UTF-8 encoded (inline non-ASCII text in terminals like Windows cmd is often not UTF-8 — use \\uXXXX escapes or a UTF-8 file)".into();
         return match protocol {
-            LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
-            LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+            LlmProtocol::OpenAI => {
+                upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+            }
+            LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+            ),
         };
     }
     let json: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -359,8 +379,14 @@ async fn llm_handle(
         Err(e) => {
             let msg = format!("invalid JSON body: {}", e);
             return match protocol {
-                LlmProtocol::OpenAI => upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
-                LlmProtocol::Anthropic => upstream::error_response_anthropic(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+                LlmProtocol::OpenAI => {
+                    upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+                }
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                    StatusCode::BAD_REQUEST,
+                    msg,
+                    "invalid_request_error",
+                ),
             };
         }
     };
@@ -1154,11 +1180,10 @@ mod tests {
             .uri("https://oa.local/v1/chat/completions")
             .body(Body::from("{}"))
             .unwrap();
-        let resp = llm_aware_proxy_dispatch(State((
-            source.clone(),
-            upstream.clone(),
-            Arc::new(state.clone()),
-        )), req)
+        let resp = llm_aware_proxy_dispatch(
+            State((source.clone(), upstream.clone(), Arc::new(state.clone()))),
+            req,
+        )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
@@ -1168,8 +1193,7 @@ mod tests {
             .uri("https://an.local/v1/messages")
             .body(Body::from("{}"))
             .unwrap();
-        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req)
-            .await;
+        let resp = llm_aware_proxy_dispatch(State((source, upstream, Arc::new(state))), req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 

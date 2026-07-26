@@ -47,7 +47,9 @@ impl LlmGatewayConfig {
         let oa = self.openai_domain.as_deref().unwrap_or("");
         let an = self.anthropic_domain.as_deref().unwrap_or("");
         if oa.is_empty() && an.is_empty() {
-            return Some("at least one of openai_domain or anthropic_domain is required when enabled".into());
+            return Some(
+                "at least one of openai_domain or anthropic_domain is required when enabled".into(),
+            );
         }
         if !oa.is_empty() && !an.is_empty() && oa == an {
             return Some("openai_domain and anthropic_domain cannot be the same".into());
