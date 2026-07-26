@@ -37,7 +37,8 @@ impl UsageInfo {
 /// （`input_tokens`/`output_tokens`）。缓存字段按以下优先级兜底：
 /// 1. DeepSeek：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
 /// 2. OpenAI 新口径：`prompt_tokens_details.cached_tokens`
-/// 3. Anthropic：`cache_read_input_tokens` / `cache_creation_input_tokens`
+/// 3. Kimi/Moonshot：`usage.cached_tokens`（顶层扁平字段，见 Kimi 官方 API 文档）
+/// 4. Anthropic：`cache_read_input_tokens` / `cache_creation_input_tokens`
 ///
 /// 恒等关系：`cache_hit + cache_miss == prompt`（无缓存信息时全记为 miss）。
 pub fn extract_usage(usage: &Value) -> UsageInfo {
@@ -61,6 +62,7 @@ pub fn extract_usage(usage: &Value) -> UsageInfo {
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(Value::as_i64)
             })
+            .or_else(|| get("cached_tokens")) // Kimi/Moonshot 顶层扁平字段
             .unwrap_or(0);
         (pt, hit)
     } else if let Some(it) = get("input_tokens") {
@@ -389,6 +391,20 @@ mod tests {
         }));
         assert_eq!(u.cache_hit_tokens, 50);
         assert_eq!(u.cache_miss_tokens, 150);
+    }
+
+    #[test]
+    fn extract_kimi_flat_cached_tokens() {
+        // Kimi/Moonshot：usage 顶层扁平 cached_tokens 字段
+        let u = extract_usage(&json!({
+            "prompt_tokens": 19,
+            "completion_tokens": 21,
+            "total_tokens": 40,
+            "cached_tokens": 10
+        }));
+        assert_eq!(u.cache_hit_tokens, 10);
+        assert_eq!(u.cache_miss_tokens, 9);
+        assert_eq!(u.cache_hit_tokens + u.cache_miss_tokens, u.prompt_tokens);
     }
 
     #[test]
