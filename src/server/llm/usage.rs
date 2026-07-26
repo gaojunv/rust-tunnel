@@ -156,10 +156,17 @@ impl UsageSseScanner {
             }
             Some("message_delta") => {
                 if let Some(delta_usage) = chunk.get("usage").map(extract_usage) {
-                    // message_delta 的 usage 只有 output_tokens，合并 message_start 的输入。
-                    let mut merged = self.anthropic_input.unwrap_or_default();
-                    merged.completion_tokens = delta_usage.completion_tokens;
-                    merged.total_tokens = merged.prompt_tokens + merged.completion_tokens;
+                    // Kimi 直通流（api.kimi.com/coding）的 message_delta 携带完整 usage，
+                    // 包括真实的 cache_read_input_tokens，直接采用；标准 Anthropic 流则
+                    // 只有 output_tokens，需与 message_start 的输入合并。
+                    let merged = if delta_usage.prompt_tokens > 0 {
+                        delta_usage
+                    } else {
+                        let mut merged = self.anthropic_input.unwrap_or_default();
+                        merged.completion_tokens = delta_usage.completion_tokens;
+                        merged.total_tokens = merged.prompt_tokens + merged.completion_tokens;
+                        merged
+                    };
                     self.latest = merged;
                 }
                 return;
@@ -475,6 +482,20 @@ mod tests {
         assert_eq!(u.cache_hit_tokens, 90);
         assert_eq!(u.completion_tokens, 25);
         assert_eq!(u.total_tokens, 125);
+    }
+
+    #[test]
+    fn scanner_kimi_anthropic_stream_full_usage_in_message_delta() {
+        // Kimi 直通流：message_start 中 cache 字段为 0，message_delta 携带完整 usage。
+        let mut s = UsageSseScanner::new();
+        s.push(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1310,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0}}}\n\n");
+        s.push(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"input_tokens\":30,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":1280,\"output_tokens\":50}}\n\n");
+        let u = s.finish();
+        assert_eq!(u.prompt_tokens, 1310);
+        assert_eq!(u.cache_hit_tokens, 1280);
+        assert_eq!(u.cache_miss_tokens, 30);
+        assert_eq!(u.completion_tokens, 50);
+        assert_eq!(u.total_tokens, 1360);
     }
 
     #[test]
