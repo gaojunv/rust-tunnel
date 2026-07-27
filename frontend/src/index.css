@@ -100,6 +100,24 @@
     @apply bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent;
   }
 
+  /* 品牌标题极光渐变流光：靛蓝→紫→青循环流动 + 亮度呼吸（Aurora Tunnel 品牌文字专用） */
+  .text-aurora {
+    background-image: linear-gradient(
+      90deg,
+      hsl(var(--primary)) 0%,
+      hsl(var(--chart-2)) 33%,
+      hsl(var(--chart-3)) 66%,
+      hsl(var(--primary)) 100%
+    );
+    background-size: 200% 100%;
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    animation:
+      aurora-text-flow 6s linear infinite,
+      aurora-text-breathe 4s ease-in-out infinite;
+  }
+
   /* 页头光影流动：底部流光渐变线（primary → 紫 → 青 循环流动） */
   .header-light-flow {
     background-image: linear-gradient(
@@ -147,9 +165,29 @@
   @media (prefers-reduced-motion: reduce) {
     .header-light-flow,
     .animate-aurora,
-    .animate-aurora-alt {
+    .animate-aurora-alt,
+    .text-aurora {
       animation: none;
     }
+  }
+}
+
+@keyframes aurora-text-flow {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 200% 50%;
+  }
+}
+
+@keyframes aurora-text-breathe {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.12);
   }
 }
 
