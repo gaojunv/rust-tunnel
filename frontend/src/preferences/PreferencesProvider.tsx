@@ -4,10 +4,11 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
-import { fetchPreferences, updatePreferences } from '../api/preferences';
+import { fetchPreferences, updatePreferences, type Preferences } from '../api/preferences';
 import {
   DEFAULT_USER_PREFERENCES,
   PREFERENCES_CACHE_KEY,
@@ -15,6 +16,9 @@ import {
   writeCachedPreferences,
   type UserPreferences,
 } from './preferencesStore';
+import { isLanguagePreference } from '../i18n/languagePreference';
+import { isThemePreference } from '../theme/theme';
+import { isTitleEffectPreference } from '../effects/titleEffectPreference';
 
 interface PreferencesContextValue {
   prefs: UserPreferences;
@@ -45,18 +49,23 @@ function toApiShape(prefs: UserPreferences): {
   };
 }
 
-function fromApiShape(api: { theme: string; language: string; title_effect: string }): UserPreferences {
+function fromApiShape(api: Preferences): UserPreferences {
   return {
-    theme: (api.theme as UserPreferences['theme']) ?? DEFAULT_USER_PREFERENCES.theme,
-    language: (api.language as UserPreferences['language']) ?? DEFAULT_USER_PREFERENCES.language,
-    titleEffect:
-      (api.title_effect as UserPreferences['titleEffect']) ?? DEFAULT_USER_PREFERENCES.titleEffect,
+    theme: isThemePreference(api.theme) ? api.theme : DEFAULT_USER_PREFERENCES.theme,
+    language: isLanguagePreference(api.language) ? api.language : DEFAULT_USER_PREFERENCES.language,
+    titleEffect: isTitleEffectPreference(api.title_effect)
+      ? api.title_effect
+      : DEFAULT_USER_PREFERENCES.titleEffect,
   };
 }
 
 export function PreferencesProvider({ children }: { children: ReactNode }) {
   const [prefs, setPrefs] = useState<UserPreferences>(() => readCachedPreferences(getStorage()));
   const [isSyncing, setIsSyncing] = useState(false);
+  const prefsRef = useRef<UserPreferences>(prefs);
+  useEffect(() => {
+    prefsRef.current = prefs;
+  }, [prefs]);
 
   // 启动：从服务器拉取并覆盖本地
   useEffect(() => {
@@ -89,21 +98,24 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
 
   const setPreference = useCallback(
     <K extends keyof UserPreferences>(key: K, value: UserPreferences[K]) => {
-      setPrefs((current) => {
-        const next = { ...current, [key]: value };
-        writeCachedPreferences(next, getStorage());
+      const current = prefsRef.current;
+      const next = { ...current, [key]: value };
+      prefsRef.current = next;
 
-        setIsSyncing(true);
-        updatePreferences(toApiShape(next))
-          .catch(() => {
-            // 回滚
-            setPrefs(current);
-            writeCachedPreferences(current, getStorage());
-          })
-          .finally(() => setIsSyncing(false));
+      // 乐观更新（setState 纯调用，无副作用）
+      setPrefs(next);
+      writeCachedPreferences(next, getStorage());
 
-        return next;
-      });
+      // 异步同步到服务器（独立于 setState）
+      setIsSyncing(true);
+      updatePreferences(toApiShape(next))
+        .catch(() => {
+          // 回滚
+          prefsRef.current = current;
+          setPrefs(current);
+          writeCachedPreferences(current, getStorage());
+        })
+        .finally(() => setIsSyncing(false));
     },
     [],
   );
