@@ -39,6 +39,11 @@ export default [
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': 'off',
       'no-undef': 'off',
+    },
+  },
+  {
+    files: ['src/test-setup.ts', 'src/**/*.test.ts', 'src/**/*.test.tsx'],
+    rules: {
       'no-dupe-class-members': 'off',
       '@typescript-eslint/no-unused-vars': [
         'error',
