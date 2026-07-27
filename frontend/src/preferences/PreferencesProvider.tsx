@@ -70,10 +70,14 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
   // 启动：从服务器拉取并覆盖本地
   useEffect(() => {
     let cancelled = false;
+    const cachedSnapshot = prefsRef.current;
     fetchPreferences()
       .then((apiPrefs) => {
         if (cancelled) return;
+        // 用户已并发修改 → 不覆盖
+        if (prefsRef.current !== cachedSnapshot) return;
         const next = fromApiShape(apiPrefs);
+        prefsRef.current = next;
         setPrefs(next);
         writeCachedPreferences(next, getStorage());
       })

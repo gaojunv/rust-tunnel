@@ -56,25 +56,32 @@ export function GridWaveTitle({ text, className, eventTargetRef }: GridWaveTitle
     const primary = readPrimaryColor();
     if (!primary) return;
 
-    // 计算 canvas 尺寸（含外扩）
-    const textRect = textEl.getBoundingClientRect();
-    const width = Math.ceil(textRect.width) + EXPAND * 2;
-    const height = Math.ceil(textRect.height) + EXPAND * 2;
-    canvas.width = width;
-    canvas.height = height;
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    // 定位：canvas 中心对齐文字
-    canvas.style.position = 'absolute';
-    canvas.style.left = '50%';
-    canvas.style.top = '50%';
-    canvas.style.transform = 'translate(-50%, -50%)';
-    canvas.style.pointerEvents = 'none';
-    canvas.style.zIndex = '0';
+    let cells: RuntimeCell[] = [];
+    let width = 0;
+    let height = 0;
 
-    // 构建网格
-    const grid = buildGrid(width, height, GRID_STEP);
-    const cells: RuntimeCell[] = grid.map((c) => ({ x: c.x, y: c.y, intensity: 0 }));
+    const rebuildGrid = () => {
+      const textRect = textEl.getBoundingClientRect();
+      width = Math.ceil(textRect.width) + EXPAND * 2;
+      height = Math.ceil(textRect.height) + EXPAND * 2;
+      canvas.width = width;
+      canvas.height = height;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      // 定位：canvas 中心对齐文字
+      canvas.style.position = 'absolute';
+      canvas.style.left = '50%';
+      canvas.style.top = '50%';
+      canvas.style.transform = 'translate(-50%, -50%)';
+      canvas.style.pointerEvents = 'none';
+      canvas.style.zIndex = '0';
+
+      // 构建网格
+      const grid = buildGrid(width, height, GRID_STEP);
+      cells = grid.map((c) => ({ x: c.x, y: c.y, intensity: 0 }));
+    };
+
+    rebuildGrid();
 
     // 鼠标位置（相对 canvas）
     let mouseX = -Infinity;
@@ -117,7 +124,14 @@ export function GridWaveTitle({ text, className, eventTargetRef }: GridWaveTitle
     };
     rafId = requestAnimationFrame(draw);
 
+    // 监听容器 resize，自动重建网格
+    const ro = new ResizeObserver(() => {
+      rebuildGrid();
+    });
+    ro.observe(container);
+
     return () => {
+      ro.disconnect();
       cancelAnimationFrame(rafId);
       eventTarget.removeEventListener('pointermove', onPointerMove);
       eventTarget.removeEventListener('pointerleave', onPointerLeave);

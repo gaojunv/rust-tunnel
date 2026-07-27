@@ -19,5 +19,7 @@ export function TitleEffectSwitch({ text, className, eventTargetRef }: TitleEffe
       return <GridWaveTitle text={text} className={className} eventTargetRef={eventTargetRef} />;
     case 'none':
       return <span className={cn('text-aurora', className)}>{text}</span>;
+    default:
+      return <span className={cn('text-aurora', className)}>{text}</span>;
   }
 }
