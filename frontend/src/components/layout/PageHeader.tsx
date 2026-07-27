@@ -35,10 +35,10 @@ export function PageHeader({ title, description, children, className }: PageHead
       </div>
 
       <div className="relative">
-        <h1 className="text-2xl font-bold tracking-tight">
+        <h1 className="text-[32px] font-bold leading-tight tracking-tight">
           <ParticleTitle text={title} eventTargetRef={cardRef} />
         </h1>
-        {description && <p className="text-muted-foreground">{description}</p>}
+        {description && <p className="mt-1.5 text-muted-foreground">{description}</p>}
       </div>
       {children && <div className="relative flex items-center gap-2">{children}</div>}
     </div>

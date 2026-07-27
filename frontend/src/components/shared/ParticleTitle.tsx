@@ -23,16 +23,17 @@ interface RuntimeParticle {
   vy: number;
 }
 
-const FONT_SIZE = 24;
-const STEP = 2; // 采样步长：中文笔画密，需更密采样才清晰
-const PARTICLE_SIZE = 2.5; // 小正方形边长（CSS px）
+const FONT_SIZE = 32; // 字号放大：稀疏大颗粒拼出更大的字，兼顾颗粒感与清晰度
+const STEP = 3; // 采样步长（还原稀疏颗粒感）
+const PARTICLE_SIZE = 2; // 小正方形边长（CSS px，还原）
 const MAX_PARTICLES = 1600; // 粒子数上限，防中文长标题卡顿
 const LIGHT_BAND = 90; // 光带半径（px）
 const REPEL_RADIUS = 96; // 扰动半径（px）
 const REPEL_FORCE = 2.4; // 扰动推力
 const SPRING = 0.06; // 归位弹簧系数
 const DAMPING = 0.86; // 阻尼
-const MAX_DISPLACEMENT = 28; // 粒子偏离原位的软上限（px），防止被扰动飞太远
+const MAX_DISPLACEMENT = 40; // 粒子偏离原位的软上限（px）
+const BUFFER = 44; // 画布四周透明缓冲区（px）：粒子被推开时仍在画布内可见，不突然消失
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(
@@ -77,21 +78,25 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
       return;
     }
 
-    // 由粒子范围确定 canvas 尺寸。
+    // 由粒子范围确定 canvas 尺寸，并在四周加 BUFFER 透明缓冲区：
+    // 粒子被扰动推开时仍落在画布内可见，不会一出文字边缘就消失。
     const maxX = Math.max(...sampled.map((p) => p.homeX));
     const maxY = Math.max(...sampled.map((p) => p.homeY));
-    const cssW = Math.ceil(maxX + STEP);
-    const cssH = Math.ceil(maxY + STEP);
+    const cssW = Math.ceil(maxX + STEP + BUFFER * 2);
+    const cssH = Math.ceil(maxY + STEP + BUFFER * 2);
     canvas.width = cssW * dpr;
     canvas.height = cssH * dpr;
     canvas.style.width = `${cssW}px`;
     canvas.style.height = `${cssH}px`;
+    // 缓冲区让 canvas 比文字大，用负边距把文字视觉位置拉回原位，布局不变。
+    canvas.style.margin = `-${BUFFER}px`;
 
     const particles: RuntimeParticle[] = sampled.map((p) => ({
-      homeX: p.homeX,
-      homeY: p.homeY,
-      x: p.homeX,
-      y: p.homeY,
+      // 粒子坐标整体偏移 BUFFER，使文字居于缓冲区中央。
+      homeX: p.homeX + BUFFER,
+      homeY: p.homeY + BUFFER,
+      x: p.homeX + BUFFER,
+      y: p.homeY + BUFFER,
       vx: 0,
       vy: 0,
     }));
@@ -154,13 +159,13 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
 
     // 事件宿主：默认 canvas 自身；传入 eventTargetRef 时用外层容器（整个页头），
     // 坐标统一换算到 canvas 局部系，保证跨元素的粒子位置一致。
+    // 注意：canvas 因 BUFFER 用负边距拉回，getBoundingClientRect 已反映其视觉位置，
+    // 这里直接以鼠标相对 canvas 可视框的坐标即可，无需额外补偿。
     const host = eventTargetRef?.current ?? canvas;
     const onMove = (e: PointerEvent) => {
       const canvasRect = canvas.getBoundingClientRect();
-      const hostRect = host.getBoundingClientRect();
-      // 鼠标相对宿主的坐标，再平移到 canvas 局部坐标系。
-      mouse.x = e.clientX - hostRect.left + (hostRect.left - canvasRect.left);
-      mouse.y = e.clientY - hostRect.top + (hostRect.top - canvasRect.top);
+      mouse.x = e.clientX - canvasRect.left;
+      mouse.y = e.clientY - canvasRect.top;
       mouse.active = true;
     };
     const onLeave = () => {
