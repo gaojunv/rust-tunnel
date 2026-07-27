@@ -69,4 +69,9 @@ describe('AppearanceTab', () => {
     const labels = await screen.findAllByText('语言');
     expect(labels.length).toBeGreaterThanOrEqual(1);
   });
+
+  it('renders title effect card', async () => {
+    renderTab();
+    expect(screen.getByText('Title Animation')).toBeTruthy();
+  });
 });
