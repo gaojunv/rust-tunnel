@@ -5,7 +5,27 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router-dom';
 import type { AxiosResponse } from 'axios';
 import { clientsApi, api } from '@/api/client';
+import { PreferencesProvider } from '@/preferences/PreferencesProvider';
+import { readCachedPreferences } from '@/preferences/preferencesStore';
 import DashboardPage from './DashboardPage';
+
+vi.mock('../api/preferences', () => ({
+  fetchPreferences: () => {
+    try {
+      const cached = readCachedPreferences(
+        typeof window !== 'undefined' ? window.localStorage : undefined,
+      );
+      return Promise.resolve({
+        theme: cached.theme,
+        language: cached.language,
+        title_effect: cached.titleEffect,
+      });
+    } catch {
+      return Promise.resolve({ theme: 'dark', language: 'system', title_effect: 'grid-wave' });
+    }
+  },
+  updatePreferences: () => Promise.resolve(),
+}));
 
 const listSpy = vi.spyOn(clientsApi, 'list');
 const getSpy = vi.spyOn(api, 'get');
@@ -17,7 +37,9 @@ const renderPage = () => {
   return render(
     <MemoryRouter>
       <QueryClientProvider client={queryClient}>
-        <DashboardPage />
+        <PreferencesProvider>
+          <DashboardPage />
+        </PreferencesProvider>
       </QueryClientProvider>
     </MemoryRouter>
   );

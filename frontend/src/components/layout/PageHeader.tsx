@@ -1,6 +1,6 @@
 import { useRef } from 'react';
 import { cn } from '@/lib/utils';
-import { ParticleTitle } from '@/components/shared/ParticleTitle';
+import { TitleEffectSwitch } from '@/components/shared/TitleEffectSwitch';
 
 interface PageHeaderProps {
   title: string;
@@ -36,7 +36,7 @@ export function PageHeader({ title, description, children, className }: PageHead
 
       <div className="relative">
         <h1 className="text-[32px] font-bold leading-tight tracking-tight">
-          <ParticleTitle text={title} eventTargetRef={cardRef} />
+          <TitleEffectSwitch text={title} eventTargetRef={cardRef} />
         </h1>
         {description && <p className="mt-1.5 text-muted-foreground">{description}</p>}
       </div>
