@@ -5,6 +5,34 @@
     "cancel": "Cancel"
   },
   "settings": {
+    "title": "Settings",
+    "description": "Configure common system settings and review security notes",
+    "tabs": {
+      "general": "General",
+      "security": "Security",
+      "appearance": "Appearance"
+    },
+    "general": {
+      "system": "System",
+      "logLevel": "Log Level",
+      "logLevelReadonly": "Log level is managed via the server config file or environment variables.",
+      "apiTls": "API Server TLS",
+      "apiTlsEnable": "Enable TLS",
+      "apiTlsEnableDesc": "Serve the API over HTTPS using ACME certificates",
+      "apiDomain": "API Domain",
+      "apiDomainPlaceholder": "api.example.com",
+      "apiDomainDesc": "Domain name for the API server TLS certificate. Requires ACME to be enabled.",
+      "configViaFile": "Configuration via server config file",
+      "configViaFileDesc": "API TLS settings (api_tls, api_domain) require a server restart to take effect. Configure them in the TOML config file or via environment variables.",
+      "acmeWarning": "ACME is not enabled. Enable ACME first to use API TLS.",
+      "reverseProxy": "Reverse Proxy",
+      "reverseProxyDesc": "Reverse proxy rules are managed on the <0>Reverse Proxy</0> page. Create and configure HTTP, TCP, and UDP proxy rules there."
+    },
+    "security": {
+      "title": "Security Configuration",
+      "note": "Security-sensitive configuration (admin password, JWT secret, client auth token) is managed via the server configuration file and cannot be changed at runtime.",
+      "changeNote": "To change these values, edit the TOML config file or set environment variables, then restart the server."
+    },
     "appearance": {
       "title": "Appearance",
       "language": "Language",

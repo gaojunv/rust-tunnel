@@ -5,6 +5,34 @@
     "cancel": "取消"
   },
   "settings": {
+    "title": "设置",
+    "description": "配置常用系统设置并查看安全说明",
+    "tabs": {
+      "general": "通用",
+      "security": "安全",
+      "appearance": "外观"
+    },
+    "general": {
+      "system": "系统",
+      "logLevel": "日志级别",
+      "logLevelReadonly": "日志级别通过服务器配置文件或环境变量管理。",
+      "apiTls": "API 服务器 TLS",
+      "apiTlsEnable": "启用 TLS",
+      "apiTlsEnableDesc": "使用 ACME 证书通过 HTTPS 提供 API 服务",
+      "apiDomain": "API 域名",
+      "apiDomainPlaceholder": "api.example.com",
+      "apiDomainDesc": "API 服务器 TLS 证书的域名。需要启用 ACME。",
+      "configViaFile": "通过服务器配置文件配置",
+      "configViaFileDesc": "API TLS 设置（api_tls, api_domain）需要重启服务器才能生效。请在 TOML 配置文件或环境变量中进行配置。",
+      "acmeWarning": "ACME 未启用。请先启用 ACME 再使用 API TLS。",
+      "reverseProxy": "反向代理",
+      "reverseProxyDesc": "反向代理规则在 <0>反向代理</0> 页面管理。在此创建和配置 HTTP、TCP 和 UDP 代理规则。"
+    },
+    "security": {
+      "title": "安全配置",
+      "note": "安全敏感配置（管理员密码、JWT 密钥、客户端认证令牌）通过服务器配置文件管理，运行时无法修改。",
+      "changeNote": "如需更改这些值，请编辑 TOML 配置文件或设置环境变量，然后重启服务器。"
+    },
     "appearance": {
       "title": "外观",
       "language": "语言",

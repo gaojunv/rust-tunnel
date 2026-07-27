@@ -1,7 +1,10 @@
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Info, Lock } from 'lucide-react';
 
 export default function SecurityTab() {
+  const { t } = useTranslation();
+
   return (
     <div className="space-y-6">
       <Card>
@@ -10,7 +13,7 @@ export default function SecurityTab() {
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
               <Lock className="h-4 w-4" />
             </div>
-            <CardTitle className="text-lg">Security Configuration</CardTitle>
+            <CardTitle className="text-lg">{t('settings.security.title')}</CardTitle>
           </div>
         </CardHeader>
         <CardContent>
@@ -18,12 +21,10 @@ export default function SecurityTab() {
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
             <div className="text-sm text-muted-foreground">
               <p>
-                Security-sensitive configuration (admin password, JWT secret, client auth token)
-                is managed via the server configuration file and cannot be changed at runtime.
+                {t('settings.security.note')}
               </p>
               <p className="mt-2">
-                To change these values, edit the TOML config file or set environment variables,
-                then restart the server.
+                {t('settings.security.changeNote')}
               </p>
             </div>
           </div>
