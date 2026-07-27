@@ -10,9 +10,22 @@ export interface SampleOptions {
   fontSizePx?: number;
   step?: number;
   dpr?: number;
+  /** 粒子数上限：超出时按均匀间隔抽稀，防止中文长标题粒子过多卡顿。 */
+  maxParticles?: number;
 }
 
 const ALPHA_THRESHOLD = 128;
+
+// 均匀抽稀到不超过 max 个（保持整体字形分布）。
+function thinOut(particles: TextParticle[], max: number): TextParticle[] {
+  if (particles.length <= max) return particles;
+  const stride = particles.length / max;
+  const out: TextParticle[] = [];
+  for (let i = 0; i < max; i++) {
+    out.push(particles[Math.floor(i * stride)]);
+  }
+  return out;
+}
 
 export function sampleTextParticles(text: string, opts: SampleOptions = {}): TextParticle[] {
   const trimmed = text.trim();
@@ -58,5 +71,5 @@ export function sampleTextParticles(text: string, opts: SampleOptions = {}): Tex
       }
     }
   }
-  return particles;
+  return thinOut(particles, opts.maxParticles ?? Infinity);
 }

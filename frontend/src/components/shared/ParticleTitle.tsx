@@ -6,6 +6,12 @@ import { readPrimaryColor } from './particleColor';
 interface ParticleTitleProps {
   text: string;
   className?: string;
+  /**
+   * 可选：指针事件宿主。默认在 canvas 自身监听；传入外层容器（如整个页头卡片）
+   * 后，鼠标在该容器任意位置移动都能驱动光波与扰动，坐标也相对容器计算，
+   * 避免鼠标一移出文字边缘效果就中断（溢出）。
+   */
+  eventTargetRef?: React.RefObject<HTMLElement | null>;
 }
 
 interface RuntimeParticle {
@@ -18,13 +24,15 @@ interface RuntimeParticle {
 }
 
 const FONT_SIZE = 24;
-const STEP = 3;
-const PARTICLE_SIZE = 2; // 小正方形边长（CSS px）
-const LIGHT_BAND = 46; // 光带半径（px）
-const REPEL_RADIUS = 56; // 扰动半径（px）
+const STEP = 2; // 采样步长：中文笔画密，需更密采样才清晰
+const PARTICLE_SIZE = 2.5; // 小正方形边长（CSS px）
+const MAX_PARTICLES = 1600; // 粒子数上限，防中文长标题卡顿
+const LIGHT_BAND = 90; // 光带半径（px）
+const REPEL_RADIUS = 96; // 扰动半径（px）
 const REPEL_FORCE = 2.4; // 扰动推力
 const SPRING = 0.06; // 归位弹簧系数
 const DAMPING = 0.86; // 阻尼
+const MAX_DISPLACEMENT = 28; // 粒子偏离原位的软上限（px），防止被扰动飞太远
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(
@@ -42,7 +50,7 @@ function usePrefersReducedMotion(): boolean {
 // Canvas 像素粒子标题：小方块颗粒拼字，悬停光波点亮 + 颗粒扰动散开，
 // 默认轻微呼吸微光。遵循 prefers-reduced-motion（退化为静态颗粒）。
 // canvas/主题色不可用时回退为普通渐变文字。
-export function ParticleTitle({ text, className }: ParticleTitleProps) {
+export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitleProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [usable, setUsable] = useState<boolean | null>(null); // null=未知, true=粒子, false=回退
   const reducedMotion = usePrefersReducedMotion();
@@ -58,7 +66,12 @@ export function ParticleTitle({ text, className }: ParticleTitleProps) {
     }
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const sampled = sampleTextParticles(text, { fontSizePx: FONT_SIZE, step: STEP, dpr });
+    const sampled = sampleTextParticles(text, {
+      fontSizePx: FONT_SIZE,
+      step: STEP,
+      dpr,
+      maxParticles: MAX_PARTICLES,
+    });
     if (sampled.length === 0) {
       setUsable(false);
       return;
@@ -112,6 +125,16 @@ export function ParticleTitle({ text, className }: ParticleTitleProps) {
         p.x += p.vx;
         p.y += p.vy;
 
+        // 位移软上限：偏离原位过远时按比例钳回，避免被扰动飞太远。
+        const offX = p.x - p.homeX;
+        const offY = p.y - p.homeY;
+        const off = Math.hypot(offX, offY);
+        if (off > MAX_DISPLACEMENT) {
+          const k = MAX_DISPLACEMENT / off;
+          p.x = p.homeX + offX * k;
+          p.y = p.homeY + offY * k;
+        }
+
         // 光波点亮：鼠标光带 + 自动光带叠加。
         const bandX = mouse.active ? mouse.x : autoBandX;
         const glow = Math.max(0, 1 - Math.abs(p.x - bandX) / LIGHT_BAND);
@@ -129,24 +152,29 @@ export function ParticleTitle({ text, className }: ParticleTitleProps) {
 
     draw(); // reduced-motion 下只画这一帧
 
+    // 事件宿主：默认 canvas 自身；传入 eventTargetRef 时用外层容器（整个页头），
+    // 坐标统一换算到 canvas 局部系，保证跨元素的粒子位置一致。
+    const host = eventTargetRef?.current ?? canvas;
     const onMove = (e: PointerEvent) => {
-      const rect = canvas.getBoundingClientRect();
-      mouse.x = e.clientX - rect.left;
-      mouse.y = e.clientY - rect.top;
+      const canvasRect = canvas.getBoundingClientRect();
+      const hostRect = host.getBoundingClientRect();
+      // 鼠标相对宿主的坐标，再平移到 canvas 局部坐标系。
+      mouse.x = e.clientX - hostRect.left + (hostRect.left - canvasRect.left);
+      mouse.y = e.clientY - hostRect.top + (hostRect.top - canvasRect.top);
       mouse.active = true;
     };
     const onLeave = () => {
       mouse.active = false;
     };
-    canvas.addEventListener('pointermove', onMove);
-    canvas.addEventListener('pointerleave', onLeave);
+    host.addEventListener('pointermove', onMove);
+    host.addEventListener('pointerleave', onLeave);
 
     return () => {
       cancelAnimationFrame(raf);
-      canvas.removeEventListener('pointermove', onMove);
-      canvas.removeEventListener('pointerleave', onLeave);
+      host.removeEventListener('pointermove', onMove);
+      host.removeEventListener('pointerleave', onLeave);
     };
-  }, [text, reducedMotion]);
+  }, [text, reducedMotion, eventTargetRef]);
 
   // 初次渲染时先挂 canvas（可用性未知也挂，由 effect 判定）。
   if (usable === false) {

@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { cn } from '@/lib/utils';
 import { ParticleTitle } from '@/components/shared/ParticleTitle';
 
@@ -13,8 +14,12 @@ interface PageHeaderProps {
 // 光斑透明度在暗色主题下更高（暗色下辉光更明显），动画遵循
 // prefers-reduced-motion（见 index.css 中的 .animate-aurora*）。
 export function PageHeader({ title, description, children, className }: PageHeaderProps) {
+  // 整个页头卡片作为粒子标题的指针事件宿主：鼠标在卡片任意位置（含描述、
+  // 右侧按钮区）移动都能驱动标题的光波与扰动，避免移出文字边缘效果就中断。
+  const cardRef = useRef<HTMLDivElement>(null);
   return (
     <div
+      ref={cardRef}
       className={cn(
         'glass-card relative flex flex-col gap-4 overflow-hidden rounded-2xl border border-border/60 px-6 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-8 sm:py-6',
         // 立体感：顶部内侧高光 + 品牌色柔和投影
@@ -31,7 +36,7 @@ export function PageHeader({ title, description, children, className }: PageHead
 
       <div className="relative">
         <h1 className="text-2xl font-bold tracking-tight">
-          <ParticleTitle text={title} />
+          <ParticleTitle text={title} eventTargetRef={cardRef} />
         </h1>
         {description && <p className="text-muted-foreground">{description}</p>}
       </div>

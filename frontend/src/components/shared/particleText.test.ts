@@ -55,4 +55,21 @@ describe('sampleTextParticles', () => {
       expect(Number.isFinite(p.homeY)).toBe(true);
     }
   });
+
+  it('thins out particles to respect maxParticles cap', () => {
+    // 中文笔画密 + 小步长会产出大量粒子，应被均匀抽稀到上限内。
+    const capped = sampleTextParticles('反向代理规则管理界面', {
+      fontSizePx: 24,
+      step: 1, // 极密采样，确保原始粒子数远超上限
+      dpr: 1,
+      maxParticles: 100,
+    });
+    expect(capped.length).toBeLessThanOrEqual(100);
+    expect(capped.length).toBeGreaterThan(0);
+
+    // 未超上限时不抽稀：长度不变。
+    const uncapped = sampleTextParticles('Hi', { fontSizePx: 24, step: 3, dpr: 1, maxParticles: 5000 });
+    const baseline = sampleTextParticles('Hi', { fontSizePx: 24, step: 3, dpr: 1 });
+    expect(uncapped.length).toBe(baseline.length);
+  });
 });
