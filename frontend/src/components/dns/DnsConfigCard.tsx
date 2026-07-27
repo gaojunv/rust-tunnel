@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -6,6 +7,7 @@ import { useDnsConfig, useUpdateDnsConfig } from '@/api/hooks';
 import { Globe } from 'lucide-react';
 
 export default function DnsConfigCard() {
+  const { t } = useTranslation();
   const { data, isLoading } = useDnsConfig();
   const updateConfig = useUpdateDnsConfig();
 
@@ -27,7 +29,7 @@ export default function DnsConfigCard() {
   };
 
   if (isLoading) {
-    return <div className="py-8 text-center text-muted-foreground">Loading...</div>;
+    return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
   }
 
   return (
@@ -37,12 +39,12 @@ export default function DnsConfigCard() {
           <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
             <Globe className="h-4 w-4" />
           </div>
-          <CardTitle className="text-lg">DNS Configuration</CardTitle>
+          <CardTitle className="text-lg">{t('dns.config.title')}</CardTitle>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">
-          <label className="text-sm font-medium">Tunnel Domain</label>
+          <label className="text-sm font-medium">{t('dns.config.tunnelDomain')}</label>
           <Input
             type="text"
             value={tunnelDomain}
@@ -51,11 +53,11 @@ export default function DnsConfigCard() {
             className="max-w-md"
           />
           <p className="text-xs text-muted-foreground">
-            Domain suffix used for tunnel address resolution
+            {t('dns.config.tunnelDomainHint')}
           </p>
         </div>
         <div className="space-y-2">
-          <label className="text-sm font-medium">Mesh Domain</label>
+          <label className="text-sm font-medium">{t('dns.config.meshDomain')}</label>
           <Input
             type="text"
             value={meshDomain}
@@ -64,11 +66,11 @@ export default function DnsConfigCard() {
             className="max-w-md"
           />
           <p className="text-xs text-muted-foreground">
-            Domain suffix used for mesh network address resolution
+            {t('dns.config.meshDomainHint')}
           </p>
         </div>
         <Button onClick={handleSave} disabled={updateConfig.isPending}>
-          {updateConfig.isPending ? 'Saving...' : 'Save'}
+          {updateConfig.isPending ? t('common.saving') : t('common.save')}
         </Button>
       </CardContent>
     </Card>

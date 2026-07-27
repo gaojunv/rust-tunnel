@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
@@ -7,6 +8,7 @@ import { Label } from '@/components/ui/label';
 import { useLlmGatewayConfig, useUpdateLlmGatewayConfig } from '@/api/hooks';
 
 export default function GatewayTab() {
+  const { t } = useTranslation();
   const { data: config, isLoading } = useLlmGatewayConfig();
   const updateMutation = useUpdateLlmGatewayConfig();
   const [enabled, setEnabled] = useState(false);
@@ -27,18 +29,18 @@ export default function GatewayTab() {
     }
   }, [config]);
 
-  if (isLoading) return <div className="text-muted-foreground">Loading...</div>;
+  if (isLoading) return <div className="text-muted-foreground">{t('common.loading')}</div>;
 
   return (
     <Card>
-      <CardHeader><CardTitle>Gateway Configuration</CardTitle></CardHeader>
+      <CardHeader><CardTitle>{t('llm.gateway.title')}</CardTitle></CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-center justify-between">
-          <Label>Enable Gateway</Label>
+          <Label>{t('llm.gateway.enableGateway')}</Label>
           <Switch checked={enabled} onCheckedChange={setEnabled} />
         </div>
         <div className="space-y-2">
-          <Label>OpenAI Domain</Label>
+          <Label>{t('llm.gateway.openaiDomain')}</Label>
           <Input
             value={openaiDomain}
             onChange={(e) => setOpenaiDomain(e.target.value)}
@@ -46,11 +48,11 @@ export default function GatewayTab() {
             disabled={!enabled}
           />
           <p className="text-xs text-muted-foreground">
-            Accepts /v1/chat/completions, /v1/models
+            {t('llm.gateway.openaiDomainHint')}
           </p>
         </div>
         <div className="space-y-2">
-          <Label>Anthropic Domain</Label>
+          <Label>{t('llm.gateway.anthropicDomain')}</Label>
           <Input
             value={anthropicDomain}
             onChange={(e) => setAnthropicDomain(e.target.value)}
@@ -58,20 +60,20 @@ export default function GatewayTab() {
             disabled={!enabled}
           />
           <p className="text-xs text-muted-foreground">
-            Accepts /v1/messages
+            {t('llm.gateway.anthropicDomainHint')}
           </p>
         </div>
         <div className="space-y-2">
-          <Label>Listen Address</Label>
+          <Label>{t('llm.gateway.listenAddress')}</Label>
           <Input value={listen} onChange={(e) => setListen(e.target.value)} placeholder="0.0.0.0:443" disabled={!enabled} />
         </div>
         <div className="flex items-center justify-between">
-          <Label>TLS</Label>
+          <Label>{t('llm.gateway.tls')}</Label>
           <Switch checked={tlsEnabled} onCheckedChange={setTlsEnabled} disabled={!enabled} />
         </div>
         {tlsEnabled && (
           <div className="flex items-center justify-between">
-            <Label>ACME Auto-Renew</Label>
+            <Label>{t('llm.gateway.acmeAutoRenew')}</Label>
             <Switch checked={tlsAcme} onCheckedChange={setTlsAcme} disabled={!enabled} />
           </div>
         )}
@@ -88,7 +90,7 @@ export default function GatewayTab() {
           }
           disabled={updateMutation.isPending}
         >
-          {updateMutation.isPending ? 'Saving...' : 'Save'}
+          {updateMutation.isPending ? t('common.saving') : t('common.save')}
         </Button>
       </CardContent>
     </Card>

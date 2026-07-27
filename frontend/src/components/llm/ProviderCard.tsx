@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
@@ -12,6 +13,7 @@ interface Props { provider: LlmProvider; onEdit: () => void; }
 
 /** 单个模型行：展示 + 别名/标签的内联编辑 */
 function ModelRow({ model }: { model: LlmModel }) {
+  const { t } = useTranslation();
   const updateModelMutation = useUpdateModel();
   const deleteModelMutation = useDeleteModel();
   const [editing, setEditing] = useState(false);
@@ -34,8 +36,8 @@ function ModelRow({ model }: { model: LlmModel }) {
     return (
       <div className="flex items-center gap-2 text-sm py-1 border-b">
         <span className="font-mono">{model.model_name}</span>
-        <Input placeholder="Alias" value={alias} onChange={(e) => setAlias(e.target.value)} className="h-7 w-32" />
-        <Input placeholder="Tags (comma separated)" value={tags} onChange={(e) => setTags(e.target.value)} className="h-7 flex-1" />
+        <Input placeholder={t('llm.providerCard.aliasPlaceholder')} value={alias} onChange={(e) => setAlias(e.target.value)} className="h-7 w-32" />
+        <Input placeholder={t('llm.providerCard.tagsPlaceholder')} value={tags} onChange={(e) => setTags(e.target.value)} className="h-7 flex-1" />
         <Button variant="ghost" size="icon" onClick={save} disabled={updateModelMutation.isPending}>
           <Check className="w-3 h-3" />
         </Button>
@@ -57,7 +59,7 @@ function ModelRow({ model }: { model: LlmModel }) {
         <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setEditing(true); }}>
           <Edit3 className="w-3 h-3" />
         </Button>
-        <Button variant="ghost" size="icon" onClick={() => { if (confirm(`Delete model "${model.model_name}"?`)) deleteModelMutation.mutate(model.id); }}>
+        <Button variant="ghost" size="icon" onClick={() => { if (confirm(t('llm.providerCard.deleteModelConfirm', { name: model.model_name }))) deleteModelMutation.mutate(model.id); }}>
           <Trash2 className="w-3 h-3 text-destructive" />
         </Button>
       </div>
@@ -66,6 +68,7 @@ function ModelRow({ model }: { model: LlmModel }) {
 }
 
 export default function ProviderCard({ provider, onEdit }: Props) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const { data: models } = useProviderModels(expanded ? provider.id : '');
   const addModelMutation = useAddModel();
@@ -86,7 +89,7 @@ export default function ProviderCard({ provider, onEdit }: Props) {
         <div className="flex items-center gap-2">
           <Switch checked={provider.enabled} onCheckedChange={(v) => toggleMutation.mutate({ id: provider.id, enabled: v })} />
           <Button variant="ghost" size="icon" onClick={onEdit}><Edit3 className="w-4 h-4" /></Button>
-          <Button variant="ghost" size="icon" onClick={() => { if (confirm('Delete this provider and all its models?')) deleteMutation.mutate(provider.id); }}>
+          <Button variant="ghost" size="icon" onClick={() => { if (confirm(t('llm.providerCard.deleteProviderConfirm'))) deleteMutation.mutate(provider.id); }}>
             <Trash2 className="w-4 h-4 text-destructive" />
           </Button>
         </div>
@@ -94,14 +97,14 @@ export default function ProviderCard({ provider, onEdit }: Props) {
       {expanded && (
         <CardContent>
           <div className="space-y-2">
-            <div className="text-xs text-muted-foreground">Base URL: {provider.base_url}</div>
-            {provider.anthropic_base_url && <div className="text-xs text-muted-foreground">Anthropic URL: {provider.anthropic_base_url}</div>}
+            <div className="text-xs text-muted-foreground">{t('llm.providerCard.baseUrl', { url: provider.base_url })}</div>
+            {provider.anthropic_base_url && <div className="text-xs text-muted-foreground">{t('llm.providerCard.anthropicUrl', { url: provider.anthropic_base_url })}</div>}
           </div>
           <div className="space-y-2 mt-3">
             <div className="flex gap-2">
-              <Input placeholder="Model name (e.g., deepseek-chat)" value={newModelName} onChange={(e) => setNewModelName(e.target.value)} className="flex-1" />
+              <Input placeholder={t('llm.providerCard.modelNamePlaceholder')} value={newModelName} onChange={(e) => setNewModelName(e.target.value)} className="flex-1" />
               <Button size="sm" onClick={() => { if (newModelName.trim()) { addModelMutation.mutate({ providerId: provider.id, model_name: newModelName.trim() }); setNewModelName(''); } }} disabled={addModelMutation.isPending}>
-                <Plus className="w-4 h-4" /> Add
+                <Plus className="w-4 h-4" /> {t('llm.providerCard.addModel')}
               </Button>
             </div>
             {models?.map((m: LlmModel) => <ModelRow key={m.id} model={m} />)}

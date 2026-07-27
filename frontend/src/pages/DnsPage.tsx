@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -26,6 +27,7 @@ import type { AddDnsRecordRequest } from '@/types';
 import { Plus, Trash2 } from 'lucide-react';
 
 export default function DnsPage() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [newRecord, setNewRecord] = useState({
@@ -68,34 +70,34 @@ export default function DnsPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="DNS Records"
-        description="Manage DNS records for tunnel and mesh domains"
+        title={t('dns.title')}
+        description={t('dns.description')}
       >
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogTrigger asChild>
             <Button>
               <Plus className="mr-2 h-4 w-4" />
-              Add Record
+              {t('dns.addRecord')}
             </Button>
           </DialogTrigger>
           <DialogContent>
             <DialogHeader>
-              <DialogTitle>Add DNS Record</DialogTitle>
+              <DialogTitle>{t('dns.addRecordTitle')}</DialogTitle>
             </DialogHeader>
             <form onSubmit={handleAdd} className="space-y-4">
               <div className="space-y-2">
-                <label className="text-sm font-medium">Name</label>
+                <label className="text-sm font-medium">{t('dns.name')}</label>
                 <Input
                   value={newRecord.name}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, name: e.target.value })
                   }
-                  placeholder="example.com"
+                  placeholder={t('dns.namePlaceholder')}
                   required
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">Type</label>
+                <label className="text-sm font-medium">{t('dns.type')}</label>
                 <select
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                   value={newRecord.record_type}
@@ -109,23 +111,23 @@ export default function DnsPage() {
                 </select>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">Value</label>
+                <label className="text-sm font-medium">{t('dns.value')}</label>
                 <Input
                   value={newRecord.value}
                   onChange={(e) =>
                     setNewRecord({ ...newRecord, value: e.target.value })
                   }
-                  placeholder="192.168.1.1"
+                  placeholder={t('dns.valuePlaceholder')}
                   required
                 />
               </div>
               {addMutation.isError && (
                 <p className="text-sm text-destructive">
-                  Failed to add record. Please try again.
+                  {t('dns.failedAdd')}
                 </p>
               )}
               <Button type="submit" disabled={addMutation.isPending}>
-                {addMutation.isPending ? 'Adding...' : 'Add Record'}
+                {addMutation.isPending ? t('dns.adding') : t('dns.addRecord')}
               </Button>
             </form>
           </DialogContent>
@@ -136,25 +138,25 @@ export default function DnsPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Records</CardTitle>
+          <CardTitle>{t('dns.records')}</CardTitle>
         </CardHeader>
         <CardContent>
           {isLoading ? (
             <div className="text-center py-8 text-muted-foreground">
-              Loading...
+              {t('common.loading')}
             </div>
           ) : !records?.length ? (
             <div className="text-center py-8 text-muted-foreground">
-              No DNS records configured
+              {t('dns.empty')}
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>Value</TableHead>
-                  <TableHead className="w-[100px]">Actions</TableHead>
+                  <TableHead>{t('dns.name')}</TableHead>
+                  <TableHead>{t('dns.type')}</TableHead>
+                  <TableHead>{t('dns.value')}</TableHead>
+                  <TableHead className="w-[100px]">{t('dns.actions')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -179,7 +181,7 @@ export default function DnsPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() => {
-                          if (window.confirm(`Delete DNS record "${record.name}"?`)) {
+                          if (window.confirm(t('dns.confirmDelete', { name: record.name }))) {
                             deleteMutation.mutate(record.name);
                           }
                         }}

@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -29,14 +30,15 @@ const STATUS_DOTS: Record<StatusTone, string> = {
   unknown: 'bg-muted-foreground/50',
 };
 
-const STATUS_LABELS: Record<StatusTone, string> = {
-  critical: 'Critical',
-  warning: 'Warning',
-  connected: 'Connected',
-  unknown: 'Unknown',
-};
+const STATUS_LABEL_KEYS = {
+  critical: 'common.status.critical',
+  warning: 'common.status.warning',
+  connected: 'common.status.connected',
+  unknown: 'common.status.unknown',
+} as const;
 
 export default function MeshPage() {
+  const { t } = useTranslation();
   const { data: clients = [], isLoading } = useQuery({
     queryKey: ['clients', 'mesh'],
     queryFn: () => clientsApi.list(),
@@ -46,31 +48,31 @@ export default function MeshPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Mesh Network"
-        description="View mesh network connections and members"
+        title={t('mesh.title')}
+        description={t('mesh.description')}
       />
 
       <Card>
         <CardHeader>
-          <CardTitle>Clients</CardTitle>
+          <CardTitle>{t('mesh.clients')}</CardTitle>
         </CardHeader>
         <CardContent>
           {isLoading ? (
             <div className="text-center py-8 text-muted-foreground">
-              Loading...
+              {t('common.loading')}
             </div>
           ) : clients.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
-              No clients connected
+              {t('mesh.empty')}
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Hostname</TableHead>
-                  <TableHead>Version</TableHead>
+                  <TableHead>{t('mesh.table.name')}</TableHead>
+                  <TableHead>{t('mesh.table.status')}</TableHead>
+                  <TableHead>{t('mesh.table.hostname')}</TableHead>
+                  <TableHead>{t('mesh.table.version')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -92,7 +94,7 @@ export default function MeshPage() {
                               STATUS_DOTS[tone]
                             )}
                           />
-                          {STATUS_LABELS[tone]}
+                          {t(STATUS_LABEL_KEYS[tone])}
                         </Badge>
                       </TableCell>
                       <TableCell>{client.hostname ?? '-'}</TableCell>

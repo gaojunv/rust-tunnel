@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -48,6 +49,7 @@ function getAuthToken(): string | null {
 }
 
 export default function LogsPage() {
+  const { t } = useTranslation();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [levelFilter, setLevelFilter] = useState<string>('ALL');
   const [sourceFilter, setSourceFilter] = useState('');
@@ -206,14 +208,14 @@ export default function LogsPage() {
   return (
     <div className="flex h-full flex-col space-y-6">
       <PageHeader
-        title="Logs"
-        description="Real-time server and client log viewer"
+        title={t('logs.title')}
+        description={t('logs.description')}
       >
         <div className="flex items-center gap-2">
           <Select value={serverLogLevel} onValueChange={handleServerLogLevelChange}>
             <SelectTrigger className="w-[130px]">
               <Terminal className="mr-2 h-4 w-4" />
-              <SelectValue placeholder="Log level" />
+              <SelectValue placeholder={t('logs.logLevelPlaceholder')} />
             </SelectTrigger>
             <SelectContent>
               {LEVEL_OPTIONS.slice(1).map((level) => (
@@ -232,7 +234,7 @@ export default function LogsPage() {
           <div className="flex items-center gap-2">
             <Select value={levelFilter} onValueChange={setLevelFilter}>
               <SelectTrigger className="w-[120px]">
-                <SelectValue placeholder="Level" />
+                <SelectValue placeholder={t('logs.levelPlaceholder')} />
               </SelectTrigger>
               <SelectContent>
                 {LEVEL_OPTIONS.map((level) => (
@@ -244,7 +246,7 @@ export default function LogsPage() {
             </Select>
 
             <Input
-              placeholder="Filter by source..."
+              placeholder={t('logs.sourcePlaceholder')}
               value={sourceFilter}
               onChange={(e) => setSourceFilter(e.target.value)}
               className="w-[180px]"
@@ -254,7 +256,7 @@ export default function LogsPage() {
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
-              placeholder="Search logs..."
+              placeholder={t('logs.searchPlaceholder')}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="pl-9"
@@ -270,12 +272,12 @@ export default function LogsPage() {
               {isPaused ? (
                 <>
                   <Play className="mr-2 h-4 w-4" />
-                  Resume
+                  {t('logs.resume')}
                 </>
               ) : (
                 <>
                   <Pause className="mr-2 h-4 w-4" />
-                  Pause
+                  {t('logs.pause')}
                 </>
               )}
             </Button>
@@ -289,14 +291,14 @@ export default function LogsPage() {
           {isInitialLoading ? (
             <div className="flex items-center justify-center py-16 text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Loading logs...
+              {t('logs.loading')}
             </div>
           ) : filteredLogs.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
               <Terminal className="mb-4 h-12 w-12 opacity-50" />
-              <p className="text-lg font-medium">No log entries</p>
+              <p className="text-lg font-medium">{t('logs.empty')}</p>
               <p className="text-sm">
-                {isPaused ? 'Resume to see new logs' : 'Waiting for logs...'}
+                {isPaused ? t('logs.resumePrompt') : t('logs.waiting')}
               </p>
             </div>
           ) : (
@@ -319,7 +321,7 @@ export default function LogsPage() {
                       ) : (
                         <ChevronUp className="mr-2 h-4 w-4" />
                       )}
-                      Load older logs
+                      {t('logs.loadOlder')}
                     </Button>
                   </div>
                 )}
@@ -363,8 +365,8 @@ export default function LogsPage() {
       {/* Footer Status */}
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>
-          {filteredLogs.length} / {logs.length} entries
-          {searchQuery && ' (filtered)'}
+          {t('logs.footer.entries', { count: filteredLogs.length })} / {t('logs.footer.entries', { count: logs.length })}
+          {searchQuery && ' ' + t('logs.footer.filtered')}
         </span>
         <div className="flex items-center gap-2">
           {isPaused && (
@@ -372,7 +374,7 @@ export default function LogsPage() {
               variant="outline"
               className="border-amber-500/25 bg-amber-500/10 text-amber-500"
             >
-              Paused
+              {t('logs.footer.paused')}
             </Badge>
           )}
           <Button
@@ -384,7 +386,7 @@ export default function LogsPage() {
             }}
             disabled={autoScroll}
           >
-            {autoScroll ? 'Auto-scroll on' : 'Scroll to bottom'}
+            {autoScroll ? t('logs.footer.autoScrollOn') : t('logs.footer.scrollToBottom')}
           </Button>
         </div>
       </div>

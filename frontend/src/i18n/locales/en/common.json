@@ -5,6 +5,9 @@
     "cancel": "Cancel",
     "status": {
       "connected": "Connected",
+      "critical": "Critical",
+      "warning": "Warning",
+      "unknown": "Unknown",
       "disconnected": "Disconnected",
       "online": "online",
       "offline": "offline",
@@ -468,6 +471,168 @@
         "tencent": "Tencent DNS",
         "custom": "Custom"
       }
+    }
+  },
+  "dns": {
+    "title": "DNS Records",
+    "description": "Manage DNS records for tunnel and mesh domains",
+    "addRecord": "Add Record",
+    "addRecordTitle": "Add DNS Record",
+    "name": "Name",
+    "type": "Type",
+    "value": "Value",
+    "actions": "Actions",
+    "namePlaceholder": "example.com",
+    "valuePlaceholder": "192.168.1.1",
+    "records": "Records",
+    "empty": "No DNS records configured",
+    "adding": "Adding...",
+    "failedAdd": "Failed to add record. Please try again.",
+    "confirmDelete": "Delete DNS record \"{{name}}\"?",
+    "config": {
+      "title": "DNS Configuration",
+      "tunnelDomain": "Tunnel Domain",
+      "tunnelDomainHint": "Domain suffix used for tunnel address resolution",
+      "meshDomain": "Mesh Domain",
+      "meshDomainHint": "Domain suffix used for mesh network address resolution"
+    }
+  },
+  "mesh": {
+    "title": "Mesh Network",
+    "description": "View mesh network connections and members",
+    "clients": "Clients",
+    "empty": "No clients connected",
+    "table": {
+      "name": "Name",
+      "status": "Status",
+      "hostname": "Hostname",
+      "version": "Version"
+    }
+  },
+  "llm": {
+    "title": "LLM Gateway",
+    "description": "Manage AI providers, models, and API keys",
+    "tabs": {
+      "usage": "Usage",
+      "gateway": "Gateway",
+      "providers": "Providers & Models",
+      "apiKeys": "API Keys"
+    },
+    "providers": "Providers",
+    "addProvider": "Add Provider",
+    "gateway": {
+      "title": "Gateway Configuration",
+      "enableGateway": "Enable Gateway",
+      "openaiDomain": "OpenAI Domain",
+      "openaiDomainHint": "Accepts /v1/chat/completions, /v1/models",
+      "anthropicDomain": "Anthropic Domain",
+      "anthropicDomainHint": "Accepts /v1/messages",
+      "listenAddress": "Listen Address",
+      "tls": "TLS",
+      "acmeAutoRenew": "ACME Auto-Renew"
+    },
+    "providerCard": {
+      "baseUrl": "Base URL: {{url}}",
+      "anthropicUrl": "Anthropic URL: {{url}}",
+      "modelNamePlaceholder": "Model name (e.g., deepseek-chat)",
+      "aliasPlaceholder": "Alias",
+      "tagsPlaceholder": "Tags (comma separated)",
+      "deleteProviderConfirm": "Delete this provider and all its models?",
+      "deleteModelConfirm": "Delete model \"{{name}}\"?",
+      "addModel": "Add"
+    },
+    "providerDialog": {
+      "editTitle": "Edit Provider",
+      "addTitle": "Add Provider",
+      "name": "Name",
+      "namePlaceholder": "My DeepSeek",
+      "providerType": "Provider Type",
+      "baseUrl": "Base URL",
+      "anthropicBaseUrl": "Anthropic Base URL (optional)",
+      "anthropicBaseUrlPlaceholder": "Leave blank for Anthropic requests to use OpenAI format",
+      "apiKey": "API Key",
+      "apiKeyPlaceholderNew": "sk-...",
+      "apiKeyPlaceholderEdit": "Leave blank to keep current"
+    },
+    "apiKeys": {
+      "title": "API Keys",
+      "newKeyNotice": "New API Key Created — copy it now, it won't be shown again!",
+      "keyNamePlaceholder": "Key name (e.g., Cursor)",
+      "generateKey": "Generate Key",
+      "empty": "No API keys created yet.",
+      "unnamed": "Unnamed",
+      "revokeConfirm": "Revoke this API key?",
+      "dismiss": "Dismiss"
+    },
+    "usage": {
+      "stats": {
+        "totalRequests": "Total Requests",
+        "totalTokens": "Total Tokens",
+        "successRate": "Success Rate",
+        "cacheHitRate": "Cache Hit Rate",
+        "promptDesc": "Input {{prompt}} · Output {{completion}}",
+        "successDesc": "{{success}}/{{total}}",
+        "cacheDesc": "Hit {{tokens}} tokens"
+      },
+      "groupBy": {
+        "label": "Group by",
+        "item": "By {{label}}",
+        "api_key": "API Key",
+        "model": "Model",
+        "provider": "Provider"
+      },
+      "table": {
+        "title": "Usage Statistics",
+        "requests": "Requests",
+        "successRate": "Success Rate",
+        "prompt": "Input",
+        "cacheHit": "Cache Hit",
+        "completion": "Output",
+        "total": "Total"
+      },
+      "empty": "No usage data for this time range",
+      "loading": "Loading...",
+      "unknown": "Unknown",
+      "detail": {
+        "title": "Request Details",
+        "total": "Total {{count}} entries",
+        "time": "Time",
+        "apiKey": "API Key",
+        "provider": "Provider",
+        "model": "Model",
+        "protocol": "Protocol",
+        "io": "Input/Cache/Output",
+        "status": "Status",
+        "latency": "Latency",
+        "empty": "No requests for this time range"
+      },
+      "pagination": {
+        "page": "Page {{current}} / {{total}}",
+        "prev": "Previous",
+        "next": "Next"
+      }
+    }
+  },
+  "logs": {
+    "title": "Logs",
+    "description": "Real-time server and client log viewer",
+    "levelPlaceholder": "Level",
+    "logLevelPlaceholder": "Log level",
+    "sourcePlaceholder": "Filter by source...",
+    "searchPlaceholder": "Search logs...",
+    "pause": "Pause",
+    "resume": "Resume",
+    "loading": "Loading logs...",
+    "empty": "No log entries",
+    "resumePrompt": "Resume to see new logs",
+    "waiting": "Waiting for logs...",
+    "loadOlder": "Load older logs",
+    "footer": {
+      "entries": "{{count}} entries",
+      "filtered": "(filtered)",
+      "paused": "Paused",
+      "autoScrollOn": "Auto-scroll on",
+      "scrollToBottom": "Scroll to bottom"
     }
   }
 }

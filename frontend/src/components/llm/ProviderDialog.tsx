@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -17,6 +18,7 @@ const TYPES: { value: ProviderType; label: string; defaultUrl: string }[] = [
 ];
 
 export default function ProviderDialog({ open, onClose, providerId }: Props) {
+  const { t } = useTranslation();
   const { data: providers } = useLlmProviders();
   const createMutation = useCreateLlmProvider();
   const updateMutation = useUpdateLlmProvider();
@@ -38,27 +40,27 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
   return (
     <Dialog open={open} onOpenChange={onClose}>
       <DialogContent>
-        <DialogHeader><DialogTitle>{existing ? 'Edit Provider' : 'Add Provider'}</DialogTitle></DialogHeader>
+        <DialogHeader><DialogTitle>{existing ? t('llm.providerDialog.editTitle') : t('llm.providerDialog.addTitle')}</DialogTitle></DialogHeader>
         <div className="space-y-4">
-          <div className="space-y-2"><Label>Name</Label><Input value={name} onChange={(e) => setName(e.target.value)} placeholder="My DeepSeek" /></div>
+          <div className="space-y-2"><Label>{t('llm.providerDialog.name')}</Label><Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t('llm.providerDialog.namePlaceholder')} /></div>
           <div className="space-y-2">
-            <Label>Provider Type</Label>
+            <Label>{t('llm.providerDialog.providerType')}</Label>
             <Select value={providerType} onValueChange={(v) => { setProviderType(v as ProviderType); const info = TYPES.find((t) => t.value === v); if (info) setBaseUrl(info.defaultUrl); }}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>{TYPES.map((pt) => <SelectItem key={pt.value} value={pt.value}>{pt.label}</SelectItem>)}</SelectContent>
             </Select>
           </div>
-          <div className="space-y-2"><Label>Base URL</Label><Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></div>
-          <div className="space-y-2"><Label>Anthropic Base URL (可选)</Label><Input value={anthropicBaseUrl} onChange={(e) => setAnthropicBaseUrl(e.target.value)} placeholder="留空则 Anthropic 请求会转为 OpenAI 格式" /></div>
-          <div className="space-y-2"><Label>API Key</Label><Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={existing ? 'Leave blank to keep current' : 'sk-...'} /></div>
+          <div className="space-y-2"><Label>{t('llm.providerDialog.baseUrl')}</Label><Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></div>
+          <div className="space-y-2"><Label>{t('llm.providerDialog.anthropicBaseUrl')}</Label><Input value={anthropicBaseUrl} onChange={(e) => setAnthropicBaseUrl(e.target.value)} placeholder={t('llm.providerDialog.anthropicBaseUrlPlaceholder')} /></div>
+          <div className="space-y-2"><Label>{t('llm.providerDialog.apiKey')}</Label><Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={existing ? t('llm.providerDialog.apiKeyPlaceholderEdit') : t('llm.providerDialog.apiKeyPlaceholderNew')} /></div>
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
           <Button onClick={() => {
             const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey, anthropic_base_url: anthropicBaseUrl || null };
             if (existing) { updateMutation.mutate({ id: existing.id, ...req }, { onSuccess: onClose }); }
             else { createMutation.mutate(req, { onSuccess: onClose }); }
-          }} disabled={createMutation.isPending || updateMutation.isPending}>Save</Button>
+          }} disabled={createMutation.isPending || updateMutation.isPending}>{t('common.save')}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
