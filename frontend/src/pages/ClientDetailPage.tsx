@@ -1,4 +1,5 @@
 import { useParams, useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -7,6 +8,7 @@ import { clientsApi } from '@/api/client';
 import { ArrowLeft, Signal, Clock, Activity, Shield } from 'lucide-react';
 
 export default function ClientDetailPage() {
+  const { t } = useTranslation();
   const { name } = useParams<{ name: string }>();
   const navigate = useNavigate();
 
@@ -21,8 +23,8 @@ export default function ClientDetailPage() {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Client" description="Loading..." />
-        <div className="py-12 text-center text-muted-foreground">Loading...</div>
+        <PageHeader title={t('clientDetail.title')} description={t('common.loading')} />
+        <div className="py-12 text-center text-muted-foreground">{t('common.loading')}</div>
       </div>
     );
   }
@@ -30,10 +32,10 @@ export default function ClientDetailPage() {
   if (!client) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Client not found" description={`No client named ${name}`}>
+        <PageHeader title={t('clientDetail.notFoundTitle')} description={t('clientDetail.notFoundDesc', { name })}>
           <Button variant="outline" onClick={() => navigate('/dashboard')}>
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back
+            {t('clientDetail.back')}
           </Button>
         </PageHeader>
       </div>
@@ -43,7 +45,7 @@ export default function ClientDetailPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title={`Client ${client.name}`}
+        title={t('clientDetail.titleWithName', { name: client.name })}
         description={client.hostname ?? undefined}
       >
         <span
@@ -54,11 +56,11 @@ export default function ClientDetailPage() {
           }`}
         >
           <Signal className="mr-1 h-3 w-3" />
-          {client.online ? 'online' : 'offline'}
+          {client.online ? t('common.status.online') : t('common.status.offline')}
         </span>
         <Button variant="outline" onClick={() => navigate('/dashboard')}>
           <ArrowLeft className="mr-2 h-4 w-4" />
-          Back
+          {t('clientDetail.back')}
         </Button>
       </PageHeader>
 
@@ -66,16 +68,16 @@ export default function ClientDetailPage() {
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Status</CardTitle>
+            <CardTitle className="text-sm font-medium">{t('clientDetail.status')}</CardTitle>
             <Signal className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{client.online ? 'online' : 'offline'}</div>
+            <div className="text-2xl font-bold">{client.online ? t('common.status.online') : t('common.status.offline')}</div>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Version</CardTitle>
+            <CardTitle className="text-sm font-medium">{t('clientDetail.version')}</CardTitle>
             <Shield className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
@@ -84,7 +86,7 @@ export default function ClientDetailPage() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Referenced by Rules</CardTitle>
+            <CardTitle className="text-sm font-medium">{t('clientDetail.referencedByRules')}</CardTitle>
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
@@ -93,7 +95,7 @@ export default function ClientDetailPage() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Last Seen</CardTitle>
+            <CardTitle className="text-sm font-medium">{t('clientDetail.lastSeen')}</CardTitle>
             <Clock className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
@@ -107,30 +109,30 @@ export default function ClientDetailPage() {
       {/* Details */}
       <Card>
         <CardHeader>
-          <CardTitle>Details</CardTitle>
+          <CardTitle>{t('clientDetail.details')}</CardTitle>
         </CardHeader>
         <CardContent>
           <dl className="grid gap-4 sm:grid-cols-2">
             <div>
-              <dt className="text-sm font-medium text-muted-foreground">Name</dt>
+              <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.name')}</dt>
               <dd className="mt-1">{client.name}</dd>
             </div>
             <div>
-              <dt className="text-sm font-medium text-muted-foreground">Hostname</dt>
+              <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.hostname')}</dt>
               <dd className="mt-1">{client.hostname ?? '-'}</dd>
             </div>
             <div>
-              <dt className="text-sm font-medium text-muted-foreground">Connected At</dt>
+              <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.connectedAt')}</dt>
               <dd className="mt-1">
                 {client.connected_at ? new Date(client.connected_at).toLocaleString() : '-'}
               </dd>
             </div>
             <div>
-              <dt className="text-sm font-medium text-muted-foreground">First Seen</dt>
+              <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.firstSeen')}</dt>
               <dd className="mt-1">{new Date(client.first_seen_at).toLocaleString()}</dd>
             </div>
             <div className="sm:col-span-2">
-              <dt className="text-sm font-medium text-muted-foreground">Note</dt>
+              <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.note')}</dt>
               <dd className="mt-1">{client.note ?? '-'}</dd>
             </div>
           </dl>

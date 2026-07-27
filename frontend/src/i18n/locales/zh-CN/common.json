@@ -2,7 +2,13 @@
   "common": {
     "loading": "加载中...",
     "save": "保存",
-    "cancel": "取消"
+    "cancel": "取消",
+    "status": {
+      "connected": "已连接",
+      "disconnected": "已断开",
+      "online": "在线",
+      "offline": "离线"
+    }
   },
   "settings": {
     "title": "设置",
@@ -101,5 +107,58 @@
       "offline": "离线",
       "empty": "暂无注册的客户端"
     }
+  },
+  "clients": {
+    "title": "客户端",
+    "description": "管理已连接的客户端和客户端认证令牌",
+    "clientToken": "客户端令牌",
+    "rotate": "轮换",
+    "rotateConfirm": "轮换令牌？新客户端需要使用新值。已连接的客户端不受影响。",
+    "confirm": "确认",
+    "kick": "踢出",
+    "delete": "删除",
+    "referencedByRules": "被 {{count}} 条规则引用",
+    "kickAndDelete": "踢出并删除",
+    "kickDeleteConfirm": "踢出 {{name}} 并删除？",
+    "deleteConfirm": "删除 {{name}}？",
+    "table": {
+      "name": "名称",
+      "status": "状态",
+      "hostname": "主机名",
+      "lastSeen": "最后在线",
+      "version": "版本",
+      "referenced": "被引用",
+      "actions": "操作"
+    },
+    "list": {
+      "connectedClients": "已连接客户端",
+      "unknown": "未知",
+      "hostnameLabel": "Hostname",
+      "versionLabel": "Version",
+      "referencedLabel": "Referenced",
+      "lastSeenLabel": "Last seen",
+      "nA": "N/A",
+      "details": "详情",
+      "noClients": "暂无已连接的客户端",
+      "clientCount": "（{{count}} 个客户端）",
+      "clientCount_plural": "（{{count}} 个客户端）"
+    }
+  },
+  "clientDetail": {
+    "title": "客户端",
+    "titleWithName": "客户端 {{name}}",
+    "notFoundTitle": "未找到客户端",
+    "notFoundDesc": "不存在名为 {{name}} 的客户端",
+    "back": "返回",
+    "status": "状态",
+    "version": "版本",
+    "referencedByRules": "被规则引用",
+    "lastSeen": "最后在线",
+    "details": "详细信息",
+    "name": "名称",
+    "hostname": "主机名",
+    "connectedAt": "连接时间",
+    "firstSeen": "首次上线",
+    "note": "备注"
   }
 }

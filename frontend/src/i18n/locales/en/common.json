@@ -2,7 +2,13 @@
   "common": {
     "loading": "Loading...",
     "save": "Save",
-    "cancel": "Cancel"
+    "cancel": "Cancel",
+    "status": {
+      "connected": "Connected",
+      "disconnected": "Disconnected",
+      "online": "online",
+      "offline": "offline"
+    }
   },
   "settings": {
     "title": "Settings",
@@ -101,5 +107,58 @@
       "offline": "offline",
       "empty": "No clients registered"
     }
+  },
+  "clients": {
+    "title": "Clients",
+    "description": "Manage connected clients and the client authentication token",
+    "clientToken": "Client Token",
+    "rotate": "Rotate",
+    "rotateConfirm": "Rotate token? New clients need the new value. Online clients stay connected.",
+    "confirm": "Confirm",
+    "kick": "Kick",
+    "delete": "Delete",
+    "referencedByRules": "Referenced by {{count}} rule(s)",
+    "kickAndDelete": "Kick and delete",
+    "kickDeleteConfirm": "Kick {{name}} and delete it?",
+    "deleteConfirm": "Delete {{name}}?",
+    "table": {
+      "name": "Name",
+      "status": "Status",
+      "hostname": "Hostname",
+      "lastSeen": "Last seen",
+      "version": "Version",
+      "referenced": "Referenced",
+      "actions": "Actions"
+    },
+    "list": {
+      "connectedClients": "Connected Clients",
+      "unknown": "Unknown",
+      "hostnameLabel": "Hostname",
+      "versionLabel": "Version",
+      "referencedLabel": "Referenced",
+      "lastSeenLabel": "Last seen",
+      "nA": "N/A",
+      "details": "Details",
+      "noClients": "No clients connected",
+      "clientCount": "({{count}} client)",
+      "clientCount_plural": "({{count}} clients)"
+    }
+  },
+  "clientDetail": {
+    "title": "Client",
+    "titleWithName": "Client {{name}}",
+    "notFoundTitle": "Client not found",
+    "notFoundDesc": "No client named {{name}}",
+    "back": "Back",
+    "status": "Status",
+    "version": "Version",
+    "referencedByRules": "Referenced by Rules",
+    "lastSeen": "Last Seen",
+    "details": "Details",
+    "name": "Name",
+    "hostname": "Hostname",
+    "connectedAt": "Connected At",
+    "firstSeen": "First Seen",
+    "note": "Note"
   }
 }
