@@ -35,7 +35,7 @@ export default function LoginPage() {
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">
           <Logo className="mx-auto mb-4 h-12 w-12 rounded-xl shadow-glow" />
-          <CardTitle className="text-2xl text-gradient">Rust Tunnel</CardTitle>
+          <CardTitle className="text-2xl text-gradient">Aurora Tunnel</CardTitle>
           <CardDescription>{t('login.subtitle')}</CardDescription>
         </CardHeader>
         <CardContent>
