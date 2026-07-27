@@ -118,6 +118,11 @@
       aurora-text-breathe 4s ease-in-out infinite;
   }
 
+  /* Logo 光环呼吸：外发光缓慢明暗（叠加在 shadow-glow 之上，动画化 box-shadow） */
+  .logo-glow-breathe {
+    animation: logo-glow-breathe 3s ease-in-out infinite;
+  }
+
   /* 页头光影流动：底部流光渐变线（primary → 紫 → 青 循环流动） */
   .header-light-flow {
     background-image: linear-gradient(
@@ -166,7 +171,8 @@
     .header-light-flow,
     .animate-aurora,
     .animate-aurora-alt,
-    .text-aurora {
+    .text-aurora,
+    .logo-glow-breathe {
       animation: none;
     }
   }
@@ -188,6 +194,16 @@
   }
   50% {
     filter: brightness(1.12);
+  }
+}
+
+@keyframes logo-glow-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 24px hsl(var(--primary) / 0.25);
+  }
+  50% {
+    box-shadow: 0 0 32px hsl(var(--primary) / 0.45);
   }
 }
 
