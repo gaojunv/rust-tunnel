@@ -12,5 +12,31 @@
       "zh-CN": "中文",
       "en": "English"
     }
+  },
+  "nav": {
+    "dashboard": "Dashboard",
+    "network": "Network",
+    "clients": "Clients",
+    "mesh": "Mesh",
+    "dns": "DNS",
+    "proxy": "Proxy",
+    "reverseProxy": "Reverse Proxy",
+    "shadowsocks": "Shadowsocks",
+    "trojan": "Trojan",
+    "acmeCerts": "ACME Certs",
+    "ai": "AI",
+    "llmGateway": "LLM Gateway",
+    "system": "System",
+    "logs": "Logs",
+    "settings": "Settings",
+    "logout": "Logout",
+    "openMenu": "Open menu"
+  },
+  "login": {
+    "subtitle": "Enter your password to continue",
+    "passwordPlaceholder": "Password",
+    "signIn": "Login",
+    "signingIn": "Logging in...",
+    "loginFailed": "Invalid password"
   }
 }

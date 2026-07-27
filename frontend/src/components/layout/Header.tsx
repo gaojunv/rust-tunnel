@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Link, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -36,51 +37,51 @@ import {
 import DataFlowBackground from '@/components/dataflow/DataFlowBackground';
 
 interface NavItem {
-  label: string;
+  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.logs' | 'nav.settings';
   icon: React.ReactNode;
   href: string;
 }
 
 interface NavGroup {
-  label: string;
+  labelKey: 'nav.network' | 'nav.proxy' | 'nav.ai' | 'nav.system';
   items: NavItem[];
 }
 
 const dashboardItem: NavItem = {
-  label: 'Dashboard',
+  labelKey: 'nav.dashboard',
   icon: <LayoutDashboard className="h-4 w-4" />,
   href: '/dashboard',
 };
 
 const navGroups: NavGroup[] = [
   {
-    label: 'Network',
+    labelKey: 'nav.network',
     items: [
-      { label: 'Clients', icon: <Network className="h-4 w-4" />, href: '/clients' },
-      { label: 'Mesh', icon: <Network className="h-4 w-4" />, href: '/mesh' },
-      { label: 'DNS', icon: <Globe className="h-4 w-4" />, href: '/dns' },
+      { labelKey: 'nav.clients', icon: <Network className="h-4 w-4" />, href: '/clients' },
+      { labelKey: 'nav.mesh', icon: <Network className="h-4 w-4" />, href: '/mesh' },
+      { labelKey: 'nav.dns', icon: <Globe className="h-4 w-4" />, href: '/dns' },
     ],
   },
   {
-    label: 'Proxy',
+    labelKey: 'nav.proxy',
     items: [
-      { label: 'Reverse Proxy', icon: <ArrowLeftRight className="h-4 w-4" />, href: '/proxy' },
-      { label: 'Shadowsocks', icon: <Shield className="h-4 w-4" />, href: '/shadowsocks' },
-      { label: 'Trojan', icon: <ShieldCheck className="h-4 w-4" />, href: '/trojan' },
-      { label: 'ACME Certs', icon: <FileBadge className="h-4 w-4" />, href: '/acme' },
+      { labelKey: 'nav.reverseProxy', icon: <ArrowLeftRight className="h-4 w-4" />, href: '/proxy' },
+      { labelKey: 'nav.shadowsocks', icon: <Shield className="h-4 w-4" />, href: '/shadowsocks' },
+      { labelKey: 'nav.trojan', icon: <ShieldCheck className="h-4 w-4" />, href: '/trojan' },
+      { labelKey: 'nav.acmeCerts', icon: <FileBadge className="h-4 w-4" />, href: '/acme' },
     ],
   },
   {
-    label: 'AI',
+    labelKey: 'nav.ai',
     items: [
-      { label: 'LLM Gateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
+      { labelKey: 'nav.llmGateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
     ],
   },
   {
-    label: 'System',
+    labelKey: 'nav.system',
     items: [
-      { label: 'Logs', icon: <ScrollText className="h-4 w-4" />, href: '/logs' },
-      { label: 'Settings', icon: <Settings className="h-4 w-4" />, href: '/settings' },
+      { labelKey: 'nav.logs', icon: <ScrollText className="h-4 w-4" />, href: '/logs' },
+      { labelKey: 'nav.settings', icon: <Settings className="h-4 w-4" />, href: '/settings' },
     ],
   },
 ];
@@ -96,6 +97,7 @@ interface HeaderProps {
 }
 
 export function Header({ onLogout }: HeaderProps) {
+  const { t } = useTranslation();
   const location = useLocation();
   const isActive = (href: string) => location.pathname === href;
 
@@ -121,17 +123,17 @@ export function Header({ onLogout }: HeaderProps) {
         <nav className="ml-4 hidden items-center gap-1 md:flex">
           <Link to={dashboardItem.href} className={navLinkClass(isActive(dashboardItem.href))}>
             {dashboardItem.icon}
-            <span>{dashboardItem.label}</span>
+            <span>{t(dashboardItem.labelKey)}</span>
           </Link>
           {navGroups.map((group) => {
             const groupActive = group.items.some((item) => isActive(item.href));
             return (
-              <DropdownMenu key={group.label}>
+              <DropdownMenu key={group.labelKey}>
                 <DropdownMenuTrigger
                   className={cn(navLinkClass(groupActive), 'outline-none')}
-                  aria-label={`${group.label} menu`}
+                  aria-label={t(group.labelKey)}
                 >
-                  <span>{group.label}</span>
+                  <span>{t(group.labelKey)}</span>
                   <ChevronDown className="h-3.5 w-3.5 opacity-60" />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start">
@@ -143,7 +145,7 @@ export function Header({ onLogout }: HeaderProps) {
                     >
                       <Link to={item.href}>
                         {item.icon}
-                        <span>{item.label}</span>
+                        <span>{t(item.labelKey)}</span>
                       </Link>
                     </DropdownMenuItem>
                   ))}
@@ -160,7 +162,7 @@ export function Header({ onLogout }: HeaderProps) {
           variant="ghost"
           size="icon"
           onClick={onLogout}
-          aria-label="Logout"
+          aria-label={t('nav.logout')}
           className="hidden text-muted-foreground hover:text-destructive md:inline-flex"
         >
           <LogOut className="h-4 w-4" />
@@ -169,7 +171,7 @@ export function Header({ onLogout }: HeaderProps) {
         {/* Mobile navigation */}
         <Sheet>
           <SheetTrigger asChild>
-            <Button variant="ghost" size="icon" aria-label="Open menu" className="md:hidden">
+            <Button variant="ghost" size="icon" aria-label={t('nav.openMenu')} className="md:hidden">
               <Menu className="h-5 w-5" />
             </Button>
           </SheetTrigger>
@@ -185,20 +187,20 @@ export function Header({ onLogout }: HeaderProps) {
                 <SheetClose asChild>
                   <Link to={dashboardItem.href} className={navLinkClass(isActive(dashboardItem.href))}>
                     {dashboardItem.icon}
-                    <span>{dashboardItem.label}</span>
+                    <span>{t(dashboardItem.labelKey)}</span>
                   </Link>
                 </SheetClose>
               </div>
               {navGroups.map((group) => (
-                <div key={group.label} className="space-y-1">
+                <div key={group.labelKey} className="space-y-1">
                   <p className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {group.label}
+                    {t(group.labelKey)}
                   </p>
                   {group.items.map((item) => (
                     <SheetClose asChild key={item.href}>
                       <Link to={item.href} className={navLinkClass(isActive(item.href))}>
                         {item.icon}
-                        <span>{item.label}</span>
+                        <span>{t(item.labelKey)}</span>
                       </Link>
                     </SheetClose>
                   ))}
@@ -213,7 +215,7 @@ export function Header({ onLogout }: HeaderProps) {
                 onClick={onLogout}
               >
                 <LogOut className="mr-2 h-4 w-4" />
-                Logout
+                {t('nav.logout')}
               </Button>
             </div>
           </SheetContent>

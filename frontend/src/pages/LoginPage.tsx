@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -8,6 +9,7 @@ import { Logo } from '@/components/shared/Logo';
 import AuroraBackground from '@/components/aurora/AuroraBackground';
 
 export default function LoginPage() {
+  const { t } = useTranslation();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const navigate = useNavigate();
@@ -22,7 +24,7 @@ export default function LoginPage() {
       localStorage.setItem('auth_token', data.token);
       navigate('/dashboard');
     } catch (err) {
-      setError('Invalid password');
+      setError(t('login.loginFailed'));
     }
   };
 
@@ -34,14 +36,14 @@ export default function LoginPage() {
         <CardHeader className="text-center">
           <Logo className="mx-auto mb-4 h-12 w-12 rounded-xl shadow-glow" />
           <CardTitle className="text-2xl text-gradient">Rust Tunnel</CardTitle>
-          <CardDescription>Enter your password to continue</CardDescription>
+          <CardDescription>{t('login.subtitle')}</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
               <Input
                 type="password"
-                placeholder="Password"
+                placeholder={t('login.passwordPlaceholder')}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
@@ -53,7 +55,7 @@ export default function LoginPage() {
               </p>
             )}
             <Button type="submit" className="w-full" disabled={login.isPending}>
-              {login.isPending ? 'Logging in...' : 'Login'}
+              {login.isPending ? t('login.signingIn') : t('login.signIn')}
             </Button>
           </form>
         </CardContent>

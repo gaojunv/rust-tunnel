@@ -12,5 +12,31 @@
       "zh-CN": "中文",
       "en": "English"
     }
+  },
+  "nav": {
+    "dashboard": "仪表盘",
+    "network": "网络",
+    "clients": "客户端",
+    "mesh": "Mesh",
+    "dns": "DNS",
+    "proxy": "代理",
+    "reverseProxy": "反向代理",
+    "shadowsocks": "Shadowsocks",
+    "trojan": "Trojan",
+    "acmeCerts": "ACME 证书",
+    "ai": "AI",
+    "llmGateway": "LLM 网关",
+    "system": "系统",
+    "logs": "日志",
+    "settings": "设置",
+    "logout": "退出登录",
+    "openMenu": "打开菜单"
+  },
+  "login": {
+    "subtitle": "输入密码即可继续",
+    "passwordPlaceholder": "密码",
+    "signIn": "登录",
+    "signingIn": "登录中...",
+    "loginFailed": "密码错误，请重试"
   }
 }
