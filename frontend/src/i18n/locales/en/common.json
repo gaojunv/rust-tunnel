@@ -1,0 +1,16 @@
+{
+  "common": {
+    "loading": "Loading...",
+    "save": "Save",
+    "cancel": "Cancel"
+  },
+  "settings": {
+    "appearance": {
+      "title": "Appearance",
+      "language": "Language",
+      "system": "System",
+      "zh-CN": "中文",
+      "en": "English"
+    }
+  }
+}

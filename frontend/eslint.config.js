@@ -39,6 +39,11 @@ export default [
       ...reactHooks.configs.recommended.rules,
       'react-refresh/only-export-components': 'off',
       'no-undef': 'off',
+      'no-dupe-class-members': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
     },
   },
 ];

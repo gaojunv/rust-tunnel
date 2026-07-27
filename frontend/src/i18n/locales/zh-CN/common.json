@@ -1,0 +1,16 @@
+{
+  "common": {
+    "loading": "加载中...",
+    "save": "保存",
+    "cancel": "取消"
+  },
+  "settings": {
+    "appearance": {
+      "title": "外观",
+      "language": "语言",
+      "system": "跟随系统",
+      "zh-CN": "中文",
+      "en": "English"
+    }
+  }
+}

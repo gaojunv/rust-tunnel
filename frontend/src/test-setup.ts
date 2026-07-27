@@ -1,3 +1,7 @@
+import i18n from '@/i18n';
+
+await i18n.changeLanguage('en');
+
 /**
  * Custom Canvas 2D mock for jsdom test environment.
  *
