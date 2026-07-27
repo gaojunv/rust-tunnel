@@ -1,6 +1,6 @@
 import { useRef } from 'react';
 import { cn } from '@/lib/utils';
-import { ParticleTitle } from '@/components/shared/ParticleTitle';
+import { TitleEffectSwitch } from '@/components/shared/TitleEffectSwitch';
 
 interface PageHeaderProps {
   title: string;
@@ -14,7 +14,7 @@ interface PageHeaderProps {
 // 光斑透明度在暗色主题下更高（暗色下辉光更明显），动画遵循
 // prefers-reduced-motion（见 index.css 中的 .animate-aurora*）。
 export function PageHeader({ title, description, children, className }: PageHeaderProps) {
-  // 整个页头卡片作为粒子标题的指针事件宿主：鼠标在卡片任意位置（含描述、
+  // 整个页头卡片作为标题动画的指针事件宿主：鼠标在卡片任意位置（含描述、
   // 右侧按钮区）移动都能驱动标题的光波与扰动，避免移出文字边缘效果就中断。
   const cardRef = useRef<HTMLDivElement>(null);
   return (
@@ -36,7 +36,7 @@ export function PageHeader({ title, description, children, className }: PageHead
 
       <div className="relative">
         <h1 className="text-[32px] font-bold leading-tight tracking-tight">
-          <ParticleTitle text={title} eventTargetRef={cardRef} />
+          <TitleEffectSwitch text={title} eventTargetRef={cardRef} />
         </h1>
         {description && <p className="mt-1.5 text-muted-foreground">{description}</p>}
       </div>

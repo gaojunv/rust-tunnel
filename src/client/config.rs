@@ -309,6 +309,12 @@ mod tests {
 
     #[test]
     fn test_password_required() {
+        // Isolate from any PASSWORD env var set at the shell level
+        let saved = std::env::var("PASSWORD").ok();
+        if saved.is_some() {
+            std::env::remove_var("PASSWORD");
+        }
+
         let cli = ClientCli {
             config_file: None,
             server: Some("host:8080".into()),
@@ -324,6 +330,11 @@ mod tests {
         };
         let err = ClientConfig::from_cli(cli).unwrap_err();
         assert!(err.contains("password"));
+
+        // Restore env var if it was set
+        if let Some(v) = saved {
+            std::env::set_var("PASSWORD", v);
+        }
     }
 
     #[test]

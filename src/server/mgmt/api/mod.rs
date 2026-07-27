@@ -17,6 +17,7 @@ pub mod clients;
 pub mod dns;
 pub mod dto;
 pub mod llm;
+pub mod preferences;
 pub mod login;
 pub mod logs;
 pub mod mesh;
@@ -215,7 +216,8 @@ pub async fn run_api_server(
         .route("/api/login", post(login::login))
         .route("/api/health", get(login::health))
         .route("/api/stats/stream", get(stats::sse_stats_stream))
-        .route("/api/logs/stream", get(logs::sse_log_stream));
+        .route("/api/logs/stream", get(logs::sse_log_stream))
+        .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)
     let mut protected_routes = Router::new()
@@ -332,6 +334,8 @@ pub async fn run_api_server(
         .route("/api/llm/usage/summary", get(llm::get_usage_summary))
         .route("/api/llm/usage/aggregate", get(llm::get_usage_aggregate))
         .route("/api/llm/usage/logs", get(llm::get_usage_logs))
+        // User preferences
+        .route("/api/preferences", put(preferences::put_preferences))
         // Settings endpoints
         .route("/api/settings", get(settings::get_settings))
         .route(

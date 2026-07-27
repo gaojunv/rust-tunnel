@@ -9,7 +9,12 @@ import {
 } from '@/components/ui/select';
 import { useLanguagePreference } from '@/i18n/I18nProvider';
 import { LANGUAGE_PREFERENCES, type LanguagePreference } from '@/i18n/languagePreference';
-import { Languages } from 'lucide-react';
+import { usePreferences } from '@/preferences/PreferencesProvider';
+import {
+  TITLE_EFFECT_PREFERENCES,
+  type TitleEffectPreference,
+} from '@/effects/titleEffectPreference';
+import { Languages, Sparkles } from 'lucide-react';
 
 /** Explicit key map for tsc type-safety with dynamic preference values. */
 const PREFERENCE_LABEL_KEYS = {
@@ -18,40 +23,77 @@ const PREFERENCE_LABEL_KEYS = {
   en: 'settings.appearance.en',
 } as const;
 
+const TITLE_EFFECT_LABEL_KEYS = {
+  'grid-wave': 'settings.appearance.titleEffect.gridWave',
+  particles: 'settings.appearance.titleEffect.particles',
+  none: 'settings.appearance.titleEffect.none',
+} as const;
+
 export default function AppearanceTab() {
   const { t } = useTranslation();
   const { preference, setPreference } = useLanguagePreference();
+  const { prefs, setPreference: setUserPreference } = usePreferences();
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <Languages className="h-4 w-4" />
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Languages className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('settings.appearance.title')}</CardTitle>
           </div>
-          <CardTitle className="text-lg">{t('settings.appearance.title')}</CardTitle>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-2">
-          <label className="text-sm font-medium">{t('settings.appearance.language')}</label>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('settings.appearance.language')}</label>
+            <Select
+              value={preference}
+              onValueChange={(value) => setPreference(value as LanguagePreference)}
+            >
+              <SelectTrigger className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {LANGUAGE_PREFERENCES.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {t(PREFERENCE_LABEL_KEYS[p])}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Sparkles className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('settings.appearance.titleEffect.title')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent>
           <Select
-            value={preference}
-            onValueChange={(value) => setPreference(value as LanguagePreference)}
+            value={prefs.titleEffect}
+            onValueChange={(value) => setUserPreference('titleEffect', value as TitleEffectPreference)}
           >
             <SelectTrigger className="w-48">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {LANGUAGE_PREFERENCES.map((p) => (
+              {TITLE_EFFECT_PREFERENCES.map((p) => (
                 <SelectItem key={p} value={p}>
-                  {t(PREFERENCE_LABEL_KEYS[p])}
+                  {t(TITLE_EFFECT_LABEL_KEYS[p])}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-        </div>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </div>
   );
 }

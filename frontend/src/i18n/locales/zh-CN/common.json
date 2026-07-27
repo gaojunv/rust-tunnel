@@ -67,7 +67,13 @@
       "language": "语言",
       "system": "跟随系统",
       "zh-CN": "中文",
-      "en": "English"
+      "en": "English",
+      "titleEffect": {
+        "title": "标题动画",
+        "gridWave": "网格波浪（推荐）",
+        "particles": "像素粒子",
+        "none": "无动画"
+      }
     }
   },
   "nav": {

@@ -1,8 +1,19 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PreferencesProvider } from '../preferences/PreferencesProvider';
+import { PREFERENCES_CACHE_KEY } from '../preferences/preferencesStore';
 import { ThemeProvider, useTheme } from './ThemeProvider';
-import { THEME_STORAGE_KEY, type ThemePreference } from './theme';
+import { type ThemePreference } from './theme';
+
+vi.mock('../api/preferences', () => ({
+  fetchPreferences: vi.fn().mockResolvedValue({
+    theme: 'dark',
+    language: 'system',
+    title_effect: 'grid-wave',
+  }),
+  updatePreferences: vi.fn().mockResolvedValue(undefined),
+}));
 
 const listeners = new Set<(event: MediaQueryListEvent) => void>();
 let systemMatchesDark = false;
@@ -49,9 +60,11 @@ const ThemeProbe = () => {
 };
 
 const renderProbe = () => render(
-  <ThemeProvider>
-    <ThemeProbe />
-  </ThemeProvider>,
+  <PreferencesProvider>
+    <ThemeProvider>
+      <ThemeProbe />
+    </ThemeProvider>
+  </PreferencesProvider>,
 );
 
 beforeEach(() => {
@@ -83,7 +96,8 @@ describe('ThemeProvider', () => {
 
     expect(screen.getByTestId('preference').textContent).toBe('dark');
     expect(screen.getByTestId('resolvedTheme').textContent).toBe('dark');
-    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('dark');
+    const stored = JSON.parse(localStorage.getItem(PREFERENCES_CACHE_KEY) ?? '{}');
+    expect(stored.theme).toBe('dark');
     expect(document.documentElement.classList.contains('dark')).toBe(true);
   });
 
