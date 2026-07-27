@@ -9,6 +9,12 @@ import { Info, ShieldCheck } from 'lucide-react';
 
 export default function TrojanConfigCard() {
   const { t } = useTranslation();
+
+  const CERT_SOURCE_LABEL_KEYS = {
+    acme_exact: 'trojan.config.certSourceLabels.acme_exact',
+    acme_wildcard: 'trojan.config.certSourceLabels.acme_wildcard',
+    self_signed: 'trojan.config.certSourceLabels.self_signed',
+  } as const;
   const { data: tjConfig, isLoading } = useTrojanConfig();
   const { data: acmeStatus } = useAcmeStatus();
   const updateTJ = useUpdateTrojanConfig();
@@ -47,7 +53,7 @@ export default function TrojanConfigCard() {
   }
 
   const certSourceLabel = tjConfig?.cert_source
-    ? (t as (key: string) => string)(`trojan.config.certSourceLabels.${tjConfig.cert_source}`)
+    ? t(CERT_SOURCE_LABEL_KEYS[tjConfig.cert_source] ?? tjConfig.cert_source)
     : null;
 
   return (

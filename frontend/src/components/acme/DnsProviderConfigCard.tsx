@@ -22,6 +22,13 @@ import { useDnsProviders, useUpdateDnsProvider } from '@/api/hooks';
 import { cn } from '@/lib/utils';
 import type { DnsProviderType, DnsProviderConfig } from '@/types';
 
+const PROVIDER_LABEL_KEYS = {
+  cloudflare: 'acme.dnsProvider.providerLabels.cloudflare',
+  aliyun: 'acme.dnsProvider.providerLabels.aliyun',
+  tencent: 'acme.dnsProvider.providerLabels.tencent',
+  custom: 'acme.dnsProvider.providerLabels.custom',
+} as const;
+
 export function DnsProviderConfigCard() {
   const { t } = useTranslation();
   const { data, isLoading } = useDnsProviders();
@@ -58,7 +65,7 @@ export function DnsProviderConfigCard() {
   }
 
   const providerLabel = data?.config
-    ? (t as (key: string) => string)(`acme.dnsProvider.providerLabels.${data.config.provider}`)
+    ? t(PROVIDER_LABEL_KEYS[data.config.provider] ?? data.config.provider)
     : t('acme.dnsProvider.notConfigured');
 
   return (
