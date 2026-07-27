@@ -29,8 +29,8 @@ export function PageHeader({ title, description, children, className }: PageHead
     >
       {/* 氛围背景：极光光斑 + 网格纹理（纯装饰，不响应交互） */}
       <div aria-hidden className="pointer-events-none absolute inset-0">
-        <div className="aurora-blob animate-aurora -left-12 -top-20 h-52 w-80 bg-[radial-gradient(circle,hsl(var(--primary)/0.22),transparent_70%)] dark:bg-[radial-gradient(circle,hsl(var(--primary)/0.35),transparent_70%)]" />
-        <div className="aurora-blob animate-aurora-alt -bottom-24 right-0 h-48 w-72 bg-[radial-gradient(circle,hsl(var(--chart-2)/0.16),transparent_70%)] dark:bg-[radial-gradient(circle,hsl(var(--chart-2)/0.28),transparent_70%)]" />
+        <div className="aurora-blob animate-aurora -left-12 -top-24 h-60 w-96 bg-[radial-gradient(circle,hsl(var(--primary)/0.28),transparent_70%)] dark:bg-[radial-gradient(circle,hsl(var(--primary)/0.42),transparent_70%)]" />
+        <div className="aurora-blob animate-aurora-alt -bottom-28 right-0 h-56 w-80 bg-[radial-gradient(circle,hsl(var(--chart-2)/0.22),transparent_70%)] dark:bg-[radial-gradient(circle,hsl(var(--chart-2)/0.34),transparent_70%)]" />
         <div className="grid-texture absolute inset-0" />
       </div>
 
