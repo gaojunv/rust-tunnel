@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Link, Shield, Server, Globe } from 'lucide-react';
@@ -10,48 +11,39 @@ interface CertConsumerBindingProps {
 
 interface ConsumerItem {
   key: keyof CertConsumers;
-  label: string;
-  description: string;
   icon: React.ReactNode;
 }
 
 const CONSUMERS: ConsumerItem[] = [
   {
     key: 'api_tls',
-    label: 'API Server TLS',
-    description: 'HTTPS for the management API',
     icon: <Server className="h-4 w-4" />,
   },
   {
     key: 'trojan',
-    label: 'Trojan Proxy',
-    description: 'TLS for Trojan proxy connections',
     icon: <Shield className="h-4 w-4" />,
   },
   {
     key: 'control_tls',
-    label: 'Control Channel TLS',
-    description: 'TLS for client control connections',
     icon: <Link className="h-4 w-4" />,
   },
   {
     key: 'reverse_proxy',
-    label: 'Reverse Proxy',
-    description: 'TLS for reverse proxy rules',
     icon: <Globe className="h-4 w-4" />,
   },
 ];
 
 export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
+  const { t } = useTranslation();
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Certificate Consumers</CardTitle>
+        <CardTitle className="text-base">{t('acme.consumers.title')}</CardTitle>
       </CardHeader>
       <CardContent>
         {!consumers ? (
           <p className="text-sm text-muted-foreground">
-            No consumer binding information available.
+            {t('acme.consumers.empty')}
           </p>
         ) : (
           <div className="grid gap-3 md:grid-cols-2">
@@ -77,9 +69,9 @@ export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
                       {item.icon}
                     </div>
                     <div>
-                      <div className="text-sm font-medium">{item.label}</div>
+                      <div className="text-sm font-medium">{t(`acme.consumers.items.${item.key}.label` as const)}</div>
                       <div className="text-xs text-muted-foreground">
-                        {item.description}
+                        {t(`acme.consumers.items.${item.key}.desc` as const)}
                       </div>
                     </div>
                   </div>
@@ -100,7 +92,7 @@ export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
                           : 'bg-muted-foreground/50'
                       )}
                     />
-                    {active ? 'Active' : 'Inactive'}
+                    {active ? t('common.status.active') : t('common.status.inactive')}
                   </Badge>
                 </div>
               );

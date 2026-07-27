@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -18,6 +19,7 @@ interface BackendFieldsProps {
 }
 
 export function BackendFields({ backends, onChange }: BackendFieldsProps) {
+  const { t } = useTranslation();
   const { data: clientsData = [] } = useQuery({
     queryKey: ['clients'],
     queryFn: clientsApi.list,
@@ -44,7 +46,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
 
   return (
     <div className="space-y-2">
-      <label className="text-sm font-medium">Backend Servers</label>
+      <label className="text-sm font-medium">{t('reverseProxy.backendFields.backendServers')}</label>
       {backends.map((backend, index) => {
         const scheme = backend.scheme ?? 'http';
         const protocol = backend.protocol ?? 'http1';
@@ -62,7 +64,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
                   }
                   className="h-3.5 w-3.5"
                 />
-                Direct
+                {t('reverseProxy.backendFields.direct')}
               </label>
               <label className="flex items-center gap-1.5 text-sm">
                 <input
@@ -71,26 +73,26 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
                   onChange={() => updateBackend(index, 'kind', 'client')}
                   className="h-3.5 w-3.5"
                 />
-                Client
+                {t('reverseProxy.backendFields.client')}
               </label>
             </div>
             {/* Client name field (only for client kind) */}
             {backend.kind === 'client' && (
               <div>
-                <label className="mb-1 block text-xs text-muted-foreground">Client Name</label>
+                <label className="mb-1 block text-xs text-muted-foreground">{t('reverseProxy.backendFields.clientName')}</label>
                 <input
                   list="clients-datalist"
                   value={backend.client_name ?? ''}
                   onChange={(e) =>
                     updateBackend(index, 'client_name', e.target.value || null)
                   }
-                  placeholder="Select or type a client name"
+                  placeholder={t('reverseProxy.backendFields.clientNamePlaceholder')}
                   className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 />
                 <datalist id="clients-datalist">
                   {clientsData.map((c) => (
                     <option key={c.name} value={c.name}>
-                      {c.online ? 'online' : 'offline'} {c.hostname ?? ''}
+                      {c.online ? t('common.status.online') : t('common.status.offline')} {c.hostname ?? ''}
                     </option>
                   ))}
                 </datalist>
@@ -110,7 +112,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
                 onChange={(e) =>
                   updateBackend(index, 'weight', parseInt(e.target.value, 10) || 100)
                 }
-                placeholder="Weight"
+                placeholder={t('reverseProxy.backendFields.weightPlaceholder')}
                 className="w-24"
               />
               <Button
@@ -124,7 +126,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
             </div>
             <div className="flex items-center gap-2">
               <div className="flex-1 space-y-1">
-                <label className="text-xs text-muted-foreground">Scheme</label>
+                <label className="text-xs text-muted-foreground">{t('reverseProxy.backendFields.scheme')}</label>
                 <Select
                   value={scheme}
                   onValueChange={(v) =>
@@ -141,7 +143,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
                 </Select>
               </div>
               <div className="flex-1 space-y-1">
-                <label className="text-xs text-muted-foreground">Protocol</label>
+                <label className="text-xs text-muted-foreground">{t('reverseProxy.backendFields.protocol')}</label>
                 <Select
                   value={protocol}
                   onValueChange={(v) =>
@@ -161,7 +163,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
             {showH2cHint && (
               <p className="flex items-center gap-1.5 text-xs text-amber-500">
                 <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                h2c prior-knowledge: 后端需支持明文 HTTP/2
+                {t('reverseProxy.backendFields.h2cHint')}
               </p>
             )}
           </div>
@@ -169,7 +171,7 @@ export function BackendFields({ backends, onChange }: BackendFieldsProps) {
       })}
       <Button type="button" variant="outline" size="sm" onClick={addBackend}>
         <Plus className="mr-2 h-4 w-4" />
-        Add Backend
+        {t('reverseProxy.backendFields.addBackend')}
       </Button>
     </div>
   );

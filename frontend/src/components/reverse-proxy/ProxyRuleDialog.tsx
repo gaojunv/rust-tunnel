@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   Dialog,
   DialogContent,
@@ -39,6 +40,7 @@ const emptyForm = {
 };
 
 export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDialogProps) {
+  const { t } = useTranslation();
   const createMutation = useCreateProxyRule();
   const updateMutation = useUpdateProxyRule();
   const [form, setForm] = useState(emptyForm);
@@ -88,7 +90,10 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         const details = (body.conflicts ?? [])
           .map((c) => c.reason)
           .join('; ');
-        alert(`规则冲突：${body.error ?? '与现有规则冲突'}${details ? '\n' + details : ''}`);
+        alert(t('reverseProxy.dialog.conflictAlert', {
+          error: body.error ?? t('reverseProxy.dialog.conflictDefault'),
+          details: details || '',
+        }));
       }
     };
 
@@ -115,13 +120,13 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] overflow-y-auto max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{editingRule ? 'Edit Rule' : 'New Rule'}</DialogTitle>
+          <DialogTitle>{editingRule ? t('reverseProxy.dialog.edit') : t('reverseProxy.dialog.new')}</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-5">
           {/* Name + Type */}
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-2">
-              <label className="text-sm font-medium">Name</label>
+              <label className="text-sm font-medium">{t('reverseProxy.dialog.name')}</label>
               <Input
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -130,7 +135,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Type</label>
+              <label className="text-sm font-medium">{t('reverseProxy.dialog.type')}</label>
               <Select
                 value={form.type}
                 onValueChange={(v) => setForm({ ...form, type: v as RuleType })}
@@ -139,9 +144,9 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="http">HTTP</SelectItem>
-                  <SelectItem value="tcp">TCP</SelectItem>
-                  <SelectItem value="udp">UDP</SelectItem>
+                  <SelectItem value="http">{t('reverseProxy.dialog.types.http')}</SelectItem>
+                  <SelectItem value="tcp">{t('reverseProxy.dialog.types.tcp')}</SelectItem>
+                  <SelectItem value="udp">{t('reverseProxy.dialog.types.udp')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -149,7 +154,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
 
           {/* Listen Address */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Listen Address</label>
+            <label className="text-sm font-medium">{t('reverseProxy.dialog.listenAddress')}</label>
             <Input
               value={form.listen}
               onChange={(e) => setForm({ ...form, listen: e.target.value })}
@@ -174,7 +179,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           {/* TCP/UDP backend */}
           {(form.type === 'tcp' || form.type === 'udp') && (
             <div className="space-y-3">
-              <label className="text-sm font-medium">Backend</label>
+              <label className="text-sm font-medium">{t('reverseProxy.dialog.backend')}</label>
               {/* Kind radio */}
               <div className="flex items-center gap-4">
                 <label className="flex items-center gap-1.5 text-sm">
@@ -200,7 +205,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
                     }
                     className="h-3.5 w-3.5"
                   />
-                  Direct
+                  {t('reverseProxy.backendFields.direct')}
                 </label>
                 <label className="flex items-center gap-1.5 text-sm">
                   <input
@@ -225,13 +230,13 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
                     }
                     className="h-3.5 w-3.5"
                   />
-                  Client
+                  {t('reverseProxy.backendFields.client')}
                 </label>
               </div>
               {/* Client name field */}
               {tcpBackend?.kind === 'client' && (
                 <div>
-                  <label className="mb-1 block text-xs text-muted-foreground">Client Name</label>
+                  <label className="mb-1 block text-xs text-muted-foreground">{t('reverseProxy.backendFields.clientName')}</label>
                   <input
                     list="tcp-clients-datalist"
                     value={tcpBackend.client_name ?? ''}
@@ -247,13 +252,13 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
                         ],
                       })
                     }
-                    placeholder="Select or type a client name"
+                    placeholder={t('reverseProxy.backendFields.clientNamePlaceholder')}
                     className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                   />
                   <datalist id="tcp-clients-datalist">
                     {clientsData.map((c) => (
                       <option key={c.name} value={c.name}>
-                        {c.online ? 'online' : 'offline'} {c.hostname ?? ''}
+                        {c.online ? t('common.status.online') : t('common.status.offline')} {c.hostname ?? ''}
                       </option>
                     ))}
                   </datalist>
@@ -284,8 +289,8 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           {/* Enabled */}
           <div className="flex items-center justify-between rounded-lg border bg-muted/30 p-4">
             <div>
-              <div className="text-sm font-medium">Enabled</div>
-              <div className="text-xs text-muted-foreground">Start this proxy rule immediately</div>
+              <div className="text-sm font-medium">{t('reverseProxy.dialog.enabled')}</div>
+              <div className="text-xs text-muted-foreground">{t('reverseProxy.dialog.enabledDesc')}</div>
             </div>
             <Switch
               checked={form.enabled}
@@ -297,17 +302,17 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
           {mutation.isError && (
             <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               <AlertTriangle className="h-4 w-4 shrink-0" />
-              Failed to {editingRule ? 'update' : 'create'} rule. Please try again.
+              {t('reverseProxy.dialog.error', { action: editingRule ? t('reverseProxy.dialog.errorUpdate') : t('reverseProxy.dialog.errorCreate') })}
             </div>
           )}
 
           {/* Submit */}
           <Button type="submit" disabled={mutation.isPending} className="w-full">
             {mutation.isPending
-              ? 'Saving...'
+              ? t('common.saving')
               : editingRule
-                ? 'Update Rule'
-                : 'Create Rule'}
+                ? t('reverseProxy.dialog.submit.update')
+                : t('reverseProxy.dialog.submit.create')}
           </Button>
         </form>
       </DialogContent>

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Input } from '@/components/ui/input';
@@ -17,6 +18,7 @@ import { cn } from '@/lib/utils';
 import type { UpdateAcmeConfigRequest } from '@/types';
 
 export function AcmeConfigCard() {
+  const { t } = useTranslation();
   const { data: config, isLoading } = useAcmeConfig();
   const updateMutation = useUpdateAcmeConfig();
   const [editOpen, setEditOpen] = useState(false);
@@ -46,7 +48,7 @@ export function AcmeConfigCard() {
   if (isLoading) {
     return (
       <Card>
-        <CardContent className="py-8 text-center text-muted-foreground">Loading...</CardContent>
+        <CardContent className="py-8 text-center text-muted-foreground">{t('common.loading')}</CardContent>
       </Card>
     );
   }
@@ -59,7 +61,7 @@ export function AcmeConfigCard() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle className="flex items-center gap-2">
-              ACME Configuration
+              {t('acme.config.title')}
               <Badge
                 variant="outline"
                 className={cn(
@@ -77,7 +79,7 @@ export function AcmeConfigCard() {
                       : 'bg-muted-foreground/50'
                   )}
                 />
-                {config.enabled ? 'Enabled' : 'Disabled'}
+                {config.enabled ? t('common.status.active') : t('common.status.inactive')}
               </Badge>
             </CardTitle>
             <div className="flex items-center gap-2">
@@ -88,7 +90,7 @@ export function AcmeConfigCard() {
               </CollapsibleTrigger>
               <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
                 <Settings className="mr-2 h-4 w-4" />
-                Edit
+                {t('acme.config.edit')}
               </Button>
             </div>
           </CardHeader>
@@ -96,28 +98,28 @@ export function AcmeConfigCard() {
             <CardContent>
               <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4 text-sm">
                 <div>
-                  <div className="text-muted-foreground">Server URL</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.serverUrl')}</div>
                   <div className="font-mono truncate">{config.server_url}</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Email</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.email')}</div>
                   <div>{config.email || '—'}</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Cert Directory</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.certDir')}</div>
                   <div className="font-mono">{config.cert_dir}</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Auto Renew</div>
-                  <div>{config.auto_renew ? 'Yes' : 'No'}</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.autoRenew')}</div>
+                  <div>{config.auto_renew ? t('common.yes') : t('common.no')}</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Check Interval</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.checkInterval')}</div>
                   <div>{config.renewal_check_interval}h</div>
                 </div>
                 <div>
-                  <div className="text-muted-foreground">Days Before Expiry</div>
-                  <div>{config.renewal_days_before_expiry} days</div>
+                  <div className="text-muted-foreground">{t('acme.config.fields.daysBeforeExpiry')}</div>
+                  <div>{config.renewal_days_before_expiry} {t('acme.config.fields.daysUnit')}</div>
                 </div>
               </div>
             </CardContent>
@@ -129,13 +131,13 @@ export function AcmeConfigCard() {
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Edit ACME Configuration</DialogTitle>
+            <DialogTitle>{t('acme.config.dialog.title')}</DialogTitle>
           </DialogHeader>
           <form onSubmit={handleSave} className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-medium">Enable ACME</div>
-                <div className="text-xs text-muted-foreground">Enable automatic certificate management</div>
+                <div className="text-sm font-medium">{t('acme.config.dialog.enable')}</div>
+                <div className="text-xs text-muted-foreground">{t('acme.config.dialog.enableDesc')}</div>
               </div>
               <Switch
                 checked={form.enabled ?? false}
@@ -144,7 +146,7 @@ export function AcmeConfigCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Server URL</label>
+              <label className="text-sm font-medium">{t('acme.config.dialog.serverUrl')}</label>
               <Input
                 value={form.server_url ?? ''}
                 onChange={(e) => setForm({ ...form, server_url: e.target.value })}
@@ -153,7 +155,7 @@ export function AcmeConfigCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Email</label>
+              <label className="text-sm font-medium">{t('acme.config.dialog.email')}</label>
               <Input
                 type="email"
                 value={form.email ?? ''}
@@ -163,15 +165,15 @@ export function AcmeConfigCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Certificate Directory</label>
+              <label className="text-sm font-medium">{t('acme.config.dialog.certDir')}</label>
               <Input value={config.cert_dir} disabled />
-              <p className="text-xs text-muted-foreground">Cannot be changed via API</p>
+              <p className="text-xs text-muted-foreground">{t('acme.config.dialog.certDirHint')}</p>
             </div>
 
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-medium">Auto Renew</div>
-                <div className="text-xs text-muted-foreground">Automatically renew certificates</div>
+                <div className="text-sm font-medium">{t('acme.config.dialog.autoRenew')}</div>
+                <div className="text-xs text-muted-foreground">{t('acme.config.dialog.autoRenewDesc')}</div>
               </div>
               <Switch
                 checked={form.auto_renew ?? false}
@@ -180,7 +182,7 @@ export function AcmeConfigCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Renewal Check Interval (hours)</label>
+              <label className="text-sm font-medium">{t('acme.config.dialog.checkInterval')}</label>
               <Input
                 type="number"
                 value={form.renewal_check_interval ?? 24}
@@ -191,7 +193,7 @@ export function AcmeConfigCard() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">Days Before Expiry</label>
+              <label className="text-sm font-medium">{t('acme.config.dialog.daysBeforeExpiry')}</label>
               <Input
                 type="number"
                 value={form.renewal_days_before_expiry ?? 30}
@@ -206,9 +208,9 @@ export function AcmeConfigCard() {
 
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-medium">Agree to ToS</div>
+                <div className="text-sm font-medium">{t('acme.config.dialog.tosAgree')}</div>
                 <div className="text-xs text-muted-foreground">
-                  Required to use ACME certificates
+                  {t('acme.config.dialog.tosDesc')}
                 </div>
               </div>
               <Switch
@@ -219,13 +221,13 @@ export function AcmeConfigCard() {
 
             {form.enabled && !form.tos_agreed && (
               <p className="text-sm text-destructive">
-                You must agree to the Terms of Service to enable ACME
+                {t('acme.config.dialog.tosError')}
               </p>
             )}
 
             {updateMutation.isError && (
               <p className="text-sm text-destructive">
-                Failed to save configuration. Please try again.
+                {t('acme.config.dialog.saveError')}
               </p>
             )}
 
@@ -234,7 +236,7 @@ export function AcmeConfigCard() {
               disabled={updateMutation.isPending || (form.enabled && !form.tos_agreed)}
               className="w-full"
             >
-              {updateMutation.isPending ? 'Saving...' : 'Save Configuration'}
+              {updateMutation.isPending ? t('common.saving') : t('acme.config.dialog.save')}
             </Button>
           </form>
         </DialogContent>

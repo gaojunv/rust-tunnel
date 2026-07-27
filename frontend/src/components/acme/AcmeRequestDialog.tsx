@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   Dialog,
   DialogContent,
@@ -24,6 +25,7 @@ interface AcmeRequestDialogProps {
 }
 
 export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps) {
+  const { t } = useTranslation();
   const [domain, setDomain] = useState('');
   const [challengeType, setChallengeType] = useState<ChallengeType>('http-01');
   const requestMutation = useRequestAcmeCertificate();
@@ -48,11 +50,11 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Request Certificate</DialogTitle>
+          <DialogTitle>{t('acme.request.title')}</DialogTitle>
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">Domain</label>
+            <label className="text-sm font-medium">{t('acme.request.domain')}</label>
             <Input
               value={domain}
               onChange={(e) => setDomain(e.target.value)}
@@ -62,7 +64,7 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
           </div>
 
           <div className="space-y-2">
-            <label className="text-sm font-medium">Challenge Type</label>
+            <label className="text-sm font-medium">{t('acme.request.challengeType')}</label>
             <Select
               value={challengeType}
               onValueChange={(value) =>
@@ -74,16 +76,16 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="http-01">
-                  HTTP-01
+                  {t('acme.request.http01')}
                   <Badge variant="outline" className="ml-2 text-xs text-primary border-primary/25">
-                    Recommended
+                    {t('acme.request.recommended')}
                   </Badge>
                 </SelectItem>
                 <SelectItem value="dns-01" disabled={!hasDnsProvider}>
-                  DNS-01
+                  {t('acme.request.dns01')}
                   {!hasDnsProvider && (
                     <Badge variant="secondary" className="ml-2 text-xs">
-                      No DNS Provider
+                      {t('acme.request.noDnsProvider')}
                     </Badge>
                   )}
                 </SelectItem>
@@ -91,20 +93,18 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
             </Select>
             {challengeType === 'http-01' ? (
               <p className="text-xs text-muted-foreground">
-                Places a file on port 80 of your server. Requires port 80 to
-                be accessible from the internet.
+                {t('acme.request.http01Desc')}
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">
-                Creates a DNS TXT record for domain validation. Requires a
-                configured DNS provider.
+                {t('acme.request.dns01Desc')}
               </p>
             )}
           </div>
 
           {requestMutation.isError && (
             <p className="text-sm text-destructive">
-              Failed to request certificate. Please try again.
+              {t('acme.request.error')}
             </p>
           )}
           <Button
@@ -112,7 +112,7 @@ export function AcmeRequestDialog({ open, onOpenChange }: AcmeRequestDialogProps
             disabled={requestMutation.isPending}
             className="w-full"
           >
-            {requestMutation.isPending ? 'Requesting...' : 'Request Certificate'}
+            {requestMutation.isPending ? t('acme.request.requesting') : t('acme.request.submit')}
           </Button>
         </form>
       </DialogContent>

@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { MetricAreaChart } from '@/components/charts/MetricAreaChart';
 import { StatCard } from '@/components/shared/StatCard';
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 
 export default function TrojanPage() {
+  const { t } = useTranslation();
   const { data: config } = useTrojanConfig();
   const { data: summary } = useStatsSummary();
   const stats = summary?.trojan;
@@ -43,29 +45,29 @@ export default function TrojanPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Trojan"
-        description="Monitor the Trojan proxy server"
+        title={t('trojan.title')}
+        description={t('trojan.description')}
       />
 
       {/* Stats */}
       <div className="grid gap-4 md:grid-cols-4">
         <StatCard
-          title="Status"
-          value={config?.enabled ? 'Active' : 'Inactive'}
+          title={t('trojan.stats.status')}
+          value={config?.enabled ? t('common.status.active') : t('common.status.inactive')}
           icon={<Shield className="h-4 w-4" />}
         />
         <StatCard
-          title="Bytes In"
+          title={t('trojan.stats.bytesIn')}
           value={formatBytes(stats?.total_bytes_in ?? 0)}
           icon={<ArrowDown className="h-4 w-4" />}
         />
         <StatCard
-          title="Bytes Out"
+          title={t('trojan.stats.bytesOut')}
           value={formatBytes(stats?.total_bytes_out ?? 0)}
           icon={<ArrowUp className="h-4 w-4" />}
         />
         <StatCard
-          title="Active Connections"
+          title={t('trojan.stats.activeConnections')}
           value={stats?.total_conns ?? 0}
           icon={<Users className="h-4 w-4" />}
         />
@@ -79,19 +81,19 @@ export default function TrojanPage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Signal className="h-5 w-5" />
-            Throughput
+            {t('trojan.throughput')}
           </CardTitle>
         </CardHeader>
         <CardContent>
           <MetricAreaChart
             data={chartData}
             series={[
-              { dataKey: 'bytes_in', label: 'Bytes In', colorVar: 'hsl(var(--chart-1))' },
-              { dataKey: 'bytes_out', label: 'Bytes Out', colorVar: 'hsl(var(--chart-2))' },
+              { dataKey: 'bytes_in', label: t('trojan.chart.bytesIn'), colorVar: 'hsl(var(--chart-1))' },
+              { dataKey: 'bytes_out', label: t('trojan.chart.bytesOut'), colorVar: 'hsl(var(--chart-2))' },
             ]}
             yFormatter={formatBps}
             className="h-[250px] w-full sm:h-[300px]"
-            emptyText="No throughput data available"
+            emptyText={t('trojan.chart.empty')}
           />
         </CardContent>
       </Card>

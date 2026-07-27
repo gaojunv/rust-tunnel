@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/button';
 import { Plus, ShieldOff } from 'lucide-react';
@@ -10,6 +11,7 @@ import { DnsProviderConfigCard } from '@/components/acme/DnsProviderConfigCard';
 import { CertConsumerBinding } from '@/components/acme/CertConsumerBinding';
 
 export default function AcmePage() {
+  const { t } = useTranslation();
   const { data: certificates, isLoading: certsLoading } = useAcmeCertificates();
   const { data: status } = useAcmeStatus();
   const [requestOpen, setRequestOpen] = useState(false);
@@ -17,12 +19,12 @@ export default function AcmePage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="ACME Certificates"
-        description="Manage automatic TLS certificates via ACME protocol"
+        title={t('acme.title')}
+        description={t('acme.description')}
       >
         <Button className="shadow-glow" onClick={() => setRequestOpen(true)} disabled={!status?.enabled}>
           <Plus className="mr-2 h-4 w-4" />
-          Request Certificate
+          {t('acme.requestCertificate')}
         </Button>
       </PageHeader>
 
@@ -34,7 +36,7 @@ export default function AcmePage() {
       {!status?.enabled ? (
         <div className="glass-card flex flex-col items-center gap-3 rounded-xl border border-dashed p-8 text-center text-muted-foreground">
           <ShieldOff className="h-8 w-8 text-muted-foreground/50" />
-          <p>ACME is not enabled. Please configure and enable ACME first.</p>
+          <p>{t('acme.notEnabled')}</p>
         </div>
       ) : (
         <AcmeCertificateTable

@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -43,11 +44,12 @@ export function AcmeCertificateTable({
   certificates,
   isLoading,
 }: AcmeCertificateTableProps) {
+  const { t } = useTranslation();
   const renewMutation = useRenewAcmeCertificate();
   const deleteMutation = useDeleteAcmeCertificate();
 
   const handleDelete = (domain: string) => {
-    if (window.confirm(`Delete certificate for "${domain}"?`)) {
+    if (window.confirm(t('acme.certificates.deleteConfirm', { domain }))) {
       deleteMutation.mutate(domain);
     }
   };
@@ -59,27 +61,27 @@ export function AcmeCertificateTable({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Certificates</CardTitle>
+        <CardTitle>{t('acme.certificates.title')}</CardTitle>
       </CardHeader>
       <CardContent>
         {isLoading ? (
           <div className="text-center py-8 text-muted-foreground">
-            Loading...
+            {t('common.loading')}
           </div>
         ) : certificates.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">
-            No certificates. Click &quot;Request Certificate&quot; to get one.
+            {t('acme.certificates.empty')}
           </div>
         ) : (
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Domain</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Issued</TableHead>
-                <TableHead>Expires</TableHead>
-                <TableHead>Auto Renew</TableHead>
-                <TableHead className="w-[80px]">Actions</TableHead>
+                <TableHead>{t('acme.certificates.columns.domain')}</TableHead>
+                <TableHead>{t('acme.certificates.columns.status')}</TableHead>
+                <TableHead>{t('acme.certificates.columns.issued')}</TableHead>
+                <TableHead>{t('acme.certificates.columns.expires')}</TableHead>
+                <TableHead>{t('acme.certificates.columns.autoRenew')}</TableHead>
+                <TableHead className="w-[80px]">{t('acme.certificates.columns.actions')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -117,7 +119,7 @@ export function AcmeCertificateTable({
                           disabled={renewMutation.isPending}
                         >
                           <RefreshCw className="mr-2 h-4 w-4" />
-                          Renew
+                          {t('acme.certificates.actions.renew')}
                         </DropdownMenuItem>
                         <DropdownMenuItem
                           onClick={() => handleDelete(cert.domain)}
@@ -125,7 +127,7 @@ export function AcmeCertificateTable({
                           disabled={deleteMutation.isPending}
                         >
                           <Trash2 className="mr-2 h-4 w-4" />
-                          Delete
+                          {t('acme.certificates.actions.delete')}
                         </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>

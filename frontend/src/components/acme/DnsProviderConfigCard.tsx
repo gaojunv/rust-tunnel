@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -21,14 +22,8 @@ import { useDnsProviders, useUpdateDnsProvider } from '@/api/hooks';
 import { cn } from '@/lib/utils';
 import type { DnsProviderType, DnsProviderConfig } from '@/types';
 
-const PROVIDER_LABELS: Record<DnsProviderType, string> = {
-  cloudflare: 'Cloudflare',
-  aliyun: 'Aliyun DNS',
-  tencent: 'Tencent DNS',
-  custom: 'Custom',
-};
-
 export function DnsProviderConfigCard() {
+  const { t } = useTranslation();
   const { data, isLoading } = useDnsProviders();
   const updateMutation = useUpdateDnsProvider();
   const [editOpen, setEditOpen] = useState(false);
@@ -56,11 +51,15 @@ export function DnsProviderConfigCard() {
     return (
       <Card>
         <CardContent className="py-8 text-center text-muted-foreground">
-          Loading...
+          {t('common.loading')}
         </CardContent>
       </Card>
     );
   }
+
+  const providerLabel = data?.config
+    ? (t as (key: string) => string)(`acme.dnsProvider.providerLabels.${data.config.provider}`)
+    : t('acme.dnsProvider.notConfigured');
 
   return (
     <>
@@ -68,7 +67,7 @@ export function DnsProviderConfigCard() {
         <CardHeader className="flex flex-row items-center justify-between">
           <CardTitle className="flex items-center gap-2">
             <Globe className="h-5 w-5 text-primary" />
-            DNS Provider
+            {t('acme.dnsProvider.title')}
             <Badge
               variant="outline"
               className={cn(
@@ -86,7 +85,7 @@ export function DnsProviderConfigCard() {
                     : 'bg-muted-foreground/50'
                 )}
               />
-              {data?.config ? PROVIDER_LABELS[data.config.provider] : 'Not Configured'}
+              {providerLabel}
             </Badge>
           </CardTitle>
           <Button
@@ -95,18 +94,18 @@ export function DnsProviderConfigCard() {
             onClick={() => setEditOpen(true)}
           >
             <Settings className="mr-2 h-4 w-4" />
-            Configure
+            {t('acme.dnsProvider.configure')}
           </Button>
         </CardHeader>
         <CardContent>
           {data?.config ? (
             <div className="grid gap-4 md:grid-cols-3 text-sm">
               <div>
-                <div className="text-muted-foreground">Provider</div>
-                <div>{PROVIDER_LABELS[data.config.provider]}</div>
+                <div className="text-muted-foreground">{t('acme.dnsProvider.provider')}</div>
+                <div>{providerLabel}</div>
               </div>
               <div>
-                <div className="text-muted-foreground">API Key</div>
+                <div className="text-muted-foreground">{t('acme.dnsProvider.apiKey')}</div>
                 <div className="font-mono">
                   {data.config.api_key
                     ? `${data.config.api_key.slice(0, 8)}...`
@@ -115,15 +114,14 @@ export function DnsProviderConfigCard() {
               </div>
               {data.config.zone_id && (
                 <div>
-                  <div className="text-muted-foreground">Zone ID</div>
+                  <div className="text-muted-foreground">{t('acme.dnsProvider.zoneId')}</div>
                   <div className="font-mono truncate">{data.config.zone_id}</div>
                 </div>
               )}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
-              No DNS provider configured. Configure a DNS provider to enable
-              DNS-01 challenge validation for ACME certificates.
+              {t('acme.dnsProvider.empty')}
             </p>
           )}
         </CardContent>
@@ -133,11 +131,11 @@ export function DnsProviderConfigCard() {
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="max-h-[85vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Configure DNS Provider</DialogTitle>
+            <DialogTitle>{t('acme.dnsProvider.dialog.title')}</DialogTitle>
           </DialogHeader>
           <form onSubmit={handleSave} className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium">Provider</label>
+              <label className="text-sm font-medium">{t('acme.dnsProvider.provider')}</label>
               <Select
                 value={form.provider}
                 onValueChange={(value) =>
@@ -148,31 +146,31 @@ export function DnsProviderConfigCard() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="cloudflare">Cloudflare</SelectItem>
-                  <SelectItem value="aliyun">Aliyun DNS</SelectItem>
-                  <SelectItem value="tencent">Tencent DNS</SelectItem>
-                  <SelectItem value="custom">Custom</SelectItem>
+                  <SelectItem value="cloudflare">{t('acme.dnsProvider.providerLabels.cloudflare')}</SelectItem>
+                  <SelectItem value="aliyun">{t('acme.dnsProvider.providerLabels.aliyun')}</SelectItem>
+                  <SelectItem value="tencent">{t('acme.dnsProvider.providerLabels.tencent')}</SelectItem>
+                  <SelectItem value="custom">{t('acme.dnsProvider.providerLabels.custom')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">API Key</label>
+              <label className="text-sm font-medium">{t('acme.dnsProvider.apiKey')}</label>
               <Input
                 value={form.api_key}
                 onChange={(e) =>
                   setForm({ ...form, api_key: e.target.value })
                 }
-                placeholder="Enter API key"
+                placeholder={t('acme.dnsProvider.apiKey')}
                 required
               />
             </div>
 
             <div className="space-y-2">
               <label className="text-sm font-medium">
-                API Secret
+                {t('acme.dnsProvider.dialog.apiSecret')}
                 <span className="text-xs text-muted-foreground ml-1">
-                  (optional)
+                  {t('common.optional')}
                 </span>
               </label>
               <Input
@@ -181,15 +179,15 @@ export function DnsProviderConfigCard() {
                 onChange={(e) =>
                   setForm({ ...form, api_secret: e.target.value })
                 }
-                placeholder="Enter API secret"
+                placeholder={t('acme.dnsProvider.dialog.apiSecret')}
               />
             </div>
 
             <div className="space-y-2">
               <label className="text-sm font-medium">
-                Zone ID
+                {t('acme.dnsProvider.dialog.zoneId')}
                 <span className="text-xs text-muted-foreground ml-1">
-                  (optional)
+                  {t('common.optional')}
                 </span>
               </label>
               <Input
@@ -197,18 +195,17 @@ export function DnsProviderConfigCard() {
                 onChange={(e) =>
                   setForm({ ...form, zone_id: e.target.value })
                 }
-                placeholder="Enter zone ID"
+                placeholder={t('acme.dnsProvider.dialog.zoneId')}
               />
             </div>
 
             <p className="text-xs text-muted-foreground">
-              DNS provider credentials are used for DNS-01 challenge validation.
-              They are stored securely on the server.
+              {t('acme.dnsProvider.dialog.hint')}
             </p>
 
             {updateMutation.isError && (
               <p className="text-sm text-destructive">
-                Failed to save DNS provider configuration. Please try again.
+                {t('acme.dnsProvider.dialog.error')}
               </p>
             )}
 
@@ -217,7 +214,7 @@ export function DnsProviderConfigCard() {
               disabled={updateMutation.isPending}
               className="w-full"
             >
-              {updateMutation.isPending ? 'Saving...' : 'Save Configuration'}
+              {updateMutation.isPending ? t('common.saving') : t('acme.dnsProvider.dialog.save')}
             </Button>
           </form>
         </DialogContent>

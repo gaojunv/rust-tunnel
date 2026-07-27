@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -29,6 +30,8 @@ export function HttpRouteFields({
   tls,
   onTlsChange,
 }: HttpRouteFieldsProps) {
+  const { t } = useTranslation();
+
   const addRoute = () => {
     onRoutesChange([
       ...routes,
@@ -48,7 +51,7 @@ export function HttpRouteFields({
     <div className="space-y-4">
       {/* Domains */}
       <div className="space-y-2">
-        <label className="text-sm font-medium">Domains</label>
+        <label className="text-sm font-medium">{t('reverseProxy.httpRouteFields.domains')}</label>
         <Input
           value={domains.join(', ')}
           onChange={(e) =>
@@ -62,23 +65,23 @@ export function HttpRouteFields({
           placeholder="example.com, api.example.com"
         />
         <p className="text-xs text-muted-foreground">
-          Comma-separated domain names
+          {t('reverseProxy.httpRouteFields.domainHint')}
         </p>
       </div>
 
       {/* Routes */}
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <label className="text-sm font-medium">Routes</label>
+          <label className="text-sm font-medium">{t('reverseProxy.httpRouteFields.routes')}</label>
           <Button type="button" variant="outline" size="sm" onClick={addRoute}>
             <Plus className="mr-2 h-4 w-4" />
-            Add Route
+            {t('reverseProxy.httpRouteFields.addRoute')}
           </Button>
         </div>
         {routes.map((route, index) => (
           <div key={index} className="rounded-lg border bg-muted/30 p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-medium">Route {index + 1}</span>
+              <span className="text-sm font-medium">{t('reverseProxy.httpRouteFields.routeN', { n: index + 1 })}</span>
               <Button
                 type="button"
                 variant="ghost"
@@ -99,7 +102,7 @@ export function HttpRouteFields({
               onChange={(backends) => updateRoute(index, { backends })}
             />
             <div className="space-y-2">
-              <label className="text-sm font-medium">Load Balancing</label>
+              <label className="text-sm font-medium">{t('reverseProxy.httpRouteFields.loadBalancing')}</label>
               <Select
                 value={route.load_balancing}
                 onValueChange={(v) =>
@@ -110,8 +113,8 @@ export function HttpRouteFields({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="round_robin">Round Robin</SelectItem>
-                  <SelectItem value="weighted_round_robin">Weighted Round Robin</SelectItem>
+                  <SelectItem value="round_robin">{t('reverseProxy.httpRouteFields.roundRobin')}</SelectItem>
+                  <SelectItem value="weighted_round_robin">{t('reverseProxy.httpRouteFields.weightedRoundRobin')}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -123,8 +126,8 @@ export function HttpRouteFields({
       <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-sm font-medium">TLS</div>
-            <div className="text-xs text-muted-foreground">Enable HTTPS</div>
+            <div className="text-sm font-medium">{t('reverseProxy.httpRouteFields.tls')}</div>
+            <div className="text-xs text-muted-foreground">{t('reverseProxy.httpRouteFields.enableHttps')}</div>
           </div>
           <Switch
             checked={tls?.enabled ?? false}
@@ -141,9 +144,9 @@ export function HttpRouteFields({
           <>
             <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-medium">ACME Certificate</div>
+                <div className="text-sm font-medium">{t('reverseProxy.httpRouteFields.acmeCertificate')}</div>
                 <div className="text-xs text-muted-foreground">
-                  Auto-manage certificate via ACME
+                  {t('reverseProxy.httpRouteFields.acmeDesc')}
                 </div>
               </div>
               <Switch
@@ -155,7 +158,7 @@ export function HttpRouteFields({
             </div>
             {tls.acme && (
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">Domain</label>
+                <label className="text-xs text-muted-foreground">{t('reverseProxy.httpRouteFields.domain')}</label>
                 <Input
                   value={tls.domain ?? ''}
                   onChange={(e) =>

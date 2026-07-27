@@ -7,8 +7,16 @@
       "connected": "Connected",
       "disconnected": "Disconnected",
       "online": "online",
-      "offline": "offline"
-    }
+      "offline": "offline",
+      "active": "Active",
+      "inactive": "Inactive"
+    },
+    "saving": "Saving...",
+    "edit": "Edit",
+    "delete": "Delete",
+    "yes": "Yes",
+    "no": "No",
+    "optional": "(optional)"
   },
   "settings": {
     "title": "Settings",
@@ -160,5 +168,307 @@
     "connectedAt": "Connected At",
     "firstSeen": "First Seen",
     "note": "Note"
+  },
+  "reverseProxy": {
+    "title": "Reverse Proxy",
+    "description": "Manage HTTP, TCP, and UDP proxy rules",
+    "newRule": "New Rule",
+    "stats": {
+      "totalRules": "Total Rules",
+      "activeRules": "Active Rules",
+      "totalConnections": "Total Connections",
+      "totalTraffic": "Total Traffic"
+    },
+    "table": {
+      "title": "Proxy Rules",
+      "empty": "No proxy rules. Click \"New Rule\" to create one.",
+      "columns": {
+        "name": "Name",
+        "type": "Type",
+        "listen": "Listen",
+        "domains": "Domains",
+        "tls": "TLS",
+        "backends": "Backends",
+        "enabled": "Enabled",
+        "actions": "Actions"
+      },
+      "deleteConfirm": "Delete proxy rule \"{{name}}\"?",
+      "backendCount": "{{count}} backends"
+    },
+    "certStatus": {
+      "none": {
+        "title": "Plaintext (no TLS)",
+        "label": "None"
+      },
+      "tlsLabel": "TLS",
+      "exact": {
+        "title": "Certificate: {{domain}} (exact)"
+      },
+      "wildcardReuse": {
+        "title": "Certificate: reused from {{domain}}",
+        "label": "Wildcard"
+      },
+      "pending": {
+        "title": "Certificate pending issuance...",
+        "label": "Pending"
+      }
+    },
+    "actions": {
+      "edit": "Edit",
+      "delete": "Delete"
+    },
+    "backendFields": {
+      "backendServers": "Backend Servers",
+      "direct": "Direct",
+      "client": "Client",
+      "clientName": "Client Name",
+      "clientNamePlaceholder": "Select or type a client name",
+      "weight": "Weight",
+      "weightPlaceholder": "Weight",
+      "scheme": "Scheme",
+      "protocol": "Protocol",
+      "h2cHint": "h2c prior-knowledge: backend must support cleartext HTTP/2",
+      "addBackend": "Add Backend"
+    },
+    "httpRouteFields": {
+      "domains": "Domains",
+      "domainHint": "Comma-separated domain names",
+      "routes": "Routes",
+      "addRoute": "Add Route",
+      "routeN": "Route {{n}}",
+      "loadBalancing": "Load Balancing",
+      "roundRobin": "Round Robin",
+      "weightedRoundRobin": "Weighted Round Robin",
+      "tls": "TLS",
+      "enableHttps": "Enable HTTPS",
+      "acmeCertificate": "ACME Certificate",
+      "acmeDesc": "Auto-manage certificate via ACME",
+      "domain": "Domain"
+    },
+    "dialog": {
+      "edit": "Edit Rule",
+      "new": "New Rule",
+      "name": "Name",
+      "type": "Type",
+      "types": {
+        "http": "HTTP",
+        "tcp": "TCP",
+        "udp": "UDP"
+      },
+      "listenAddress": "Listen Address",
+      "backend": "Backend",
+      "enabled": "Enabled",
+      "enabledDesc": "Start this proxy rule immediately",
+      "error": "Failed to {{action}} rule. Please try again.",
+      "errorUpdate": "update",
+      "errorCreate": "create",
+      "submit": {
+        "update": "Update Rule",
+        "create": "Create Rule"
+      },
+      "conflictAlert": "Rule conflict: {{error}}\n{{details}}",
+      "conflictDefault": "Conflict with existing rule"
+    }
+  },
+  "shadowsocks": {
+    "title": "Shadowsocks",
+    "description": "Monitor the Shadowsocks proxy server",
+    "stats": {
+      "status": "Status",
+      "bytesIn": "Bytes In",
+      "bytesOut": "Bytes Out",
+      "activeConnections": "Active Connections"
+    },
+    "throughput": "Throughput",
+    "chart": {
+      "bytesIn": "Bytes In",
+      "bytesOut": "Bytes Out",
+      "empty": "No throughput data available"
+    },
+    "config": {
+      "title": "Shadowsocks Proxy",
+      "enable": "Enable",
+      "port": "Port",
+      "cipher": "Cipher",
+      "password": "Password",
+      "passwordHint": {
+        "enabled": "Leave blank to keep current password",
+        "disabled": "Required to enable"
+      },
+      "save": "Save Shadowsocks Config"
+    }
+  },
+  "trojan": {
+    "title": "Trojan",
+    "description": "Monitor the Trojan proxy server",
+    "stats": {
+      "status": "Status",
+      "bytesIn": "Bytes In",
+      "bytesOut": "Bytes Out",
+      "activeConnections": "Active Connections"
+    },
+    "throughput": "Throughput",
+    "chart": {
+      "bytesIn": "Bytes In",
+      "bytesOut": "Bytes Out",
+      "empty": "No throughput data available"
+    },
+    "config": {
+      "title": "Trojan Proxy",
+      "enable": "Enable",
+      "port": "Port",
+      "domain": "Domain",
+      "domainHint": "Used for ACME certificate lookup and SNI-based port sharing. Leave empty to use a self-signed certificate.",
+      "password": "Password",
+      "passwordHint": {
+        "enabled": "Leave blank to keep current password",
+        "disabled": "Required to enable"
+      },
+      "fallback": "Fallback",
+      "fallbackHint": "Address to redirect traffic to when authentication fails",
+      "tls": {
+        "title": "TLS Certificate",
+        "current": "Current:",
+        "acmeWarning": " — no ACME certificate matches this domain. Issue one via ACME to use a trusted certificate.",
+        "sharedHint": "Sharing the reverse proxy port — TLS connections are dispatched by SNI to Trojan or HTTP routes.",
+        "desc": "Trojan requires TLS. When a domain is set, the matching ACME certificate (including one-level wildcard) is used; otherwise a self-signed certificate is generated.",
+        "acmeNotEnabled": "ACME is not enabled — Trojan will fall back to a self-signed certificate."
+      },
+      "save": "Save Trojan Config",
+      "certSourceLabels": {
+        "acme_exact": "ACME certificate (exact match)",
+        "acme_wildcard": "ACME wildcard certificate",
+        "self_signed": "Self-signed certificate (fallback)"
+      }
+    }
+  },
+  "acme": {
+    "title": "ACME Certificates",
+    "description": "Manage automatic TLS certificates via ACME protocol",
+    "requestCertificate": "Request Certificate",
+    "notEnabled": "ACME is not enabled. Please configure and enable ACME first.",
+    "status": {
+      "pending": "Pending",
+      "active": "Active",
+      "expired": "Expired",
+      "failed": "Failed"
+    },
+    "config": {
+      "title": "ACME Configuration",
+      "edit": "Edit",
+      "fields": {
+        "serverUrl": "Server URL",
+        "email": "Email",
+        "certDir": "Cert Directory",
+        "autoRenew": "Auto Renew",
+        "checkInterval": "Check Interval",
+        "daysBeforeExpiry": "Days Before Expiry",
+        "daysUnit": "days"
+      },
+      "dialog": {
+        "title": "Edit ACME Configuration",
+        "enable": "Enable ACME",
+        "enableDesc": "Enable automatic certificate management",
+        "serverUrl": "Server URL",
+        "email": "Email",
+        "certDir": "Certificate Directory",
+        "certDirHint": "Cannot be changed via API",
+        "autoRenew": "Auto Renew",
+        "autoRenewDesc": "Automatically renew certificates",
+        "checkInterval": "Renewal Check Interval (hours)",
+        "daysBeforeExpiry": "Days Before Expiry",
+        "tosAgree": "Agree to ToS",
+        "tosDesc": "Required to use ACME certificates",
+        "tosError": "You must agree to the Terms of Service to enable ACME",
+        "saveError": "Failed to save configuration. Please try again.",
+        "save": "Save Configuration"
+      }
+    },
+    "certificates": {
+      "title": "Certificates",
+      "empty": "No certificates. Click \"Request Certificate\" to get one.",
+      "columns": {
+        "domain": "Domain",
+        "status": "Status",
+        "issued": "Issued",
+        "expires": "Expires",
+        "autoRenew": "Auto Renew",
+        "actions": "Actions"
+      },
+      "deleteConfirm": "Delete certificate for \"{{domain}}\"?",
+      "actions": {
+        "renew": "Renew",
+        "delete": "Delete"
+      }
+    },
+    "consumers": {
+      "title": "Certificate Consumers",
+      "empty": "No consumer binding information available.",
+      "items": {
+        "api_tls": {
+          "label": "API Server TLS",
+          "desc": "HTTPS for the management API"
+        },
+        "trojan": {
+          "label": "Trojan Proxy",
+          "desc": "TLS for Trojan proxy connections"
+        },
+        "control_tls": {
+          "label": "Control Channel TLS",
+          "desc": "TLS for client control connections"
+        },
+        "reverse_proxy": {
+          "label": "Reverse Proxy",
+          "desc": "TLS for reverse proxy rules"
+        }
+      }
+    },
+    "challenge": {
+      "loading": "Loading challenge status...",
+      "title": "Challenge Status",
+      "domain": "Domain",
+      "type": "Challenge Type",
+      "status": "Status",
+      "verifiedLabel": "Verified",
+      "failedLabel": "Failed",
+      "pendingLabel": "Pending"
+    },
+    "request": {
+      "title": "Request Certificate",
+      "domain": "Domain",
+      "challengeType": "Challenge Type",
+      "http01": "HTTP-01",
+      "recommended": "Recommended",
+      "dns01": "DNS-01",
+      "noDnsProvider": "No DNS Provider",
+      "http01Desc": "Places a file on port 80 of your server. Requires port 80 to be accessible from the internet.",
+      "dns01Desc": "Creates a DNS TXT record for domain validation. Requires a configured DNS provider.",
+      "error": "Failed to request certificate. Please try again.",
+      "requesting": "Requesting...",
+      "submit": "Request Certificate"
+    },
+    "dnsProvider": {
+      "title": "DNS Provider",
+      "notConfigured": "Not Configured",
+      "configure": "Configure",
+      "provider": "Provider",
+      "apiKey": "API Key",
+      "zoneId": "Zone ID",
+      "empty": "No DNS provider configured. Configure a DNS provider to enable DNS-01 challenge validation for ACME certificates.",
+      "dialog": {
+        "title": "Configure DNS Provider",
+        "apiSecret": "API Secret",
+        "zoneId": "Zone ID",
+        "hint": "DNS provider credentials are used for DNS-01 challenge validation. They are stored securely on the server.",
+        "error": "Failed to save DNS provider configuration. Please try again.",
+        "save": "Save Configuration"
+      },
+      "providerLabels": {
+        "cloudflare": "Cloudflare",
+        "aliyun": "Aliyun DNS",
+        "tencent": "Tencent DNS",
+        "custom": "Custom"
+      }
+    }
   }
 }

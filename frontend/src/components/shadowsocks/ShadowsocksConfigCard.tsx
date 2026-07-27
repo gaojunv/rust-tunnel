@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -14,6 +15,7 @@ import { useShadowsocksConfig, useUpdateShadowsocksConfig } from '@/api/hooks';
 import { Shield } from 'lucide-react';
 
 export default function ShadowsocksConfigCard() {
+  const { t } = useTranslation();
   const { data: ssConfig, isLoading } = useShadowsocksConfig();
   const updateSS = useUpdateShadowsocksConfig();
 
@@ -44,7 +46,7 @@ export default function ShadowsocksConfigCard() {
   };
 
   if (isLoading) {
-    return <div className="py-8 text-center text-muted-foreground">Loading...</div>;
+    return <div className="py-8 text-center text-muted-foreground">{t('common.loading')}</div>;
   }
 
   return (
@@ -55,10 +57,10 @@ export default function ShadowsocksConfigCard() {
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
               <Shield className="h-4 w-4" />
             </div>
-            <CardTitle className="text-lg">Shadowsocks Proxy</CardTitle>
+            <CardTitle className="text-lg">{t('shadowsocks.config.title')}</CardTitle>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Enable</span>
+            <span className="text-sm text-muted-foreground">{t('shadowsocks.config.enable')}</span>
             <Switch checked={ssEnabled} onCheckedChange={setSsEnabled} />
           </div>
         </div>
@@ -66,7 +68,7 @@ export default function ShadowsocksConfigCard() {
       <CardContent className="space-y-4">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="space-y-2">
-            <label className="text-sm font-medium">Port</label>
+            <label className="text-sm font-medium">{t('shadowsocks.config.port')}</label>
             <Input
               type="number"
               value={ssPort}
@@ -75,7 +77,7 @@ export default function ShadowsocksConfigCard() {
             />
           </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium">Cipher</label>
+            <label className="text-sm font-medium">{t('shadowsocks.config.cipher')}</label>
             <Select value={ssCipher} onValueChange={setSsCipher}>
               <SelectTrigger>
                 <SelectValue />
@@ -89,20 +91,20 @@ export default function ShadowsocksConfigCard() {
             </Select>
           </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium">Password</label>
+            <label className="text-sm font-medium">{t('shadowsocks.config.password')}</label>
             <Input
               type="password"
               value={ssPassword}
               onChange={(e) => setSsPassword(e.target.value)}
-              placeholder={ssConfig?.enabled ? '••••••••' : 'Enter password'}
+              placeholder={ssConfig?.enabled ? '••••••••' : t('shadowsocks.config.password')}
             />
             <p className="text-xs text-muted-foreground">
-              {ssConfig?.enabled ? 'Leave blank to keep current password' : 'Required to enable'}
+              {ssConfig?.enabled ? t('shadowsocks.config.passwordHint.enabled') : t('shadowsocks.config.passwordHint.disabled')}
             </p>
           </div>
         </div>
         <Button onClick={handleSaveSS} disabled={updateSS.isPending}>
-          {updateSS.isPending ? 'Saving...' : 'Save Shadowsocks Config'}
+          {updateSS.isPending ? t('common.saving') : t('shadowsocks.config.save')}
         </Button>
       </CardContent>
     </Card>

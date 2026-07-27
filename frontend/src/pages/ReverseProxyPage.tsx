@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/button';
 import { Plus } from 'lucide-react';
@@ -9,6 +10,7 @@ import { ProxyRuleDialog } from '@/components/reverse-proxy/ProxyRuleDialog';
 import type { ProxyRule } from '@/types';
 
 export default function ReverseProxyPage() {
+  const { t } = useTranslation();
   const { data: rules, isLoading } = useProxyRules();
   const updateMutation = useUpdateProxyRule();
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -42,12 +44,12 @@ export default function ReverseProxyPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Reverse Proxy"
-        description="Manage HTTP, TCP, and UDP proxy rules"
+        title={t('reverseProxy.title')}
+        description={t('reverseProxy.description')}
       >
         <Button onClick={handleCreate} className="shadow-glow">
           <Plus className="mr-2 h-4 w-4" />
-          New Rule
+          {t('reverseProxy.newRule')}
         </Button>
       </PageHeader>
 

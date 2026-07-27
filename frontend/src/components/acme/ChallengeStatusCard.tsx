@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { AlertCircle, CheckCircle, Clock } from 'lucide-react';
@@ -66,13 +67,14 @@ function getChallengeTypeLabel(type: string) {
 }
 
 export function ChallengeStatusCard({ domain }: ChallengeStatusCardProps) {
+  const { t } = useTranslation();
   const { data: status, isLoading } = useChallengeStatus(domain);
 
   if (isLoading) {
     return (
       <Card>
         <CardContent className="py-8 text-center text-muted-foreground">
-          Loading challenge status...
+          {t('acme.challenge.loading')}
         </CardContent>
       </Card>
     );
@@ -85,25 +87,25 @@ export function ChallengeStatusCard({ domain }: ChallengeStatusCardProps) {
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle className="flex items-center gap-2 text-base">
           {getStatusIcon(status.status)}
-          Challenge Status
+          {t('acme.challenge.title')}
         </CardTitle>
         {getStatusBadge(status.status)}
       </CardHeader>
       <CardContent>
         <div className="grid gap-4 md:grid-cols-3 text-sm">
           <div>
-            <div className="text-muted-foreground">Domain</div>
+            <div className="text-muted-foreground">{t('acme.challenge.domain')}</div>
             <div className="font-mono">{status.domain}</div>
           </div>
           <div>
-            <div className="text-muted-foreground">Challenge Type</div>
+            <div className="text-muted-foreground">{t('acme.challenge.type')}</div>
             <div>{getChallengeTypeLabel(status.type)}</div>
           </div>
           <div>
-            <div className="text-muted-foreground">Status</div>
+            <div className="text-muted-foreground">{t('acme.challenge.status')}</div>
             <div className="flex items-center gap-2">
               {getStatusIcon(status.status)}
-              {status.status.charAt(0).toUpperCase() + status.status.slice(1)}
+              {t(`acme.challenge.${status.status === 'verified' ? 'verifiedLabel' : status.status === 'failed' ? 'failedLabel' : 'pendingLabel'}`)}
             </div>
           </div>
         </div>
