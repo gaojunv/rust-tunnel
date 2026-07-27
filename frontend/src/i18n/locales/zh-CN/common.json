@@ -23,7 +23,7 @@
       "apiDomainPlaceholder": "api.example.com",
       "apiDomainDesc": "API 服务器 TLS 证书的域名。需要启用 ACME。",
       "configViaFile": "通过服务器配置文件配置",
-      "configViaFileDesc": "API TLS 设置（api_tls, api_domain）需要重启服务器才能生效。请在 TOML 配置文件或环境变量中进行配置。",
+      "configViaFileDesc": "API TLS 设置（<0>api_tls</0>, <1>api_domain</1>）需要重启服务器才能生效。请在 TOML 配置文件或环境变量中进行配置。",
       "acmeWarning": "ACME 未启用。请先启用 ACME 再使用 API TLS。",
       "reverseProxy": "反向代理",
       "reverseProxyDesc": "反向代理规则在 <0>反向代理</0> 页面管理。在此创建和配置 HTTP、TCP 和 UDP 代理规则。"

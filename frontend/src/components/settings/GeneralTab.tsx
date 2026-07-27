@@ -111,7 +111,13 @@ export default function GeneralTab() {
             <div className="text-sm text-muted-foreground">
               <p className="mb-1 font-medium text-foreground">{t('settings.general.configViaFile')}</p>
               <p>
-                {t('settings.general.configViaFileDesc')}
+                <Trans
+                  i18nKey="settings.general.configViaFileDesc"
+                  components={[
+                    <code className="rounded border bg-background/60 px-1 py-0.5 text-xs" />,
+                    <code className="rounded border bg-background/60 px-1 py-0.5 text-xs" />,
+                  ]}
+                />
               </p>
               {!acmeStatus?.enabled && (
                 <p className="mt-2 text-amber-500">

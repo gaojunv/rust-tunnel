@@ -23,7 +23,7 @@
       "apiDomainPlaceholder": "api.example.com",
       "apiDomainDesc": "Domain name for the API server TLS certificate. Requires ACME to be enabled.",
       "configViaFile": "Configuration via server config file",
-      "configViaFileDesc": "API TLS settings (api_tls, api_domain) require a server restart to take effect. Configure them in the TOML config file or via environment variables.",
+      "configViaFileDesc": "API TLS settings (<0>api_tls</0>, <1>api_domain</1>) require a server restart to take effect. Configure them in the TOML config file or via environment variables.",
       "acmeWarning": "ACME is not enabled. Enable ACME first to use API TLS.",
       "reverseProxy": "Reverse Proxy",
       "reverseProxyDesc": "Reverse proxy rules are managed on the <0>Reverse Proxy</0> page. Create and configure HTTP, TCP, and UDP proxy rules there."
