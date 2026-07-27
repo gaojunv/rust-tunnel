@@ -7,12 +7,11 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import i18n from './index';
+import { useTranslation } from 'react-i18next';
+import { usePreferences } from '../preferences/PreferencesProvider';
 import {
   detectSystemLanguage,
-  readStoredLanguagePreference,
   resolveLanguage,
-  writeStoredLanguagePreference,
   type LanguagePreference,
   type ResolvedLanguage,
 } from './languagePreference';
@@ -20,67 +19,45 @@ import {
 interface LanguageContextValue {
   preference: LanguagePreference;
   resolvedLanguage: ResolvedLanguage;
-  setPreference: (preference: LanguagePreference) => void;
+  setPreference: (pref: LanguagePreference) => void;
 }
 
 const LanguageContext = createContext<LanguageContextValue | undefined>(undefined);
 
-const getStorage = (): Storage | undefined => {
-  try {
-    return window.localStorage;
-  } catch {
-    return undefined;
-  }
-};
-
-const getSystemLanguage = (): ResolvedLanguage => {
-  if (typeof navigator === 'undefined') {
-    return 'en';
-  }
-
+function getSystemLanguage(): ResolvedLanguage {
+  if (typeof navigator === 'undefined') return 'en';
   return detectSystemLanguage(navigator.language);
-};
-
-interface I18nProviderProps {
-  children: ReactNode;
 }
 
-export const I18nProvider = ({ children }: I18nProviderProps) => {
-  const [preference, setPreferenceState] = useState<LanguagePreference>(() =>
-    readStoredLanguagePreference(getStorage()),
-  );
-  const [systemLanguage, setSystemLanguage] = useState<ResolvedLanguage>(() =>
-    getSystemLanguage(),
-  );
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const { i18n } = useTranslation();
+  const { prefs, setPreference: setGlobalPreference } = usePreferences();
+  const [systemLanguage, setSystemLanguage] = useState<ResolvedLanguage>(() => getSystemLanguage());
 
-  const resolvedLanguage = resolveLanguage(preference, systemLanguage);
+  const preference = prefs.language;
+  const resolvedLanguage = useMemo(
+    () => resolveLanguage(preference, systemLanguage),
+    [preference, systemLanguage],
+  );
 
   useEffect(() => {
     if (i18n.language !== resolvedLanguage) {
       void i18n.changeLanguage(resolvedLanguage);
     }
-  }, [resolvedLanguage]);
+  }, [i18n, resolvedLanguage]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') {
-      return undefined;
-    }
-
-    const handleChange = () => {
-      setSystemLanguage(getSystemLanguage());
-    };
-
-    window.addEventListener('languagechange', handleChange);
-
-    return () => {
-      window.removeEventListener('languagechange', handleChange);
-    };
+    const onLanguageChange = () => setSystemLanguage(getSystemLanguage());
+    window.addEventListener('languagechange', onLanguageChange);
+    return () => window.removeEventListener('languagechange', onLanguageChange);
   }, []);
 
-  const setPreference = useCallback((nextPreference: LanguagePreference) => {
-    setPreferenceState(nextPreference);
-    writeStoredLanguagePreference(nextPreference, getStorage());
-  }, []);
+  const setPreference = useCallback(
+    (pref: LanguagePreference) => {
+      setGlobalPreference('language', pref);
+    },
+    [setGlobalPreference],
+  );
 
   const value = useMemo(
     () => ({ preference, resolvedLanguage, setPreference }),
@@ -88,14 +65,10 @@ export const I18nProvider = ({ children }: I18nProviderProps) => {
   );
 
   return <LanguageContext.Provider value={value}>{children}</LanguageContext.Provider>;
-};
+}
 
-export const useLanguagePreference = (): LanguageContextValue => {
-  const context = useContext(LanguageContext);
-
-  if (!context) {
-    throw new Error('useLanguagePreference must be used within an I18nProvider');
-  }
-
-  return context;
-};
+export function useLanguagePreference(): LanguageContextValue {
+  const ctx = useContext(LanguageContext);
+  if (!ctx) throw new Error('useLanguagePreference must be used within I18nProvider');
+  return ctx;
+}

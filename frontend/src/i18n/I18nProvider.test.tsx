@@ -1,9 +1,19 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import i18n from './index';
 import { I18nProvider, useLanguagePreference } from './I18nProvider';
-import { LANGUAGE_STORAGE_KEY } from './languagePreference';
+import { PreferencesProvider } from '../preferences/PreferencesProvider';
+import { PREFERENCES_CACHE_KEY } from '../preferences/preferencesStore';
+
+vi.mock('../api/preferences', () => ({
+  fetchPreferences: vi.fn().mockResolvedValue({
+    theme: 'dark',
+    language: 'system',
+    title_effect: 'grid-wave',
+  }),
+  updatePreferences: vi.fn().mockResolvedValue(undefined),
+}));
 
 function Probe() {
   const { preference, resolvedLanguage, setPreference } = useLanguagePreference();
@@ -38,9 +48,11 @@ describe('I18nProvider', () => {
   it('defaults to system preference and resolves from navigator.language', () => {
     setNavigatorLanguage('zh-CN');
     render(
-      <I18nProvider>
-        <Probe />
-      </I18nProvider>,
+      <PreferencesProvider>
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>
+      </PreferencesProvider>,
     );
 
     expect(screen.getByTestId('preference').textContent).toBe('system');
@@ -48,13 +60,18 @@ describe('I18nProvider', () => {
     expect(i18n.language).toBe('zh-CN');
   });
 
-  it('reads stored preference', () => {
-    localStorage.setItem(LANGUAGE_STORAGE_KEY, 'en');
+  it('reads stored preference from cache', () => {
+    localStorage.setItem(
+      PREFERENCES_CACHE_KEY,
+      JSON.stringify({ theme: 'dark', language: 'en', titleEffect: 'grid-wave' }),
+    );
     setNavigatorLanguage('zh-CN');
     render(
-      <I18nProvider>
-        <Probe />
-      </I18nProvider>,
+      <PreferencesProvider>
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>
+      </PreferencesProvider>,
     );
 
     expect(screen.getByTestId('resolved').textContent).toBe('en');
@@ -62,26 +79,34 @@ describe('I18nProvider', () => {
 
   it('setPreference persists and switches i18n language', () => {
     render(
-      <I18nProvider>
-        <Probe />
-      </I18nProvider>,
+      <PreferencesProvider>
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>
+      </PreferencesProvider>,
     );
 
     act(() => {
       screen.getByText('to-zh').click();
     });
 
-    expect(localStorage.getItem(LANGUAGE_STORAGE_KEY)).toBe('zh-CN');
+    const cached = JSON.parse(localStorage.getItem(PREFERENCES_CACHE_KEY) || '{}');
+    expect(cached.language).toBe('zh-CN');
     expect(screen.getByTestId('resolved').textContent).toBe('zh-CN');
     expect(i18n.language).toBe('zh-CN');
   });
 
   it('falls back to system for invalid stored value', () => {
-    localStorage.setItem(LANGUAGE_STORAGE_KEY, 'fr');
+    localStorage.setItem(
+      PREFERENCES_CACHE_KEY,
+      JSON.stringify({ theme: 'dark', language: 'fr', titleEffect: 'grid-wave' }),
+    );
     render(
-      <I18nProvider>
-        <Probe />
-      </I18nProvider>,
+      <PreferencesProvider>
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>
+      </PreferencesProvider>,
     );
 
     expect(screen.getByTestId('preference').textContent).toBe('system');
@@ -89,9 +114,11 @@ describe('I18nProvider', () => {
 
   it('reacts to languagechange when preference is system', () => {
     render(
-      <I18nProvider>
-        <Probe />
-      </I18nProvider>,
+      <PreferencesProvider>
+        <I18nProvider>
+          <Probe />
+        </I18nProvider>
+      </PreferencesProvider>,
     );
 
     expect(screen.getByTestId('resolved').textContent).toBe('en');
