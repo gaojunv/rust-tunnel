@@ -114,7 +114,7 @@ export function Header({ onLogout }: HeaderProps) {
       <div className="container relative mx-auto flex h-14 items-center gap-2 px-4 md:px-6">
         <Link to="/" className="flex items-center gap-2 font-semibold">
           <Logo className="h-7 w-7 rounded-lg shadow-glow" />
-          <span className="hidden bg-gradient-to-r from-foreground to-muted-foreground bg-clip-text text-transparent sm:inline">
+          <span className="text-aurora hidden font-semibold sm:inline">
             Aurora Tunnel
           </span>
         </Link>
@@ -179,7 +179,7 @@ export function Header({ onLogout }: HeaderProps) {
             <SheetHeader className="border-b p-4">
               <SheetTitle className="flex items-center gap-2 text-left">
                 <Logo className="h-7 w-7 rounded-lg shadow-glow" />
-                Aurora Tunnel
+                <span className="text-aurora">Aurora Tunnel</span>
               </SheetTitle>
             </SheetHeader>
             <nav className="flex-1 space-y-4 overflow-y-auto p-4">
