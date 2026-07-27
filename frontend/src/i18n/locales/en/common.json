@@ -19,7 +19,19 @@
     "delete": "Delete",
     "yes": "Yes",
     "no": "No",
-    "optional": "(optional)"
+    "optional": "(optional)",
+    "noData": "No data available",
+    "close": "Close"
+  },
+  "timeRange": {
+    "custom": "Custom"
+  },
+  "theme": {
+    "ariaLabel": "Switch theme",
+    "system": "System",
+    "light": "Light",
+    "dark": "Dark",
+    "systemDesc": "Automatically switch based on system theme"
   },
   "settings": {
     "title": "Settings",
@@ -114,8 +126,6 @@
       "version": "Version",
       "referenced": "Referenced",
       "actions": "Actions",
-      "online": "online",
-      "offline": "offline",
       "empty": "No clients registered"
     }
   },
@@ -588,7 +598,8 @@
         "prompt": "Input",
         "cacheHit": "Cache Hit",
         "completion": "Output",
-        "total": "Total"
+        "total": "Total",
+        "stream": "stream"
       },
       "empty": "No usage data for this time range",
       "loading": "Loading...",

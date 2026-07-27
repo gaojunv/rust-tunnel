@@ -1,4 +1,5 @@
 import { useMediaQuery } from '../../hooks/useMediaQuery';
+import { useTranslation } from 'react-i18next';
 import type { TimePreset } from '../../hooks/useTimeRange';
 
 interface TimeRangeSelectorProps {
@@ -33,6 +34,7 @@ export const TimeRangeSelector = ({
   onCustomChange,
 }: TimeRangeSelectorProps) => {
   const isMobile = useMediaQuery('(max-width: 639px)');
+  const { t } = useTranslation();
 
   return (
     <div className={`flex items-center gap-2 ${isMobile ? 'flex-col items-start' : 'flex-wrap'}`}>
@@ -63,7 +65,7 @@ export const TimeRangeSelector = ({
               : 'text-muted-foreground hover:text-foreground hover:bg-accent'
             }`}
         >
-          Custom
+          {t('timeRange.custom')}
         </button>
         {preset === 'custom' && (
           <div className={`flex items-center gap-1 ${isMobile ? 'flex-col w-full' : ''}`}>

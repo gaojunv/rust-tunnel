@@ -36,7 +36,7 @@ export const MetricAreaChart = ({
   threshold,
   thresholdLabel,
   className = 'h-[200px] w-full',
-  emptyText = 'No data available',
+  emptyText,
 }: MetricAreaChartProps) => {
   const gradientId = useId().replace(/:/g, '');
 

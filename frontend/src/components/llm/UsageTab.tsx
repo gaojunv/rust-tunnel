@@ -240,7 +240,7 @@ export default function UsageTab() {
                     </TableCell>
                     <TableCell>
                       {l.protocol}
-                      {l.stream ? ' (stream)' : ''}
+                      {l.stream ? ` ${t('llm.usage.table.stream')}` : ''}
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-xs">
                       {fmt(l.prompt_tokens)} / {fmt(l.cache_hit_tokens)} / {fmt(l.completion_tokens)}

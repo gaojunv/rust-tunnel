@@ -19,7 +19,19 @@
     "delete": "删除",
     "yes": "是",
     "no": "否",
-    "optional": "（可选）"
+    "optional": "（可选）",
+    "noData": "暂无数据",
+    "close": "关闭"
+  },
+  "timeRange": {
+    "custom": "自定义"
+  },
+  "theme": {
+    "ariaLabel": "切换主题",
+    "system": "跟随系统",
+    "light": "浅色",
+    "dark": "深色",
+    "systemDesc": "根据系统主题自动切换"
   },
   "settings": {
     "title": "设置",
@@ -114,8 +126,6 @@
       "version": "版本",
       "referenced": "被引用",
       "actions": "操作",
-      "online": "在线",
-      "offline": "离线",
       "empty": "暂无注册的客户端"
     }
   },
@@ -588,7 +598,8 @@
         "prompt": "输入",
         "cacheHit": "缓存命中",
         "completion": "输出",
-        "total": "总计"
+        "total": "总计",
+        "stream": "stream"
       },
       "empty": "该时间范围内暂无用量数据",
       "loading": "加载中...",

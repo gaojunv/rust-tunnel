@@ -1,19 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useTheme } from '../../theme/ThemeProvider';
 import type { ThemePreference } from '../../theme/theme';
 import type { ReactNode } from 'react';
 
-interface ThemeOption {
-  value: ThemePreference;
-  label: string;
-  description?: string;
-}
+/** Explicit key map for tsc type-safety with dynamic theme preference values. */
+const THEME_LABEL_KEYS = {
+  system: 'theme.system',
+  light: 'theme.light',
+  dark: 'theme.dark',
+} as const;
 
-const themeOptions: ThemeOption[] = [
-  { value: 'system', label: '跟随系统', description: '根据系统主题自动切换' },
-  { value: 'light', label: '浅色' },
-  { value: 'dark', label: '深色' },
-];
+function getDescKey(value: ThemePreference): 'theme.systemDesc' | undefined {
+  return value === 'system' ? 'theme.systemDesc' : undefined;
+}
 
 const SystemIcon = () => (
   <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -55,7 +55,11 @@ const iconByPreference: Record<ThemePreference, ReactNode> = {
   dark: <MoonIcon />,
 };
 
+/** Ordered list of theme options for rendering. */
+const THEME_OPTIONS: ThemePreference[] = ['system', 'light', 'dark'];
+
 export const ThemeToggle = () => {
+  const { t } = useTranslation();
   const { preference, setPreference } = useTheme();
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -93,7 +97,7 @@ export const ThemeToggle = () => {
     <div className="relative" ref={containerRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
-        aria-label="切换主题"
+        aria-label={t('theme.ariaLabel')}
         aria-haspopup="menu"
         aria-expanded={isOpen}
         className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
@@ -104,34 +108,38 @@ export const ThemeToggle = () => {
       {isOpen && (
         <div className="absolute right-0 z-50 mt-2 w-56 rounded-lg border bg-popover shadow-xl focus:outline-none">
           <div className="py-1" role="menu" aria-orientation="vertical">
-            {themeOptions.map((option) => (
-              <button
-                key={option.value}
-                onClick={() => handleSelect(option.value)}
-                className={`group flex items-center w-full px-4 py-2 text-sm text-left transition-colors ${
-                  preference === option.value
-                    ? 'bg-accent text-foreground'
-                    : 'text-muted-foreground hover:bg-accent hover:text-foreground'
-                }`}
-                role="menuitemradio"
-                aria-checked={preference === option.value}
-              >
-                <span className="mr-3 flex h-6 w-6 items-center justify-center text-muted-foreground">
-                  {iconByPreference[option.value]}
-                </span>
-                <span className="flex-1">
-                  <div className="font-medium">{option.label}</div>
-                  {option.description && (
-                    <div className="text-xs text-muted-foreground">{option.description}</div>
-                  )}
-                </span>
-                {preference === option.value && (
-                  <span className="ml-3 text-primary">
-                    <CheckIcon />
+            {THEME_OPTIONS.map((value) => {
+              const labelKey = THEME_LABEL_KEYS[value];
+              const descKey = getDescKey(value);
+              return (
+                <button
+                  key={value}
+                  onClick={() => handleSelect(value)}
+                  className={`group flex items-center w-full px-4 py-2 text-sm text-left transition-colors ${
+                    preference === value
+                      ? 'bg-accent text-foreground'
+                      : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                  }`}
+                  role="menuitemradio"
+                  aria-checked={preference === value}
+                >
+                  <span className="mr-3 flex h-6 w-6 items-center justify-center text-muted-foreground">
+                    {iconByPreference[value]}
                   </span>
-                )}
-              </button>
-            ))}
+                  <span className="flex-1">
+                    <div className="font-medium">{t(labelKey)}</div>
+                    {descKey && (
+                      <div className="text-xs text-muted-foreground">{t(descKey)}</div>
+                    )}
+                  </span>
+                  {preference === value && (
+                    <span className="ml-3 text-primary">
+                      <CheckIcon />
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

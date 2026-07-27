@@ -194,7 +194,7 @@ export default function DashboardPage() {
                             : 'bg-muted text-muted-foreground'
                         }`}
                       >
-                        {client.online ? t('dashboard.clientList.online') : t('dashboard.clientList.offline')}
+                        {client.online ? t('common.status.online') : t('common.status.offline')}
                       </span>
                     </TableCell>
                     <TableCell className="text-muted-foreground">
