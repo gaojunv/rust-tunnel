@@ -223,7 +223,6 @@
       "client": "客户端",
       "clientName": "客户端名称",
       "clientNamePlaceholder": "选择或输入客户端名称",
-      "weight": "权重",
       "weightPlaceholder": "权重",
       "scheme": "协议",
       "protocol": "应用层协议",

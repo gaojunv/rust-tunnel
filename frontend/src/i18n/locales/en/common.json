@@ -223,7 +223,6 @@
       "client": "Client",
       "clientName": "Client Name",
       "clientNamePlaceholder": "Select or type a client name",
-      "weight": "Weight",
       "weightPlaceholder": "Weight",
       "scheme": "Scheme",
       "protocol": "Protocol",
