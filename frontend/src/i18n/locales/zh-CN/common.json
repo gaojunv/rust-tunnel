@@ -66,5 +66,40 @@
     "signIn": "登录",
     "signingIn": "登录中...",
     "loginFailed": "密码错误，请重试"
+  },
+  "dashboard": {
+    "title": "仪表盘",
+    "description": "隧道连接概览",
+    "statsOverview": {
+      "clients": "客户端",
+      "reverseProxy": "反向代理",
+      "shadowsocks": "Shadowsocks",
+      "trojan": "Trojan",
+      "connections": "{{count}} 个连接 · {{entities}} 个实体"
+    },
+    "connectedClients": "已连接客户端",
+    "activeConnections": "活跃连接数",
+    "totalBytesIn": "总入站流量",
+    "totalBytesOut": "总出站流量",
+    "networkTraffic": "网络流量",
+    "trafficLabel": {
+      "client": "客户端",
+      "proxy": "代理",
+      "shadowsocks": "Shadowsocks",
+      "trojan": "Trojan"
+    },
+    "noTraffic": "无 {{type}} 流量",
+    "clientList": {
+      "title": "客户端",
+      "name": "名称",
+      "hostname": "主机名",
+      "status": "状态",
+      "version": "版本",
+      "referenced": "被引用",
+      "actions": "操作",
+      "online": "在线",
+      "offline": "离线",
+      "empty": "暂无注册的客户端"
+    }
   }
 }

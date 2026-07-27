@@ -1,5 +1,6 @@
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -29,26 +30,27 @@ import {
 
 function StatsOverview() {
   const { data: summary, isLoading } = useStatsSummary();
+  const { t } = useTranslation();
   useStatsStream();
 
   const cards = [
     {
-      title: 'Clients',
+      title: t('dashboard.statsOverview.clients'),
       icon: <Users className="h-4 w-4" />,
       entity: summary?.clients,
     },
     {
-      title: 'Reverse Proxy',
+      title: t('dashboard.statsOverview.reverseProxy'),
       icon: <Network className="h-4 w-4" />,
       entity: summary?.proxy,
     },
     {
-      title: 'Shadowsocks',
+      title: t('dashboard.statsOverview.shadowsocks'),
       icon: <Shield className="h-4 w-4" />,
       entity: summary?.shadowsocks,
     },
     {
-      title: 'Trojan',
+      title: t('dashboard.statsOverview.trojan'),
       icon: <Globe className="h-4 w-4" />,
       entity: summary?.trojan,
     },
@@ -71,7 +73,10 @@ function StatsOverview() {
           description={
             isLoading
               ? undefined
-              : `${card.entity?.total_conns ?? 0} connections · ${card.entity?.entity_count ?? 0} entities`
+              : t('dashboard.statsOverview.connections', {
+                  count: card.entity?.total_conns ?? 0,
+                  entities: card.entity?.entity_count ?? 0,
+                })
           }
           icon={card.icon}
         />
@@ -82,6 +87,7 @@ function StatsOverview() {
 
 export default function DashboardPage() {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   const { data: clients = [], isLoading: clientsLoading } = useQuery({
     queryKey: ['clients', 'dashboard'],
     queryFn: () => clientsApi.list(),
@@ -100,8 +106,8 @@ export default function DashboardPage() {
   return (
     <div className="space-y-6">
       <PageHeader
-        title="Dashboard"
-        description="Overview of your tunnel connections"
+        title={t('dashboard.title')}
+        description={t('dashboard.description')}
       />
 
       {/* Unified Stats Overview */}
@@ -110,22 +116,22 @@ export default function DashboardPage() {
       {/* Stats Grid */}
       <div className="grid gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
         <StatCard
-          title="Connected Clients"
+          title={t('dashboard.connectedClients')}
           value={connectedClients}
           icon={<Users className="h-4 w-4" />}
         />
         <StatCard
-          title="Active Connections"
+          title={t('dashboard.activeConnections')}
           value={activeConnections}
           icon={<Activity className="h-4 w-4" />}
         />
         <StatCard
-          title="Total Bytes In"
+          title={t('dashboard.totalBytesIn')}
           value={formatBytes(totalBytesIn)}
           icon={<ArrowDown className="h-4 w-4" />}
         />
         <StatCard
-          title="Total Bytes Out"
+          title={t('dashboard.totalBytesOut')}
           value={formatBytes(totalBytesOut)}
           icon={<ArrowUp className="h-4 w-4" />}
         />
@@ -137,39 +143,39 @@ export default function DashboardPage() {
       {/* Client List */}
       <Card>
         <CardHeader>
-          <CardTitle>Clients</CardTitle>
+          <CardTitle>{t('dashboard.clientList.title')}</CardTitle>
         </CardHeader>
         <CardContent>
           {clientsLoading ? (
             <div className="py-12 text-center text-sm text-muted-foreground">
-              Loading...
+              {t('common.loading')}
             </div>
           ) : clients.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-12 text-muted-foreground">
               <Users className="h-8 w-8 opacity-40" />
-              <p className="text-sm">No clients registered</p>
+              <p className="text-sm">{t('dashboard.clientList.empty')}</p>
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Name
+                    {t('dashboard.clientList.name')}
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Hostname
+                    {t('dashboard.clientList.hostname')}
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Status
+                    {t('dashboard.clientList.status')}
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Version
+                    {t('dashboard.clientList.version')}
                   </TableHead>
                   <TableHead className="text-xs uppercase tracking-wider">
-                    Referenced
+                    {t('dashboard.clientList.referenced')}
                   </TableHead>
                   <TableHead className="text-right text-xs uppercase tracking-wider">
-                    Actions
+                    {t('dashboard.clientList.actions')}
                   </TableHead>
                 </TableRow>
               </TableHeader>
@@ -188,7 +194,7 @@ export default function DashboardPage() {
                             : 'bg-muted text-muted-foreground'
                         }`}
                       >
-                        {client.online ? 'online' : 'offline'}
+                        {client.online ? t('dashboard.clientList.online') : t('dashboard.clientList.offline')}
                       </span>
                     </TableCell>
                     <TableCell className="text-muted-foreground">

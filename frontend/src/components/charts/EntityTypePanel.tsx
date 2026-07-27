@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -26,6 +27,7 @@ interface EntityTypePanelProps {
  * 内部按 entity_id 拆 series，label 通过 useEntityLabel 映射为人类可读名。
  */
 export const EntityTypePanel = ({ type, titleLabel, snapshots }: EntityTypePanelProps) => {
+  const { t } = useTranslation();
   const entityLabel = useEntityLabel();
 
   const entities = useMemo(
@@ -72,7 +74,7 @@ export const EntityTypePanel = ({ type, titleLabel, snapshots }: EntityTypePanel
       </CardHeader>
       <CardContent>
         {chartData.length === 0 ? (
-          <ChartEmpty message={`No ${titleLabel} traffic`} />
+          <ChartEmpty message={t('dashboard.noTraffic', { type: titleLabel })} />
         ) : (
           <ChartContainer config={chartConfig} className="h-[220px] w-full">
             <AreaChart data={chartData} margin={{ left: 12, right: 12 }}>

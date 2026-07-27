@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
@@ -9,14 +10,8 @@ import type { EntityType } from '@/hooks/useEntityLabel';
 
 const ENTITY_TYPES: readonly EntityType[] = ['client', 'proxy', 'shadowsocks', 'trojan'];
 
-const TITLE_LABEL: Record<EntityType, string> = {
-  client: 'Client',
-  proxy: 'Proxy',
-  shadowsocks: 'Shadowsocks',
-  trojan: 'Trojan',
-};
-
 export const TrafficAreaChart = () => {
+  const { t } = useTranslation();
   const { range, preset, presets, setPreset, setCustomRange } = useTimeRange();
 
   const startIso = useMemo(() => new Date(range.startMs).toISOString(), [range.startMs]);
@@ -45,7 +40,7 @@ export const TrafficAreaChart = () => {
   return (
     <Card>
       <CardHeader className="flex flex-col gap-3 space-y-0 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle>Network Traffic</CardTitle>
+        <CardTitle>{t('dashboard.networkTraffic')}</CardTitle>
         <TimeRangeSelector
           preset={preset}
           presets={presets}
@@ -61,7 +56,7 @@ export const TrafficAreaChart = () => {
             <EntityTypePanel
               key={type}
               type={type}
-              titleLabel={TITLE_LABEL[type]}
+              titleLabel={t(`dashboard.trafficLabel.${type}`)}
               snapshots={buckets[type]}
             />
           ))}

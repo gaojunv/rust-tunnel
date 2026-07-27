@@ -66,5 +66,40 @@
     "signIn": "Login",
     "signingIn": "Logging in...",
     "loginFailed": "Invalid password"
+  },
+  "dashboard": {
+    "title": "Dashboard",
+    "description": "Overview of your tunnel connections",
+    "statsOverview": {
+      "clients": "Clients",
+      "reverseProxy": "Reverse Proxy",
+      "shadowsocks": "Shadowsocks",
+      "trojan": "Trojan",
+      "connections": "{{count}} connections · {{entities}} entities"
+    },
+    "connectedClients": "Connected Clients",
+    "activeConnections": "Active Connections",
+    "totalBytesIn": "Total Bytes In",
+    "totalBytesOut": "Total Bytes Out",
+    "networkTraffic": "Network Traffic",
+    "trafficLabel": {
+      "client": "Client",
+      "proxy": "Proxy",
+      "shadowsocks": "Shadowsocks",
+      "trojan": "Trojan"
+    },
+    "noTraffic": "No {{type}} traffic",
+    "clientList": {
+      "title": "Clients",
+      "name": "Name",
+      "hostname": "Hostname",
+      "status": "Status",
+      "version": "Version",
+      "referenced": "Referenced",
+      "actions": "Actions",
+      "online": "online",
+      "offline": "offline",
+      "empty": "No clients registered"
+    }
   }
 }
