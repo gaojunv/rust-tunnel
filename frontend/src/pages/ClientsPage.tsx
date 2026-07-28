@@ -40,7 +40,7 @@ export default function ClientsPage() {
     <div className="space-y-6">
       <PageHeader title={t('clients.title')} description={t('clients.description')} />
 
-      <section className="rounded-lg border bg-card p-4">
+      <section className="card-aurora rounded-lg border bg-card p-4">
         <h2 className="mb-3 text-sm font-medium">{t('clients.clientToken')}</h2>
         <div className="flex flex-wrap items-center gap-4">
           <code className="rounded bg-muted px-3 py-1.5 font-mono text-sm">
@@ -75,7 +75,7 @@ export default function ClientsPage() {
         </div>
       </section>
 
-      <section className="rounded-lg border bg-card">
+      <section className="card-aurora rounded-lg border bg-card">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
