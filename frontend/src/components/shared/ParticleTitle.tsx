@@ -24,6 +24,11 @@ interface RuntimeParticle {
 }
 
 const FONT_SIZE = 32; // 字号放大：稀疏大颗粒拼出更大的字，兼顾颗粒感与清晰度
+// 采样画布高度系数（与 particleText.ts 中 height = fontSizePx × dpr × 1.4 对应）
+const SAMPLE_HEIGHT_RATIO = 1.4;
+// h1 行高系数（与 PageHeader 的 leading-tight = 1.25 一致），
+// 用于把 canvas 的视觉高度精确对齐到行高，消除三种标题模式间的高度差。
+const LINE_HEIGHT_RATIO = 1.25;
 const STEP = 3; // 采样步长（还原稀疏颗粒感）
 const PARTICLE_SIZE = 2; // 小正方形边长（CSS px，还原）
 const MAX_PARTICLES = 1600; // 粒子数上限，防中文长标题卡顿
@@ -60,11 +65,23 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
-    const hsl = readPrimaryColor();
+    let hsl = readPrimaryColor();
     if (!ctx || !hsl) {
       setUsable(false);
       return;
     }
+
+    // 主题切换时 --primary CSS 变量改变，重新读取颜色。
+    // MutationObserver 监听 <html> 的 class（dark class 切换），
+    // 不重建 effect，只更新绘制时使用的颜色分量。
+    const themeObserver = new MutationObserver(() => {
+      const next = readPrimaryColor();
+      if (next) hsl = next;
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const sampled = sampleTextParticles(text, {
@@ -78,18 +95,30 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
       return;
     }
 
-    // 由粒子范围确定 canvas 尺寸，并在四周加 BUFFER 透明缓冲区：
+    // 由粒子范围确定 canvas 宽度，并在四周加 BUFFER 透明缓冲区：
     // 粒子被扰动推开时仍落在画布内可见，不会一出文字边缘就消失。
+    // 高度不用 maxY（实际采样到的最底部粒子，随字形波动，导致视觉高度不稳定），
+    // 而用理论采样画布高 FONT_SIZE × 1.4，保证任何标题文字的视觉高度都精确等于行高。
     const maxX = Math.max(...sampled.map((p) => p.homeX));
-    const maxY = Math.max(...sampled.map((p) => p.homeY));
     const cssW = Math.ceil(maxX + STEP + BUFFER * 2);
-    const cssH = Math.ceil(maxY + STEP + BUFFER * 2);
+    const cssH = Math.ceil(FONT_SIZE * SAMPLE_HEIGHT_RATIO + BUFFER * 2);
     canvas.width = cssW * dpr;
     canvas.height = cssH * dpr;
     canvas.style.width = `${cssW}px`;
     canvas.style.height = `${cssH}px`;
-    // 缓冲区让 canvas 比文字大，用负边距把文字视觉位置拉回原位，布局不变。
-    canvas.style.margin = `-${BUFFER}px`;
+    // 高度对齐：采样画布高 = FONT_SIZE × 1.4（44.8px），比 h1 行高 40px 多 4.8px。
+    // 若直接用对称的 -BUFFER margin，视觉高度 = cssH - 2×BUFFER = 44.8 ≈ 45px，
+    // 与 none / grid-wave 模式的纯文字行高 40px 不一致，导致 PageHeader 高 1~2px。
+    // 修复：把多出的 extraV 均分到上下 margin（各 extraV/2），既把视觉高度压到 40px，
+    // 又保持文字中心与视觉框中心重合（采样时 textBaseline='middle' 已让文字居中，
+    // 对称压缩不会偏移中心）：
+    //   cssH - (BUFFER + extraV/2) × 2 = (44.8 + 88) - 2.4×2 - 88 = 40px
+    // 粒子扰动空间不受影响——canvas 实际高度仍是 44.8 + 88，BUFFER 缓冲区完整保留。
+    const sampleH = FONT_SIZE * SAMPLE_HEIGHT_RATIO; // 44.8（采样画布理论高，CSS px）
+    const lineH = FONT_SIZE * LINE_HEIGHT_RATIO;     // 40（h1 行高）
+    const extraV = Math.max(0, sampleH - lineH);     // 4.8（采样画布超出行高的部分）
+    const marginV = BUFFER + extraV / 2;             // 46.4（上下各压的量）
+    canvas.style.margin = `-${marginV}px -${BUFFER}px`;
 
     const particles: RuntimeParticle[] = sampled.map((p) => ({
       // 粒子坐标整体偏移 BUFFER，使文字居于缓冲区中央。
@@ -106,6 +135,8 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
     let t = 0;
 
     const draw = () => {
+      const color = hsl;
+      if (!color) return; // 类型守卫：上方已 return，此处仅为 TS 闭包收窄
       t += 1;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       // 呼吸微光：整体亮度随时间正弦缓慢变化。
@@ -143,10 +174,10 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
         // 光波点亮：鼠标光带 + 自动光带叠加。
         const bandX = mouse.active ? mouse.x : autoBandX;
         const glow = Math.max(0, 1 - Math.abs(p.x - bandX) / LIGHT_BAND);
-        const lightness = Math.min(90, hsl.l + breathe * 6 + glow * 30);
+        const lightness = Math.min(90, color.l + breathe * 6 + glow * 30);
         const alpha = 0.55 + breathe * 0.15 + glow * 0.3;
         const size = PARTICLE_SIZE * (1 + glow * 0.5);
-        ctx.fillStyle = `hsl(${hsl.h} ${hsl.s}% ${lightness}% / ${Math.min(1, alpha)})`;
+        ctx.fillStyle = `hsl(${color.h} ${color.s}% ${lightness}% / ${Math.min(1, alpha)})`;
         ctx.fillRect(p.x * dpr - (size * dpr) / 2, p.y * dpr - (size * dpr) / 2, size * dpr, size * dpr);
       }
 
@@ -176,6 +207,7 @@ export function ParticleTitle({ text, className, eventTargetRef }: ParticleTitle
 
     return () => {
       cancelAnimationFrame(raf);
+      themeObserver.disconnect();
       host.removeEventListener('pointermove', onMove);
       host.removeEventListener('pointerleave', onLeave);
     };

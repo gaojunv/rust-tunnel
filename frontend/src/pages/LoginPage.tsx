@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { useLogin } from '@/api/hooks';
 import { Logo } from '@/components/shared/Logo';
 import AuroraBackground from '@/components/aurora/AuroraBackground';
+import { usePreferences } from '@/preferences/PreferencesProvider';
 
 export default function LoginPage() {
   const { t } = useTranslation();
@@ -14,6 +15,7 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const navigate = useNavigate();
   const login = useLogin();
+  const { prefs } = usePreferences();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -30,7 +32,7 @@ export default function LoginPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
-      <AuroraBackground />
+      {prefs.titleEffect !== 'none' && <AuroraBackground />}
 
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">

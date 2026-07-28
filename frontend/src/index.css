@@ -60,10 +60,36 @@
 
   html {
     color-scheme: light;
+    /* 始终保留纵向滚动条：页面从短到长（或反之）切换时不水平抖动。
+       比 scrollbar-gutter: stable 更好——gutter 在无滚动条时会留一块空白，
+       而 overflow-y: scroll 始终显示一条细轨道，视觉更连续。
+       配合下方细滚动条样式 + body scroll-lock 覆盖规则使用。 */
+    overflow-y: scroll;
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
   }
 
   html.dark {
     color-scheme: dark;
+  }
+
+  /* WebKit / Chromium：细滚动条 + 透明轨道，降低 gutter 区域的视觉存在感 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
   }
 
   * {
@@ -87,6 +113,22 @@
       radial-gradient(ellipse 70% 50% at 85% 110%, hsl(262 83% 68% / 0.07), transparent);
     background-attachment: fixed;
   }
+}
+
+/* Radix Select/Dialog 打开时通过 react-remove-scroll-bar 给 body 加
+   margin-right 补偿滚动条宽度（gapMode: 'margin'，inline <style> 注入到
+   head 末尾）。但 html 已用 scrollbar-gutter: stable 预留槽位（html 宽度
+   不变），再补偿反而让内容右移 → 抖动。
+   注意两点：
+   1) 必须放在 @layer 外。Radix 注入的是非 layered 样式，按 CSS 层级规则
+      非 layered 优先级高于 layered，写在 @layer base 里会被压制。
+   2) 选择器必须比 Radix 的 `body[data-scroll-locked]` 更具体。Radix 的
+      <style> 标签插入到 head 末尾（声明顺序后于 index.css），如果特异性
+      相同会按顺序输给 Radix。`html body[data-scroll-locked]` 多一级元素
+      选择器，特异性更高 → 胜出。 */
+html body[data-scroll-locked] {
+  margin-right: 0 !important;
+  padding-right: 0 !important;
 }
 
 @layer utilities {
