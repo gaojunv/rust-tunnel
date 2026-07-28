@@ -160,6 +160,45 @@ html body[data-scroll-locked] {
       aurora-text-breathe 4s ease-in-out infinite;
   }
 
+  /* 卡片极光光晕：常驻极淡微光，hover 时三色流动 + 边框微亮 */
+  .card-aurora {
+    position: relative;
+  }
+
+  .card-aurora::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    background: linear-gradient(
+      135deg,
+      hsl(var(--primary) / 0.10) 0%,
+      transparent 50%,
+      hsl(var(--primary) / 0.10) 100%
+    );
+    opacity: 0.5;
+    transition: opacity 0.3s ease;
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .card-aurora:hover::before {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--primary) / 0.35) 0%,
+      hsl(var(--chart-2) / 0.35) 33%,
+      hsl(var(--chart-3) / 0.35) 66%,
+      hsl(var(--primary) / 0.35) 100%
+    );
+    background-size: 200% 100%;
+    opacity: 1;
+    animation: aurora-text-flow 6s linear infinite;
+  }
+
+  .card-aurora:hover {
+    border-color: hsl(var(--primary) / 0.35);
+  }
+
   /* Logo 光环呼吸：外发光缓慢明暗（叠加在 shadow-glow 之上，动画化 box-shadow） */
   .logo-glow-breathe {
     animation: logo-glow-breathe 3s ease-in-out infinite;
@@ -214,7 +253,8 @@ html body[data-scroll-locked] {
     .animate-aurora,
     .animate-aurora-alt,
     .text-aurora,
-    .logo-glow-breathe {
+    .logo-glow-breathe,
+    .card-aurora::before {
       animation: none;
     }
   }
