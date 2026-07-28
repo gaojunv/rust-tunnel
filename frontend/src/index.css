@@ -160,52 +160,48 @@ html body[data-scroll-locked] {
       aurora-text-breathe 4s ease-in-out infinite;
   }
 
-  /* 卡片边框极光光晕：常驻极淡微光，hover 时边框三色流转 */
+  /* 卡片极光光晕：PageHeader 风格的大面积柔和光晕，hover 时三色流转 */
   .card-aurora {
     position: relative;
+    transition: box-shadow 0.3s ease;
+    box-shadow:
+      inset 0 1px 0 0 hsl(var(--foreground) / 0.03),
+      0 8px 24px -12px hsl(var(--primary) / 0.15);
   }
 
-  .card-aurora::before {
-    content: '';
-    position: absolute;
-    inset: -2px;
-    border-radius: inherit;
-    padding: 2px;
-    background: linear-gradient(
-      135deg,
-      hsl(var(--primary) / 0.15) 0%,
-      hsl(var(--primary) / 0.08) 50%,
-      hsl(var(--primary) / 0.15) 100%
-    );
-    -webkit-mask:
-      linear-gradient(#fff 0 0) content-box,
-      linear-gradient(#fff 0 0);
-    -webkit-mask-composite: xor;
-    mask:
-      linear-gradient(#fff 0 0) content-box,
-      linear-gradient(#fff 0 0);
-    mask-composite: exclude;
-    opacity: 0.4;
-    transition: opacity 0.3s ease;
-    pointer-events: none;
-    z-index: 1;
-  }
-
-  .card-aurora:hover::before {
-    background: linear-gradient(
-      90deg,
-      hsl(var(--primary) / 0.5) 0%,
-      hsl(var(--chart-2) / 0.5) 33%,
-      hsl(var(--chart-3) / 0.5) 66%,
-      hsl(var(--primary) / 0.5) 100%
-    );
-    background-size: 200% 100%;
-    opacity: 1;
-    animation: aurora-text-flow 6s linear infinite;
-  }
-
+  /* hover：多层 box-shadow 模拟三色光晕 */
   .card-aurora:hover {
-    border-color: hsl(var(--primary) / 0.4);
+    box-shadow:
+      inset 0 1px 0 0 hsl(var(--foreground) / 0.05),
+      0 12px 32px -12px hsl(var(--primary) / 0.35),
+      0 0 60px -20px hsl(var(--chart-2) / 0.25),
+      0 0 100px -30px hsl(var(--chart-3) / 0.2);
+    animation: card-aurora-glow 6s ease-in-out infinite;
+  }
+
+  /* 光晕颜色流动动画：通过改变 box-shadow 颜色实现 */
+  @keyframes card-aurora-glow {
+    0%, 100% {
+      box-shadow:
+        inset 0 1px 0 0 hsl(var(--foreground) / 0.05),
+        0 12px 32px -12px hsl(var(--primary) / 0.35),
+        0 0 60px -20px hsl(var(--chart-2) / 0.25),
+        0 0 100px -30px hsl(var(--chart-3) / 0.2);
+    }
+    33% {
+      box-shadow:
+        inset 0 1px 0 0 hsl(var(--foreground) / 0.05),
+        0 12px 32px -12px hsl(var(--chart-2) / 0.35),
+        0 0 60px -20px hsl(var(--chart-3) / 0.25),
+        0 0 100px -30px hsl(var(--primary) / 0.2);
+    }
+    66% {
+      box-shadow:
+        inset 0 1px 0 0 hsl(var(--foreground) / 0.05),
+        0 12px 32px -12px hsl(var(--chart-3) / 0.35),
+        0 0 60px -20px hsl(var(--primary) / 0.25),
+        0 0 100px -30px hsl(var(--chart-2) / 0.2);
+    }
   }
 
   /* Logo 光环呼吸：外发光缓慢明暗（叠加在 shadow-glow 之上，动画化 box-shadow） */
@@ -263,7 +259,7 @@ html body[data-scroll-locked] {
     .animate-aurora-alt,
     .text-aurora,
     .logo-glow-breathe,
-    .card-aurora::before {
+    .card-aurora:hover {
       animation: none;
     }
   }
