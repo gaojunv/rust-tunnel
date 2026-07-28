@@ -4,12 +4,13 @@ import { cn } from "@/lib/utils"
 
 const Card = React.forwardRef<
   HTMLDivElement,
-  React.HTMLAttributes<HTMLDivElement>
->(({ className, ...props }, ref) => (
+  React.HTMLAttributes<HTMLDivElement> & { noAurora?: boolean }
+>(({ className, noAurora, ...props }, ref) => (
   <div
     ref={ref}
     className={cn(
       "rounded-xl border bg-card/70 text-card-foreground shadow-lg shadow-black/5 backdrop-blur-xl transition-colors dark:shadow-black/20",
+      !noAurora && "card-aurora",
       className
     )}
     {...props}
