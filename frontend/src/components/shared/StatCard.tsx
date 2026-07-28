@@ -14,7 +14,7 @@ export function StatCard({ title, value, description, icon, trend, className }: 
   return (
     <Card
       className={cn(
-        'group relative overflow-hidden transition-all duration-300',
+        'group relative transition-all duration-300',
         className
       )}
     >
