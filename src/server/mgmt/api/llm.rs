@@ -8,7 +8,7 @@ use axum::{
 use super::ApiState;
 use crate::server::llm::{
     auth::generate_api_key,
-    crypto::{encrypt_field, LlmCipher},
+    crypto::{decrypt_field, encrypt_field, LlmCipher},
     provider::{is_valid_provider_type, resolve_base_url, VALID_PROVIDER_TYPES},
     ApiKeyView, CreateApiKeyRequest, CreateApiKeyResponse, LlmGatewayConfig, ModelConfig,
     ModelRequest, ProviderConfig, ProviderRequest,
@@ -158,19 +158,33 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
         }
     };
 
+    // extra_config 落库前已加密，回显给前端时需解密；历史明文原样透传，
+    // 解密失败（如主密钥轮换）降级为 None 而不是让整个列表请求失败。
+    let cipher = llm_cipher(&state).await;
     let providers: Vec<ProviderConfig> = records
         .into_iter()
-        .map(|r| ProviderConfig {
-            id: r.id,
-            name: r.name,
-            provider_type: r.provider_type,
-            base_url: r.base_url,
-            api_key: String::new(),
-            extra_config: r.extra_config,
-            anthropic_base_url: r.anthropic_base_url,
-            enabled: r.enabled != 0,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+        .map(|r| {
+            let extra_config = r.extra_config.and_then(|ec| {
+                match decrypt_field(cipher.as_ref(), &ec) {
+                    Ok(pt) => Some(pt),
+                    Err(e) => {
+                        tracing::warn!("failed to decrypt extra_config for provider {}: {}", r.id, e);
+                        None
+                    }
+                }
+            });
+            ProviderConfig {
+                id: r.id,
+                name: r.name,
+                provider_type: r.provider_type,
+                base_url: r.base_url,
+                api_key: String::new(),
+                extra_config,
+                anthropic_base_url: r.anthropic_base_url,
+                enabled: r.enabled != 0,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+            }
         })
         .collect();
 

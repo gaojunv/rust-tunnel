@@ -16,6 +16,44 @@ pub fn map_stop_reason(openai: &str) -> String {
     }
 }
 
+/// 把 OpenAI usage 对象转成 Anthropic usage 对象，保留缓存与输入细分。
+///
+/// 映射规则（与 [`crate::server::llm::usage::extract_usage`] 的解析口径互逆）：
+/// - `prompt_tokens` → `input_tokens`（新增未缓存输入 = prompt - cache_hit）
+/// - `prompt_cache_hit_tokens` → `cache_read_input_tokens`
+/// - `completion_tokens` → `output_tokens`
+///
+/// `input_tokens` 按 Anthropic 口径取「未缓存新增输入」，让 `extract_usage` 能
+/// 用 `input + cache_read + cache_creation` 还原出完整 prompt_tokens，进而
+/// 算出 cache_hit / cache_miss。缺省字段不输出（保持 Anthropic 响应整洁）。
+fn openai_usage_to_anthropic(usage: &Value) -> Value {
+    if !usage.is_object() {
+        return json!({ "input_tokens": 0, "output_tokens": 0 });
+    }
+    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
+    let prompt = get("prompt_tokens").unwrap_or(0);
+    let completion = get("completion_tokens").unwrap_or(0);
+    let cache_hit = get("prompt_cache_hit_tokens")
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_i64)
+        })
+        .unwrap_or(0);
+    // 新增未缓存输入；上游给了 prompt_cache_miss_tokens 时优先用（与计费口径一致）。
+    let input = get("prompt_cache_miss_tokens").unwrap_or(prompt - cache_hit);
+
+    let mut out = json!({
+        "input_tokens": input,
+        "output_tokens": completion,
+    });
+    if cache_hit > 0 {
+        out["cache_read_input_tokens"] = json!(cache_hit);
+    }
+    out
+}
+
 /// 非流式：OpenAI chat.completion 响应 JSON → Anthropic Messages 响应 JSON。
 ///
 /// 除了 `message.content` 转成 `text` 块外，`message.tool_calls` 数组会被展开为
@@ -59,10 +97,7 @@ pub fn openai_response_to_anthropic(openai: &Value) -> Value {
         "model": openai["model"].as_str().unwrap_or(""),
         "stop_reason": map_stop_reason(finish_reason),
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": openai["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-            "output_tokens": openai["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-        },
+        "usage": openai_usage_to_anthropic(&openai["usage"]),
     })
 }
 
@@ -131,7 +166,7 @@ impl AnthropicSseTranslator {
         };
         let payload = payload.trim();
         if payload == "[DONE]" {
-            self.close("end_turn", 0, out);
+            self.close("end_turn", json!({ "output_tokens": 0 }), out);
             return;
         }
         let chunk: Value = match serde_json::from_str(payload) {
@@ -151,10 +186,7 @@ impl AnthropicSseTranslator {
                     "model": chunk["model"].as_str().unwrap_or(""),
                     "stop_reason": null,
                     "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": chunk["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                        "output_tokens": 0,
-                    },
+                    "usage": openai_usage_to_anthropic(&chunk["usage"]),
                 },
             });
             push_event(out, "message_start", &msg);
@@ -233,13 +265,17 @@ impl AnthropicSseTranslator {
 
         // 结束
         if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
-            let output_tokens = chunk["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-            self.close(&map_stop_reason(reason), output_tokens, out);
+            let usage = openai_usage_to_anthropic(&chunk["usage"]);
+            self.close(&map_stop_reason(reason), usage, out);
         }
     }
 
     /// 发送收尾事件（所有已开启 block 的 content_block_stop → message_delta → message_stop）。幂等。
-    fn close(&mut self, stop_reason: &str, output_tokens: u64, out: &mut String) {
+    ///
+    /// `usage` 必须携带完整输入细分（input_tokens / cache_read_input_tokens），
+    /// 而非仅 output_tokens —— 下游 usage 扫描器靠它命中「完整 usage」分支，
+    /// 避免与 message_start 的空 input 合并后丢失 prompt/cache 统计。
+    fn close(&mut self, stop_reason: &str, usage: Value, out: &mut String) {
         if self.closed || !self.started {
             return;
         }
@@ -270,7 +306,7 @@ impl AnthropicSseTranslator {
         let msg_delta = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {"output_tokens": output_tokens},
+            "usage": usage,
         });
         push_event(out, "message_delta", &msg_delta);
 
@@ -470,6 +506,35 @@ mod tests {
         let out = String::from_utf8(t.push(chunk.as_bytes())).unwrap();
         assert!(out.contains("\"input_tokens\":7"));
         assert!(out.contains("\"output_tokens\":3"));
+    }
+
+    #[test]
+    fn stream_opencode_style_usage_preserves_cache_and_input() {
+        // 回归：opencode 流的 usage 只出现在 finish_reason 收尾 chunk，
+        // 且携带 DeepSeek 缓存字段。翻译后的 message_delta 必须带完整 input 细分，
+        // 让下游 UsageSseScanner 命中「完整 usage」分支（prompt_tokens>0），
+        // 否则会与 message_start 的空 input 合并、丢失 prompt/cache 统计。
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}],\"usage\":null}\n\n"));
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":87,\"completion_tokens\":16,\"total_tokens\":103,\"prompt_cache_hit_tokens\":60,\"prompt_cache_miss_tokens\":27}}\n\n"));
+        let text = String::from_utf8(all).unwrap();
+
+        // message_delta 的 usage 含 input/cache 细分
+        let delta_pos = text.find("message_delta").expect("missing message_delta");
+        let tail = &text[delta_pos..];
+        assert!(tail.contains("\"cache_read_input_tokens\":60"), "{tail}");
+        assert!(tail.contains("\"input_tokens\":27"), "{tail}");
+        assert!(tail.contains("\"output_tokens\":16"), "{tail}");
+
+        // 端到端：翻译输出喂回 scanner，必须解析出完整 prompt/cache
+        let mut scanner = crate::server::llm::usage::UsageSseScanner::new();
+        scanner.push(text.as_bytes());
+        let u = scanner.finish();
+        assert_eq!(u.prompt_tokens, 87);
+        assert_eq!(u.cache_hit_tokens, 60);
+        assert_eq!(u.cache_miss_tokens, 27);
+        assert_eq!(u.completion_tokens, 16);
     }
 
     // ── 工具调用：非流式 ──────────────────────────────────────
