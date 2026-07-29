@@ -140,6 +140,19 @@ html:has(body[data-scroll-locked]) {
   overscroll-behavior: contain !important;
 }
 
+/* 中和 react-remove-scroll-bar 注入 body 的滚动条补偿。
+   项目已用 scrollbar-gutter: stable 永久预留槽位，滚动条不会消失，
+   Radix 的 margin/padding 补偿与 position:relative 只会造成：
+   1) 右侧空隙变大 → 页面抖动
+   2) sticky Header 定位上下文被扰乱 → 滚动后下拉时页头消失 */
+body[data-scroll-locked] {
+  position: static !important;
+  margin-right: 0 !important;
+  padding-right: 0 !important;
+  padding-left: 0 !important;
+  padding-top: 0 !important;
+}
+
 @layer utilities {
   /* 玻璃拟态卡片表面（配合 Card 的 border-border 使用，明暗主题均安全） */
   .glass-card {
