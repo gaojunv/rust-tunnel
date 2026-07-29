@@ -168,6 +168,17 @@ pub async fn call_upstream(
         let body_text = resp.text().await.unwrap_or_default();
         // Sanitize: strip potential API key from error message
         let sanitized = sanitize_error_message(&body_text);
+        // 诊断日志：上游 4xx/5xx 时记录转换后的请求体摘要，便于定位字段兼容问题。
+        // 注意脱敏：messages 只记录结构（role/长度/工具字段），不记录正文内容。
+        let req_debug = summarize_request_for_log(&req_body);
+        tracing::warn!(
+            target: "llm_upstream",
+            status = status.as_u16(),
+            url = %url,
+            request = %req_debug,
+            upstream_error = %sanitized,
+            "LLM upstream rejected request"
+        );
         return Err((
             status,
             format!("Upstream error {}: {}", status.as_u16(), sanitized),
@@ -290,6 +301,68 @@ pub async fn call_upstream_raw(
     } else {
         relay_upstream_body(resp).await
     }
+}
+
+/// 生成请求体的结构摘要用于诊断日志：保留字段名和值类型/长度，
+/// 但 messages 的正文、tools 的 description/parameters 不落地（避免泄露对话内容）。
+fn summarize_request_for_log(req_body: &serde_json::Value) -> String {
+    use serde_json::json;
+
+    let mut summary = serde_json::Map::new();
+    for (k, v) in req_body.as_object().into_iter().flatten() {
+        match k.as_str() {
+            "messages" => {
+                let msgs: Vec<serde_json::Value> = v
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|m| {
+                                let role = m
+                                    .get("role")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                let content_len = m
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .map(str::len)
+                                    .unwrap_or(0);
+                                let has_tool_calls = m.get("tool_calls").is_some();
+                                let tool_call_id = m.get("tool_call_id").is_some();
+                                json!({
+                                    "role": role,
+                                    "content_len": content_len,
+                                    "tool_calls": has_tool_calls,
+                                    "tool_call_id": tool_call_id,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                summary.insert(k.clone(), json!(msgs));
+            }
+            "tools" => {
+                // 只记录工具名，不记录 description/parameters
+                let names: Vec<&str> = v
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                t.get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|n| n.as_str())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                summary.insert(k.clone(), json!(names));
+            }
+            _ => {
+                summary.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(summary).to_string()
 }
 
 /// Build an OpenAI-format error response.
