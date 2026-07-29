@@ -568,7 +568,9 @@
       "anthropicBaseUrlPlaceholder": "Leave blank for Anthropic requests to use OpenAI format",
       "apiKey": "API Key",
       "apiKeyPlaceholderNew": "sk-...",
-      "apiKeyPlaceholderEdit": "Leave blank to keep current"
+      "apiKeyPlaceholderEdit": "Leave blank to keep current",
+      "compatToolHistory": "Tool history compatibility mode",
+      "compatToolHistoryHint": "Enable when upstream doesn't support multi-turn tool calling (e.g. opencode); tool history is converted to plain text"
     },
     "apiKeys": {
       "title": "API Keys",

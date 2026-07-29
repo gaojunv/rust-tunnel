@@ -4,6 +4,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useCreateLlmProvider, useUpdateLlmProvider, useLlmProviders } from '@/api/hooks';
 import type { ProviderType } from '@/types';
@@ -17,6 +18,21 @@ const TYPES: { value: ProviderType; label: string; defaultUrl: string }[] = [
   { value: 'mimo', label: 'Mimo', defaultUrl: '' },
 ];
 
+/** 从 extra_config JSON 里读出开关状态；非法/缺省视为关闭。 */
+function parseCompat(extraConfig?: string | null): boolean {
+  if (!extraConfig) return false;
+  try { return (JSON.parse(extraConfig) as { compat_tool_history?: boolean }).compat_tool_history === true; }
+  catch { return false; }
+}
+
+/** 把开关状态合并回 extra_config JSON，保留已有其他键。 */
+function mergeCompat(extraConfig: string | null | undefined, compat: boolean): string | null {
+  let obj: Record<string, unknown> = {};
+  if (extraConfig) { try { obj = JSON.parse(extraConfig) as Record<string, unknown>; } catch { obj = {}; } }
+  if (compat) obj.compat_tool_history = true; else delete obj.compat_tool_history;
+  return Object.keys(obj).length > 0 ? JSON.stringify(obj) : null;
+}
+
 export default function ProviderDialog({ open, onClose, providerId }: Props) {
   const { t } = useTranslation();
   const { data: providers } = useLlmProviders();
@@ -27,13 +43,14 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('');
+  const [compatToolHistory, setCompatToolHistory] = useState(false);
 
   const existing = providerId ? providers?.find((p) => p.id === providerId) : null;
 
   useEffect(() => {
     if (open) {
-      if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); setAnthropicBaseUrl(existing.anthropic_base_url || ''); }
-      else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); setAnthropicBaseUrl(''); }
+      if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); setAnthropicBaseUrl(existing.anthropic_base_url || ''); setCompatToolHistory(parseCompat(existing.extra_config)); }
+      else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); setAnthropicBaseUrl(''); setCompatToolHistory(false); }
     }
   }, [open, existing]);
 
@@ -53,11 +70,18 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
           <div className="space-y-2"><Label>{t('llm.providerDialog.baseUrl')}</Label><Input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} /></div>
           <div className="space-y-2"><Label>{t('llm.providerDialog.anthropicBaseUrl')}</Label><Input value={anthropicBaseUrl} onChange={(e) => setAnthropicBaseUrl(e.target.value)} placeholder={t('llm.providerDialog.anthropicBaseUrlPlaceholder')} /></div>
           <div className="space-y-2"><Label>{t('llm.providerDialog.apiKey')}</Label><Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={existing ? t('llm.providerDialog.apiKeyPlaceholderEdit') : t('llm.providerDialog.apiKeyPlaceholderNew')} /></div>
+          <div className="flex items-center justify-between space-x-2">
+            <Label className="flex flex-col space-y-1">
+              <span>{t('llm.providerDialog.compatToolHistory')}</span>
+              <span className="font-normal text-xs text-muted-foreground">{t('llm.providerDialog.compatToolHistoryHint')}</span>
+            </Label>
+            <Switch checked={compatToolHistory} onCheckedChange={setCompatToolHistory} />
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
           <Button onClick={() => {
-            const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey, anthropic_base_url: anthropicBaseUrl || null };
+            const req = { name, provider_type: providerType, base_url: baseUrl, api_key: apiKey, anthropic_base_url: anthropicBaseUrl || null, extra_config: mergeCompat(existing?.extra_config, compatToolHistory) };
             if (existing) { updateMutation.mutate({ id: existing.id, ...req }, { onSuccess: onClose }); }
             else { createMutation.mutate(req, { onSuccess: onClose }); }
           }} disabled={createMutation.isPending || updateMutation.isPending}>{t('common.save')}</Button>

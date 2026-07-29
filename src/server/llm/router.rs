@@ -56,13 +56,22 @@ pub async fn resolve_model(
     let api_key = super::crypto::decrypt_field(state.cipher.as_ref(), &provider_record.api_key)
         .map_err(|e| ResolveError::Db(format!("failed to decrypt provider api key: {}", e)))?;
 
+    // extra_config 同样加密落库（可能含开关配置），用前解密；历史明文原样透传。
+    let extra_config = match provider_record.extra_config {
+        Some(ec) => Some(
+            super::crypto::decrypt_field(state.cipher.as_ref(), &ec)
+                .map_err(|e| ResolveError::Db(format!("failed to decrypt extra_config: {}", e)))?,
+        ),
+        None => None,
+    };
+
     let provider = ProviderConfig {
         id: provider_record.id,
         name: provider_record.name,
         provider_type: provider_record.provider_type,
         base_url: provider_record.base_url,
         api_key,
-        extra_config: provider_record.extra_config,
+        extra_config,
         anthropic_base_url: provider_record.anthropic_base_url,
         enabled: provider_record.enabled != 0,
         created_at: provider_record.created_at,

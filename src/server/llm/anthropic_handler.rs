@@ -385,6 +385,12 @@ pub async fn handle_messages(
     let mut request = request;
     request.model = actual_model;
 
+    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为纯文本，
+    // 适配不支持多轮 tool calling 的上游（如 opencode）。
+    if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
+        super::compat::rewrite_tool_history(&mut request.messages);
+    }
+
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
             // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。

@@ -568,7 +568,9 @@
       "anthropicBaseUrlPlaceholder": "留空则 Anthropic 请求会转为 OpenAI 格式",
       "apiKey": "API 密钥",
       "apiKeyPlaceholderNew": "sk-...",
-      "apiKeyPlaceholderEdit": "留空则保持当前密钥不变"
+      "apiKeyPlaceholderEdit": "留空则保持当前密钥不变",
+      "compatToolHistory": "工具历史兼容模式",
+      "compatToolHistoryHint": "上游不支持多轮工具调用时开启（如 opencode），工具历史将转为纯文本"
     },
     "apiKeys": {
       "title": "API 密钥",

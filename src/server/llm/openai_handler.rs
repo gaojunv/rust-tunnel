@@ -217,6 +217,12 @@ pub async fn handle_chat_completions(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
+    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为纯文本。
+    let mut request = request;
+    if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
+        super::compat::rewrite_tool_history(&mut request.messages);
+    }
+
     // Call upstream
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,

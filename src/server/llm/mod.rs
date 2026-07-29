@@ -1,5 +1,6 @@
 pub mod anthropic_handler;
 pub mod auth;
+pub mod compat;
 pub mod crypto;
 pub mod format;
 pub mod openai_handler;
