@@ -67,6 +67,10 @@
     overflow-y: scroll;
     scrollbar-width: thin;
     scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
+    /* 预留滚动条槽位：Radix Select/Dropdown 打开时通过 overflow:hidden 锁定
+       <html> 滚动，若无 gutter，滚动条消失会导致页面宽度突变（抖动）。
+       stable 让槽位始终存在，无论 overflow 是 scroll 还是 hidden。 */
+    scrollbar-gutter: stable;
   }
 
   html.dark {
@@ -121,8 +125,10 @@
    body 的 overflow:hidden 锁不住 <html>，导致下拉打开后页面仍可滚动，
    把 sticky Header 顶出视口（"页头消失"）。
 
-   修复：把滚动锁定提升到 <html>，同时保留原有的零 margin/padding 补偿
-   （html 已用 overflow-y: scroll 始终保留滚动条，Radix 的 gap 补偿反而会造成抖动）。
+   修复：把滚动锁定提升到 <html>。
+   同时删除原有的 margin/padding 补偿——因为 <html> 已用
+   scrollbar-gutter: stable 预留了滚动条槽位，Radix 的 gap 计算
+   （基于 body 的 margin-right）在这种情况下反而会造成布局抖动。
 
    注意两点：
    1) 必须放在 @layer 外。Radix 注入的是非 layered 样式，按 CSS 层级规则
@@ -132,11 +138,6 @@
 html:has(body[data-scroll-locked]) {
   overflow: hidden !important;
   overscroll-behavior: contain !important;
-}
-
-html body[data-scroll-locked] {
-  margin-right: 0 !important;
-  padding-right: 0 !important;
 }
 
 @layer utilities {
