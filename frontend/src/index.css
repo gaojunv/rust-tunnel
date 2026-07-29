@@ -60,11 +60,8 @@
 
   html {
     color-scheme: light;
-    /* 始终保留纵向滚动条：页面从短到长（或反之）切换时不水平抖动。
-       比 scrollbar-gutter: stable 更好——gutter 在无滚动条时会留一块空白，
-       而 overflow-y: scroll 始终显示一条细轨道，视觉更连续。
-       配合下方细滚动条样式 + body scroll-lock 覆盖规则使用。 */
-    overflow-y: scroll;
+    /* 细滚动条样式：供 ScrollArea 内部或其他局部滚动容器使用。
+       主滚动已迁移到 AppLayout 的 ScrollArea，html 不再强制 overflow-y: scroll。 */
     scrollbar-width: thin;
     scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent;
   }
