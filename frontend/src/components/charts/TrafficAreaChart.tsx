@@ -1,6 +1,5 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
 import { useStatsQuery } from '@/api/hooks';
@@ -38,9 +37,11 @@ export const TrafficAreaChart = () => {
   }, [snapshots]);
 
   return (
-    <Card>
-      <CardHeader className="flex flex-col gap-3 space-y-0 sm:flex-row sm:items-center sm:justify-between">
-        <CardTitle>{t('dashboard.networkTraffic')}</CardTitle>
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <h2 className="text-lg font-semibold tracking-tight">
+          {t('dashboard.networkTraffic')}
+        </h2>
         <TimeRangeSelector
           preset={preset}
           presets={presets}
@@ -49,19 +50,17 @@ export const TrafficAreaChart = () => {
           onPresetChange={setPreset}
           onCustomChange={setCustomRange}
         />
-      </CardHeader>
-      <CardContent>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          {ENTITY_TYPES.map((type) => (
-            <EntityTypePanel
-              key={type}
-              type={type}
-              titleLabel={t(`dashboard.trafficLabel.${type}`)}
-              snapshots={buckets[type]}
-            />
-          ))}
-        </div>
-      </CardContent>
-    </Card>
+      </div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        {ENTITY_TYPES.map((type) => (
+          <EntityTypePanel
+            key={type}
+            type={type}
+            titleLabel={t(`dashboard.trafficLabel.${type}`)}
+            snapshots={buckets[type]}
+          />
+        ))}
+      </div>
+    </div>
   );
 };
