@@ -109,7 +109,9 @@ pub fn extract_usage_from_body(body: &Value) -> UsageInfo {
 /// 只保留“最后一次见到的、非空的” usage。跨 chunk 边界的行由内部缓冲拼接。
 #[derive(Debug, Default)]
 pub struct UsageSseScanner {
-    line_buf: String,
+    /// 原始字节缓冲：多字节 UTF-8 字符可能跨块，按块 lossy 会物化 U+FFFD
+    /// 导致该行 JSON 解析失败、usage 丢失。按字节缓冲、凑满一行再转换。
+    line_buf: Vec<u8>,
     /// Anthropic 流的 input 部分（来自 message_start）在 output 之前，需要合并。
     anthropic_input: Option<UsageInfo>,
     latest: UsageInfo,
@@ -122,10 +124,11 @@ impl UsageSseScanner {
 
     /// 喂入一段上游字节（透传给客户端的同一份数据）。
     pub fn push(&mut self, bytes: &[u8]) {
-        self.line_buf.push_str(&String::from_utf8_lossy(bytes));
-        while let Some(pos) = self.line_buf.find('\n') {
-            let line = self.line_buf[..pos].trim_end_matches('\r').to_string();
-            self.line_buf.drain(..=pos);
+        self.line_buf.extend_from_slice(bytes);
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            let line_bytes = &line_bytes[..line_bytes.len() - 1];
+            let line = String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
             self.process_line(&line);
         }
     }

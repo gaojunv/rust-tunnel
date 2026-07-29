@@ -111,8 +111,13 @@ pub fn openai_response_to_anthropic(openai: &Value) -> Value {
 /// - 每个 tool_call 按上游 `delta.tool_calls[i].index` 首次出现顺序分配 index 1、2、...；
 /// - 所有已开启的 block 会在 message_stop 前逐个发送 `content_block_stop`。
 pub struct AnthropicSseTranslator {
-    /// 尚未遇到换行符的不完整数据
-    line_buf: String,
+    /// 尚未遇到换行符的不完整数据（原始字节）。
+    ///
+    /// 必须用字节而非 String：上游按 token 吐流，一个 UTF-8 多字节字符
+    /// （中文 3 字节、emoji 4 字节）可能被切到两个网络块。若按块做
+    /// `from_utf8_lossy`，残缺字节会物化成 U+FFFD 替换符、永久污染内容。
+    /// 按字节缓冲、只在凑满一行（`\n` 边界）后才转 UTF-8，可从根源避免。
+    line_buf: Vec<u8>,
     /// message_start 是否已发送
     started: bool,
     /// message_stop 是否已发送
@@ -134,7 +139,7 @@ impl Default for AnthropicSseTranslator {
 impl AnthropicSseTranslator {
     pub fn new() -> Self {
         Self {
-            line_buf: String::new(),
+            line_buf: Vec::new(),
             started: false,
             closed: false,
             text_block_open: false,
@@ -148,14 +153,16 @@ impl AnthropicSseTranslator {
 
     /// 喂入上游字节块，返回可立即发给客户端的 Anthropic SSE 字节。
     pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.line_buf.push_str(&String::from_utf8_lossy(bytes));
+        self.line_buf.extend_from_slice(bytes);
 
         let mut out = String::new();
-        // 逐行处理完整行，残留部分留在 line_buf
-        while let Some(pos) = self.line_buf.find('\n') {
-            let line = self.line_buf[..pos].trim_end_matches('\r').to_string();
-            self.line_buf.drain(..=pos);
-            self.process_line(&line, &mut out);
+        // 逐行处理完整行，残留部分（含未凑齐的 UTF-8 序列）留在 line_buf
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            // 去掉末尾 \n 与可选 \r；此时行内不再含被切断的多字节字符
+            let line_bytes = &line_bytes[..line_bytes.len() - 1];
+            let line_str = String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
+            self.process_line(&line_str, &mut out);
         }
         out.into_bytes()
     }
@@ -451,6 +458,37 @@ mod tests {
         let text = String::from_utf8(combined).unwrap();
         assert!(text.contains("event: message_start"));
         assert!(text.contains("\"text\":\"World\""));
+    }
+
+    #[test]
+    fn stream_multibyte_utf8_split_across_chunks_no_replacement_char() {
+        // 回归：中文（3 字节）/ emoji（4 字节）被从字符中间切到两个网络块时，
+        // 旧实现按块 from_utf8_lossy 会把残缺字节物化成 U+FFFD，客户端看到乱码。
+        let mut t = AnthropicSseTranslator::new();
+        let chunk = openai_chunk("你好👋", None);
+        let bytes = chunk.as_bytes();
+
+        // 找到每个多字节字符的字节边界，逐字节切碎喂入（最严苛的切法）
+        for i in 1..bytes.len() {
+            let mut t2 = AnthropicSseTranslator::new();
+            let out1 = t2.push(&bytes[..i]);
+            let out2 = t2.push(&bytes[i..]);
+            let combined = [out1, out2].concat();
+            let text = String::from_utf8(combined)
+                .unwrap_or_else(|e| panic!("split at byte {i} produced invalid utf8: {e}"));
+            assert!(
+                !text.contains('\u{FFFD}'),
+                "split at byte {i} produced replacement char: {text}"
+            );
+            assert!(
+                text.contains("你好👋"),
+                "split at byte {i} lost content: {text}"
+            );
+        }
+
+        // 整体也验证一次
+        let out = t.push(bytes);
+        assert!(String::from_utf8(out).unwrap().contains("你好👋"));
     }
 
     #[test]
