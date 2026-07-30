@@ -533,6 +533,11 @@ pub async fn handle_udp_associate(
         HashMap::new();
     // Responses from per-target read tasks, drained by the select loop
     let (resp_tx, mut resp_rx) = mpsc::channel::<(UdpPacket, SocketAddr)>(256);
+    // Death notifications from per-target read tasks — when a read task exits
+    // (idle timeout, socket error, send failure), it sends the target address so
+    // the stale entry is removed from the map, allowing the next packet to that
+    // target to spawn a fresh socket and read task.
+    let (dead_tx, mut dead_rx) = mpsc::channel::<SocketAddr>(64);
 
     let mut read_buf: Vec<u8> = initial_payload;
     let mut chunk = [0u8; 65536];
@@ -563,6 +568,7 @@ pub async fn handle_udp_associate(
                                         connection_id,
                                         &mut targets,
                                         &resp_tx,
+                                        &dead_tx,
                                     )
                                     .await;
                                 }
@@ -604,6 +610,13 @@ pub async fn handle_udp_associate(
                     }
                 }
             }
+            dead = dead_rx.recv() => {
+                if let Some(addr) = dead {
+                    if let Some((_, abort)) = targets.remove(&addr) {
+                        abort.abort(); // no-op if task already exited; keeps map consistent
+                    }
+                }
+            }
         }
     }
 
@@ -637,6 +650,7 @@ async fn dispatch_udp_packet(
         (std::sync::Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle),
     >,
     resp_tx: &tokio::sync::mpsc::Sender<(UdpPacket, std::net::SocketAddr)>,
+    dead_tx: &tokio::sync::mpsc::Sender<std::net::SocketAddr>,
 ) {
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -690,6 +704,7 @@ async fn dispatch_udp_packet(
         // Spawn the response read task with idle timeout
         let task_socket = Arc::clone(&socket);
         let task_tx = resp_tx.clone();
+        let task_dead_tx = dead_tx.clone();
         let task_target = target;
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -721,6 +736,9 @@ async fn dispatch_udp_packet(
                     Err(_) => break,      // idle timeout
                 }
             }
+            // Notify the main loop that this read task has exited,
+            // so the stale entry can be removed from the targets map.
+            let _ = task_dead_tx.send(task_target).await;
         });
 
         e.insert((socket, handle.abort_handle()));
@@ -1565,6 +1583,37 @@ mod tests {
                 _ => panic!("roundtrip failed"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_udp_dead_channel_removes_stale_target() {
+        // Simulate the death-notification flow: insert a target entry whose
+        // "read task" immediately sends its address on the dead channel,
+        // then verify the removal arm logic drops the entry.
+        use std::collections::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let mut targets: HashMap<SocketAddr, (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle)> =
+            HashMap::new();
+        let (dead_tx, mut dead_rx) = tokio::sync::mpsc::channel::<SocketAddr>(64);
+
+        let addr: SocketAddr = "127.0.0.1:15353".parse().unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let tx2 = dead_tx.clone();
+        let handle = tokio::spawn(async move {
+            let _ = tx2.send(addr).await; // simulate read-task death
+        });
+        targets.insert(addr, (socket, handle.abort_handle()));
+
+        // Main-loop removal arm
+        if let Some(dead) = dead_rx.recv().await {
+            if let Some((_, abort)) = targets.remove(&dead) {
+                abort.abort();
+            }
+        }
+
+        assert!(targets.is_empty(), "stale target entry should be removed");
     }
 }
 
