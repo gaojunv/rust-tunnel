@@ -310,6 +310,7 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
 ///   1. 先发送剩余文本的 content chunk（如果有）
 ///   2. 再发送 tool_calls chunk
 ///   3. 最后发送 finish chunk（finish_reason="tool_calls"）
+///
 /// 如果没有伪工具调用，原样转发所有 chunk。
 pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
     use futures_util::StreamExt;
@@ -333,6 +334,10 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
     let mut first_chunk: Option<serde_json::Value> = None;
     let mut model = String::new();
     let mut id = String::new();
+    // 上游末尾携带 usage 的 chunk（OpenAI include_usage 时出现在收尾 chunk）。
+    // 重建流时必须保留，否则下游 Anthropic 翻译只能走 [DONE] 分支硬编码
+    // output_tokens=0，导致 usage 统计全 0。
+    let mut usage_chunk: Option<serde_json::Value> = None;
 
     for line in text.lines() {
         if line.starts_with("data:") {
@@ -345,6 +350,15 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                     first_chunk = Some(chunk.clone());
                     model = chunk["model"].as_str().unwrap_or("").to_string();
                     id = chunk["id"].as_str().unwrap_or("").to_string();
+                }
+                // 记录最后一个携带非空 usage 对象的 chunk（保留其 choices/finish_reason，
+                // 重建时原样转发，仅依赖它把 usage 带给下游）。
+                if chunk
+                    .get("usage")
+                    .map(|u| u.is_object())
+                    .unwrap_or(false)
+                {
+                    usage_chunk = Some(chunk);
                 }
                 parser.push_chunk(line);
             }
@@ -399,7 +413,13 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
         output.push_str(&format!("data: {}\n\n", chunk));
     }
 
-    // 3. 发送 [DONE]
+    // 3. 保留上游 usage chunk（若有）：下游 Anthropic 翻译靠它发出带完整
+    //    input/output 细分的 message_delta，usage 统计才不会全 0。
+    if let Some(usage) = usage_chunk {
+        output.push_str(&format!("data: {}\n\n", usage));
+    }
+
+    // 4. 发送 [DONE]
     output.push_str("data: [DONE]\n\n");
 
     Response::from_parts(parts, Body::from(output.into_bytes()))
@@ -879,5 +899,59 @@ mod tests {
         // 应包含剩余文本和 tool_calls
         assert!(text.contains("我来执行"), "应包含剩余文本: {text}");
         assert!(text.contains("tool_calls"), "应包含 tool_calls: {text}");
+    }
+
+    /// 回归：compat 流式重写命中伪工具调用时，必须保留上游末尾的 usage chunk，
+    /// 否则下游 AnthropicSseTranslator 只能走 `[DONE]` 分支硬编码 output_tokens=0，
+    /// 导致 UsageSseScanner 统计的 tokens 全 0。
+    #[tokio::test]
+    async fn test_stream_rewrite_preserves_usage_chunk() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[调用工具 Bash] {\\\"command\\\":\\\"ls\\\"}\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":87,\"completion_tokens\":16,\"total_tokens\":103,\"prompt_cache_hit_tokens\":60,\"prompt_cache_miss_tokens\":27}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(sse_data))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 伪工具调用重写仍然生效
+        assert!(text.contains("tool_calls"), "应包含 tool_calls: {text}");
+        // 上游 usage 必须保留在重写后的流里
+        assert!(
+            text.contains("\"prompt_tokens\":87"),
+            "重写后丢失上游 prompt_tokens: {text}"
+        );
+        assert!(
+            text.contains("\"completion_tokens\":16"),
+            "重写后丢失上游 completion_tokens: {text}"
+        );
+
+        // 端到端：重写输出经 Anthropic 翻译 + usage 扫描，必须解析出非零 tokens。
+        let anthropic_resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(text.clone()))
+            .unwrap();
+        let anthropic_stream =
+            crate::server::llm::anthropic_handler::convert_openai_stream_to_anthropic_for_test(
+                anthropic_resp,
+            );
+        let anthropic_bytes = axum::body::to_bytes(anthropic_stream.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let mut scanner = crate::server::llm::usage::UsageSseScanner::new();
+        scanner.push(&anthropic_bytes);
+        let u = scanner.finish();
+        assert_eq!(u.prompt_tokens, 87, "端到端 prompt_tokens 不应为 0");
+        assert_eq!(u.completion_tokens, 16, "端到端 completion_tokens 不应为 0");
     }
 }

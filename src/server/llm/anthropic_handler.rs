@@ -459,9 +459,14 @@ fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
         .unwrap()
 }
 
+/// 测试专用：暴露流式 OpenAI→Anthropic 转换，供跨模块端到端测试使用。
+#[cfg(test)]
+pub(crate) fn convert_openai_stream_to_anthropic_for_test(openai_resp: Response) -> Response {
+    convert_openai_stream_to_anthropic(openai_resp)
+}
+
 /// Convert OpenAI chat completion response to Anthropic Messages format.
-async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
-    let status = openai_resp.status();
+async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {    let status = openai_resp.status();
     let body_bytes = axum::body::to_bytes(openai_resp.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();

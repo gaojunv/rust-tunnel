@@ -128,6 +128,11 @@ pub struct AnthropicSseTranslator {
     tool_blocks: std::collections::HashMap<u64, u32>,
     /// 下一个可分配的 anthropic block index（text 用 0；tool 从 1 起，除非无 text）
     next_block_index: u32,
+    /// close() 时使用的 stop_reason；部分上游（compat 伪工具重写）会在 finish 之后
+    /// 才补发携带 usage 的 chunk，需要用同一 stop_reason 补发一条 message_delta。
+    close_stop_reason: Option<String>,
+    /// close() 之后是否已补发过 usage message_delta（幂等，避免重复）。
+    late_usage_emitted: bool,
 }
 
 impl Default for AnthropicSseTranslator {
@@ -148,6 +153,8 @@ impl AnthropicSseTranslator {
             // Anthropic 允许 tool_use block 从任何 index 开始，因此从 0 起也可以。
             // 这里选择：text 出现即占 0，tool 从 next_block_index 起（初始 1）。
             next_block_index: 1,
+            close_stop_reason: None,
+            late_usage_emitted: false,
         }
     }
 
@@ -180,6 +187,31 @@ impl AnthropicSseTranslator {
             Ok(v) => v,
             Err(_) => return, // 无法解析的行直接跳过
         };
+
+        // 已关闭后又收到携带 usage 的 chunk（compat 伪工具重写把 usage 放在 finish
+        // 之后）：补发一条带完整 input/output 细分的 message_delta，否则下游
+        // UsageSseScanner 只能拿到 close() 时的空 usage，tokens 统计为 0。
+        if self.closed && !self.late_usage_emitted {
+            if chunk
+                .get("usage")
+                .map(|u| u.is_object())
+                .unwrap_or(false)
+            {
+                self.late_usage_emitted = true;
+                let usage = openai_usage_to_anthropic(&chunk["usage"]);
+                let stop_reason = self
+                    .close_stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "end_turn".to_string());
+                let msg_delta = json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                    "usage": usage,
+                });
+                push_event(out, "message_delta", &msg_delta);
+            }
+            return;
+        }
 
         if !self.started {
             self.started = true;
@@ -287,6 +319,7 @@ impl AnthropicSseTranslator {
             return;
         }
         self.closed = true;
+        self.close_stop_reason = Some(stop_reason.to_string());
 
         // 关闭 text block（若开启过）
         if self.text_block_open {
