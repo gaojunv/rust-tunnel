@@ -487,6 +487,254 @@ pub fn validate_trojan_domain(domain: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum bytes buffered while waiting for a complete UDP packet.
+/// ~2x max packet size (65535 payload + header); exceeding this means a misbehaving peer.
+const UDP_READ_BUF_LIMIT: usize = 128 * 1024;
+
+/// Idle timeout for per-target UDP sockets.
+const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Handle a Trojan UDP ASSOCIATE session.
+///
+/// The TLS stream carries UDP packets (ATYP+ADDR+PORT+LEN+CRLF+payload) in both
+/// directions. Per target address we maintain one outbound UdpSocket; responses
+/// from all targets are multiplexed back onto the TLS stream through a single
+/// writer task via an mpsc channel.
+#[allow(dead_code)] // wired up in Task 5
+pub async fn handle_udp_associate(
+    connection_id: u64,
+    trojan_port: u16,
+    mut tls_stream: TlsStream<TcpStream>,
+    initial_payload: Vec<u8>,
+    state: ServerState,
+) {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
+
+    debug!(
+        "Starting Trojan UDP ASSOCIATE for connection {}",
+        connection_id
+    );
+
+    state.increment_trojan_connections(trojan_port).await;
+    let entity_id = format!("trojan:{}", trojan_port);
+    state
+        .stats_collector
+        .incr_conns(EntityType::Trojan, &entity_id);
+
+    let mut bytes_in: u64 = 0;
+    let mut bytes_out: u64 = 0;
+
+    // target addr -> (socket, abort handle for its read task)
+    let mut targets: HashMap<SocketAddr, (Arc<UdpSocket>, tokio::task::AbortHandle)> =
+        HashMap::new();
+    // Responses from per-target read tasks, drained by the select loop
+    let (resp_tx, mut resp_rx) = mpsc::channel::<(UdpPacket, SocketAddr)>(256);
+
+    let mut read_buf: Vec<u8> = initial_payload;
+    let mut chunk = [0u8; 65536];
+
+    loop {
+        tokio::select! {
+            read = tls_stream.read(&mut chunk) => {
+                match read {
+                    Ok(0) => break, // client closed
+                    Ok(n) => {
+                        read_buf.extend_from_slice(&chunk[..n]);
+                        if read_buf.len() > UDP_READ_BUF_LIMIT {
+                            warn!(
+                                "Trojan UDP connection {} read buffer over limit, closing",
+                                connection_id
+                            );
+                            break;
+                        }
+                        // Drain all complete packets from the buffer
+                        let mut offset = 0;
+                        loop {
+                            match parse_udp_packet(&read_buf[offset..]) {
+                                PacketParseResult::Complete(pkt, consumed) => {
+                                    offset += consumed;
+                                    bytes_in += pkt.payload.len() as u64;
+                                    dispatch_udp_packet(
+                                        pkt,
+                                        connection_id,
+                                        &mut targets,
+                                        &resp_tx,
+                                    )
+                                    .await;
+                                }
+                                PacketParseResult::Incomplete => break,
+                                PacketParseResult::Invalid(reason) => {
+                                    warn!(
+                                        "Invalid UDP packet on connection {}: {}",
+                                        connection_id, reason
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        read_buf.drain(..offset);
+                    }
+                    Err(e) => {
+                        debug!("Trojan UDP connection {} read error: {}", connection_id, e);
+                        break;
+                    }
+                }
+            }
+            resp = resp_rx.recv() => {
+                match resp {
+                    Some((pkt, _from)) => {
+                        bytes_out += pkt.payload.len() as u64;
+                        if let Err(e) = tls_stream.write_all(&pkt.encode()).await {
+                            debug!(
+                                "Trojan UDP connection {} write error: {}",
+                                connection_id, e
+                            );
+                            break;
+                        }
+                    }
+                    None => {
+                        // All senders dropped (no targets left) — wait for client data only.
+                        // Yield to avoid busy-loop: recv() on empty-but-open channel pends,
+                        // so None only happens after targets cleared AND channel closed,
+                        // which cannot occur while resp_tx is alive. Unreachable in practice.
+                    }
+                }
+            }
+        }
+    }
+
+    // Cleanup: abort all read tasks (drops sockets)
+    for (_, (_, abort)) in targets.drain() {
+        abort.abort();
+    }
+
+    state.decrement_trojan_connections(trojan_port).await;
+    state
+        .stats_collector
+        .decr_conns(EntityType::Trojan, &entity_id);
+    state
+        .stats_collector
+        .record_bytes(EntityType::Trojan, &entity_id, bytes_in, bytes_out);
+
+    debug!(
+        "Trojan UDP connection {} closed: sent {} bytes, received {} bytes",
+        connection_id, bytes_in, bytes_out
+    );
+}
+
+/// Resolve the packet target, get-or-create its outbound socket (spawning a
+/// response read task on first use), and send the payload. Failures drop the
+/// packet without affecting other targets.
+async fn dispatch_udp_packet(
+    pkt: UdpPacket,
+    connection_id: u64,
+    targets: &mut std::collections::HashMap<
+        std::net::SocketAddr,
+        (std::sync::Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle),
+    >,
+    resp_tx: &tokio::sync::mpsc::Sender<(UdpPacket, std::net::SocketAddr)>,
+) {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    // Resolve target address
+    let target: SocketAddr = match &pkt.address {
+        TrojanAddress::IPv4(ip) => SocketAddr::new((*ip).into(), pkt.port),
+        TrojanAddress::IPv6(ip) => SocketAddr::new((*ip).into(), pkt.port),
+        TrojanAddress::Domain(domain) => {
+            match tokio::net::lookup_host((domain.as_str(), pkt.port)).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(a) => a,
+                    None => {
+                        debug!(
+                            "UDP connection {}: no addresses for {}",
+                            connection_id, domain
+                        );
+                        return;
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        "UDP connection {}: DNS lookup failed for {}: {}",
+                        connection_id, domain, e
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    // Get or create the per-target socket
+    if let std::collections::hash_map::Entry::Vacant(e) = targets.entry(target) {
+        let bind_addr: SocketAddr = if target.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        let socket = match UdpSocket::bind(bind_addr).await {
+            Ok(s) => Arc::new(s),
+            Err(e_bind) => {
+                warn!(
+                    "UDP connection {}: failed to bind socket for {}: {}",
+                    connection_id, target, e_bind
+                );
+                return;
+            }
+        };
+
+        // Spawn the response read task with idle timeout
+        let task_socket = Arc::clone(&socket);
+        let task_tx = resp_tx.clone();
+        let task_target = target;
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let recv = tokio::time::timeout(
+                    UDP_SOCKET_IDLE_TIMEOUT,
+                    task_socket.recv_from(&mut buf),
+                )
+                .await;
+                match recv {
+                    Ok(Ok((n, from))) => {
+                        if from != task_target {
+                            continue; // only accept packets from the expected peer
+                        }
+                        let address = match from {
+                            SocketAddr::V4(a) => TrojanAddress::IPv4(*a.ip()),
+                            SocketAddr::V6(a) => TrojanAddress::IPv6(*a.ip()),
+                        };
+                        let pkt = UdpPacket {
+                            address,
+                            port: from.port(),
+                            payload: buf[..n].to_vec(),
+                        };
+                        if task_tx.send((pkt, from)).await.is_err() {
+                            break; // session closed
+                        }
+                    }
+                    Ok(Err(_)) => break,  // socket error
+                    Err(_) => break,      // idle timeout
+                }
+            }
+        });
+
+        e.insert((socket, handle.abort_handle()));
+    }
+
+    let (socket, _) = &targets[&target];
+    if let Err(e) = socket.send_to(&pkt.payload, target).await {
+        debug!(
+            "UDP connection {}: send_to {} failed: {}",
+            connection_id, target, e
+        );
+    }
+}
+
 /// Proxy a Trojan connection to target.
 /// Trojan data is already decrypted by TLS, so we just do raw TCP bidirectional copy.
 pub async fn proxy_trojan_connection(
