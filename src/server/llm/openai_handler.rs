@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -224,8 +225,22 @@ pub async fn handle_chat_completions(
     }
 
     // Call upstream
+    let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
-        Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
+        Ok(resp) => {
+            let resp = if compat_enabled {
+                if request.stream {
+                    // 流式 + compat 模式：缓冲所有 content，流结束时解析伪工具调用
+                    rewrite_pseudo_tool_calls_in_stream(resp).await
+                } else {
+                    // 非流式 + compat 模式：解析伪工具调用，还原为结构化 tool_calls
+                    rewrite_pseudo_tool_calls_in_response(resp).await
+                }
+            } else {
+                resp
+            };
+            super::usage::wrap_and_record(resp, ctx, db, started).await
+        }
         Err((status, msg)) => {
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {
@@ -234,6 +249,160 @@ pub async fn handle_chat_completions(
             state.error_for_protocol(status, msg, "upstream_error")
         }
     }
+}
+
+/// 非流式响应：从 OpenAI chat.completion body 中解析伪工具调用文本，
+/// 还原为结构化 `tool_calls`，让客户端能正常执行工具。
+///
+/// 只在 compat 模式（`compat_tool_history`）开启时调用。
+/// 如果响应中没有伪工具调用格式，原样返回。
+pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return Response::from_parts(parts, Body::from("failed to read response")),
+    };
+
+    let mut json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+    };
+
+    // 只处理 OpenAI chat.completion 格式
+    let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+
+    for choice in choices.iter_mut() {
+        let Some(message) = choice.get_mut("message") else {
+            continue;
+        };
+        let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+
+        let (remaining, tool_calls) = super::compat::parse_pseudo_tool_calls(content);
+        if let Some(calls) = tool_calls {
+            // 有伪工具调用：更新 content（去除工具调用部分），注入结构化 tool_calls
+            if remaining.is_empty() {
+                message["content"] = serde_json::Value::Null;
+            } else {
+                message["content"] = serde_json::Value::String(remaining);
+            }
+            message["tool_calls"] = serde_json::Value::Array(calls);
+            // 修改 finish_reason 为 tool_calls（OpenAI 惯例）
+            choice["finish_reason"] = serde_json::Value::String("tool_calls".into());
+        }
+    }
+
+    let new_bytes = serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec());
+    Response::from_parts(parts, Body::from(new_bytes))
+}
+
+/// 流式响应：缓冲整个 SSE 流，解析伪工具调用，重新构建 SSE 流。
+///
+/// 只在 compat 模式（`compat_tool_history`）开启时调用。
+/// 如果流中没有伪工具调用格式，原样返回。
+///
+/// 实现策略：读取整个 SSE 流到内存（LLM 流通常 < 几 MB），解析所有
+/// chunk 的 `delta.content`，流结束时用 `parse_pseudo_tool_calls` 检测
+/// 伪工具调用。如果有，重新构建 SSE 流：
+///   1. 先发送剩余文本的 content chunk（如果有）
+///   2. 再发送 tool_calls chunk
+///   3. 最后发送 finish chunk（finish_reason="tool_calls"）
+/// 如果没有伪工具调用，原样转发所有 chunk。
+pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
+    use futures_util::StreamExt;
+
+    let (parts, body) = resp.into_parts();
+
+    // 读取整个流到内存
+    let mut all_bytes = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => all_bytes.extend_from_slice(&bytes),
+            Err(_) => break,
+        }
+    }
+
+    let text = String::from_utf8_lossy(&all_bytes);
+
+    // 解析所有 SSE 行，提取 content 和元数据
+    let mut parser = super::compat::StreamPseudoToolCallParser::new();
+    let mut first_chunk: Option<serde_json::Value> = None;
+    let mut model = String::new();
+    let mut id = String::new();
+
+    for line in text.lines() {
+        if line.starts_with("data:") {
+            let payload = line.strip_prefix("data:").unwrap().trim();
+            if payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) {
+                if first_chunk.is_none() {
+                    first_chunk = Some(chunk.clone());
+                    model = chunk["model"].as_str().unwrap_or("").to_string();
+                    id = chunk["id"].as_str().unwrap_or("").to_string();
+                }
+                parser.push_chunk(line);
+            }
+        }
+    }
+
+    let result = parser.finish();
+
+    if !result.has_tool_calls {
+        // 没有伪工具调用，原样返回
+        return Response::from_parts(parts, Body::from(all_bytes));
+    }
+
+    // 有伪工具调用：重新构建 SSE 流
+    let mut output = String::new();
+    let tool_calls = result.tool_calls.unwrap();
+
+    // 1. 如果有剩余文本，先发送 content chunk
+    if !result.remaining_text.is_empty() {
+        let chunk = serde_json::json!({
+            "id": id,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": result.remaining_text},
+                "finish_reason": null
+            }]
+        });
+        output.push_str(&format!("data: {}\n\n", chunk));
+    }
+
+    // 2. 发送 tool_calls chunk（每个 tool_call 一个 chunk）
+    for (i, call) in tool_calls.iter().enumerate() {
+        let is_last = i == tool_calls.len() - 1;
+        let finish = if is_last { "tool_calls" } else { "" };
+        let chunk = serde_json::json!({
+            "id": id,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": i,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": call["function"],
+                    }]
+                },
+                "finish_reason": if is_last { serde_json::Value::String(finish.into()) } else { serde_json::Value::Null }
+            }]
+        });
+        output.push_str(&format!("data: {}\n\n", chunk));
+    }
+
+    // 3. 发送 [DONE]
+    output.push_str("data: [DONE]\n\n");
+
+    Response::from_parts(parts, Body::from(output.into_bytes()))
 }
 
 #[cfg(test)]
@@ -488,5 +657,227 @@ mod tests {
         // 路由成功的记录应包含 provider/model 标识
         assert_eq!(logs[0].provider_name, "DS");
         assert_eq!(logs[0].model_name, "deepseek-chat");
+    }
+
+    // ── 伪工具调用解析集成测试 ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rewrite_pseudo_tool_calls_in_response() {
+        // 模拟上游返回的 OpenAI chat.completion 响应，content 中包含伪工具调用
+        let upstream_body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "[调用工具 Bash] {\"command\":\"ls\"}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // content 应为 null（只有工具调用，无文本）
+        assert!(v["choices"][0]["message"]["content"].is_null());
+        // 应有结构化 tool_calls
+        let calls = v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("应有 tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        let args: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["command"], "ls");
+        // finish_reason 应为 tool_calls
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_preserves_text_and_tool_calls() {
+        let upstream_body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "我来执行命令\n[调用工具 Bash] {\"command\":\"ls\"}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // 文本部分保留
+        assert_eq!(
+            v["choices"][0]["message"]["content"].as_str().unwrap(),
+            "我来执行命令"
+        );
+        // 同时有 tool_calls
+        assert!(v["choices"][0]["message"]["tool_calls"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_no_pseudo_tool_calls_passthrough() {
+        // 没有伪工具调用时，响应应原样通过
+        let upstream_body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "普通回复"},
+                "finish_reason": "stop"
+            }]
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            v["choices"][0]["message"]["content"].as_str().unwrap(),
+            "普通回复"
+        );
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_multiple_tool_calls() {
+        let upstream_body = serde_json::json!({
+            "id": "chatcmpl-1",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "[调用工具 Bash] {\"command\":\"ls\"}\n[调用工具 Read] {\"path\":\"/tmp\"}"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let calls = v["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("应有 tool_calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        assert_eq!(calls[1]["function"]["name"], "Read");
+    }
+
+    // ── 流式伪工具调用解析集成测试 ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_stream_rewrite_with_tool_calls() {
+        // 模拟上游 SSE 流，content 中包含伪工具调用
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"[调用工具 Bash] {\\\"command\\\":\\\"ls\\\"}\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(sse_data))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 应包含 tool_calls chunk
+        assert!(text.contains("tool_calls"), "应包含 tool_calls: {text}");
+        assert!(text.contains("Bash"), "应包含工具名: {text}");
+        assert!(text.contains("call_1"), "应包含 call id: {text}");
+        // finish_reason 应为 tool_calls
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "finish_reason 应为 tool_calls: {text}");
+        // 不应包含原始伪工具调用文本
+        assert!(!text.contains("[调用工具"), "不应包含伪工具调用文本: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_stream_rewrite_no_tool_calls_passthrough() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"普通文本\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(sse_data))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 应原样透传
+        assert!(text.contains("普通文本"), "应包含原始文本: {text}");
+        assert!(text.contains("[DONE]"), "应包含 [DONE]: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_stream_rewrite_mixed_content() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"我来执行\\n[调用工具 Bash] {\\\"command\\\":\\\"ls\\\"}\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(sse_data))
+            .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 应包含剩余文本和 tool_calls
+        assert!(text.contains("我来执行"), "应包含剩余文本: {text}");
+        assert!(text.contains("tool_calls"), "应包含 tool_calls: {text}");
     }
 }

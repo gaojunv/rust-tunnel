@@ -385,9 +385,8 @@ pub async fn handle_messages(
     let mut request = request;
     request.model = actual_model;
 
-    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为纯文本，
-    // 适配不支持多轮 tool calling 的上游（如 opencode）。
-    if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
+    let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
+    if compat_enabled {
         super::compat::rewrite_tool_history(&mut request.messages);
     }
 
@@ -396,9 +395,23 @@ pub async fn handle_messages(
             // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
             // 非流式整体转换会消费 body，因此这里在转换后再包一层。
             if !request.stream {
+                // compat 模式：先解析伪工具调用还原为结构化 tool_calls，
+                // 再转成 Anthropic 格式（Anthropic 的 tool_use 块）。
+                let resp = if compat_enabled {
+                    super::openai_handler::rewrite_pseudo_tool_calls_in_response(resp).await
+                } else {
+                    resp
+                };
                 let converted = convert_openai_to_anthropic_response(resp).await;
                 super::usage::wrap_and_record(converted, ctx, db, started).await
             } else {
+                // compat 模式：流式路径同样先解析伪工具调用，
+                // 再转成 Anthropic SSE 事件流。
+                let resp = if compat_enabled {
+                    super::openai_handler::rewrite_pseudo_tool_calls_in_stream(resp).await
+                } else {
+                    resp
+                };
                 let converted = convert_openai_stream_to_anthropic(resp);
                 super::usage::wrap_and_record(converted, ctx, db, started).await
             }
