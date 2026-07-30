@@ -270,6 +270,21 @@ pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
                 Some(&b) if !matches!(b, 0x01 | 0x03 | 0x04) => {
                     PacketParseResult::Invalid(format!("Invalid ATYP in UDP packet: 0x{b:02x}"))
                 }
+                Some(0x03) if buf.len() >= 2 => {
+                    let domain_len = buf[1] as usize;
+                    if domain_len == 0 || domain_len > 253 {
+                        PacketParseResult::Invalid(format!(
+                            "Invalid domain length in UDP packet: {domain_len}"
+                        ))
+                    } else if buf.len() >= 2 + domain_len {
+                        // Full domain present but parse still failed => invalid characters
+                        PacketParseResult::Invalid(
+                            "Invalid domain characters in UDP packet".to_string(),
+                        )
+                    } else {
+                        PacketParseResult::Incomplete
+                    }
+                }
                 _ => PacketParseResult::Incomplete,
             };
         }
@@ -1209,6 +1224,38 @@ mod tests {
         match parse_udp_packet(&buf) {
             PacketParseResult::Complete(pkt, _) => assert!(pkt.payload.is_empty()),
             _ => panic!("Expected Complete for empty payload"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_invalid_zero_length_domain() {
+        // 0x03 + len 0 — enough bytes to know it's invalid, must not be Incomplete
+        let buf = [0x03, 0x00];
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Invalid(_) => {}
+            _ => panic!("Expected Invalid for zero-length domain"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_invalid_domain_chars_full_data() {
+        // Full domain bytes present but containing invalid char '@'
+        let mut buf = vec![0x03, 4];
+        buf.extend_from_slice(b"ex@m");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Invalid(_) => {}
+            _ => panic!("Expected Invalid for domain with invalid chars"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_incomplete_domain_short_buffer() {
+        // Domain length says 10 but only 4 bytes present — genuinely Incomplete
+        let mut buf = vec![0x03, 10];
+        buf.extend_from_slice(b"exam");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Incomplete => {}
+            _ => panic!("Expected Incomplete for short domain buffer"),
         }
     }
 }
