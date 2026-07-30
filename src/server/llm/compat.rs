@@ -268,6 +268,12 @@ pub struct StreamParseResult {
     pub remaining_text: String,
 }
 
+impl Default for StreamPseudoToolCallParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamPseudoToolCallParser {
     pub fn new() -> Self {
         Self {
