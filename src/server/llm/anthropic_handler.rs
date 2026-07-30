@@ -388,6 +388,7 @@ pub async fn handle_messages(
     let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     if compat_enabled {
         super::compat::rewrite_tool_history(&mut request.messages);
+        super::compat::inject_tool_call_guidance(&mut request.messages);
     }
 
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
@@ -1008,5 +1009,111 @@ mod tests {
         assert_eq!(logs[0].status_code, 502);
         assert_eq!(logs[0].error_type.as_deref(), Some("upstream_error"));
         assert_eq!(logs[0].protocol, "anthropic");
+    }
+
+    /// v2 端到端：Anthropic 请求 → compat 改写 → 上游（mock）→
+    /// 增量解析 → Anthropic SSE。验证：
+    /// 1. 发往上游的 messages 末尾有 system 引导；
+    /// 2. 上游返回 <tool_call> 文本时被还原为 Anthropic tool_use 事件；
+    /// 3. 坏标签不泄漏。
+    #[tokio::test]
+    async fn test_anthropic_compat_end_to_end_with_mock_upstream() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // mock 上游：记录请求体，返回含 <tool_call> 的 OpenAI SSE
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured2.clone();
+                async move {
+                    *captured.lock().await = body;
+                    let sse = concat!(
+                        "data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"我来读取\\n<tool_call>\\n{\\\"name\\\":\\\"Read\\\",\\\"arguments\\\":{\\\"path\\\":\\\"/a.txt\\\"}}\\n</tool_call>\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"c1\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":10,\"total_tokens\":60}}\n\n",
+                        "data: [DONE]\n\n",
+                    );
+                    axum::response::Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // state：provider base_url 指向 mock，开启 compat
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        let providers = db.llm_list_providers().await.unwrap();
+        db.llm_save_provider(
+            &providers[0].id,
+            "DS",
+            "deepseek",
+            &format!("http://{addr}"),
+            "sk-upstream",
+            Some(r#"{"compat_tool_history": true}"#),
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "读文件"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/old"}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "old content"}
+                    ]}
+                ],
+                "max_tokens": 100,
+                "stream": true
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 1. 上游收到的请求：历史是标签文本 + 末尾引导 + 无 tool 结构
+        let body = captured.lock().await.clone();
+        let msgs = body["messages"].as_array().unwrap();
+        let s = serde_json::to_string(&msgs).unwrap();
+        assert!(!s.contains("tool_call_id"), "上游不得收到 tool 结构: {s}");
+        assert!(s.contains("<tool_call>"), "历史应为标签格式: {s}");
+        let tool_result_msg = msgs.iter().find(|m| {
+            m["content"].as_str().map_or(false, |c| c.contains("<tool_result"))
+        }).unwrap();
+        assert!(tool_result_msg["content"].as_str().unwrap().contains(r#"<tool_result name="Read">"#),
+            "tool_result 应有 name 属性: {tool_result_msg}");
+        let last = msgs.last().unwrap();
+        assert_eq!(last["role"], "system");
+        assert!(last["content"].as_str().unwrap().contains("<tool_call>"),
+            "末尾应有引导: {last}");
+
+        // 2. 客户端收到 Anthropic SSE：text + tool_use，标签不泄漏
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("我来读取"), "{text}");
+        assert!(text.contains("\"type\":\"tool_use\""), "{text}");
+        assert!(text.contains("\"name\":\"Read\""), "{text}");
+        assert!(!text.contains("tool_call>"), "标签不得泄漏: {text}");
+        assert!(text.contains("event: message_stop"), "{text}");
     }
 }
