@@ -238,6 +238,69 @@ pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
     ParseResult::Complete(request)
 }
 
+// ---------------------------------------------------------------------------
+// UDP packet parser (Task 2)
+// ---------------------------------------------------------------------------
+
+/// A parsed Trojan UDP packet
+#[derive(Debug, Clone)]
+pub struct UdpPacket {
+    pub address: TrojanAddress,
+    pub port: u16,
+    pub payload: Vec<u8>,
+}
+
+/// Result of incremental UDP packet parsing
+pub enum PacketParseResult {
+    /// Parsed packet + total bytes consumed (including header and CRLF)
+    Complete(UdpPacket, usize),
+    Incomplete,
+    Invalid(String),
+}
+
+/// Parse one Trojan UDP packet from the front of `buf`.
+/// Wire format: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
+pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
+    // Address (includes ATYP byte)
+    let (address, addr_len) = match TrojanAddress::parse(buf, 0) {
+        Some(r) => r,
+        // First byte unknown ATYP is unrecoverable protocol error; otherwise insufficient data
+        None => {
+            return match buf.first() {
+                Some(&b) if !matches!(b, 0x01 | 0x03 | 0x04) => {
+                    PacketParseResult::Invalid(format!("Invalid ATYP in UDP packet: 0x{b:02x}"))
+                }
+                _ => PacketParseResult::Incomplete,
+            };
+        }
+    };
+
+    let port_offset = addr_len;
+    // PORT(2) + LENGTH(2) + CRLF(2)
+    if port_offset + 6 > buf.len() {
+        return PacketParseResult::Incomplete;
+    }
+    let port = u16::from_be_bytes([buf[port_offset], buf[port_offset + 1]]);
+    let length = u16::from_be_bytes([buf[port_offset + 2], buf[port_offset + 3]]) as usize;
+
+    let crlf_offset = port_offset + 4;
+    if buf[crlf_offset] != b'\r' || buf[crlf_offset + 1] != b'\n' {
+        return PacketParseResult::Invalid("Missing CRLF in UDP packet header".to_string());
+    }
+
+    let payload_offset = crlf_offset + 2;
+    if payload_offset + length > buf.len() {
+        return PacketParseResult::Incomplete;
+    }
+
+    let packet = UdpPacket {
+        address,
+        port,
+        payload: buf[payload_offset..payload_offset + length].to_vec(),
+    };
+    PacketParseResult::Complete(packet, payload_offset + length)
+}
+
 /// Handle Trojan handshake over TLS stream
 /// Returns (TrojanConnectionContext, remaining payload bytes) on success
 pub async fn handle_trojan_handshake(
@@ -1012,6 +1075,140 @@ mod tests {
             let (parsed, consumed) = TrojanAddress::parse(&buf, 0).expect("parse failed");
             assert_eq!(parsed, addr);
             assert_eq!(consumed, buf.len());
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // UDP packet parser tests (Task 2)
+    // ---------------------------------------------------------------------------
+
+    fn build_udp_packet(atyp_addr: &[u8], port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(atyp_addr);
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn test_udp_packet_parse_ipv4() {
+        let atyp_addr = [0x01, 8, 8, 8, 8];
+        let buf = build_udp_packet(&atyp_addr, 53, b"dns-query");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Complete(pkt, consumed) => {
+                assert_eq!(pkt.address, TrojanAddress::IPv4(Ipv4Addr::new(8, 8, 8, 8)));
+                assert_eq!(pkt.port, 53);
+                assert_eq!(pkt.payload, b"dns-query");
+                assert_eq!(consumed, buf.len());
+            }
+            _ => panic!("Expected Complete"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_parse_domain() {
+        let mut atyp_addr = vec![0x03, b"dns.google".len() as u8];
+        atyp_addr.extend_from_slice(b"dns.google");
+        let buf = build_udp_packet(&atyp_addr, 53, b"q");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Complete(pkt, consumed) => {
+                assert_eq!(pkt.address, TrojanAddress::Domain("dns.google".to_string()));
+                assert_eq!(pkt.port, 53);
+                assert_eq!(consumed, buf.len());
+            }
+            _ => panic!("Expected Complete"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_parse_ipv6() {
+        let mut atyp_addr = vec![0x04];
+        atyp_addr.extend_from_slice(&[0u8; 15]);
+        atyp_addr.push(1);
+        let buf = build_udp_packet(&atyp_addr, 123, b"ntp");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Complete(pkt, _) => {
+                assert_eq!(pkt.address, TrojanAddress::IPv6(Ipv6Addr::LOCALHOST));
+                assert_eq!(pkt.port, 123);
+                assert_eq!(pkt.payload, b"ntp");
+            }
+            _ => panic!("Expected Complete"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_incomplete_header() {
+        // Only ATYP one byte
+        match parse_udp_packet(&[0x01]) {
+            PacketParseResult::Incomplete => {}
+            _ => panic!("Expected Incomplete"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_incomplete_payload() {
+        let atyp_addr = [0x01, 8, 8, 8, 8];
+        let mut buf = build_udp_packet(&atyp_addr, 53, b"full-payload");
+        buf.truncate(buf.len() - 3); // payload missing 3 bytes
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Incomplete => {}
+            _ => panic!("Expected Incomplete for truncated payload"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_coalesced() {
+        // Coalesced: two packets in one buffer
+        let atyp_addr = [0x01, 1, 1, 1, 1];
+        let mut buf = build_udp_packet(&atyp_addr, 53, b"first");
+        buf.extend_from_slice(&build_udp_packet(&atyp_addr, 53, b"second"));
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Complete(pkt, consumed) => {
+                assert_eq!(pkt.payload, b"first");
+                match parse_udp_packet(&buf[consumed..]) {
+                    PacketParseResult::Complete(pkt2, consumed2) => {
+                        assert_eq!(pkt2.payload, b"second");
+                        assert_eq!(consumed + consumed2, buf.len());
+                    }
+                    _ => panic!("Expected second Complete"),
+                }
+            }
+            _ => panic!("Expected first Complete"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_invalid_atyp() {
+        let buf = build_udp_packet(&[0x07, 1, 2, 3, 4], 53, b"x");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Invalid(msg) => assert!(msg.contains("address") || msg.contains("ATYP") || msg.contains("atyp")),
+            _ => panic!("Expected Invalid for bad ATYP"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_missing_crlf() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 8, 8, 8, 8]);
+        buf.extend_from_slice(&53u16.to_be_bytes());
+        buf.extend_from_slice(&1u16.to_be_bytes());
+        buf.extend_from_slice(b"XX"); // Not CRLF
+        buf.push(b'q');
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Invalid(msg) => assert!(msg.contains("CRLF")),
+            _ => panic!("Expected Invalid for missing CRLF"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_empty_payload() {
+        let atyp_addr = [0x01, 8, 8, 8, 8];
+        let buf = build_udp_packet(&atyp_addr, 53, b"");
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Complete(pkt, _) => assert!(pkt.payload.is_empty()),
+            _ => panic!("Expected Complete for empty payload"),
         }
     }
 }
