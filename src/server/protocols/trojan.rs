@@ -316,6 +316,18 @@ pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
     PacketParseResult::Complete(packet, payload_offset + length)
 }
 
+impl UdpPacket {
+    /// Encode the packet to wire bytes: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.payload.len() + 32);
+        self.address.encode(&mut out);
+        out.extend_from_slice(&self.port.to_be_bytes());
+        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&self.payload);
+        out
+    }
+}
 /// Handle Trojan handshake over TLS stream
 /// Returns (TrojanConnectionContext, remaining payload bytes) on success
 pub async fn handle_trojan_handshake(
@@ -1256,6 +1268,54 @@ mod tests {
         match parse_udp_packet(&buf) {
             PacketParseResult::Incomplete => {}
             _ => panic!("Expected Incomplete for short domain buffer"),
+        }
+    }
+
+    #[test]
+    fn test_udp_packet_encode_ipv4() {
+        let pkt = UdpPacket {
+            address: TrojanAddress::IPv4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 53,
+            payload: b"dns-response".to_vec(),
+        };
+        let encoded = pkt.encode();
+        let mut expected = vec![0x01, 8, 8, 8, 8];
+        expected.extend_from_slice(&53u16.to_be_bytes());
+        expected.extend_from_slice(&12u16.to_be_bytes());
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(b"dns-response");
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn test_udp_packet_encode_parse_roundtrip() {
+        for pkt in [
+            UdpPacket {
+                address: TrojanAddress::IPv4(Ipv4Addr::new(1, 2, 3, 4)),
+                port: 53,
+                payload: b"hello".to_vec(),
+            },
+            UdpPacket {
+                address: TrojanAddress::IPv6(Ipv6Addr::LOCALHOST),
+                port: 123,
+                payload: Vec::new(),
+            },
+            UdpPacket {
+                address: TrojanAddress::Domain("dns.google".to_string()),
+                port: 853,
+                payload: vec![0u8; 512],
+            },
+        ] {
+            let encoded = pkt.encode();
+            match parse_udp_packet(&encoded) {
+                PacketParseResult::Complete(parsed, consumed) => {
+                    assert_eq!(parsed.address, pkt.address);
+                    assert_eq!(parsed.port, pkt.port);
+                    assert_eq!(parsed.payload, pkt.payload);
+                    assert_eq!(consumed, encoded.len());
+                }
+                _ => panic!("roundtrip failed"),
+            }
         }
     }
 }
