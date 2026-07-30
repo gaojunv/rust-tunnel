@@ -1540,6 +1540,16 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_packet_invalid_overlong_domain() {
+        // 0x03 + len 254 (> 253 max) — enough bytes to know it's invalid
+        let buf = [0x03, 254];
+        match parse_udp_packet(&buf) {
+            PacketParseResult::Invalid(_) => {}
+            _ => panic!("Expected Invalid for overlong domain"),
+        }
+    }
+
+    #[test]
     fn test_udp_packet_invalid_domain_chars_full_data() {
         // Full domain bytes present but containing invalid char '@'
         let mut buf = vec![0x03, 4];
@@ -1881,36 +1891,15 @@ mod legacy_tests {
         response
     }
 
-    /// Read exactly `n` bytes from the stream with a timeout.
-    async fn read_exact_timeout(
-        stream: &mut TlsStream<TcpStream>,
-        n: usize,
-        timeout: Duration,
-    ) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
-            Ok(Ok(read_n)) if read_n > 0 => {
-                buf.truncate(read_n);
-                Some(buf)
-            }
-            _ => None,
-        }
-    }
-
     /// Start a UDP echo server on a random port.
     async fn start_udp_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        if socket.send_to(&buf[..n], from).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                if socket.send_to(&buf[..n], from).await.is_err() {
+                    break;
                 }
             }
         });
