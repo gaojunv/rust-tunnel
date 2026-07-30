@@ -500,7 +500,6 @@ const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// directions. Per target address we maintain one outbound UdpSocket; responses
 /// from all targets are multiplexed back onto the TLS stream through a single
 /// writer task via an mpsc channel.
-#[allow(dead_code)] // wired up in Task 5
 pub async fn handle_udp_associate(
     connection_id: u64,
     trojan_port: u16,
@@ -541,6 +540,27 @@ pub async fn handle_udp_associate(
 
     let mut read_buf: Vec<u8> = initial_payload;
     let mut chunk = [0u8; 65536];
+
+    // Process packets that arrived together with the handshake BEFORE entering
+    // the select loop (the loop only parses on new reads).
+    {
+        let mut offset = 0;
+        loop {
+            match parse_udp_packet(&read_buf[offset..]) {
+                PacketParseResult::Complete(pkt, consumed) => {
+                    offset += consumed;
+                    bytes_in += pkt.payload.len() as u64;
+                    dispatch_udp_packet(pkt, connection_id, &mut targets, &resp_tx, &dead_tx).await;
+                }
+                PacketParseResult::Incomplete => break,
+                PacketParseResult::Invalid(reason) => {
+                    warn!("Invalid UDP packet on connection {}: {}", connection_id, reason);
+                    break;
+                }
+            }
+        }
+        read_buf.drain(..offset);
+    }
 
     loop {
         tokio::select! {
@@ -768,12 +788,16 @@ pub async fn proxy_trojan_connection(
         connection_id, trojan_ctx.target_addr
     );
 
-    // Reject UDP ASSOCIATE — only CONNECT is supported
+    // UDP ASSOCIATE: hand off to the UDP session handler
     if trojan_ctx.command == TrojanCommand::UdpAssociate {
-        warn!(
-            "Trojan UDP ASSOCIATE is not supported for connection {}",
-            connection_id
-        );
+        handle_udp_associate(
+            connection_id,
+            trojan_port,
+            tls_stream,
+            initial_payload,
+            state,
+        )
+        .await;
         return;
     }
 
@@ -1873,6 +1897,55 @@ mod legacy_tests {
         }
     }
 
+    /// Start a UDP echo server on a random port.
+    async fn start_udp_echo_server() -> (u16, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if socket.send_to(&buf[..n], from).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    /// Build a Trojan UDP packet (ATYP=IPv4).
+    fn build_udp_packet_v4(ip: std::net::Ipv4Addr, port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0x01];
+        buf.extend_from_slice(&ip.octets());
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Parse one UDP packet from the front of `buf`; returns (src_port, payload, consumed).
+    fn parse_udp_packet_test(buf: &[u8]) -> Option<(u16, Vec<u8>, usize)> {
+        if buf.is_empty() || buf[0] != 0x01 || buf.len() < 11 {
+            return None;
+        }
+        let port = u16::from_be_bytes([buf[5], buf[6]]);
+        let len = u16::from_be_bytes([buf[7], buf[8]]) as usize;
+        if buf[9] != b'\r' || buf[10] != b'\n' || buf.len() < 11 + len {
+            return None;
+        }
+        Some((port, buf[11..11 + len].to_vec(), 11 + len))
+    }
+
+    /// Helper: view of the not-yet-consumed remainder of a read buffer.
+    fn responses_buf(buf: &[u8], n: usize, offset: usize) -> Vec<u8> {
+        buf[..n][offset.min(n)..].to_vec()
+    }
+
     // ---------------------------------------------------------------------------
     // unit tests
     // ---------------------------------------------------------------------------
@@ -2257,8 +2330,8 @@ mod legacy_tests {
 
         #[tokio::test]
         #[ignore]
-        async fn test_trojan_udp_associate_rejected() {
-            let (echo_port, echo_handle) = start_echo_server().await;
+        async fn test_trojan_udp_associate_echo() {
+            let (udp_port, udp_handle) = start_udp_echo_server().await;
             let state = ServerState::new();
             let trojan_port = find_available_port().await;
 
@@ -2266,7 +2339,7 @@ mod legacy_tests {
                 start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
-            // Connect and send UDP ASSOCIATE command (0x03)
+            // TLS connect + UDP ASSOCIATE handshake (target addr is advisory)
             let config = create_insecure_client_config().unwrap();
             let connector = tokio_rustls::TlsConnector::from(config);
             let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
@@ -2280,21 +2353,139 @@ mod legacy_tests {
                 "testpass",
                 0x03, // UDP ASSOCIATE
                 &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
-                echo_port,
+                udp_port,
             );
             tls_stream.write_all(&header).await.unwrap();
-            tls_stream.write_all(b"udp-data").await.unwrap();
 
-            // The server should close the connection (UDP not supported)
-            let result = read_exact_timeout(&mut tls_stream, 8, Duration::from_secs(3)).await;
-            // Either we get EOF (0 bytes) or an error — either way, no echo data
-            assert!(
-                result.is_none() || result.as_ref().map(|r| r.is_empty()).unwrap_or(true),
-                "Expected connection close for UDP ASSOCIATE, but got data"
+            // Send a UDP packet through the tunnel
+            let packet = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"udp-echo-test");
+            tls_stream.write_all(&packet).await.unwrap();
+            tls_stream.flush().await.unwrap();
+
+            // Read the response packet
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(5), tls_stream.read(&mut buf))
+                .await
+                .expect("timed out waiting for UDP response")
+                .expect("read failed");
+            let (src_port, payload, _consumed) =
+                parse_udp_packet_test(&buf[..n]).expect("failed to parse UDP response packet");
+            assert_eq!(src_port, udp_port);
+            assert_eq!(payload, b"udp-echo-test");
+
+            server_handle.abort();
+            udp_handle.abort();
+        }
+
+        #[tokio::test]
+        #[ignore]
+        async fn test_trojan_udp_associate_multi_target() {
+            let (udp_port_a, udp_handle_a) = start_udp_echo_server().await;
+            let (udp_port_b, udp_handle_b) = start_udp_echo_server().await;
+            let state = ServerState::new();
+            let trojan_port = find_available_port().await;
+
+            let (_acceptor, server_handle, _tmp_dir) =
+                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+            wait_for_port(trojan_port, Duration::from_secs(5)).await;
+
+            let config = create_insecure_client_config().unwrap();
+            let connector = tokio_rustls::TlsConnector::from(config);
+            let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+                .await
+                .unwrap();
+            let server_name =
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
+
+            let header = build_trojan_header(
+                "testpass",
+                0x03,
+                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                udp_port_a,
+            );
+            tls_stream.write_all(&header).await.unwrap();
+
+            // Two packets to two different targets over the same associate connection
+            let pkt_a = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port_a, b"to-a");
+            let pkt_b = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port_b, b"to-b");
+            tls_stream.write_all(&pkt_a).await.unwrap();
+            tls_stream.write_all(&pkt_b).await.unwrap();
+
+            // Collect two response packets (order may vary)
+            let mut responses = Vec::new();
+            let mut buf = vec![0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while responses.len() < 2 {
+                let n = tokio::time::timeout_at(deadline, tls_stream.read(&mut buf))
+                    .await
+                    .expect("timed out waiting for UDP responses")
+                    .expect("read failed");
+                let mut offset = 0;
+                while let Some((src_port, payload, consumed)) = parse_udp_packet_test(&responses_buf(&buf, n, offset)) {
+                    responses.push((src_port, payload));
+                    offset += consumed;
+                }
+            }
+
+            assert!(responses
+                .iter()
+                .any(|(p, d)| *p == udp_port_a && d == b"to-a"));
+            assert!(responses
+                .iter()
+                .any(|(p, d)| *p == udp_port_b && d == b"to-b"));
+
+            server_handle.abort();
+            udp_handle_a.abort();
+            udp_handle_b.abort();
+        }
+
+        #[tokio::test]
+        #[ignore]
+        async fn test_trojan_udp_associate_cleanup_on_close() {
+            let (udp_port, udp_handle) = start_udp_echo_server().await;
+            let state = ServerState::new();
+            let trojan_port = find_available_port().await;
+
+            let (_acceptor, server_handle, _tmp_dir) =
+                start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            wait_for_port(trojan_port, Duration::from_secs(5)).await;
+
+            {
+                let config = create_insecure_client_config().unwrap();
+                let connector = tokio_rustls::TlsConnector::from(config);
+                let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+                    .await
+                    .unwrap();
+                let server_name =
+                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+                let mut tls_stream = connector.connect(server_name, stream).await.unwrap();
+
+                let header = build_trojan_header(
+                    "testpass",
+                    0x03,
+                    &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                    udp_port,
+                );
+                tls_stream.write_all(&header).await.unwrap();
+                let packet =
+                    build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"ping");
+                tls_stream.write_all(&packet).await.unwrap();
+
+                let mut buf = [0u8; 256];
+                let _ = tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await;
+                // tls_stream dropped here — session should clean up
+            }
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(
+                state.get_connection_count_for_port(trojan_port).await,
+                0,
+                "Connection count should be 0 after UDP associate client disconnect"
             );
 
             server_handle.abort();
-            echo_handle.abort();
+            udp_handle.abort();
         }
 
         #[tokio::test]
