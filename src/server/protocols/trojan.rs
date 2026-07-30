@@ -90,6 +90,25 @@ impl TrojanAddress {
             _ => None,
         }
     }
+
+    /// Encode address to buffer (ATYP + address bytes, no port)
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            TrojanAddress::IPv4(addr) => {
+                out.push(0x01);
+                out.extend_from_slice(&addr.octets());
+            }
+            TrojanAddress::IPv6(addr) => {
+                out.push(0x04);
+                out.extend_from_slice(&addr.octets());
+            }
+            TrojanAddress::Domain(domain) => {
+                out.push(0x03);
+                out.push(domain.len() as u8);
+                out.extend_from_slice(domain.as_bytes());
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for TrojanAddress {
@@ -950,6 +969,50 @@ mod tests {
     fn test_trojan_command_values() {
         assert_eq!(TrojanCommand::Connect as u8, 0x01);
         assert_eq!(TrojanCommand::UdpAssociate as u8, 0x03);
+    }
+
+    #[test]
+    fn test_address_encode_ipv4() {
+        let addr = TrojanAddress::IPv4(Ipv4Addr::new(192, 168, 1, 1));
+        let mut buf = Vec::new();
+        addr.encode(&mut buf);
+        assert_eq!(buf, vec![0x01, 192, 168, 1, 1]);
+    }
+
+    #[test]
+    fn test_address_encode_ipv6() {
+        let addr = TrojanAddress::IPv6(Ipv6Addr::LOCALHOST);
+        let mut buf = Vec::new();
+        addr.encode(&mut buf);
+        let mut expected = vec![0x04];
+        expected.extend_from_slice(&[0u8; 15]);
+        expected.push(1);
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_address_encode_domain() {
+        let addr = TrojanAddress::Domain("example.com".to_string());
+        let mut buf = Vec::new();
+        addr.encode(&mut buf);
+        let mut expected = vec![0x03, 11];
+        expected.extend_from_slice(b"example.com");
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn test_address_encode_parse_roundtrip() {
+        for addr in [
+            TrojanAddress::IPv4(Ipv4Addr::new(10, 0, 0, 1)),
+            TrojanAddress::IPv6(Ipv6Addr::LOCALHOST),
+            TrojanAddress::Domain("a-b.example.com".to_string()),
+        ] {
+            let mut buf = Vec::new();
+            addr.encode(&mut buf);
+            let (parsed, consumed) = TrojanAddress::parse(&buf, 0).expect("parse failed");
+            assert_eq!(parsed, addr);
+            assert_eq!(consumed, buf.len());
+        }
     }
 }
 
