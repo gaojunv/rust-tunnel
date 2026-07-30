@@ -429,9 +429,9 @@ fn scan_legacy_call(buf: &str) -> LegacyScan {
             return LegacyScan::Incomplete; // 参数可能还在路上
         }
         // 明确不是 JSON 参数：判失败，消耗 name 部分 + 已见内容
-        return LegacyScan::Invalid {
-            consumed: bracket + 1 + skip + rest.len().min(64),
-        };
+        let raw_consumed = bracket + 1 + skip + rest.len().min(64);
+        let consumed = buf.floor_char_boundary(raw_consumed);
+        return LegacyScan::Invalid { consumed };
     }
     // brace 匹配（容忍字符串内转义）
     let mut depth = 0i32;
@@ -1329,5 +1329,42 @@ mod tests {
         let args: Value = serde_json::from_str(
             calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
+    }
+
+    // ── take_tool_calls ───────────────────────────────────────
+
+    #[test]
+    fn take_tool_calls_returns_and_clears() {
+        let mut s = TagScanner::new();
+        s.push("<tool_call>{\"name\":\"Bash\",\"arguments\":{}}</tool_call>");
+        assert!(s.has_tool_calls());
+        let calls = s.take_tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        let calls2 = s.take_tool_calls();
+        assert!(calls2.is_empty());
+    }
+
+    // ── 旧格式 Invalid UTF-8 边界安全 ─────────────────────────
+
+    #[test]
+    fn scanner_legacy_invalid_utf8_safe_consumed() {
+        // 输入："[调用工具 Bash] " + 30 个中文字符（每个 3 字节）。
+        // 旧代码中 rest.len().min(64) 会落在多字节字符中间，导致 buf[..consumed] panic。
+        let garbage: String = std::iter::repeat("文").take(30).collect();
+        let input = format!("[调用工具 Bash] {}", garbage);
+        let mut s = TagScanner::new();
+        let events = s.push(&input);
+        // 不应 panic，应产出 Discarded 事件
+        assert!(
+            events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
+            "should produce Discarded, got: {events:?}"
+        );
+        // 任何 Text 事件不应包含旧的标记前缀
+        for e in &events {
+            if let ScanEvent::Text(t) = e {
+                assert!(!t.contains("[调用工具"), "Discarded text leaked: {t}");
+            }
+        }
     }
 }
