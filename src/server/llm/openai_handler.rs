@@ -232,7 +232,7 @@ pub async fn handle_chat_completions(
         Ok(resp) => {
             let resp = if compat_enabled {
                 if request.stream {
-                    // 流式 + compat 模式：缓冲所有 content，流结束时解析伪工具调用
+                    // 流式 + compat 模式：增量解析 content，伪工具调用即时识别为 tool_calls
                     rewrite_pseudo_tool_calls_in_stream(resp).await
                 } else {
                     // 非流式 + compat 模式：解析伪工具调用，还原为结构化 tool_calls
@@ -418,6 +418,7 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
             }
             if payload == "[DONE]" {
                 saw_done = true;
+                // byte_buf 中 [DONE] 之后仅剩尾随空行（`\n` / `\r\n`），安全丢弃。
                 break 'outer;
             }
             let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
@@ -436,6 +437,10 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
             // 上游原生 tool_calls（模型走了结构化路径）：原样透传
             if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
                 out.push_str(&format!("data: {payload}\n\n"));
+                // 如果原生 tool_calls chunk 也携带 usage，清除 usage_chunk 防止重复
+                if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                    usage_chunk = None;
+                }
                 continue;
             }
             if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
@@ -443,6 +448,10 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                     // 无伪工具调用：原样透传 finish chunk
                     if !saw_finish {
                         saw_finish = true;
+                        // 如果 finish chunk 已携带 usage，清除 usage_chunk 防止重复发出
+                        if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                            usage_chunk = None;
+                        }
                         out.push_str(&format!("data: {payload}\n\n"));
                     }
                 } else {
@@ -450,6 +459,15 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                     saw_finish = true;
                     let _ = reason;
                 }
+            }
+            // 非 content/non-tool_calls/finish_reason 的 chunk（如 delta: {"role":"assistant"}）
+            // 原样透传。排除仅 usage 的 chunk（由 saw_done 分支在收尾发出）。
+            if chunk["choices"][0]["delta"]["content"].as_str().is_none()
+                && !chunk["choices"][0]["delta"]["tool_calls"].is_array()
+                && chunk["choices"][0]["finish_reason"].as_str().is_none()
+                && !chunk.get("usage").map(|u| u.is_object()).unwrap_or(false)
+            {
+                out.push_str(&format!("data: {payload}\n\n"));
             }
         }
     }
@@ -1006,6 +1024,31 @@ mod tests {
         let u = scanner.finish();
         assert_eq!(u.prompt_tokens, 87, "端到端 prompt_tokens 不应为 0");
         assert_eq!(u.completion_tokens, 16, "端到端 completion_tokens 不应为 0");
+    }
+
+    /// Regression: finish chunk carries usage with no pseudo tool calls →
+    /// usage must appear exactly once (not duplicated by raw forward + post-loop emit).
+    #[tokio::test]
+    async fn test_stream_rewrite_usage_not_duplicated_on_finish_chunk() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(sse_data))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // usage 应恰好出现一次（无重复）
+        let count = text.matches("\"prompt_tokens\"").count();
+        assert_eq!(count, 1, "usage should appear exactly once, got {count} in: {text}");
     }
 
     // ── v2 增量流式：文本即时透传 + 跨 chunk 标签 ─────────────────
