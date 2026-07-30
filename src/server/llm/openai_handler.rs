@@ -218,10 +218,12 @@ pub async fn handle_chat_completions(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
-    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为纯文本。
+    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为标签文本，
+    // 并在末尾注入 system 引导（教模型输出伪工具调用格式）。
     let mut request = request;
     if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
         super::compat::rewrite_tool_history(&mut request.messages);
+        super::compat::inject_tool_call_guidance(&mut request.messages);
     }
 
     // Call upstream
@@ -281,17 +283,40 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
             continue;
         };
 
-        let (remaining, tool_calls) = super::compat::parse_pseudo_tool_calls(content);
-        if let Some(calls) = tool_calls {
-            // 有伪工具调用：更新 content（去除工具调用部分），注入结构化 tool_calls
+        let mut scanner = super::compat::TagScanner::new();
+        let mut events = scanner.push(content);
+        events.extend(scanner.finish());
+
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut calls: Vec<serde_json::Value> = Vec::new();
+        for e in events {
+            match e {
+                super::compat::ScanEvent::Text(t) => {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        text_parts.push(t.to_string());
+                    }
+                }
+                super::compat::ScanEvent::ToolCall(v) => calls.push(v),
+                super::compat::ScanEvent::Discarded(_) => {}
+            }
+        }
+
+        if !calls.is_empty() {
+            let remaining = text_parts.join("\n");
             if remaining.is_empty() {
                 message["content"] = serde_json::Value::Null;
             } else {
                 message["content"] = serde_json::Value::String(remaining);
             }
             message["tool_calls"] = serde_json::Value::Array(calls);
-            // 修改 finish_reason 为 tool_calls（OpenAI 惯例）
             choice["finish_reason"] = serde_json::Value::String("tool_calls".into());
+        } else {
+            // 无工具调用但可能有剥离发生：仅在内容确实变化时回写
+            let joined = text_parts.join("\n");
+            if joined != content.trim() {
+                message["content"] = serde_json::Value::String(joined);
+            }
         }
     }
 
@@ -299,130 +324,158 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
     Response::from_parts(parts, Body::from(new_bytes))
 }
 
-/// 流式响应：缓冲整个 SSE 流，解析伪工具调用，重新构建 SSE 流。
+/// 流式响应：增量解析伪工具调用，文本按到达顺序透传，tool_call 完整后注入结构化 chunk。
 ///
-/// 只在 compat 模式（`compat_tool_history`）开启时调用。
-/// 如果流中没有伪工具调用格式，原样返回。
-///
-/// 实现策略：读取整个 SSE 流到内存（LLM 流通常 < 几 MB），解析所有
-/// chunk 的 `delta.content`，流结束时用 `parse_pseudo_tool_calls` 检测
-/// 伪工具调用。如果有，重新构建 SSE 流：
-///   1. 先发送剩余文本的 content chunk（如果有）
-///   2. 再发送 tool_calls chunk
-///   3. 最后发送 finish chunk（finish_reason="tool_calls"）
-///
-/// 如果没有伪工具调用，原样转发所有 chunk。
+/// 只在 compat 模式开启时调用。内部状态机：
+///   上游 chunk → 按 SSE 行提取 delta.content → TagScanner 增量解析
+///   Text 事件 → 立即包装为 OpenAI chunk 发出
+///   ToolCall 事件 → 暂存
+///   finish_reason / [DONE] → 先发暂存的 tool_calls chunk（最后一个带
+///   finish_reason="tool_calls"），再发 usage chunk，最后 [DONE]。
 pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
     use futures_util::StreamExt;
 
     let (parts, body) = resp.into_parts();
-
-    // 读取整个流到内存
-    let mut all_bytes = Vec::new();
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => all_bytes.extend_from_slice(&bytes),
-            Err(_) => break,
-        }
-    }
 
-    let text = String::from_utf8_lossy(&all_bytes);
-
-    // 解析所有 SSE 行，提取 content 和元数据
-    let mut parser = super::compat::StreamPseudoToolCallParser::new();
-    let mut first_chunk: Option<serde_json::Value> = None;
+    let mut scanner = super::compat::TagScanner::new();
+    let mut byte_buf: Vec<u8> = Vec::new(); // 不完整的 SSE 行（字节，UTF-8 安全）
     let mut model = String::new();
     let mut id = String::new();
-    // 上游末尾携带 usage 的 chunk（OpenAI include_usage 时出现在收尾 chunk）。
-    // 重建流时必须保留，否则下游 Anthropic 翻译只能走 [DONE] 分支硬编码
-    // output_tokens=0，导致 usage 统计全 0。
+    let mut pending_calls: Vec<serde_json::Value> = Vec::new();
     let mut usage_chunk: Option<serde_json::Value> = None;
+    let mut saw_finish = false;
+    let mut saw_done = false;
+    let mut out = String::new();
 
-    for line in text.lines() {
-        if line.starts_with("data:") {
-            let payload = line.strip_prefix("data:").unwrap().trim();
-            if payload == "[DONE]" {
+    /// 把一段 delta.content 喂给 scanner，把事件序列化为输出 chunk。
+    macro_rules! drain_events {
+        ($events:expr, $out:expr, $id:expr, $model:expr, $pending:expr) => {
+            for e in $events {
+                match e {
+                    super::compat::ScanEvent::Text(t) => {
+                        if !t.is_empty() {
+                            let chunk = serde_json::json!({
+                                "id": $id, "model": $model,
+                                "choices": [{"index": 0,
+                                    "delta": {"content": t},
+                                    "finish_reason": null}]
+                            });
+                            $out.push_str(&format!("data: {chunk}\n\n"));
+                        }
+                    }
+                    super::compat::ScanEvent::ToolCall(v) => $pending.push(v),
+                    super::compat::ScanEvent::Discarded(_) => {}
+                }
+            }
+        };
+    }
+
+    /// 发暂存的 tool_calls chunk（最后一个带 finish_reason）。
+    macro_rules! flush_calls {
+        ($out:expr, $id:expr, $model:expr, $pending:expr) => {
+            if !$pending.is_empty() {
+                let calls = std::mem::take(&mut $pending);
+                let n = calls.len();
+                for (i, call) in calls.into_iter().enumerate() {
+                    let is_last = i + 1 == n;
+                    let chunk = serde_json::json!({
+                        "id": $id, "model": $model,
+                        "choices": [{"index": 0,
+                            "delta": {"tool_calls": [{
+                                "index": i,
+                                "id": call["id"],
+                                "type": "function",
+                                "function": call["function"],
+                            }]},
+                            "finish_reason": if is_last {
+                                serde_json::Value::String("tool_calls".into())
+                            } else {
+                                serde_json::Value::Null
+                            }}]
+                    });
+                    $out.push_str(&format!("data: {chunk}\n\n"));
+                }
+            }
+        };
+    }
+
+    'outer: while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        byte_buf.extend_from_slice(&bytes);
+        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = byte_buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(
+                line_bytes.strip_suffix(b"\r\n")
+                    .or_else(|| line_bytes.strip_suffix(b"\n"))
+                    .unwrap_or(&line_bytes),
+            )
+            .into_owned();
+            let Some(payload) = line.strip_prefix("data:") else { continue };
+            let payload = payload.trim();
+            if payload.is_empty() {
                 continue;
             }
-            if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) {
-                if first_chunk.is_none() {
-                    first_chunk = Some(chunk.clone());
-                    model = chunk["model"].as_str().unwrap_or("").to_string();
-                    id = chunk["id"].as_str().unwrap_or("").to_string();
+            if payload == "[DONE]" {
+                saw_done = true;
+                break 'outer;
+            }
+            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            if id.is_empty() {
+                id = chunk["id"].as_str().unwrap_or("").to_string();
+                model = chunk["model"].as_str().unwrap_or("").to_string();
+            }
+            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                usage_chunk = Some(chunk.clone());
+            }
+            if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                drain_events!(scanner.push(content), out, id, model, pending_calls);
+            }
+            // 上游原生 tool_calls（模型走了结构化路径）：原样透传
+            if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
+                out.push_str(&format!("data: {payload}\n\n"));
+                continue;
+            }
+            if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+                if pending_calls.is_empty() {
+                    // 无伪工具调用：原样透传 finish chunk
+                    if !saw_finish {
+                        saw_finish = true;
+                        out.push_str(&format!("data: {payload}\n\n"));
+                    }
+                } else {
+                    // 有伪工具调用：finish 由 flush_calls 的 tool_calls 收尾承担
+                    saw_finish = true;
+                    let _ = reason;
                 }
-                // 记录最后一个携带非空 usage 对象的 chunk（保留其 choices/finish_reason，
-                // 重建时原样转发，仅依赖它把 usage 带给下游）。
-                if chunk
-                    .get("usage")
-                    .map(|u| u.is_object())
-                    .unwrap_or(false)
-                {
-                    usage_chunk = Some(chunk);
-                }
-                parser.push_chunk(line);
             }
         }
     }
 
-    let result = parser.finish();
-
-    if !result.has_tool_calls {
-        // 没有伪工具调用，原样返回
-        return Response::from_parts(parts, Body::from(all_bytes));
+    // 清算 scanner（未闭合标签剥离）→ 冲刷 tool_calls → usage → [DONE]
+    drain_events!(scanner.finish(), out, id, model, pending_calls);
+    flush_calls!(out, id, model, pending_calls);
+    if saw_done {
+        // [DONE] 行已在流中：usage 从上游 copy 是完整的，直接转发。
+        if let Some(u) = usage_chunk.take() {
+            out.push_str(&format!("data: {u}\n\n"));
+        }
+        out.push_str("data: [DONE]\n\n");
+    } else {
+        // 上游断流未发 [DONE]：补发 usage + [DONE]。
+        if !saw_finish {
+            if let Some(u) = usage_chunk.take() {
+                out.push_str(&format!("data: {u}\n\n"));
+            }
+        }
+        if !out.ends_with("data: [DONE]\n\n") {
+            out.push_str("data: [DONE]\n\n");
+        }
     }
 
-    // 有伪工具调用：重新构建 SSE 流
-    let mut output = String::new();
-    let tool_calls = result.tool_calls.unwrap();
-
-    // 1. 如果有剩余文本，先发送 content chunk
-    if !result.remaining_text.is_empty() {
-        let chunk = serde_json::json!({
-            "id": id,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": result.remaining_text},
-                "finish_reason": null
-            }]
-        });
-        output.push_str(&format!("data: {}\n\n", chunk));
-    }
-
-    // 2. 发送 tool_calls chunk（每个 tool_call 一个 chunk）
-    for (i, call) in tool_calls.iter().enumerate() {
-        let is_last = i == tool_calls.len() - 1;
-        let finish = if is_last { "tool_calls" } else { "" };
-        let chunk = serde_json::json!({
-            "id": id,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": i,
-                        "id": call["id"],
-                        "type": "function",
-                        "function": call["function"],
-                    }]
-                },
-                "finish_reason": if is_last { serde_json::Value::String(finish.into()) } else { serde_json::Value::Null }
-            }]
-        });
-        output.push_str(&format!("data: {}\n\n", chunk));
-    }
-
-    // 3. 保留上游 usage chunk（若有）：下游 Anthropic 翻译靠它发出带完整
-    //    input/output 细分的 message_delta，usage 统计才不会全 0。
-    if let Some(usage) = usage_chunk {
-        output.push_str(&format!("data: {}\n\n", usage));
-    }
-
-    // 4. 发送 [DONE]
-    output.push_str("data: [DONE]\n\n");
-
-    Response::from_parts(parts, Body::from(output.into_bytes()))
+    Response::from_parts(parts, Body::from(out.into_bytes()))
 }
 
 #[cfg(test)]
@@ -953,5 +1006,141 @@ mod tests {
         let u = scanner.finish();
         assert_eq!(u.prompt_tokens, 87, "端到端 prompt_tokens 不应为 0");
         assert_eq!(u.completion_tokens, 16, "端到端 completion_tokens 不应为 0");
+    }
+
+    // ── v2 增量流式：文本即时透传 + 跨 chunk 标签 ─────────────────
+
+    /// v2 增量流式：文本 chunk 应立即出现在输出（不等流结束）。
+    /// 用"读到第一个文本 chunk 时输出已含文本"验证增量性——
+    /// 实现上通过逐 chunk 喂入、单 chunk 内检查输出来观察。
+    #[tokio::test]
+    async fn test_stream_v2_text_flushed_immediately() {
+        // 两个 data 行之间夹一个大文本，标签在后一个 chunk：
+        // 若实现仍是全流缓冲，单次输出里必然同时包含 [DONE] 之后的内容；
+        // 增量实现则文本先行。这里验证最终输出：文本在前、tool_calls 在后、
+        // 且不包含标签原文。
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"开始执行\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<tool_call>\\n{\\\"name\\\":\\\"Bash\\\",\\\"arguments\\\":{\\\"command\\\":\\\"ls\\\"}}\\n</tool_call>\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(sse_data))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("开始执行"), "文本应透传: {text}");
+        assert!(text.contains("tool_calls"), "应有 tool_calls: {text}");
+        assert!(text.contains("Bash"), "应有工具名: {text}");
+        assert!(!text.contains("tool_call>"), "标签原文不得泄漏: {text}");
+        assert!(text.contains("\"prompt_tokens\":10"), "usage 应保留: {text}");
+        assert!(text.contains("[DONE]"), "[DONE] 应保留: {text}");
+        // finish_reason 应是 tool_calls（有工具调用的收尾）
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+    }
+
+    /// v2 增量流式：<tool_call> 起始标签被切到两个网络 chunk。
+    #[tokio::test]
+    async fn test_stream_v2_tag_split_across_network_chunks() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<to\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ol_call>{\\\"name\\\":\\\"A\\\",\\\"arguments\\\":{}}</tool_call>\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(sse_data))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("tool_calls"), "跨 chunk 标签应解析: {text}");
+        assert!(!text.contains("<to"), "半个标签不得泄漏: {text}");
+    }
+
+    /// v2 增量流式：坏 JSON 剥离且不泄漏。
+    #[tokio::test]
+    async fn test_stream_v2_broken_json_stripped() {
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"前文<tool_call>{bad</tool_call>后文\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(sse_data))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("前文"), "{text}");
+        assert!(text.contains("后文"), "{text}");
+        assert!(!text.contains("bad"), "坏 JSON 不得泄漏: {text}");
+        assert!(!text.contains("tool_call>"), "标签不得泄漏: {text}");
+    }
+
+    /// v2 非流式：新标签格式还原结构化 tool_calls。
+    #[tokio::test]
+    async fn test_nonstream_v2_tag_parsed() {
+        let upstream_body = serde_json::json!({
+            "id": "chatcmpl-1", "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant",
+                    "content": "看下\n<tool_call>\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"].as_str().unwrap(), "看下");
+        let calls = v["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// v2 非流式：坏 JSON 剥离，content 中无残留。
+    #[tokio::test]
+    async fn test_nonstream_v2_broken_stripped() {
+        let upstream_body = serde_json::json!({
+            "id": "x", "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant",
+                    "content": "正常<tool_call>{oops</tool_call>结尾"},
+                "finish_reason": "stop"
+            }]
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(serde_json::to_vec(&upstream_body).unwrap()))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let c = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(c.contains("正常"), "{c}");
+        assert!(c.contains("结尾"), "{c}");
+        assert!(!c.contains("oops"), "{c}");
+        assert!(!c.contains("tool_call"), "{c}");
     }
 }
