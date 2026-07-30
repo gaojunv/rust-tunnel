@@ -1131,6 +1131,47 @@ mod tests {
         assert!(!text.contains("tool_call>"), "标签不得泄漏: {text}");
     }
 
+    /// v2 流式 UTF-8 安全：多字节字符（中文 3 字节、emoji 4 字节）被从字符中间
+    /// 切到两个网络块时，byte_buf 按行缓冲不得物化 U+FFFD 替换符。
+    #[tokio::test]
+    async fn test_stream_v2_multibyte_utf8_split_across_chunks() {
+        use futures_util::stream;
+
+        let sse_data = concat!(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好👋\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let bytes = sse_data.as_bytes();
+
+        // 逐字节边界切碎喂入（最严苛的切法），每个切点都不得产生乱码
+        for i in 1..bytes.len() {
+            let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+                Ok(bytes::Bytes::copy_from_slice(&bytes[..i])),
+                Ok(bytes::Bytes::copy_from_slice(&bytes[i..])),
+            ];
+            let body = Body::from_stream(stream::iter(chunks));
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/event-stream")
+                .body(body)
+                .unwrap();
+            let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+            let out = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8(out.to_vec())
+                .unwrap_or_else(|e| panic!("split at byte {i} produced invalid utf8: {e}"));
+            assert!(
+                !text.contains('\u{FFFD}'),
+                "split at byte {i} produced replacement char: {text}"
+            );
+            assert!(
+                text.contains("你好👋"),
+                "split at byte {i} lost content: {text}"
+            );
+        }
+    }
+
     /// v2 非流式：新标签格式还原结构化 tool_calls。
     #[tokio::test]
     async fn test_nonstream_v2_tag_parsed() {
