@@ -95,6 +95,12 @@ impl VectorStore {
         }
     }
 
+    /// 数据根目录：`rag/<kb_id>/` 存向量 shard，`rag_docs/<kb_id>/` 存文档原文
+    /// （管理 API 层读写原文用，见 `mgmt/api/rag.rs`）。
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     fn shard_dir(&self, kb_id: &str) -> PathBuf {
         self.data_dir.join("rag").join(kb_id)
     }

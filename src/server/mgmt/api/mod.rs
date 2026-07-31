@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -349,6 +350,7 @@ pub async fn run_api_server(
             "/api/llm/kb/:id/docs",
             get(rag::list_docs).post(rag::upload_doc),
         )
+        .layer(DefaultBodyLimit::max(rag::MULTIPART_BODY_LIMIT))
         .route(
             "/api/llm/kb/:id/docs/:doc_id",
             get(rag::get_doc).delete(rag::delete_doc),

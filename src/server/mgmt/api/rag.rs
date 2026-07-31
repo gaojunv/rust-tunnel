@@ -34,8 +34,23 @@ use super::{dto::SseQuery, ApiState};
 /// 上传文档的最大字节数（2MB）。超大文件直接 `400`，避免内存膨胀与过长的分块处理。
 const MAX_DOC_BYTES: usize = 2 * 1024 * 1024;
 
+/// multipart 请求体总长上限：单文件上限之上预留 boundary/头等开销，让字段级
+/// 流式超限校验（而非 axum 的 DefaultBodyLimit 通用错误）成为真正的裁判者，
+/// 自定义 "file too large" 消息由此可达。
+pub(crate) const MULTIPART_BODY_LIMIT: usize = MAX_DOC_BYTES + 64 * 1024;
+
 /// 单次上传允许的字段名：handler 不关心 name，按 `file_name` 判定文件字段。
 const ACCEPTED_EXTENSIONS: [&str; 2] = ["md", "txt"];
+
+/// 文档原文落盘路径：`<data_dir>/rag_docs/<kb_id>/<doc_id>.md`。
+/// 摄入时把原文写入该文件（规格 §2.1），reindex 依赖它无损重建。
+fn doc_source_path(store: &VectorStore, kb_id: &str, doc_id: &str) -> std::path::PathBuf {
+    store
+        .data_dir()
+        .join("rag_docs")
+        .join(kb_id)
+        .join(format!("{doc_id}.md"))
+}
 
 /// 取当前 LLM 运行时状态（未初始化时为 `None` → 请求失败）。
 async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
@@ -356,6 +371,13 @@ pub async fn delete_kb(State(state): State<ApiState>, Path(id): Path<String>) ->
     if let Err(e) = rt.store.delete_kb(&id).await {
         tracing::warn!(kb_id = %id, error = %e, "rag: store delete_kb failed");
     }
+    // 清理该库全部原文文件（best-effort，失败仅 warn）
+    let source_dir = rt.store.data_dir().join("rag_docs").join(&id);
+    if source_dir.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(&source_dir).await {
+            tracing::warn!(kb_id = %id, error = %e, "rag: remove kb doc source dir failed");
+        }
+    }
     if let Err(e) = rt.db.rag_delete_kb(&id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
@@ -435,7 +457,7 @@ pub async fn upload_doc(
     let mut filename: Option<String> = None;
     let mut content: Option<Vec<u8>> = None;
     loop {
-        let field = match multipart.next_field().await {
+        let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(_) => return (StatusCode::BAD_REQUEST, "invalid multipart body").into_response(),
@@ -447,18 +469,30 @@ pub async fn upload_doc(
             return (StatusCode::BAD_REQUEST, "multiple files in one request").into_response();
         }
         let name = field.file_name().unwrap_or_default().to_string();
-        let Ok(bytes) = field.bytes().await else {
-            return (StatusCode::BAD_REQUEST, "failed to read file field").into_response();
-        };
-        if bytes.len() > MAX_DOC_BYTES {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("file too large (max {MAX_DOC_BYTES} bytes)"),
-            )
-                .into_response();
+        // 流式读取 + 即时超限截断：累计超过 MAX 立即返回自定义 400，不做全文
+        // 缓冲。与 DefaultBodyLimit 解耦——即使未来放宽/禁用请求体上限，内存也
+        // 始终有界（至多 MAX + 单个 chunk）。axum 0.7 的 Field 无 reader()，
+        // 用等价的 chunk() 流式接口。
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "failed to read file field").into_response()
+                }
+            };
+            if bytes.len() + chunk.len() > MAX_DOC_BYTES {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("file too large (max {MAX_DOC_BYTES} bytes)"),
+                )
+                    .into_response();
+            }
+            bytes.extend_from_slice(&chunk);
         }
         filename = Some(name);
-        content = Some(bytes.to_vec());
+        content = Some(bytes);
     }
 
     let Some(name) = filename else {
@@ -491,11 +525,34 @@ pub async fn upload_doc(
         "sha256:{}",
         hex::encode(sha2::Sha256::digest(text.as_bytes()))
     );
+
+    // 原文落盘（规格 §2.1）：reindex 依赖此文件。写盘失败则返回错误、不落库、
+    // 不摄入，避免出现"有 doc 记录无原文"的不可 reindex 状态。
+    let source_path = doc_source_path(&rt.store, &kb_id, &doc_id);
+    if let Some(parent) = source_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to init document storage: {e}"),
+            )
+                .into_response();
+        }
+    }
+    if let Err(e) = tokio::fs::write(&source_path, text.as_bytes()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist original document: {e}"),
+        )
+            .into_response();
+    }
+
     if let Err(e) = rt
         .db
         .rag_create_document(&doc_id, &kb_id, &name, &content_hash)
         .await
     {
+        // 清理已落盘的原文，避免孤儿文件
+        let _ = tokio::fs::remove_file(&source_path).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
@@ -571,26 +628,118 @@ pub async fn delete_doc(
     if let Err(e) = rt.db.rag_delete_document(&doc_id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
+    // 清理原文文件（reindex 的真相源）。失败仅 warn：DB 是源，残留文件无害。
+    let source_path = doc_source_path(&rt.store, &kb_id, &doc_id);
+    if source_path.exists() {
+        if let Err(e) = tokio::fs::remove_file(&source_path).await {
+            tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, error = %e, "rag: remove doc source file failed");
+        }
+    }
     StatusCode::OK.into_response()
 }
 
-/// POST `/api/llm/kb/:id/docs/:doc_id/reindex` — 重新摄入文档。
+/// POST `/api/llm/kb/:id/docs/:doc_id/reindex` — 重建单文档索引（规格 §5.2/§7）。
 ///
-/// 原始文本在摄入后不保留（只存分块），无法无损重建，故不支持就地重索引：
-/// 返回 `400` 提示重新上传。该路由保留以对齐前端契约；如需换分块参数重索引，
-/// 正确路径是删除后重新上传。
+/// 摄入时已把原文落盘（`<data_dir>/rag_docs/<kb_id>/<doc_id>.md`，见 upload_doc），
+/// 故可无损重建：清旧索引（向量 + SQLite 分块）→ 重新走完整摄入。换分块参数后
+/// 也通过本端点重索引。原文文件缺失（老数据/手动删除）→ 409，提示删除重传。
 pub async fn reindex_doc(
     State(state): State<ApiState>,
-    Path((_kb_id, _doc_id)): Path<(String, String)>,
+    Path((kb_id, doc_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    // 此实现为占位：摄入流程不保留原始文本（见 upload_doc / spawn_ingest），
-    // 从分块重建内容会因 overlap 失真。注册路由以对齐接口，行为是明确报错。
-    let _ = rag_rt(&state).await;
-    (
-        StatusCode::BAD_REQUEST,
-        "reindex not supported: original document text is not retained after ingestion; delete and re-upload instead",
-    )
-        .into_response()
+    let rt = match rag_rt(&state).await {
+        Ok(rt) => rt,
+        Err(e) => return e.into_response(),
+    };
+    let Some(kb) = (match rt.db.rag_get_kb(&kb_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
+    };
+    let Some(doc) = (match rt.db.rag_get_document(&doc_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, "document not found").into_response();
+    };
+    if doc.kb_id != kb_id {
+        return (StatusCode::NOT_FOUND, "document not found").into_response();
+    }
+
+    // 读原文（摄入时已落盘）。缺失 → 无法无损重建，提示删除重传。
+    let source_path = doc_source_path(&rt.store, &kb_id, &doc_id);
+    let text = match tokio::fs::read_to_string(&source_path).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, path = %source_path.display(), error = %e, "rag reindex: source file missing");
+            return (
+                StatusCode::CONFLICT,
+                "original document missing; delete and re-upload it",
+            )
+                .into_response();
+        }
+    };
+    if text.trim().is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "original document missing; delete and re-upload it",
+        )
+            .into_response();
+    }
+
+    // 清旧索引：先向量后 SQLite（向量删除失败仅 warn，DB 是源）。
+    if let Err(e) = rt
+        .store
+        .delete_by_doc(&kb_id, kb.emb_dimension as usize, &doc_id)
+        .await
+    {
+        tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, error = %e, "rag reindex: store delete_by_doc failed");
+    }
+    if let Err(e) = rt.db.rag_delete_chunks_by_doc(&doc_id).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+    }
+
+    // 标记 pending（旧 chunk_count 不再有效），随后 spawn_ingest 走完整摄入
+    // （与 upload 同路径：processing → ready/failed + SSE 事件）。
+    if let Err(e) = rt
+        .db
+        .rag_update_document_status(&doc_id, "pending", 0, None)
+        .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+    }
+    spawn_ingest(
+        rt.db.clone(),
+        rt.store.clone(),
+        rt.cipher.clone(),
+        kb,
+        doc_id.clone(),
+        text,
+        rt.tx.clone(),
+    );
+
+    match rt.db.rag_get_document(&doc_id).await {
+        Ok(Some(d)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(d).unwrap_or_default()),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": doc_id,
+                "kb_id": kb_id,
+                "status": "pending",
+                "chunk_count": 0,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 // ── test-embedding / query / SSE ─────────────────────────────────
@@ -731,6 +880,7 @@ pub async fn sse_kb_events(
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::DefaultBodyLimit;
     use axum::http::{header, Method, Request, StatusCode as HttpStatus};
     use axum::routing::{get, post};
     use axum::Router;
@@ -775,6 +925,7 @@ mod tests {
                 "/api/llm/kb/:id/docs",
                 get(super::list_docs).post(super::upload_doc),
             )
+            .layer(DefaultBodyLimit::max(super::MULTIPART_BODY_LIMIT))
             .route(
                 "/api/llm/kb/:id/docs/:doc_id",
                 get(super::get_doc).delete(super::delete_doc),
@@ -799,6 +950,17 @@ mod tests {
         (status, body)
     }
 
+    /// oneshot 请求助手：返回 (status, 原始响应文本)。错误响应多为纯文本，
+    /// 需要断言具体消息（如 "file too large"）时用这个。
+    async fn call_raw(app: &Router, req: Request<Body>) -> (HttpStatus, String) {
+        let resp = app.clone().oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("read response body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     fn json_request(method: Method, uri: String, body: &Value) -> Request<Body> {
         Request::builder()
             .method(method)
@@ -817,6 +979,19 @@ mod tests {
              {content}\r\n\
              --{boundary}--\r\n"
         )
+    }
+
+    /// 字节版 multipart 请求体（非 UTF-8 上传测试用）。
+    fn multipart_body_bytes(boundary: &str, filename: &str, content: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: text/plain\r\n\r\n"
+        )
+        .into_bytes();
+        v.extend_from_slice(content);
+        v.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        v
     }
 
     /// 起一个返回固定维度向量的本地 embedding server，返回 `base_url`。
@@ -867,6 +1042,27 @@ mod tests {
         let (status, body) = call(app, req).await;
         assert_eq!(status, HttpStatus::CREATED, "create kb: {body}");
         body["id"].as_str().expect("kb id").to_string()
+    }
+
+    /// 轮询 GET /docs/:id 直到 status=ready，返回 chunk_count（10s 上限）。
+    async fn wait_doc_ready(app: &Router, kb_id: &str, doc_id: &str) -> i64 {
+        for _ in 0..50 {
+            let (status, body) = call(
+                app,
+                json_request(
+                    Method::GET,
+                    format!("/api/llm/kb/{kb_id}/docs/{doc_id}"),
+                    &json!(null),
+                ),
+            )
+            .await;
+            assert_eq!(status, HttpStatus::OK);
+            if body["status"] == json!("ready") {
+                return body["chunk_count"].as_i64().unwrap_or(0);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("doc {doc_id} did not become ready");
     }
 
     #[tokio::test]
@@ -1023,6 +1219,17 @@ mod tests {
             .starts_with("sha256:"));
         let doc_id = body["id"].as_str().expect("doc id").to_string();
 
+        // §2.1 原文落盘：<data_dir>/rag_docs/<kb_id>/<doc_id>.md
+        let source_path = dir
+            .path()
+            .join("rag_docs")
+            .join(&kb_id)
+            .join(format!("{doc_id}.md"));
+        assert!(
+            source_path.exists(),
+            "original doc file should be persisted on upload"
+        );
+
         // 等摄入事件与文档 ready
         let ev1 = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -1106,6 +1313,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
+        assert!(
+            !source_path.exists(),
+            "doc source file should be removed on delete"
+        );
 
         // DELETE /api/llm/kb/:id → 200，随后 404，store shard 目录删除
         let (status, _body) = call(
@@ -1123,6 +1334,10 @@ mod tests {
         assert!(
             !dir.path().join("rag").join(&kb_id).exists(),
             "kb shard dir should be removed"
+        );
+        assert!(
+            !dir.path().join("rag_docs").join(&kb_id).exists(),
+            "kb doc source dir should be removed"
         );
         assert!(db.rag_get_kb(&kb_id).await.unwrap().is_none());
     }
@@ -1149,7 +1364,8 @@ mod tests {
         let (status, _body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
 
-        // >2MB → 400
+        // >2MB → 400，且是自写的 "file too large" 消息（流式超限截断可达，
+        // 不依赖 DefaultBodyLimit 的通用错误）
         let big = "x".repeat(2 * 1024 * 1024 + 1);
         let boundary = "b-big";
         let req = Request::builder()
@@ -1161,8 +1377,12 @@ mod tests {
             )
             .body(Body::from(multipart_body(boundary, "big.md", &big)))
             .expect("build request");
-        let (status, _body) = call(&app, req).await;
+        let (status, body_text) = call_raw(&app, req).await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(
+            body_text.contains("file too large"),
+            "oversize should return custom message, got: {body_text}"
+        );
 
         // 无文件字段 → 400
         let boundary = "b-nofile";
@@ -1236,5 +1456,129 @@ mod tests {
             .expect("build request");
         let (status, _body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_non_utf8_file() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 非 UTF-8 字节序列（扩展名合法 .md）→ 400 "file must be UTF-8 text"
+        let boundary = "b-utf8";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body_bytes(
+                boundary,
+                "bad.md",
+                &[0xffu8, 0xfe, 0xfd],
+            )))
+            .expect("build request");
+        let (status, body_text) = call_raw(&app, req).await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(
+            body_text.contains("UTF-8"),
+            "non-utf8 should return UTF-8 message, got: {body_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_doc_rebuilds_index() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 上传 → 原文落盘
+        let content =
+            "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n"
+                .to_string();
+        let boundary = "b-reindex";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body(boundary, "guide.md", &content)))
+            .expect("build request");
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "upload: {body}");
+        let doc_id = body["id"].as_str().expect("doc id").to_string();
+        let source_path = dir
+            .path()
+            .join("rag_docs")
+            .join(&kb_id)
+            .join(format!("{doc_id}.md"));
+        assert!(
+            source_path.exists(),
+            "original doc file should be persisted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source_path).unwrap(),
+            content,
+            "persisted source should match upload"
+        );
+
+        // 首次摄入 → ready
+        let first = wait_doc_ready(&app, &kb_id, &doc_id).await;
+        assert!(first > 0);
+        assert_eq!(db.rag_count_kb_chunks(&kb_id).await.unwrap(), first);
+
+        // reindex → 立即返回 pending/processing
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "reindex: {body}");
+        let st = body["status"].as_str().unwrap_or("");
+        assert!(
+            st == "pending" || st == "processing",
+            "reindex immediate status should be pending/processing, got {st}"
+        );
+
+        // 重建完成 → ready，chunk 数一致；旧索引已清（无重复分块）
+        let second = wait_doc_ready(&app, &kb_id, &doc_id).await;
+        assert!(second > 0);
+        assert_eq!(
+            second, first,
+            "reindex should rebuild the same number of chunks"
+        );
+        assert_eq!(
+            db.rag_count_kb_chunks(&kb_id).await.unwrap(),
+            second,
+            "old chunks must be removed before re-ingest"
+        );
+
+        // 重建后可检索
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                format!("/api/llm/kb/{kb_id}/query"),
+                &json!({ "text": "怎么安装?" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "query after reindex: {body}");
+        assert!(
+            !body["chunks"].as_array().unwrap().is_empty(),
+            "query should hit rebuilt chunks"
+        );
     }
 }
