@@ -76,6 +76,13 @@ async fn do_ingest(
     let embedder = Embedder::new(&kb.emb_base_url, &api_key, &kb.emb_model);
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let vectors = embedder.embed(&texts).await.map_err(|e| e.to_string())?;
+    if vectors.len() != texts.len() {
+        return Err(format!(
+            "embedding count mismatch: sent {}, got {}",
+            texts.len(),
+            vectors.len()
+        ));
+    }
 
     // 写向量 + 元数据
     let mut points = Vec::with_capacity(chunks.len());
@@ -146,6 +153,39 @@ mod tests {
             post(move |body: Json<Value>| async move {
                 let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
                 let data: Vec<_> = (0..n)
+                    .map(|i| {
+                        json!({
+                            "index": i,
+                            "embedding": vec![0.1f32; dim],
+                            "object": "embedding"
+                        })
+                    })
+                    .collect();
+                Json(json!({"object": "list", "data": data}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// 起一个返回固定 embedding 的本地 HTTP server，但 data 比 input 少一条
+    /// （模拟服务商部分结果，触发 do_ingest 的 count mismatch 校验）。
+    async fn mock_embedding_server_short(dim: usize) -> String {
+        use axum::extract::Json;
+        use axum::routing::post;
+        use axum::Router;
+        use serde_json::{json, Value};
+        let app = Router::new().route(
+            "/embeddings",
+            post(move |body: Json<Value>| async move {
+                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let data: Vec<_> = (0..n.saturating_sub(1))
                     .map(|i| {
                         json!({
                             "index": i,
@@ -254,5 +294,51 @@ mod tests {
         let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
         assert_eq!(doc.status, "failed");
         assert!(doc.error.as_deref().is_some_and(|e| !e.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn embed_count_mismatch_marks_doc_failed() {
+        let db = Database::new(":memory:").await.expect("in-memory db");
+        // mock 返回的向量比输入文本少一条 → do_ingest 报 count mismatch，
+        // 而非静默丢弃尾部 chunk 后仍报 ready。
+        let base = mock_embedding_server_short(8).await;
+        let kb = create_kb(&db, "kb-short", &base, 8).await;
+        let doc_id = "doc-short".to_string();
+        db.rag_create_document(&doc_id, &kb.id, "y.md", "sha256:y")
+            .await
+            .unwrap();
+        // 内容需产生至少 2 个 chunk，使 mock 的 n-1 返回值非空
+        // （否则会先触发 embedder 的 EmptyResponse，而非本校验）。
+        let content = "# A\n\n段落一。\n\n## B\n\n段落二。\n".to_string();
+
+        let (_d, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(16);
+        spawn_ingest(
+            db.clone(),
+            store.clone(),
+            None,
+            kb.clone(),
+            doc_id.clone(),
+            content,
+            tx,
+        );
+
+        // 事件序列：processing → failed，error 含 count mismatch
+        let s1 = next_event(&mut rx).await;
+        assert_eq!(s1.status, "processing");
+        let s2 = next_event(&mut rx).await;
+        assert_eq!(s2.status, "failed");
+        let err = s2.error.as_deref().expect("failed event has error");
+        assert!(err.contains("count mismatch"), "error should mention count mismatch: {err}");
+
+        let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
+        assert_eq!(doc.status, "failed");
+        assert!(doc
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("count mismatch")));
+        // 尾部 chunk 未入索引：count 保持 0
+        assert_eq!(doc.chunk_count, 0);
+        assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
     }
 }
