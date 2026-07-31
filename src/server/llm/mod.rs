@@ -267,6 +267,8 @@ pub struct LlmState {
     pub cipher: Option<crate::server::llm::crypto::LlmCipher>,
     /// RAG 向量存储（知识库检索）。
     pub rag_store: rag::store::VectorStore,
+    /// RAG 摄入状态事件通道（SSE 推送给前端）。
+    pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
 }
 
 impl LlmState {
@@ -290,6 +292,7 @@ impl LlmState {
             gateway_config: Arc::new(RwLock::new(None)),
             cipher,
             rag_store: rag::store::VectorStore::new(rag_data_dir),
+            rag_tx: tokio::sync::broadcast::channel(256).0,
         }
     }
 }
