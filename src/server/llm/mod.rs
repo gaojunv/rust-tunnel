@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod format;
 pub mod openai_handler;
 pub mod provider;
+pub mod rag;
 pub mod router;
 pub mod upstream;
 pub mod usage;
