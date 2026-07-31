@@ -105,6 +105,16 @@ pub struct ProviderConfig {
     pub updated_at: String,
 }
 
+/// 三态反序列化：字段缺失 → `None`；显式 `null` → `Some(None)`；字符串 → `Some(Some(s))`。
+/// 裸 `Option<String>` 无法区分前两者（serde 把缺失/null 都映到 None），
+/// 导致前端“清除 extra_config”的显式 null 被误当“保留原值”，开关永远关不掉。
+fn deserialize_nullable_string<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(<Option<String> as serde::Deserialize>::deserialize(d)?))
+}
+
 /// Request body for creating/updating a provider.
 #[derive(Debug, serde::Deserialize)]
 pub struct ProviderRequest {
@@ -112,7 +122,9 @@ pub struct ProviderRequest {
     pub provider_type: String,
     pub base_url: String,
     pub api_key: String,
-    pub extra_config: Option<String>,
+    /// 三态语义：缺失 = 不修改；`null` = 清除；字符串 = 覆盖。
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub extra_config: Option<Option<String>>,
     /// Anthropic Messages API base URL; 留空或 null 表示不支持。
     pub anthropic_base_url: Option<String>,
 }

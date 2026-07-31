@@ -222,10 +222,11 @@ pub async fn create_provider(
     // 敏感字段落库前加密（AES-256-GCM；未配置主密钥时明文兼容）
     let cipher = llm_cipher(&state).await;
     let api_key = encrypt_field(cipher.as_ref(), &body.api_key);
+    // 新建：null 或缺失均视为“无配置”
     let extra_config = body
         .extra_config
-        .as_deref()
-        .map(|ec| encrypt_field(cipher.as_ref(), ec));
+        .flatten()
+        .map(|ec| encrypt_field(cipher.as_ref(), &ec));
 
     if let Err(e) = db
         .llm_save_provider(
@@ -294,7 +295,7 @@ pub async fn update_provider(
 
     // 敏感字段的“未提供即保留”语义：
     // - api_key 为空 → 沿用已存密文（不要二次加密）
-    // - extra_config 为 None → 沿用已有值；Some → 加密后覆盖
+    // - extra_config 三态：字段缺失 → 沿用已有值；显式 null → 清除；字符串 → 加密后覆盖
     let api_key = if body.api_key.is_empty() {
         existing.api_key.clone()
     } else {
@@ -302,7 +303,8 @@ pub async fn update_provider(
     };
     let extra_config = match &body.extra_config {
         None => existing.extra_config.clone(),
-        Some(ec) => Some(encrypt_field(cipher.as_ref(), ec)),
+        Some(None) => None,
+        Some(Some(ec)) => Some(encrypt_field(cipher.as_ref(), ec)),
     };
     // anthropic_base_url: None 表示不修改，Some 表示更新（含清空）
     let anthropic_base_url = body

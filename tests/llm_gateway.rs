@@ -477,6 +477,78 @@ async fn llm_mgmt_crud_flow() {
     .expect("test timed out");
 }
 
+/// 复现前端「关闭 Tool history compatibility mode 保存后刷新仍显示开启」：
+/// 前端关闭开关时 PUT 会显式携带 `"extra_config": null`（mergeCompat 返回 null），
+/// 语义应为“清除”；若后端把 None 当“保留原值”，开关就永远关不掉。
+#[tokio::test(flavor = "multi_thread")]
+async fn llm_provider_extra_config_explicit_null_clears() {
+    tokio::time::timeout(TIMEOUT, async {
+        let harness = TestHarness::spawn(HarnessOpts {
+            exposed_port_count: 1,
+            ..HarnessOpts::default()
+        })
+        .await;
+        let api = harness.api_client();
+
+        // 创建：开启 compat（等价前端开开关保存）
+        let (status, body) = api
+            .post_json(
+                "/api/llm/providers",
+                json!({
+                    "name": "compat",
+                    "provider_type": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "sk-x",
+                    "extra_config": "{\"compat_tool_history\":true}"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let pid = body["id"].as_str().unwrap().to_string();
+
+        // GET 回显应为明文 true
+        let (_, body) = api.get_json("/api/llm/providers").await;
+        let p = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == pid)
+            .unwrap();
+        assert_eq!(p["extra_config"], json!("{\"compat_tool_history\":true}"));
+
+        // 关闭开关保存：前端显式发 "extra_config": null
+        let (status, _) = api
+            .put_json(
+                &format!("/api/llm/providers/{pid}"),
+                json!({
+                    "name": "compat",
+                    "provider_type": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "",
+                    "extra_config": null
+                }),
+            )
+            .await;
+        assert!(status.is_success());
+
+        // 刷新后 GET 回显应为 null（开关关闭）
+        let (_, body) = api.get_json("/api/llm/providers").await;
+        let p = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == pid)
+            .unwrap();
+        assert!(
+            p["extra_config"].is_null(),
+            "explicit null extra_config must clear the value, got {}",
+            p["extra_config"]
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
 // ── 测试：OpenAI 端点端到端 ─────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
