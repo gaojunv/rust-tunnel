@@ -209,6 +209,8 @@ pub struct UsageContext {
     /// "openai" / "anthropic"。
     pub protocol: String,
     pub stream: bool,
+    /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
+    pub rag_chunks_injected: Option<i64>,
 }
 
 impl UsageContext {
@@ -239,6 +241,7 @@ impl UsageContext {
             total_tokens: usage.total_tokens,
             latency_ms,
             error_type,
+            rag_chunks_injected: self.rag_chunks_injected,
         }
     }
 }

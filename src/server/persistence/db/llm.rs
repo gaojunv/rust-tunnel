@@ -65,6 +65,8 @@ pub struct LlmUsageLogRecord {
     pub total_tokens: i64,
     pub latency_ms: i64,
     pub error_type: Option<String>,
+    /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
+    pub rag_chunks_injected: Option<i64>,
 }
 
 /// 待插入的用量日志（各标识可空——认证/路由失败时部分字段缺失）。
@@ -88,6 +90,7 @@ pub struct LlmUsageInsert {
     pub total_tokens: i64,
     pub latency_ms: i64,
     pub error_type: Option<String>,
+    pub rag_chunks_injected: Option<i64>,
 }
 
 /// 一个聚合维度的用量汇总行。
@@ -378,8 +381,8 @@ impl Database {
                 id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                 model_id, model_name, requested_model, protocol, stream, status_code,
                 success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-                completion_tokens, total_tokens, latency_ms, error_type
-            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -401,6 +404,7 @@ impl Database {
         .bind(u.total_tokens)
         .bind(u.latency_ms)
         .bind(&u.error_type)
+        .bind(u.rag_chunks_injected)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -480,7 +484,11 @@ impl Database {
     ) -> Result<Vec<LlmUsageLogRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmUsageLogRecord>(
             r#"
-            SELECT * FROM llm_usage_logs
+            SELECT id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
+                   model_id, model_name, requested_model, protocol, stream, status_code,
+                   success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+                   completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
+            FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -776,6 +784,7 @@ mod tests {
             total_tokens: prompt + completion,
             latency_ms: 123,
             error_type: None,
+            rag_chunks_injected: None,
         }
     }
 
@@ -858,5 +867,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_log_records_rag_chunks_injected() {
+        let (db, _tmp) = fresh_db().await;
+
+        let insert = LlmUsageInsert {
+            api_key_name: "k".into(),
+            provider_name: "p".into(),
+            model_name: "m".into(),
+            requested_model: "m".into(),
+            protocol: "openai".into(),
+            stream: false,
+            status_code: 200,
+            success: true,
+            rag_chunks_injected: Some(3),
+            ..Default::default()
+        };
+        db.llm_insert_usage_log(&insert).await.unwrap();
+        let logs = db
+            .llm_query_usage_logs("2000-01-01", "2100-01-01", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs[0].rag_chunks_injected, Some(3));
     }
 }
