@@ -38,6 +38,8 @@ pub struct LlmApiKeyRecord {
     pub enabled: i32,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// 绑定的 RAG 知识库 id（未绑定时为 None）。
+    pub kb_id: Option<String>,
 }
 
 /// 一条 LLM 网关请求的用量日志。
@@ -323,17 +325,19 @@ impl Database {
         key_hash: &str,
         key_prefix: &str,
         name: &str,
+        kb_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO llm_api_keys (id, key_hash, key_prefix, name)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO llm_api_keys (id, key_hash, key_prefix, name, kb_id)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
         .bind(key_hash)
         .bind(key_prefix)
         .bind(name)
+        .bind(kb_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -704,7 +708,7 @@ mod tests {
         let (db, _tmp) = fresh_db().await;
 
         let id = uuid::Uuid::new_v4().to_string();
-        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor")
+        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor", None)
             .await
             .unwrap();
 
@@ -712,6 +716,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "Cursor");
         assert_eq!(keys[0].key_prefix, "sk-abc...xyz");
+        assert_eq!(keys[0].kb_id, None, "未绑定时 kb_id 应为 None");
 
         // Find by hash
         let found = db

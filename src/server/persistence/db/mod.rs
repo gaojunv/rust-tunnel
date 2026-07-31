@@ -12,6 +12,7 @@ pub mod llm;
 pub mod logs;
 pub mod mesh;
 pub mod proxy_rules;
+pub mod rag;
 pub mod records;
 pub mod reverse_proxy;
 pub mod schema;

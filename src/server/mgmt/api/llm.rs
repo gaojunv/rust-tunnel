@@ -553,7 +553,7 @@ pub async fn create_api_key(
     let (key, hash, prefix) = generate_api_key();
     let id = uuid::Uuid::new_v4().to_string();
 
-    if let Err(e) = db.llm_save_api_key(&id, &hash, &prefix, &body.name).await {
+    if let Err(e) = db.llm_save_api_key(&id, &hash, &prefix, &body.name, None).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("DB error: {}", e),

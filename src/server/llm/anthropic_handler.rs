@@ -879,7 +879,7 @@ mod tests {
 
         let (key, hash, prefix) = crate::server::llm::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_api_key(&kid, &hash, &prefix, "test")
+        db.llm_save_api_key(&kid, &hash, &prefix, "test", None)
             .await
             .unwrap();
 
