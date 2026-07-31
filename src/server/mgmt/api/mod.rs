@@ -21,6 +21,7 @@ pub mod login;
 pub mod logs;
 pub mod mesh;
 pub mod preferences;
+pub mod rag;
 pub mod reverse_proxy;
 pub mod server_auth;
 pub mod settings;
@@ -217,6 +218,7 @@ pub async fn run_api_server(
         .route("/api/health", get(login::health))
         .route("/api/stats/stream", get(stats::sse_stats_stream))
         .route("/api/logs/stream", get(logs::sse_log_stream))
+        .route("/api/llm/kb/events", get(rag::sse_kb_events))
         .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)
@@ -334,6 +336,29 @@ pub async fn run_api_server(
         .route("/api/llm/usage/summary", get(llm::get_usage_summary))
         .route("/api/llm/usage/aggregate", get(llm::get_usage_aggregate))
         .route("/api/llm/usage/logs", get(llm::get_usage_logs))
+        // RAG knowledge base management (SSE events endpoint is in public_routes — uses ?token= query param)
+        .route("/api/llm/kb", get(rag::list_kbs).post(rag::create_kb))
+        .route(
+            "/api/llm/kb/:id",
+            get(rag::get_kb)
+                .put(rag::update_kb)
+                .patch(rag::patch_kb)
+                .delete(rag::delete_kb),
+        )
+        .route(
+            "/api/llm/kb/:id/docs",
+            get(rag::list_docs).post(rag::upload_doc),
+        )
+        .route(
+            "/api/llm/kb/:id/docs/:doc_id",
+            get(rag::get_doc).delete(rag::delete_doc),
+        )
+        .route(
+            "/api/llm/kb/:id/docs/:doc_id/reindex",
+            post(rag::reindex_doc),
+        )
+        .route("/api/llm/kb/test-embedding", post(rag::test_embedding))
+        .route("/api/llm/kb/:id/query", post(rag::query_kb))
         // User preferences
         .route("/api/preferences", put(preferences::put_preferences))
         // Settings endpoints

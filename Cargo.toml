@@ -45,7 +45,7 @@ rand = "0.8"
 get_if_addrs = "0.5.3"
 
 # Web framework
-axum = { version = "0.7", features = ["json"] }
+axum = { version = "0.7", features = ["json", "multipart"] }
 # serde_html_form 版 Query 提取器，支持重复的查询参数（如 entity_type=a&entity_type=b）
 axum-extra = { version = "0.9", features = ["query"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
@@ -120,6 +120,7 @@ trust-dns-resolver = "0.23"
 embed-frontend = ["rust-embed"]
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
