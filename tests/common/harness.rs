@@ -140,7 +140,14 @@ impl TestHarness {
         // provider API key encryption at rest.
         state
             .proxy_state
-            .init_llm_state(state.db().cloned(), Some([42u8; 32]))
+            .init_llm_state(
+                state.db().cloned(),
+                Some([42u8; 32]),
+                // RAG 向量数据根目录：与生产一致，用 DB 所在目录（VectorStore 内部再拼 rag/<kb_id>）
+                std::path::Path::new(&config.db_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(".")),
+            )
             .await;
         let proxy_state = state.proxy_state.clone();
 

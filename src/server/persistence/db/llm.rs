@@ -371,6 +371,19 @@ impl Database {
         Ok(())
     }
 
+    /// 查询某 api key 绑定的知识库 id（未绑定返回 None）。
+    pub async fn rag_get_kb_id_for_api_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT kb_id FROM llm_api_keys WHERE id = ?")
+                .bind(key_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
     // ── Usage logs ────────────────────────────────────────────────
 
     /// 插入一条用量日志。timestamp 由 DB 用 datetime('now') 填充（UTC）。

@@ -10,6 +10,7 @@ pub mod router;
 pub mod upstream;
 pub mod usage;
 
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -264,17 +265,31 @@ pub struct LlmState {
     pub gateway_config: Arc<RwLock<Option<LlmGatewayConfig>>>,
     /// 字段加密器（提供商 API Key 等敏感字段的落库加密）；None 表示未配置主密钥。
     pub cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    /// RAG 向量存储（知识库检索）。
+    pub rag_store: rag::store::VectorStore,
 }
 
 impl LlmState {
+    /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
+    /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录。
     pub fn new(
         db: Option<Database>,
         cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    ) -> Self {
+        Self::new_with_rag(db, cipher, Path::new(&std::env::temp_dir()))
+    }
+
+    /// 指定 RAG 数据目录构造（知识库向量 shard 位于 `<rag_data_dir>/rag/<kb_id>/`）。
+    pub fn new_with_rag(
+        db: Option<Database>,
+        cipher: Option<crate::server::llm::crypto::LlmCipher>,
+        rag_data_dir: &Path,
     ) -> Self {
         Self {
             db,
             gateway_config: Arc::new(RwLock::new(None)),
             cipher,
+            rag_store: rag::store::VectorStore::new(rag_data_dir),
         }
     }
 }

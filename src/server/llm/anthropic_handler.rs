@@ -335,7 +335,8 @@ pub async fn handle_messages(
         .unwrap_or(false);
 
     // 用量采集上下文
-    let ctx = super::usage::UsageContext {
+    let api_key_id_for_rag = api_key_id.clone();
+    let mut ctx = super::usage::UsageContext {
         api_key_id: Some(api_key_id),
         api_key_name,
         provider_id: Some(provider.id.clone()),
@@ -385,6 +386,26 @@ pub async fn handle_messages(
 
     let mut request = request;
     request.model = actual_model;
+
+    // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
+    // 直通路径（anthropic_base_url 分支）不注入 —— 规格边界。
+    let mut rag_injected: i64 = 0;
+    if let Some(ref db) = db {
+        if let Ok(Some(kb_id)) = db.rag_get_kb_id_for_api_key(&api_key_id_for_rag).await {
+            let outcome = super::rag::enhance(
+                db,
+                &state.llm.rag_store,
+                state.llm.cipher.as_ref(),
+                &kb_id,
+                &mut request,
+            )
+            .await;
+            rag_injected = outcome.injected as i64;
+        }
+    }
+    if rag_injected > 0 {
+        ctx.rag_chunks_injected = Some(rag_injected);
+    }
 
     let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     if compat_enabled {

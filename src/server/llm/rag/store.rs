@@ -78,6 +78,15 @@ pub struct VectorStore {
     shards: Arc<Mutex<HashMap<String, Arc<qdrant_edge::EdgeShard>>>>,
 }
 
+// 手动实现 Debug（EdgeShard 不实现 Debug，且其内部状态在锁内）：只暴露 data_dir。
+impl fmt::Debug for VectorStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VectorStore")
+            .field("data_dir", &self.data_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 impl VectorStore {
     pub fn new(data_dir: &Path) -> Self {
         Self {
