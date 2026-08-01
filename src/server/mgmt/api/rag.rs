@@ -145,8 +145,8 @@ fn validate_kb_params(
     chunk_overlap: i64,
     score_threshold: f64,
 ) -> Option<String> {
-    if top_k < 1 {
-        return Some("top_k must be >= 1".to_string());
+    if !(1..=20).contains(&top_k) {
+        return Some("top_k must be 1-20".to_string());
     }
     if chunk_size < 1 {
         return Some("chunk_size must be >= 1".to_string());
@@ -340,7 +340,17 @@ pub async fn patch_kb(
     }) else {
         return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
     };
-    let enabled = body["enabled"].as_bool().unwrap_or(false);
+    // 类型校验前置：非布尔 enabled 直接 400，避免 `as_bool().unwrap_or(false)`
+    // 把一次类型错误静默变成「禁用 KB」（对齐 api-key PATCH 的校验语义）。
+    let enabled = match body.get("enabled") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "enabled must be a boolean").into_response()
+        }
+        None => {
+            return (StatusCode::BAD_REQUEST, "enabled is required").into_response()
+        }
+    };
     if let Err(e) = rt.db.rag_toggle_kb(&id, enabled).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
@@ -452,6 +462,12 @@ pub async fn upload_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
     };
+
+    // 软关检查：delete_kb 先软关（enabled=0）再删数据。窗口期内到达的 upload
+    // 在此被拒，避免「删库竞态」重建 shard 目录、留下指向已删 KB 的 doc 行。
+    if kb.enabled == 0 {
+        return (StatusCode::CONFLICT, "knowledge base is disabled").into_response();
+    }
 
     // 读取文件字段：按 file_name 判定（首个带文件名且非空的字段即文件）。
     let mut filename: Option<String> = None;
@@ -669,6 +685,16 @@ pub async fn reindex_doc(
     };
     if doc.kb_id != kb_id {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
+    }
+
+    // 并发防护：pending/processing 表示原始摄入或上一次 reindex 仍在途，
+    // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。拒绝并让前端重试。
+    if doc.status == "pending" || doc.status == "processing" {
+        return (
+            StatusCode::CONFLICT,
+            "document is being processed, retry later".to_string(),
+        )
+            .into_response();
     }
 
     // 读原文（摄入时已落盘）。缺失 → 无法无损重建，提示删除重传。
@@ -1580,5 +1606,209 @@ mod tests {
             !body["chunks"].as_array().unwrap().is_empty(),
             "query should hit rebuilt chunks"
         );
+    }
+
+    #[tokio::test]
+    async fn create_and_update_enforce_top_k_cap() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let app = test_router(state);
+
+        // 边界值 top_k=20 → 允许
+        let req = json_request(
+            Method::POST,
+            "/api/llm/kb".to_string(),
+            &json!({
+                "name": "边界库",
+                "emb_base_url": base,
+                "emb_model": "m",
+                "emb_dimension": 8,
+                "top_k": 20,
+            }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "top_k=20 应允许: {body}");
+        let kb_id = body["id"].as_str().expect("kb id").to_string();
+
+        // 超上限 top_k=21 → 400，消息为 "top_k must be 1-20"
+        let req = json_request(
+            Method::POST,
+            "/api/llm/kb".to_string(),
+            &json!({
+                "name": "超限库",
+                "emb_base_url": base,
+                "emb_model": "m",
+                "emb_dimension": 8,
+                "top_k": 21,
+            }),
+        );
+        let (status, body_text) = call_raw(&app, req).await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST, "top_k=21 应 400");
+        assert!(
+            body_text.contains("top_k must be 1-20"),
+            "错误消息应提示 1-20, got: {body_text}"
+        );
+
+        // 更新路径同样受限于上限
+        let (status, body_text) = call_raw(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "name": "改名", "top_k": 21, "chunk_size": 512, "chunk_overlap": 64 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST, "update top_k=21 应 400");
+        assert!(body_text.contains("top_k must be 1-20"));
+    }
+
+    #[tokio::test]
+    async fn patch_kb_rejects_non_boolean_enabled() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 非布尔 → 400，且不得静默禁用 KB
+        let (status, _body) = call(
+            &app,
+            json_request(
+                Method::PATCH,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "enabled": "yes" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+    }
+
+    #[tokio::test]
+    async fn patch_kb_rejects_missing_enabled_and_preserves_state() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+
+        // 空体 {} → 400（不再静默禁用）
+        let (status, _body) = call(
+            &app,
+            json_request(Method::PATCH, format!("/api/llm/kb/{kb_id}"), &json!({})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert_eq!(
+            db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled,
+            1,
+            "空 PATCH 不得把 KB 静默禁用"
+        );
+
+        // 非布尔 → 400，状态不变
+        let (status, _body) = call(
+            &app,
+            json_request(
+                Method::PATCH,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "enabled": 1 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_to_disabled_kb_rejected() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 软关 KB
+        db.rag_toggle_kb(&kb_id, false).await.unwrap();
+
+        // 上传 → 409 "knowledge base is disabled"（与 delete_kb 的软关配合）
+        let boundary = "b-disabled";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body(boundary, "a.md", "hi")))
+            .expect("build request");
+        let (status, body_text) = call_raw(&app, req).await;
+        assert_eq!(status, HttpStatus::CONFLICT);
+        assert!(
+            body_text.contains("knowledge base is disabled"),
+            "禁用 KB 上传应提示 disabled, got: {body_text}"
+        );
+        // 未留下任何 doc 记录/原文文件
+        assert!(db.rag_list_documents(&kb_id).await.unwrap().is_empty());
+        assert!(!dir.path().join("rag_docs").join(&kb_id).exists());
+    }
+
+    #[tokio::test]
+    async fn reindex_rejected_while_doc_processing() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 手工构造一个 status=processing 的 doc + 落盘原文（确定性，无时序竞态）
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_document(&doc_id, &kb_id, "busy.md", "sha256:x")
+            .await
+            .unwrap();
+        db.rag_update_document_status(&doc_id, "processing", 0, None)
+            .await
+            .unwrap();
+        let source_path = dir.path().join("rag_docs").join(&kb_id).join(format!("{doc_id}.md"));
+        tokio::fs::create_dir_all(source_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source_path, "# busy").await.unwrap();
+
+        // 在途 reindex → 409 "document is being processed, retry later"
+        let (status, body_text) = call_raw(
+            &app,
+            json_request(
+                Method::POST,
+                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::CONFLICT);
+        assert!(
+            body_text.contains("document is being processed, retry later"),
+            "processing 中 reindex 应 409, got: {body_text}"
+        );
+        // pending 同样拒绝
+        db.rag_update_document_status(&doc_id, "pending", 0, None)
+            .await
+            .unwrap();
+        let (status, _body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                format!("/api/llm/kb/{kb_id}/docs/{doc_id}/reindex"),
+                &json!(null),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::CONFLICT);
     }
 }

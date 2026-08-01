@@ -98,7 +98,19 @@ async fn do_ingest(
     }
     store.upsert(&kb.id, kb.emb_dimension as usize, points).await
         .map_err(|e| e.to_string())?;
-    db.rag_insert_chunks(&rows).await.map_err(|e| e.to_string())?;
+    if let Err(e) = db.rag_insert_chunks(&rows).await {
+        // 回滚本任务刚写入的向量：rag_insert_chunks 失败意味着元数据未落库
+        // （FK 失败——doc 在摄入中途被删、或库被软关后的竞态），不清理则这些
+        // 向量永久残留（chunk id 不在 rag_chunks 中，检索不可见，纯磁盘泄漏）。
+        // best-effort：失败仅 warn，DB 仍是源，不影响错误上报。
+        if let Err(se) = store
+            .delete_by_doc(&kb.id, kb.emb_dimension as usize, doc_id)
+            .await
+        {
+            tracing::warn!(kb_id = %kb.id, doc_id, error = %se, "rag ingest: vector rollback failed");
+        }
+        return Err(e.to_string());
+    }
     Ok(chunks.len() as i64)
 }
 
@@ -339,6 +351,28 @@ mod tests {
             .is_some_and(|e| e.contains("count mismatch")));
         // 尾部 chunk 未入索引：count 保持 0
         assert_eq!(doc.chunk_count, 0);
+        assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_insert_failure_rolls_back_vectors() {
+        let db = Database::new(":memory:").await.expect("in-memory db");
+        let base = mock_embedding_server(8).await;
+        let kb = create_kb(&db, "kb-rollback", &base, 8).await;
+        let (_d, store) = tmp_store();
+
+        // 不创建 doc 行：rag_insert_chunks 因 FK（doc_id 不存在）失败。
+        // 这是「doc 在摄入中途被删 / insert 落库失败」的确定性模拟 ——
+        // upsert 已写入向量，随后 insert 失败，必须回滚本次向量防孤儿残留。
+        let content = "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n".to_string();
+        let res = do_ingest(&db, &store, None, &kb, "ghost-doc", &content).await;
+        assert!(res.is_err(), "FK 失败应使摄入失败: {res:?}");
+
+        // 向量已回滚：同 kb search 应为空（不留孤儿向量），分块也未落库。
+        let hits = store
+            .search(&kb.id, kb.emb_dimension as usize, &[1.0f32; 8], 10)
+            .await;
+        assert!(hits.is_empty(), "insert 失败后应回滚本次写入的向量");
         assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
     }
 }
