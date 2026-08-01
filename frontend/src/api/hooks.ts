@@ -8,6 +8,8 @@ import {
   updateTrojanConfig,
   getLogs,
   setLogsLevel,
+  getLlmLogging,
+  setLlmLogging,
   getProxyRules,
   createProxyRule,
   updateProxyRule,
@@ -142,6 +144,19 @@ export function useSetLogsLevel() {
       queryClient.invalidateQueries({ queryKey: ['logs'] });
     },
   });
+}
+
+export function useLlmLogging() {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: ['llm-logging'],
+    queryFn: getLlmLogging,
+  });
+  const mutation = useMutation({
+    mutationFn: setLlmLogging,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['llm-logging'] }),
+  });
+  return { ...query, setLlmLogging: mutation.mutate, isToggling: mutation.isPending };
 }
 
 // Reverse Proxy hooks

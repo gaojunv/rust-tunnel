@@ -698,6 +698,7 @@
     "description": "实时查看服务器和客户端日志",
     "levelPlaceholder": "级别",
     "logLevelPlaceholder": "日志级别",
+    "llmLogging": "LLM 请求日志",
     "sourcePlaceholder": "按来源筛选...",
     "searchPlaceholder": "搜索日志...",
     "pause": "暂停",

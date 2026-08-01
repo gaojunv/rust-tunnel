@@ -12,7 +12,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { PageHeader } from '@/components/layout/PageHeader';
-import { useSetLogsLevel } from '@/api/hooks';
+import { Switch } from '@/components/ui/switch';
+import { useSetLogsLevel, useLlmLogging } from '@/api/hooks';
 import { getLogs } from '@/api/client';
 import type { LogEntry } from '@/types';
 import {
@@ -66,6 +67,7 @@ export default function LogsPage() {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   const setLogsLevelMutation = useSetLogsLevel();
+  const { data: llmLogging, setLlmLogging } = useLlmLogging();
 
   // Fetch initial logs
   useEffect(() => {
@@ -212,6 +214,15 @@ export default function LogsPage() {
         description={t('logs.description')}
       >
         <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={llmLogging?.enabled ?? true}
+              onCheckedChange={(checked) => setLlmLogging(checked)}
+            />
+            <span className="text-sm text-muted-foreground">
+              {t('logs.llmLogging')}
+            </span>
+          </div>
           <Select value={serverLogLevel} onValueChange={handleServerLogLevelChange}>
             <SelectTrigger className="w-[130px]">
               <Terminal className="mr-2 h-4 w-4" />

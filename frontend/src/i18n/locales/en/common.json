@@ -698,6 +698,7 @@
     "description": "Real-time server and client log viewer",
     "levelPlaceholder": "Level",
     "logLevelPlaceholder": "Log level",
+    "llmLogging": "LLM request logging",
     "sourcePlaceholder": "Filter by source...",
     "searchPlaceholder": "Search logs...",
     "pause": "Pause",

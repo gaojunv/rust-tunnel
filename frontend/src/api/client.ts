@@ -139,6 +139,16 @@ export const setLogsLevel = async (level: string): Promise<{ level: string }> =>
   return response.data;
 };
 
+export const getLlmLogging = async (): Promise<{ enabled: boolean }> => {
+  const response = await api.get<{ enabled: boolean }>('/logs/llm-logging');
+  return response.data;
+};
+
+export const setLlmLogging = async (enabled: boolean): Promise<{ enabled: boolean }> => {
+  const response = await api.put<{ enabled: boolean }>('/logs/llm-logging', { enabled });
+  return response.data;
+};
+
 // Mesh API
 export const getMeshes = async (): Promise<MeshNetworkResponse[]> => {
   const response = await api.get<MeshNetworkResponse[]>('/mesh');
