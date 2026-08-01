@@ -372,6 +372,11 @@ export async function toggleLlmApiKey(id: string, enabled: boolean): Promise<voi
   await api.patch(`/llm/api-keys/${id}`, { enabled });
 }
 
+/** 绑定/解绑 API 密钥的 RAG 知识库。kbId 为 null 时解绑。 */
+export async function bindLlmApiKey(id: string, kbId: string | null): Promise<void> {
+  await api.patch(`/llm/api-keys/${id}`, { kb_id: kbId });
+}
+
 export async function deleteLlmApiKey(id: string): Promise<void> {
   await api.delete(`/llm/api-keys/${id}`);
 }

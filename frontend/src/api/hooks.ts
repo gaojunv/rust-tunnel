@@ -41,6 +41,7 @@ import {
   listLlmApiKeys,
   createLlmApiKey,
   toggleLlmApiKey,
+  bindLlmApiKey,
   deleteLlmApiKey,
   getLlmUsageSummary,
   getLlmUsageAggregate,
@@ -488,6 +489,14 @@ export function useToggleLlmApiKey() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleLlmApiKey(id, enabled),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
+}
+
+export function useBindLlmApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, kbId }: { id: string; kbId: string | null }) => bindLlmApiKey(id, kbId),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
   });
 }

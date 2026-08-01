@@ -330,6 +330,8 @@ export interface LlmApiKey {
   enabled: boolean;
   created_at: string;
   last_used_at?: string | null;
+  /** 绑定的 RAG 知识库 id（未绑定为 null）。 */
+  kb_id?: string | null;
 }
 
 export interface CreateApiKeyResponse {

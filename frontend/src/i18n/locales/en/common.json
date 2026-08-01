@@ -581,7 +581,11 @@
       "empty": "No API keys created yet.",
       "unnamed": "Unnamed",
       "revokeConfirm": "Revoke this API key?",
-      "dismiss": "Dismiss"
+      "dismiss": "Dismiss",
+      "kbBind": "Bind Knowledge Base",
+      "kbNone": "None",
+      "kbDeleted": "Deleted",
+      "bindError": "Bind failed: {{error}}"
     },
     "usage": {
       "stats": {

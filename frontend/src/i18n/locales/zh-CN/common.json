@@ -581,7 +581,11 @@
       "empty": "暂未创建 API 密钥。",
       "unnamed": "未命名",
       "revokeConfirm": "撤销此 API 密钥？",
-      "dismiss": "关闭"
+      "dismiss": "关闭",
+      "kbBind": "绑定知识库",
+      "kbNone": "无",
+      "kbDeleted": "已删除",
+      "bindError": "绑定失败：{{error}}"
     },
     "usage": {
       "stats": {
