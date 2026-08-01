@@ -76,7 +76,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
   - `logs.rs` — 自定义 tracing Layer，捕获日志到内存 + SQLite，API 支持分页/过滤
   - `stats.rs` — 实时质量监控、RTT/丢包/吞吐量追踪、评分（0-100）、阈值告警、历史采样
   - `dynamic_config.rs` — 动态配置管理
-- `llm/` — LLM 网关：OpenAI/Anthropic 双协议入口（`openai_handler.rs`/`anthropic_handler.rs`）、provider/model/api-key 管理、用量日志、compat 工具调用改写；`llm/rag/` — RAG 知识库：`chunker`（Markdown 分块）、`embedder`（远端 embedding）、`store`（qdrant-edge 向量 shard）、`retriever`（检索+注入）、`ingest`（后台摄入任务）
+- `llm/` — LLM 网关：OpenAI/Anthropic 双协议入口（`openai_handler.rs`/`anthropic_handler.rs`）、provider/model/api-key 管理、用量日志、compat 工具调用改写；`llm/rag/` — RAG 知识库：`extractor`（多格式文本提取：PDF/Word/Excel/PPT→Markdown）、`chunker`（Markdown 分块）、`embedder`（远端 embedding）、`store`（qdrant-edge 向量 shard）、`retriever`（检索+注入）、`ingest`（后台摄入任务）
 - `pki/` — 证书与 ACME 自动续签
 - `net/` — 网络基建（listener/dns/mesh）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
