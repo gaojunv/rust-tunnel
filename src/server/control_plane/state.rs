@@ -97,6 +97,7 @@ impl ServerState {
             dns_provider_config: Arc::new(RwLock::new(None)),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
                 log_level: "info".to_string(),
+                llm_request_logging: true,
                 ss: None,
                 trojan: None,
                 reverse_proxy: crate::server::dynamic_config::ReverseProxySettings {
@@ -144,6 +145,7 @@ impl ServerState {
             dns_provider_config: Arc::new(RwLock::new(None)),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
                 log_level: "info".to_string(),
+                llm_request_logging: true,
                 ss: None,
                 trojan: None,
                 reverse_proxy: crate::server::dynamic_config::ReverseProxySettings {
