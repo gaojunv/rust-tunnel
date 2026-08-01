@@ -11,6 +11,11 @@ use quick_xml::Reader;
 
 use super::error::ExtractError;
 
+/// 单部件解压后字节上限（20MB，与二进制上传上限一致；真实 XML 部件远小于此）。
+/// 上传的 zip 是不可信输入，deflate 解压膨胀比可达 ~1000:1，必须硬性封顶防止
+/// 解压炸弹 OOM（见 `read_part`）。
+const MAX_PART_BYTES: u64 = 20 * 1024 * 1024;
+
 /// 打开 OOXML zip 容器。
 pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractError> {
     zip::ZipArchive::new(Cursor::new(bytes))
@@ -20,18 +25,25 @@ pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractE
 /// 读取 zip 内一个部件为 UTF-8 字符串。
 ///
 /// 注意：不根据中央目录声明的 `part.size()` 预分配缓冲——该字段来自不可信
-/// 的 zip 头部，可伪造为任意大（见模块注释）。改用 `Vec::new()` 让
-/// `read_to_end` 按真实解压字节增长，天然受 inflate 实际输出约束。
+/// 的 zip 头部，可伪造为任意大（见模块注释）。改用 `Vec::new()` 按真实解压
+/// 字节增长，并用 `Read::take(MAX_PART_BYTES + 1)` 硬性封顶解压后大小：即使
+/// 头部伪造出超小尺寸，解压炸弹仍会在解压到上限后报 ParseFailed，绝不 OOM。
 pub fn read_part<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Result<String, ExtractError> {
-    let mut part = archive
+    let part = archive
         .by_name(name)
         .map_err(|_| ExtractError::ParseFailed(format!("missing part: {name}")))?;
     let mut buf = Vec::new();
-    part.read_to_end(&mut buf)
+    part.take(MAX_PART_BYTES + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| ExtractError::ParseFailed(format!("read part {name}: {e}")))?;
+    if buf.len() > MAX_PART_BYTES as usize {
+        return Err(ExtractError::ParseFailed(format!(
+            "part {name} exceeds {MAX_PART_BYTES} bytes"
+        )));
+    }
     String::from_utf8(buf).map_err(|_| ExtractError::ParseFailed(format!("part {name} not utf-8")))
 }
 
@@ -130,7 +142,7 @@ fn parse_heading_level(style: &str) -> Option<usize> {
 /// （严格实现应走 rels）。若遇到实际 sheet 顺序错乱的文件再补 rels 解析。
 pub fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let mut archive = open_zip(bytes)?;
-    let shared = read_shared_strings(&mut archive);
+    let shared = read_shared_strings(&mut archive)?;
     let sheet_names = read_sheet_names(&mut archive)?;
     let mut out = String::new();
     for (idx, name) in sheet_names.iter().enumerate() {
@@ -139,7 +151,7 @@ pub fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
         let Ok(xml) = read_part(&mut archive, &part) else {
             continue;
         };
-        let rows = parse_sheet_rows(&xml, &shared);
+        let rows = parse_sheet_rows(&xml, &shared)?;
         if rows.is_empty() {
             continue;
         }
@@ -157,10 +169,12 @@ pub fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
 }
 
 /// 解析 `xl/sharedStrings.xml`（可选部件，缺失则空表）：每个 `<si>` 内所有 `<t>`
-/// 文本拼接为一条共享字符串。
-fn read_shared_strings<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<String> {
+/// 文本拼接为一条共享字符串。解析错误整体失败（不静默截断成残缺表）。
+fn read_shared_strings<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<Vec<String>, ExtractError> {
     let Ok(xml) = read_part(archive, "xl/sharedStrings.xml") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut reader = Reader::from_str(&xml);
     reader.trim_text(true);
@@ -189,12 +203,12 @@ fn read_shared_strings<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<
                 strings.push(String::new());
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => return Err(ExtractError::ParseFailed(format!("sharedStrings xml: {e}"))),
             _ => {}
         }
         buf.clear();
     }
-    strings
+    Ok(strings)
 }
 
 /// 解析 `xl/workbook.xml` 的 `<sheet name="...">` 属性得 sheet 名列表。
@@ -224,7 +238,8 @@ fn read_sheet_names<R: Read + Seek>(
 }
 
 /// 解析 sheet 工作表的 `<row>`/`<c>`：返回每行按列号定位的文本（缺失列补空）。
-fn parse_sheet_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
+/// 解析错误整体失败（不静默截断成残缺表格）。
+fn parse_sheet_rows(xml: &str, shared: &[String]) -> Result<Vec<Vec<String>>, ExtractError> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -274,12 +289,12 @@ fn parse_sheet_rows(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => return Err(ExtractError::ParseFailed(format!("sheet xml: {e}"))),
             _ => {}
         }
         buf.clear();
     }
-    rows
+    Ok(rows)
 }
 
 /// 解析中的单元格：列位置（无 r 属性则按序追加）+ 是否共享字符串 + `<v>` 原始值。
@@ -407,7 +422,7 @@ pub fn pptx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
         let Ok(xml) = read_part(&mut archive, &part) else {
             continue;
         };
-        let blocks = parse_slide_blocks(&xml);
+        let blocks = parse_slide_blocks(&xml)?;
         let Some((title, rest)) = blocks.split_first() else {
             continue;
         };
@@ -418,7 +433,7 @@ pub fn pptx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
             out.push_str(block);
             out.push_str("\n\n");
         }
-        if let Some(notes) = read_notes(&mut archive, num) {
+        if let Some(notes) = read_notes(&mut archive, num)? {
             out.push_str("> 备注：");
             out.push_str(&notes);
             out.push_str("\n\n");
@@ -448,8 +463,8 @@ fn slide_parts<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Vec<(usize, Stri
 }
 
 /// 解析单页 slide XML：按 `<p:sp>`（shape）分组 `<a:t>` 文本，shape 内段落以
-/// 换行分隔；返回非空文本块（首个即标题）。
-fn parse_slide_blocks(xml: &str) -> Vec<String> {
+/// 换行分隔；返回非空文本块（首个即标题）。解析错误整体失败。
+fn parse_slide_blocks(xml: &str) -> Result<Vec<String>, ExtractError> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut blocks = Vec::new();
@@ -497,30 +512,34 @@ fn parse_slide_blocks(xml: &str) -> Vec<String> {
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => return Err(ExtractError::ParseFailed(format!("slide xml: {e}"))),
             _ => {}
         }
         buf.clear();
     }
-    blocks
+    Ok(blocks)
 }
 
 /// 对应页码的备注页（`ppt/notesSlides/notesSlideN.xml`，可选）：收集所有 `<a:t>`
-/// 文本，无文本返回 None。
-fn read_notes<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, num: usize) -> Option<String> {
+/// 文本，无文本返回 None。部件缺失容忍（None）；已存在部件的解析错误整体失败。
+fn read_notes<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    num: usize,
+) -> Result<Option<String>, ExtractError> {
     let part = format!("ppt/notesSlides/notesSlide{num}.xml");
     let Ok(xml) = read_part(archive, &part) else {
-        return None;
+        return Ok(None);
     };
-    let texts = collect_a_t_texts(&xml);
+    let texts = collect_a_t_texts(&xml)?;
     if texts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(texts.join("\n"))
+    Ok(Some(texts.join("\n")))
 }
 
 /// 收集 XML 中所有 `<a:t>` 文本（按文档序，单条去首尾空白、空条丢弃）。
-fn collect_a_t_texts(xml: &str) -> Vec<String> {
+/// 解析错误整体失败。
+fn collect_a_t_texts(xml: &str) -> Result<Vec<String>, ExtractError> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
     let mut texts = Vec::new();
@@ -546,12 +565,12 @@ fn collect_a_t_texts(xml: &str) -> Vec<String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => return Err(ExtractError::ParseFailed(format!("a:t texts xml: {e}"))),
             _ => {}
         }
         buf.clear();
     }
-    texts
+    Ok(texts)
 }
 
 #[cfg(test)]
@@ -784,6 +803,60 @@ pub(crate) mod tests {
         }
         assert!(matches!(
             pptx_to_markdown(&buf.into_inner()),
+            Err(ExtractError::ParseFailed(_))
+        ));
+    }
+
+    /// 回归（Finding #1）：zip 解压炸弹——document.xml 是 25MB 零的 deflate
+    /// （~1000:1 膨胀比，压缩后仅 ~25KB）。`read_part` 的 20MB 硬上限必须在
+    /// 解压到上限后报 ParseFailed，绝不 OOM、也绝不甘于静默成功。
+    #[test]
+    fn docx_zip_bomb_part_capped() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(b"<Types/>").unwrap();
+            zip.start_file("word/document.xml", opts).unwrap();
+            zip.write_all(&vec![0u8; 25 * 1024 * 1024]).unwrap();
+            zip.finish().unwrap();
+        }
+        let err = docx_to_markdown(&buf.into_inner()).unwrap_err();
+        assert!(
+            matches!(err, ExtractError::ParseFailed(ref m) if m.contains("exceeds")),
+            "expected size-cap ParseFailed, got: {err}"
+        );
+    }
+
+    /// 回归（Finding #3）：sheet XML 前半段合法、后半段损坏（闭合标签与 `<row>`
+    /// 不匹配）→ 必须 ParseFailed，不得静默截断成 Ok 的残缺表格。
+    #[test]
+    fn xlsx_garbage_sheet_fails_not_truncates() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(b"<Types/>").unwrap();
+            zip.start_file("xl/workbook.xml", opts).unwrap();
+            zip.write_all(br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="S" sheetId="1"/></sheets></workbook>"#).unwrap();
+            zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+            // 首行合法；第二行 `<c>` 闭合后出现与 `<row>` 不匹配的 `</roX>`
+            // → quick-xml 在事件流中途报 EndEventMismatch。
+            let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1"><v>ok</v></c></row>
+<row r="2"><c r="A2"><v>good</v></c></roX>
+</sheetData></worksheet>"#;
+            zip.write_all(sheet.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            xlsx_to_markdown(&buf.into_inner()),
             Err(ExtractError::ParseFailed(_))
         ));
     }

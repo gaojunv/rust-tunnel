@@ -11,6 +11,10 @@ pub use error::ExtractError;
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 /// 二进制类大小上限（20MB：带图 PPT/PDF 常达数 MB）。
 const MAX_BINARY_BYTES: usize = 20 * 1024 * 1024;
+/// 提取文本累计字节上限（20MB，与二进制上传上限一致）。PDF 逐页累计文本、
+/// OOXML 单部件解压共享同一数量级：上传的二进制是不可信输入，解压（deflate /
+/// FlateDecode）膨胀比可达 ~1000:1，必须在提取侧硬性封顶，防止膨胀到 GB 级。
+pub(crate) const MAX_EXTRACT_TEXT_BYTES: usize = 20 * 1024 * 1024;
 
 /// 支持摄入的文件类型。DB `rag_documents.file_type` 存 `as_str()` 值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +167,10 @@ mod tests {
     fn extract_text_passthrough() {
         let md = "# 标题\n\n内容。\n";
         assert_eq!(extract(md.as_bytes(), FileType::Markdown).unwrap(), md);
-        assert_eq!(extract(b"plain text", FileType::Text).unwrap(), "plain text");
+        assert_eq!(
+            extract(b"plain text", FileType::Text).unwrap(),
+            "plain text"
+        );
     }
 
     #[test]

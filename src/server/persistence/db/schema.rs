@@ -690,14 +690,16 @@ impl Database {
         }
     }
 
-    /// 回填 SQL：按 filename 扩展名推导 file_type。
+    /// 回填 SQL：旧版所有上传（含 .txt）一律落盘为 `<doc_id>.md`（原文不保留真实
+    /// 扩展名），故 legacy 行无条件回填 'md'。绝不能按 filename 扩展名推导——
+    /// 否则 notes.txt 会被推导成 'txt'，reindex 找 `.txt` 原文 409、delete 孤儿化
+    /// 真实的 `.md` 文件。
     /// 与 `Database::backfill_rag_document_file_type`（db/rag.rs）共享，避免两份 SQL 漂移。
     pub(crate) const BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL: &str =
-        "UPDATE rag_documents SET file_type = lower(substr(filename, instr(filename, '.') + 1)) \
-         WHERE file_type = '' AND instr(filename, '.') > 0";
+        "UPDATE rag_documents SET file_type = 'md' WHERE file_type = ''";
 
     /// Migration: old DBs lack `file_type` on `rag_documents`. Idempotent.
-    /// 列添加成功后在同一函数内按 filename 扩展名回填老数据（老数据只有 md/txt，必然可推导）。
+    /// 列添加成功后在同一函数内回填老数据为 'md'（老数据落盘一律 .md，见上方常量注释）。
     async fn migrate_rag_documents_add_file_type(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE rag_documents ADD COLUMN file_type TEXT NOT NULL DEFAULT ''")
             .execute(pool)

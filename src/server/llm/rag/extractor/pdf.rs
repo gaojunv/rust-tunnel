@@ -1,11 +1,26 @@
 //! PDF 文本层提取（lopdf）。扫描件（无文本层）返回 NoTextLayer。
 
 use super::error::ExtractError;
+use super::MAX_EXTRACT_TEXT_BYTES;
+
+/// 页面文本累计字节数守卫：累计超过 `MAX_EXTRACT_TEXT_BYTES`（20MB）返回
+/// ParseFailed，防止带 FlateDecode 流解压炸弹的 PDF 把文本层膨胀到 GB 级。
+/// 单独抽出便于单元测试（真实构造 >20MB 文本层的 PDF 成本高）。
+fn accumulate_page(total: &mut usize, text: &str) -> Result<(), ExtractError> {
+    *total = total.saturating_add(text.len());
+    if *total > MAX_EXTRACT_TEXT_BYTES {
+        return Err(ExtractError::ParseFailed(
+            "extracted text exceeds size cap".into(),
+        ));
+    }
+    Ok(())
+}
 
 /// 提取 PDF 文本层，按页组织，页间空行分隔。
 pub fn pdf_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let doc = lopdf::Document::load_mem(bytes)
         .map_err(|e| ExtractError::ParseFailed(format!("pdf load: {e}")))?;
+    let mut total = 0usize;
     let mut pages_out: Vec<String> = Vec::new();
     // get_pages() 返回 BTreeMap<页码, 页对象 id>；lopdf 0.32 的
     // extract_text 吃页码 `&[u32]`（内部再查页对象 id），故传页码。
@@ -13,6 +28,7 @@ pub fn pdf_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
         let text = doc.extract_text(&[page_no]).unwrap_or_default();
         let text = text.trim();
         if !text.is_empty() {
+            accumulate_page(&mut total, text)?;
             pages_out.push(text.to_string());
         }
     }
@@ -72,6 +88,34 @@ mod tests {
             pdf_to_markdown(&make_empty_page_pdf()),
             Err(ExtractError::NoTextLayer)
         ));
+    }
+
+    /// 回归（Finding #1）：文本累计上限——单页超限、跨页累计超限都 ParseFailed，
+    /// 绝不静默截断。真实构造 >20MB 文本层的 PDF 成本高，直接测累计守卫。
+    #[test]
+    fn page_text_accumulation_is_capped() {
+        // 单页一次性超限（恰好等于上限仍合法，超过上限才报错）
+        let mut total = 0usize;
+        let big = "x".repeat(MAX_EXTRACT_TEXT_BYTES + 1);
+        assert!(matches!(
+            accumulate_page(&mut total, &big),
+            Err(ExtractError::ParseFailed(_))
+        ));
+
+        // 跨页累计超限：两页各自合法，合起来超上限
+        let mut t = 0usize;
+        let half = MAX_EXTRACT_TEXT_BYTES / 2;
+        accumulate_page(&mut t, &"y".repeat(half)).unwrap();
+        accumulate_page(&mut t, &"z".repeat(half)).unwrap();
+        assert!(matches!(
+            accumulate_page(&mut t, "w"),
+            Err(ExtractError::ParseFailed(_))
+        ));
+
+        // 上限内合法且计数正确
+        let mut t2 = 0usize;
+        accumulate_page(&mut t2, "hello").unwrap();
+        assert_eq!(t2, "hello".len());
     }
 
     /// 程序化生成最小单页含文本 PDF（避免 repo 提交二进制 fixture）。

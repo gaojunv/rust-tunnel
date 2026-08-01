@@ -189,8 +189,8 @@ impl Database {
         Ok(())
     }
 
-    /// 测试/维护用：按 filename 扩展名回填空 file_type。
-    /// 与 schema.rs 迁移函数共享 `BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL`。
+    /// 测试/维护用：回填空 file_type 为 'md'（老数据落盘一律 .md，见 schema.rs
+    /// `BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL` 注释）。
     pub async fn backfill_rag_document_file_type(&self) -> Result<(), sqlx::Error> {
         sqlx::query(Self::BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL)
             .execute(&self.pool)
@@ -198,16 +198,30 @@ impl Database {
         Ok(())
     }
 
-    pub async fn rag_get_document(&self, id: &str) -> Result<Option<RagDocumentRecord>, sqlx::Error> {
-        sqlx::query_as::<_, RagDocumentRecord>("SELECT * FROM rag_documents WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
+    pub async fn rag_get_document(
+        &self,
+        id: &str,
+    ) -> Result<Option<RagDocumentRecord>, sqlx::Error> {
+        // 显式列：`SELECT *` 会在 ALTER TABLE 追加 file_type 后命中 sqlx 语句缓存中的
+        // 旧列元数据，与 RagDocumentRecord 的 FromRow 错位导致越界 panic（同 2201ba6
+        // llm_api_keys 的修法）。
+        sqlx::query_as::<_, RagDocumentRecord>(
+            "SELECT id, kb_id, filename, file_type, content_hash, status, chunk_count, \
+             error, created_at, updated_at FROM rag_documents WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
     }
 
-    pub async fn rag_list_documents(&self, kb_id: &str) -> Result<Vec<RagDocumentRecord>, sqlx::Error> {
+    pub async fn rag_list_documents(
+        &self,
+        kb_id: &str,
+    ) -> Result<Vec<RagDocumentRecord>, sqlx::Error> {
+        // 同上：显式列避免语句缓存旧元数据与 FromRow 错位。
         sqlx::query_as::<_, RagDocumentRecord>(
-            "SELECT * FROM rag_documents WHERE kb_id = ? ORDER BY created_at",
+            "SELECT id, kb_id, filename, file_type, content_hash, status, chunk_count, \
+             error, created_at, updated_at FROM rag_documents WHERE kb_id = ? ORDER BY created_at",
         )
         .bind(kb_id)
         .fetch_all(&self.pool)
@@ -583,16 +597,37 @@ mod tests {
     #[tokio::test]
     async fn migration_backfills_legacy_rows() {
         // 验证老数据回填规则：插入 file_type='' 的行（模拟迁移前的老数据），
-        // 跑回填方法后应按 filename 扩展名推导出类型。
+        // 跑回填方法后应无条件为 'md'（旧版所有上传一律落盘 .md）。
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb("kb2", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true)
-            .await
-            .unwrap();
+        db.rag_create_kb(
+            "kb2", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
+        )
+        .await
+        .unwrap();
         db.rag_create_document("legacy", "kb2", "old.md", "sha256:y", "")
             .await
             .unwrap();
         db.backfill_rag_document_file_type().await.unwrap();
         let doc = db.rag_get_document("legacy").await.unwrap().unwrap();
+        assert_eq!(doc.file_type, "md");
+    }
+
+    #[tokio::test]
+    async fn migration_backfill_sets_txt_legacy_rows_to_md() {
+        // 回归（Finding #2）：旧版 .txt 上传同样落盘为 <doc_id>.md（原文不保留
+        // 扩展名）。若按 filename 扩展名推导，notes.txt 会被回填成 'txt'，
+        // reindex 找 .txt 原文 409、delete 孤儿化真实 .md——回填必须锁定为 'md'。
+        let db = Database::new(":memory:").await.unwrap();
+        db.rag_create_kb(
+            "kb3", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
+        )
+        .await
+        .unwrap();
+        db.rag_create_document("legacy-txt", "kb3", "notes.txt", "sha256:z", "")
+            .await
+            .unwrap();
+        db.backfill_rag_document_file_type().await.unwrap();
+        let doc = db.rag_get_document("legacy-txt").await.unwrap().unwrap();
         assert_eq!(doc.file_type, "md");
     }
 }
