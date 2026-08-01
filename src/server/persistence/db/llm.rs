@@ -355,6 +355,20 @@ impl Database {
         Ok(())
     }
 
+    /// 绑定/解绑 api key 的知识库（`None` 解绑）。KB 存在性由调用方负责校验。
+    pub async fn llm_set_api_key_kb(
+        &self,
+        id: &str,
+        kb_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE llm_api_keys SET kb_id = ? WHERE id = ?")
+            .bind(kb_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn llm_delete_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM llm_api_keys WHERE id = ?")
             .bind(id)

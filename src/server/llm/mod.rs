@@ -149,12 +149,18 @@ pub struct ApiKeyView {
     pub enabled: bool,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// 绑定的 RAG 知识库 id（未绑定为 None）。
+    #[serde(default)]
+    pub kb_id: Option<String>,
 }
 
 /// Request body for creating an API key.
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
+    /// 可选：创建时即绑定 RAG 知识库（不存在则 400）。
+    #[serde(default)]
+    pub kb_id: Option<String>,
 }
 
 /// Response for API key creation — full key shown only once.
