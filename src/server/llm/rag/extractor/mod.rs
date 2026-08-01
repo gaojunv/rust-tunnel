@@ -93,10 +93,8 @@ pub fn extract(bytes: &[u8], file_type: FileType) -> Result<String, ExtractError
         }
         FileType::Pdf => pdf::pdf_to_markdown(bytes),
         FileType::Docx => ooxml::docx_to_markdown(bytes),
-        // 由后续 Task 实现（ooxml.rs）。
-        FileType::Xlsx | FileType::Pptx => {
-            Err(ExtractError::ParseFailed("ooxml parser not wired".into()))
-        }
+        FileType::Xlsx => ooxml::xlsx_to_markdown(bytes),
+        FileType::Pptx => ooxml::pptx_to_markdown(bytes),
     }
 }
 
@@ -183,5 +181,13 @@ mod tests {
         let out = extract(&bytes, FileType::Docx).unwrap();
         assert!(out.contains("# 安装指南"), "got: {out}");
         assert!(out.contains("第一步：下载。"), "got: {out}");
+    }
+
+    #[test]
+    fn extract_xlsx_and_pptx_dispatch_to_ooxml() {
+        let xlsx_out = extract(&ooxml::tests::make_test_xlsx(), FileType::Xlsx).unwrap();
+        assert!(xlsx_out.contains("| 姓名 | 年龄 |"), "got: {xlsx_out}");
+        let pptx_out = extract(&ooxml::tests::make_test_pptx(), FileType::Pptx).unwrap();
+        assert!(pptx_out.contains("## 产品方案"), "got: {pptx_out}");
     }
 }
