@@ -422,6 +422,7 @@ export interface LlmKbDocument {
   id: string;
   kb_id: string;
   filename: string;
+  file_type: string;
   content_hash: string;
   status: KbDocStatus;
   chunk_count: number;

@@ -669,7 +669,7 @@
     "docs": "文档",
     "uploadHint": "将 .md 或 .txt 文件拖到这里（每个最大 2MB）",
     "browse": "或点击选择文件",
-    "fileInvalid": "仅允许 .md 和 .txt 文件，且大小不超过 2MB",
+    "fileInvalid": "仅允许 .md/.txt/.pdf/.docx/.xlsx/.pptx 文件；文本类不超过 2MB，其他不超过 20MB",
     "saveError": "保存失败：{{error}}",
     "uploadError": "上传失败：{{error}}",
     "actionError": "操作失败：{{error}}",

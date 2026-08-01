@@ -669,7 +669,7 @@
     "docs": "Documents",
     "uploadHint": "Drop .md or .txt files here (max 2MB each)",
     "browse": "or click to browse",
-    "fileInvalid": "Only .md and .txt files up to 2MB are allowed",
+    "fileInvalid": "Only .md/.txt/.pdf/.docx/.xlsx/.pptx are allowed; text files up to 2MB, others up to 20MB",
     "saveError": "Failed to save: {{error}}",
     "uploadError": "Upload failed: {{error}}",
     "actionError": "Operation failed: {{error}}",

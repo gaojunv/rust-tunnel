@@ -31,8 +31,14 @@ import {
 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 
-const MAX_DOC_BYTES = 2 * 1024 * 1024;
-const ACCEPTED_EXTENSIONS = ['md', 'txt'];
+const TEXT_MAX_BYTES = 2 * 1024 * 1024;
+const BINARY_MAX_BYTES = 20 * 1024 * 1024;
+const ACCEPTED_EXTENSIONS = ['md', 'txt', 'pdf', 'docx', 'xlsx', 'pptx'];
+const TEXT_EXTENSIONS = ['md', 'txt'];
+
+function maxBytesFor(ext: string): number {
+  return TEXT_EXTENSIONS.includes(ext) ? TEXT_MAX_BYTES : BINARY_MAX_BYTES;
+}
 
 interface Props {
   kb: LlmKnowledgeBase;
@@ -157,8 +163,8 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
     let hasInvalid = false;
     const accepted: File[] = [];
     Array.from(list).forEach((f) => {
-      const ext = f.name.toLowerCase().split('.').pop();
-      if (ACCEPTED_EXTENSIONS.includes(ext ?? '') && f.size <= MAX_DOC_BYTES) {
+      const ext = f.name.toLowerCase().split('.').pop() ?? '';
+      if (ACCEPTED_EXTENSIONS.includes(ext) && f.size <= maxBytesFor(ext)) {
         accepted.push(f);
       } else {
         hasInvalid = true;
@@ -244,7 +250,7 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".md,.txt"
+            accept=".md,.txt,.pdf,.docx,.xlsx,.pptx"
             multiple
             className="hidden"
             onChange={(e) => {
