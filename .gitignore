@@ -5,6 +5,9 @@ frontend-dist
 data/rust-tunnel.db
 data/rust-tunnel.db-wal
 data/rust-tunnel.db-shm
+data/rag/
+data/rag_docs/
+data/llm_master.key
 .env
 .vscode/.DS_Store
 

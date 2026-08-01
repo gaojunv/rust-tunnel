@@ -341,7 +341,14 @@ async fn main() -> TunnelResult<()> {
         };
     state
         .proxy_state
-        .init_llm_state(state.db().cloned(), llm_master_key)
+        .init_llm_state(
+            state.db().cloned(),
+            llm_master_key,
+            // RAG 向量数据根目录：DB 同目录（VectorStore 内部再拼 rag/<kb_id>，与 Task 1 规格一致）
+            std::path::Path::new(&config.db_path)
+                .parent()
+                .unwrap_or(std::path::Path::new(".")),
+        )
         .await;
 
     {

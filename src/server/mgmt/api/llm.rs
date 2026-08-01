@@ -539,9 +539,28 @@ pub async fn list_api_keys(State(state): State<ApiState>) -> impl IntoResponse {
             enabled: r.enabled != 0,
             created_at: r.created_at,
             last_used_at: r.last_used_at,
+            kb_id: r.kb_id,
         })
         .collect();
     Json(serde_json::json!({"api_keys": keys})).into_response()
+}
+
+/// 校验 `kb_id` 指向的 RAG 知识库存在。`None`（解绑/未指定）直接通过。
+async fn ensure_kb_exists(
+    db: &crate::server::db::Database,
+    kb_id: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let Some(kb_id) = kb_id else {
+        return Ok(());
+    };
+    match db.rag_get_kb(kb_id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((StatusCode::BAD_REQUEST, "kb not found".to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB error: {}", e),
+        )),
+    }
 }
 
 pub async fn create_api_key(
@@ -552,10 +571,19 @@ pub async fn create_api_key(
         Some(db) => db,
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
     };
+
+    // 指定 kb_id 时先校验知识库存在（不存在 → 400）
+    if let Err((status, msg)) = ensure_kb_exists(db, body.kb_id.as_deref()).await {
+        return (status, msg).into_response();
+    }
+
     let (key, hash, prefix) = generate_api_key();
     let id = uuid::Uuid::new_v4().to_string();
 
-    if let Err(e) = db.llm_save_api_key(&id, &hash, &prefix, &body.name).await {
+    if let Err(e) = db
+        .llm_save_api_key(&id, &hash, &prefix, &body.name, body.kb_id.as_deref())
+        .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("DB error: {}", e),
@@ -581,14 +609,45 @@ pub async fn toggle_api_key(
         Some(db) => db,
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
     };
-    let enabled = body["enabled"].as_bool().unwrap_or(false);
-    if let Err(e) = db.llm_toggle_api_key(&id, enabled).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("DB error: {}", e),
-        )
-            .into_response();
+
+    // 先校验、后变更：kb_id 的类型与存在性校验前置到 enabled toggle 之前，
+    // 全部校验通过后才依次应用变更，保证组合 PATCH（enabled + kb_id）失败时
+    // 不产生「enabled 已落库但请求返回 400」的部分生效。
+    let new_kb_id: Option<&str> = match body.get("kb_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "kb_id must be a string or null").into_response()
+        }
+    };
+    if let Err((status, msg)) = ensure_kb_exists(db, new_kb_id).await {
+        return (status, msg).into_response();
     }
+
+    // enabled：仅当请求体含 "enabled" 键时才 toggle，
+    // 避免只绑 kb_id 的请求把 key 误禁用。
+    if body.get("enabled").is_some() {
+        let enabled = body["enabled"].as_bool().unwrap_or(false);
+        if let Err(e) = db.llm_toggle_api_key(&id, enabled).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
+    // kb_id：含键则绑定/解绑（Value::Null → 解绑）。存在性已在上面校验。
+    if body.get("kb_id").is_some() {
+        if let Err(e) = db.llm_set_api_key_kb(&id, new_kb_id).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("DB error: {}", e),
+            )
+                .into_response();
+        }
+    }
+
     StatusCode::OK.into_response()
 }
 
@@ -736,5 +795,260 @@ pub async fn get_usage_logs(
             format!("DB error: {}", e),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode as HttpStatus};
+    use axum::routing::{get, patch};
+    use axum::Router;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    use crate::server::auth::AuthConfig;
+    use crate::server::control::ServerState;
+    use crate::server::db::Database;
+
+    /// 内存 DB 的 ApiState（api key CRUD 不依赖 llm_state 字段加密器）。
+    async fn test_api_state() -> ApiState {
+        let db = Database::new(":memory:").await.expect("in-memory db");
+        ApiState {
+            server_state: ServerState::with_db(db),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        }
+    }
+
+    /// 覆盖 api key 全部路由的测试 Router（免 JWT，auth_config 关闭）。
+    fn test_router(state: ApiState) -> Router {
+        Router::new()
+            .route(
+                "/api/llm/api-keys",
+                get(super::list_api_keys).post(super::create_api_key),
+            )
+            .route(
+                "/api/llm/api-keys/:id",
+                patch(super::toggle_api_key).delete(super::delete_api_key),
+            )
+            .with_state(state)
+    }
+
+    /// oneshot 请求助手：返回 (status, json body)。
+    async fn call(app: &Router, req: Request<Body>) -> (HttpStatus, Value) {
+        let resp = app.clone().oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .expect("read response body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+        (status, body)
+    }
+
+    fn json_request(method: Method, uri: String, body: &Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    /// 直接向内存 DB 建一个知识库，返回 kb_id。
+    async fn seed_kb(db: &Database) -> String {
+        let kb_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_kb(
+            &kb_id,
+            "测试库",
+            "",
+            "http://127.0.0.1:9999",
+            "sk-test",
+            "test-model",
+            8,
+            5,
+            1000,
+            0,
+            0.5,
+            true,
+        )
+        .await
+        .expect("seed kb");
+        kb_id
+    }
+
+    /// 辅助：GET /api/llm/api-keys 返回的 api_keys 数组。
+    async fn list_keys(app: &Router) -> Value {
+        let (status, body) = call(
+            app,
+            json_request(Method::GET, "/api/llm/api-keys".to_string(), &json!(null)),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "list keys: {body}");
+        body["api_keys"].clone()
+    }
+
+    #[tokio::test]
+    async fn create_and_bind_api_key_to_kb() {
+        let state = test_api_state().await;
+        let db = state.server_state.db().expect("db").clone();
+        let kb_id = seed_kb(&db).await;
+        let app = test_router(state);
+
+        // 建 KB → POST {name, kb_id} → 列表返回绑定后的 kb_id
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor", "kb_id": kb_id }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "create key: {body}");
+        let key_id = body["id"].as_str().expect("key id").to_string();
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["id"], json!(key_id));
+        assert_eq!(keys[0]["kb_id"], json!(kb_id), "绑定后列表应返回 kb_id");
+
+        // PATCH kb_id: null → 解绑
+        let req = json_request(
+            Method::PATCH,
+            format!("/api/llm/api-keys/{key_id}"),
+            &json!({ "kb_id": null }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::OK, "unbind should succeed");
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["kb_id"], Value::Null, "解绑后 kb_id 应为 null");
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_unknown_kb() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor", "kb_id": "nonexistent" }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST, "unknown kb_id → 400");
+
+        // 校验：失败的创建不应留下任何 key
+        let keys = list_keys(&app).await;
+        assert_eq!(keys.as_array().map(Vec::len), Some(0), "no key created");
+    }
+
+    #[tokio::test]
+    async fn patch_bind_kb_keeps_key_enabled() {
+        let state = test_api_state().await;
+        let db = state.server_state.db().expect("db").clone();
+        let kb_id = seed_kb(&db).await;
+        let app = test_router(state);
+
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor" }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "create key: {body}");
+        let key_id = body["id"].as_str().expect("key id").to_string();
+
+        // 只绑定 kb_id、不含 enabled 键 —— 不应把 key 禁用（回归 unwrap_or(false) 的坑）
+        let req = json_request(
+            Method::PATCH,
+            format!("/api/llm/api-keys/{key_id}"),
+            &json!({ "kb_id": kb_id }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::OK);
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["enabled"], json!(true), "仅绑定 kb_id 不应禁用 key");
+        assert_eq!(keys[0]["kb_id"], json!(kb_id));
+    }
+
+    #[tokio::test]
+    async fn patch_kb_rejects_unknown_kb() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor" }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "create key: {body}");
+        let key_id = body["id"].as_str().expect("key id").to_string();
+
+        let req = json_request(
+            Method::PATCH,
+            format!("/api/llm/api-keys/{key_id}"),
+            &json!({ "kb_id": "nonexistent" }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST, "unknown kb on bind → 400");
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["kb_id"], Value::Null, "绑定失败不应改动 kb_id");
+    }
+
+    #[tokio::test]
+    async fn patch_enabled_still_toggles() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor" }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "create key: {body}");
+        let key_id = body["id"].as_str().expect("key id").to_string();
+
+        let req = json_request(
+            Method::PATCH,
+            format!("/api/llm/api-keys/{key_id}"),
+            &json!({ "enabled": false }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::OK, "disable key");
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["enabled"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn patch_combined_failure_does_not_toggle_enabled() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+
+        let req = json_request(
+            Method::POST,
+            "/api/llm/api-keys".to_string(),
+            &json!({ "name": "cursor" }),
+        );
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "create key: {body}");
+        let key_id = body["id"].as_str().expect("key id").to_string();
+
+        // 组合 PATCH：enabled=false + 未知 kb_id → 400，且 key 的 enabled 不被静默改变
+        let req = json_request(
+            Method::PATCH,
+            format!("/api/llm/api-keys/{key_id}"),
+            &json!({ "enabled": false, "kb_id": "nonexistent" }),
+        );
+        let (status, _) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST, "unknown kb → 400");
+
+        let keys = list_keys(&app).await;
+        assert_eq!(keys[0]["enabled"], json!(true), "校验失败不应改动 enabled");
+        assert_eq!(keys[0]["kb_id"], Value::Null, "绑定失败不应改动 kb_id");
     }
 }

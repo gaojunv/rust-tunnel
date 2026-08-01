@@ -486,6 +486,74 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // RAG knowledge bases
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_knowledge_bases (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                emb_base_url TEXT NOT NULL,
+                emb_api_key TEXT NOT NULL,
+                emb_model TEXT NOT NULL,
+                emb_dimension INTEGER NOT NULL,
+                top_k INTEGER NOT NULL DEFAULT 5,
+                chunk_size INTEGER NOT NULL DEFAULT 512,
+                chunk_overlap INTEGER NOT NULL DEFAULT 64,
+                score_threshold REAL NOT NULL DEFAULT 0.3,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_documents (
+                id TEXT PRIMARY KEY,
+                kb_id TEXT NOT NULL REFERENCES rag_knowledge_bases(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS rag_chunks (
+                id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL REFERENCES rag_documents(id) ON DELETE CASCADE,
+                kb_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                heading_path TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                token_count INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc ON rag_chunks(doc_id)")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_chunks_kb ON rag_chunks(kb_id)")
+            .execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_documents_kb ON rag_documents(kb_id)")
+            .execute(pool).await?;
+
+        // 幂等迁移：llm_api_keys 加 kb_id，llm_usage_logs 加 rag_chunks_injected
+        Self::migrate_llm_api_keys_add_kb_id(pool).await?;
+        Self::migrate_llm_usage_add_rag_chunks(pool).await?;
+
         Ok(())
     }
 
@@ -593,6 +661,30 @@ impl Database {
                     Err(e)
                 }
             }
+        }
+    }
+
+    /// Migration: old DBs lack `kb_id` on `llm_api_keys`. Idempotent.
+    async fn migrate_llm_api_keys_add_kb_id(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_api_keys ADD COLUMN kb_id TEXT REFERENCES rag_knowledge_bases(id) ON DELETE SET NULL")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Migration: old DBs lack `rag_chunks_injected` on `llm_usage_logs`. Idempotent.
+    async fn migrate_llm_usage_add_rag_chunks(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_usage_logs ADD COLUMN rag_chunks_injected INTEGER")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
         }
     }
 }

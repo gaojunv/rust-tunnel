@@ -151,6 +151,7 @@ pub async fn handle_chat_completions(
                         requested_model: model.clone(),
                         protocol: "openai".into(),
                         stream,
+                        rag_chunks_injected: None,
                     };
                     ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
                 }
@@ -174,6 +175,7 @@ pub async fn handle_chat_completions(
                     requested_model: model.clone(),
                     protocol: "openai".into(),
                     stream,
+                    rag_chunks_injected: None,
                 };
                 ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
             }
@@ -204,7 +206,8 @@ pub async fn handle_chat_completions(
     };
 
     // 用量采集上下文
-    let ctx = super::usage::UsageContext {
+    let api_key_id_for_rag = api_key_id.clone();
+    let mut ctx = super::usage::UsageContext {
         api_key_id: Some(api_key_id),
         api_key_name,
         provider_id: Some(provider.id.clone()),
@@ -214,13 +217,35 @@ pub async fn handle_chat_completions(
         requested_model: model,
         protocol: "openai".into(),
         stream,
+        rag_chunks_injected: None,
     };
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
+    let mut request = request;
+
+    // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
+    // 失败降级为无 RAG 直通。
+    let mut rag_injected: i64 = 0;
+    if let Some(ref db) = db {
+        if let Ok(Some(kb_id)) = db.rag_get_kb_id_for_api_key(&api_key_id_for_rag).await {
+            let outcome = super::rag::enhance(
+                db,
+                &state.llm.rag_store,
+                state.llm.cipher.as_ref(),
+                &kb_id,
+                &mut request,
+            )
+            .await;
+            rag_injected = outcome.injected as i64;
+        }
+    }
+    if rag_injected > 0 {
+        ctx.rag_chunks_injected = Some(rag_injected);
+    }
+
     // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为标签文本，
     // 并在末尾注入 system 引导（教模型输出伪工具调用格式）。
-    let mut request = request;
     if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
         super::compat::rewrite_tool_history(&mut request.messages);
         super::compat::inject_tool_call_guidance(&mut request.messages);
@@ -530,7 +555,7 @@ mod tests {
 
         let (key, hash, prefix) = crate::server::llm::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_api_key(&kid, &hash, &prefix, "test")
+        db.llm_save_api_key(&kid, &hash, &prefix, "test", None)
             .await
             .unwrap();
 
@@ -544,6 +569,309 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {key}")).unwrap(),
         );
         headers
+    }
+
+    /// 构造带 RAG 的 LlmState：真实临时 DB + 真实 VectorStore（tempdir）+ KB + chunk + api key 绑 KB。
+    /// `emb_base_url` 由调用点启动的 mock embedding server 提供（返回固定 8 维向量）。
+    /// 返回 (state, 有效 API key, _tempdir 守卫)。
+    async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(
+            &pid,
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        let mid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+            .await
+            .unwrap();
+
+        // 知识库：emb 指向 mock embedding server，维度 8（与 mock 返回一致）
+        let kb_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_kb(
+            &kb_id,
+            "rag-kb",
+            "",
+            emb_base_url,
+            "sk-emb",
+            "emb-model",
+            8,
+            5,
+            1000,
+            0,
+            0.0,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // 一个分块（向量随后 upsert 进 store）；先建文档（rag_chunks.doc_id 有 FK 约束）
+        let chunk_id = uuid::Uuid::new_v4().to_string();
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_document(&doc_id, &kb_id, "install.md", "hash")
+            .await
+            .unwrap();
+        db.rag_insert_chunks(&[(
+            chunk_id.clone(),
+            doc_id.clone(),
+            kb_id.clone(),
+            0,
+            "指南/安装".into(),
+            "RAG 知识库测试内容".into(),
+            8,
+        )])
+        .await
+        .unwrap();
+
+        // API key 绑定该知识库
+        let (key, hash, prefix) = crate::server::llm::auth::generate_api_key();
+        let kid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_api_key(&kid, &hash, &prefix, "rag-test", Some(&kb_id))
+            .await
+            .unwrap();
+
+        // rag_store 指向同一 tempdir（VectorStore 内部再拼 rag/<kb_id>）；直接在 state 上 upsert，
+        // 保证整个生命周期只有这一个 VectorStore 实例（避免同目录并发打开两个 EdgeShard）。
+        let state = LlmState::new_with_rag(Some(db), None, tmp.path());
+        state
+            .rag_store
+            .upsert(
+                &kb_id,
+                8,
+                vec![crate::server::llm::rag::store::ChunkPoint {
+                    id: chunk_id,
+                    vector: vec![0.1f32; 8],
+                    doc_id,
+                    seq: 0,
+                    heading_path: "指南/安装".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        (state, key, tmp)
+    }
+
+    /// RAG 注入端到端：api key 绑 KB → 请求 chat completions → 上游收到的 messages[0]
+    /// 是注入的 system 消息且含 `<knowledge_base>`；usage log 记录 rag_chunks_injected=1。
+    #[tokio::test]
+    async fn rag_injects_knowledge_base_into_messages() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // mock embedding server：任意输入返回固定 8 维向量（与 KB 维度一致）
+        let emb_app = Router::new().route(
+            "/embeddings",
+            post(|body: axum::Json<serde_json::Value>| async move {
+                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let data: Vec<_> = (0..n)
+                    .map(|i| {
+                        serde_json::json!({
+                            "index": i,
+                            "embedding": vec![0.1f32; 8],
+                            "object": "embedding"
+                        })
+                    })
+                    .collect();
+                axum::Json(serde_json::json!({"object": "list", "data": data}))
+            }),
+        );
+        let emb_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let emb_addr = emb_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(emb_listener, emb_app).await.unwrap();
+        });
+
+        // mock upstream LLM：回显请求体，返回一个普通 chat completion
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+        let captured2 = captured.clone();
+        let llm_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured2.clone();
+                async move {
+                    *captured.lock().await = body;
+                    axum::Json(serde_json::json!({
+                        "id": "chatcmpl-rag",
+                        "object": "chat.completion",
+                        "model": "deepseek-chat",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "基于资料的回答"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    }))
+                }
+            }),
+        );
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_app).await.unwrap();
+        });
+
+        let (state, key, _tmp) = state_with_rag(&format!("http://{emb_addr}")).await;
+        let db = state.db.clone().unwrap();
+
+        // provider base_url 指向 mock upstream
+        let providers = db.llm_list_providers().await.unwrap();
+        db.llm_save_provider(
+            &providers[0].id,
+            "DS",
+            "deepseek",
+            &format!("http://{llm_addr}"),
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_chat_completions(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: None,
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "关于知识库的问题"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 上游收到的 messages[0] 是注入的 system 消息，含 <knowledge_base>
+        let body = captured.lock().await.clone();
+        let msgs = body["messages"]
+            .as_array()
+            .expect("upstream should receive messages");
+        assert_eq!(msgs[0]["role"], "system", "messages[0] 应为注入的 system: {body}");
+        let sys = msgs[0]["content"].as_str().expect("system content");
+        assert!(
+            sys.contains("<knowledge_base>"),
+            "system 应含 <knowledge_base>: {sys}"
+        );
+        assert!(sys.contains("RAG 知识库测试内容"), "system 应含 chunk 内容: {sys}");
+
+        // usage log 记录 rag_chunks_injected = 1（fire-and-forget 写入，稍等）
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "应有一条成功的 usage log");
+        assert_eq!(logs[0].rag_chunks_injected, Some(1));
+    }
+
+    /// 降级直通端到端：api key **绑定**了 KB，但 KB 的 emb_base_url 不可达 →
+    /// 检索降级为空，请求原样透传上游（messages 无 knowledge_base 注入），
+    /// usage log 记录成功且 rag_chunks_injected 为 None。验证「RAG 永不阻断会话」。
+    #[tokio::test]
+    async fn rag_degrades_to_pass_through_when_embedding_unreachable() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // mock upstream LLM：回显请求体，返回一个普通 chat completion
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+        let captured2 = captured.clone();
+        let llm_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured2.clone();
+                async move {
+                    *captured.lock().await = body;
+                    axum::Json(serde_json::json!({
+                        "id": "chatcmpl-degrade",
+                        "object": "chat.completion",
+                        "model": "deepseek-chat",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+                    }))
+                }
+            }),
+        );
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_app).await.unwrap();
+        });
+
+        // KB 的 emb_base_url 指向不可达地址（127.0.0.1:1 → connection refused），
+        // api key 仍绑定该 KB → 检索阶段降级为空。
+        let (state, key, _tmp) = state_with_rag("http://127.0.0.1:1").await;
+        let db = state.db.clone().unwrap();
+
+        let providers = db.llm_list_providers().await.unwrap();
+        db.llm_save_provider(
+            &providers[0].id,
+            "DS",
+            "deepseek",
+            &format!("http://{llm_addr}"),
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_chat_completions(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: None,
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "直通问题"}]
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 上游收到的 messages 无注入：只有原始 user 消息，不含 <knowledge_base>
+        let body = captured.lock().await.clone();
+        let msgs = body["messages"]
+            .as_array()
+            .expect("upstream should receive messages");
+        assert_eq!(msgs.len(), 1, "降级直通不应注入 system: {body}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert!(
+            !body.to_string().contains("<knowledge_base>"),
+            "不应注入 knowledge_base: {body}"
+        );
+
+        // usage log：成功记录，rag_chunks_injected 为 None（未注入）
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "应有一条成功的 usage log");
+        assert_eq!(logs[0].success, 1);
+        assert_eq!(
+            logs[0].rag_chunks_injected, None,
+            "降级直通不应记录注入 chunk 数"
+        );
     }
 
     #[tokio::test]

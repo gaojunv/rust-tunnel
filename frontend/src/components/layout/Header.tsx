@@ -34,11 +34,12 @@ import {
   Menu,
   LogOut,
   Bot,
+  BookOpen,
 } from 'lucide-react';
 import DataFlowBackground from '@/components/dataflow/DataFlowBackground';
 
 interface NavItem {
-  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.logs' | 'nav.settings';
+  labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledgeBase' | 'nav.logs' | 'nav.settings';
   icon: React.ReactNode;
   href: string;
 }
@@ -76,6 +77,7 @@ const navGroups: NavGroup[] = [
     labelKey: 'nav.ai',
     items: [
       { labelKey: 'nav.llmGateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
+      { labelKey: 'nav.knowledgeBase', icon: <BookOpen className="h-4 w-4" />, href: '/llm/kb' },
     ],
   },
   {

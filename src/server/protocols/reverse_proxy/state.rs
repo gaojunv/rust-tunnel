@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
@@ -79,14 +80,20 @@ impl ReverseProxyState {
     /// Initialize the LlmState from the in-memory `__llm_gateway__` rule (if any).
     /// Called during server startup after rules are loaded from DB.
     /// `master_key` 用于提供商 API Key 的落库加解密；None 表示不加解密（明文兼容）。
-    pub async fn init_llm_state(&self, db: Option<Database>, master_key: Option<[u8; 32]>) {
+    /// `rag_data_dir` 是 RAG 向量库数据根目录（建议传 DB 所在目录，VectorStore 内部再拼 `rag/<kb_id>`）。
+    pub async fn init_llm_state(
+        &self,
+        db: Option<Database>,
+        master_key: Option<[u8; 32]>,
+        rag_data_dir: &Path,
+    ) {
         let gateway_rule = {
             let rules = self.rules.lock().await;
             rules.get("__llm_gateway__").cloned()
         };
 
         let cipher = master_key.map(crate::server::llm::crypto::LlmCipher::from_master_key);
-        let llm = LlmState::new(db, cipher);
+        let llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
 
         // Derive gateway config from the ProxyRule
         if let Some(rule) = gateway_rule {
@@ -570,7 +577,7 @@ mod tests {
         drop(rules);
 
         // Initialize LlmState (without DB)
-        state.init_llm_state(None, None).await;
+        state.init_llm_state(None, None, std::path::Path::new(".")).await;
 
         let llm_guard = state.llm_state.read().await;
         assert!(llm_guard.is_some(), "llm_state should be initialized");
@@ -588,7 +595,7 @@ mod tests {
     async fn init_llm_state_no_gateway_rule() {
         let state = ReverseProxyState::new();
         // No gateway rule — llm_state should still be initialized (disabled)
-        state.init_llm_state(None, None).await;
+        state.init_llm_state(None, None, std::path::Path::new(".")).await;
         let llm_guard = state.llm_state.read().await;
         assert!(
             llm_guard.is_some(),
@@ -622,7 +629,7 @@ mod tests {
         );
         drop(rules);
 
-        state.init_llm_state(None, None).await;
+        state.init_llm_state(None, None, std::path::Path::new(".")).await;
 
         // Even if the rule exists but is disabled, llm_state should be initialized
         // (the enabled flag is checked per-request)

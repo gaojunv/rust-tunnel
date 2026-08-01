@@ -38,6 +38,8 @@ pub struct LlmApiKeyRecord {
     pub enabled: i32,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// 绑定的 RAG 知识库 id（未绑定时为 None）。
+    pub kb_id: Option<String>,
 }
 
 /// 一条 LLM 网关请求的用量日志。
@@ -63,6 +65,8 @@ pub struct LlmUsageLogRecord {
     pub total_tokens: i64,
     pub latency_ms: i64,
     pub error_type: Option<String>,
+    /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
+    pub rag_chunks_injected: Option<i64>,
 }
 
 /// 待插入的用量日志（各标识可空——认证/路由失败时部分字段缺失）。
@@ -86,6 +90,7 @@ pub struct LlmUsageInsert {
     pub total_tokens: i64,
     pub latency_ms: i64,
     pub error_type: Option<String>,
+    pub rag_chunks_injected: Option<i64>,
 }
 
 /// 一个聚合维度的用量汇总行。
@@ -323,17 +328,19 @@ impl Database {
         key_hash: &str,
         key_prefix: &str,
         name: &str,
+        kb_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO llm_api_keys (id, key_hash, key_prefix, name)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO llm_api_keys (id, key_hash, key_prefix, name, kb_id)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
         .bind(key_hash)
         .bind(key_prefix)
         .bind(name)
+        .bind(kb_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -342,6 +349,20 @@ impl Database {
     pub async fn llm_toggle_api_key(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET enabled = ? WHERE id = ?")
             .bind(enabled as i32)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 绑定/解绑 api key 的知识库（`None` 解绑）。KB 存在性由调用方负责校验。
+    pub async fn llm_set_api_key_kb(
+        &self,
+        id: &str,
+        kb_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE llm_api_keys SET kb_id = ? WHERE id = ?")
+            .bind(kb_id)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -364,6 +385,19 @@ impl Database {
         Ok(())
     }
 
+    /// 查询某 api key 绑定的知识库 id（未绑定返回 None）。
+    pub async fn rag_get_kb_id_for_api_key(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT kb_id FROM llm_api_keys WHERE id = ?")
+                .bind(key_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
     // ── Usage logs ────────────────────────────────────────────────
 
     /// 插入一条用量日志。timestamp 由 DB 用 datetime('now') 填充（UTC）。
@@ -374,8 +408,8 @@ impl Database {
                 id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                 model_id, model_name, requested_model, protocol, stream, status_code,
                 success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-                completion_tokens, total_tokens, latency_ms, error_type
-            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -397,6 +431,7 @@ impl Database {
         .bind(u.total_tokens)
         .bind(u.latency_ms)
         .bind(&u.error_type)
+        .bind(u.rag_chunks_injected)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -476,7 +511,11 @@ impl Database {
     ) -> Result<Vec<LlmUsageLogRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmUsageLogRecord>(
             r#"
-            SELECT * FROM llm_usage_logs
+            SELECT id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
+                   model_id, model_name, requested_model, protocol, stream, status_code,
+                   success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+                   completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
+            FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
@@ -704,7 +743,7 @@ mod tests {
         let (db, _tmp) = fresh_db().await;
 
         let id = uuid::Uuid::new_v4().to_string();
-        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor")
+        db.llm_save_api_key(&id, "hash123", "sk-abc...xyz", "Cursor", None)
             .await
             .unwrap();
 
@@ -712,6 +751,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].name, "Cursor");
         assert_eq!(keys[0].key_prefix, "sk-abc...xyz");
+        assert_eq!(keys[0].kb_id, None, "未绑定时 kb_id 应为 None");
 
         // Find by hash
         let found = db
@@ -771,6 +811,7 @@ mod tests {
             total_tokens: prompt + completion,
             latency_ms: 123,
             error_type: None,
+            rag_chunks_injected: None,
         }
     }
 
@@ -853,5 +894,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_log_records_rag_chunks_injected() {
+        let (db, _tmp) = fresh_db().await;
+
+        let insert = LlmUsageInsert {
+            api_key_name: "k".into(),
+            provider_name: "p".into(),
+            model_name: "m".into(),
+            requested_model: "m".into(),
+            protocol: "openai".into(),
+            stream: false,
+            status_code: 200,
+            success: true,
+            rag_chunks_injected: Some(3),
+            ..Default::default()
+        };
+        db.llm_insert_usage_log(&insert).await.unwrap();
+        let logs = db
+            .llm_query_usage_logs("2000-01-01", "2100-01-01", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs[0].rag_chunks_injected, Some(3));
     }
 }

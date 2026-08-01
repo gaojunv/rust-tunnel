@@ -5,10 +5,12 @@ pub mod crypto;
 pub mod format;
 pub mod openai_handler;
 pub mod provider;
+pub mod rag;
 pub mod router;
 pub mod upstream;
 pub mod usage;
 
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -159,12 +161,18 @@ pub struct ApiKeyView {
     pub enabled: bool,
     pub created_at: String,
     pub last_used_at: Option<String>,
+    /// 绑定的 RAG 知识库 id（未绑定为 None）。
+    #[serde(default)]
+    pub kb_id: Option<String>,
 }
 
 /// Request body for creating an API key.
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateApiKeyRequest {
     pub name: String,
+    /// 可选：创建时即绑定 RAG 知识库（不存在则 400）。
+    #[serde(default)]
+    pub kb_id: Option<String>,
 }
 
 /// Response for API key creation — full key shown only once.
@@ -275,17 +283,34 @@ pub struct LlmState {
     pub gateway_config: Arc<RwLock<Option<LlmGatewayConfig>>>,
     /// 字段加密器（提供商 API Key 等敏感字段的落库加密）；None 表示未配置主密钥。
     pub cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    /// RAG 向量存储（知识库检索）。
+    pub rag_store: rag::store::VectorStore,
+    /// RAG 摄入状态事件通道（SSE 推送给前端）。
+    pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
 }
 
 impl LlmState {
+    /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
+    /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录。
     pub fn new(
         db: Option<Database>,
         cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    ) -> Self {
+        Self::new_with_rag(db, cipher, Path::new(&std::env::temp_dir()))
+    }
+
+    /// 指定 RAG 数据目录构造（知识库向量 shard 位于 `<rag_data_dir>/rag/<kb_id>/`）。
+    pub fn new_with_rag(
+        db: Option<Database>,
+        cipher: Option<crate::server::llm::crypto::LlmCipher>,
+        rag_data_dir: &Path,
     ) -> Self {
         Self {
             db,
             gateway_config: Arc::new(RwLock::new(None)),
             cipher,
+            rag_store: rag::store::VectorStore::new(rag_data_dir),
+            rag_tx: tokio::sync::broadcast::channel(256).0,
         }
     }
 }

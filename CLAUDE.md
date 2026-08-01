@@ -69,13 +69,14 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
   - `trojan.rs` — 内置 Trojan 代理：TLS 必需、SHA-224 认证、增量解析（`ParseResult`）、认证失败回退
   - `trojan_runtime.rs` — SS/Trojan 运行时管理与连接生命周期
   - `reverse_proxy/` — 反向代理子系统，含规则、路由、HTTP/TCP handler、Connector trait、直连/隧道连接、SNI 分发
-- `persistence/` — 数据持久化（SQLite WAL 模式）：流量、质量、会话、clients、SS/Trojan 配置、日志
+- `persistence/` — 数据持久化（SQLite WAL 模式）：流量、质量、会话、clients、SS/Trojan 配置、日志、RAG（kb/docs/chunks）
 - `mgmt/` — 管理面：
   - `api/` — Axum API 路由 + `rust-embed` 嵌入前端
   - `auth.rs` — JWT 认证
   - `logs.rs` — 自定义 tracing Layer，捕获日志到内存 + SQLite，API 支持分页/过滤
   - `stats.rs` — 实时质量监控、RTT/丢包/吞吐量追踪、评分（0-100）、阈值告警、历史采样
   - `dynamic_config.rs` — 动态配置管理
+- `llm/` — LLM 网关：OpenAI/Anthropic 双协议入口（`openai_handler.rs`/`anthropic_handler.rs`）、provider/model/api-key 管理、用量日志、compat 工具调用改写；`llm/rag/` — RAG 知识库：`chunker`（Markdown 分块）、`embedder`（远端 embedding）、`store`（qdrant-edge 向量 shard）、`retriever`（检索+注入）、`ingest`（后台摄入任务）
 - `pki/` — 证书与 ACME 自动续签
 - `net/` — 网络基建（listener/dns/mesh）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
@@ -89,20 +90,23 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 ### 前端架构
 - 位于 `frontend/`，构建产物输出到 `frontend-dist/`（gitignored，由 `rust-embed` 嵌入）
 - **无路由库** — 通过 `App.tsx` 中的状态条件渲染切换页面
-- **React Query v3**（非 TanStack Query v5）— 数据获取和缓存
+- **React Query v5**（`@tanstack/react-query`）— 数据获取和缓存
 - **无全局状态管理库** — 状态通过 React Query + 组件本地状态管理
 - Vite 开发服务器将 `/api` 代理到 `localhost:3000`（服务器 API 端口）
 - 共享组件在 `frontend/src/components/shared/`：`ChartContainer`、`StatCard`、`TimeRangeSelector`、`MobileBottomNav`
+- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）
 - TypeScript 类型定义集中 在 `frontend/src/types/index.ts`
 - API 客户端在 `frontend/src/api/client.ts`：Axios + JWT 拦截器
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`）
 
 ### API 端点
-- 公开：`POST /api/login`、`GET /api/health`
+- 公开：`POST /api/login`、`GET /api/health`、`GET /api/llm/kb/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
+- LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`
+- RAG 知识库（新）：`/api/llm/kb`（CRUD）、`/api/llm/kb/:id`、`/api/llm/kb/:id/docs`、`/api/llm/kb/:id/docs/:doc_id`（含 `/reindex`）、`/api/llm/kb/test-embedding`、`/api/llm/kb/:id/query`
 - 完整列表见 `src/server/mgmt/api/mod.rs`
 
 ## 代码模式

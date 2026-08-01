@@ -34,6 +34,12 @@ import type {
   LlmUsageAggregateRow,
   LlmUsageLogsResponse,
   UsageGroupBy,
+  LlmKnowledgeBase,
+  LlmKbDocument,
+  KbQueryResult,
+  CreateLlmKbRequest,
+  UpdateLlmKbRequest,
+  TestEmbeddingResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -366,6 +372,11 @@ export async function toggleLlmApiKey(id: string, enabled: boolean): Promise<voi
   await api.patch(`/llm/api-keys/${id}`, { enabled });
 }
 
+/** 绑定/解绑 API 密钥的 RAG 知识库。kbId 为 null 时解绑。 */
+export async function bindLlmApiKey(id: string, kbId: string | null): Promise<void> {
+  await api.patch(`/llm/api-keys/${id}`, { kb_id: kbId });
+}
+
 export async function deleteLlmApiKey(id: string): Promise<void> {
   await api.delete(`/llm/api-keys/${id}`);
 }
@@ -397,5 +408,89 @@ export async function getLlmUsageLogs(
 ): Promise<LlmUsageLogsResponse> {
   const { data } = await api.get('/llm/usage/logs', { params });
   return { logs: data.logs, total: data.total };
+}
+
+// ── RAG Knowledge Base ──────────────────────────────────────────
+
+export async function listLlmKbs(): Promise<LlmKnowledgeBase[]> {
+  const { data } = await api.get('/llm/kb');
+  return data.knowledge_bases;
+}
+
+export async function getLlmKb(id: string): Promise<LlmKnowledgeBase> {
+  const { data } = await api.get(`/llm/kb/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function createLlmKb(req: CreateLlmKbRequest): Promise<{ id: string }> {
+  const { data } = await api.post('/llm/kb', req);
+  return data;
+}
+
+export async function updateLlmKb(id: string, req: UpdateLlmKbRequest): Promise<void> {
+  await api.put(`/llm/kb/${encodeURIComponent(id)}`, req);
+}
+
+export async function toggleLlmKb(id: string, enabled: boolean): Promise<void> {
+  await api.patch(`/llm/kb/${encodeURIComponent(id)}`, { enabled });
+}
+
+export async function deleteLlmKb(id: string): Promise<void> {
+  await api.delete(`/llm/kb/${encodeURIComponent(id)}`);
+}
+
+export async function listLlmKbDocs(kbId: string): Promise<LlmKbDocument[]> {
+  const { data } = await api.get(`/llm/kb/${encodeURIComponent(kbId)}/docs`);
+  return data.documents;
+}
+
+export async function uploadKbDoc(kbId: string, file: File): Promise<LlmKbDocument> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs`, formData);
+  return data;
+}
+
+export async function deleteKbDoc(kbId: string, docId: string): Promise<void> {
+  await api.delete(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}`);
+}
+
+export async function reindexKbDoc(kbId: string, docId: string): Promise<LlmKbDocument> {
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}/reindex`);
+  return data;
+}
+
+export async function testEmbedding(req: {
+  base_url: string;
+  api_key: string;
+  model: string;
+}): Promise<TestEmbeddingResult> {
+  const { data } = await api.post('/llm/kb/test-embedding', req);
+  return data;
+}
+
+export async function queryKb(kbId: string, text: string): Promise<KbQueryResult> {
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/query`, { text });
+  return data;
+}
+
+/**
+ * Extract a human-readable message from an API error.
+ * Axum handlers on this server reply with plain-text bodies on failure
+ * (e.g. `(StatusCode::BAD_REQUEST, "name is required")`), but some endpoints
+ * return JSON `{ "error": "..." }`. Falls back to the generic Error message.
+ */
+export function getApiErrorMessage(err: unknown): string {
+  const data = (err as { response?: { data?: unknown } } | null)?.response?.data;
+  if (typeof data === 'string' && data.trim() !== '') {
+    return data;
+  }
+  if (data && typeof data === 'object') {
+    const msg = (data as { error?: unknown }).error;
+    if (typeof msg === 'string' && msg.trim() !== '') {
+      return msg;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
 }
 

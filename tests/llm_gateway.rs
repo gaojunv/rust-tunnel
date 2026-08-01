@@ -1084,7 +1084,12 @@ async fn llm_gateway_config_restored_from_rule() {
         harness
             .server_state
             .proxy_state
-            .init_llm_state(harness.server_state.db().cloned(), Some([42u8; 32]))
+            .init_llm_state(
+                harness.server_state.db().cloned(),
+                Some([42u8; 32]),
+                // 本测试不绑定知识库，RAG 目录不产生文件；用系统临时目录即可
+                std::env::temp_dir().as_path(),
+            )
             .await;
 
         // Gateway 配置应从规则恢复
