@@ -2,6 +2,7 @@
 //! PDF/Office 解析全部走纯 Rust crate（lopdf/zip/quick-xml），不做 OCR。
 
 pub mod error;
+pub mod ooxml;
 pub mod pdf;
 
 pub use error::ExtractError;
@@ -91,8 +92,9 @@ pub fn extract(bytes: &[u8], file_type: FileType) -> Result<String, ExtractError
             String::from_utf8(bytes.to_vec()).map_err(|_| ExtractError::NotUtf8)
         }
         FileType::Pdf => pdf::pdf_to_markdown(bytes),
+        FileType::Docx => ooxml::docx_to_markdown(bytes),
         // 由后续 Task 实现（ooxml.rs）。
-        FileType::Docx | FileType::Xlsx | FileType::Pptx => {
+        FileType::Xlsx | FileType::Pptx => {
             Err(ExtractError::ParseFailed("ooxml parser not wired".into()))
         }
     }
@@ -173,5 +175,13 @@ mod tests {
             extract(&bad, FileType::Markdown),
             Err(ExtractError::NotUtf8)
         ));
+    }
+
+    #[test]
+    fn extract_docx_dispatches_to_ooxml() {
+        let bytes = ooxml::tests::make_test_docx();
+        let out = extract(&bytes, FileType::Docx).unwrap();
+        assert!(out.contains("# 安装指南"), "got: {out}");
+        assert!(out.contains("第一步：下载。"), "got: {out}");
     }
 }

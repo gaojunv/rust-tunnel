@@ -94,6 +94,10 @@ shadowsocks = { version = "1.24", default-features = false, features = ["aead-ci
 md-5 = "0.10"
 # PDF 文本层提取（纯 Rust，无系统动态库依赖；nom_parser 提供 load/extract_text）
 lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] }
+# OOXML（docx/xlsx/pptx）解包：仅 deflate（miniz_oxide 纯 Rust），不开 bzip2/zstd/aes
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# OOXML XML 部件解析；escape-html 提供文本实体的 unescape
+quick-xml = { version = "0.31", features = ["escape-html"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
