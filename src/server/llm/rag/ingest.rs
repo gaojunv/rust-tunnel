@@ -1,10 +1,15 @@
 //! 文档摄入后台任务：分块 → embedding → 写向量 → 更新状态 → 发 SSE 事件。
 
-use tokio::sync::broadcast;
+use super::{
+    chunker,
+    embedder::Embedder,
+    extractor::{self, FileType},
+    store::{ChunkPoint, VectorStore},
+};
+use crate::server::db::rag::RagKnowledgeBaseRecord;
 use crate::server::db::Database;
 use crate::server::llm::crypto::{decrypt_field, LlmCipher};
-use crate::server::db::rag::RagKnowledgeBaseRecord;
-use super::{chunker, embedder::Embedder, store::{ChunkPoint, VectorStore}};
+use tokio::sync::broadcast;
 
 /// 文档状态变更事件（SSE 推送给前端）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -18,17 +23,22 @@ pub struct KbEvent {
 
 /// 启动文档摄入后台任务。
 ///
-/// 流程：doc status=processing（发事件）→ chunk → embed 批量 → store.upsert →
+/// 流程：doc status=processing（发事件）→ 提取 → chunk → embed 批量 → store.upsert →
 /// rag_insert_chunks → doc status=ready + chunk_count（发事件）；任何失败 →
 /// doc status=failed + error（发事件）。事件与 db 状态写入一一对应，
 /// 事件在状态落库之后发出，前端可据此轮询/推送双通道感知进度。
+///
+/// `source_path` 为已落盘的原始文件路径（`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`，
+/// 见 mgmt/api/rag.rs `doc_source_path`），`file_type` 决定解析方式。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_ingest(
     db: Database,
     store: VectorStore,
     cipher: Option<LlmCipher>,
     kb: RagKnowledgeBaseRecord,
     doc_id: String,
-    content: String,
+    source_path: std::path::PathBuf,
+    file_type: FileType,
     tx: broadcast::Sender<KbEvent>,
 ) {
     tokio::spawn(async move {
@@ -46,7 +56,17 @@ pub fn spawn_ingest(
         let _ = db.rag_update_document_status(&doc_id, "processing", 0, None).await;
         emit("processing", 0, None);
 
-        match do_ingest(&db, &store, cipher.as_ref(), &kb, &doc_id, &content).await {
+        match do_ingest(
+            &db,
+            &store,
+            cipher.as_ref(),
+            &kb,
+            &doc_id,
+            &source_path,
+            file_type,
+        )
+        .await
+        {
             Ok(count) => {
                 let _ = db.rag_update_document_status(&doc_id, "ready", count, None).await;
                 emit("ready", count, None);
@@ -59,16 +79,29 @@ pub fn spawn_ingest(
     });
 }
 
-/// 分块 → 向量化 → 写 shard → 落库，返回分块数。失败时返回人类可读错误。
+/// 提取 → 分块 → 向量化 → 写 shard → 落库，返回分块数。失败时返回人类可读错误。
 async fn do_ingest(
     db: &Database,
     store: &VectorStore,
     cipher: Option<&LlmCipher>,
     kb: &RagKnowledgeBaseRecord,
     doc_id: &str,
-    content: &str,
+    source_path: &std::path::Path,
+    file_type: FileType,
 ) -> Result<i64, String> {
-    let chunks = chunker::chunk_markdown(content, kb.chunk_size as usize, kb.chunk_overlap as usize);
+    let bytes = tokio::fs::read(source_path)
+        .await
+        .map_err(|e| format!("read source file: {e}"))?;
+    // CPU 密集的解析放阻塞池，避免卡住 tokio worker（PDF 解析大文件可达数百 ms）。
+    let content = tokio::task::spawn_blocking(move || extractor::extract(&bytes, file_type))
+        .await
+        .map_err(|e| format!("extract task: {e}"))?
+        .map_err(|e| e.to_string())?;
+    if content.trim().is_empty() {
+        return Err("no text extracted from document".to_string());
+    }
+    let chunks =
+        chunker::chunk_markdown(&content, kb.chunk_size as usize, kb.chunk_overlap as usize);
     if chunks.is_empty() {
         return Err("empty content".to_string());
     }
@@ -120,10 +153,27 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use crate::server::db::Database;
     use crate::server::db::rag::RagKnowledgeBaseRecord;
+    use crate::server::db::Database;
+    use crate::server::llm::rag::extractor::pdf::make_empty_page_pdf;
 
     use super::*;
+
+    /// 把文本写入临时源文件，返回 (TempDir, 路径)。TempDir 需活到任务结束。
+    fn write_source(content: &str, ext: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("doc.{ext}"));
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    /// 字节版 write_source：用于二进制 fixture（PDF/OOXML）。
+    fn write_source_bytes(bytes: &[u8], ext: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("doc.{ext}"));
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
 
     /// TempDir 放前、store 放后：qadrant-edge 的 `EdgeShard` Drop 时同步 flush
     /// 并 `expect()`（目录已删会 panic），故 store 必须先于 TempDir 析构。
@@ -241,13 +291,15 @@ mod tests {
 
         let (_d, store) = tmp_store();
         let (tx, mut rx) = broadcast::channel(16);
+        let (_sd, src) = write_source(&content, "md");
         spawn_ingest(
             db.clone(),
             store.clone(),
             None,
             kb.clone(),
             doc_id.clone(),
-            content,
+            src,
+            FileType::Markdown,
             tx,
         );
 
@@ -286,13 +338,15 @@ mod tests {
 
         let (_d, store) = tmp_store();
         let (tx, mut rx) = broadcast::channel(16);
+        let (_sd, src) = write_source("some content", "md");
         spawn_ingest(
             db.clone(),
             store.clone(),
             None,
             kb,
             doc_id.clone(),
-            "some content".to_string(),
+            src,
+            FileType::Markdown,
             tx,
         );
 
@@ -325,13 +379,15 @@ mod tests {
 
         let (_d, store) = tmp_store();
         let (tx, mut rx) = broadcast::channel(16);
+        let (_sd, src) = write_source(&content, "md");
         spawn_ingest(
             db.clone(),
             store.clone(),
             None,
             kb.clone(),
             doc_id.clone(),
-            content,
+            src,
+            FileType::Markdown,
             tx,
         );
 
@@ -365,7 +421,17 @@ mod tests {
         // 这是「doc 在摄入中途被删 / insert 落库失败」的确定性模拟 ——
         // upsert 已写入向量，随后 insert 失败，必须回滚本次向量防孤儿残留。
         let content = "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n".to_string();
-        let res = do_ingest(&db, &store, None, &kb, "ghost-doc", &content).await;
+        let (_sd, src) = write_source(&content, "md");
+        let res = do_ingest(
+            &db,
+            &store,
+            None,
+            &kb,
+            "ghost-doc",
+            &src,
+            FileType::Markdown,
+        )
+        .await;
         assert!(res.is_err(), "FK 失败应使摄入失败: {res:?}");
 
         // 向量已回滚：同 kb search 应为空（不留孤儿向量），分块也未落库。
@@ -373,6 +439,52 @@ mod tests {
             .search(&kb.id, kb.emb_dimension as usize, &[1.0f32; 8], 10)
             .await;
         assert!(hits.is_empty(), "insert 失败后应回滚本次写入的向量");
+        assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_extract_failure_marks_doc_failed() {
+        let db = Database::new(":memory:").await.expect("in-memory db");
+        let base = mock_embedding_server(8).await;
+        let kb = create_kb(&db, "kb-scan", &base, 8).await;
+        let doc_id = "doc-scan".to_string();
+        db.rag_create_document(&doc_id, &kb.id, "scan.pdf", "sha256:x", "pdf")
+            .await
+            .unwrap();
+        // 无文本层 PDF（复用 extractor::pdf 测试用空页 PDF 构造）。
+        let (_sd, src) = write_source_bytes(&make_empty_page_pdf(), "pdf");
+        let (_d, store) = tmp_store();
+        let (tx, mut rx) = broadcast::channel(16);
+        spawn_ingest(
+            db.clone(),
+            store.clone(),
+            None,
+            kb.clone(),
+            doc_id.clone(),
+            src,
+            FileType::Pdf,
+            tx,
+        );
+
+        // 事件序列：processing → failed，error 含 no text layer
+        let s1 = next_event(&mut rx).await;
+        assert_eq!(s1.status, "processing");
+        let s2 = next_event(&mut rx).await;
+        assert_eq!(s2.status, "failed");
+        assert!(
+            s2.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no text layer")),
+            "error should mention no text layer: {:?}",
+            s2.error
+        );
+
+        let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
+        assert_eq!(doc.status, "failed");
+        assert!(doc
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no text layer")));
         assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
     }
 }
