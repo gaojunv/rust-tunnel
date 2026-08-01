@@ -1138,4 +1138,209 @@ mod tests {
         assert!(!text.contains("tool_call>"), "标签不得泄漏: {text}");
         assert!(text.contains("event: message_stop"), "{text}");
     }
+
+    /// 构造带 RAG 的 LlmState（与 openai_handler 测试等价的 helper）：真实临时
+    /// DB + VectorStore（tempdir）+ KB + chunk + api key 绑 KB。`emb_base_url`
+    /// 由调用点启动的 mock embedding server 提供（返回固定 8 维向量）。
+    async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_provider(
+            &pid,
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        let mid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+            .await
+            .unwrap();
+
+        // 知识库 + 一个分块（向量随后 upsert 进 store）
+        let kb_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_kb(
+            &kb_id,
+            "rag-kb",
+            "",
+            emb_base_url,
+            "sk-emb",
+            "emb-model",
+            8,
+            5,
+            1000,
+            0,
+            0.0,
+            true,
+        )
+        .await
+        .unwrap();
+        let chunk_id = uuid::Uuid::new_v4().to_string();
+        let doc_id = uuid::Uuid::new_v4().to_string();
+        db.rag_create_document(&doc_id, &kb_id, "install.md", "hash")
+            .await
+            .unwrap();
+        db.rag_insert_chunks(&[(
+            chunk_id.clone(),
+            doc_id.clone(),
+            kb_id.clone(),
+            0,
+            "指南/安装".into(),
+            "RAG 知识库测试内容".into(),
+            8,
+        )])
+        .await
+        .unwrap();
+
+        // API key 绑定该知识库
+        let (key, hash, prefix) = crate::server::llm::auth::generate_api_key();
+        let kid = uuid::Uuid::new_v4().to_string();
+        db.llm_save_api_key(&kid, &hash, &prefix, "rag-test", Some(&kb_id))
+            .await
+            .unwrap();
+
+        let state = LlmState::new_with_rag(Some(db), None, tmp.path());
+        state
+            .rag_store
+            .upsert(
+                &kb_id,
+                8,
+                vec![crate::server::llm::rag::store::ChunkPoint {
+                    id: chunk_id,
+                    vector: vec![0.1f32; 8],
+                    doc_id,
+                    seq: 0,
+                    heading_path: "指南/安装".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        (state, key, tmp)
+    }
+
+    /// 回退路径注入端到端：api key 绑 KB → Anthropic 请求 → 回退路径转 OpenAI 格式
+    /// → RAG 注入 messages[0]（含 `<knowledge_base>`）→ 上游（OpenAI 格式）收到；
+    /// usage log 记录 rag_chunks_injected=1。复刻 openai_handler 的 rag 注入测试。
+    #[tokio::test]
+    async fn anthropic_fallback_injects_knowledge_base() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // mock embedding server：任意输入返回固定 8 维向量
+        let emb_app = Router::new().route(
+            "/embeddings",
+            post(|body: axum::Json<serde_json::Value>| async move {
+                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let data: Vec<_> = (0..n)
+                    .map(|i| {
+                        serde_json::json!({
+                            "index": i,
+                            "embedding": vec![0.1f32; 8],
+                            "object": "embedding"
+                        })
+                    })
+                    .collect();
+                axum::Json(serde_json::json!({"object": "list", "data": data}))
+            }),
+        );
+        let emb_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let emb_addr = emb_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(emb_listener, emb_app).await.unwrap();
+        });
+
+        // mock upstream（OpenAI 格式）：回显请求体。回退路径的 call_upstream 指向它。
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+        let captured2 = captured.clone();
+        let llm_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured2.clone();
+                async move {
+                    *captured.lock().await = body;
+                    axum::Json(serde_json::json!({
+                        "id": "chatcmpl-rag-a",
+                        "object": "chat.completion",
+                        "model": "deepseek-chat",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "基于资料的回答"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                    }))
+                }
+            }),
+        );
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_app).await.unwrap();
+        });
+
+        let (state, key, _tmp) = state_with_rag(&format!("http://{emb_addr}")).await;
+        let db = state.db.clone().unwrap();
+
+        // provider 无 anthropic_base_url → 走回退路径；base_url 指向 mock upstream
+        let providers = db.llm_list_providers().await.unwrap();
+        db.llm_save_provider(
+            &providers[0].id,
+            "DS",
+            "deepseek",
+            &format!("http://{llm_addr}"),
+            "sk-upstream",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": "关于知识库的问题"}],
+                "max_tokens": 100
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 上游（OpenAI 格式）收到的 messages[0] 是注入的 system 消息
+        let body = captured.lock().await.clone();
+        let msgs = body["messages"]
+            .as_array()
+            .expect("upstream should receive messages");
+        assert_eq!(msgs[0]["role"], "system", "messages[0] 应为注入的 system: {body}");
+        let sys = msgs[0]["content"].as_str().expect("system content");
+        assert!(
+            sys.contains("<knowledge_base>"),
+            "system 应含 <knowledge_base>: {sys}"
+        );
+        assert!(sys.contains("RAG 知识库测试内容"), "system 应含 chunk 内容: {sys}");
+
+        // usage log 记录 rag_chunks_injected = 1（fire-and-forget 写入，稍等）
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1, "应有一条成功的 usage log");
+        assert_eq!(logs[0].rag_chunks_injected, Some(1));
+    }
 }
