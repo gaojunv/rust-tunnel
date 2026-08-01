@@ -516,6 +516,7 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 kb_id TEXT NOT NULL REFERENCES rag_knowledge_bases(id) ON DELETE CASCADE,
                 filename TEXT NOT NULL,
+                file_type TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 chunk_count INTEGER NOT NULL DEFAULT 0,
@@ -553,6 +554,7 @@ impl Database {
         // 幂等迁移：llm_api_keys 加 kb_id，llm_usage_logs 加 rag_chunks_injected
         Self::migrate_llm_api_keys_add_kb_id(pool).await?;
         Self::migrate_llm_usage_add_rag_chunks(pool).await?;
+        Self::migrate_rag_documents_add_file_type(pool).await?;
 
         Ok(())
     }
@@ -686,5 +688,28 @@ impl Database {
             Err(e) if e.to_string().contains("duplicate column") => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// 回填 SQL：按 filename 扩展名推导 file_type。
+    /// 与 `Database::backfill_rag_document_file_type`（db/rag.rs）共享，避免两份 SQL 漂移。
+    pub(crate) const BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL: &str =
+        "UPDATE rag_documents SET file_type = lower(substr(filename, instr(filename, '.') + 1)) \
+         WHERE file_type = '' AND instr(filename, '.') > 0";
+
+    /// Migration: old DBs lack `file_type` on `rag_documents`. Idempotent.
+    /// 列添加成功后在同一函数内按 filename 扩展名回填老数据（老数据只有 md/txt，必然可推导）。
+    async fn migrate_rag_documents_add_file_type(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE rag_documents ADD COLUMN file_type TEXT NOT NULL DEFAULT ''")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e),
+        }
+        sqlx::query(Self::BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL)
+            .execute(pool)
+            .await?;
+        Ok(())
     }
 }

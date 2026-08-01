@@ -82,6 +82,21 @@ impl FileType {
     }
 }
 
+/// 统一提取入口：原始字节 → Markdown 文本。
+/// Markdown/Text 直通（UTF-8 校验）；二进制格式走各自解析器。
+pub fn extract(bytes: &[u8], file_type: FileType) -> Result<String, ExtractError> {
+    match file_type {
+        FileType::Markdown | FileType::Text => {
+            String::from_utf8(bytes.to_vec()).map_err(|_| ExtractError::NotUtf8)
+        }
+        // 由后续 Task 实现（pdf.rs / ooxml.rs）。
+        FileType::Pdf => Err(ExtractError::ParseFailed("pdf parser not wired".into())),
+        FileType::Docx | FileType::Xlsx | FileType::Pptx => {
+            Err(ExtractError::ParseFailed("ooxml parser not wired".into()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +156,21 @@ mod tests {
         assert!(FileType::Xlsx.probe(&zip_head).is_ok());
         assert!(FileType::Pptx.probe(&zip_head).is_ok());
         assert!(FileType::Docx.probe(b"%PDF-1.7").is_err());
+    }
+
+    #[test]
+    fn extract_text_passthrough() {
+        let md = "# 标题\n\n内容。\n";
+        assert_eq!(extract(md.as_bytes(), FileType::Markdown).unwrap(), md);
+        assert_eq!(extract(b"plain text", FileType::Text).unwrap(), "plain text");
+    }
+
+    #[test]
+    fn extract_text_rejects_non_utf8() {
+        let bad = [0xFF, 0xFE, 0x41];
+        assert!(matches!(
+            extract(&bad, FileType::Markdown),
+            Err(ExtractError::NotUtf8)
+        ));
     }
 }

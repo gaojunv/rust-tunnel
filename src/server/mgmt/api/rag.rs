@@ -564,7 +564,7 @@ pub async fn upload_doc(
 
     if let Err(e) = rt
         .db
-        .rag_create_document(&doc_id, &kb_id, &name, &content_hash)
+        .rag_create_document(&doc_id, &kb_id, &name, &content_hash, "md")
         .await
     {
         // 清理已落盘的原文，避免孤儿文件
@@ -1769,7 +1769,7 @@ mod tests {
 
         // 手工构造一个 status=processing 的 doc + 落盘原文（确定性，无时序竞态）
         let doc_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_document(&doc_id, &kb_id, "busy.md", "sha256:x")
+        db.rag_create_document(&doc_id, &kb_id, "busy.md", "sha256:x", "md")
             .await
             .unwrap();
         db.rag_update_document_status(&doc_id, "processing", 0, None)

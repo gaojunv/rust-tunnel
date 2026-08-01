@@ -620,7 +620,7 @@ mod tests {
         // 一个分块（向量随后 upsert 进 store）；先建文档（rag_chunks.doc_id 有 FK 约束）
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let doc_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_document(&doc_id, &kb_id, "install.md", "hash")
+        db.rag_create_document(&doc_id, &kb_id, "install.md", "hash", "md")
             .await
             .unwrap();
         db.rag_insert_chunks(&[(

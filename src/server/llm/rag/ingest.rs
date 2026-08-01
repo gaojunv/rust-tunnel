@@ -234,7 +234,7 @@ mod tests {
         let base = mock_embedding_server(8).await;
         let kb = create_kb(&db, "kb-1", &base, 8).await;
         let doc_id = "doc-1".to_string();
-        db.rag_create_document(&doc_id, &kb.id, "guide.md", "sha256:abc")
+        db.rag_create_document(&doc_id, &kb.id, "guide.md", "sha256:abc", "md")
             .await
             .unwrap();
         let content = "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n".to_string();
@@ -280,7 +280,7 @@ mod tests {
         // emb_base_url 指向不可达地址（127.0.0.1:1 → connection refused）
         let kb = create_kb(&db, "kb-fail", "http://127.0.0.1:1", 8).await;
         let doc_id = "doc-fail".to_string();
-        db.rag_create_document(&doc_id, &kb.id, "x.md", "sha256:x")
+        db.rag_create_document(&doc_id, &kb.id, "x.md", "sha256:x", "md")
             .await
             .unwrap();
 
@@ -316,7 +316,7 @@ mod tests {
         let base = mock_embedding_server_short(8).await;
         let kb = create_kb(&db, "kb-short", &base, 8).await;
         let doc_id = "doc-short".to_string();
-        db.rag_create_document(&doc_id, &kb.id, "y.md", "sha256:y")
+        db.rag_create_document(&doc_id, &kb.id, "y.md", "sha256:y", "md")
             .await
             .unwrap();
         // 内容需产生至少 2 个 chunk，使 mock 的 n-1 返回值非空

@@ -25,6 +25,7 @@ pub struct RagDocumentRecord {
     pub id: String,
     pub kb_id: String,
     pub filename: String,
+    pub file_type: String,
     pub content_hash: String,
     pub status: String,
     pub chunk_count: i64,
@@ -170,19 +171,30 @@ impl Database {
         kb_id: &str,
         filename: &str,
         content_hash: &str,
+        file_type: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO rag_documents (id, kb_id, filename, content_hash, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))
+            INSERT INTO rag_documents (id, kb_id, filename, file_type, content_hash, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))
             "#,
         )
         .bind(id)
         .bind(kb_id)
         .bind(filename)
+        .bind(file_type)
         .bind(content_hash)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// 测试/维护用：按 filename 扩展名回填空 file_type。
+    /// 与 schema.rs 迁移函数共享 `BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL`。
+    pub async fn backfill_rag_document_file_type(&self) -> Result<(), sqlx::Error> {
+        sqlx::query(Self::BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -468,7 +480,7 @@ mod tests {
         create_sample_kb(&db, "kb-d").await;
 
         // document
-        db.rag_create_document("doc-1", "kb-d", "guide.md", "sha256:abc")
+        db.rag_create_document("doc-1", "kb-d", "guide.md", "sha256:abc", "md")
             .await
             .unwrap();
         let doc = db.rag_get_document("doc-1").await.unwrap().unwrap();
@@ -478,7 +490,7 @@ mod tests {
         assert!(doc.error.is_none());
 
         // list
-        db.rag_create_document("doc-2", "kb-d", "other.md", "sha256:def")
+        db.rag_create_document("doc-2", "kb-d", "other.md", "sha256:def", "md")
             .await
             .unwrap();
         let docs = db.rag_list_documents("kb-d").await.unwrap();
@@ -553,5 +565,34 @@ mod tests {
         // 删除知识库级联删文档
         db.rag_delete_kb("kb-d").await.unwrap();
         assert!(db.rag_list_documents("kb-d").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_roundtrip_carries_file_type() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.rag_create_kb("kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true)
+            .await
+            .unwrap();
+        db.rag_create_document("d1", "kb1", "a.pdf", "sha256:x", "pdf")
+            .await
+            .unwrap();
+        let doc = db.rag_get_document("d1").await.unwrap().unwrap();
+        assert_eq!(doc.file_type, "pdf");
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_legacy_rows() {
+        // 验证老数据回填规则：插入 file_type='' 的行（模拟迁移前的老数据），
+        // 跑回填方法后应按 filename 扩展名推导出类型。
+        let db = Database::new(":memory:").await.unwrap();
+        db.rag_create_kb("kb2", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true)
+            .await
+            .unwrap();
+        db.rag_create_document("legacy", "kb2", "old.md", "sha256:y", "")
+            .await
+            .unwrap();
+        db.backfill_rag_document_file_type().await.unwrap();
+        let doc = db.rag_get_document("legacy").await.unwrap().unwrap();
+        assert_eq!(doc.file_type, "md");
     }
 }
