@@ -27,7 +27,9 @@ import {
   Trash2,
   Edit3,
   FileText,
+  AlertTriangle,
 } from 'lucide-react';
+import { getApiErrorMessage } from '@/api/client';
 
 const MAX_DOC_BYTES = 2 * 1024 * 1024;
 const ACCEPTED_EXTENSIONS = ['md', 'txt'];
@@ -126,6 +128,7 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
   const [query, setQuery] = useState('');
   const [dragging, setDragging] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [overrides, setOverrides] = useState<Record<string, DocOverride>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -162,7 +165,16 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
       }
     });
     setUploadError(hasInvalid ? t('kb.fileInvalid') : null);
-    accepted.forEach((f) => uploadMutation.mutate({ kbId: kb.id, file: f }));
+    accepted.forEach((f) =>
+      uploadMutation.mutate(
+        { kbId: kb.id, file: f },
+        {
+          onError: (err) => {
+            setUploadError(t('kb.uploadError', { error: getApiErrorMessage(err) }));
+          },
+        },
+      ),
+    );
   };
 
   const runQuery = () => {
@@ -172,7 +184,13 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
 
   const deleteKb = () => {
     if (confirm(t('kb.deleteKb', { name: kb.name }))) {
-      deleteKbMutation.mutate(kb.id, { onSuccess: onDeleted });
+      setActionError(null);
+      deleteKbMutation.mutate(kb.id, {
+        onSuccess: onDeleted,
+        onError: (err) => {
+          setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+        },
+      });
     }
   };
 
@@ -212,6 +230,13 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
           </div>
         </CardHeader>
       </Card>
+
+      {actionError && (
+        <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          {actionError}
+        </div>
+      )}
 
       {/* 上传区 */}
       <Card>
@@ -281,12 +306,28 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
                     reindexing={reindexing}
                     onDelete={() => {
                       if (confirm(t('kb.deleteDoc', { name: d.filename }))) {
-                        deleteMutation.mutate({ kbId: kb.id, docId: d.id });
+                        setActionError(null);
+                        deleteMutation.mutate(
+                          { kbId: kb.id, docId: d.id },
+                          {
+                            onError: (err) => {
+                              setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                            },
+                          },
+                        );
                       }
                     }}
                     onReindex={() => {
                       if (confirm(t('kb.reindexConfirm', { name: d.filename }))) {
-                        reindexMutation.mutate({ kbId: kb.id, docId: d.id });
+                        setActionError(null);
+                        reindexMutation.mutate(
+                          { kbId: kb.id, docId: d.id },
+                          {
+                            onError: (err) => {
+                              setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                            },
+                          },
+                        );
                       }
                     }}
                   />

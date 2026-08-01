@@ -469,3 +469,23 @@ export async function queryKb(kbId: string, text: string): Promise<KbQueryResult
   return data;
 }
 
+/**
+ * Extract a human-readable message from an API error.
+ * Axum handlers on this server reply with plain-text bodies on failure
+ * (e.g. `(StatusCode::BAD_REQUEST, "name is required")`), but some endpoints
+ * return JSON `{ "error": "..." }`. Falls back to the generic Error message.
+ */
+export function getApiErrorMessage(err: unknown): string {
+  const data = (err as { response?: { data?: unknown } } | null)?.response?.data;
+  if (typeof data === 'string' && data.trim() !== '') {
+    return data;
+  }
+  if (data && typeof data === 'object') {
+    const msg = (data as { error?: unknown }).error;
+    if (typeof msg === 'string' && msg.trim() !== '') {
+      return msg;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+

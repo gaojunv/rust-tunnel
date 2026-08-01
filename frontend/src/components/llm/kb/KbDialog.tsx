@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { ChevronDown, Loader2, Wifi } from 'lucide-react';
+import { getApiErrorMessage } from '@/api/client';
 import {
   useLlmKbs,
   useCreateLlmKb,
@@ -45,38 +46,51 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [testMsg, setTestMsg] = useState<string | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // Initialize the form exactly once per open cycle. `existing` is an object
+  // reference inside the live `llm-kbs` query array, so it changes on every
+  // refetch (window focus, SSE invalidate while documents ingest); re-running
+  // the init on those changes would clobber in-progress edits.
+  const initRef = useRef(false);
 
   useEffect(() => {
-    if (open) {
-      if (existing) {
-        setName(existing.name);
-        setDescription(existing.description);
-        setEmbBaseUrl(existing.emb_base_url);
-        setEmbApiKey('');
-        setEmbModel(existing.emb_model);
-        setEmbDimension(existing.emb_dimension);
-        setTopK(existing.top_k);
-        setChunkSize(existing.chunk_size);
-        setChunkOverlap(existing.chunk_overlap);
-        setScoreThreshold(existing.score_threshold);
-        setEnabled(existing.enabled);
-      } else {
-        setName('');
-        setDescription('');
-        setEmbBaseUrl('');
-        setEmbApiKey('');
-        setEmbModel('');
-        setEmbDimension('');
-        setTopK(5);
-        setChunkSize(512);
-        setChunkOverlap(64);
-        setScoreThreshold(0.3);
-        setEnabled(true);
-      }
-      setAdvancedOpen(false);
-      setTestMsg(null);
-      setTestError(null);
+    if (!open) {
+      initRef.current = false;
+      return;
     }
+    if (initRef.current) return;
+    initRef.current = true;
+
+    if (existing) {
+      setName(existing.name);
+      setDescription(existing.description);
+      setEmbBaseUrl(existing.emb_base_url);
+      setEmbApiKey('');
+      setEmbModel(existing.emb_model);
+      setEmbDimension(existing.emb_dimension);
+      setTopK(existing.top_k);
+      setChunkSize(existing.chunk_size);
+      setChunkOverlap(existing.chunk_overlap);
+      setScoreThreshold(existing.score_threshold);
+      setEnabled(existing.enabled);
+    } else {
+      setName('');
+      setDescription('');
+      setEmbBaseUrl('');
+      setEmbApiKey('');
+      setEmbModel('');
+      setEmbDimension('');
+      setTopK(5);
+      setChunkSize(512);
+      setChunkOverlap(64);
+      setScoreThreshold(0.3);
+      setEnabled(true);
+    }
+    setAdvancedOpen(false);
+    setTestMsg(null);
+    setTestError(null);
+    setSubmitError(null);
   }, [open, existing]);
 
   const runTest = () => {
@@ -100,6 +114,10 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
 
   const submit = () => {
     if (!name.trim()) return;
+    setSubmitError(null);
+    const fail = (err: unknown) => {
+      setSubmitError(t('kb.saveError', { error: getApiErrorMessage(err) }));
+    };
     if (isEdit) {
       updateMutation.mutate(
         {
@@ -111,7 +129,10 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           chunk_overlap: chunkOverlap,
           score_threshold: scoreThreshold,
         },
-        { onSuccess: onClose },
+        {
+          onSuccess: onClose,
+          onError: fail,
+        },
       );
     } else {
       createMutation.mutate(
@@ -133,6 +154,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
             onClose();
             onCreated?.(res.id);
           },
+          onError: fail,
         },
       );
     }
@@ -256,6 +278,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
             </div>
           )}
         </div>
+        {submitError && <p className="text-sm text-destructive">{submitError}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
           <Button

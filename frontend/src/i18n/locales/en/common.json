@@ -666,6 +666,9 @@
     "uploadHint": "Drop .md or .txt files here (max 2MB each)",
     "browse": "or click to browse",
     "fileInvalid": "Only .md and .txt files up to 2MB are allowed",
+    "saveError": "Failed to save: {{error}}",
+    "uploadError": "Upload failed: {{error}}",
+    "actionError": "Operation failed: {{error}}",
     "emptyDocs": "No documents yet. Upload a .md or .txt file.",
     "chunks": "chunks",
     "status": {
