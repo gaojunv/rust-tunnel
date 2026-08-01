@@ -92,6 +92,8 @@ rustls-native-certs = "0.7"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
 md-5 = "0.10"
+# PDF 文本层提取（纯 Rust，无系统动态库依赖；nom_parser 提供 load/extract_text）
+lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

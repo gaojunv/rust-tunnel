@@ -2,6 +2,7 @@
 //! PDF/Office 解析全部走纯 Rust crate（lopdf/zip/quick-xml），不做 OCR。
 
 pub mod error;
+pub mod pdf;
 
 pub use error::ExtractError;
 
@@ -89,8 +90,8 @@ pub fn extract(bytes: &[u8], file_type: FileType) -> Result<String, ExtractError
         FileType::Markdown | FileType::Text => {
             String::from_utf8(bytes.to_vec()).map_err(|_| ExtractError::NotUtf8)
         }
-        // 由后续 Task 实现（pdf.rs / ooxml.rs）。
-        FileType::Pdf => Err(ExtractError::ParseFailed("pdf parser not wired".into())),
+        FileType::Pdf => pdf::pdf_to_markdown(bytes),
+        // 由后续 Task 实现（ooxml.rs）。
         FileType::Docx | FileType::Xlsx | FileType::Pptx => {
             Err(ExtractError::ParseFailed("ooxml parser not wired".into()))
         }
