@@ -393,3 +393,84 @@ export interface LlmUsageLogsResponse {
   total: number;
 }
 
+// === LLM RAG Knowledge Base ===
+
+export type KbDocStatus = 'pending' | 'processing' | 'ready' | 'failed';
+
+export interface LlmKnowledgeBase {
+  id: string;
+  name: string;
+  description: string;
+  emb_base_url: string;
+  emb_api_key: string; // 恒为空字符串（后端不回显）
+  emb_model: string;
+  emb_dimension: number;
+  top_k: number;
+  chunk_size: number;
+  chunk_overlap: number;
+  score_threshold: number;
+  enabled: boolean;
+  doc_count?: number;
+  chunk_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LlmKbDocument {
+  id: string;
+  kb_id: string;
+  filename: string;
+  content_hash: string;
+  status: KbDocStatus;
+  chunk_count: number;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KbQueryHit {
+  heading_path: string;
+  content: string;
+  score: number;
+}
+
+export interface KbQueryResult {
+  chunks: KbQueryHit[];
+}
+
+export interface KbEvent {
+  doc_id: string;
+  kb_id: string;
+  status: KbDocStatus;
+  chunk_count: number;
+  error?: string | null;
+}
+
+export interface CreateLlmKbRequest {
+  name: string;
+  description: string;
+  emb_base_url: string;
+  emb_api_key: string;
+  emb_model: string;
+  emb_dimension: number;
+  top_k?: number;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  score_threshold?: number;
+  enabled?: boolean;
+}
+
+export interface UpdateLlmKbRequest {
+  name: string;
+  description: string;
+  top_k?: number;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  score_threshold?: number;
+}
+
+export interface TestEmbeddingResult {
+  dimension: number;
+  latency_ms: number;
+}
+

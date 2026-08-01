@@ -45,6 +45,18 @@ import {
   getLlmUsageSummary,
   getLlmUsageAggregate,
   getLlmUsageLogs,
+  listLlmKbs,
+  getLlmKb,
+  createLlmKb,
+  updateLlmKb,
+  toggleLlmKb,
+  deleteLlmKb,
+  listLlmKbDocs,
+  uploadKbDoc,
+  deleteKbDoc,
+  reindexKbDoc,
+  testEmbedding,
+  queryKb,
 } from './client';
 import type {
   LoginRequest,
@@ -58,6 +70,8 @@ import type {
   CreateModelRequest,
   LlmGatewayConfig,
   UsageGroupBy,
+  CreateLlmKbRequest,
+  UpdateLlmKbRequest,
 } from '../types';
 
 // Shadowsocks hooks
@@ -511,5 +525,110 @@ export function useLlmUsageLogs(range: UsageRange, limit = 50, offset = 0) {
   return useQuery({
     queryKey: ['llm-usage-logs', range.start, range.end, limit, offset],
     queryFn: () => getLlmUsageLogs({ ...range, limit, offset }),
+  });
+}
+
+// ── RAG Knowledge Base ──────────────────────────────────────
+
+export function useLlmKbs() {
+  return useQuery({ queryKey: ['llm-kbs'], queryFn: () => listLlmKbs() });
+}
+
+export function useLlmKb(id: string) {
+  return useQuery({
+    queryKey: ['llm-kb', id],
+    queryFn: () => getLlmKb(id),
+    enabled: !!id,
+  });
+}
+
+export function useCreateLlmKb() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: CreateLlmKbRequest) => createLlmKb(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-kbs'] }),
+  });
+}
+
+export function useUpdateLlmKb() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & UpdateLlmKbRequest) => updateLlmKb(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+      qc.invalidateQueries({ queryKey: ['llm-kb', vars.id] });
+    },
+  });
+}
+
+export function useToggleLlmKb() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => toggleLlmKb(id, enabled),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+      qc.invalidateQueries({ queryKey: ['llm-kb', vars.id] });
+    },
+  });
+}
+
+export function useDeleteLlmKb() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteLlmKb(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-kbs'] }),
+  });
+}
+
+export function useLlmKbDocs(kbId: string) {
+  return useQuery({
+    queryKey: ['llm-kb-docs', kbId],
+    queryFn: () => listLlmKbDocs(kbId),
+    enabled: !!kbId,
+  });
+}
+
+export function useUploadKbDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kbId, file }: { kbId: string; file: File }) => uploadKbDoc(kbId, file),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
+      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+    },
+  });
+}
+
+export function useDeleteKbDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kbId, docId }: { kbId: string; docId: string }) => deleteKbDoc(kbId, docId),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
+      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+    },
+  });
+}
+
+export function useReindexKbDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kbId, docId }: { kbId: string; docId: string }) => reindexKbDoc(kbId, docId),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['llm-kb-docs', vars.kbId] });
+      qc.invalidateQueries({ queryKey: ['llm-kbs'] });
+    },
+  });
+}
+
+export function useTestEmbedding() {
+  return useMutation({
+    mutationFn: (req: { base_url: string; api_key: string; model: string }) => testEmbedding(req),
+  });
+}
+
+export function useKbQuery() {
+  return useMutation({
+    mutationFn: ({ kbId, text }: { kbId: string; text: string }) => queryKb(kbId, text),
   });
 }

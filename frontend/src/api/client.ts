@@ -34,6 +34,12 @@ import type {
   LlmUsageAggregateRow,
   LlmUsageLogsResponse,
   UsageGroupBy,
+  LlmKnowledgeBase,
+  LlmKbDocument,
+  KbQueryResult,
+  CreateLlmKbRequest,
+  UpdateLlmKbRequest,
+  TestEmbeddingResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -397,5 +403,69 @@ export async function getLlmUsageLogs(
 ): Promise<LlmUsageLogsResponse> {
   const { data } = await api.get('/llm/usage/logs', { params });
   return { logs: data.logs, total: data.total };
+}
+
+// ── RAG Knowledge Base ──────────────────────────────────────────
+
+export async function listLlmKbs(): Promise<LlmKnowledgeBase[]> {
+  const { data } = await api.get('/llm/kb');
+  return data.knowledge_bases;
+}
+
+export async function getLlmKb(id: string): Promise<LlmKnowledgeBase> {
+  const { data } = await api.get(`/llm/kb/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function createLlmKb(req: CreateLlmKbRequest): Promise<{ id: string }> {
+  const { data } = await api.post('/llm/kb', req);
+  return data;
+}
+
+export async function updateLlmKb(id: string, req: UpdateLlmKbRequest): Promise<void> {
+  await api.put(`/llm/kb/${encodeURIComponent(id)}`, req);
+}
+
+export async function toggleLlmKb(id: string, enabled: boolean): Promise<void> {
+  await api.patch(`/llm/kb/${encodeURIComponent(id)}`, { enabled });
+}
+
+export async function deleteLlmKb(id: string): Promise<void> {
+  await api.delete(`/llm/kb/${encodeURIComponent(id)}`);
+}
+
+export async function listLlmKbDocs(kbId: string): Promise<LlmKbDocument[]> {
+  const { data } = await api.get(`/llm/kb/${encodeURIComponent(kbId)}/docs`);
+  return data.documents;
+}
+
+export async function uploadKbDoc(kbId: string, file: File): Promise<LlmKbDocument> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs`, formData);
+  return data;
+}
+
+export async function deleteKbDoc(kbId: string, docId: string): Promise<void> {
+  await api.delete(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}`);
+}
+
+export async function reindexKbDoc(kbId: string, docId: string): Promise<LlmKbDocument> {
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/docs/${encodeURIComponent(docId)}/reindex`);
+  return data;
+}
+
+export async function testEmbedding(req: {
+  base_url: string;
+  api_key: string;
+  model: string;
+}): Promise<TestEmbeddingResult> {
+  const { data } = await api.post('/llm/kb/test-embedding', req);
+  return data;
+}
+
+export async function queryKb(kbId: string, text: string): Promise<KbQueryResult> {
+  const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/query`, { text });
+  return data;
 }
 
