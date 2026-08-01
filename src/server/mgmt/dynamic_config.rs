@@ -53,6 +53,26 @@ pub struct DynamicConfig {
 }
 
 impl DynamicConfig {
+    /// 供 LLM handler 内部默认使用：llm_request_logging 默认开启，其余取最小默认。
+    /// 生产环境由 init_llm_state 注入 ServerState 的真实实例覆盖此默认。
+    pub fn default_for_llm() -> Self {
+        Self {
+            log_level: "info".to_string(),
+            llm_request_logging: true,
+            ss: None,
+            trojan: None,
+            reverse_proxy: ReverseProxySettings {
+                max_connections: 10000,
+                connection_timeout_secs: 30,
+                buffer_size: 8192,
+            },
+            dns: DnsSettings {
+                tunnel_domain: "tunnel.local".to_string(),
+                mesh_domain: "mesh.local".to_string(),
+            },
+        }
+    }
+
     /// Load dynamic config from DB. If DB has no records, seed from ServerConfig (first run).
     ///
     /// 表中若存在多行（旧版本按端口 upsert 可能残留多份配置），取最近更新的一行——

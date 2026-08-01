@@ -147,6 +147,7 @@ impl TestHarness {
                 std::path::Path::new(&config.db_path)
                     .parent()
                     .unwrap_or(std::path::Path::new(".")),
+                state.dynamic_config.clone(),
             )
             .await;
         let proxy_state = state.proxy_state.clone();

@@ -287,6 +287,8 @@ pub struct LlmState {
     pub rag_store: rag::store::VectorStore,
     /// RAG 摄入状态事件通道（SSE 推送给前端）。
     pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
+    /// 动态配置引用（LLM 请求日志开关等）。默认开启，生产路径由 init_llm_state 注入真实实例。
+    pub dynamic_config: Arc<RwLock<crate::server::dynamic_config::DynamicConfig>>,
 }
 
 impl LlmState {
@@ -311,6 +313,9 @@ impl LlmState {
             cipher,
             rag_store: rag::store::VectorStore::new(rag_data_dir),
             rag_tx: tokio::sync::broadcast::channel(256).0,
+            dynamic_config: Arc::new(RwLock::new(
+                crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+            )),
         }
     }
 }
@@ -336,6 +341,16 @@ mod tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.openai_domain.as_deref(), Some("oa.example.com"));
         assert_eq!(cfg.anthropic_domain.as_deref(), Some("an.example.com"));
+    }
+
+    #[test]
+    fn test_dynamic_config_default_enabled() {
+        // 默认构造：llm_request_logging 必须开启（生产路径由 init_llm_state 注入真实实例覆盖）
+        let state = LlmState::new(None, None);
+        assert!(
+            state.dynamic_config.blocking_read().llm_request_logging,
+            "default dynamic_config should enable llm request logging"
+        );
     }
 
     #[test]

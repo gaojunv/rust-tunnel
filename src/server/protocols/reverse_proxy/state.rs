@@ -86,6 +86,7 @@ impl ReverseProxyState {
         db: Option<Database>,
         master_key: Option<[u8; 32]>,
         rag_data_dir: &Path,
+        dynamic_config: Arc<tokio::sync::RwLock<crate::server::dynamic_config::DynamicConfig>>,
     ) {
         let gateway_rule = {
             let rules = self.rules.lock().await;
@@ -93,7 +94,8 @@ impl ReverseProxyState {
         };
 
         let cipher = master_key.map(crate::server::llm::crypto::LlmCipher::from_master_key);
-        let llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
+        let mut llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
+        llm.dynamic_config = dynamic_config;
 
         // Derive gateway config from the ProxyRule
         if let Some(rule) = gateway_rule {
@@ -577,7 +579,16 @@ mod tests {
         drop(rules);
 
         // Initialize LlmState (without DB)
-        state.init_llm_state(None, None, std::path::Path::new(".")).await;
+        state
+            .init_llm_state(
+                None,
+                None,
+                std::path::Path::new("."),
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+                )),
+            )
+            .await;
 
         let llm_guard = state.llm_state.read().await;
         assert!(llm_guard.is_some(), "llm_state should be initialized");
@@ -595,7 +606,16 @@ mod tests {
     async fn init_llm_state_no_gateway_rule() {
         let state = ReverseProxyState::new();
         // No gateway rule — llm_state should still be initialized (disabled)
-        state.init_llm_state(None, None, std::path::Path::new(".")).await;
+        state
+            .init_llm_state(
+                None,
+                None,
+                std::path::Path::new("."),
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+                )),
+            )
+            .await;
         let llm_guard = state.llm_state.read().await;
         assert!(
             llm_guard.is_some(),
@@ -629,7 +649,16 @@ mod tests {
         );
         drop(rules);
 
-        state.init_llm_state(None, None, std::path::Path::new(".")).await;
+        state
+            .init_llm_state(
+                None,
+                None,
+                std::path::Path::new("."),
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+                )),
+            )
+            .await;
 
         // Even if the rule exists but is disabled, llm_state should be initialized
         // (the enabled flag is checked per-request)

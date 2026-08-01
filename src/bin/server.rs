@@ -348,6 +348,7 @@ async fn main() -> TunnelResult<()> {
             std::path::Path::new(&config.db_path)
                 .parent()
                 .unwrap_or(std::path::Path::new(".")),
+            state.dynamic_config.clone(),
         )
         .await;
 

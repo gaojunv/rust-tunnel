@@ -945,7 +945,14 @@ mod tests {
         let server_state = ServerState::with_db(db);
         server_state
             .proxy_state
-            .init_llm_state(server_state.db().cloned(), Some([42u8; 32]), rag_dir)
+            .init_llm_state(
+                server_state.db().cloned(),
+                Some([42u8; 32]),
+                rag_dir,
+                std::sync::Arc::new(tokio::sync::RwLock::new(
+                    crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+                )),
+            )
             .await;
         ApiState {
             server_state,
