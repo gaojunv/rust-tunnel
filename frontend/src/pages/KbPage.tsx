@@ -39,6 +39,7 @@ export default function KbPage() {
         <div className="min-w-0 flex-1">
           {selectedKb ? (
             <KbDetail
+              key={selectedKb.id}
               kb={selectedKb}
               onBack={() => setSelectedId(null)}
               onDeleted={() => setSelectedId(null)}
