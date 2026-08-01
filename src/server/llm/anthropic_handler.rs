@@ -415,6 +415,11 @@ pub async fn handle_messages(
 
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            super::log_llm_request(
+                &state.llm, "anthropic", &request.model, request.messages.len(),
+                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms,
+            ).await;
             // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
             // 非流式整体转换会消费 body，因此这里在转换后再包一层。
             if !request.stream {
@@ -440,6 +445,11 @@ pub async fn handle_messages(
             }
         }
         Err((status, msg)) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            super::log_llm_request(
+                &state.llm, "anthropic", &request.model, request.messages.len(),
+                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+            ).await;
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
             }

@@ -255,6 +255,11 @@ pub async fn handle_chat_completions(
     let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     match call_upstream(&provider.base_url, &provider.api_key, &request).await {
         Ok(resp) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            super::log_llm_request(
+                &state.llm, "openai", &request.model, request.messages.len(),
+                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms,
+            ).await;
             let resp = if compat_enabled {
                 if request.stream {
                     // 流式 + compat 模式：增量解析 content，伪工具调用即时识别为 tool_calls
@@ -269,6 +274,11 @@ pub async fn handle_chat_completions(
             super::usage::wrap_and_record(resp, ctx, db, started).await
         }
         Err((status, msg)) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            super::log_llm_request(
+                &state.llm, "openai", &request.model, request.messages.len(),
+                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+            ).await;
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);

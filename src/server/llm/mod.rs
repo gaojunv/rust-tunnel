@@ -320,6 +320,39 @@ impl LlmState {
     }
 }
 
+/// 记录 LLM 请求摘要日志（受 dynamic_config.llm_request_logging 开关控制）。
+///
+/// 在 LLM 网关入口调用（compat/RAG 改写后、上游调用前后）。只记摘要不记正文。
+/// 4xx/5xx 详细错误日志由 upstream.rs 的 llm_upstream/llm_upstream_debug 负责，不受此开关影响。
+#[allow(clippy::too_many_arguments)]
+pub async fn log_llm_request(
+    llm: &LlmState,
+    protocol: &str,
+    model: &str,
+    message_count: usize,
+    has_tools: bool,
+    stream: bool,
+    status: Option<u16>,
+    error: Option<&str>,
+    elapsed_ms: u128,
+) {
+    if !llm.dynamic_config.read().await.llm_request_logging {
+        return;
+    }
+    tracing::info!(
+        target: "llm_request",
+        protocol,
+        model,
+        message_count,
+        has_tools,
+        stream,
+        status = status.map_or(0i64, i64::from),
+        error = error.unwrap_or(""),
+        elapsed_ms = elapsed_ms as i64,
+        "LLM request"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +384,22 @@ mod tests {
             state.dynamic_config.blocking_read().llm_request_logging,
             "default dynamic_config should enable llm request logging"
         );
+    }
+
+    #[tokio::test]
+    async fn test_log_llm_request_respects_disabled_flag() {
+        let state = LlmState::new(None, None);
+        // 关闭开关
+        state.dynamic_config.write().await.llm_request_logging = false;
+        // 开关关闭时应直接返回，不 panic
+        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10).await;
+    }
+
+    #[tokio::test]
+    async fn test_log_llm_request_default_enabled() {
+        let state = LlmState::new(None, None);
+        // 默认开启，调用不应 panic
+        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10).await;
     }
 
     #[test]
