@@ -27,6 +27,12 @@ pub struct SetLevelRequest {
     pub level: String,
 }
 
+/// Request body for PUT /api/logs/llm-logging
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct SetLlmLoggingRequest {
+    pub enabled: bool,
+}
+
 /// SSE query params (for token-based auth)
 #[derive(Debug, Deserialize)]
 pub struct SseQuery {

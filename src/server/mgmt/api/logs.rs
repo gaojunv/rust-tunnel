@@ -306,3 +306,117 @@ pub async fn put_logs_level(
 
     Json(serde_json::json!({ "level": body.level.to_lowercase() })).into_response()
 }
+
+pub async fn get_llm_logging(State(state): State<ApiState>) -> impl IntoResponse {
+    let enabled = state
+        .server_state
+        .dynamic_config
+        .read()
+        .await
+        .llm_request_logging;
+    Json(serde_json::json!({ "enabled": enabled })).into_response()
+}
+
+pub async fn put_llm_logging(
+    State(state): State<ApiState>,
+    Json(body): Json<super::dto::SetLlmLoggingRequest>,
+) -> impl IntoResponse {
+    // 更新动态配置
+    {
+        let mut dc = state.server_state.dynamic_config.write().await;
+        dc.llm_request_logging = body.enabled;
+    }
+
+    // 持久化到 DB
+    if let Some(db) = state.server_state.db() {
+        let _ = db
+            .save_server_setting("llm_request_logging", if body.enabled { "true" } else { "false" })
+            .await;
+    }
+
+    tracing::info!("LLM request logging toggled to {}", body.enabled);
+    Json(serde_json::json!({ "enabled": body.enabled })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::auth::AuthConfig;
+    use std::sync::Arc;
+
+    async fn get_enabled(state: ApiState) -> bool {
+        let resp = get_llm_logging(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["enabled"]
+            .as_bool()
+            .unwrap()
+    }
+
+    fn make_state() -> ApiState {
+        ApiState {
+            server_state: crate::server::control::ServerState::new(),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_llm_logging_default_true() {
+        assert!(get_enabled(make_state()).await);
+    }
+
+    #[tokio::test]
+    async fn test_put_llm_logging_toggles_and_persists() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let state = ApiState {
+            server_state: crate::server::control::ServerState::with_db(db),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+
+        // PUT false
+        let resp = put_llm_logging(
+            State(state.clone()),
+            Json(super::super::dto::SetLlmLoggingRequest { enabled: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], serde_json::json!(false));
+
+        // GET should reflect the new value
+        assert!(!get_enabled(state.clone()).await);
+
+        // DB should persist "false"
+        let stored = state
+            .server_state
+            .db()
+            .expect("db")
+            .load_server_setting("llm_request_logging")
+            .await
+            .expect("load ok")
+            .expect("stored");
+        assert_eq!(stored, "false");
+    }
+
+    #[tokio::test]
+    async fn test_put_llm_logging_turns_back_on() {
+        let state = make_state();
+
+        let resp = put_llm_logging(
+            State(state.clone()),
+            Json(super::super::dto::SetLlmLoggingRequest { enabled: true }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(get_enabled(state).await);
+    }
+}

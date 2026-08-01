@@ -263,6 +263,10 @@ pub async fn run_api_server(
         // Log viewer endpoints (SSE stream is in public_routes — uses ?token= query param)
         .route("/api/logs", get(logs::get_logs))
         .route(
+            "/api/logs/llm-logging",
+            get(logs::get_llm_logging).put(logs::put_llm_logging),
+        )
+        .route(
             "/api/logs/level",
             get(logs::get_logs_level).put(logs::put_logs_level),
         )
