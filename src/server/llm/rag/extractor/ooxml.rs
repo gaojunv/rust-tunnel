@@ -1,5 +1,8 @@
 //! OOXML（docx/xlsx/pptx）解包与 XML 解析共享基建。
 //! OOXML = zip 容器 + XML 部件；三种格式复用 open_zip/read_part。
+//!
+//! 安全注意：上传的 docx/xlsx/pptx 是不可信输入，zip 中央目录中声明的
+//! 解压大小（`size`）等头部字段可被伪造，绝不能据此分配内存或限制读取。
 
 use std::io::{Cursor, Read, Seek};
 
@@ -15,6 +18,10 @@ pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractE
 }
 
 /// 读取 zip 内一个部件为 UTF-8 字符串。
+///
+/// 注意：不根据中央目录声明的 `part.size()` 预分配缓冲——该字段来自不可信
+/// 的 zip 头部，可伪造为任意大（见模块注释）。改用 `Vec::new()` 让
+/// `read_to_end` 按真实解压字节增长，天然受 inflate 实际输出约束。
 pub fn read_part<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
@@ -22,7 +29,7 @@ pub fn read_part<R: Read + Seek>(
     let mut part = archive
         .by_name(name)
         .map_err(|_| ExtractError::ParseFailed(format!("missing part: {name}")))?;
-    let mut buf = Vec::with_capacity(part.size() as usize);
+    let mut buf = Vec::new();
     part.read_to_end(&mut buf)
         .map_err(|e| ExtractError::ParseFailed(format!("read part {name}: {e}")))?;
     String::from_utf8(buf).map_err(|_| ExtractError::ParseFailed(format!("part {name} not utf-8")))
@@ -105,7 +112,8 @@ fn apply_pstyle(para_heading: &mut Option<usize>, elem: &BytesStart<'_>) {
     }
 }
 
-/// "Heading1"/"1" → Some(1)；其余 → None。
+/// "Heading1" → Some(1)；其余（含纯数字、中文样式名）→ None。
+/// w:pStyle 的 w:val 是内部 styleId（内置标题始终为 HeadingN，与 UI 语言无关）。
 fn parse_heading_level(style: &str) -> Option<usize> {
     let digits: String = style.chars().filter(|c| c.is_ascii_digit()).collect();
     if style.to_ascii_lowercase().starts_with("heading") {
