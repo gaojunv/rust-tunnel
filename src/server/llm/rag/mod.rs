@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod embedder;
+pub mod extractor;
 pub mod ingest;
 pub mod retriever;
 pub mod store;
