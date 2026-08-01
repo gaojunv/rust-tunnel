@@ -419,4 +419,121 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(get_enabled(state).await);
     }
+
+    /// 完整端到端 round-trip：PUT 关闭 → dynamic_config 同步 → DB 持久化 →
+    /// 模拟服务重启（load_or_seed 回读）→ 重启后的 GET 仍为 false。
+    #[tokio::test]
+    async fn test_llm_logging_round_trip_survives_restart() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let state = ApiState {
+            server_state: crate::server::control::ServerState::with_db(db.clone()),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+
+        // PUT 关闭
+        let resp = put_llm_logging(
+            State(state.clone()),
+            Json(super::super::dto::SetLlmLoggingRequest { enabled: false }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // dynamic_config 已同步更新
+        assert!(
+            !state.server_state.dynamic_config.read().await.llm_request_logging,
+            "dynamic_config should be false after PUT"
+        );
+
+        // DB 已持久化为 "false"
+        let stored = db
+            .load_server_setting("llm_request_logging")
+            .await
+            .unwrap()
+            .expect("llm_request_logging row should exist after PUT");
+        assert_eq!(stored, "false");
+
+        // 模拟重启：与 bin/server.rs 启动流程一致 —— load_or_seed 从 DB 回读
+        let config = crate::server::config::ServerConfig::default();
+        let reloaded =
+            crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
+        assert!(
+            !reloaded.llm_request_logging,
+            "restart must read back false from DB"
+        );
+
+        // 重启后的新 ServerState 应用该配置后，GET 也应返回 false
+        let restarted = ApiState {
+            server_state: crate::server::control::ServerState::with_db(db.clone()),
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        };
+        restarted.server_state.set_dynamic_config(reloaded).await;
+        assert!(!get_enabled(restarted).await, "GET after restart is false");
+    }
+
+    /// load_or_seed 的开关解析逻辑：只有 "1"/"true" 视为开启，其余为关闭。
+    #[tokio::test]
+    async fn test_llm_logging_load_or_seed_parsing() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let config = crate::server::config::ServerConfig::default();
+
+        // "true" → 开启
+        db.save_server_setting("llm_request_logging", "true")
+            .await
+            .unwrap();
+        assert!(
+            crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config)
+                .await
+                .llm_request_logging
+        );
+
+        // "1" → 开启（旧版本/兼容值）
+        db.save_server_setting("llm_request_logging", "1")
+            .await
+            .unwrap();
+        assert!(
+            crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config)
+                .await
+                .llm_request_logging
+        );
+
+        // "false" → 关闭
+        db.save_server_setting("llm_request_logging", "false")
+            .await
+            .unwrap();
+        assert!(
+            !crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config)
+                .await
+                .llm_request_logging
+        );
+
+        // 未识别的字符串 → 关闭（严格解析）
+        db.save_server_setting("llm_request_logging", "yes")
+            .await
+            .unwrap();
+        assert!(
+            !crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config)
+                .await
+                .llm_request_logging
+        );
+    }
+
+    /// 全新 DB：load_or_seed 默认开启，并把默认值 "true" 回写 DB。
+    #[tokio::test]
+    async fn test_llm_logging_load_or_seed_defaults_true_on_fresh_db() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let config = crate::server::config::ServerConfig::default();
+
+        let dc = crate::server::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
+        assert!(dc.llm_request_logging, "fresh DB must default to enabled");
+
+        let stored = db
+            .load_server_setting("llm_request_logging")
+            .await
+            .unwrap()
+            .expect("seeded row should exist");
+        assert_eq!(stored, "true");
+    }
 }
