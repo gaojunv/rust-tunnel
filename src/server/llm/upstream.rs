@@ -179,6 +179,27 @@ pub async fn call_upstream(
             upstream_error = %sanitized,
             "LLM upstream rejected request"
         );
+
+        // 增强诊断：记录完整请求体（截断到 8KB）到系统日志，用于对比子代理/主代理差异。
+        // 脱敏：移除 Authorization 头，但保留请求体的完整内容（包含 messages/tools）。
+        let full_req = serde_json::to_string_pretty(&req_body).unwrap_or_default();
+        let truncated_req = if full_req.len() > 8192 {
+            format!("{}...\n[truncated, total {} bytes]", &full_req[..8192], full_req.len())
+        } else {
+            full_req
+        };
+        tracing::warn!(
+            target: "llm_upstream_debug",
+            status = status.as_u16(),
+            model = %request.model,
+            stream = request.stream,
+            message_count = request.messages.len(),
+            has_tools = request.tools.is_some(),
+            full_request_body = %truncated_req,
+            upstream_error_full = %sanitized,
+            "LLM upstream 4xx/5xx - full request dump"
+        );
+
         return Err((
             status,
             format!("Upstream error {}: {}", status.as_u16(), sanitized),
