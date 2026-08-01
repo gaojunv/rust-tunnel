@@ -305,9 +305,14 @@ impl Database {
     // ── API Key CRUD ─────────────────────────────────────────────
 
     pub async fn llm_list_api_keys(&self) -> Result<Vec<LlmApiKeyRecord>, sqlx::Error> {
-        sqlx::query_as::<_, LlmApiKeyRecord>("SELECT * FROM llm_api_keys ORDER BY created_at")
-            .fetch_all(&self.pool)
-            .await
+        // 显式列：`SELECT *` 会在 ALTER TABLE 追加 kb_id 后命中 sqlx 语句缓存中的
+        // 旧列元数据（7 列），与 8 字段的 FromRow 错位导致越界 panic。
+        sqlx::query_as::<_, LlmApiKeyRecord>(
+            "SELECT id, key_hash, key_prefix, name, enabled, created_at, last_used_at, kb_id \
+             FROM llm_api_keys ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn llm_find_api_key_by_hash(
@@ -315,7 +320,8 @@ impl Database {
         hash: &str,
     ) -> Result<Option<LlmApiKeyRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmApiKeyRecord>(
-            "SELECT * FROM llm_api_keys WHERE key_hash = ? AND enabled = 1",
+            "SELECT id, key_hash, key_prefix, name, enabled, created_at, last_used_at, kb_id \
+             FROM llm_api_keys WHERE key_hash = ? AND enabled = 1",
         )
         .bind(hash)
         .fetch_optional(&self.pool)
