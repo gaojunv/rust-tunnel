@@ -183,6 +183,11 @@ fn read_shared_strings<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<
                 in_si = false;
                 strings.push(std::mem::take(&mut si_text));
             }
+            // 空 `<si/>`（Empty 事件）是合法 OOXML：占一个下标、无文本。
+            // 跳过会导致后续所有共享字符串下标前移一位 → 单元格 t="s" 解析错位。
+            Ok(Event::Empty(e)) if e.name().as_ref() == b"si" => {
+                strings.push(String::new());
+            }
             Ok(Event::Eof) => break,
             Err(_) => break,
             _ => {}
@@ -644,6 +649,40 @@ pub(crate) mod tests {
         assert!(out.contains("## 员工表"), "got: {out}");
         assert!(out.contains("| 姓名 | 年龄 |"), "got: {out}");
         assert!(out.contains("| 张三 | 30 |"), "got: {out}");
+    }
+
+    /// sharedStrings 首个条目为空 `<si/>`（合法 OOXML）：占一个下标，
+    /// 后续下标不得整体前移，单元格 `t="s"` 引用必须仍解析到正确字符串。
+    #[test]
+    fn xlsx_empty_shared_string_does_not_shift_indices() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(b"<Types/>").unwrap();
+            zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+            // 文本含中文，不能写进 br# 字节串（字节串字面量仅限 ASCII），转普通字符串写字节。
+            let shared = r#"<?xml version="1.0"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
+<si/><si><t>姓名</t></si><si><t>年龄</t></si>
+</sst>"#;
+            zip.write_all(shared.as_bytes()).unwrap();
+            zip.start_file("xl/workbook.xml", opts).unwrap();
+            zip.write_all(br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="S" sheetId="1"/></sheets></workbook>"#).unwrap();
+            zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+            // 下标 1/2 分别对应「姓名」「年龄」；若空 `<si/>` 被跳过，此处会错位成
+            // 「姓名」→「姓名」、B1 越界为空。
+            let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="s"><v>1</v></c><c r="B1" t="s"><v>2</v></c></row>
+</sheetData></worksheet>"#;
+            zip.write_all(sheet.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let out = xlsx_to_markdown(&buf.into_inner()).unwrap();
+        assert!(out.contains("| 姓名 | 年龄 |"), "got: {out}");
     }
 
     /// 无 sharedStrings 的 xlsx：`t="str"`/无 `t` 单元格取字面值，`|` 需转义。
