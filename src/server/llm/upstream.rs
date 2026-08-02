@@ -121,6 +121,11 @@ pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value
     // 透传模式：以原始请求体为基底，定点覆盖网关必须改写的字段。
     if let Some(mut raw) = request.raw_body.clone() {
         raw["model"] = request.model.clone().into(); // 别名 → 真实模型名
+        // stream 必须始终与网关决策一致：客户端省略 stream（或传非布尔值）时，
+        // 也保证上游收到显式布尔值，避免透传模式下 stream 变成 null。
+        // request.stream 与客户端显式值同源（as_bool().unwrap_or(false)），
+        // 显式提供时覆盖为同值（no-op），与重建模式旧行为保持一致。
+        raw["stream"] = request.stream.into();
         if request.stream {
             // 幂等注入 include_usage：保留客户端已有 stream_options 字段。
             let so = raw
@@ -693,6 +698,36 @@ mod tests {
         assert_eq!(body["user"], "abc");
         // model 被别名解析覆盖
         assert_eq!(body["model"], "real-model");
+        // 非流式不注入 stream_options
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn build_upstream_body_passthrough_omitted_stream_defaults_to_false() {
+        use crate::server::llm::ChatCompletionRequest;
+        use crate::server::llm::ChatMessage;
+        // 客户端省略 stream 字段：透传模式也必须发出显式布尔 false
+        // （回归：此前透传原样返回 → stream 变 null，破坏非流式上游语义）。
+        let raw = serde_json::json!({
+            "model": "client-alias",
+            "messages": [{"role": "user", "content": "hi"}],
+            "seed": 42,
+        });
+        let req = ChatCompletionRequest {
+            model: "real-model".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body: Some(raw),
+        };
+        let body = build_upstream_body(&req);
+        assert_eq!(body["stream"], false);
+        // 未知参数仍原样保留
+        assert_eq!(body["seed"], 42);
         // 非流式不注入 stream_options
         assert!(body.get("stream_options").is_none());
     }
