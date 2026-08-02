@@ -260,6 +260,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
         tools,
         tool_choice,
+        raw_body: None,
     })
 }
 

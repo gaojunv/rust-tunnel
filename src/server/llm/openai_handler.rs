@@ -202,6 +202,7 @@ pub async fn handle_chat_completions(
         // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
         tools: body.get("tools").and_then(|v| v.as_array()).cloned(),
         tool_choice: body.get("tool_choice").cloned(),
+        raw_body: None,
     };
 
     // 用量采集上下文

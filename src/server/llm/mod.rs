@@ -233,6 +233,11 @@ pub struct ChatCompletionRequest {
     /// OpenAI `tool_choice`：`"auto"` / `"required"` / `{type:"function", function:{name}}`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI 协议入口透传模式：保留原始请求体。
+    /// 有值则 build_upstream_body 以此为基底定点覆盖 model/stream_options，
+    /// 其余字段原样上行；None（anthropic 转换路径）走原有重建逻辑。
+    #[serde(skip)]
+    pub raw_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
