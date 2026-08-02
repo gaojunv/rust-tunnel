@@ -320,9 +320,11 @@ impl LlmState {
     }
 }
 
-/// 记录 LLM 请求摘要日志（受 dynamic_config.llm_request_logging 开关控制）。
+/// 记录 LLM 请求日志（受 dynamic_config.llm_request_logging 开关控制）。
 ///
-/// 在 LLM 网关入口调用（compat/RAG 改写后、上游调用前后）。只记摘要不记正文。
+/// 在 LLM 网关入口调用（compat/RAG 改写后、上游调用前后）。
+/// `request_body` 是发往上游的完整请求体，原样落地、不截断不简化——
+/// 该日志用于排查上游兼容问题，看不到正文就没有意义。
 /// 4xx/5xx 详细错误日志由 upstream.rs 的 llm_upstream/llm_upstream_debug 负责，不受此开关影响。
 #[allow(clippy::too_many_arguments)]
 pub async fn log_llm_request(
@@ -335,20 +337,24 @@ pub async fn log_llm_request(
     status: Option<u16>,
     error: Option<&str>,
     elapsed_ms: u128,
+    request_body: &serde_json::Value,
 ) {
     if !llm.dynamic_config.read().await.llm_request_logging {
         return;
     }
+    // 全部字段用 %（record_str）输出：LogLayer 只把 record_str 字段拼进 message，
+    // 裸字段走 record_debug 会被丢弃（之前日志里只剩 protocol/model/error 就是这个原因）。
     tracing::info!(
         target: "llm_request",
-        protocol,
-        model,
-        message_count,
-        has_tools,
-        stream,
-        status = status.map_or(0i64, i64::from),
-        error = error.unwrap_or(""),
-        elapsed_ms = elapsed_ms as i64,
+        protocol = %protocol,
+        model = %model,
+        message_count = %message_count,
+        has_tools = %has_tools,
+        stream = %stream,
+        status = %status.map_or(0, i64::from),
+        error = %error.unwrap_or(""),
+        elapsed_ms = %elapsed_ms,
+        request_body = %request_body,
         "LLM request"
     );
 }
@@ -392,14 +398,16 @@ mod tests {
         // 关闭开关
         state.dynamic_config.write().await.llm_request_logging = false;
         // 开关关闭时应直接返回，不 panic
-        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10).await;
+        let body = serde_json::json!({"model": "gpt-4", "messages": []});
+        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10, &body).await;
     }
 
     #[tokio::test]
     async fn test_log_llm_request_default_enabled() {
         let state = LlmState::new(None, None);
         // 默认开启，调用不应 panic
-        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10).await;
+        let body = serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
+        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10, &body).await;
     }
 
     #[test]

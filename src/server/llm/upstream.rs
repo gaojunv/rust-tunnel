@@ -109,20 +109,15 @@ fn sanitize_error_message(body: &str) -> String {
     out
 }
 
-/// Call an upstream LLM provider with OpenAI-compatible format.
-/// Supports both streaming (SSE) and non-streaming modes.
-pub async fn call_upstream(
-    base_url: &str,
-    api_key: &str,
-    request: &ChatCompletionRequest,
-) -> Result<Response, (StatusCode, String)> {
-    let client = &*UPSTREAM_CLIENT;
-
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-
-    // 构造上游请求体：可选字段仅在有值时挂上，避免部分上游对 null 敏感。
-    // messages 直接用带 skip_serializing_if 的 ChatMessage 序列化，工具字段
-    // （tool_calls / tool_call_id / name）能一并透传。
+/// 构造发往上游的 OpenAI 请求体。
+///
+/// 可选字段仅在有值时挂上，避免部分上游对 null 敏感。
+/// messages 直接用带 skip_serializing_if 的 ChatMessage 序列化，工具字段
+/// （tool_calls / tool_call_id / name）能一并透传。
+///
+/// 独立成公共函数是为了让调用方在发送前拿到完整请求体写日志
+/// （`log_llm_request` 记录的就是这个 body，与实际发送内容逐字节一致）。
+pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value {
     let mut req_body = serde_json::json!({
         "model": request.model,
         "messages": request.messages,
@@ -148,12 +143,38 @@ pub async fn call_upstream(
     if request.stream {
         req_body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
+    req_body
+}
+
+/// Call an upstream LLM provider with OpenAI-compatible format.
+/// Supports both streaming (SSE) and non-streaming modes.
+pub async fn call_upstream(
+    base_url: &str,
+    api_key: &str,
+    request: &ChatCompletionRequest,
+) -> Result<Response, (StatusCode, String)> {
+    let req_body = build_upstream_body(request);
+    call_upstream_with_body(base_url, api_key, &req_body).await
+}
+
+/// 用已构造好的请求体调用上游。
+///
+/// 调用方（handler）先用 `build_upstream_body` 构造 body、写入完整请求日志，
+/// 再走这里发送——保证日志内容与实际发送的请求体一致。
+pub async fn call_upstream_with_body(
+    base_url: &str,
+    api_key: &str,
+    req_body: &serde_json::Value,
+) -> Result<Response, (StatusCode, String)> {
+    let client = &*UPSTREAM_CLIENT;
+
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
     let req = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
-        .json(&req_body);
+        .json(req_body);
 
     let resp = req.send().await.map_err(|e| {
         (
@@ -170,7 +191,7 @@ pub async fn call_upstream(
         let sanitized = sanitize_error_message(&body_text);
         // 诊断日志：上游 4xx/5xx 时记录转换后的请求体摘要，便于定位字段兼容问题。
         // 注意脱敏：messages 只记录结构（role/长度/工具字段），不记录正文内容。
-        let req_debug = summarize_request_for_log(&req_body);
+        let req_debug = summarize_request_for_log(req_body);
         tracing::warn!(
             target: "llm_upstream",
             status = status.as_u16(),
@@ -182,7 +203,7 @@ pub async fn call_upstream(
 
         // 增强诊断：记录完整请求体（截断到 8KB）到系统日志，用于对比子代理/主代理差异。
         // 脱敏：移除 Authorization 头，但保留请求体的完整内容（包含 messages/tools）。
-        let full_req = serde_json::to_string_pretty(&req_body).unwrap_or_default();
+        let full_req = serde_json::to_string_pretty(req_body).unwrap_or_default();
         let truncated_req = if full_req.len() > 8192 {
             format!("{}...\n[truncated, total {} bytes]", &full_req[..8192], full_req.len())
         } else {
@@ -191,10 +212,10 @@ pub async fn call_upstream(
         tracing::warn!(
             target: "llm_upstream_debug",
             status = status.as_u16(),
-            model = %request.model,
-            stream = request.stream,
-            message_count = request.messages.len(),
-            has_tools = request.tools.is_some(),
+            model = %req_body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+            stream = req_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+            message_count = req_body.get("messages").and_then(|m| m.as_array()).map_or(0, Vec::len),
+            has_tools = req_body.get("tools").is_some(),
             full_request_body = %truncated_req,
             upstream_error_full = %sanitized,
             "LLM upstream 4xx/5xx - full request dump"
@@ -206,7 +227,11 @@ pub async fn call_upstream(
         ));
     }
 
-    if request.stream {
+    let is_stream = req_body
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    if is_stream {
         relay_upstream_stream(resp).await
     } else {
         relay_upstream_body(resp).await

@@ -7,7 +7,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use super::router::{list_available_models, resolve_model};
-use super::upstream::call_upstream;
 use super::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
 
 /// State for LLM request handlers.
@@ -251,14 +250,20 @@ pub async fn handle_chat_completions(
         super::compat::inject_tool_call_guidance(&mut request.messages);
     }
 
-    // Call upstream
+    // Call upstream：先构造完整请求体（RAG/compat 改写后的最终内容），
+    // 写入请求日志后发送，保证日志与实际发送内容一致。
     let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
-    match call_upstream(&provider.base_url, &provider.api_key, &request).await {
+    let req_body = super::upstream::build_upstream_body(&request);
+    super::log_llm_request(
+        &state.llm, "openai", &request.model, request.messages.len(),
+        request.tools.is_some(), request.stream, None, None, 0, &req_body,
+    ).await;
+    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body).await {
         Ok(resp) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm, "openai", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms,
+                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms, &req_body,
             ).await;
             let resp = if compat_enabled {
                 if request.stream {
@@ -277,7 +282,7 @@ pub async fn handle_chat_completions(
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm, "openai", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
             ).await;
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {

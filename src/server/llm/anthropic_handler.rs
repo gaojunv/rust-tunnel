@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 
 use super::openai_handler::LlmHandlerState;
 use super::router::resolve_model;
-use super::upstream::call_upstream;
 use super::{ChatCompletionRequest, ChatMessage};
 
 /// 拆解 Anthropic 消息 content 字段的结果。
@@ -361,6 +360,12 @@ pub async fn handle_messages(
         let message_count = body["messages"].as_array().map_or(0, Vec::len);
         let has_tools = body.get("tools").is_some();
 
+        // 完整记录发往上游的原始请求体（替换 model 后），不做任何简化。
+        super::log_llm_request(
+            &state.llm, "anthropic", &log_model, message_count,
+            has_tools, is_stream, None, None, 0, &body,
+        ).await;
+
         return match super::upstream::call_upstream_raw(
             anthropic_url,
             &provider.api_key,
@@ -374,7 +379,7 @@ pub async fn handle_messages(
                 let elapsed_ms = started.elapsed().as_millis();
                 super::log_llm_request(
                     &state.llm, "anthropic", &log_model, message_count,
-                    has_tools, is_stream, Some(200), None, elapsed_ms,
+                    has_tools, is_stream, Some(200), None, elapsed_ms, &body,
                 ).await;
                 super::usage::wrap_and_record(resp, ctx, db, started).await
             }
@@ -382,7 +387,7 @@ pub async fn handle_messages(
                 let elapsed_ms = started.elapsed().as_millis();
                 super::log_llm_request(
                     &state.llm, "anthropic", &log_model, message_count,
-                    has_tools, is_stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+                    has_tools, is_stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &body,
                 ).await;
                 if let Some(ref db) = db {
                     ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
@@ -429,12 +434,19 @@ pub async fn handle_messages(
         super::compat::inject_tool_call_guidance(&mut request.messages);
     }
 
-    match call_upstream(&provider.base_url, &provider.api_key, &request).await {
+    // 构造完整上游请求体（Anthropic→OpenAI 转换 + RAG + compat 改写后的最终内容），
+    // 写日志后发送，保证日志与实际发送内容一致。
+    let req_body = super::upstream::build_upstream_body(&request);
+    super::log_llm_request(
+        &state.llm, "anthropic", &request.model, request.messages.len(),
+        request.tools.is_some(), request.stream, None, None, 0, &req_body,
+    ).await;
+    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body).await {
         Ok(resp) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm, "anthropic", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms,
+                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms, &req_body,
             ).await;
             // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
             // 非流式整体转换会消费 body，因此这里在转换后再包一层。
@@ -464,7 +476,7 @@ pub async fn handle_messages(
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm, "anthropic", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
             ).await;
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
