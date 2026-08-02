@@ -206,11 +206,14 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                 }
             }
             _ => {
-                // user / 其它角色：文本正常挂到 user 消息；tool_result 展开成独立
-                // `role="tool"` 消息（OpenAI 每个 tool_call_id 一条）。
-                if !parsed.text.is_empty() {
-                    all_messages.push(ChatMessage::text(&role, parsed.text));
-                }
+                // user / 其它角色：tool_result 展开成独立 `role="tool"` 消息，
+                // 文本正常挂到 user 消息。
+                //
+                // 关键顺序：tool 消息必须先于 user 文本输出。
+                // OpenAI 要求 assistant(tool_calls) 后紧跟 tool 消息，
+                // 如果 text 先输出会插入一条 user 消息打断这个序列，
+                // 导致上游返回 400（"insufficient tool messages following
+                // tool_calls message"）。
                 for tr in parsed.tool_results {
                     all_messages.push(ChatMessage {
                         role: "tool".to_string(),
@@ -219,6 +222,9 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                         tool_call_id: Some(tr.tool_call_id),
                         name: None,
                     });
+                }
+                if !parsed.text.is_empty() {
+                    all_messages.push(ChatMessage::text(&role, parsed.text));
                 }
             }
         }
@@ -802,20 +808,21 @@ mod tests {
             ],
         });
         let r = anthropic_to_openai(&input).unwrap();
-        // user, assistant, user("thanks"), tool(a), tool(b)
+        // 期望顺序：user, assistant, tool(a), tool(b), user("thanks")
+        // tool 消息必须紧跟 assistant(tool_calls)，user 文本排在最后
         assert_eq!(r.messages.len(), 5);
         // assistant 有两个 tool_calls
         assert_eq!(r.messages[1].tool_calls.as_ref().unwrap().len(), 2);
-        // 第 3 条：user 剩余文本
-        assert_eq!(r.messages[2].role, "user");
-        assert_eq!(r.messages[2].content.as_deref(), Some("thanks"));
-        // 第 4/5 条：tool 消息
+        // 第 3/4 条：tool 消息紧跟 assistant
+        assert_eq!(r.messages[2].role, "tool");
+        assert_eq!(r.messages[2].tool_call_id.as_deref(), Some("toolu_a"));
+        assert_eq!(r.messages[2].content.as_deref(), Some("72F"));
         assert_eq!(r.messages[3].role, "tool");
-        assert_eq!(r.messages[3].tool_call_id.as_deref(), Some("toolu_a"));
-        assert_eq!(r.messages[3].content.as_deref(), Some("72F"));
-        assert_eq!(r.messages[4].role, "tool");
-        assert_eq!(r.messages[4].tool_call_id.as_deref(), Some("toolu_b"));
-        assert_eq!(r.messages[4].content.as_deref(), Some("cloudy"));
+        assert_eq!(r.messages[3].tool_call_id.as_deref(), Some("toolu_b"));
+        assert_eq!(r.messages[3].content.as_deref(), Some("cloudy"));
+        // 第 5 条：user 剩余文本排在 tool 消息之后
+        assert_eq!(r.messages[4].role, "user");
+        assert_eq!(r.messages[4].content.as_deref(), Some("thanks"));
     }
 
     #[test]
