@@ -154,6 +154,16 @@ export function useLlmLogging() {
   });
   const mutation = useMutation({
     mutationFn: setLlmLogging,
+    onMutate: async (enabled: boolean) => {
+      // 取消进行中的查询，避免乐观更新与后台拉取竞态
+      await queryClient.cancelQueries({ queryKey: ['llm-logging'] });
+      // 乐观更新：立即切换 UI，慢网络下不回跳
+      queryClient.setQueryData<{ enabled: boolean }>(['llm-logging'], { enabled });
+    },
+    onError: () => {
+      // 回滚：失效缓存重新拉取真实值
+      queryClient.invalidateQueries({ queryKey: ['llm-logging'] });
+    },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['llm-logging'] }),
   });
   return { ...query, setLlmLogging: mutation.mutate, isToggling: mutation.isPending };

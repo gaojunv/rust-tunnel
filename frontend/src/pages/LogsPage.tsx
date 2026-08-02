@@ -67,7 +67,7 @@ export default function LogsPage() {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   const setLogsLevelMutation = useSetLogsLevel();
-  const { data: llmLogging, setLlmLogging } = useLlmLogging();
+  const { data: llmLogging, setLlmLogging, isToggling } = useLlmLogging();
 
   // Fetch initial logs
   useEffect(() => {
@@ -218,6 +218,7 @@ export default function LogsPage() {
             <Switch
               checked={llmLogging?.enabled ?? true}
               onCheckedChange={(checked) => setLlmLogging(checked)}
+              disabled={isToggling}
             />
             <span className="text-sm text-muted-foreground">
               {t('logs.llmLogging')}
