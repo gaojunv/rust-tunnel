@@ -118,6 +118,24 @@ fn sanitize_error_message(body: &str) -> String {
 /// 独立成公共函数是为了让调用方在发送前拿到完整请求体写日志
 /// （`log_llm_request` 记录的就是这个 body，与实际发送内容逐字节一致）。
 pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value {
+    // 透传模式：以原始请求体为基底，定点覆盖网关必须改写的字段。
+    if let Some(mut raw) = request.raw_body.clone() {
+        raw["model"] = request.model.clone().into(); // 别名 → 真实模型名
+        if request.stream {
+            // 幂等注入 include_usage：保留客户端已有 stream_options 字段。
+            let so = raw
+                .as_object_mut()
+                .and_then(|o| o.get_mut("stream_options"))
+                .and_then(|v| v.as_object_mut());
+            if let Some(so) = so {
+                so.insert("include_usage".into(), serde_json::Value::Bool(true));
+            } else {
+                raw["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+        }
+        return raw;
+    }
+    // 重建模式：anthropic 转换路径（raw_body 为 None）。
     let mut req_body = serde_json::json!({
         "model": request.model,
         "messages": request.messages,
@@ -138,8 +156,6 @@ pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value
     if let Some(choice) = &request.tool_choice {
         req_body["tool_choice"] = choice.clone();
     }
-    // 流式请求注入 stream_options.include_usage=true：OpenAI 系上游（火山/Kimi/Mimo）
-    // 默认流式不返回 usage，注入后才会在末尾 chunk 附带；DeepSeek 默认返回，注入无副作用。
     if request.stream {
         req_body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
@@ -644,5 +660,90 @@ mod tests {
         let result = sanitize_error_message(&s);
         assert!(!result.ends_with("..."));
         assert_eq!(result.len(), 500);
+    }
+
+    #[test]
+    fn build_upstream_body_passthrough_unknown_params() {
+        use crate::server::llm::ChatCompletionRequest;
+        use crate::server::llm::ChatMessage;
+        let raw = serde_json::json!({
+            "model": "client-alias",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "stop": ["\n\n"],
+            "seed": 42,
+            "user": "abc",
+            "temperature": 0.7,
+        });
+        let req = ChatCompletionRequest {
+            model: "real-model".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: false,
+            max_tokens: None,
+            temperature: Some(0.7),
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body: Some(raw),
+        };
+        let body = build_upstream_body(&req);
+        // 未知参数原样保留
+        assert_eq!(body["stop"], serde_json::json!(["\n\n"]));
+        assert_eq!(body["seed"], 42);
+        assert_eq!(body["user"], "abc");
+        // model 被别名解析覆盖
+        assert_eq!(body["model"], "real-model");
+        // 非流式不注入 stream_options
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn build_upstream_body_stream_injects_include_usage_keeps_client_fields() {
+        use crate::server::llm::ChatCompletionRequest;
+        use crate::server::llm::ChatMessage;
+        let raw = serde_json::json!({
+            "model": "alias",
+            "messages": [],
+            "stream": true,
+            "stream_options": {"max_tokens": 100},
+        });
+        let req = ChatCompletionRequest {
+            model: "real".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body: Some(raw),
+        };
+        let body = build_upstream_body(&req);
+        let so = body["stream_options"].as_object().unwrap();
+        // 客户端已有字段保留
+        assert_eq!(so["max_tokens"], 100);
+        // include_usage 被网关注入
+        assert_eq!(so["include_usage"], true);
+    }
+
+    #[test]
+    fn build_upstream_body_no_raw_body_rebuilds() {
+        use crate::server::llm::ChatCompletionRequest;
+        use crate::server::llm::ChatMessage;
+        let req = ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            stream: false,
+            max_tokens: Some(10),
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body: None,
+        };
+        let body = build_upstream_body(&req);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["max_tokens"], 10);
     }
 }
