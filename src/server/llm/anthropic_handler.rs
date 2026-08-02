@@ -248,11 +248,28 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     // Anthropic → OpenAI：仅透传已知安全的 stop 参数,其余 Anthropic 原生字段
     // (metadata/thinking 等)不上 OpenAI 端点。raw_body 是裁剪后的安全 body,
     // 由 build_upstream_body 透传；messages 在后续 RAG/compat 改写后回写。
+    // 转换字段(max_tokens/temperature/top_p/tools/tool_choice)必须继续透传,
+    // 否则透传模式下 build_upstream_body 不会补它们(它只覆盖 model/stream_options)。
     let mut passthrough = serde_json::json!({
         "model": anthropic_model,
         "messages": all_messages.clone(),
         "stream": stream,
     });
+    if let Some(v) = body.get("max_tokens") {
+        passthrough["max_tokens"] = v.clone();
+    }
+    if let Some(v) = body.get("temperature") {
+        passthrough["temperature"] = v.clone();
+    }
+    if let Some(v) = body.get("top_p") {
+        passthrough["top_p"] = v.clone();
+    }
+    if let Some(tools) = &tools {
+        passthrough["tools"] = serde_json::Value::Array(tools.clone());
+    }
+    if let Some(choice) = &tool_choice {
+        passthrough["tool_choice"] = choice.clone();
+    }
     if let Some(stops) = body.get("stop_sequences") {
         passthrough["stop"] = stops.clone();
     }
@@ -670,6 +687,26 @@ mod tests {
         // ChatCompletionRequest 无 stop 字段,此处断言重构后的 build_upstream_body 输出。
         let out = crate::server::llm::upstream::build_upstream_body(&req);
         assert_eq!(out["stop"], serde_json::json!(["\n\n", "</s>"]));
+    }
+
+    #[test]
+    fn anthropic_fallback_preserves_converted_fields() {
+        let body = serde_json::json!({
+            "model": "claude-3-haiku",
+            "max_tokens": 100,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["\n\n"],
+            "tools": [{"type": "custom", "name": "t"}],
+        });
+        let req = anthropic_to_openai(&body).unwrap();
+        let out = crate::server::llm::upstream::build_upstream_body(&req);
+        assert_eq!(out["max_tokens"], 100);
+        assert_eq!(out["temperature"], 0.3);
+        assert_eq!(out["top_p"], 0.9);
+        assert_eq!(out["stop"], serde_json::json!(["\n\n"]));
+        assert!(out["tools"].is_array(), "tools must not be dropped: {out}");
     }
 
     #[test]
