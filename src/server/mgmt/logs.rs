@@ -286,6 +286,14 @@ where
                     if self.message.starts_with('"') && self.message.ends_with('"') {
                         self.message = self.message[1..self.message.len() - 1].to_string();
                     }
+                } else {
+                    // `%field`（display）和裸字段都走这里——必须拼进 message，
+                    // 否则日志只剩字面量（"LLM request" 无字段的 bug 根因）
+                    if !self.message.is_empty() {
+                        self.message.push(' ');
+                    }
+                    self.message
+                        .push_str(&format!("{}={:?}", name, value));
                 }
             }
 
