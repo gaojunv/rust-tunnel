@@ -355,7 +355,11 @@ pub async fn handle_messages(
     if let Some(ref anthropic_url) = provider.anthropic_base_url {
         // 替换 model 为实际上游名称
         let mut body = body;
+        let log_model = actual_model.clone();
         body["model"] = serde_json::Value::String(actual_model);
+
+        let message_count = body["messages"].as_array().map_or(0, Vec::len);
+        let has_tools = body.get("tools").is_some();
 
         return match super::upstream::call_upstream_raw(
             anthropic_url,
@@ -366,8 +370,20 @@ pub async fn handle_messages(
         )
         .await
         {
-            Ok(resp) => super::usage::wrap_and_record(resp, ctx, db, started).await,
+            Ok(resp) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                super::log_llm_request(
+                    &state.llm, "anthropic", &log_model, message_count,
+                    has_tools, is_stream, Some(200), None, elapsed_ms,
+                ).await;
+                super::usage::wrap_and_record(resp, ctx, db, started).await
+            }
             Err((status, msg)) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                super::log_llm_request(
+                    &state.llm, "anthropic", &log_model, message_count,
+                    has_tools, is_stream, Some(status.as_u16()), Some(&msg), elapsed_ms,
+                ).await;
                 if let Some(ref db) = db {
                     ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
                 }
