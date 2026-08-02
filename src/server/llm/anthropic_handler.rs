@@ -245,6 +245,18 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         .get("tool_choice")
         .and_then(anthropic_tool_choice_to_openai);
 
+    // Anthropic → OpenAI：仅透传已知安全的 stop 参数,其余 Anthropic 原生字段
+    // (metadata/thinking 等)不上 OpenAI 端点。raw_body 是裁剪后的安全 body,
+    // 由 build_upstream_body 透传；messages 在后续 RAG/compat 改写后回写。
+    let mut passthrough = serde_json::json!({
+        "model": anthropic_model,
+        "messages": all_messages.clone(),
+        "stream": stream,
+    });
+    if let Some(stops) = body.get("stop_sequences") {
+        passthrough["stop"] = stops.clone();
+    }
+
     Ok(ChatCompletionRequest {
         model: anthropic_model.to_string(),
         messages: all_messages,
@@ -260,7 +272,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
         tools,
         tool_choice,
-        raw_body: None,
+        raw_body: Some(passthrough),
     })
 }
 
@@ -433,12 +445,20 @@ pub async fn handle_messages(
     }
     if rag_injected > 0 {
         ctx.rag_chunks_injected = Some(rag_injected);
+        // 改写回写:raw_body 是透传基底,这里保证上行的是 RAG/compat 改写后的 messages。
+        if let Some(raw) = request.raw_body.as_mut() {
+            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+        }
     }
 
     let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     if compat_enabled {
         super::compat::rewrite_tool_history(&mut request.messages);
         super::compat::inject_tool_call_guidance(&mut request.messages);
+        // 改写回写:与 RAG 相同,保证上行的是改写后的 messages。
+        if let Some(raw) = request.raw_body.as_mut() {
+            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+        }
     }
 
     // 构造完整上游请求体（Anthropic→OpenAI 转换 + RAG + compat 改写后的最终内容），
@@ -636,6 +656,20 @@ mod tests {
         let result = anthropic_to_openai(&input).unwrap();
         assert_eq!(result.temperature, Some(0.7));
         assert_eq!(result.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn anthropic_stop_sequences_maps_to_openai_stop() {
+        let body = serde_json::json!({
+            "model": "claude-3-haiku",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_sequences": ["\n\n", "</s>"],
+        });
+        let req = anthropic_to_openai(&body).unwrap();
+        // ChatCompletionRequest 无 stop 字段,此处断言重构后的 build_upstream_body 输出。
+        let out = crate::server::llm::upstream::build_upstream_body(&req);
+        assert_eq!(out["stop"], serde_json::json!(["\n\n", "</s>"]));
     }
 
     #[test]
