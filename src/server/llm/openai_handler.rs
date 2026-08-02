@@ -134,9 +134,55 @@ pub async fn handle_chat_completions(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let messages: Vec<ChatMessage> = match body.get("messages") {
-        Some(msgs) => match serde_json::from_value(msgs.clone()) {
-            Ok(m) => m,
+
+    // api_key_id_for_rag 需在 api_key_id 稍后 move 进 ctx 之前 clone。
+    let api_key_id_for_rag = api_key_id.clone();
+
+    // ── 惰性结构化判断 ──
+    // ChatMessage.content 是 Option<String>，多模态 content 数组无法结构化。
+    // 因此仅在 RAG 或 compat 需要操作 messages 时才反序列化；否则保留原始
+    // Value，由 raw_body 原样透传（build_upstream_body 以 raw_body 为基底）。
+    let mut kb_id_for_rag: Option<String> = None;
+    if let Some(ref db) = state.llm.db {
+        kb_id_for_rag = db
+            .rag_get_kb_id_for_api_key(&api_key_id_for_rag)
+            .await
+            .ok()
+            .flatten();
+    }
+    let compat_enabled =
+        super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
+    let need_structured = compat_enabled || kb_id_for_rag.is_some();
+
+    // messages 存在性校验保持无条件（与旧行为一致）；完整反序列化仅 in need_structured。
+    if body.get("messages").is_none() {
+        // 记录请求错误（缺少 messages）
+        if let Some(ref db) = state.llm.db {
+            let ctx = super::usage::UsageContext {
+                api_key_id: Some(api_key_id.clone()),
+                api_key_name: api_key_name.clone(),
+                provider_id: Some(provider.id.clone()),
+                provider_name: provider.name.clone(),
+                model_id: Some(model_id.clone()),
+                model_name: actual_model.clone(),
+                requested_model: model.clone(),
+                protocol: "openai".into(),
+                stream,
+                rag_chunks_injected: None,
+            };
+            ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
+        }
+        return state.error_for_protocol(
+            StatusCode::BAD_REQUEST,
+            "messages is required".into(),
+            "invalid_request_error",
+        );
+    }
+
+    let mut request_messages: Vec<ChatMessage> = Vec::new();
+    if need_structured {
+        match serde_json::from_value(body.get("messages").unwrap().clone()) {
+            Ok(m) => request_messages = m,
             Err(e) => {
                 // 记录请求解析错误
                 if let Some(ref db) = state.llm.db {
@@ -160,35 +206,12 @@ pub async fn handle_chat_completions(
                     "invalid_request_error",
                 );
             }
-        },
-        None => {
-            // 记录请求错误（缺少 messages）
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    api_key_id: Some(api_key_id.clone()),
-                    api_key_name: api_key_name.clone(),
-                    provider_id: Some(provider.id.clone()),
-                    provider_name: provider.name.clone(),
-                    model_id: Some(model_id.clone()),
-                    model_name: actual_model.clone(),
-                    requested_model: model.clone(),
-                    protocol: "openai".into(),
-                    stream,
-                    rag_chunks_injected: None,
-                };
-                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
-            }
-            return state.error_for_protocol(
-                StatusCode::BAD_REQUEST,
-                "messages is required".into(),
-                "invalid_request_error",
-            );
         }
-    };
+    }
 
-    let request = ChatCompletionRequest {
+    let mut request = ChatCompletionRequest {
         model: actual_model.clone(),
-        messages,
+        messages: request_messages,
         stream,
         max_tokens: body
             .get("max_tokens")
@@ -202,11 +225,10 @@ pub async fn handle_chat_completions(
         // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
         tools: body.get("tools").and_then(|v| v.as_array()).cloned(),
         tool_choice: body.get("tool_choice").cloned(),
-        raw_body: None,
+        raw_body: Some(body.clone()),
     };
 
     // 用量采集上下文
-    let api_key_id_for_rag = api_key_id.clone();
     let mut ctx = super::usage::UsageContext {
         api_key_id: Some(api_key_id),
         api_key_name,
@@ -222,13 +244,10 @@ pub async fn handle_chat_completions(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
-    let mut request = request;
-
     // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
-    // 失败降级为无 RAG 直通。
     let mut rag_injected: i64 = 0;
-    if let Some(ref db) = db {
-        if let Ok(Some(kb_id)) = db.rag_get_kb_id_for_api_key(&api_key_id_for_rag).await {
+    if let Some(kb_id) = kb_id_for_rag {
+        if let Some(ref db) = db {
             let outcome = super::rag::enhance(
                 db,
                 &state.llm.rag_store,
@@ -242,29 +261,44 @@ pub async fn handle_chat_completions(
     }
     if rag_injected > 0 {
         ctx.rag_chunks_injected = Some(rag_injected);
+        // 改写回写：透传基底 raw_body["messages"] 必须用改写后的内容。
+        if let Some(raw) = request.raw_body.as_mut() {
+            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+        }
     }
 
     // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为标签文本，
     // 并在末尾注入 system 引导（教模型输出伪工具调用格式）。
-    if super::compat::compat_tool_history_enabled(provider.extra_config.as_deref()) {
+    if compat_enabled {
         super::compat::rewrite_tool_history(&mut request.messages);
         super::compat::inject_tool_call_guidance(&mut request.messages);
+        // 改写回写：与 RAG 相同，保证上行的是改写后的 messages。
+        if let Some(raw) = request.raw_body.as_mut() {
+            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+        }
     }
+
+    // 日志统计：message_count 在未结构化时取原始数组长度，has_tools 取 tools 存在性。
+    let message_count = if need_structured {
+        request.messages.len()
+    } else {
+        body["messages"].as_array().map_or(0, Vec::len)
+    };
+    let has_tools = request.tools.is_some();
 
     // Call upstream：先构造完整请求体（RAG/compat 改写后的最终内容），
     // 写入请求日志后发送，保证日志与实际发送内容一致。
-    let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     let req_body = super::upstream::build_upstream_body(&request);
     super::log_llm_request(
-        &state.llm, "openai", &request.model, request.messages.len(),
-        request.tools.is_some(), request.stream, None, None, 0, &req_body,
+        &state.llm, "openai", &request.model, message_count,
+        has_tools, request.stream, None, None, 0, &req_body,
     ).await;
     match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body).await {
         Ok(resp) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "openai", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms, &req_body,
+                &state.llm, "openai", &request.model, message_count,
+                has_tools, request.stream, Some(200), None, elapsed_ms, &req_body,
             ).await;
             let resp = if compat_enabled {
                 if request.stream {
@@ -282,8 +316,8 @@ pub async fn handle_chat_completions(
         Err((status, msg)) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "openai", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
+                &state.llm, "openai", &request.model, message_count,
+                has_tools, request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
             ).await;
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {
@@ -1570,5 +1604,38 @@ mod tests {
         assert!(c.contains("结尾"), "{c}");
         assert!(!c.contains("oops"), "{c}");
         assert!(!c.contains("tool_call"), "{c}");
+    }
+
+    /// 回归：未启用 RAG/compat 时，多模态 content 数组（image_url 等）不结构化，
+    /// raw_body 透传基底保持 messages 原样上行——不再因 ChatMessage.content 是
+    /// Option<String> 而 400 拒绝。
+    #[test]
+    fn multimodal_content_array_passes_through_when_no_rag_compat() {
+        // 模块顶部 `use super::*` 已引入 ChatMessage（此处 struct 字面量经类型推断使用）。
+        use crate::server::llm::ChatCompletionRequest;
+        let raw = serde_json::json!({
+            "model": "alias",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}],
+            "stream": false,
+        });
+        let req = ChatCompletionRequest {
+            model: "real".into(),
+            messages: vec![], // 未结构化：多模态时 request.messages 为空
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body: Some(raw),
+        };
+        let body = crate::server::llm::upstream::build_upstream_body(&req);
+        // messages 保持客户端原样的数组（content 为数组）
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[0]["content"][1]["type"], "image_url");
     }
 }
