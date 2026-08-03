@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::router::{list_available_models, resolve_model};
+use super::router::{list_available_models, resolve_with_failover};
 use super::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
 
 /// State for LLM request handlers.
@@ -110,9 +110,9 @@ pub async fn handle_chat_completions(
         }
     };
 
-    // Resolve model → provider
-    let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
-        Ok(r) => r,
+    // Resolve model → 候选链（模型组故障转移）
+    let chain = match resolve_with_failover(&state.llm, &model).await {
+        Ok(c) => c,
         Err(e) => {
             // 记录路由失败到用量日志
             if let Some(ref db) = state.llm.db {
@@ -128,6 +128,11 @@ pub async fn handle_chat_completions(
             return super::router::resolve_error_response(&state.llm, e).await;
         }
     };
+    // 首选候选：provider 级配置（compat 开关）以首选为准——RAG/compat 改写在循环外只做一次
+    let first_candidate = chain.candidates[0].clone();
+    let provider = first_candidate.provider.clone();
+    let actual_model = first_candidate.model_name.clone();
+    let model_id = first_candidate.model_id.clone();
 
     // Build unified request
     let stream = body
@@ -309,15 +314,32 @@ pub async fn handle_chat_completions(
         &req_body,
     )
     .await;
-    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body)
-        .await
-    {
-        Ok(resp) => {
+    let outcome = super::upstream::execute_with_failover(
+        &state.llm.breakers,
+        &chain,
+        &req_body,
+        request.stream,
+    )
+    .await;
+    match outcome {
+        super::upstream::FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+        } => {
+            // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
+            if failed_over {
+                ctx.provider_id = Some(candidate.provider.id.clone());
+                ctx.provider_name = candidate.provider.name.clone();
+                ctx.model_id = Some(candidate.model_id.clone());
+                ctx.model_name = candidate.model_name.clone();
+                ctx.failover_from = Some(first_candidate.model_name.clone());
+            }
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,
                 "openai",
-                &request.model,
+                &ctx.model_name,
                 message_count,
                 has_tools,
                 request.stream,
@@ -340,7 +362,11 @@ pub async fn handle_chat_completions(
             };
             super::usage::wrap_and_record(resp, ctx, db, started).await
         }
-        Err((status, msg)) => {
+        super::upstream::FailoverOutcome::Exhausted {
+            status,
+            message: msg,
+            ..
+        } => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,

@@ -431,6 +431,122 @@ pub async fn call_upstream_stream_guarded(
         .unwrap())
 }
 
+/// 候选链执行循环的结果。
+///
+/// `Success` 同时携带完整的 `Response` 与出账 `Candidate`，体积较大；
+/// 接口按 Task 6 brief 约定（非 Box），仅在成功分支 move 一次，非热点，故 allow。
+#[allow(clippy::large_enum_variant)]
+pub enum FailoverOutcome {
+    /// 某候选成功。
+    Success {
+        /// 上游响应（流式为首字节守卫后的拼接体）。
+        resp: Response,
+        /// 实际出账的候选（usage 落库以此为准）。
+        candidate: crate::server::llm::router::Candidate,
+        /// 是否发生过转移（首选不是出账候选）。
+        failed_over: bool,
+    },
+    /// 全部候选失败：返回最后一个被尝试候选的错误。
+    Exhausted {
+        /// HTTP 状态码（全熔断无尝试时为 503）。
+        status: StatusCode,
+        /// 错误消息。
+        message: String,
+        /// 是否尝试过非首选候选。
+        failed_over: bool,
+    },
+}
+
+/// 在候选链上执行上游调用：熔断跳过 + 可转移重试。
+///
+/// 调用方负责 RAG/compat 改写与 `req_body` 构造；本函数循环内仅
+/// clone body + 定点改 `model`。中途失败尝试不记 usage（仅 warn 日志）。
+pub async fn execute_with_failover(
+    breakers: &crate::server::llm::breaker::ModelBreakers,
+    chain: &crate::server::llm::router::CandidateChain,
+    req_body: &serde_json::Value,
+    stream: bool,
+) -> FailoverOutcome {
+    let first_model = chain.candidates.first().map(|c| c.model_name.clone());
+    let mut attempted_any = false;
+    let mut last_err: Option<(StatusCode, String)> = None;
+
+    for cand in &chain.candidates {
+        if !breakers.allow(&cand.model_id) {
+            tracing::debug!(
+                model_id = %cand.model_id,
+                model = %cand.model_name,
+                "LLM failover: candidate skipped (circuit open)"
+            );
+            continue;
+        }
+        attempted_any = true;
+
+        let mut body = req_body.clone();
+        set_body_model(&mut body, &cand.model_name);
+
+        let result = if stream {
+            call_upstream_stream_guarded(&cand.provider.base_url, &cand.provider.api_key, &body).await
+        } else {
+            call_upstream_with_body(&cand.provider.base_url, &cand.provider.api_key, &body).await
+        };
+
+        match result {
+            Ok(resp) => {
+                breakers.record_success(&cand.model_id);
+                let failed_over = first_model.as_deref() != Some(cand.model_name.as_str());
+                return FailoverOutcome::Success {
+                    resp,
+                    candidate: cand.clone(),
+                    failed_over,
+                };
+            }
+            Err((status, msg)) => {
+                let retryable = is_retryable(
+                    status,
+                    failover_on_429_enabled(cand.provider.extra_config.as_deref()),
+                );
+                if retryable {
+                    tracing::warn!(
+                        group = ?chain.group_name,
+                        from_model = %cand.model_name,
+                        status = status.as_u16(),
+                        reason = %msg,
+                        "LLM failover: candidate failed, trying next"
+                    );
+                    breakers.record_failure(&cand.model_id);
+                    last_err = Some((status, msg));
+                    continue;
+                }
+                // 不可转移（4xx）：上游可达，计成功；立即终止
+                breakers.record_success(&cand.model_id);
+                return FailoverOutcome::Exhausted {
+                    status,
+                    message: msg,
+                    failed_over: false,
+                };
+            }
+        }
+    }
+
+    match last_err {
+        Some((status, message)) => FailoverOutcome::Exhausted {
+            status,
+            message,
+            failed_over: true,
+        },
+        None => FailoverOutcome::Exhausted {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: if attempted_any {
+                "all candidates failed".to_string()
+            } else {
+                "all_candidates_unavailable".to_string()
+            },
+            failed_over: false,
+        },
+    }
+}
+
 /// 透传原始请求到上游 Anthropic 端点，不做格式转换。
 ///
 /// 认证策略：同时支持 `x-api-key`（Anthropic 原生）和 `Authorization: Bearer`（OpenAI 风格）。
@@ -1077,6 +1193,200 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("cr"));
         assert!(text.contains("[DONE]"));
+    }
+
+    /// 测试辅助：起一个行为可控的 mock 上游（每个连接调 handler 一次）。
+    async fn start_behavior_upstream<F>(mut on_conn: F) -> String
+    where
+        F: FnMut(tokio::net::TcpStream) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { break };
+                on_conn(sock).await;
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    /// 快速构造 CandidateChain（测试用）。
+    fn test_chain(specs: &[(&str, &str, &str)]) -> crate::server::llm::router::CandidateChain {
+        use crate::server::llm::router::{Candidate, CandidateChain};
+        use crate::server::llm::ProviderConfig;
+        CandidateChain {
+            candidates: specs
+                .iter()
+                .enumerate()
+                .map(|(i, (base, model_name, model_id))| Candidate {
+                    provider: ProviderConfig {
+                        id: format!("p{}", i),
+                        name: format!("P{}", i),
+                        provider_type: "deepseek".into(),
+                        base_url: base.to_string(),
+                        api_key: "k".into(),
+                        extra_config: None,
+                        anthropic_base_url: None,
+                        enabled: true,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                    },
+                    model_name: model_name.to_string(),
+                    model_id: model_id.to_string(),
+                    priority: i as i64,
+                })
+                .collect(),
+            group_name: Some("g".into()),
+        }
+    }
+
+    fn ok_sse_response_body() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\r\n\r\ndata: [DONE]\r\n\r\n"
+    }
+
+    async fn write_http(sock: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let resp = format!(
+            "HTTP/1.1 {}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    }
+
+    async fn drain_request(sock: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 8192];
+        let _ = sock.read(&mut buf).await;
+    }
+
+    #[tokio::test]
+    async fn test_failover_first_candidate_500_then_success() {
+        let bad = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+        })).await;
+        let good = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+        })).await;
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let out = execute_with_failover(&breakers, &chain, &body, true).await;
+        let FailoverOutcome::Success { resp, candidate, failed_over } = out else {
+            panic!("expected success");
+        };
+        assert!(failed_over);
+        assert_eq!(candidate.model_id, "id-good");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 坏候选被记一次失败
+        assert_eq!(breakers.snapshot("id-bad").consecutive_failures, 1);
+        // 好候选成功复位
+        assert_eq!(breakers.snapshot("id-good").consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_failover_exhausted_returns_last_error() {
+        let bad1 = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+        })).await;
+        let bad2 = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "503 Service Unavailable", "{\"e\":2}").await;
+        })).await;
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+            panic!("expected exhausted");
+        };
+        assert!(failed_over);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "返回最后一个候选的错误");
+    }
+
+    #[tokio::test]
+    async fn test_failover_400_not_retryable() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h1 = hits.clone();
+        let bad = start_behavior_upstream(move |mut s| {
+            let h = h1.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "400 Bad Request", "{\"e\":\"bad\"}").await;
+            })
+        }).await;
+        let h2 = hits.clone();
+        let never = start_behavior_upstream(move |mut s| {
+            let h = h2.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+            })
+        }).await;
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+            panic!("expected exhausted (400 应立即终止)");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!failed_over, "400 不算转移");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "第二个候选不应被请求");
+        // 4xx 视为上游健康：不计失败
+        assert_eq!(breakers.snapshot("id1").consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_failover_skips_broken_candidate() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let bh = bad_hits.clone();
+        let bad = start_behavior_upstream(move |mut s| {
+            let bh = bh.clone();
+            Box::pin(async move {
+                bh.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "500 Internal Server Error", "{}").await;
+            })
+        }).await;
+        let good = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+        })).await;
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        // 连续 5 次请求把 id-bad 打到熔断
+        for _ in 0..5 {
+            let _ = execute_with_failover(&breakers, &chain, &body, false).await;
+        }
+        assert_eq!(bad_hits.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            breakers.snapshot("id-bad").state,
+            crate::server::llm::breaker::BreakerStateView::Open
+        );
+        // 第 6 次：坏候选被跳过，直接打好候选
+        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        assert!(matches!(out, FailoverOutcome::Success { .. }));
+        assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
     }
 
     #[tokio::test]
