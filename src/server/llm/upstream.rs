@@ -309,6 +309,117 @@ async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (Statu
         .unwrap())
 }
 
+/// 判定上游失败是否可转移（换下一个候选重试）。
+///
+/// 可转移：5xx（含连接/超时映射来的 502）、429（受 `failover_on_429` 开关控制）。
+/// 不可转移：其余 4xx（请求本身问题，换模型大概率同样失败）。
+pub fn is_retryable(status: StatusCode, failover_on_429: bool) -> bool {
+    if status.is_server_error() {
+        return true;
+    }
+    status == StatusCode::TOO_MANY_REQUESTS && failover_on_429
+}
+
+/// 从 provider `extra_config` JSON 读 `failover_on_429` 开关（默认 true）。
+pub fn failover_on_429_enabled(extra_config: Option<&str>) -> bool {
+    let Some(ec) = extra_config else { return true };
+    serde_json::from_str::<serde_json::Value>(ec)
+        .ok()
+        .and_then(|v| v.get("failover_on_429")?.as_bool())
+        .unwrap_or(true)
+}
+
+/// 定点改写请求体的 model 字段（重试循环内用，其他字段不动）。
+pub fn set_body_model(body: &mut serde_json::Value, model: &str) {
+    body["model"] = serde_json::Value::String(model.to_string());
+}
+
+/// 流式上游调用的首字节守卫。
+///
+/// 与 `call_upstream_with_body` 的差别：拿到 2xx 响应后不直接 relay，
+/// 而是先缓冲到第一个 SSE `data:` 事件（30s 首字节超时），成功再把
+/// "已缓冲前缀 + 剩余流"拼成响应体返回；失败按 `(status, msg)` 返回，
+/// 供外层故障转移循环判定。
+///
+/// 适用场景：模型组候选链——确保客户端收到首字节前可以换候选重发。
+pub async fn call_upstream_stream_guarded(
+    base_url: &str,
+    api_key: &str,
+    req_body: &serde_json::Value,
+) -> Result<Response, (StatusCode, String)> {
+    use futures_util::StreamExt;
+
+    let client = &*UPSTREAM_CLIENT;
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(req_body)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Upstream connection failed: {}", e),
+            )
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        let sanitized = sanitize_error_message(&body_text);
+        return Err((
+            status,
+            format!("Upstream error {}: {}", status.as_u16(), sanitized),
+        ));
+    }
+
+    // 缓冲到第一个 SSE data 事件（含跨 chunk 到达的情况），30s 首字节超时。
+    let mut stream = resp.bytes_stream();
+    let mut prefix: Vec<u8> = Vec::new();
+    let first_event_deadline = std::time::Duration::from_secs(30);
+    let collect = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Upstream stream read failed: {}", e),
+                )
+            })?;
+            prefix.extend_from_slice(&chunk);
+            // 任意一个完整 SSE 事件（\n\n 或 \r\n\r\n 结尾）出现即放行
+            if prefix.windows(2).any(|w| w == b"\n\n") {
+                return Ok(());
+            }
+        }
+        // 流正常结束但没等到事件——空流也放行（上游立刻 [DONE] 的边界场景）
+        Ok(())
+    };
+    tokio::time::timeout(first_event_deadline, collect)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Upstream first-byte timeout".to_string(),
+            )
+        })??;
+
+    // 拼"前缀 replay + 剩余流"的响应体
+    let prefix_stream = futures_util::stream::once(async move {
+        Ok::<_, std::io::Error>(prefix)
+    });
+    let rest_stream = stream.map(|r| r.map(|b| b.to_vec()).map_err(|e| std::io::Error::other(e.to_string())));
+    let body = Body::from_stream(prefix_stream.chain(rest_stream));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap())
+}
+
 /// 透传原始请求到上游 Anthropic 端点，不做格式转换。
 ///
 /// 认证策略：同时支持 `x-api-key`（Anthropic 原生）和 `Authorization: Bearer`（OpenAI 风格）。
@@ -791,5 +902,122 @@ mod tests {
         assert_eq!(body["model"], "m");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn test_is_retryable() {
+        use axum::http::StatusCode;
+        // 5xx 可转移
+        assert!(is_retryable(StatusCode::INTERNAL_SERVER_ERROR, true));
+        assert!(is_retryable(StatusCode::BAD_GATEWAY, true));
+        assert!(is_retryable(StatusCode::SERVICE_UNAVAILABLE, true));
+        // 429 受开关控制
+        assert!(is_retryable(StatusCode::TOO_MANY_REQUESTS, true));
+        assert!(!is_retryable(StatusCode::TOO_MANY_REQUESTS, false));
+        // 其他 4xx 不可转移
+        assert!(!is_retryable(StatusCode::BAD_REQUEST, true));
+        assert!(!is_retryable(StatusCode::UNAUTHORIZED, true));
+        assert!(!is_retryable(StatusCode::NOT_FOUND, true));
+        // 2xx 不在此函数语义内（调用方只在失败时调用），但保守返回 false
+        assert!(!is_retryable(StatusCode::OK, true));
+    }
+
+    #[test]
+    fn test_failover_on_429_enabled() {
+        // 默认（无 extra_config / 无该 key）为 true
+        assert!(failover_on_429_enabled(None));
+        assert!(failover_on_429_enabled(Some("{}")));
+        assert!(failover_on_429_enabled(Some(r#"{"compat_tool_history":true}"#)));
+        // 显式配置
+        assert!(failover_on_429_enabled(Some(r#"{"failover_on_429":true}"#)));
+        assert!(!failover_on_429_enabled(Some(r#"{"failover_on_429":false}"#)));
+        // 非法 JSON 保守默认 true
+        assert!(failover_on_429_enabled(Some("not-json")));
+    }
+
+    #[test]
+    fn test_set_body_model() {
+        let mut body = serde_json::json!({"model": "old", "messages": []});
+        set_body_model(&mut body, "new-model");
+        assert_eq!(body["model"], "new-model");
+        assert_eq!(body["messages"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_stream_guarded_success_replays_prefix() {
+        // 起裸 TCP mock：延迟 50ms 后吐两个 SSE chunk 再关
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            // 读完请求头+体（简单粗暴：读一次足够测试体量）
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let req_body = serde_json::json!({"model": "m", "stream": true});
+        let resp = call_upstream_stream_guarded(
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 读全量 body：应包含两个 chunk（前缀 replay + 续传）
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hel"));
+        assert!(text.contains("lo"));
+        assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_guarded_connect_failure_retryable() {
+        // 绑定后立即丢弃 listener → 端口不可连
+        let addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let req_body = serde_json::json!({"model": "m", "stream": true});
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(is_retryable(err.0, true));
+    }
+
+    #[tokio::test]
+    async fn test_stream_guarded_upstream_500_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = "{\"error\":\"boom\"}";
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let req_body = serde_json::json!({"model": "m", "stream": true});
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(is_retryable(err.0, true));
     }
 }
