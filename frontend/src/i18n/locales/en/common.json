@@ -601,6 +601,7 @@
       "resetBreaker": "Reset Breaker",
       "breaker": {
         "closed": "Closed",
+        "halfOpen": "Probing",
         "open": "Open {{secs}}s"
       }
     },

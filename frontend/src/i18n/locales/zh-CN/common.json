@@ -601,6 +601,7 @@
       "resetBreaker": "重置熔断",
       "breaker": {
         "closed": "正常",
+        "halfOpen": "试探中",
         "open": "熔断中 {{secs}}s"
       }
     },

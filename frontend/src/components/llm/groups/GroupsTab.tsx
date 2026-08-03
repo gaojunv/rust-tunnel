@@ -77,11 +77,15 @@ export function GroupsTab() {
 
       <GroupDialog
         open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open);
+          if (!open) setEditingId(null);
+        }}
         groupId={editingId}
         onDelete={(id) => {
           deleteGroup.mutate(id);
           setDialogOpen(false);
+          setEditingId(null);
         }}
       />
     </div>

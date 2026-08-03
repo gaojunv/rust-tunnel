@@ -54,6 +54,8 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
   const [name, setName] = useState('');
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [pickModelId, setPickModelId] = useState('');
+  // 新建成功后缓存服务端分配 id，save 部分失败重试时复用（走 update 分支），避免重复建组
+  const [createdId, setCreatedId] = useState<string | null>(null);
   // 记录本次 (open, groupId) 是否已完成编辑态回填，防止 5s 熔断轮询的 detail 刷新覆盖用户编辑
   const backfilledRef = useRef(false);
 
@@ -62,6 +64,7 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
     setName('');
     setMembers([]);
     setPickModelId('');
+    setCreatedId(null);
     backfilledRef.current = false;
   }, [open, groupId]);
 
@@ -102,10 +105,12 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
 
   const save = async () => {
     try {
-      let id = groupId;
+      const effectiveId = groupId ?? createdId;
+      let id = effectiveId;
       if (!id) {
         const created = await createGroup.mutateAsync({ name });
         id = created.id;
+        setCreatedId(created.id);
       } else {
         await updateGroup.mutateAsync({ id, name });
       }
@@ -125,6 +130,9 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
     if (!m) return null;
     if (m.breaker.state === 'closed') {
       return <Badge variant="secondary">{t('llm.groups.breaker.closed')}</Badge>;
+    }
+    if (m.breaker.state === 'halfopenprobe') {
+      return <Badge variant="outline">{t('llm.groups.breaker.halfOpen')}</Badge>;
     }
     return (
       <Badge variant="destructive">
