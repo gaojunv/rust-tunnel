@@ -128,7 +128,8 @@ impl UsageSseScanner {
         while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
             let line_bytes = &line_bytes[..line_bytes.len() - 1];
-            let line = String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
+            let line =
+                String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
             self.process_line(&line);
         }
     }

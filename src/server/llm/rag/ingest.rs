@@ -53,7 +53,9 @@ pub fn spawn_ingest(
         };
 
         // processing
-        let _ = db.rag_update_document_status(&doc_id, "processing", 0, None).await;
+        let _ = db
+            .rag_update_document_status(&doc_id, "processing", 0, None)
+            .await;
         emit("processing", 0, None);
 
         match do_ingest(
@@ -68,11 +70,15 @@ pub fn spawn_ingest(
         .await
         {
             Ok(count) => {
-                let _ = db.rag_update_document_status(&doc_id, "ready", count, None).await;
+                let _ = db
+                    .rag_update_document_status(&doc_id, "ready", count, None)
+                    .await;
                 emit("ready", count, None);
             }
             Err(e) => {
-                let _ = db.rag_update_document_status(&doc_id, "failed", 0, Some(&e)).await;
+                let _ = db
+                    .rag_update_document_status(&doc_id, "failed", 0, Some(&e))
+                    .await;
                 emit("failed", 0, Some(e));
             }
         }
@@ -123,13 +129,25 @@ async fn do_ingest(
     for (i, (c, v)) in chunks.iter().zip(vectors).enumerate() {
         let cid = uuid::Uuid::new_v4().to_string();
         points.push(ChunkPoint {
-            id: cid.clone(), vector: v, doc_id: doc_id.to_string(),
-            seq: i as i64, heading_path: c.heading_path.clone(),
+            id: cid.clone(),
+            vector: v,
+            doc_id: doc_id.to_string(),
+            seq: i as i64,
+            heading_path: c.heading_path.clone(),
         });
-        rows.push((cid, doc_id.to_string(), kb.id.clone(), i as i64,
-                   c.heading_path.clone(), c.content.clone(), c.token_count as i64));
+        rows.push((
+            cid,
+            doc_id.to_string(),
+            kb.id.clone(),
+            i as i64,
+            c.heading_path.clone(),
+            c.content.clone(),
+            c.token_count as i64,
+        ));
     }
-    store.upsert(&kb.id, kb.emb_dimension as usize, points).await
+    store
+        .upsert(&kb.id, kb.emb_dimension as usize, points)
+        .await
         .map_err(|e| e.to_string())?;
     if let Err(e) = db.rag_insert_chunks(&rows).await {
         // 回滚本任务刚写入的向量：rag_insert_chunks 失败意味着元数据未落库
@@ -184,7 +202,12 @@ mod tests {
     }
 
     /// 建一个指向给定 embedding base 的知识库并返回完整 record。
-    async fn create_kb(db: &Database, id: &str, emb_base_url: &str, dim: i64) -> RagKnowledgeBaseRecord {
+    async fn create_kb(
+        db: &Database,
+        id: &str,
+        emb_base_url: &str,
+        dim: i64,
+    ) -> RagKnowledgeBaseRecord {
         db.rag_create_kb(
             id,
             "测试库",
@@ -226,9 +249,7 @@ mod tests {
                 Json(json!({"object": "list", "data": data}))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -259,9 +280,7 @@ mod tests {
                 Json(json!({"object": "list", "data": data}))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -287,7 +306,9 @@ mod tests {
         db.rag_create_document(&doc_id, &kb.id, "guide.md", "sha256:abc", "md")
             .await
             .unwrap();
-        let content = "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n".to_string();
+        let content =
+            "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n"
+                .to_string();
 
         let (_d, store) = tmp_store();
         let (tx, mut rx) = broadcast::channel(16);
@@ -317,11 +338,16 @@ mod tests {
         assert!(doc.chunk_count > 0);
         assert!(doc.error.is_none());
         assert_eq!(s2.chunk_count, doc.chunk_count);
-        assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), doc.chunk_count);
+        assert_eq!(
+            db.rag_count_kb_chunks(&kb.id).await.unwrap(),
+            doc.chunk_count
+        );
 
         // 向量已写入：同 kb search 能命中
         let query = [1.0f32; 8];
-        let hits = store.search(&kb.id, kb.emb_dimension as usize, &query, 5).await;
+        let hits = store
+            .search(&kb.id, kb.emb_dimension as usize, &query, 5)
+            .await;
         assert_eq!(hits.len() as i64, doc.chunk_count);
         assert!(!hits.is_empty());
     }
@@ -397,7 +423,10 @@ mod tests {
         let s2 = next_event(&mut rx).await;
         assert_eq!(s2.status, "failed");
         let err = s2.error.as_deref().expect("failed event has error");
-        assert!(err.contains("count mismatch"), "error should mention count mismatch: {err}");
+        assert!(
+            err.contains("count mismatch"),
+            "error should mention count mismatch: {err}"
+        );
 
         let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
         assert_eq!(doc.status, "failed");

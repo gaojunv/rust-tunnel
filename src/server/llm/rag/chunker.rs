@@ -22,7 +22,10 @@ fn approx_tokens(s: &str) -> usize {
 ///
 /// `List` / `Table` 为后续列表/表格检测预留（当前解析器只产出前三类）。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code, reason = "List/Table reserved for future list/table detection")]
+#[allow(
+    dead_code,
+    reason = "List/Table reserved for future list/table detection"
+)]
 enum UnitKind {
     Heading,
     Paragraph,
@@ -284,8 +287,10 @@ mod tests {
         let code = "```rust\nfn a() {}\nfn b() {}\nfn c() {}\n```\n";
         let md = format!("# T\n\n{}\n\n后续段落。\n", code);
         let chunks = chunk_markdown(&md, 20, 0); // 很小的 chunk_size
-        // 代码块完整存在于某个块中
-        assert!(chunks.iter().any(|c| c.content.contains("fn a()") && c.content.contains("fn c()")));
+                                                 // 代码块完整存在于某个块中
+        assert!(chunks
+            .iter()
+            .any(|c| c.content.contains("fn a()") && c.content.contains("fn c()")));
     }
 
     #[test]

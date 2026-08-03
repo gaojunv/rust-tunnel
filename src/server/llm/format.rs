@@ -168,7 +168,8 @@ impl AnthropicSseTranslator {
             let line_bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
             // 去掉末尾 \n 与可选 \r；此时行内不再含被切断的多字节字符
             let line_bytes = &line_bytes[..line_bytes.len() - 1];
-            let line_str = String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
+            let line_str =
+                String::from_utf8_lossy(line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes));
             self.process_line(&line_str, &mut out);
         }
         out.into_bytes()
@@ -192,11 +193,7 @@ impl AnthropicSseTranslator {
         // 之后）：补发一条带完整 input/output 细分的 message_delta，否则下游
         // UsageSseScanner 只能拿到 close() 时的空 usage，tokens 统计为 0。
         if self.closed && !self.late_usage_emitted {
-            if chunk
-                .get("usage")
-                .map(|u| u.is_object())
-                .unwrap_or(false)
-            {
+            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
                 self.late_usage_emitted = true;
                 let usage = openai_usage_to_anthropic(&chunk["usage"]);
                 let stop_reason = self

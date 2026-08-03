@@ -294,16 +294,36 @@ pub async fn handle_chat_completions(
     // 写入请求日志后发送，保证日志与实际发送内容一致。
     let req_body = super::upstream::build_upstream_body(&request);
     super::log_llm_request(
-        &state.llm, "openai", &request.model, message_count,
-        has_tools, request.stream, None, None, 0, &req_body,
-    ).await;
-    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body).await {
+        &state.llm,
+        "openai",
+        &request.model,
+        message_count,
+        has_tools,
+        request.stream,
+        None,
+        None,
+        0,
+        &req_body,
+    )
+    .await;
+    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body)
+        .await
+    {
         Ok(resp) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "openai", &request.model, message_count,
-                has_tools, request.stream, Some(200), None, elapsed_ms, &req_body,
-            ).await;
+                &state.llm,
+                "openai",
+                &request.model,
+                message_count,
+                has_tools,
+                request.stream,
+                Some(200),
+                None,
+                elapsed_ms,
+                &req_body,
+            )
+            .await;
             let resp = if compat_enabled {
                 if request.stream {
                     // 流式 + compat 模式：增量解析 content，伪工具调用即时识别为 tool_calls
@@ -320,9 +340,18 @@ pub async fn handle_chat_completions(
         Err((status, msg)) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "openai", &request.model, message_count,
-                has_tools, request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
-            ).await;
+                &state.llm,
+                "openai",
+                &request.model,
+                message_count,
+                has_tools,
+                request.stream,
+                Some(status.as_u16()),
+                Some(&msg),
+                elapsed_ms,
+                &req_body,
+            )
+            .await;
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
@@ -485,12 +514,15 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
         while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = byte_buf.drain(..=pos).collect();
             let line = String::from_utf8_lossy(
-                line_bytes.strip_suffix(b"\r\n")
+                line_bytes
+                    .strip_suffix(b"\r\n")
                     .or_else(|| line_bytes.strip_suffix(b"\n"))
                     .unwrap_or(&line_bytes),
             )
             .into_owned();
-            let Some(payload) = line.strip_prefix("data:") else { continue };
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
             let payload = payload.trim();
             if payload.is_empty() {
                 continue;
@@ -814,13 +846,19 @@ mod tests {
         let msgs = body["messages"]
             .as_array()
             .expect("upstream should receive messages");
-        assert_eq!(msgs[0]["role"], "system", "messages[0] 应为注入的 system: {body}");
+        assert_eq!(
+            msgs[0]["role"], "system",
+            "messages[0] 应为注入的 system: {body}"
+        );
         let sys = msgs[0]["content"].as_str().expect("system content");
         assert!(
             sys.contains("<knowledge_base>"),
             "system 应含 <knowledge_base>: {sys}"
         );
-        assert!(sys.contains("RAG 知识库测试内容"), "system 应含 chunk 内容: {sys}");
+        assert!(
+            sys.contains("RAG 知识库测试内容"),
+            "system 应含 chunk 内容: {sys}"
+        );
 
         // usage log 记录 rag_chunks_injected = 1（fire-and-forget 写入，稍等）
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1303,9 +1341,15 @@ mod tests {
         assert!(text.contains("Bash"), "应包含工具名: {text}");
         assert!(text.contains("call_1"), "应包含 call id: {text}");
         // finish_reason 应为 tool_calls
-        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "finish_reason 应为 tool_calls: {text}");
+        assert!(
+            text.contains("\"finish_reason\":\"tool_calls\""),
+            "finish_reason 应为 tool_calls: {text}"
+        );
         // 不应包含原始伪工具调用文本
-        assert!(!text.contains("[调用工具"), "不应包含伪工具调用文本: {text}");
+        assert!(
+            !text.contains("[调用工具"),
+            "不应包含伪工具调用文本: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1430,7 +1474,10 @@ mod tests {
 
         // usage 应恰好出现一次（无重复）
         let count = text.matches("\"prompt_tokens\"").count();
-        assert_eq!(count, 1, "usage should appear exactly once, got {count} in: {text}");
+        assert_eq!(
+            count, 1,
+            "usage should appear exactly once, got {count} in: {text}"
+        );
     }
 
     // ── v2 增量流式：文本即时透传 + 跨 chunk 标签 ─────────────────
@@ -1464,7 +1511,10 @@ mod tests {
         assert!(text.contains("tool_calls"), "应有 tool_calls: {text}");
         assert!(text.contains("Bash"), "应有工具名: {text}");
         assert!(!text.contains("tool_call>"), "标签原文不得泄漏: {text}");
-        assert!(text.contains("\"prompt_tokens\":10"), "usage 应保留: {text}");
+        assert!(
+            text.contains("\"prompt_tokens\":10"),
+            "usage 应保留: {text}"
+        );
         assert!(text.contains("[DONE]"), "[DONE] 应保留: {text}");
         // finish_reason 应是 tool_calls（有工具调用的收尾）
         assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
@@ -1576,7 +1626,10 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["choices"][0]["message"]["content"].as_str().unwrap(), "看下");
+        assert_eq!(
+            v["choices"][0]["message"]["content"].as_str().unwrap(),
+            "看下"
+        );
         let calls = v["choices"][0]["message"]["tool_calls"].as_array().unwrap();
         assert_eq!(calls[0]["function"]["name"], "Bash");
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");

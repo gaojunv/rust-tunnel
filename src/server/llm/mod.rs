@@ -114,7 +114,9 @@ fn deserialize_nullable_string<'de, D>(d: D) -> Result<Option<Option<String>>, D
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Some(<Option<String> as serde::Deserialize>::deserialize(d)?))
+    Ok(Some(<Option<String> as serde::Deserialize>::deserialize(
+        d,
+    )?))
 }
 
 /// Request body for creating/updating a provider.
@@ -404,15 +406,40 @@ mod tests {
         state.dynamic_config.write().await.llm_request_logging = false;
         // 开关关闭时应直接返回，不 panic
         let body = serde_json::json!({"model": "gpt-4", "messages": []});
-        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10, &body).await;
+        log_llm_request(
+            &state,
+            "openai",
+            "gpt-4",
+            1,
+            false,
+            false,
+            Some(200),
+            None,
+            10,
+            &body,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn test_log_llm_request_default_enabled() {
         let state = LlmState::new(None, None);
         // 默认开启，调用不应 panic
-        let body = serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
-        log_llm_request(&state, "openai", "gpt-4", 1, false, false, Some(200), None, 10, &body).await;
+        let body =
+            serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
+        log_llm_request(
+            &state,
+            "openai",
+            "gpt-4",
+            1,
+            false,
+            false,
+            Some(200),
+            None,
+            10,
+            &body,
+        )
+        .await;
     }
 
     /// 回归测试：日志页面曾只显示 "LLM request" 几个字。
@@ -428,16 +455,34 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(LogLayer::new(store.clone()));
 
         let state = LlmState::new(None, None);
-        let body = serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
+        let body =
+            serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
 
         // set_default guard 覆盖整个 await（with_default 对 async 块的注册语义不可靠）
         let _guard = tracing::subscriber::set_default(subscriber);
-        log_llm_request(&state, "openai", "gpt-4", 3, true, false, Some(200), None, 42, &body).await;
+        log_llm_request(
+            &state,
+            "openai",
+            "gpt-4",
+            3,
+            true,
+            false,
+            Some(200),
+            None,
+            42,
+            &body,
+        )
+        .await;
 
         // send → ring buffer 由后台 task 转发，轮询等待落地
         let mut msg = String::new();
         for _ in 0..50 {
-            if let Some(entry) = store.get_all().await.into_iter().find(|e| e.target == "llm_request") {
+            if let Some(entry) = store
+                .get_all()
+                .await
+                .into_iter()
+                .find(|e| e.target == "llm_request")
+            {
                 msg = entry.message;
                 break;
             }

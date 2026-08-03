@@ -92,7 +92,10 @@ impl Database {
         Ok(())
     }
 
-    pub async fn rag_get_kb(&self, id: &str) -> Result<Option<RagKnowledgeBaseRecord>, sqlx::Error> {
+    pub async fn rag_get_kb(
+        &self,
+        id: &str,
+    ) -> Result<Option<RagKnowledgeBaseRecord>, sqlx::Error> {
         sqlx::query_as::<_, RagKnowledgeBaseRecord>(
             "SELECT * FROM rag_knowledge_bases WHERE id = ?",
         )
@@ -346,7 +349,9 @@ mod tests {
 
     async fn test_db() -> Database {
         // 内存数据库；Database::new 内部自动初始化完整 schema（含本次新增的 RAG 表）
-        Database::new(":memory:").await.expect("create in-memory db")
+        Database::new(":memory:")
+            .await
+            .expect("create in-memory db")
     }
 
     #[tokio::test]
@@ -354,13 +359,12 @@ mod tests {
         let db = test_db().await;
         // 三张表存在
         for t in ["rag_knowledge_bases", "rag_documents", "rag_chunks"] {
-            let row: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-            )
-            .bind(t)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+            let row: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                    .bind(t)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
             assert_eq!(row.0, 1, "table {} should exist", t);
         }
         // llm_api_keys 有 kb_id 列
@@ -467,7 +471,10 @@ mod tests {
         assert_eq!(kb.chunk_size, 256);
         assert_eq!(kb.chunk_overlap, 32);
         assert!((kb.score_threshold - 0.5).abs() < 1e-9);
-        assert_eq!(kb.emb_base_url, "https://api.example.com", "emb 配置不可被 update_params 改");
+        assert_eq!(
+            kb.emb_base_url, "https://api.example.com",
+            "emb 配置不可被 update_params 改"
+        );
 
         // list
         create_sample_kb(&db, "kb-2").await;
@@ -554,7 +561,9 @@ mod tests {
         assert!(db.rag_get_chunks_by_ids(&[]).await.unwrap().is_empty());
 
         // 更新文档状态
-        db.rag_update_document_status("doc-1", "ready", 2, None).await.unwrap();
+        db.rag_update_document_status("doc-1", "ready", 2, None)
+            .await
+            .unwrap();
         let doc = db.rag_get_document("doc-1").await.unwrap().unwrap();
         assert_eq!(doc.status, "ready");
         assert_eq!(doc.chunk_count, 2);
@@ -570,7 +579,11 @@ mod tests {
         // 按文档删分块
         db.rag_delete_chunks_by_doc("doc-1").await.unwrap();
         assert_eq!(db.rag_count_kb_chunks("kb-d").await.unwrap(), 0);
-        assert!(db.rag_get_chunks_by_ids(&["c-1".to_string()]).await.unwrap().is_empty());
+        assert!(db
+            .rag_get_chunks_by_ids(&["c-1".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
 
         // 删除文档
         db.rag_delete_document("doc-1").await.unwrap();
@@ -584,9 +597,11 @@ mod tests {
     #[tokio::test]
     async fn document_roundtrip_carries_file_type() {
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb("kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true)
-            .await
-            .unwrap();
+        db.rag_create_kb(
+            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
+        )
+        .await
+        .unwrap();
         db.rag_create_document("d1", "kb1", "a.pdf", "sha256:x", "pdf")
             .await
             .unwrap();

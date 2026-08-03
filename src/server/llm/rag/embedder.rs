@@ -125,9 +125,7 @@ mod tests {
                 Json(json!({"object": "list", "data": data}))
             }),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -139,7 +137,10 @@ mod tests {
     async fn embed_returns_vectors_in_order() {
         let base = mock_embedding_server(8).await;
         let e = Embedder::new(&base, "sk-test", "test-model");
-        let out = e.embed(&["a".into(), "b".into(), "c".into()]).await.unwrap();
+        let out = e
+            .embed(&["a".into(), "b".into(), "c".into()])
+            .await
+            .unwrap();
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(|v| v.len() == 8));
     }

@@ -128,10 +128,10 @@ pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value
         // anthropic_to_openai 也构造对象 passthrough。
         debug_assert!(raw.is_object(), "raw_body 应为 JSON 对象");
         raw["model"] = request.model.clone().into(); // 别名 → 真实模型名
-        // stream 必须始终与网关决策一致：客户端省略 stream（或传非布尔值）时，
-        // 也保证上游收到显式布尔值，避免透传模式下 stream 变成 null。
-        // request.stream 与客户端显式值同源（as_bool().unwrap_or(false)），
-        // 显式提供时覆盖为同值（no-op），与重建模式旧行为保持一致。
+                                                     // stream 必须始终与网关决策一致：客户端省略 stream（或传非布尔值）时，
+                                                     // 也保证上游收到显式布尔值，避免透传模式下 stream 变成 null。
+                                                     // request.stream 与客户端显式值同源（as_bool().unwrap_or(false)），
+                                                     // 显式提供时覆盖为同值（no-op），与重建模式旧行为保持一致。
         raw["stream"] = request.stream.into();
         if request.stream {
             // 幂等注入 include_usage：保留客户端已有 stream_options 字段。
@@ -233,7 +233,11 @@ pub async fn call_upstream_with_body(
         // 脱敏：移除 Authorization 头，但保留请求体的完整内容（包含 messages/tools）。
         let full_req = serde_json::to_string_pretty(req_body).unwrap_or_default();
         let truncated_req = if full_req.len() > 8192 {
-            format!("{}...\n[truncated, total {} bytes]", &full_req[..8192], full_req.len())
+            format!(
+                "{}...\n[truncated, total {} bytes]",
+                &full_req[..8192],
+                full_req.len()
+            )
         } else {
             full_req
         };

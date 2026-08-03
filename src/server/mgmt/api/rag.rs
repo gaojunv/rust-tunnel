@@ -344,12 +344,8 @@ pub async fn patch_kb(
     // 把一次类型错误静默变成「禁用 KB」（对齐 api-key PATCH 的校验语义）。
     let enabled = match body.get("enabled") {
         Some(serde_json::Value::Bool(b)) => *b,
-        Some(_) => {
-            return (StatusCode::BAD_REQUEST, "enabled must be a boolean").into_response()
-        }
-        None => {
-            return (StatusCode::BAD_REQUEST, "enabled is required").into_response()
-        }
+        Some(_) => return (StatusCode::BAD_REQUEST, "enabled must be a boolean").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "enabled is required").into_response(),
     };
     if let Err(e) = rt.db.rag_toggle_kb(&id, enabled).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
@@ -1876,7 +1872,11 @@ mod tests {
         db.rag_update_document_status(&doc_id, "processing", 0, None)
             .await
             .unwrap();
-        let source_path = dir.path().join("rag_docs").join(&kb_id).join(format!("{doc_id}.md"));
+        let source_path = dir
+            .path()
+            .join("rag_docs")
+            .join(&kb_id)
+            .join(format!("{doc_id}.md"));
         tokio::fs::create_dir_all(source_path.parent().unwrap())
             .await
             .unwrap();

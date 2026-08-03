@@ -292,8 +292,7 @@ where
                     if !self.message.is_empty() {
                         self.message.push(' ');
                     }
-                    self.message
-                        .push_str(&format!("{}={:?}", name, value));
+                    self.message.push_str(&format!("{}={:?}", name, value));
                 }
             }
 

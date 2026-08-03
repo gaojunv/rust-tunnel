@@ -2,10 +2,10 @@
 
 use super::embedder::Embedder;
 use super::store::VectorStore;
+use crate::server::db::rag::RagKnowledgeBaseRecord;
 use crate::server::db::Database;
 use crate::server::llm::crypto::decrypt_field;
 use crate::server::llm::crypto::LlmCipher;
-use crate::server::db::rag::RagKnowledgeBaseRecord;
 
 #[derive(Debug, Clone)]
 pub struct RetrievedChunk {
@@ -38,7 +38,12 @@ pub async fn retrieve(
         return Vec::new();
     };
     let hits = store
-        .search(&kb.id, kb.emb_dimension as usize, &query_vec, kb.top_k as usize)
+        .search(
+            &kb.id,
+            kb.emb_dimension as usize,
+            &query_vec,
+            kb.top_k as usize,
+        )
         .await;
     if hits.is_empty() {
         return Vec::new();
@@ -110,8 +115,16 @@ mod tests {
     #[test]
     fn filters_below_threshold() {
         let pts = vec![
-            RetrievedChunk { heading_path: "a".into(), content: "x".into(), score: 0.9 },
-            RetrievedChunk { heading_path: "b".into(), content: "y".into(), score: 0.2 },
+            RetrievedChunk {
+                heading_path: "a".into(),
+                content: "x".into(),
+                score: 0.9,
+            },
+            RetrievedChunk {
+                heading_path: "b".into(),
+                content: "y".into(),
+                score: 0.2,
+            },
         ];
         let kept = filter_by_threshold(pts, 0.3);
         assert_eq!(kept.len(), 1);
@@ -120,9 +133,11 @@ mod tests {
 
     #[test]
     fn system_message_wraps_in_kb_tags() {
-        let chunks = vec![
-            RetrievedChunk { heading_path: "指南/安装".into(), content: "步骤".into(), score: 0.9 },
-        ];
+        let chunks = vec![RetrievedChunk {
+            heading_path: "指南/安装".into(),
+            content: "步骤".into(),
+            score: 0.9,
+        }];
         let msg = build_system_message(&chunks);
         assert!(msg.starts_with("<knowledge_base>"));
         assert!(msg.ends_with("</knowledge_base>"));

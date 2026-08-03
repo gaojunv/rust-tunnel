@@ -554,7 +554,10 @@ pub async fn handle_udp_associate(
                 }
                 PacketParseResult::Incomplete => break,
                 PacketParseResult::Invalid(reason) => {
-                    warn!("Invalid UDP packet on connection {}: {}", connection_id, reason);
+                    warn!(
+                        "Invalid UDP packet on connection {}: {}",
+                        connection_id, reason
+                    );
                     break;
                 }
             }
@@ -667,7 +670,10 @@ async fn dispatch_udp_packet(
     connection_id: u64,
     targets: &mut std::collections::HashMap<
         std::net::SocketAddr,
-        (std::sync::Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle),
+        (
+            std::sync::Arc<tokio::net::UdpSocket>,
+            tokio::task::AbortHandle,
+        ),
     >,
     resp_tx: &tokio::sync::mpsc::Sender<(UdpPacket, std::net::SocketAddr)>,
     dead_tx: &tokio::sync::mpsc::Sender<std::net::SocketAddr>,
@@ -729,11 +735,9 @@ async fn dispatch_udp_packet(
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
-                let recv = tokio::time::timeout(
-                    UDP_SOCKET_IDLE_TIMEOUT,
-                    task_socket.recv_from(&mut buf),
-                )
-                .await;
+                let recv =
+                    tokio::time::timeout(UDP_SOCKET_IDLE_TIMEOUT, task_socket.recv_from(&mut buf))
+                        .await;
                 match recv {
                     Ok(Ok((n, from))) => {
                         if from != task_target {
@@ -752,8 +756,8 @@ async fn dispatch_udp_packet(
                             break; // session closed
                         }
                     }
-                    Ok(Err(_)) => break,  // socket error
-                    Err(_) => break,      // idle timeout
+                    Ok(Err(_)) => break, // socket error
+                    Err(_) => break,     // idle timeout
                 }
             }
             // Notify the main loop that this read task has exited,
@@ -1500,7 +1504,9 @@ mod tests {
     fn test_udp_packet_invalid_atyp() {
         let buf = build_udp_packet(&[0x07, 1, 2, 3, 4], 53, b"x");
         match parse_udp_packet(&buf) {
-            PacketParseResult::Invalid(msg) => assert!(msg.contains("address") || msg.contains("ATYP") || msg.contains("atyp")),
+            PacketParseResult::Invalid(msg) => {
+                assert!(msg.contains("address") || msg.contains("ATYP") || msg.contains("atyp"))
+            }
             _ => panic!("Expected Invalid for bad ATYP"),
         }
     }
@@ -1628,8 +1634,10 @@ mod tests {
         use std::net::SocketAddr;
         use std::sync::Arc;
 
-        let mut targets: HashMap<SocketAddr, (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle)> =
-            HashMap::new();
+        let mut targets: HashMap<
+            SocketAddr,
+            (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle),
+        > = HashMap::new();
         let (dead_tx, mut dead_rx) = tokio::sync::mpsc::channel::<SocketAddr>(64);
 
         let addr: SocketAddr = "127.0.0.1:15353".parse().unwrap();
@@ -2347,7 +2355,8 @@ mod legacy_tests {
             tls_stream.write_all(&header).await.unwrap();
 
             // Send a UDP packet through the tunnel
-            let packet = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"udp-echo-test");
+            let packet =
+                build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"udp-echo-test");
             tls_stream.write_all(&packet).await.unwrap();
             tls_stream.flush().await.unwrap();
 
@@ -2411,7 +2420,9 @@ mod legacy_tests {
                     .expect("timed out waiting for UDP responses")
                     .expect("read failed");
                 let mut offset = 0;
-                while let Some((src_port, payload, consumed)) = parse_udp_packet_test(&responses_buf(&buf, n, offset)) {
+                while let Some((src_port, payload, consumed)) =
+                    parse_udp_packet_test(&responses_buf(&buf, n, offset))
+                {
                     responses.push((src_port, payload));
                     offset += consumed;
                 }
@@ -2457,12 +2468,12 @@ mod legacy_tests {
                     udp_port,
                 );
                 tls_stream.write_all(&header).await.unwrap();
-                let packet =
-                    build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"ping");
+                let packet = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"ping");
                 tls_stream.write_all(&packet).await.unwrap();
 
                 let mut buf = [0u8; 256];
-                let _ = tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), tls_stream.read(&mut buf)).await;
                 // tls_stream dropped here — session should clean up
             }
 

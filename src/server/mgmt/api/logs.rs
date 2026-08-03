@@ -330,7 +330,10 @@ pub async fn put_llm_logging(
     // 持久化到 DB
     if let Some(db) = state.server_state.db() {
         let _ = db
-            .save_server_setting("llm_request_logging", if body.enabled { "true" } else { "false" })
+            .save_server_setting(
+                "llm_request_logging",
+                if body.enabled { "true" } else { "false" },
+            )
             .await;
     }
 
@@ -442,7 +445,12 @@ mod tests {
 
         // dynamic_config 已同步更新
         assert!(
-            !state.server_state.dynamic_config.read().await.llm_request_logging,
+            !state
+                .server_state
+                .dynamic_config
+                .read()
+                .await
+                .llm_request_logging,
             "dynamic_config should be false after PUT"
         );
 

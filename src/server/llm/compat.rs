@@ -61,9 +61,7 @@ pub const TOOL_CALL_GUIDANCE: &str = "你可以通过两种方式调用工具：
 /// 在 messages 末尾注入伪工具调用引导（幂等：末尾已是引导则跳过）。
 pub fn inject_tool_call_guidance(messages: &mut Vec<ChatMessage>) {
     if let Some(last) = messages.last() {
-        if last.role == "system"
-            && last.content.as_deref() == Some(TOOL_CALL_GUIDANCE)
-        {
+        if last.role == "system" && last.content.as_deref() == Some(TOOL_CALL_GUIDANCE) {
             return;
         }
     }
@@ -76,7 +74,8 @@ pub fn rewrite_tool_history(messages: &mut [ChatMessage]) -> bool {
     let mut rewritten = false;
 
     // 第一遍：收集 tool_call_id → 函数名映射，用于给 tool 结果消息标注来源工具。
-    let mut id_to_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for m in messages.iter() {
         if let Some(calls) = &m.tool_calls {
             for c in calls {
@@ -231,35 +230,41 @@ impl TagScanner {
                     }
                 }
                 ScanState::InToolCall => {
-                    let Some(pos) = self.buf.find(TOOL_CALL_CLOSE) else { break };
+                    let Some(pos) = self.buf.find(TOOL_CALL_CLOSE) else {
+                        break;
+                    };
                     let body = self.buf[..pos].to_string();
                     self.buf.drain(..pos + TOOL_CALL_CLOSE.len());
                     self.state = ScanState::Text;
                     self.emit_call(&body, &mut events);
                 }
                 ScanState::InToolResult => {
-                    let Some(pos) = self.buf.find(RESULT_CLOSE) else { break };
+                    let Some(pos) = self.buf.find(RESULT_CLOSE) else {
+                        break;
+                    };
                     self.buf.drain(..pos + RESULT_CLOSE.len());
                     self.state = ScanState::Text;
                     // 工具结果标签内容（模型正常不会输出）静默剥离
                 }
-                ScanState::InLegacyCall => {
-                    match scan_legacy_call(&self.buf) {
-                        LegacyScan::Incomplete => break,
-                        LegacyScan::Done { name, args, consumed } => {
-                            self.buf.drain(..consumed);
-                            self.state = ScanState::Text;
-                            self.push_call(&name, &args, &mut events);
-                        }
-                        LegacyScan::Invalid { consumed } => {
-                            let frag = self.buf[..consumed].to_string();
-                            self.buf.drain(..consumed);
-                            self.state = ScanState::Text;
-                            log_discard("legacy call parse failed", &frag);
-                            events.push(ScanEvent::Discarded(frag));
-                        }
+                ScanState::InLegacyCall => match scan_legacy_call(&self.buf) {
+                    LegacyScan::Incomplete => break,
+                    LegacyScan::Done {
+                        name,
+                        args,
+                        consumed,
+                    } => {
+                        self.buf.drain(..consumed);
+                        self.state = ScanState::Text;
+                        self.push_call(&name, &args, &mut events);
                     }
-                }
+                    LegacyScan::Invalid { consumed } => {
+                        let frag = self.buf[..consumed].to_string();
+                        self.buf.drain(..consumed);
+                        self.state = ScanState::Text;
+                        log_discard("legacy call parse failed", &frag);
+                        events.push(ScanEvent::Discarded(frag));
+                    }
+                },
                 ScanState::InLegacyResult => {
                     let Some(pos) = self.buf.find(']') else { break };
                     self.buf.drain(..pos + 1);
@@ -407,8 +412,14 @@ fn parse_tool_call_body(body: &str) -> Option<(String, String)> {
 /// 旧格式 `[调用工具 name] {args}` 的增量扫描结果。
 enum LegacyScan {
     Incomplete,
-    Done { name: String, args: String, consumed: usize },
-    Invalid { consumed: usize },
+    Done {
+        name: String,
+        args: String,
+        consumed: usize,
+    },
+    Invalid {
+        consumed: usize,
+    },
 }
 
 /// 在 buf 开头尝试解析旧格式调用（buf 已位于 "[调用工具 " 之后）。
@@ -479,7 +490,6 @@ fn log_discard(reason: &str, frag: &str) {
     );
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,9 +501,9 @@ mod tests {
         assert!(!compat_tool_history_enabled(Some("")));
         assert!(!compat_tool_history_enabled(Some("not json")));
         assert!(!compat_tool_history_enabled(Some("{}")));
-        assert!(!compat_tool_history_enabled(
-            Some(r#"{"compat_tool_history": false}"#)
-        ));
+        assert!(!compat_tool_history_enabled(Some(
+            r#"{"compat_tool_history": false}"#
+        )));
     }
 
     #[test]
@@ -616,7 +626,6 @@ mod tests {
         assert!(!s.contains("\"tool\""), "{s}");
     }
 
-
     // ── v2 协议：标签格式改写 ──────────────────────────────────
 
     #[test]
@@ -665,7 +674,10 @@ mod tests {
         assert!(rewrite_tool_history(&mut msgs));
         assert_eq!(msgs[1].role, "user");
         let c = msgs[1].content.as_deref().unwrap();
-        assert!(c.contains("<tool_result name=\"Read\">"), "应含工具结果标签: {c}");
+        assert!(
+            c.contains("<tool_result name=\"Read\">"),
+            "应含工具结果标签: {c}"
+        );
         assert!(c.contains("file content"), "应保留结果内容: {c}");
         assert!(c.contains("</tool_result>"), "应含结束标签: {c}");
         assert!(!c.contains("[工具结果"), "不应再有旧格式: {c}");
@@ -718,16 +730,21 @@ mod tests {
     #[test]
     fn scanner_single_tool_call_tag() {
         let mut s = TagScanner::new();
-        let events = s.push("<tool_call>\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>");
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v),
-            _ => None,
-        }).collect();
+        let events = s.push(
+            "<tool_call>\n{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>",
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "Bash");
         assert_eq!(calls[0]["id"], "call_1");
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
         assert!(s.has_tool_calls());
     }
@@ -735,11 +752,15 @@ mod tests {
     #[test]
     fn scanner_text_before_and_after() {
         let mut s = TagScanner::new();
-        let events = s.push("先执行\n<tool_call>{\"name\":\"Bash\",\"arguments\":{}}</tool_call>\n完成");
-        let texts: Vec<&str> = events.iter().filter_map(|e| match e {
-            ScanEvent::Text(t) => Some(t.as_str()),
-            _ => None,
-        }).collect();
+        let events =
+            s.push("先执行\n<tool_call>{\"name\":\"Bash\",\"arguments\":{}}</tool_call>\n完成");
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(texts.iter().any(|t| t.contains("先执行")), "{texts:?}");
         assert!(texts.iter().any(|t| t.contains("完成")), "{texts:?}");
     }
@@ -752,10 +773,13 @@ mod tests {
         events.extend(s.push("前置<to"));
         events.extend(s.push("ol_call"));
         events.extend(s.push(">{\"name\":\"A\",\"arguments\":{}}</tool_call>"));
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v),
-            _ => None,
-        }).collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 1, "跨 chunk 标签应被识别: {events:?}");
         // 切断前的"前置"文本应立即输出
         let first_text = events.iter().find_map(|e| match e {
@@ -768,11 +792,15 @@ mod tests {
     #[test]
     fn scanner_json_with_code_fence_tolerated() {
         let mut s = TagScanner::new();
-        let events = s.push("<tool_call>\n```json\n{\"name\":\"Bash\",\"arguments\":{}}\n```\n</tool_call>");
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v),
-            _ => None,
-        }).collect();
+        let events =
+            s.push("<tool_call>\n```json\n{\"name\":\"Bash\",\"arguments\":{}}\n```\n</tool_call>");
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 1, "应容忍代码围栏: {events:?}");
     }
 
@@ -780,8 +808,10 @@ mod tests {
     fn scanner_broken_json_discarded_not_leaked() {
         let mut s = TagScanner::new();
         let events = s.push("<tool_call>\n{bad json\n</tool_call>");
-        assert!(events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
-            "坏 JSON 应产生 Discarded: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
+            "坏 JSON 应产生 Discarded: {events:?}"
+        );
         for e in &events {
             if let ScanEvent::Text(t) = e {
                 assert!(!t.contains("<tool_call>"), "泄漏: {t}");
@@ -795,8 +825,10 @@ mod tests {
         let mut s = TagScanner::new();
         s.push("<tool_call>\n{\"name\":\"Bash\"");
         let events = s.finish();
-        assert!(events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
-            "未闭合标签应 Discarded: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
+            "未闭合标签应 Discarded: {events:?}"
+        );
         for e in &events {
             if let ScanEvent::Text(t) = e {
                 assert!(!t.contains("tool_call"), "泄漏: {t}");
@@ -811,18 +843,33 @@ mod tests {
         let finish_events = s.finish();
         // push() emits safe text immediately; finish() flushes the trailing
         // prefix that was being held back as a potential marker start.
-        let push_text: String = push_events.iter().filter_map(|e| match e {
-            ScanEvent::Text(t) => Some(t.clone()),
-            _ => None,
-        }).collect();
-        assert!(push_text.contains("正常文本"), "安全文本应即时输出: {push_text}");
-        let finish_text: String = finish_events.iter().filter_map(|e| match e {
-            ScanEvent::Text(t) => Some(t.clone()),
-            _ => None,
-        }).collect();
-        assert!(finish_text.contains("<tool_"), "悬挂前缀应在 finish 时放行: {finish_text}");
+        let push_text: String = push_events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            push_text.contains("正常文本"),
+            "安全文本应即时输出: {push_text}"
+        );
+        let finish_text: String = finish_events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            finish_text.contains("<tool_"),
+            "悬挂前缀应在 finish 时放行: {finish_text}"
+        );
         let all_text = push_text + &finish_text;
-        assert!(all_text.contains("正常文本<tool_"), "结合 push+finish 应有完整文本: {all_text}");
+        assert!(
+            all_text.contains("正常文本<tool_"),
+            "结合 push+finish 应有完整文本: {all_text}"
+        );
     }
 
     // ── v2：旧格式回环兼容 ────────────────────────────────────
@@ -831,10 +878,13 @@ mod tests {
     fn scanner_legacy_format_still_parsed() {
         let mut s = TagScanner::new();
         let events = s.push("[调用工具 Bash] {\"command\":\"ls\"}");
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v),
-            _ => None,
-        }).collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 1, "旧格式仍应识别: {events:?}");
         assert_eq!(calls[0]["function"]["name"], "Bash");
     }
@@ -843,8 +893,10 @@ mod tests {
     fn scanner_legacy_broken_discarded() {
         let mut s = TagScanner::new();
         let events = s.push("[调用工具 Bash] {invalid}");
-        assert!(events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
-            "旧格式坏 JSON 应 Discarded（不再原文回退）: {events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, ScanEvent::Discarded(_))),
+            "旧格式坏 JSON 应 Discarded（不再原文回退）: {events:?}"
+        );
     }
 
     #[test]
@@ -853,11 +905,15 @@ mod tests {
         let events = s.push(
             "<tool_call>{\"name\":\"A\",\"arguments\":{}}</tool_call>\n\
              [调用工具 B] {}\n\
-             <tool_call>{\"name\":\"C\",\"arguments\":{}}</tool_call>");
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v.clone()),
-            _ => None,
-        }).collect();
+             <tool_call>{\"name\":\"C\",\"arguments\":{}}</tool_call>",
+        );
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[1]["id"], "call_2");
@@ -883,14 +939,17 @@ mod tests {
         let mut s = TagScanner::new();
         let mut events = s.push(&text);
         events.extend(s.finish());
-        let calls: Vec<_> = events.iter().filter_map(|e| match e {
-            ScanEvent::ToolCall(v) => Some(v),
-            _ => None,
-        }).collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::ToolCall(v) => Some(v),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["function"]["name"], "Bash");
-        let args: Value = serde_json::from_str(
-            calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["command"], "ls");
     }
 

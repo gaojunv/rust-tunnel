@@ -164,15 +164,19 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
     let providers: Vec<ProviderConfig> = records
         .into_iter()
         .map(|r| {
-            let extra_config = r.extra_config.and_then(|ec| {
-                match decrypt_field(cipher.as_ref(), &ec) {
-                    Ok(pt) => Some(pt),
-                    Err(e) => {
-                        tracing::warn!("failed to decrypt extra_config for provider {}: {}", r.id, e);
-                        None
-                    }
-                }
-            });
+            let extra_config =
+                r.extra_config
+                    .and_then(|ec| match decrypt_field(cipher.as_ref(), &ec) {
+                        Ok(pt) => Some(pt),
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to decrypt extra_config for provider {}: {}",
+                                r.id,
+                                e
+                            );
+                            None
+                        }
+                    });
             ProviderConfig {
                 id: r.id,
                 name: r.name,

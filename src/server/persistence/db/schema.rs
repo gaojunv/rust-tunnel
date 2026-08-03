@@ -545,11 +545,14 @@ impl Database {
         .execute(pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc ON rag_chunks(doc_id)")
-            .execute(pool).await?;
+            .execute(pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_chunks_kb ON rag_chunks(kb_id)")
-            .execute(pool).await?;
+            .execute(pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_rag_documents_kb ON rag_documents(kb_id)")
-            .execute(pool).await?;
+            .execute(pool)
+            .await?;
 
         // 幂等迁移：llm_api_keys 加 kb_id，llm_usage_logs 加 rag_chunks_injected
         Self::migrate_llm_api_keys_add_kb_id(pool).await?;

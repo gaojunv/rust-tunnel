@@ -400,9 +400,18 @@ pub async fn handle_messages(
 
         // 完整记录发往上游的原始请求体（替换 model 后），不做任何简化。
         super::log_llm_request(
-            &state.llm, "anthropic", &log_model, message_count,
-            has_tools, is_stream, None, None, 0, &body,
-        ).await;
+            &state.llm,
+            "anthropic",
+            &log_model,
+            message_count,
+            has_tools,
+            is_stream,
+            None,
+            None,
+            0,
+            &body,
+        )
+        .await;
 
         return match super::upstream::call_upstream_raw(
             anthropic_url,
@@ -416,17 +425,35 @@ pub async fn handle_messages(
             Ok(resp) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 super::log_llm_request(
-                    &state.llm, "anthropic", &log_model, message_count,
-                    has_tools, is_stream, Some(200), None, elapsed_ms, &body,
-                ).await;
+                    &state.llm,
+                    "anthropic",
+                    &log_model,
+                    message_count,
+                    has_tools,
+                    is_stream,
+                    Some(200),
+                    None,
+                    elapsed_ms,
+                    &body,
+                )
+                .await;
                 super::usage::wrap_and_record(resp, ctx, db, started).await
             }
             Err((status, msg)) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 super::log_llm_request(
-                    &state.llm, "anthropic", &log_model, message_count,
-                    has_tools, is_stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &body,
-                ).await;
+                    &state.llm,
+                    "anthropic",
+                    &log_model,
+                    message_count,
+                    has_tools,
+                    is_stream,
+                    Some(status.as_u16()),
+                    Some(&msg),
+                    elapsed_ms,
+                    &body,
+                )
+                .await;
                 if let Some(ref db) = db {
                     ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
                 }
@@ -472,7 +499,8 @@ pub async fn handle_messages(
         }
     }
 
-    let compat_enabled = super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
+    let compat_enabled =
+        super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
     if compat_enabled {
         super::compat::rewrite_tool_history(&mut request.messages);
         super::compat::inject_tool_call_guidance(&mut request.messages);
@@ -488,16 +516,36 @@ pub async fn handle_messages(
     // 写日志后发送，保证日志与实际发送内容一致。
     let req_body = super::upstream::build_upstream_body(&request);
     super::log_llm_request(
-        &state.llm, "anthropic", &request.model, request.messages.len(),
-        request.tools.is_some(), request.stream, None, None, 0, &req_body,
-    ).await;
-    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body).await {
+        &state.llm,
+        "anthropic",
+        &request.model,
+        request.messages.len(),
+        request.tools.is_some(),
+        request.stream,
+        None,
+        None,
+        0,
+        &req_body,
+    )
+    .await;
+    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body)
+        .await
+    {
         Ok(resp) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "anthropic", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(200), None, elapsed_ms, &req_body,
-            ).await;
+                &state.llm,
+                "anthropic",
+                &request.model,
+                request.messages.len(),
+                request.tools.is_some(),
+                request.stream,
+                Some(200),
+                None,
+                elapsed_ms,
+                &req_body,
+            )
+            .await;
             // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
             // 非流式整体转换会消费 body，因此这里在转换后再包一层。
             if !request.stream {
@@ -525,9 +573,18 @@ pub async fn handle_messages(
         Err((status, msg)) => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
-                &state.llm, "anthropic", &request.model, request.messages.len(),
-                request.tools.is_some(), request.stream, Some(status.as_u16()), Some(&msg), elapsed_ms, &req_body,
-            ).await;
+                &state.llm,
+                "anthropic",
+                &request.model,
+                request.messages.len(),
+                request.tools.is_some(),
+                request.stream,
+                Some(status.as_u16()),
+                Some(&msg),
+                elapsed_ms,
+                &req_body,
+            )
+            .await;
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
             }
@@ -577,7 +634,8 @@ pub(crate) fn convert_openai_stream_to_anthropic_for_test(openai_resp: Response)
 }
 
 /// Convert OpenAI chat completion response to Anthropic Messages format.
-async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {    let status = openai_resp.status();
+async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
+    let status = openai_resp.status();
     let body_bytes = axum::body::to_bytes(openai_resp.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();
@@ -1240,15 +1298,27 @@ mod tests {
         let s = serde_json::to_string(&msgs).unwrap();
         assert!(!s.contains("tool_call_id"), "上游不得收到 tool 结构: {s}");
         assert!(s.contains("<tool_call>"), "历史应为标签格式: {s}");
-        let tool_result_msg = msgs.iter().find(|m| {
-            m["content"].as_str().map_or(false, |c| c.contains("<tool_result"))
-        }).unwrap();
-        assert!(tool_result_msg["content"].as_str().unwrap().contains(r#"<tool_result name="Read">"#),
-            "tool_result 应有 name 属性: {tool_result_msg}");
+        let tool_result_msg = msgs
+            .iter()
+            .find(|m| {
+                m["content"]
+                    .as_str()
+                    .map_or(false, |c| c.contains("<tool_result"))
+            })
+            .unwrap();
+        assert!(
+            tool_result_msg["content"]
+                .as_str()
+                .unwrap()
+                .contains(r#"<tool_result name="Read">"#),
+            "tool_result 应有 name 属性: {tool_result_msg}"
+        );
         let last = msgs.last().unwrap();
         assert_eq!(last["role"], "system");
-        assert!(last["content"].as_str().unwrap().contains("<tool_call>"),
-            "末尾应有引导: {last}");
+        assert!(
+            last["content"].as_str().unwrap().contains("<tool_call>"),
+            "末尾应有引导: {last}"
+        );
 
         // 2. 客户端收到 Anthropic SSE：text + tool_use，标签不泄漏
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -1449,13 +1519,19 @@ mod tests {
         let msgs = body["messages"]
             .as_array()
             .expect("upstream should receive messages");
-        assert_eq!(msgs[0]["role"], "system", "messages[0] 应为注入的 system: {body}");
+        assert_eq!(
+            msgs[0]["role"], "system",
+            "messages[0] 应为注入的 system: {body}"
+        );
         let sys = msgs[0]["content"].as_str().expect("system content");
         assert!(
             sys.contains("<knowledge_base>"),
             "system 应含 <knowledge_base>: {sys}"
         );
-        assert!(sys.contains("RAG 知识库测试内容"), "system 应含 chunk 内容: {sys}");
+        assert!(
+            sys.contains("RAG 知识库测试内容"),
+            "system 应含 chunk 内容: {sys}"
+        );
 
         // usage log 记录 rag_chunks_injected = 1（fire-and-forget 写入，稍等）
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
