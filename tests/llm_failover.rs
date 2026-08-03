@@ -116,7 +116,7 @@ async fn model_groups_mgmt_api() {
     assert_eq!(reset["status"], "ok");
     assert_eq!(reset["reset"], 2);
 
-    // 删除：组删除后成员行需一并清理（FK 级联不生效，由 handler 显式清空）
+    // 删除：组删除后成员行需一并清理（FK 级联经 sqlx 默认的 PRAGMA foreign_keys=ON 已生效；db 层 llm_delete_model_group 亦显式清空）
     let status = api
         .delete_status(&format!("/api/llm/model-groups/{gid}"))
         .await;

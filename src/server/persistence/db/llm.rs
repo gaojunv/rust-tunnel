@@ -627,17 +627,21 @@ impl Database {
         Ok(())
     }
 
+    /// 删除模型组。FK 级联（ON DELETE CASCADE）经 sqlx 默认的
+    /// `PRAGMA foreign_keys=ON` 已生效；此处显式先删成员是防御性冗余，
+    /// 防止未来池配置变更导致级联静默失效时残留孤儿成员行。
     pub async fn llm_delete_model_group(&self, id: &str) -> Result<(), sqlx::Error> {
-        // 全仓未开 PRAGMA foreign_keys，删组不会级联删成员——先显式清空成员行避免孤儿数据
+        // 两条删除放同一事务：组删除失败时不残留"成员已清空、组仍在"的中间态
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM llm_model_group_members WHERE group_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM llm_model_groups WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+        tx.commit().await
     }
 
     pub async fn llm_list_model_groups(&self) -> Result<Vec<LlmModelGroupRecord>, sqlx::Error> {
@@ -1220,7 +1224,7 @@ mod tests {
             .unwrap();
         assert_eq!(db.llm_group_member_count("g1").await.unwrap(), 1);
 
-        // 全仓未开 PRAGMA foreign_keys，删组须显式清空成员行（回归：孤儿成员数据）
+        // 删组：FK 级联经 sqlx 默认的 PRAGMA foreign_keys=ON 已生效，成员行随组一并清理（回归：孤儿成员数据）
         db.llm_delete_model_group("g1").await.unwrap();
         assert_eq!(db.llm_group_member_count("g1").await.unwrap(), 0);
     }
