@@ -94,6 +94,8 @@ pub struct LlmUsageLogRecord {
     pub error_type: Option<String>,
     /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
     pub rag_chunks_injected: Option<i64>,
+    /// 发生故障转移时记录首选（被跳过的）模型名；未转移为 NULL。
+    pub failover_from: Option<String>,
 }
 
 /// 待插入的用量日志（各标识可空——认证/路由失败时部分字段缺失）。
@@ -551,7 +553,8 @@ impl Database {
             SELECT id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                    model_id, model_name, requested_model, protocol, stream, status_code,
                    success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-                   completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
+                   completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected,
+                   failover_from
             FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC

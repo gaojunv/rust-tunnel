@@ -212,6 +212,8 @@ pub struct UsageContext {
     pub stream: bool,
     /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
     pub rag_chunks_injected: Option<i64>,
+    /// 发生故障转移时记录首选（被跳过的）模型名；未转移为 None。
+    pub failover_from: Option<String>,
 }
 
 impl UsageContext {
@@ -243,8 +245,7 @@ impl UsageContext {
             latency_ms,
             error_type,
             rag_chunks_injected: self.rag_chunks_injected,
-            // 故障转移来源由路由层填充（后续任务接入），此处暂为 None。
-            failover_from: None,
+            failover_from: self.failover_from,
         }
     }
 }
@@ -513,5 +514,29 @@ mod tests {
         s.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
         s.push(b"data: [DONE]\n\n");
         assert!(s.finish().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failover_from_recorded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let ctx = UsageContext {
+            requested_model: "router".into(),
+            protocol: "openai".into(),
+            failover_from: Some("model-a".into()),
+            ..Default::default()
+        };
+        // record_failure 路径也会带上 failover_from
+        ctx.record_failure(&db, 500, "upstream_error", std::time::Instant::now());
+        // spawn_record 是 fire-and-forget，给一点落库时间
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].failover_from.as_deref(), Some("model-a"));
     }
 }

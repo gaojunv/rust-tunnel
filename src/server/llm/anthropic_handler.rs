@@ -384,6 +384,7 @@ pub async fn handle_messages(
         protocol: "anthropic".into(),
         stream: is_stream,
         rag_chunks_injected: None,
+        failover_from: None,
     };
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();

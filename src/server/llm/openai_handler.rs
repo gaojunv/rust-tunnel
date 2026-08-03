@@ -169,6 +169,7 @@ pub async fn handle_chat_completions(
                 protocol: "openai".into(),
                 stream,
                 rag_chunks_injected: None,
+                failover_from: None,
             };
             ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
         }
@@ -197,6 +198,7 @@ pub async fn handle_chat_completions(
                         protocol: "openai".into(),
                         stream,
                         rag_chunks_injected: None,
+                        failover_from: None,
                     };
                     ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
                 }
@@ -240,6 +242,7 @@ pub async fn handle_chat_completions(
         protocol: "openai".into(),
         stream,
         rag_chunks_injected: None,
+        failover_from: None,
     };
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
