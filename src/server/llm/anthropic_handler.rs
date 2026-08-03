@@ -6,7 +6,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::openai_handler::LlmHandlerState;
-use super::router::resolve_model;
+use super::router::resolve_with_failover;
 use super::{ChatCompletionRequest, ChatMessage};
 
 /// 拆解 Anthropic 消息 content 字段的结果。
@@ -347,9 +347,9 @@ pub async fn handle_messages(
         }
     };
 
-    // Resolve model → provider
-    let (provider, actual_model, model_id) = match resolve_model(&state.llm, &model).await {
-        Ok(r) => r,
+    // Resolve model → 候选链（模型组故障转移）
+    let chain = match resolve_with_failover(&state.llm, &model).await {
+        Ok(c) => c,
         Err(e) => {
             // 记录路由失败到用量日志
             if let Some(ref db) = state.llm.db {
@@ -365,6 +365,12 @@ pub async fn handle_messages(
             return super::router::resolve_error_response(&state.llm, e).await;
         }
     };
+    // 首选候选：provider 级配置（compat 开关 / anthropic_base_url 直通判定）以首选为准——
+    // RAG/compat 改写在循环外只做一次，`execute_with_failover` 循环内仅 clone body + 改 model。
+    let first_candidate = chain.candidates[0].clone();
+    let provider = first_candidate.provider.clone();
+    let actual_model = first_candidate.model_name.clone();
+    let model_id = first_candidate.model_id.clone();
 
     let is_stream = body
         .get("stream")
@@ -389,78 +395,82 @@ pub async fn handle_messages(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
-    // ── 直通路径：provider 配置了 anthropic_base_url ──
+    // ── 直通路径：provider 配置了 anthropic_base_url，且为单候选时直接透传 ──
     if let Some(ref anthropic_url) = provider.anthropic_base_url {
-        // 替换 model 为实际上游名称
-        let mut body = body;
-        let log_model = actual_model.clone();
-        body["model"] = serde_json::Value::String(actual_model);
+        // 组链守卫：组链（>1 候选）跳过直通、走下方转换路径——直通（call_upstream_raw）
+        // 不做故障转移，组语义应优先保证可用性；首选候选的直通配置仅在单候选时生效。
+        if chain.candidates.len() == 1 {
+            // 替换 model 为实际上游名称
+            let mut body = body;
+            let log_model = actual_model.clone();
+            body["model"] = serde_json::Value::String(actual_model);
 
-        let message_count = body["messages"].as_array().map_or(0, Vec::len);
-        let has_tools = body.get("tools").is_some();
+            let message_count = body["messages"].as_array().map_or(0, Vec::len);
+            let has_tools = body.get("tools").is_some();
 
-        // 完整记录发往上游的原始请求体（替换 model 后），不做任何简化。
-        super::log_llm_request(
-            &state.llm,
-            "anthropic",
-            &log_model,
-            message_count,
-            has_tools,
-            is_stream,
-            None,
-            None,
-            0,
-            &body,
-        )
-        .await;
+            // 完整记录发往上游的原始请求体（替换 model 后），不做任何简化。
+            super::log_llm_request(
+                &state.llm,
+                "anthropic",
+                &log_model,
+                message_count,
+                has_tools,
+                is_stream,
+                None,
+                None,
+                0,
+                &body,
+            )
+            .await;
 
-        return match super::upstream::call_upstream_raw(
-            anthropic_url,
-            &provider.api_key,
-            "/v1/messages",
-            &body,
-            is_stream,
-        )
-        .await
-        {
-            Ok(resp) => {
-                let elapsed_ms = started.elapsed().as_millis();
-                super::log_llm_request(
-                    &state.llm,
-                    "anthropic",
-                    &log_model,
-                    message_count,
-                    has_tools,
-                    is_stream,
-                    Some(200),
-                    None,
-                    elapsed_ms,
-                    &body,
-                )
-                .await;
-                super::usage::wrap_and_record(resp, ctx, db, started).await
-            }
-            Err((status, msg)) => {
-                let elapsed_ms = started.elapsed().as_millis();
-                super::log_llm_request(
-                    &state.llm,
-                    "anthropic",
-                    &log_model,
-                    message_count,
-                    has_tools,
-                    is_stream,
-                    Some(status.as_u16()),
-                    Some(&msg),
-                    elapsed_ms,
-                    &body,
-                )
-                .await;
-                if let Some(ref db) = db {
-                    ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+            return match super::upstream::call_upstream_raw(
+                anthropic_url,
+                &provider.api_key,
+                "/v1/messages",
+                &body,
+                is_stream,
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    super::log_llm_request(
+                        &state.llm,
+                        "anthropic",
+                        &log_model,
+                        message_count,
+                        has_tools,
+                        is_stream,
+                        Some(200),
+                        None,
+                        elapsed_ms,
+                        &body,
+                    )
+                    .await;
+                    super::usage::wrap_and_record(resp, ctx, db, started).await
                 }
-                state.error_for_protocol(status, msg, "upstream_error")
-            }
-        };
+                Err((status, msg)) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    super::log_llm_request(
+                        &state.llm,
+                        "anthropic",
+                        &log_model,
+                        message_count,
+                        has_tools,
+                        is_stream,
+                        Some(status.as_u16()),
+                        Some(&msg),
+                        elapsed_ms,
+                        &body,
+                    )
+                    .await;
+                    if let Some(ref db) = db {
+                        ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+                    }
+                    state.error_for_protocol(status, msg, "upstream_error")
+                }
+            };
+        }
     }
 
     // ── 回退路径：转成 OpenAI 格式发到 base_url ──
@@ -529,15 +539,32 @@ pub async fn handle_messages(
         &req_body,
     )
     .await;
-    match super::upstream::call_upstream_with_body(&provider.base_url, &provider.api_key, &req_body)
-        .await
-    {
-        Ok(resp) => {
+    let outcome = super::upstream::execute_with_failover(
+        &state.llm.breakers,
+        &chain,
+        &req_body,
+        request.stream,
+    )
+    .await;
+    match outcome {
+        super::upstream::FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+        } => {
+            // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
+            if failed_over {
+                ctx.provider_id = Some(candidate.provider.id.clone());
+                ctx.provider_name = candidate.provider.name.clone();
+                ctx.model_id = Some(candidate.model_id.clone());
+                ctx.model_name = candidate.model_name.clone();
+                ctx.failover_from = Some(first_candidate.model_name.clone());
+            }
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,
                 "anthropic",
-                &request.model,
+                &ctx.model_name,
                 request.messages.len(),
                 request.tools.is_some(),
                 request.stream,
@@ -547,31 +574,33 @@ pub async fn handle_messages(
                 &req_body,
             )
             .await;
-            // 回退路径：上游是 OpenAI 格式，先采集 usage 再转成 Anthropic 格式。
-            // 非流式整体转换会消费 body，因此这里在转换后再包一层。
-            if !request.stream {
-                // compat 模式：先解析伪工具调用还原为结构化 tool_calls，
-                // 再转成 Anthropic 格式（Anthropic 的 tool_use 块）。
-                let resp = if compat_enabled {
-                    super::openai_handler::rewrite_pseudo_tool_calls_in_response(resp).await
-                } else {
-                    resp
-                };
-                let converted = convert_openai_to_anthropic_response(resp).await;
-                super::usage::wrap_and_record(converted, ctx, db, started).await
-            } else {
-                // compat 模式：流式路径同样先解析伪工具调用，
-                // 再转成 Anthropic SSE 事件流。
-                let resp = if compat_enabled {
+            // 回退路径：上游是 OpenAI 格式，先做 compat 后处理（伪工具调用还原），
+            // 再转成 Anthropic 格式。非流式整体转换会消费 body，因此转换后再包一层。
+            let resp = if compat_enabled {
+                if request.stream {
+                    // compat 模式：流式路径同样先解析伪工具调用，
+                    // 再转成 Anthropic SSE 事件流。
                     super::openai_handler::rewrite_pseudo_tool_calls_in_stream(resp).await
                 } else {
-                    resp
-                };
-                let converted = convert_openai_stream_to_anthropic(resp);
-                super::usage::wrap_and_record(converted, ctx, db, started).await
-            }
+                    // compat 模式：先解析伪工具调用还原为结构化 tool_calls，
+                    // 再转成 Anthropic 格式（Anthropic 的 tool_use 块）。
+                    super::openai_handler::rewrite_pseudo_tool_calls_in_response(resp).await
+                }
+            } else {
+                resp
+            };
+            let resp = if request.stream {
+                convert_openai_stream_to_anthropic(resp)
+            } else {
+                convert_openai_to_anthropic_response(resp).await
+            };
+            super::usage::wrap_and_record(resp, ctx, db, started).await
         }
-        Err((status, msg)) => {
+        super::upstream::FailoverOutcome::Exhausted {
+            status,
+            message: msg,
+            ..
+        } => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,
@@ -586,6 +615,7 @@ pub async fn handle_messages(
                 &req_body,
             )
             .await;
+            // 全部候选失败：记录失败请求到用量日志
             if let Some(ref db) = db {
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
             }
@@ -1213,6 +1243,119 @@ mod tests {
         assert_eq!(logs[0].status_code, 502);
         assert_eq!(logs[0].error_type.as_deref(), Some("upstream_error"));
         assert_eq!(logs[0].protocol, "anthropic");
+    }
+
+    /// 端到端（进程内）：组 [坏候选 500 → 好候选 200]，非流式请求应转移成功，
+    /// 且最终响应来自好候选；usage log 记录 failover_from = 首选坏候选、
+    /// model_name = 实际出账好候选。转换路径上游是 OpenAI 协议（chat.completion）。
+    #[tokio::test]
+    async fn test_convert_path_failover() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 坏候选：一律 500
+        let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = bad_listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let _ = s.read(&mut buf).await;
+                    let body = "{\"error\":\"boom\"}";
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        // 好候选：返回 OpenAI chat.completion 非流式 JSON（转换路径上游是 OpenAI 协议）
+        let good_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good_addr = good_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = good_listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let _ = s.read(&mut buf).await;
+                    let body = serde_json::json!({
+                        "id": "chatcmpl-1", "object": "chat.completion",
+                        "choices": [{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                        "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+                    }).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        // 两个 provider 各一个模型（无 anthropic_base_url → 走转换路径）
+        db.llm_save_provider(
+            "p-bad",
+            "Bad",
+            "deepseek",
+            &format!("http://{bad_addr}"),
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_provider(
+            "p-good",
+            "Good",
+            "deepseek",
+            &format!("http://{good_addr}"),
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model("m-bad", "p-bad", "bad-model", "", "[]", true)
+            .await
+            .unwrap();
+        db.llm_save_model("m-good", "p-good", "good-model", "", "[]", true)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m-bad".into(), 1), ("m-good".into(), 2)])
+            .await
+            .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "router", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 用量日志：failover_from = 首选坏候选，model_name = 实际出账好候选
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        let last = logs.first().expect("usage log");
+        assert_eq!(last.failover_from.as_deref(), Some("bad-model"));
+        assert_eq!(last.model_name, "good-model");
     }
 
     /// v2 端到端：Anthropic 请求 → compat 改写 → 上游（mock）→
