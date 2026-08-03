@@ -628,6 +628,11 @@ impl Database {
     }
 
     pub async fn llm_delete_model_group(&self, id: &str) -> Result<(), sqlx::Error> {
+        // 全仓未开 PRAGMA foreign_keys，删组不会级联删成员——先显式清空成员行避免孤儿数据
+        sqlx::query("DELETE FROM llm_model_group_members WHERE group_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM llm_model_groups WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -1195,6 +1200,29 @@ mod tests {
         assert_eq!(members2.len(), 1);
         assert_eq!(members2[0].model_id, "m2");
         assert_eq!(members2[0].priority, 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_group_cleans_members() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
+            .await
+            .unwrap();
+        db.llm_save_model("m1", "p1", "deepseek-chat", "", "[]", true)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1)])
+            .await
+            .unwrap();
+        assert_eq!(db.llm_group_member_count("g1").await.unwrap(), 1);
+
+        // 全仓未开 PRAGMA foreign_keys，删组须显式清空成员行（回归：孤儿成员数据）
+        db.llm_delete_model_group("g1").await.unwrap();
+        assert_eq!(db.llm_group_member_count("g1").await.unwrap(), 0);
     }
 
     #[tokio::test]

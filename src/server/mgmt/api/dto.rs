@@ -121,3 +121,68 @@ pub struct AddDnsRecordRequest {
     pub value: String,
     pub port: Option<u16>,
 }
+
+// ── LLM 模型组（多模型故障转移）──────────────────────────────────
+
+/// 模型组视图（列表用）。
+#[derive(Debug, Serialize)]
+pub struct ModelGroupView {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub member_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 创建/更新模型组请求。
+#[derive(Debug, Deserialize)]
+pub struct ModelGroupRequest {
+    pub name: String,
+    pub enabled: Option<bool>,
+}
+
+/// 组成员输入。
+#[derive(Debug, Deserialize)]
+pub struct GroupMemberInput {
+    pub model_id: String,
+    pub priority: i32,
+}
+
+/// 整体替换成员请求。
+#[derive(Debug, Deserialize)]
+pub struct ReplaceMembersRequest {
+    pub members: Vec<GroupMemberInput>,
+}
+
+/// 熔断快照视图。
+#[derive(Debug, Serialize)]
+pub struct BreakerSnapshotView {
+    pub state: String,
+    pub consecutive_failures: u32,
+    pub cooldown_remaining_secs: u64,
+}
+
+/// 组成员视图（详情用）。
+#[derive(Debug, Serialize)]
+pub struct GroupMemberView {
+    pub model_id: String,
+    pub priority: i32,
+    pub model_name: String,
+    pub alias: String,
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_enabled: bool,
+    pub breaker: BreakerSnapshotView,
+}
+
+/// 模型组详情视图。
+#[derive(Debug, Serialize)]
+pub struct ModelGroupDetailView {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub members: Vec<GroupMemberView>,
+}

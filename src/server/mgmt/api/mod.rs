@@ -341,6 +341,25 @@ pub async fn run_api_server(
         .route("/api/llm/usage/summary", get(llm::get_usage_summary))
         .route("/api/llm/usage/aggregate", get(llm::get_usage_aggregate))
         .route("/api/llm/usage/logs", get(llm::get_usage_logs))
+        // LLM model groups (multi-model failover)
+        .route(
+            "/api/llm/model-groups",
+            get(llm::list_model_groups).post(llm::create_model_group),
+        )
+        .route(
+            "/api/llm/model-groups/:id",
+            get(llm::get_model_group)
+                .put(llm::update_model_group)
+                .delete(llm::delete_model_group),
+        )
+        .route(
+            "/api/llm/model-groups/:id/members",
+            put(llm::replace_group_members),
+        )
+        .route(
+            "/api/llm/model-groups/:id/reset-breaker",
+            post(llm::reset_group_breaker),
+        )
         // RAG knowledge base management (SSE events endpoint is in public_routes — uses ?token= query param)
         .route("/api/llm/kb", get(rag::list_kbs).post(rag::create_kb))
         .route(

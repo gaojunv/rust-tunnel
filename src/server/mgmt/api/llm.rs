@@ -5,9 +5,14 @@ use axum::{
     Json,
 };
 
+use super::dto::{
+    BreakerSnapshotView, GroupMemberView, ModelGroupDetailView, ModelGroupRequest,
+    ModelGroupView, ReplaceMembersRequest,
+};
 use super::ApiState;
 use crate::server::llm::{
     auth::generate_api_key,
+    breaker::ModelBreakers,
     crypto::{decrypt_field, encrypt_field, LlmCipher},
     provider::{is_valid_provider_type, resolve_base_url, VALID_PROVIDER_TYPES},
     ApiKeyView, CreateApiKeyRequest, CreateApiKeyResponse, LlmGatewayConfig, ModelConfig,
@@ -800,6 +805,237 @@ pub async fn get_usage_logs(
         )
             .into_response(),
     }
+}
+
+// ── 模型组（多模型故障转移）───────────────────────────────────────
+
+/// 从 server_state 取 LlmState 的 breakers（组详情/重置用）。
+/// llm_state 未初始化（LLM 网关从未启用）时回落为空熔断器集合。
+async fn llm_breakers(state: &ApiState) -> ModelBreakers {
+    state
+        .server_state
+        .proxy_state
+        .llm_state
+        .read()
+        .await
+        .as_ref()
+        .map(|l| l.breakers.clone())
+        .unwrap_or_default()
+}
+
+/// GET /api/llm/model-groups
+pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let groups = match db.llm_list_model_groups().await {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    };
+    let mut views = Vec::with_capacity(groups.len());
+    for g in groups {
+        let member_count = db.llm_group_member_count(&g.id).await.unwrap_or(0);
+        views.push(ModelGroupView {
+            id: g.id,
+            name: g.name,
+            enabled: g.enabled != 0,
+            member_count,
+            created_at: g.created_at,
+            updated_at: g.updated_at,
+        });
+    }
+    Json(serde_json::json!({"groups": views})).into_response()
+}
+
+/// POST /api/llm/model-groups
+pub async fn create_model_group(
+    State(state): State<ApiState>,
+    Json(body): Json<ModelGroupRequest>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    if body.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    }
+    match db.llm_group_name_conflicts(&body.name, None).await {
+        Ok(true) => return (StatusCode::CONFLICT, "name conflicts with existing model/alias/group").into_response(),
+        Ok(false) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = db.llm_create_model_group(&id, &body.name, body.enabled.unwrap_or(true)).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({"status": "ok", "id": id}))).into_response()
+}
+
+/// GET /api/llm/model-groups/:id
+pub async fn get_model_group(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let group = match db.llm_get_model_group(&id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    };
+    let members = match db.llm_list_group_members(&id).await {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    };
+    let breakers = llm_breakers(&state).await;
+    // provider 名映射
+    let providers = db.llm_list_providers().await.unwrap_or_default();
+    let provider_name = |pid: &str| {
+        providers
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    };
+    let member_views: Vec<GroupMemberView> = members
+        .into_iter()
+        .map(|m| {
+            let snap = breakers.snapshot(&m.model_id);
+            GroupMemberView {
+                model_id: m.model_id,
+                priority: m.priority,
+                model_name: m.model_name,
+                alias: m.alias,
+                provider_id: m.provider_id.clone(),
+                provider_name: provider_name(&m.provider_id),
+                model_enabled: m.model_enabled != 0,
+                breaker: BreakerSnapshotView {
+                    state: format!("{:?}", snap.state).to_lowercase(),
+                    consecutive_failures: snap.consecutive_failures,
+                    cooldown_remaining_secs: snap.cooldown_remaining_secs,
+                },
+            }
+        })
+        .collect();
+    Json(ModelGroupDetailView {
+        id: group.id,
+        name: group.name,
+        enabled: group.enabled != 0,
+        created_at: group.created_at,
+        updated_at: group.updated_at,
+        members: member_views,
+    })
+    .into_response()
+}
+
+/// PUT /api/llm/model-groups/:id
+pub async fn update_model_group(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ModelGroupRequest>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    let group = match db.llm_get_model_group(&id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    };
+    if body.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    }
+    match db.llm_group_name_conflicts(&body.name, Some(&id)).await {
+        Ok(true) => return (StatusCode::CONFLICT, "name conflicts with existing model/alias/group").into_response(),
+        Ok(false) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    }
+    let enabled = body.enabled.unwrap_or(group.enabled != 0);
+    if let Err(e) = db.llm_update_model_group(&id, &body.name, enabled).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+    }
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// DELETE /api/llm/model-groups/:id
+pub async fn delete_model_group(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    match db.llm_get_model_group(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    }
+    if let Err(e) = db.llm_delete_model_group(&id).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+    }
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// PUT /api/llm/model-groups/:id/members（整体替换；priority 兜底重排为 1..N）
+pub async fn replace_group_members(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<ReplaceMembersRequest>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    match db.llm_get_model_group(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    }
+    // 校验 model_id 存在
+    let models = db.llm_list_models().await.unwrap_or_default();
+    for m in &body.members {
+        if !models.iter().any(|mo| mo.id == m.model_id) {
+            return (StatusCode::BAD_REQUEST, format!("model {} not found", m.model_id)).into_response();
+        }
+    }
+    // priority 兜底：按传入顺序重排为 1..N（前端传错也能自愈）
+    let normalized: Vec<(String, i32)> = body
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.model_id.clone(), (i + 1) as i32))
+        .collect();
+    if let Err(e) = db.llm_replace_group_members(&id, &normalized).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response();
+    }
+    Json(serde_json::json!({"status": "ok"})).into_response()
+}
+
+/// POST /api/llm/model-groups/:id/reset-breaker
+pub async fn reset_group_breaker(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let db = match state.server_state.db() {
+        Some(db) => db,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "no database").into_response(),
+    };
+    match db.llm_get_model_group(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "group not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {}", e)).into_response(),
+    }
+    let members = db.llm_list_group_members(&id).await.unwrap_or_default();
+    let ids: Vec<String> = members.into_iter().map(|m| m.model_id).collect();
+    let count = ids.len();
+    let breakers = llm_breakers(&state).await;
+    breakers.reset_many(&ids);
+    Json(serde_json::json!({"status": "ok", "reset": count})).into_response()
 }
 
 #[cfg(test)]
