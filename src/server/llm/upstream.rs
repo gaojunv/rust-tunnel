@@ -467,8 +467,7 @@ pub async fn execute_with_failover(
     req_body: &serde_json::Value,
     stream: bool,
 ) -> FailoverOutcome {
-    let first_model = chain.candidates.first().map(|c| c.model_name.clone());
-    let mut attempted_any = false;
+    let mut attempts = 0usize;
     let mut last_err: Option<(StatusCode, String)> = None;
 
     for cand in &chain.candidates {
@@ -480,7 +479,7 @@ pub async fn execute_with_failover(
             );
             continue;
         }
-        attempted_any = true;
+        attempts += 1;
 
         let mut body = req_body.clone();
         set_body_model(&mut body, &cand.model_name);
@@ -494,7 +493,12 @@ pub async fn execute_with_failover(
         match result {
             Ok(resp) => {
                 breakers.record_success(&cand.model_id);
-                let failed_over = first_model.as_deref() != Some(cand.model_name.as_str());
+                // 按 model_id 判定：组内允许"同 model_name 不同 provider/model_id"冗余候选，
+                // 真实 provider 转移必须计为 failed_over（usage 出账归因）。
+                let failed_over = chain
+                    .candidates
+                    .first()
+                    .is_some_and(|first| first.model_id != cand.model_id);
                 return FailoverOutcome::Success {
                     resp,
                     candidate: cand.clone(),
@@ -533,11 +537,12 @@ pub async fn execute_with_failover(
         Some((status, message)) => FailoverOutcome::Exhausted {
             status,
             message,
-            failed_over: true,
+            // 只有实际尝试过非首选候选才算转移（单元素链 retryable 失败不算）
+            failed_over: attempts > 1,
         },
         None => FailoverOutcome::Exhausted {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            message: if attempted_any {
+            message: if attempts > 0 {
                 "all candidates failed".to_string()
             } else {
                 "all_candidates_unavailable".to_string()
@@ -1387,6 +1392,28 @@ mod tests {
         let out = execute_with_failover(&breakers, &chain, &body, false).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
+    }
+
+    #[tokio::test]
+    async fn test_failover_all_candidates_circuit_open() {
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[
+            ("http://127.0.0.1:1", "m1", "id1"),
+            ("http://127.0.0.1:1", "m2", "id2"),
+        ]);
+        // 手动把两个候选打到熔断（5 连败）
+        for _ in 0..crate::server::llm::breaker::FAILURE_THRESHOLD {
+            breakers.record_failure("id1");
+            breakers.record_failure("id2");
+        }
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted { status, message, failed_over } = out else {
+            panic!("expected exhausted");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(message, "all_candidates_unavailable");
+        assert!(!failed_over);
     }
 
     #[tokio::test]
