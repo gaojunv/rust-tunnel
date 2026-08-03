@@ -1,0 +1,15 @@
+# 编译期内存控制：
+# - qdrant-edge 单 crate 编译峰值 ~3GB，本机常驻进程已占 ~5.5G/7.8G，
+#   可用 ~2.2G，nproc=10 全并行必然 OOM(SIGKILL)。
+# - jobs=2 保证任意时刻最多 2 个 crate 并行编译，qdrant-edge 即使与另一个
+#   中等 crate 同时编译也不超内存上限。机器内存充裕后可酌情调高。
+[build]
+jobs = 2
+
+# 使用 mold 链接器（比默认 GNU ld 快数倍，尤其链接 1G+ 测试二进制时）。
+# 需要系统已安装 mold（/usr/bin/mold）；gcc 通过 -fuse-ld=mold 调用。
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

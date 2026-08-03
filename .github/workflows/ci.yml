@@ -19,6 +19,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install mold linker
+        # .cargo/config.toml 通过 -fuse-ld=mold 指定 mold 链接器，加速 1G+ 测试二进制链接
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Cache cargo registry & target
         uses: actions/cache@v4
         with:
