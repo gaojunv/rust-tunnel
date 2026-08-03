@@ -1034,8 +1034,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_stream_guarded_crlf_first_event_releases() {
-        // mock：连接保持打开——先吐一个 \r\n\r\n 结尾的事件，sleep 200ms，再吐第二个事件和 [DONE]
-        // 断言：守卫在第一个事件后即返回（总耗时应显著小于 30s），且最终 body 含两个事件内容
+        // 严格回归：mock 在首个 CRLF 事件后保持连接打开 2s 再发 [DONE] 并关闭——
+        // 守卫若不能识别 \r\n\r\n，会傻等连接结束（>=2s，走"空流也放行"的 EOF 分支）
+        // 才返回，ttfb 断言失败；正确行为 = 首个 CRLF 事件到达即放行（<1s）。
+        // 修复前的宽松版（200ms 后关闭连接）会误走 EOF 分支通过，无法捕获 CRLF 回归。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1043,8 +1045,7 @@ mod tests {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut buf = vec![0u8; 8192];
             let _ = sock.read(&mut buf).await.unwrap();
-            // 先发响应头 + 第一个 CRLF 事件（Content-Length 不定，用 chunked 简化——
-            // 裸 HTTP/1.1 无 Content-Length + Connection: close 即可，靠连接结束标识 EOF）
+            // 裸 HTTP/1.1 无 Content-Length + Connection: close：靠连接结束标识 EOF
             let head =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
             sock.write_all(head.as_bytes()).await.unwrap();
@@ -1052,7 +1053,8 @@ mod tests {
                 .await
                 .unwrap();
             sock.flush().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // 关键：保持连接打开 2s，守卫应早已放行
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             sock.write_all(b"data: [DONE]\r\n\r\n").await.unwrap();
         });
 
@@ -1061,17 +1063,20 @@ mod tests {
         let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
             .await
             .unwrap();
+        let ttfb = started.elapsed();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ttfb < std::time::Duration::from_secs(1),
+            "首事件即放行，实际耗时 {:?}（CRLF 识别失效？）",
+            ttfb
+        );
+        // 剩余流续传不丢字节：前缀已含第一段，续传含 [DONE]
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("cr"));
         assert!(text.contains("[DONE]"));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "应首事件即放行，非等满超时"
-        );
     }
 
     #[tokio::test]
