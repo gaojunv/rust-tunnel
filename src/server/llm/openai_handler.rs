@@ -263,7 +263,9 @@ pub async fn handle_chat_completions(
         ctx.rag_chunks_injected = Some(rag_injected);
         // 改写回写：透传基底 raw_body["messages"] 必须用改写后的内容。
         if let Some(raw) = request.raw_body.as_mut() {
-            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+            if let Ok(v) = serde_json::to_value(&request.messages) {
+                raw["messages"] = v;
+            }
         }
     }
 
@@ -274,7 +276,9 @@ pub async fn handle_chat_completions(
         super::compat::inject_tool_call_guidance(&mut request.messages);
         // 改写回写：与 RAG 相同，保证上行的是改写后的 messages。
         if let Some(raw) = request.raw_body.as_mut() {
-            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+            if let Ok(v) = serde_json::to_value(&request.messages) {
+                raw["messages"] = v;
+            }
         }
     }
 

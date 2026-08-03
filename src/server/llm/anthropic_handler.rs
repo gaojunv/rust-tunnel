@@ -250,18 +250,20 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     // 由 build_upstream_body 透传；messages 在后续 RAG/compat 改写后回写。
     // 转换字段(max_tokens/temperature/top_p/tools/tool_choice)必须继续透传,
     // 否则透传模式下 build_upstream_body 不会补它们(它只覆盖 model/stream_options)。
+    // "model" 值会被 build_upstream_body 用 request.model(别名解析后)覆盖,此处仅为占位。
     let mut passthrough = serde_json::json!({
         "model": anthropic_model,
         "messages": all_messages.clone(),
         "stream": stream,
     });
-    if let Some(v) = body.get("max_tokens") {
+    // 显式 null 按旧重建路径语义忽略(as_u64/as_f64 对 null 取 None),避免 null 敏感上游。
+    if let Some(v) = body.get("max_tokens").filter(|v| !v.is_null()) {
         passthrough["max_tokens"] = v.clone();
     }
-    if let Some(v) = body.get("temperature") {
+    if let Some(v) = body.get("temperature").filter(|v| !v.is_null()) {
         passthrough["temperature"] = v.clone();
     }
-    if let Some(v) = body.get("top_p") {
+    if let Some(v) = body.get("top_p").filter(|v| !v.is_null()) {
         passthrough["top_p"] = v.clone();
     }
     if let Some(tools) = &tools {
@@ -270,7 +272,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     if let Some(choice) = &tool_choice {
         passthrough["tool_choice"] = choice.clone();
     }
-    if let Some(stops) = body.get("stop_sequences") {
+    if let Some(stops) = body.get("stop_sequences").filter(|v| !v.is_null()) {
         passthrough["stop"] = stops.clone();
     }
 
@@ -464,7 +466,9 @@ pub async fn handle_messages(
         ctx.rag_chunks_injected = Some(rag_injected);
         // 改写回写:raw_body 是透传基底,这里保证上行的是 RAG/compat 改写后的 messages。
         if let Some(raw) = request.raw_body.as_mut() {
-            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+            if let Ok(v) = serde_json::to_value(&request.messages) {
+                raw["messages"] = v;
+            }
         }
     }
 
@@ -474,7 +478,9 @@ pub async fn handle_messages(
         super::compat::inject_tool_call_guidance(&mut request.messages);
         // 改写回写:与 RAG 相同,保证上行的是改写后的 messages。
         if let Some(raw) = request.raw_body.as_mut() {
-            raw["messages"] = serde_json::to_value(&request.messages).unwrap_or_default();
+            if let Ok(v) = serde_json::to_value(&request.messages) {
+                raw["messages"] = v;
+            }
         }
     }
 

@@ -111,15 +111,22 @@ fn sanitize_error_message(body: &str) -> String {
 
 /// 构造发往上游的 OpenAI 请求体。
 ///
-/// 可选字段仅在有值时挂上，避免部分上游对 null 敏感。
-/// messages 直接用带 skip_serializing_if 的 ChatMessage 序列化，工具字段
-/// （tool_calls / tool_call_id / name）能一并透传。
+/// 两种模式：
+/// - 透传（`raw_body` 有值）：以原始请求体为基底，只覆盖网关必须改写的字段
+///   （model 别名 → 真实模型名、stream 恒为显式布尔、流式注入 stream_options.include_usage），
+///   其余参数原样上行。messages 保留客户端原样（含多模态 content 数组）。
+/// - 重建（`raw_body` 为 None，anthropic 转换路径）：从 request 逐字段拼回，
+///   可选字段仅在有值时挂上（避免部分上游对 null 敏感），
+///   messages 用带 skip_serializing_if 的 ChatMessage 序列化。
 ///
 /// 独立成公共函数是为了让调用方在发送前拿到完整请求体写日志
 /// （`log_llm_request` 记录的就是这个 body，与实际发送内容逐字节一致）。
 pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value {
     // 透传模式：以原始请求体为基底，定点覆盖网关必须改写的字段。
     if let Some(mut raw) = request.raw_body.clone() {
+        // raw_body 恒为对象：openai handler 先 400 校验 model/messages 后才构造请求，
+        // anthropic_to_openai 也构造对象 passthrough。
+        debug_assert!(raw.is_object(), "raw_body 应为 JSON 对象");
         raw["model"] = request.model.clone().into(); // 别名 → 真实模型名
         // stream 必须始终与网关决策一致：客户端省略 stream（或传非布尔值）时，
         // 也保证上游收到显式布尔值，避免透传模式下 stream 变成 null。
