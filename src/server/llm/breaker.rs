@@ -78,12 +78,30 @@ impl ModelBreakers {
         match entry.open {
             None => true,
             Some(open) => {
-                // 冷却未满或已有试探在飞 → 拒绝；冷却已满且无试探 → 抢下试探权放行
-                if open.opened_at.elapsed() >= open.cooldown && !entry.probe_in_flight {
+                let elapsed = open.opened_at.elapsed();
+                // 冷却未满 → 拒绝
+                if elapsed < open.cooldown {
+                    false
+                } else if entry.probe_in_flight {
+                    // 陈旧试探回收：试探请求被客户端断开时 record_* 不会执行，
+                    // probe_in_flight 可能永真（单模型场景永久 503）。
+                    // 超过冷却 + 上游读超时（300s）视为陈旧，允许重新夺取。
+                    if elapsed > open.cooldown + std::time::Duration::from_secs(300) {
+                        // 重新夺取：把 opened_at 重置到冷却刚满的锚点，开启新的试探窗口。
+                        // 否则陈旧窗口（opened_at 仍在过去）对后续请求恒成立，单飞失效，
+                        // 会同时放行多个并发试探冲击上游。
+                        if let Some(o) = entry.open.as_mut() {
+                            o.opened_at = std::time::Instant::now() - o.cooldown;
+                        }
+                        entry.probe_in_flight = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    // 冷却已满且无试探 → 抢下试探权放行
                     entry.probe_in_flight = true;
                     true
-                } else {
-                    false
                 }
             }
         }
@@ -209,6 +227,18 @@ impl ModelBreakers {
             entry.probe_in_flight = false;
         }
     }
+
+    /// 测试辅助：把 opened_at 拨到冷却 + 上游读超时（300s）之后，模拟"试探请求被
+    /// 客户端断开、record_* 未执行"导致的陈旧试探（probe_in_flight 保持原值）。
+    #[cfg(test)]
+    fn force_probe_stale_for_test(&self, model_id: &str) {
+        let mut map = self.inner.lock().expect("breaker mutex poisoned");
+        if let Some(entry) = map.get_mut(model_id) {
+            if let Some(open) = entry.open.as_mut() {
+                open.opened_at = Instant::now() - open.cooldown - Duration::from_secs(301);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +310,47 @@ mod tests {
         // 冷却翻倍（30→60），此时剩余应在 (30, 60] 之间
         assert!(snap.cooldown_remaining_secs > BASE_COOLDOWN_SECS);
         assert!(snap.cooldown_remaining_secs <= BASE_COOLDOWN_SECS * 2);
+    }
+
+    #[test]
+    fn stale_probe_is_reclaimed_after_timeout() {
+        let b = ModelBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            b.record_failure("m1");
+        }
+        b.force_cooldown_elapsed_for_test("m1");
+        assert!(b.allow("m1")); // 抢到试探权，probe_in_flight=true
+        assert!(!b.allow("m1")); // 单飞：并发请求被拒
+        // 不 record_* —— 模拟试探请求被客户端断开（record_success/failure 均不执行）
+        // 把 opened_at 拨到冷却 + 301s 之后（超过冷却 + 上游读超时 300s）→ 陈旧
+        b.force_probe_stale_for_test("m1");
+        assert!(b.allow("m1"), "陈旧试探应被回收，允许重新夺取");
+        // 回收后仍保持单飞（重新夺取的试探在飞）
+        assert!(!b.allow("m1"));
+        // 试探成功 → 正常恢复
+        b.record_success("m1");
+        assert_eq!(b.snapshot("m1").state, BreakerStateView::Closed);
+        assert!(b.allow("m1"));
+    }
+
+    #[test]
+    fn fresh_probe_not_reclaimed_during_window() {
+        // 试探在飞但未超过"冷却 + 300s"窗口：不允许重新夺取
+        let b = ModelBreakers::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            b.record_failure("m1");
+        }
+        b.force_cooldown_elapsed_for_test("m1");
+        assert!(b.allow("m1")); // 抢到试探
+        assert!(!b.allow("m1"));
+        // 只拨过冷却期一小段（未到 +300s 陈旧窗口）
+        {
+            let mut map = b.inner.lock().unwrap();
+            let entry = map.get_mut("m1").unwrap();
+            let open = entry.open.as_mut().unwrap();
+            open.opened_at = std::time::Instant::now() - open.cooldown - std::time::Duration::from_secs(1);
+        }
+        assert!(!b.allow("m1"), "窗口内的在飞试探不应被回收");
     }
 
     #[test]

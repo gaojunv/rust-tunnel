@@ -469,6 +469,7 @@ pub async fn execute_with_failover(
 ) -> FailoverOutcome {
     let mut attempts = 0usize;
     let mut last_err: Option<(StatusCode, String)> = None;
+    let mut last_attempted: Option<&str> = None; // 实际发起过上游调用的候选 model_id
 
     for cand in &chain.candidates {
         if !breakers.allow(&cand.model_id) {
@@ -480,11 +481,15 @@ pub async fn execute_with_failover(
             continue;
         }
         attempts += 1;
+        last_attempted = Some(cand.model_id.as_str());
 
         let mut body = req_body.clone();
         set_body_model(&mut body, &cand.model_name);
 
-        let result = if stream {
+        // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
+        // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
+        // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
+        let result = if stream && chain.candidates.len() > 1 {
             call_upstream_stream_guarded(&cand.provider.base_url, &cand.provider.api_key, &body).await
         } else {
             call_upstream_with_body(&cand.provider.base_url, &cand.provider.api_key, &body).await
@@ -527,7 +532,11 @@ pub async fn execute_with_failover(
                 return FailoverOutcome::Exhausted {
                     status,
                     message: msg,
-                    failed_over: false,
+                    // 与 Success 分支同源判定：实际尝试的最后一个候选非首选即转移
+                    // （如 A retryable 失败后 B 返回 4xx → last_attempted=B≠首选 → true）
+                    failed_over: last_attempted.is_some_and(|mid| {
+                        Some(mid) != chain.candidates.first().map(|c| c.model_id.as_str())
+                    }),
                 };
             }
         }
@@ -537,8 +546,12 @@ pub async fn execute_with_failover(
         Some((status, message)) => FailoverOutcome::Exhausted {
             status,
             message,
-            // 只有实际尝试过非首选候选才算转移（单元素链 retryable 失败不算）
-            failed_over: attempts > 1,
+            // 与 Success 分支同源判定：实际尝试的最后一个候选非首选即转移。
+            // 首选被熔断跳过（allow=false 不计 attempts）+ 备选失败也计转移，
+            // 避免 usage 把 model_name 记为从未尝试的首选、failover_from 归因错误。
+            failed_over: last_attempted.is_some_and(|mid| {
+                Some(mid) != chain.candidates.first().map(|c| c.model_id.as_str())
+            }),
         },
         None => FailoverOutcome::Exhausted {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1414,6 +1427,94 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(message, "all_candidates_unavailable");
         assert!(!failed_over);
+    }
+
+    #[tokio::test]
+    async fn test_failover_single_candidate_stream_no_guard() {
+        // 单元素链流式：不走首字节守卫（旧 relay 行为，响应头即放行）。
+        // mock 先发 200 响应头、sleep 2s 才发首个 SSE 事件——若仍走守卫，
+        // 会等待首事件 ≥2s 才返回；旧行为应 <1s 拿到 Response。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // 关键：2s 后才发首事件（守卫在此处才会放行，旧 relay 应立即放行）
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = sock
+                .write_all(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",
+                )
+                .await;
+        });
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&format!("http://{}", addr), "m1", "id1")]);
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let started = std::time::Instant::now();
+        let out = execute_with_failover(&breakers, &chain, &body, true).await;
+        let ttfb = started.elapsed();
+        let FailoverOutcome::Success { resp, failed_over, .. } = out else {
+            panic!("expected success");
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!failed_over);
+        assert!(
+            ttfb < std::time::Duration::from_secs(1),
+            "单元素链流式应响应头即放行，实际耗时 {:?}（仍走首字节守卫？）",
+            ttfb
+        );
+        // 剩余流透传完整（relay 直通，连接未截断）
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hi"));
+        assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_failover_preferred_broken_backup_fails_marks_transfer() {
+        // 首选熔断跳过（allow=false 不计 attempts）+ 备选被尝试且失败 → attempts==1。
+        // 修复前 failed_over 用 attempts>1 判定 → false（归因错误，model_name 记为首选）；
+        // 修复后按 last_attempted（备选）≠ 首选判定 → true。
+        let backup = start_behavior_upstream(|mut s| Box::pin(async move {
+            drain_request(&mut s).await;
+            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+        })).await;
+
+        let breakers = crate::server::llm::breaker::ModelBreakers::new();
+        // 手动机 5 连败把首选熔断
+        for _ in 0..crate::server::llm::breaker::FAILURE_THRESHOLD {
+            breakers.record_failure("id-broken");
+        }
+        let chain = test_chain(&[
+            ("http://127.0.0.1:1", "m-broken", "id-broken"),
+            (&backup, "m-backup", "id-backup"),
+        ]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+            panic!("expected exhausted");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            failed_over,
+            "首选熔断跳过+备选失败应记为转移（failed_over=true）"
+        );
+        // 首选从未被请求（熔断跳过），备选被请求一次
+        assert_eq!(
+            breakers.snapshot("id-broken").state,
+            crate::server::llm::breaker::BreakerStateView::Open
+        );
     }
 
     #[tokio::test]
