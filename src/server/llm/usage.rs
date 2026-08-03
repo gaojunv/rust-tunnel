@@ -243,6 +243,8 @@ impl UsageContext {
             latency_ms,
             error_type,
             rag_chunks_injected: self.rag_chunks_injected,
+            // 故障转移来源由路由层填充（后续任务接入），此处暂为 None。
+            failover_from: None,
         }
     }
 }

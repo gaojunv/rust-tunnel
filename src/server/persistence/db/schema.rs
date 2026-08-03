@@ -486,6 +486,35 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // LLM model groups (failover routing): 组聚合多个模型，按 priority 依次尝试
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_model_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // 组成员：一组多模型，priority 升序即故障转移尝试顺序
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS llm_model_group_members (
+                group_id TEXT NOT NULL REFERENCES llm_model_groups(id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL REFERENCES llm_models(id) ON DELETE CASCADE,
+                priority INTEGER NOT NULL,
+                PRIMARY KEY (group_id, model_id)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         // RAG knowledge bases
         sqlx::query(
             r#"
@@ -554,9 +583,10 @@ impl Database {
             .execute(pool)
             .await?;
 
-        // 幂等迁移：llm_api_keys 加 kb_id，llm_usage_logs 加 rag_chunks_injected
+        // 幂等迁移：llm_api_keys 加 kb_id，llm_usage_logs 加 rag_chunks_injected / failover_from
         Self::migrate_llm_api_keys_add_kb_id(pool).await?;
         Self::migrate_llm_usage_add_rag_chunks(pool).await?;
+        Self::migrate_llm_usage_add_failover_from(pool).await?;
         Self::migrate_rag_documents_add_file_type(pool).await?;
 
         Ok(())
@@ -684,6 +714,18 @@ impl Database {
     /// Migration: old DBs lack `rag_chunks_injected` on `llm_usage_logs`. Idempotent.
     async fn migrate_llm_usage_add_rag_chunks(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE llm_usage_logs ADD COLUMN rag_chunks_injected INTEGER")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Migration: old DBs lack `failover_from` on `llm_usage_logs`. Idempotent.
+    async fn migrate_llm_usage_add_failover_from(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_usage_logs ADD COLUMN failover_from TEXT")
             .execute(pool)
             .await
         {

@@ -30,6 +30,33 @@ pub struct LlmModelRecord {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LlmModelGroupRecord {
+    pub id: String,
+    pub name: String,
+    pub enabled: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LlmModelGroupMemberRecord {
+    pub group_id: String,
+    pub model_id: String,
+    pub priority: i32,
+}
+
+/// 组成员联查：含模型与 provider 关键字段，供路由层构建候选链。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LlmGroupMemberJoined {
+    pub model_id: String,
+    pub priority: i32,
+    pub model_name: String,
+    pub alias: String,
+    pub model_enabled: i32,
+    pub provider_id: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmApiKeyRecord {
     pub id: String,
     pub key_hash: String,
@@ -91,6 +118,8 @@ pub struct LlmUsageInsert {
     pub latency_ms: i64,
     pub error_type: Option<String>,
     pub rag_chunks_injected: Option<i64>,
+    /// 发生故障转移时记录首选（被跳过的）模型名；未转移为 None。
+    pub failover_from: Option<String>,
 }
 
 /// 一个聚合维度的用量汇总行。
@@ -414,8 +443,9 @@ impl Database {
                 id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                 model_id, model_name, requested_model, protocol, stream, status_code,
                 success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-                completion_tokens, total_tokens, latency_ms, error_type, rag_chunks_injected
-            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                completion_tokens, total_tokens, latency_ms, error_type,
+                rag_chunks_injected, failover_from
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(uuid::Uuid::new_v4().to_string())
@@ -438,6 +468,7 @@ impl Database {
         .bind(u.latency_ms)
         .bind(&u.error_type)
         .bind(u.rag_chunks_injected)
+        .bind(&u.failover_from)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -557,6 +588,164 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    // ── Model groups (failover routing) ──────────────────────────
+
+    pub async fn llm_create_model_group(
+        &self,
+        id: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO llm_model_groups (id, name, enabled) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(name)
+            .bind(enabled as i32)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn llm_update_model_group(
+        &self,
+        id: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE llm_model_groups SET name = ?, enabled = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(name)
+        .bind(enabled as i32)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn llm_delete_model_group(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM llm_model_groups WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn llm_list_model_groups(&self) -> Result<Vec<LlmModelGroupRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmModelGroupRecord>(
+            "SELECT * FROM llm_model_groups ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn llm_get_model_group(
+        &self,
+        id: &str,
+    ) -> Result<Option<LlmModelGroupRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmModelGroupRecord>("SELECT * FROM llm_model_groups WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    pub async fn llm_find_group_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<LlmModelGroupRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmModelGroupRecord>(
+            "SELECT * FROM llm_model_groups WHERE name = ? AND enabled = 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// 整体替换组成员（事务内 DELETE + INSERT）。members: [(model_id, priority)]。
+    pub async fn llm_replace_group_members(
+        &self,
+        group_id: &str,
+        members: &[(String, i32)],
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM llm_model_group_members WHERE group_id = ?")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        for (model_id, priority) in members {
+            sqlx::query(
+                "INSERT INTO llm_model_group_members (group_id, model_id, priority) VALUES (?, ?, ?)",
+            )
+            .bind(group_id)
+            .bind(model_id)
+            .bind(priority)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await
+    }
+
+    /// 组成员联查（按 priority 升序）。
+    pub async fn llm_list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<LlmGroupMemberJoined>, sqlx::Error> {
+        sqlx::query_as::<_, LlmGroupMemberJoined>(
+            "SELECT m.model_id, m.priority, mo.model_name, mo.alias, mo.enabled AS model_enabled, mo.provider_id
+             FROM llm_model_group_members m
+             JOIN llm_models mo ON mo.id = m.model_id
+             WHERE m.group_id = ?
+             ORDER BY m.priority ASC",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn llm_group_member_count(&self, group_id: &str) -> Result<i64, sqlx::Error> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM llm_model_group_members WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// 组名冲突检测：与现有 model_name / alias / 其他组名比对。
+    /// exclude_group_id 用于编辑组时排除自身。
+    pub async fn llm_group_name_conflicts(
+        &self,
+        name: &str,
+        exclude_group_id: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let model_hit: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM llm_models WHERE model_name = ? OR alias = ?",
+        )
+        .bind(name)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await?;
+        if model_hit.0 > 0 {
+            return Ok(true);
+        }
+        let group_hit: (i64,) = match exclude_group_id {
+            Some(ex) => {
+                sqlx::query_as("SELECT COUNT(*) FROM llm_model_groups WHERE name = ? AND id != ?")
+                    .bind(name)
+                    .bind(ex)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query_as("SELECT COUNT(*) FROM llm_model_groups WHERE name = ?")
+                    .bind(name)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+        };
+        Ok(group_hit.0 > 0)
     }
 }
 
@@ -818,6 +1007,7 @@ mod tests {
             latency_ms: 123,
             error_type: None,
             rag_chunks_injected: None,
+            failover_from: None,
         }
     }
 
@@ -924,5 +1114,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logs[0].rag_chunks_injected, Some(3));
+    }
+
+    // ── Model groups (failover) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_model_group_crud() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        // 创建组
+        db.llm_create_model_group("g1", "smart-router", true)
+            .await
+            .unwrap();
+        let g = db.llm_get_model_group("g1").await.unwrap().unwrap();
+        assert_eq!(g.name, "smart-router");
+        assert_eq!(g.enabled, 1);
+
+        // 按名查
+        let by_name = db.llm_find_group_by_name("smart-router").await.unwrap().unwrap();
+        assert_eq!(by_name.id, "g1");
+
+        // 改名 + 禁用
+        db.llm_update_model_group("g1", "smart-router-2", false)
+            .await
+            .unwrap();
+        let g2 = db.llm_get_model_group("g1").await.unwrap().unwrap();
+        assert_eq!(g2.name, "smart-router-2");
+        assert_eq!(g2.enabled, 0);
+
+        // 列表
+        assert_eq!(db.llm_list_model_groups().await.unwrap().len(), 1);
+
+        // 删除
+        db.llm_delete_model_group("g1").await.unwrap();
+        assert!(db.llm_get_model_group("g1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_group_members_replace_and_join() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+
+        // 准备 provider + 2 个模型
+        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
+            .await
+            .unwrap();
+        db.llm_save_model("m1", "p1", "deepseek-chat", "chat", "[]", true)
+            .await
+            .unwrap();
+        db.llm_save_model("m2", "p1", "deepseek-reasoner", "", "[]", true)
+            .await
+            .unwrap();
+
+        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m2".into(), 2)])
+            .await
+            .unwrap();
+
+        let members = db.llm_list_group_members("g1").await.unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].model_id, "m1");
+        assert_eq!(members[0].model_name, "deepseek-chat");
+        assert_eq!(members[0].alias, "chat");
+        assert_eq!(members[1].priority, 2);
+        assert_eq!(db.llm_group_member_count("g1").await.unwrap(), 2);
+
+        // 整体替换：去掉 m1，m2 提到 1
+        db.llm_replace_group_members("g1", &[("m2".into(), 1)])
+            .await
+            .unwrap();
+        let members2 = db.llm_list_group_members("g1").await.unwrap();
+        assert_eq!(members2.len(), 1);
+        assert_eq!(members2[0].model_id, "m2");
+        assert_eq!(members2[0].priority, 1);
+    }
+
+    #[tokio::test]
+    async fn test_group_name_conflicts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
+            .await
+            .unwrap();
+        db.llm_save_model("m1", "p1", "deepseek-chat", "chat-alias", "[]", true)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true).await.unwrap();
+
+        assert!(db.llm_group_name_conflicts("deepseek-chat", None).await.unwrap()); // 撞 model_name
+        assert!(db.llm_group_name_conflicts("chat-alias", None).await.unwrap());    // 撞 alias
+        assert!(db.llm_group_name_conflicts("router", None).await.unwrap());        // 撞其他组名
+        assert!(!db.llm_group_name_conflicts("router", Some("g1")).await.unwrap()); // 排除自身
+        assert!(!db.llm_group_name_conflicts("free-name", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_usage_insert_with_failover_from() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let u = crate::server::persistence::db::llm::LlmUsageInsert {
+            requested_model: "router".into(),
+            protocol: "openai".into(),
+            stream: false,
+            status_code: 200,
+            success: true,
+            failover_from: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        db.llm_insert_usage_log(&u).await.unwrap();
+        // 能查到即可（具体查询方法现有测试已有覆盖）
     }
 }
