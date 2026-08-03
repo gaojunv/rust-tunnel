@@ -1,5 +1,6 @@
 pub mod anthropic_handler;
 pub mod auth;
+pub mod breaker;
 pub mod compat;
 pub mod crypto;
 pub mod format;
@@ -296,6 +297,8 @@ pub struct LlmState {
     pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
     /// 动态配置引用（LLM 请求日志开关等）。默认开启，生产路径由 init_llm_state 注入真实实例。
     pub dynamic_config: Arc<RwLock<crate::server::dynamic_config::DynamicConfig>>,
+    /// 按模型粒度的熔断器（故障转移时跳过持续失败的候选）。
+    pub breakers: breaker::ModelBreakers,
 }
 
 impl LlmState {
@@ -323,6 +326,7 @@ impl LlmState {
             dynamic_config: Arc::new(RwLock::new(
                 crate::server::dynamic_config::DynamicConfig::default_for_llm(),
             )),
+            breakers: breaker::ModelBreakers::new(),
         }
     }
 }
