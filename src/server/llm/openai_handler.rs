@@ -365,7 +365,7 @@ pub async fn handle_chat_completions(
         super::upstream::FailoverOutcome::Exhausted {
             status,
             message: msg,
-            ..
+            failed_over,
         } => {
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
@@ -383,6 +383,10 @@ pub async fn handle_chat_completions(
             .await;
             // 记录失败请求到用量日志，确保请求明细中可见
             if let Some(ref db) = db {
+                // 全部候选失败但实际尝试过转移：failover_from 记首选（被跳过的）模型名
+                if failed_over {
+                    ctx.failover_from = Some(first_candidate.model_name.clone());
+                }
                 ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
             }
             state.error_for_protocol(status, msg, "upstream_error")
