@@ -375,6 +375,9 @@ pub async fn call_upstream_stream_guarded(
         ));
     }
 
+    /// 首事件缓冲上限：SSE 首事件通常 <64KB；超限视为非 SSE/恶意流，走转移。
+    const MAX_PREFIX_BYTES: usize = 4 * 1024 * 1024;
+
     // 缓冲到第一个 SSE data 事件（含跨 chunk 到达的情况），30s 首字节超时。
     let mut stream = resp.bytes_stream();
     let mut prefix: Vec<u8> = Vec::new();
@@ -388,8 +391,16 @@ pub async fn call_upstream_stream_guarded(
                 )
             })?;
             prefix.extend_from_slice(&chunk);
-            // 任意一个完整 SSE 事件（\n\n 或 \r\n\r\n 结尾）出现即放行
-            if prefix.windows(2).any(|w| w == b"\n\n") {
+            if prefix.len() > MAX_PREFIX_BYTES {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream prefix exceeded limit (not an SSE stream?)".to_string(),
+                ));
+            }
+            // 上游 SSE 事件结尾：\n\n（OpenAI 标准）或 \r\n\r\n（CRLF 风格）
+            if prefix.windows(4).any(|w| w == b"\r\n\r\n")
+                || prefix.windows(2).any(|w| w == b"\n\n")
+            {
                 return Ok(());
             }
         }
@@ -1019,5 +1030,76 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(is_retryable(err.0, true));
+    }
+
+    #[tokio::test]
+    async fn test_stream_guarded_crlf_first_event_releases() {
+        // mock：连接保持打开——先吐一个 \r\n\r\n 结尾的事件，sleep 200ms，再吐第二个事件和 [DONE]
+        // 断言：守卫在第一个事件后即返回（总耗时应显著小于 30s），且最终 body 含两个事件内容
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            // 先发响应头 + 第一个 CRLF 事件（Content-Length 不定，用 chunked 简化——
+            // 裸 HTTP/1.1 无 Content-Length + Connection: close 即可，靠连接结束标识 EOF）
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"cr\"}}]}\r\n\r\n")
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            sock.write_all(b"data: [DONE]\r\n\r\n").await.unwrap();
+        });
+
+        let req_body = serde_json::json!({"model": "m", "stream": true});
+        let started = std::time::Instant::now();
+        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("cr"));
+        assert!(text.contains("[DONE]"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "应首事件即放行，非等满超时"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_guarded_prefix_overflow() {
+        // mock：200 后持续吐无事件分隔符的字节（每次 1MB 纯文本行，无 \n\n）
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..8 {
+                if sock.write_all(&chunk).await.is_err() {
+                    break; // 客户端已断开（守卫返回 Err 后 drop）
+                }
+            }
+        });
+
+        let req_body = serde_json::json!({"model": "m", "stream": true});
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("prefix") || err.1.contains("limit"));
     }
 }
