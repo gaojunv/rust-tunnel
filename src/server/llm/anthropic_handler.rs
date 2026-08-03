@@ -1303,7 +1303,7 @@ mod tests {
             .find(|m| {
                 m["content"]
                     .as_str()
-                    .map_or(false, |c| c.contains("<tool_result"))
+                    .is_some_and(|c| c.contains("<tool_result"))
             })
             .unwrap();
         assert!(

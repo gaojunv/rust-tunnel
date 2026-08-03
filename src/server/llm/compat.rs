@@ -973,7 +973,7 @@ mod tests {
     fn scanner_legacy_invalid_utf8_safe_consumed() {
         // 输入："[调用工具 Bash] " + 30 个中文字符（每个 3 字节）。
         // 旧代码中 rest.len().min(64) 会落在多字节字符中间，导致 buf[..consumed] panic。
-        let garbage: String = std::iter::repeat("文").take(30).collect();
+        let garbage = "文".repeat(30);
         let input = format!("[调用工具 Bash] {}", garbage);
         let mut s = TagScanner::new();
         let events = s.push(&input);
