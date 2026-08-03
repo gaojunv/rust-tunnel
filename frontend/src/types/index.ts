@@ -388,11 +388,50 @@ export interface LlmUsageLog {
   total_tokens: number;
   latency_ms: number;
   error_type: string | null;
+  /** 本请求从哪个模型故障转移而来（未转移为 null）。 */
+  failover_from?: string | null;
 }
 
 export interface LlmUsageLogsResponse {
   logs: LlmUsageLog[];
   total: number;
+}
+
+// === LLM 模型组（多模型故障转移） ===
+
+export interface LlmModelGroup {
+  id: string;
+  name: string;
+  enabled: boolean;
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BreakerSnapshot {
+  state: string; // "closed" | "open" | "halfopenprobe"
+  consecutive_failures: number;
+  cooldown_remaining_secs: number;
+}
+
+export interface LlmGroupMember {
+  model_id: string;
+  priority: number;
+  model_name: string;
+  alias: string;
+  provider_id: string;
+  provider_name: string;
+  model_enabled: boolean;
+  breaker: BreakerSnapshot;
+}
+
+export interface LlmModelGroupDetail {
+  id: string;
+  name: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  members: LlmGroupMember[];
 }
 
 // === LLM RAG Knowledge Base ===

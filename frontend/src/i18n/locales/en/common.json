@@ -21,7 +21,9 @@
     "no": "No",
     "optional": "(optional)",
     "noData": "No data available",
-    "close": "Close"
+    "close": "Close",
+    "add": "Add",
+    "disabled": "Disabled"
   },
   "timeRange": {
     "custom": "Custom"
@@ -533,7 +535,8 @@
       "usage": "Usage",
       "gateway": "Gateway",
       "providers": "Providers & Models",
-      "apiKeys": "API Keys"
+      "apiKeys": "API Keys",
+      "groups": "Groups"
     },
     "providers": "Providers",
     "addProvider": "Add Provider",
@@ -587,6 +590,20 @@
       "kbDeleted": "Deleted",
       "bindError": "Bind failed: {{error}}"
     },
+    "groups": {
+      "add": "New Model Group",
+      "edit": "Edit Model Group",
+      "empty": "No model groups yet. Create one to enable multi-model failover.",
+      "name": "Group name",
+      "members": "Member models (ordered by priority)",
+      "memberCount": "{{count}} models",
+      "pickModel": "Pick a model...",
+      "resetBreaker": "Reset Breaker",
+      "breaker": {
+        "closed": "Closed",
+        "open": "Open {{secs}}s"
+      }
+    },
     "usage": {
       "stats": {
         "totalRequests": "Total Requests",
@@ -597,6 +614,9 @@
         "successDesc": "{{success}}/{{total}}",
         "cacheDesc": "Hit {{tokens}} tokens"
       },
+      "failover": "Failover",
+      "failoverRate": "Failover Rate",
+      "failoverRateDesc": "{{count}}/{{total}} entries",
       "groupBy": {
         "label": "Group by",
         "item": "By {{label}}",

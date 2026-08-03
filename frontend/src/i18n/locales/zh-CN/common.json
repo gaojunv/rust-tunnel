@@ -21,7 +21,9 @@
     "no": "否",
     "optional": "（可选）",
     "noData": "暂无数据",
-    "close": "关闭"
+    "close": "关闭",
+    "add": "添加",
+    "disabled": "已禁用"
   },
   "timeRange": {
     "custom": "自定义"
@@ -533,7 +535,8 @@
       "usage": "用量",
       "gateway": "网关",
       "providers": "供应商与模型",
-      "apiKeys": "API 密钥"
+      "apiKeys": "API 密钥",
+      "groups": "模型组"
     },
     "providers": "供应商",
     "addProvider": "添加供应商",
@@ -587,6 +590,20 @@
       "kbDeleted": "已删除",
       "bindError": "绑定失败：{{error}}"
     },
+    "groups": {
+      "add": "新建模型组",
+      "edit": "编辑模型组",
+      "empty": "还没有模型组。创建一个以启用多模型故障转移。",
+      "name": "组名",
+      "members": "成员模型（按优先级排列）",
+      "memberCount": "{{count}} 个模型",
+      "pickModel": "选择模型...",
+      "resetBreaker": "重置熔断",
+      "breaker": {
+        "closed": "正常",
+        "open": "熔断中 {{secs}}s"
+      }
+    },
     "usage": {
       "stats": {
         "totalRequests": "总请求数",
@@ -597,6 +614,9 @@
         "successDesc": "{{success}}/{{total}}",
         "cacheDesc": "命中 {{tokens}} tokens"
       },
+      "failover": "转移",
+      "failoverRate": "转移率",
+      "failoverRateDesc": "{{count}}/{{total}} 条",
       "groupBy": {
         "label": "分组方式",
         "item": "按{{label}}",

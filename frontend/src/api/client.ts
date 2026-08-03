@@ -40,6 +40,8 @@ import type {
   CreateLlmKbRequest,
   UpdateLlmKbRequest,
   TestEmbeddingResult,
+  LlmModelGroup,
+  LlmModelGroupDetail,
 } from '../types';
 
 const API_BASE = '/api';
@@ -481,6 +483,49 @@ export async function testEmbedding(req: {
 
 export async function queryKb(kbId: string, text: string): Promise<KbQueryResult> {
   const { data } = await api.post(`/llm/kb/${encodeURIComponent(kbId)}/query`, { text });
+  return data;
+}
+
+// ── LLM 模型组（多模型故障转移） ──────────────────────────────────
+
+export async function listLlmModelGroups(): Promise<LlmModelGroup[]> {
+  const { data } = await api.get('/llm/model-groups');
+  return data.groups;
+}
+
+export async function createLlmModelGroup(req: {
+  name: string;
+  enabled?: boolean;
+}): Promise<{ id: string }> {
+  const { data } = await api.post('/llm/model-groups', req);
+  return data;
+}
+
+export async function getLlmModelGroup(id: string): Promise<LlmModelGroupDetail> {
+  const { data } = await api.get(`/llm/model-groups/${id}`);
+  return data;
+}
+
+export async function updateLlmModelGroup(
+  id: string,
+  req: { name: string; enabled?: boolean },
+): Promise<void> {
+  await api.put(`/llm/model-groups/${id}`, req);
+}
+
+export async function deleteLlmModelGroup(id: string): Promise<void> {
+  await api.delete(`/llm/model-groups/${id}`);
+}
+
+export async function replaceGroupMembers(
+  id: string,
+  members: { model_id: string; priority: number }[],
+): Promise<void> {
+  await api.put(`/llm/model-groups/${id}/members`, { members });
+}
+
+export async function resetGroupBreaker(id: string): Promise<{ reset: number }> {
+  const { data } = await api.post(`/llm/model-groups/${id}/reset-breaker`, {});
   return data;
 }
 

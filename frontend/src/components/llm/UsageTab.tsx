@@ -17,12 +17,13 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import { StatCard } from '@/components/shared/StatCard';
 import { TimeRangeSelector } from '@/components/shared/TimeRangeSelector';
 import { useTimeRange } from '@/hooks/useTimeRange';
 import { useLlmUsageSummary, useLlmUsageAggregate, useLlmUsageLogs } from '@/api/hooks';
 import type { UsageGroupBy } from '@/types';
-import { Activity, Coins, CheckCircle2, Database, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Activity, Coins, CheckCircle2, Database, GitCompareArrows, ChevronLeft, ChevronRight } from 'lucide-react';
 
 const GROUP_BY_LABEL_KEYS = {
   api_key: 'llm.usage.groupBy.api_key',
@@ -74,6 +75,13 @@ export default function UsageTab() {
   const successRate = summary ? pct(summary.success, summary.requests) : '—';
   const cacheRate = summary ? pct(summary.cache_hit_tokens, summary.prompt_tokens) : '—';
 
+  // 转移率：当前页日志中 failover_from 非空的比例（前端计算）
+  const failoverRate = useMemo(() => {
+    const pageLogs = logsData?.logs ?? [];
+    if (pageLogs.length === 0) return 0;
+    return pageLogs.filter((l) => l.failover_from).length / pageLogs.length;
+  }, [logsData]);
+
   return (
     <div className="space-y-6">
       {/* 时间范围 */}
@@ -89,7 +97,7 @@ export default function UsageTab() {
       </div>
 
       {/* Stat Cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
         <StatCard
           title={t('llm.usage.stats.totalRequests')}
           value={summary ? fmt(summary.requests) : '—'}
@@ -116,6 +124,12 @@ export default function UsageTab() {
           value={cacheRate}
           description={summary ? t('llm.usage.stats.cacheDesc', { tokens: fmt(summary.cache_hit_tokens) }) : undefined}
           icon={<Database className="h-4 w-4" />}
+        />
+        <StatCard
+          title={t('llm.usage.failoverRate')}
+          value={`${(failoverRate * 100).toFixed(1)}%`}
+          description={t('llm.usage.failoverRateDesc', { count: logs.filter((l) => l.failover_from).length, total: logs.length })}
+          icon={<GitCompareArrows className="h-4 w-4" />}
         />
       </div>
 
@@ -208,6 +222,7 @@ export default function UsageTab() {
                 <TableHead>{t('llm.usage.detail.apiKey')}</TableHead>
                 <TableHead>{t('llm.usage.detail.provider')}</TableHead>
                 <TableHead>{t('llm.usage.detail.model')}</TableHead>
+                <TableHead>{t('llm.usage.failover')}</TableHead>
                 <TableHead>{t('llm.usage.detail.protocol')}</TableHead>
                 <TableHead className="text-right">{t('llm.usage.detail.io')}</TableHead>
                 <TableHead className="text-right">{t('llm.usage.detail.status')}</TableHead>
@@ -217,13 +232,13 @@ export default function UsageTab() {
             <TableBody>
               {logsLoading ? (
                 <TableRow>
-                  <TableCell colSpan={8} className="text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="text-center text-muted-foreground">
                     {t('llm.usage.loading')}
                   </TableCell>
                 </TableRow>
               ) : logs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={8} className="text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="text-center text-muted-foreground">
                     {t('llm.usage.detail.empty')}
                   </TableCell>
                 </TableRow>
@@ -237,6 +252,15 @@ export default function UsageTab() {
                     <TableCell>{l.provider_name || '—'}</TableCell>
                     <TableCell className="font-mono text-xs">
                       {l.model_name || l.requested_model}
+                    </TableCell>
+                    <TableCell>
+                      {l.failover_from ? (
+                        <Badge variant="outline" title={l.failover_from}>
+                          {l.failover_from} → {l.model_name || l.requested_model}
+                        </Badge>
+                      ) : (
+                        <span className="text-muted-foreground">-</span>
+                      )}
                     </TableCell>
                     <TableCell>
                       {l.protocol}

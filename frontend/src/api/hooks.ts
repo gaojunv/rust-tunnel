@@ -48,6 +48,14 @@ import {
   getLlmUsageSummary,
   getLlmUsageAggregate,
   getLlmUsageLogs,
+  listAllLlmModels,
+  listLlmModelGroups,
+  createLlmModelGroup,
+  getLlmModelGroup,
+  updateLlmModelGroup,
+  deleteLlmModelGroup,
+  replaceGroupMembers,
+  resetGroupBreaker,
   listLlmKbs,
   getLlmKb,
   createLlmKb,
@@ -472,6 +480,11 @@ export function useProviderModels(providerId: string) {
   });
 }
 
+/** 全部模型（GET /api/llm/models），用于模型组选模型。 */
+export function useLlmAllModels() {
+  return useQuery({ queryKey: ['llm-models', 'all'], queryFn: () => listAllLlmModels() });
+}
+
 export function useAddModel() {
   const qc = useQueryClient();
   return useMutation({
@@ -531,6 +544,63 @@ export function useDeleteLlmApiKey() {
   return useMutation({
     mutationFn: (id: string) => deleteLlmApiKey(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-api-keys'] }),
+  });
+}
+
+// ── 模型组（多模型故障转移） ──────────────────────────────────
+
+export function useLlmModelGroups() {
+  return useQuery({ queryKey: ['llm-model-groups'], queryFn: () => listLlmModelGroups() });
+}
+
+export function useLlmModelGroup(id: string | undefined) {
+  return useQuery({
+    queryKey: ['llm-model-groups', id],
+    queryFn: () => getLlmModelGroup(id!),
+    enabled: !!id,
+    refetchInterval: 5000, // 熔断状态轮询刷新
+  });
+}
+
+export function useCreateLlmModelGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: { name: string; enabled?: boolean }) => createLlmModelGroup(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
+  });
+}
+
+export function useUpdateLlmModelGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string; name: string; enabled?: boolean }) =>
+      updateLlmModelGroup(id, req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
+  });
+}
+
+export function useDeleteLlmModelGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteLlmModelGroup(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
+  });
+}
+
+export function useReplaceGroupMembers() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, members }: { id: string; members: { model_id: string; priority: number }[] }) =>
+      replaceGroupMembers(id, members),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
+  });
+}
+
+export function useResetGroupBreaker() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => resetGroupBreaker(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-model-groups'] }),
   });
 }
 

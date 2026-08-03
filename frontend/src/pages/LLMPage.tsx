@@ -7,6 +7,7 @@ import ProviderCard from '@/components/llm/ProviderCard';
 import ProviderDialog from '@/components/llm/ProviderDialog';
 import ApiKeyTable from '@/components/llm/ApiKeyTable';
 import UsageTab from '@/components/llm/UsageTab';
+import { GroupsTab } from '@/components/llm/groups/GroupsTab';
 import { useLlmProviders } from '@/api/hooks';
 import { Button } from '@/components/ui/button';
 import { Plus } from 'lucide-react';
@@ -26,6 +27,7 @@ export default function LLMPage() {
           <TabsTrigger value="gateway">{t('llm.tabs.gateway')}</TabsTrigger>
           <TabsTrigger value="providers">{t('llm.tabs.providers')}</TabsTrigger>
           <TabsTrigger value="api-keys">{t('llm.tabs.apiKeys')}</TabsTrigger>
+          <TabsTrigger value="groups">{t('llm.tabs.groups')}</TabsTrigger>
         </TabsList>
         <TabsContent value="usage" className="mt-4"><UsageTab /></TabsContent>
         <TabsContent value="gateway" className="mt-4"><GatewayTab /></TabsContent>
@@ -44,6 +46,9 @@ export default function LLMPage() {
           <ProviderDialog open={providerDialogOpen} onClose={() => setProviderDialogOpen(false)} providerId={editingProvider} />
         </TabsContent>
         <TabsContent value="api-keys" className="mt-4"><ApiKeyTable /></TabsContent>
+        <TabsContent value="groups" className="mt-4">
+          <GroupsTab />
+        </TabsContent>
       </Tabs>
     </div>
   );
