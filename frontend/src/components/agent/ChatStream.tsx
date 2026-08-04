@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
-import { Loader2, Wrench } from 'lucide-react';
-import { agentWsUrl, listAgentMessages } from '../../api/client';
+import { Loader2, SendHorizontal, Wrench } from 'lucide-react';
+import { agentWsUrl, listAgentMessages, updateAgentSessionModel } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
+import Markdown from './Markdown';
+import ModelSelect from './ModelSelect';
 
 interface ChatItem {
   kind: 'user' | 'assistant' | 'tool';
@@ -14,7 +16,15 @@ interface ChatItem {
   toolResult?: string;
 }
 
-export default function ChatStream({ sessionId }: { sessionId: string }) {
+const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
+
+interface Props {
+  sessionId: string;
+  model: string;
+  onModelChange: (id: string) => void;
+}
+
+export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [items, setItems] = useState<ChatItem[]>([]);
@@ -25,6 +35,11 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
+  // 在飞工具调用（按 id 追踪），running 解除需其清空
+  const pendingToolsRef = useRef<Set<string>>(new Set());
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // running 的 ref 镜像：WS onmessage 闭包内避免读旧 state
+  const runningRef = useRef(false);
 
   // 历史消息（与 SidebarTabs 共享 queryKey，invalidate 后 Git 面板自动刷新）
   const { data: history } = useQuery({
@@ -53,9 +68,37 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
     setItems(loaded);
   }, [history]);
 
+  const clearRunningTimeout = useCallback(() => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }, []);
+
+  const stopRunning = useCallback(() => {
+    runningRef.current = false;
+    setRunning(false);
+    clearRunningTimeout();
+    pendingToolsRef.current.clear();
+  }, [clearRunningTimeout]);
+
+  const armRunning = useCallback(() => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setRunning(true);
+    clearRunningTimeout();
+    // 10 分钟超时兜底：到点未终态则强制解除
+    timeoutRef.current = globalThis.setTimeout(() => {
+      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+      stopRunning();
+    }, RUNNING_TIMEOUT_MS);
+  }, [clearRunningTimeout, stopRunning, t]);
+
   // WebSocket
   useEffect(() => {
     const ws = new WebSocket(agentWsUrl(sessionId));
+    // ref 在组件生命周期内恒定，复制到局部变量供 handler/cleanup 使用（exhaustive-deps）
+    const pendingTools = pendingToolsRef.current;
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       let msg: AgentWsEvent;
@@ -67,8 +110,12 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
       if (msg.type === 'assistant_chunk' && msg.content) {
         setItems((prev) => [...prev, { kind: 'assistant', content: msg.content! }]);
       } else if (msg.type === 'tool_call') {
+        if (msg.id) pendingTools.add(msg.id);
+        // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）
+        armRunning();
         setItems((prev) => [...prev, { kind: 'tool', content: '', toolName: msg.name, toolArgs: msg.args }]);
       } else if (msg.type === 'tool_result') {
+        if (msg.id) pendingTools.delete(msg.id);
         setItems((prev) => {
           const next = [...prev];
           for (let i = next.length - 1; i >= 0; i--) {
@@ -80,25 +127,31 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
           return next;
         });
       } else if (msg.type === 'done') {
-        setRunning(false);
-        // 刷新共享的历史缓存，让 SidebarTabs（Git tab）拿到最新 tool 结果
-        void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
+        // 严格终态：工具全部回齐才解除 Running（防御乱序帧）
+        if (pendingTools.size === 0) {
+          stopRunning();
+          // 刷新共享的历史缓存，让 SidebarTabs（Git tab）拿到最新 tool 结果
+          void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
+        }
       } else if (msg.type === 'error') {
         setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
-        setRunning(false);
+        stopRunning();
       }
     };
-    ws.onclose = () => setRunning(false);
-    ws.onerror = () => setRunning(false);
+    ws.onclose = () => stopRunning();
+    ws.onerror = () => stopRunning();
     return () => {
       ws.onclose = null;
       ws.onerror = null;
       ws.close();
+      clearRunningTimeout();
+      pendingTools.clear();
     };
-  }, [sessionId, queryClient]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // jsdom 未实现 scrollIntoView，?.() 保证测试环境不抛错
+    bottomRef.current?.scrollIntoView?.({ behavior: 'smooth' });
   }, [items]);
 
   const send = () => {
@@ -119,16 +172,21 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
     }
     setItems((prev) => [...prev, { kind: 'user', content: text }]);
     setInput('');
-    setRunning(true);
+    armRunning();
+  };
+
+  const handleModelChange = (id: string) => {
+    onModelChange(id);
+    void updateAgentSessionModel(sessionId, id).catch(() => {
+      /* 失败回滚由 AgentPage invalidate 处理，此处静默 */
+    });
   };
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex-1 space-y-3 overflow-y-auto p-4">
         {items.length === 0 && !running && (
-          <p className="text-center text-sm text-muted-foreground">
-            {t('agent.chatEmptyHint')}
-          </p>
+          <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
         {items.map((it, i) => (
           <div
@@ -161,6 +219,8 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
                   </div>
                 )}
               </div>
+            ) : it.kind === 'assistant' ? (
+              <Markdown content={it.content} />
             ) : (
               <div className="whitespace-pre-wrap">{it.content}</div>
             )}
@@ -174,8 +234,10 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* 一体化输入框：模型选择(左下) + 发送图标(右下) 内嵌 */}
       <div className="border-t p-2">
-        <div className="flex gap-2">
+        <div className="rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -186,12 +248,26 @@ export default function ChatStream({ sessionId }: { sessionId: string }) {
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
-            className="flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm"
+            className="w-full resize-none rounded-t-xl border-0 bg-transparent px-3 pt-2 text-sm focus:outline-none"
             rows={2}
           />
-          <Button onClick={send} disabled={running} className="self-end">
-            {t('agent.send')}
-          </Button>
+          <div className="flex items-center justify-between px-2 pb-1.5">
+            <ModelSelect value={model} onChange={handleModelChange} disabled={running} />
+            <Button
+              onClick={send}
+              disabled={running || !input.trim()}
+              size="sm"
+              variant="ghost"
+              aria-label={t('agent.send')}
+              className="h-8 w-8 rounded-full p-0"
+            >
+              {running ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <SendHorizontal className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
