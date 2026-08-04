@@ -66,6 +66,9 @@ pub struct ClientEntry {
     /// the connector code in a later task; guarded by a tokio mutex so it can
     /// be held across awaits during connection setup / teardown.
     pub active_connections: Mutex<HashMap<u64, ActiveTunnelConnection>>,
+    /// Pending agent exec requests, keyed by request_id; resolved by
+    /// `deliver_agent_response` when the client's AgentExecResponse arrives.
+    pub agent_pending: Mutex<HashMap<String, oneshot::Sender<crate::common::AgentResult>>>,
 }
 
 /// Global registry of online clients, keyed by name. Cloneable: internal state
@@ -148,6 +151,7 @@ impl ClientRegistry {
             connected_at: Utc::now(),
             last_ping_micros: AtomicU64::new(0),
             active_connections: Mutex::new(HashMap::new()),
+            agent_pending: Mutex::new(HashMap::new()),
         });
         self.entries
             .write()
@@ -290,6 +294,75 @@ impl ClientRegistry {
             }
         }
     }
+
+    /// Execute an agent command on a client over the control channel.
+    ///
+    /// # Errors
+    /// - `NotConnected` — client offline
+    /// - `BrokenPipe` — control channel closed while sending
+    /// - `TimedOut` — no response within `timeout`
+    pub async fn agent_exec(
+        &self,
+        client_name: &str,
+        session_id: &str,
+        command: crate::common::AgentCommand,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<crate::common::AgentResult> {
+        use std::io::{Error, ErrorKind};
+
+        let entry = self.get(client_name).await.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotConnected,
+                format!("client '{client_name}' offline"),
+            )
+        })?;
+
+        let request_id = format!("{:032x}", rand::random::<u128>());
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = entry.agent_pending.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+
+        let send_result = entry
+            .control_sender
+            .send(ControlMessage::AgentExecRequest {
+                session_id: session_id.to_string(),
+                request_id: request_id.clone(),
+                command,
+            })
+            .await;
+        if send_result.is_err() {
+            entry.agent_pending.lock().await.remove(&request_id);
+            return Err(Error::new(ErrorKind::BrokenPipe, "control channel closed"));
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err(Error::new(ErrorKind::BrokenPipe, "response channel dropped")),
+            Err(_) => {
+                entry.agent_pending.lock().await.remove(&request_id);
+                Err(Error::new(ErrorKind::TimedOut, "agent exec timed out"))
+            }
+        }
+    }
+
+    /// Route an AgentExecResponse from the control loop to the waiter.
+    pub async fn deliver_agent_response(
+        &self,
+        client_name: &str,
+        request_id: &str,
+        result: crate::common::AgentResult,
+    ) {
+        if let Some(entry) = self.get(client_name).await {
+            let tx = entry.agent_pending.lock().await.remove(request_id);
+            if let Some(tx) = tx {
+                let _ = tx.send(result);
+            } else {
+                debug!("agent response for unknown request_id {}", request_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,5 +484,92 @@ mod tests {
         // should not panic
         registry.disconnect("ghost", "kicked").await;
         assert!(registry.get("ghost").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_offline_client() {
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = ClientRegistry::new(db);
+        let result = registry
+            .agent_exec(
+                "ghost",
+                "sess",
+                crate::common::AgentCommand::GitStatus,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+
+        // 模拟客户端：收到 AgentExecRequest 后回 Response
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            let msg = rx.recv().await.unwrap();
+            match msg {
+                ControlMessage::AgentExecRequest {
+                    session_id,
+                    request_id,
+                    ..
+                } => {
+                    registry2
+                        .deliver_agent_response(
+                            "nas",
+                            &request_id,
+                            crate::common::AgentResult::Success,
+                        )
+                        .await;
+                    let _ = session_id;
+                }
+                other => panic!("expected AgentExecRequest, got {other:?}"),
+            }
+        });
+
+        let result = registry
+            .agent_exec(
+                "nas",
+                "sess",
+                crate::common::AgentCommand::GitPush,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, crate::common::AgentResult::Success));
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_timeout() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, _rx) = mpsc::channel(32); // 无人消费 → 永远等不到响应
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+
+        let result = registry
+            .agent_exec(
+                "nas",
+                "sess",
+                crate::common::AgentCommand::GitPush,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 }
