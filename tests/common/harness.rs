@@ -237,6 +237,7 @@ impl TestHarness {
             tls: self.tls,
             tls_server_name: Some("localhost".to_string()),
             tls_insecure: true,
+            enable_agent: false,
             log: "warn".to_string(),
         };
 

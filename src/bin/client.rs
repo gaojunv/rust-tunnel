@@ -32,6 +32,9 @@ async fn run() -> TunnelResult<()> {
         "Starting rust-tunnel client, connecting to server {}",
         config.server
     );
+    if config.enable_agent {
+        tracing::info!("Agent executor enabled (accepting AgentExecRequest)");
+    }
 
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
 

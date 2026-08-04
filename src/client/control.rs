@@ -227,6 +227,46 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         info!("Connection {} closed by server", connection_id);
                         state.close_connection(connection_id).await;
                     }
+                    ControlMessage::AgentExecRequest {
+                        session_id,
+                        request_id,
+                        command,
+                    } => {
+                        let sender = state.control_sender.clone();
+                        if !state.config.enable_agent {
+                            tokio::spawn(async move {
+                                let _ = sender
+                                    .send(ControlMessage::AgentExecResponse {
+                                        session_id,
+                                        request_id,
+                                        result: crate::common::AgentResult::Error {
+                                            message: "agent not enabled on this client".into(),
+                                        },
+                                    })
+                                    .await;
+                            });
+                            continue;
+                        }
+                        // MVP: sandbox root is the client process cwd; Task 13
+                        // will deliver an explicit root_path via the protocol.
+                        let root = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        tokio::spawn(async move {
+                            let result = crate::client::agent::handle_exec_request(
+                                &command,
+                                &root,
+                                std::time::Duration::from_secs(120),
+                            )
+                            .await;
+                            let _ = sender
+                                .send(ControlMessage::AgentExecResponse {
+                                    session_id,
+                                    request_id,
+                                    result,
+                                })
+                                .await;
+                        });
+                    }
                     ControlMessage::Disconnect { reason } => {
                         info!("Server requested disconnect: {}", reason);
                         return Err(TunnelError::Protocol(format!(
@@ -321,11 +361,16 @@ pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
         .unwrap_or_else(|| "unnamed-client".to_string());
 
     // Register with v2 protocol (single Register, no per-forward loop)
+    let client_version = if config.enable_agent {
+        format!("{}+agent", env!("CARGO_PKG_VERSION"))
+    } else {
+        env!("CARGO_PKG_VERSION").to_string()
+    };
     let register = ControlMessage::Register {
         protocol_version: 2,
         client_name: client_name.clone(),
         password: config.password.clone(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_version,
     };
     register.write_to_stream(&mut writer).await?;
     info!("Sent Register to server (name='{client_name}')");
@@ -453,6 +498,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);
@@ -645,5 +691,102 @@ mod tests {
         let mut reader = &buffer[..];
         let result = process_control_messages(&mut reader, state).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_agent_exec_disabled() {
+        // enable_agent=false 时收到 AgentExecRequest → 回 AgentExecResponse::Error("agent not enabled")
+        let state = create_test_state();
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState {
+            control_sender: tx,
+            ..state
+        };
+
+        let mut buffer = Vec::new();
+        ControlMessage::AgentExecRequest {
+            session_id: "s".into(),
+            request_id: "r1".into(),
+            command: crate::common::AgentCommand::Shell {
+                cmd: "echo hi".into(),
+                cwd: None,
+            },
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        match msg {
+            ControlMessage::AgentExecResponse {
+                request_id, result, ..
+            } => {
+                assert_eq!(request_id, "r1");
+                match result {
+                    crate::common::AgentResult::Error { message } => {
+                        assert!(message.contains("not enabled"));
+                    }
+                    other => panic!("expected Error, got {other:?}"),
+                }
+            }
+            other => panic!("expected AgentExecResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_agent_exec_shell() {
+        // enable_agent=true 时执行 shell 并回结果
+        let config = ClientConfig {
+            enable_agent: true,
+            ..create_test_state().config
+        };
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState::new(config, tx);
+
+        let mut buffer = Vec::new();
+        ControlMessage::AgentExecRequest {
+            session_id: "s".into(),
+            request_id: "r2".into(),
+            command: crate::common::AgentCommand::Shell {
+                cmd: "echo hello-agent".into(),
+                cwd: None,
+            },
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        match msg {
+            ControlMessage::AgentExecResponse {
+                request_id, result, ..
+            } => {
+                assert_eq!(request_id, "r2");
+                match result {
+                    crate::common::AgentResult::Shell {
+                        stdout, exit_code, ..
+                    } => {
+                        assert_eq!(exit_code, 0);
+                        assert!(stdout.contains("hello-agent"));
+                    }
+                    other => panic!("expected Shell, got {other:?}"),
+                }
+            }
+            other => panic!("expected AgentExecResponse, got {other:?}"),
+        }
     }
 }

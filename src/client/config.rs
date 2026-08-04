@@ -52,6 +52,11 @@ pub struct ClientCli {
     #[clap(long = "mesh-service", action = clap::ArgAction::Append)]
     pub mesh_services: Vec<String>,
 
+    /// Enable agent executor: accept AgentExecRequest from server to run
+    /// shell/file/git commands sandboxed in a workspace directory
+    #[clap(long)]
+    pub enable_agent: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -68,6 +73,7 @@ pub struct ClientConfigFile {
     pub mesh: Option<String>,
     pub mesh_name: Option<String>,
     pub mesh_services: Option<Vec<String>>,
+    pub enable_agent: Option<bool>,
     pub log: Option<String>,
 }
 
@@ -88,6 +94,8 @@ pub struct ClientConfig {
     pub tls_server_name: Option<String>,
     /// Skip TLS certificate verification (insecure, for self-signed certs)
     pub tls_insecure: bool,
+    /// Enable the agent executor (accept AgentExecRequest from server)
+    pub enable_agent: bool,
     pub log: String,
 }
 
@@ -103,6 +111,7 @@ impl Default for ClientConfig {
             tls: true, // TLS enabled by default for security
             tls_server_name: None,
             tls_insecure: true, // Accept self-signed certs by default (TOFU mode)
+            enable_agent: false,
             log: "info".to_string(),
         }
     }
@@ -154,6 +163,9 @@ impl ClientConfig {
                 }
                 if let Some(v) = file_config.log {
                     config.log = v;
+                }
+                if let Some(v) = file_config.enable_agent {
+                    config.enable_agent = v;
                 }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
@@ -223,6 +235,9 @@ impl ClientConfig {
         if !cli.mesh_services.is_empty() {
             config.mesh_services = cli.mesh_services;
         }
+        // CLI flag can only enable (there is no --disable-agent); a file-set
+        // true value is preserved when the flag is absent.
+        config.enable_agent = config.enable_agent || cli.enable_agent;
 
         // Validate required fields
         if config.server.is_empty() {
@@ -270,6 +285,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: Some("debug".to_string()),
         };
 
@@ -287,6 +303,47 @@ mod tests {
     }
 
     #[test]
+    fn test_enable_agent_flag() {
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("host:8080".into()),
+            name: None,
+            password: Some("pw".into()),
+            tls: None,
+            tls_server_name: None,
+            tls_insecure: None,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
+            enable_agent: true,
+            log: None,
+        };
+        let cfg = ClientConfig::from_cli(cli).unwrap();
+        assert!(cfg.enable_agent);
+    }
+
+    #[test]
+    fn test_enable_agent_default_false() {
+        // Flag absent and no file → defaults to false
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("host:8080".into()),
+            name: None,
+            password: Some("pw".into()),
+            tls: None,
+            tls_server_name: None,
+            tls_insecure: None,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
+            enable_agent: false,
+            log: None,
+        };
+        let cfg = ClientConfig::from_cli(cli).unwrap();
+        assert!(!cfg.enable_agent);
+    }
+
+    #[test]
     fn test_config_missing_server() {
         let cli = ClientCli {
             config_file: None,
@@ -299,6 +356,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: None,
         };
 
@@ -326,6 +384,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: None,
         };
         let err = ClientConfig::from_cli(cli).unwrap_err();
@@ -352,6 +411,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: None,
         };
         let cfg = ClientConfig::from_cli(cli).unwrap();
@@ -371,6 +431,7 @@ mod tests {
             mesh: Some("mesh-net".to_string()),
             mesh_name: Some("my-client".to_string()),
             mesh_services: vec!["db:mysql:localhost:3306".to_string()],
+            enable_agent: true,
             log: "debug".into(),
         };
 
@@ -384,6 +445,7 @@ mod tests {
         assert_eq!(config.mesh, cloned.mesh);
         assert_eq!(config.mesh_name, cloned.mesh_name);
         assert_eq!(config.mesh_services, cloned.mesh_services);
+        assert_eq!(config.enable_agent, cloned.enable_agent);
         assert_eq!(config.log, cloned.log);
     }
 
@@ -400,6 +462,7 @@ mod tests {
             mesh: None,
             mesh_name: None,
             mesh_services: vec![],
+            enable_agent: false,
             log: None,
         };
 
