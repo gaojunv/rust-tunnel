@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod acme;
+pub mod agent;
 pub mod clients;
 pub mod dns;
 pub mod dto;
@@ -384,6 +385,33 @@ pub async fn run_api_server(
         )
         .route("/api/llm/kb/test-embedding", post(rag::test_embedding))
         .route("/api/llm/kb/:id/query", post(rag::query_kb))
+        // Agent workbench endpoints (WebSocket is in public_routes — uses ?token= query param)
+        .route(
+            "/api/agent/workspaces",
+            get(agent::list_workspaces).post(agent::create_workspace),
+        )
+        .route(
+            "/api/agent/workspaces/:id",
+            get(agent::get_workspace)
+                .put(agent::update_workspace)
+                .delete(agent::delete_workspace),
+        )
+        .route(
+            "/api/agent/workspaces/:id/sessions",
+            get(agent::list_sessions).post(agent::create_session),
+        )
+        .route(
+            "/api/agent/sessions/:id",
+            put(agent::update_session).delete(agent::delete_session),
+        )
+        .route(
+            "/api/agent/sessions/:id/archive",
+            post(agent::archive_session),
+        )
+        .route(
+            "/api/agent/sessions/:id/messages",
+            get(agent::list_messages),
+        )
         // User preferences
         .route("/api/preferences", put(preferences::put_preferences))
         // Settings endpoints

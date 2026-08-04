@@ -1,6 +1,7 @@
 pub mod pki;
 pub use mgmt::api;
 pub use pki::acme;
+pub mod agent;
 pub mod config;
 pub mod control_plane;
 pub use control_plane as control;

@@ -42,6 +42,8 @@ pub struct ServerState {
     pub proxy_state: ReverseProxyState,
     /// Client registry (spec §2.6)
     pub client_registry: Option<ClientRegistry>,
+    /// AI agent workbench state (workspace execution locks, DB access)
+    pub agent_state: Option<crate::server::agent::AgentState>,
     /// ACME client for certificate management (set when ACME is enabled)
     pub acme_client: Arc<RwLock<Option<std::sync::Arc<crate::server::acme::client::AcmeClient>>>>,
     /// ACME configuration info (set when ACME is enabled)
@@ -90,6 +92,7 @@ impl ServerState {
             dns_registry: None,
             proxy_state: ReverseProxyState::new(),
             client_registry: None,
+            agent_state: None,
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
@@ -127,6 +130,7 @@ impl ServerState {
 
     /// Create a new server state with database
     pub fn with_db(db: Database) -> Self {
+        let registry = ClientRegistry::new(db.clone());
         let mut state = Self {
             ports: Arc::new(Mutex::new(HashMap::new())),
             ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -137,7 +141,8 @@ impl ServerState {
             mesh_manager: MeshManager::new(),
             dns_registry: None,
             proxy_state: ReverseProxyState::with_db(db.clone()),
-            client_registry: Some(ClientRegistry::new(db)),
+            client_registry: Some(registry.clone()),
+            agent_state: Some(crate::server::agent::AgentState::new(registry, db)),
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
