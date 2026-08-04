@@ -231,6 +231,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         session_id,
                         request_id,
                         root_path,
+                        docker_container,
                         command,
                     } => {
                         let sender = state.control_sender.clone();
@@ -249,13 +250,15 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                             continue;
                         }
                         // Sandbox root comes from the server-side workspace config
-                        // delivered in the request.
+                        // delivered in the request (in docker mode it is the
+                        // container-side root; commands are wrapped in `docker exec`).
                         let root = std::path::PathBuf::from(root_path);
                         tokio::spawn(async move {
                             let result = crate::client::agent::handle_exec_request(
                                 &command,
                                 &root,
                                 std::time::Duration::from_secs(120),
+                                docker_container.as_deref(),
                             )
                             .await;
                             let _ = sender
@@ -708,6 +711,7 @@ mod tests {
             session_id: "s".into(),
             request_id: "r1".into(),
             root_path: ".".into(),
+            docker_container: None,
             command: crate::common::AgentCommand::Shell {
                 cmd: "echo hi".into(),
                 cwd: None,
@@ -756,6 +760,7 @@ mod tests {
             session_id: "s".into(),
             request_id: "r2".into(),
             root_path: ".".into(),
+            docker_container: None,
             command: crate::common::AgentCommand::Shell {
                 cmd: "echo hello-agent".into(),
                 cwd: None,

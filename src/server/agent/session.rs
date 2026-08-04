@@ -6,7 +6,11 @@ pub struct SessionRuntime {
     pub session_id: String,
     pub workspace_id: String,
     pub client_id: String,
+    pub runtime_type: String,
     pub root_path: String,
+    /// Container to exec into when `runtime_type == "docker"`; None means the
+    /// workspace is docker-typed but has no container yet (or host runtime).
+    pub docker_container: Option<String>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
 }
@@ -49,7 +53,9 @@ impl SessionRuntime {
             session_id: session_id.to_string(),
             workspace_id: session.workspace_id,
             client_id: workspace.client_id,
+            runtime_type: workspace.runtime_type,
             root_path: workspace.root_path,
+            docker_container: workspace.docker_container_id,
             model: session.model.unwrap_or_else(|| default_model.to_string()),
             messages,
         })
@@ -65,7 +71,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_rebuilds_history() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -99,14 +105,51 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_model_fallback() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         let rt = SessionRuntime::load(&db, "s1", "fallback-model")
             .await
             .unwrap();
         assert_eq!(rt.model, "fallback-model");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_docker_workspace() {
+        let db = Database::new(":memory:").await.unwrap();
+        // docker 运行时，container 已启动并登记 id
+        db.agent_create_workspace(
+            "w1",
+            "p",
+            "nas",
+            "docker",
+            "/container/work",
+            Some("node:20"),
+            Some("dev-ctr"),
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        assert_eq!(rt.runtime_type, "docker");
+        assert_eq!(rt.docker_container.as_deref(), Some("dev-ctr"));
+        assert_eq!(rt.root_path, "/container/work");
+
+        // docker 运行时但容器未启动（container_id 为空）
+        db.agent_create_workspace("w2", "p", "nas", "docker", "/x", Some("node:20"), None)
+            .await
+            .unwrap();
+        db.agent_create_session("s2", "w2", None, None)
+            .await
+            .unwrap();
+        let rt = SessionRuntime::load(&db, "s2", "m").await.unwrap();
+        assert_eq!(rt.runtime_type, "docker");
+        assert_eq!(rt.docker_container, None);
     }
 
     #[tokio::test]

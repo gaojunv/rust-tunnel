@@ -38,6 +38,7 @@ pub struct AgentMessageRecord {
 impl Database {
     // ── Workspace CRUD ──────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn agent_create_workspace(
         &self,
         id: &str,
@@ -46,11 +47,13 @@ impl Database {
         runtime_type: &str,
         root_path: &str,
         docker_image: Option<&str>,
+        docker_container_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path, docker_image)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO agent_workspaces
+                (id, name, client_id, runtime_type, root_path, docker_image, docker_container_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
@@ -59,6 +62,7 @@ impl Database {
         .bind(runtime_type)
         .bind(root_path)
         .bind(docker_image)
+        .bind(docker_container_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -68,12 +72,10 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<AgentWorkspaceRecord>, sqlx::Error> {
-        sqlx::query_as::<_, AgentWorkspaceRecord>(
-            "SELECT * FROM agent_workspaces WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
+        sqlx::query_as::<_, AgentWorkspaceRecord>("SELECT * FROM agent_workspaces WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     pub async fn agent_list_workspaces(&self) -> Result<Vec<AgentWorkspaceRecord>, sqlx::Error> {
@@ -228,9 +230,28 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_crud() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "my-proj", "nas", "host", "/home/user/proj", None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "my-proj",
+            "nas",
+            "host",
+            "/home/user/proj",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_workspace(
+            "w2",
+            "dproj",
+            "nas",
+            "docker",
+            "/container/work",
+            Some("node:20"),
+            Some("dev-ctr"),
+        )
+        .await
+        .unwrap();
 
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.name, "my-proj");
@@ -238,8 +259,15 @@ mod tests {
         assert_eq!(ws.runtime_type, "host");
         assert_eq!(ws.root_path, "/home/user/proj");
         assert!(ws.docker_image.is_none());
+        assert!(ws.docker_container_id.is_none());
 
-        assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 1);
+        // docker 运行时：image 与 container_id 均持久化
+        let ws = db.agent_get_workspace("w2").await.unwrap().unwrap();
+        assert_eq!(ws.runtime_type, "docker");
+        assert_eq!(ws.docker_image.as_deref(), Some("node:20"));
+        assert_eq!(ws.docker_container_id.as_deref(), Some("dev-ctr"));
+
+        assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 2);
 
         db.agent_update_workspace("w1", "renamed", "/new/path")
             .await
@@ -250,18 +278,22 @@ mod tests {
 
         db.agent_delete_workspace("w1").await.unwrap();
         assert!(db.agent_get_workspace("w1").await.unwrap().is_none());
+        db.agent_delete_workspace("w2").await.unwrap();
+        assert!(db.agent_get_workspace("w2").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn test_session_crud_and_archive() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", Some("fix bug"), Some("gpt-4o"))
             .await
             .unwrap();
-        db.agent_create_session("s2", "w1", None, None).await.unwrap();
+        db.agent_create_session("s2", "w1", None, None)
+            .await
+            .unwrap();
 
         let sessions = db.agent_list_sessions("w1").await.unwrap();
         assert_eq!(sessions.len(), 2);
@@ -288,10 +320,12 @@ mod tests {
     #[tokio::test]
     async fn test_message_append_and_list() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         db.agent_add_message("m1", "s1", "user", "帮我修 bug", None)
             .await
@@ -324,10 +358,12 @@ mod tests {
     #[tokio::test]
     async fn test_delete_workspace_cascades() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         db.agent_add_message("m1", "s1", "user", "hi", None)
             .await
             .unwrap();

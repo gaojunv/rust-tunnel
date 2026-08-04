@@ -306,6 +306,7 @@ impl ClientRegistry {
         client_name: &str,
         session_id: &str,
         root_path: &str,
+        docker_container: Option<&str>,
         command: crate::common::AgentCommand,
         timeout: std::time::Duration,
     ) -> std::io::Result<crate::common::AgentResult> {
@@ -331,6 +332,7 @@ impl ClientRegistry {
                 session_id: session_id.to_string(),
                 request_id: request_id.clone(),
                 root_path: root_path.to_string(),
+                docker_container: docker_container.map(str::to_string),
                 command,
             })
             .await;
@@ -341,7 +343,10 @@ impl ClientRegistry {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(Error::new(ErrorKind::BrokenPipe, "response channel dropped")),
+            Ok(Err(_)) => Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "response channel dropped",
+            )),
             Err(_) => {
                 entry.agent_pending.lock().await.remove(&request_id);
                 Err(Error::new(ErrorKind::TimedOut, "agent exec timed out"))
@@ -497,6 +502,7 @@ mod tests {
                 "ghost",
                 "sess",
                 "/workspace",
+                None,
                 crate::common::AgentCommand::GitStatus,
                 std::time::Duration::from_secs(1),
             )
@@ -526,9 +532,11 @@ mod tests {
                     session_id,
                     request_id,
                     root_path,
+                    docker_container,
                     ..
                 } => {
                     assert_eq!(root_path, "/workspace");
+                    assert_eq!(docker_container.as_deref(), Some("dev-ctr"));
                     registry2
                         .deliver_agent_response(
                             "nas",
@@ -547,6 +555,7 @@ mod tests {
                 "nas",
                 "sess",
                 "/workspace",
+                Some("dev-ctr"),
                 crate::common::AgentCommand::GitPush,
                 std::time::Duration::from_secs(2),
             )
@@ -572,6 +581,7 @@ mod tests {
                 "nas",
                 "sess",
                 "/workspace",
+                None,
                 crate::common::AgentCommand::GitPush,
                 std::time::Duration::from_millis(100),
             )

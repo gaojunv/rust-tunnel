@@ -2,9 +2,9 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
-use crate::common::AgentResult;
 use super::{executor, session::SessionRuntime, tools, AgentState};
+use crate::common::AgentResult;
+use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
 /// One LLM response, parsed.
 pub enum LlmTurn {
@@ -173,14 +173,24 @@ pub async fn run_agent_turn(
 
                     let result_text = match tools::parse_tool_call(&call.name, &call.args) {
                         Ok(command) => {
-                            let result = executor::exec_on_client(
-                                &agent,
-                                &rt.workspace_id,
-                                &rt.client_id,
-                                &rt.root_path,
-                                command,
-                            )
-                            .await;
+                            // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
+                            // 避免静默回退到宿主机执行。
+                            let result =
+                                if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+                                    AgentResult::Error {
+                                        message: "docker container not started".into(),
+                                    }
+                                } else {
+                                    executor::exec_on_client(
+                                        &agent,
+                                        &rt.workspace_id,
+                                        &rt.client_id,
+                                        &rt.root_path,
+                                        rt.docker_container.as_deref(),
+                                        command,
+                                    )
+                                    .await
+                                };
                             let text = agent_result_to_text(&result);
                             let _ = ws_tx
                                 .send(serde_json::json!({

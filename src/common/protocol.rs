@@ -54,10 +54,14 @@ pub enum AgentResult {
         exit_code: i32,
     },
     /// Also used for ListDir / GitStatus / GitDiff textual output
-    FileContent { content: String },
+    FileContent {
+        content: String,
+    },
     /// WriteFile / GitCommit / GitPush 等无返回值的命令
     Success,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -153,7 +157,10 @@ pub enum ControlMessage {
         session_id: String,
         request_id: String,
         /// Workspace root directory on the client; the executor sandboxes into it
+        /// (in docker mode this is the container-side path)
         root_path: String,
+        /// When set, commands run via `docker exec <container>` instead of host shell
+        docker_container: Option<String>,
         command: AgentCommand,
     },
     /// Client returns the result of an agent command
@@ -660,6 +667,7 @@ mod tests {
             session_id: "sess-1".into(),
             request_id: "req-1".into(),
             root_path: "/workspace".into(),
+            docker_container: Some("dev-ctr".into()),
             command: AgentCommand::Shell {
                 cmd: "ls -la".into(),
                 cwd: Some("/workspace".into()),
@@ -672,11 +680,13 @@ mod tests {
                 session_id,
                 request_id,
                 root_path,
+                docker_container,
                 command,
             } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(request_id, "req-1");
                 assert_eq!(root_path, "/workspace");
+                assert_eq!(docker_container.as_deref(), Some("dev-ctr"));
                 match command {
                     AgentCommand::Shell { cmd, cwd } => {
                         assert_eq!(cmd, "ls -la");
@@ -720,7 +730,9 @@ mod tests {
     #[test]
     fn test_agent_command_all_variants_roundtrip() {
         let commands = vec![
-            AgentCommand::ReadFile { path: "a.rs".into() },
+            AgentCommand::ReadFile {
+                path: "a.rs".into(),
+            },
             AgentCommand::WriteFile {
                 path: "b.rs".into(),
                 content: "fn main() {}".into(),
@@ -741,6 +753,7 @@ mod tests {
                 session_id: "s".into(),
                 request_id: "r".into(),
                 root_path: "/workspace".into(),
+                docker_container: None,
                 command,
             };
             let bytes = msg.serialize().unwrap();

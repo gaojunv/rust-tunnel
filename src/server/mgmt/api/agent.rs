@@ -24,6 +24,9 @@ pub struct CreateWorkspaceRequest {
     pub runtime_type: String, // "host" | "docker"
     pub root_path: String,
     pub docker_image: Option<String>,
+    /// Pre-started container to `docker exec` into. MVP: container lifecycle is
+    /// out of scope — the user must start the container and supply its id here.
+    pub docker_container_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,7 +86,9 @@ fn parse_user_message(msg: Message) -> Option<String> {
     if body.get("type").and_then(|t| t.as_str()) != Some("user_message") {
         return None;
     }
-    body.get("content").and_then(|c| c.as_str()).map(str::to_string)
+    body.get("content")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
 }
 
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
@@ -277,6 +282,7 @@ pub async fn create_workspace(
             &body.runtime_type,
             &body.root_path,
             body.docker_image.as_deref(),
+            body.docker_container_id.as_deref(),
         )
         .await
     {
@@ -468,6 +474,7 @@ mod tests {
                 runtime_type: "host".into(),
                 root_path: "/home/u/proj".into(),
                 docker_image: None,
+                docker_container_id: None,
             }),
         )
         .await
@@ -489,6 +496,7 @@ mod tests {
                 runtime_type: "kubernetes".into(),
                 root_path: "/p".into(),
                 docker_image: None,
+                docker_container_id: None,
             }),
         )
         .await
@@ -497,9 +505,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_docker_workspace_persists_container_id() {
+        let (state, _db) = test_state().await;
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "dproj".into(),
+                client_id: "nas".into(),
+                runtime_type: "docker".into(),
+                root_path: "/container/work".into(),
+                docker_image: Some("node:20".into()),
+                docker_container_id: Some("dev-ctr".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 响应体包含持久化的 container_id
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["runtime_type"], "docker");
+        assert_eq!(json["docker_container_id"], "dev-ctr");
+    }
+
+    #[tokio::test]
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
 
