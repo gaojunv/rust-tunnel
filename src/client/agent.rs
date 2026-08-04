@@ -96,13 +96,37 @@ pub async fn handle_exec_request(
             Ok(p) => list_dir(&p).await,
             Err(e) => AgentResult::Error { message: e },
         },
-        // Git 系列在 Task 10 实现，先返回不支持
-        AgentCommand::GitStatus
-        | AgentCommand::GitDiff { .. }
-        | AgentCommand::GitCommit { .. }
-        | AgentCommand::GitPush => AgentResult::Error {
-            message: "git commands not yet supported".into(),
-        },
+        AgentCommand::GitStatus => {
+            git_exec(&["status", "--short", "--branch"], root_path, timeout).await
+        }
+        AgentCommand::GitDiff { path } => {
+            let mut args: Vec<String> = vec!["diff".into()];
+            if let Some(path) = path {
+                match resolve_sandboxed(root_path, path).and_then(|abs| {
+                    abs.strip_prefix(root_path)
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .map_err(|_| format!("path not under root: {path}"))
+                }) {
+                    Ok(rel) => {
+                        args.push("--".into());
+                        args.push(rel);
+                    }
+                    Err(e) => return AgentResult::Error { message: e },
+                }
+            }
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            git_exec(&refs, root_path, timeout).await
+        }
+        AgentCommand::GitCommit { message } => {
+            // 先 stage 全部，再 commit；git add 失败立即返回错误
+            if let AgentResult::Error { message: err } =
+                git_exec(&["add", "-A"], root_path, timeout).await
+            {
+                return AgentResult::Error { message: err };
+            }
+            git_exec(&["commit", "-m", message], root_path, timeout).await
+        }
+        AgentCommand::GitPush => git_exec(&["push"], root_path, timeout).await,
     }
 }
 
@@ -160,6 +184,39 @@ async fn list_dir(path: &Path) -> AgentResult {
     lines.sort();
     AgentResult::FileContent {
         content: lines.join("\n"),
+    }
+}
+
+/// 在沙箱内执行一条 git 命令；成功时返回 stdout（为空则返回 stderr）作为
+/// FileContent，非零退出码归一为 Error。输出同样受 MAX_OUTPUT 截断。
+async fn git_exec(args: &[&str], root_path: &Path, timeout: Duration) -> AgentResult {
+    let child = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(root_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(timeout, child).await {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if out.status.success() {
+                AgentResult::FileContent {
+                    content: truncate_output(if stdout.is_empty() { stderr } else { stdout }),
+                }
+            } else {
+                AgentResult::Error {
+                    message: truncate_output(format!("git {:?} failed: {stderr}", args)),
+                }
+            }
+        }
+        Ok(Err(e)) => AgentResult::Error {
+            message: format!("spawn git failed: {e}"),
+        },
+        Err(_) => AgentResult::Error {
+            message: format!("git command timed out after {}s", timeout.as_secs()),
+        },
     }
 }
 
@@ -356,5 +413,107 @@ mod tests {
     fn test_truncate_output_short_unchanged() {
         let s = "hello".to_string();
         assert_eq!(truncate_output(s.clone()), s);
+    }
+
+    fn init_git_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init"]).status.success());
+        assert!(run(&["config", "user.name", "t"]).status.success());
+        assert!(run(&["config", "user.email", "t@t"]).status.success());
+    }
+
+    #[tokio::test]
+    async fn test_git_status_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let status = handle_exec_request(
+            &AgentCommand::GitStatus,
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        match status {
+            AgentResult::FileContent { content } => assert!(content.contains("a.txt")),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+
+        let commit = handle_exec_request(
+            &AgentCommand::GitCommit {
+                message: "add a".into(),
+            },
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        match commit {
+            AgentResult::FileContent { content } => assert!(content.contains("add a")),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+
+        // 提交后工作区干净
+        let status = handle_exec_request(
+            &AgentCommand::GitStatus,
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        match status {
+            AgentResult::FileContent { content } => assert!(!content.contains("a.txt")),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "v1").unwrap();
+        handle_exec_request(
+            &AgentCommand::GitCommit {
+                message: "v1".into(),
+            },
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        std::fs::write(dir.path().join("a.txt"), "v2").unwrap();
+        let diff = handle_exec_request(
+            &AgentCommand::GitDiff { path: None },
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        match diff {
+            AgentResult::FileContent { content } => {
+                assert!(content.contains("v1"));
+                assert!(content.contains("v2"));
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_exec_request(
+            &AgentCommand::GitStatus,
+            dir.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(matches!(result, AgentResult::Error { .. }));
     }
 }
