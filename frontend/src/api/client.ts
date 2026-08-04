@@ -573,6 +573,10 @@ export async function deleteAgentSession(id: string): Promise<void> {
   await api.delete(`/agent/sessions/${id}`);
 }
 
+export async function updateAgentSessionTitle(id: string, title: string): Promise<void> {
+  await api.put(`/agent/sessions/${id}`, { title });
+}
+
 export async function listAgentMessages(sessionId: string): Promise<AgentMessage[]> {
   const { data } = await api.get(`/agent/sessions/${sessionId}/messages`);
   return data;
