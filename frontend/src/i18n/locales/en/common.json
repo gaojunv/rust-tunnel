@@ -41,7 +41,14 @@
     "tabs": {
       "general": "General",
       "security": "Security",
-      "appearance": "Appearance"
+      "appearance": "Appearance",
+      "agent": "Agent"
+    },
+    "agent": {
+      "title": "AI Workbench",
+      "defaultModelDesc": "Default model used when a session has no model of its own. Sessions can override it per chat; changes apply to new messages.",
+      "saved": "Saved",
+      "clearDefault": "Clear (use first available model)"
     },
     "general": {
       "system": "System",
@@ -721,11 +728,8 @@
     "newWorkspace": "New Workspace",
     "workspaces": "Workspaces",
     "newSession": "New Session",
-    "collapseSidebar": "Collapse sidebar",
-    "expandSidebar": "Expand sidebar",
     "selectOrNewSession": "Select or create a session to start",
     "selectWorkspaceFirst": "Select a workspace first",
-    "sessions": "Sessions",
     "noSessions": "No sessions yet. Click \"New Session\" above to start.",
     "unnamedSession": "Untitled session",
     "name": "Name",
@@ -755,7 +759,25 @@
     "running": "Agent is running…",
     "inputPlaceholder": "Describe what you need… (Enter to send, Shift+Enter for newline)",
     "send": "Send",
-    "connectionLost": "Connection lost. Please refresh and try again."
+    "connectionLost": "Connection lost. Please refresh and try again.",
+    "selectSession": "Select session…",
+    "selectSessionAria": "Select session",
+    "deleteWorkspace": "Delete workspace",
+    "deleteSession": "Delete session",
+    "renameSession": "Rename session",
+    "confirmDeleteWorkspace": "Delete this workspace and all its sessions? This cannot be undone.",
+    "confirmDeleteSession": "Delete this session? This cannot be undone.",
+    "sessionNamePlaceholder": "Session name",
+    "model": "Models",
+    "modelGroups": "Model Groups",
+    "selectModel": "Select model…",
+    "defaultModel": "Default model",
+    "responseTimeout": "Response timed out, please retry",
+    "modelUpdateFailed": "Failed to update model, reverted to previous selection",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "save": "Save"
   },
   "logs": {
     "title": "Logs",

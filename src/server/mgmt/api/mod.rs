@@ -406,12 +406,20 @@ pub async fn run_api_server(
             put(agent::update_session).delete(agent::delete_session),
         )
         .route(
+            "/api/agent/sessions/:id/model",
+            axum::routing::patch(agent::update_session_model),
+        )
+        .route(
             "/api/agent/sessions/:id/archive",
             post(agent::archive_session),
         )
         .route(
             "/api/agent/sessions/:id/messages",
             get(agent::list_messages),
+        )
+        .route(
+            "/api/agent/default-model",
+            get(agent::get_default_model).put(agent::put_default_model),
         )
         // User preferences
         .route("/api/preferences", put(preferences::put_preferences))

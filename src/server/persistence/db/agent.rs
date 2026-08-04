@@ -169,6 +169,21 @@ impl Database {
         Ok(())
     }
 
+    pub async fn agent_update_session_model(
+        &self,
+        id: &str,
+        model: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET model = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn agent_archive_session(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_sessions SET status = 'archived', updated_at = datetime('now') WHERE id = ?",
@@ -315,6 +330,29 @@ mod tests {
 
         db.agent_delete_session("s2").await.unwrap();
         assert_eq!(db.agent_list_sessions("w1").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_session_model() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+
+        // 更新为新模型
+        db.agent_update_session_model("s1", Some("claude-opus-5"))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+
+        // 空（None）清除，回退默认
+        db.agent_update_session_model("s1", None).await.unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert!(s.model.is_none());
     }
 
     #[tokio::test]

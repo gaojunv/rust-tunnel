@@ -1,3 +1,6 @@
+/* highlight.js 亮色主题：@import 须位于所有规则之前（CSS 规范） */
+@import 'highlight.js/styles/github.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -324,4 +327,18 @@ html body[data-scroll-locked] {
   }
 }
 
-
+/* highlight.js 代码高亮：暗色主题覆盖（dark class 在 <html> 上，github-dark 关键色） */
+html.dark .hljs {
+  color: #c9d1d9;
+  background: #0d1117;
+}
+html.dark .hljs-keyword,
+html.dark .hljs-selector-tag { color: #ff7b72; }
+html.dark .hljs-string,
+html.dark .hljs-attr { color: #a5d6ff; }
+html.dark .hljs-comment { color: #8b949e; }
+html.dark .hljs-number,
+html.dark .hljs-literal { color: #79c0ff; }
+html.dark .hljs-title,
+html.dark .hljs-name { color: #d2a8ff; }
+html.dark .hljs-built_in { color: #ffa657; }

@@ -41,7 +41,14 @@
     "tabs": {
       "general": "通用",
       "security": "安全",
-      "appearance": "外观"
+      "appearance": "外观",
+      "agent": "Agent"
+    },
+    "agent": {
+      "title": "AI 工作台",
+      "defaultModelDesc": "会话未单独设置模型时使用的默认模型。会话可在对话内单独覆盖；修改对新消息生效。",
+      "saved": "已保存",
+      "clearDefault": "清除（使用第一个可用模型）"
     },
     "general": {
       "system": "系统",
@@ -721,11 +728,8 @@
     "newWorkspace": "新建工作区",
     "workspaces": "工作区",
     "newSession": "新会话",
-    "collapseSidebar": "收起侧栏",
-    "expandSidebar": "展开侧栏",
     "selectOrNewSession": "选择或新建一个会话开始",
     "selectWorkspaceFirst": "先选择一个工作区",
-    "sessions": "会话",
     "noSessions": "暂无会话，点击上方「新会话」开始",
     "unnamedSession": "未命名会话",
     "name": "名称",
@@ -755,7 +759,25 @@
     "running": "Agent 运行中…",
     "inputPlaceholder": "描述你的需求… (Enter 发送, Shift+Enter 换行)",
     "send": "发送",
-    "connectionLost": "连接已断开，请刷新重试"
+    "connectionLost": "连接已断开，请刷新重试",
+    "selectSession": "选择会话…",
+    "selectSessionAria": "选择会话",
+    "deleteWorkspace": "删除工作区",
+    "deleteSession": "删除会话",
+    "renameSession": "重命名会话",
+    "confirmDeleteWorkspace": "确定删除该工作区及其所有会话？此操作不可撤销。",
+    "confirmDeleteSession": "确定删除该会话？此操作不可撤销。",
+    "sessionNamePlaceholder": "会话名称",
+    "model": "模型",
+    "modelGroups": "模型组",
+    "selectModel": "选择模型…",
+    "defaultModel": "默认模型",
+    "responseTimeout": "响应超时，请重试",
+    "modelUpdateFailed": "模型更新失败，已回滚到之前的模型",
+    "delete": "删除",
+    "cancel": "取消",
+    "confirm": "确定",
+    "save": "保存"
   },
   "logs": {
     "title": "日志",

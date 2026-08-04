@@ -42,6 +42,52 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateSessionModelRequest {
+    /// 空串表示清除会话模型，回退到默认解析。
+    pub model: String,
+}
+
+const DEFAULT_MODEL_KEY: &str = "agent_default_model";
+
+#[derive(Debug, serde::Serialize)]
+pub struct DefaultModelResponse {
+    pub model: String,
+}
+
+/// GET /api/agent/default-model — 读全局默认模型（未设置返回空串）。
+pub async fn get_default_model(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match agent.db.load_server_setting(DEFAULT_MODEL_KEY).await {
+        Ok(Some(m)) => Json(DefaultModelResponse { model: m }).into_response(),
+        Ok(None) => Json(DefaultModelResponse {
+            model: String::new(),
+        })
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// PUT /api/agent/default-model — 写全局默认模型（空串清除）。
+pub async fn put_default_model(
+    State(state): State<ApiState>,
+    Json(body): Json<UpdateSessionModelRequest>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match agent
+        .db
+        .save_server_setting(DEFAULT_MODEL_KEY, body.model.trim())
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateSessionRequest {
     pub title: String,
 }
@@ -72,6 +118,26 @@ pub async fn agent_ws(
     }
     ws.on_upgrade(move |socket| handle_agent_socket(state, socket, params.session_id))
         .into_response()
+}
+
+/// 会话模型「下一条消息生效」：每轮从 DB 重读 `session.model`，若已设置（非空）
+/// 且与运行时当前模型不同则覆盖。`session.model` 为 `None` 表示回退默认——保持
+/// `SessionRuntime::load` 的加载路径语义（此时 `rt.model` 已在 load/首轮解析为
+/// 默认或第一个可用模型），不据此覆盖，避免把已解析的模型改写为空串。
+async fn refresh_session_model(
+    db: &crate::server::db::Database,
+    session_id: &str,
+    rt_model: &mut String,
+) {
+    let Ok(Some(session)) = db.agent_get_session(session_id).await else {
+        return;
+    };
+    if let Some(model) = session.model {
+        let model = model.trim();
+        if !model.is_empty() && model != rt_model {
+            *rt_model = model.to_string();
+        }
+    }
 }
 
 /// Extract the user-message content from a WebSocket message; returns None for
@@ -166,19 +232,31 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
         let rt = match rt_cache.as_mut() {
             Some(rt) => {
+                // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
+                // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
+                refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
                 rt.messages.push(ChatMessage::text("user", content));
                 rt
             }
             None => {
-                let mut loaded = match SessionRuntime::load(&agent.db, &session_id, "").await {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(serde_json::json!({"type": "error", "message": e}))
-                            .await;
-                        continue;
-                    }
-                };
+                // 全局默认模型：session.model 为空时优先于「第一个可用模型」。
+                let default_model = agent
+                    .db
+                    .load_server_setting(DEFAULT_MODEL_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let mut loaded =
+                    match SessionRuntime::load(&agent.db, &session_id, &default_model).await {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(serde_json::json!({"type": "error", "message": e}))
+                                .await;
+                            continue;
+                        }
+                    };
                 // 模型为空 → 取 LLM 网关第一个可用模型
                 if loaded.model.is_empty() {
                     if let Ok(models) =
@@ -398,6 +476,28 @@ pub async fn update_session(
     }
 }
 
+pub async fn update_session_model(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateSessionModelRequest>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // 会话不存在返回 404
+    match agent.db.agent_get_session(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let model = body.model.trim();
+    let model = if model.is_empty() { None } else { Some(model) };
+    match agent.db.agent_update_session_model(&id, model).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub async fn archive_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -559,5 +659,117 @@ mod tests {
             .into_response();
         // 消息列表对不存在的会话返回 404
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_session_model_endpoint() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 设置模型
+        let resp = update_session_model(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(UpdateSessionModelRequest {
+                model: "claude-opus-5".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+
+        // 空串清除
+        let resp = update_session_model(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(UpdateSessionModelRequest { model: "  ".into() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(db.agent_get_session("s1").await.unwrap().unwrap().model.is_none());
+
+        // 不存在的会话 → 404
+        let resp = update_session_model(
+            State(state),
+            Path("nope".to_string()),
+            Json(UpdateSessionModelRequest { model: "x".into() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_session_model_applies_patched_model() {
+        let (_state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+
+        // 会话模型已在 load 时解析为 gpt-4o；PATCH 落库新模型后，下一轮重读应覆盖。
+        let mut rt_model = "gpt-4o".to_string();
+        db.agent_update_session_model("s1", Some("claude-opus-5"))
+            .await
+            .unwrap();
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 模型值相同 → 保持原值，无多余写。
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 清除（None）→ 回退默认语义：保持加载路径已解析的模型，不覆盖为空串。
+        db.agent_update_session_model("s1", None).await.unwrap();
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 不存在的会话 → 静默保持原模型。
+        let mut other = "keep".to_string();
+        refresh_session_model(&db, "ghost", &mut other).await;
+        assert_eq!(other, "keep");
+    }
+
+    #[tokio::test]
+    async fn test_default_model_roundtrip() {
+        let (state, _db) = test_state().await;
+
+        // 未设置 → 空串
+        let resp = get_default_model(State(state.clone())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "");
+
+        // 写入
+        let resp = put_default_model(
+            State(state.clone()),
+            Json(UpdateSessionModelRequest {
+                model: "deepseek-chat".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 读回
+        let resp = get_default_model(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "deepseek-chat");
     }
 }

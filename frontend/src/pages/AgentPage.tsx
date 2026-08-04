@@ -1,99 +1,141 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useQuery } from '@tanstack/react-query';
-import { Button } from '@/components/ui/button';
-import { PanelLeft, Plus, Sparkles } from 'lucide-react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Sparkles } from 'lucide-react';
 import {
   listAgentWorkspaces,
   listAgentSessions,
   createAgentSession,
+  getAgentDefaultModel,
 } from '../api/client';
 import type { AgentWorkspace, AgentSession } from '../types';
 import ChatStream from '../components/agent/ChatStream';
-import SidebarTabs from '../components/agent/SidebarTabs';
-import SessionList from '../components/agent/SessionList';
+import WorkspaceBar from '../components/agent/WorkspaceBar';
+import SessionBar from '../components/agent/SessionBar';
+import ActivityBar from '../components/agent/ActivityBar';
 import WorkspaceDialog from '../components/agent/WorkspaceDialog';
 
 export default function AgentPage() {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [workspaceId, setWorkspaceId] = useState('');
   const [sessionId, setSessionId] = useState('');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [model, setModel] = useState('');
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
+  // 自动选中守卫：切换 workspace / 新建会话 / 手动选择后允许自动选中最近会话；
+  // 删除当前会话后置 false，严格回引导态（不自动重选），直到用户再次手动选择或切 workspace。
+  const autoSelectRef = useRef(true);
 
   const { data: workspaces } = useQuery<AgentWorkspace[]>({
     queryKey: ['agent-workspaces'],
     queryFn: listAgentWorkspaces,
   });
 
-  const { data: sessions, refetch: refetchSessions } = useQuery<AgentSession[]>({
+  const { data: sessions } = useQuery<AgentSession[]>({
     queryKey: ['agent-sessions', workspaceId],
     queryFn: () => listAgentSessions(workspaceId),
     enabled: !!workspaceId,
   });
 
+  // 全局默认模型（会话无模型时回显）
+  const { data: defaultModel } = useQuery({
+    queryKey: ['agent-default-model'],
+    queryFn: getAgentDefaultModel,
+    staleTime: 60_000,
+  });
+
+  // 只有一个 workspace 时自动选中
+  useEffect(() => {
+    if (!workspaceId && workspaces?.length === 1) {
+      setWorkspaceId(workspaces[0].id);
+    }
+  }, [workspaces, workspaceId]);
+
+  // 选中 workspace 后自动选中最近会话（sessions 已按 created_at DESC 排序）
+  useEffect(() => {
+    if (!workspaceId || !sessions) return;
+    // 删除当前会话后回引导态：显式清空（删除）后禁止自动重选，直到手动选择/切 workspace
+    if (!autoSelectRef.current) return;
+    if (sessions.length === 0) {
+      setSessionId('');
+      return;
+    }
+    if (!sessions.some((s) => s.id === sessionId)) {
+      setSessionId(sessions[0].id);
+    }
+  }, [sessions, workspaceId, sessionId]);
+
+  // 会话切换：回显其模型（空则回退全局默认）
+  useEffect(() => {
+    const cur = sessions?.find((s) => s.id === sessionId);
+    setModel(cur?.model || defaultModel || '');
+  }, [sessionId, sessions, defaultModel]);
+
   const handleNewSession = async () => {
     if (!workspaceId) return;
-    const s = await createAgentSession(workspaceId);
+    const s = await createAgentSession(workspaceId, undefined, model || undefined);
+    // 同步写入共享缓存：确保自动选中 effect 不会因陈旧列表把新会话打回旧会话
+    queryClient.setQueryData<AgentSession[]>(['agent-sessions', workspaceId], (old) => [
+      s,
+      ...(old ?? []),
+    ]);
+    autoSelectRef.current = true;
     setSessionId(s.id);
-    refetchSessions();
+  };
+
+  const handleSelectWorkspace = (id: string) => {
+    // 切换 workspace → 重新允许自动选中最近会话
+    autoSelectRef.current = true;
+    setWorkspaceId(id);
+    setSessionId('');
+  };
+
+  // 手动选择会话 → 重新允许自动选中（后续列表变更时按需自愈）
+  const handleSelectSession = (id: string) => {
+    autoSelectRef.current = true;
+    setSessionId(id);
+  };
+
+  // 删除当前会话 → 严格回引导态：清空选中且禁止自动重选
+  const handleDeletedCurrent = () => {
+    autoSelectRef.current = false;
+    setSessionId('');
   };
 
   return (
     <div className="flex h-[calc(100dvh-7.5rem)] min-h-[480px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card">
-      {/* 顶栏 */}
+      {/* 顶栏：logo + WorkspaceBar + SessionBar */}
       <div className="flex items-center gap-2 border-b border-border/60 p-2">
         <Sparkles className="h-4 w-4 shrink-0 text-primary" />
-        <select
-          value={workspaceId}
-          onChange={(e) => {
-            setWorkspaceId(e.target.value);
-            setSessionId('');
-          }}
-          className="h-9 max-w-[220px] rounded-md border border-input bg-background px-3 py-1 text-sm"
-          aria-label={t('agent.selectWorkspaceAria')}
-        >
-          <option value="">{t('agent.selectWorkspace')}</option>
-          {workspaces?.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}
-            </option>
-          ))}
-        </select>
-        <Button variant="outline" size="sm" onClick={() => setShowWorkspaceDialog(true)}>
-          <Plus className="mr-1 h-4 w-4" />
-          {t('agent.workspaces')}
-        </Button>
+        <WorkspaceBar
+          workspaceId={workspaceId}
+          onSelect={handleSelectWorkspace}
+          onNew={() => setShowWorkspaceDialog(true)}
+        />
         {workspaceId && (
-          <Button variant="outline" size="sm" onClick={handleNewSession}>
-            <Plus className="mr-1 h-4 w-4" />
-            {t('agent.newSession')}
-          </Button>
+          <SessionBar
+            workspaceId={workspaceId}
+            sessionId={sessionId}
+            onSelect={handleSelectSession}
+            onDeletedCurrent={handleDeletedCurrent}
+            onNew={handleNewSession}
+          />
         )}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="ml-auto"
-          onClick={() => setSidebarOpen((o) => !o)}
-        >
-          <PanelLeft className="mr-1 h-4 w-4" />
-          {sidebarOpen ? t('agent.collapseSidebar') : t('agent.expandSidebar')}
-        </Button>
       </div>
 
       <div className="flex min-h-0 flex-1">
-        {/* 左侧栏：会话列表 + 侧栏 tabs */}
-        {sidebarOpen && workspaceId && sessionId && (
-          <div className="flex w-72 shrink-0 flex-col border-r border-border/60">
-            <SessionList sessions={sessions ?? []} activeId={sessionId} onSelect={setSessionId} />
-            <SidebarTabs workspaceId={workspaceId} sessionId={sessionId} />
-          </div>
-        )}
+        {/* VS Code 式 Activity Bar（选中会话后可用） */}
+        {sessionId && <ActivityBar sessionId={sessionId} />}
 
         {/* 对话区 */}
         <div className="min-w-0 flex-1">
           {sessionId ? (
-            <ChatStream key={sessionId} sessionId={sessionId} />
+            <ChatStream
+              key={sessionId}
+              sessionId={sessionId}
+              model={model}
+              onModelChange={setModel}
+            />
           ) : (
             <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
               {workspaceId ? t('agent.selectOrNewSession') : t('agent.selectWorkspaceFirst')}
