@@ -221,6 +221,7 @@ pub async fn run_api_server(
         .route("/api/stats/stream", get(stats::sse_stats_stream))
         .route("/api/logs/stream", get(logs::sse_log_stream))
         .route("/api/llm/kb/events", get(rag::sse_kb_events))
+        .route("/api/agent/ws", get(agent::agent_ws))
         .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)

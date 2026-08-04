@@ -1,11 +1,19 @@
-//! Agent workbench REST handlers.
+//! Agent workbench REST + WebSocket handlers.
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+
+use crate::server::agent::session::SessionRuntime;
+use crate::server::auth::validate_token;
+use crate::server::llm::ChatMessage;
 
 use super::ApiState;
 
@@ -38,6 +46,150 @@ pub struct UpdateSessionRequest {
 /// Generate a random hex id (32 hex chars, 128-bit).
 fn new_id() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentWsQuery {
+    pub session_id: String,
+    pub token: Option<String>,
+}
+
+/// GET /api/agent/ws?session_id=xxx&token=<jwt>
+/// Public route; JWT validated from query param (browser WebSocket can't set headers).
+pub async fn agent_ws(
+    State(state): State<ApiState>,
+    Query(params): Query<AgentWsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if state.auth_config.is_enabled() {
+        let token = params.token.as_deref().unwrap_or("");
+        if token.is_empty() || validate_token(token, &state.auth_config.jwt_secret).is_err() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| handle_agent_socket(state, socket, params.session_id))
+        .into_response()
+}
+
+async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
+    let (mut ws_sink, mut ws_stream) = socket.split();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+
+    // 推送任务：event_rx → WebSocket
+    let push_task = tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            let text = serde_json::to_string(&ev).unwrap_or_default();
+            if ws_sink.send(Message::Text(text)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Live per-connection runtime cache. Reloading from the DB between turns is
+    // protocol-invalid: assistant tool_calls messages are never persisted and
+    // tool rows lack tool_call_id, so a DB replay yields a message sequence the
+    // OpenAI API rejects (400). Instead, load once on the first user message
+    // (which is persisted first), then append user text onto the in-memory
+    // messages for later turns — the runner's in-memory path is valid. A fresh
+    // WebSocket connection does reload, which may lose prior tool-call
+    // structure; that is the accepted MVP tradeoff.
+    let mut rt_cache: Option<SessionRuntime> = None;
+
+    while let Some(Ok(msg)) = ws_stream.next().await {
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if body.get("type").and_then(|t| t.as_str()) != Some("user_message") {
+            continue;
+        }
+        let Some(content) = body.get("content").and_then(|c| c.as_str()) else {
+            continue;
+        };
+
+        let (agent, llm) = match (
+            state.server_state.agent_state.clone(),
+            state
+                .server_state
+                .proxy_state
+                .llm_state
+                .read()
+                .await
+                .as_ref()
+                .cloned(),
+        ) {
+            (Some(a), Some(l)) => (a, l),
+            _ => {
+                let _ = event_tx
+                    .send(serde_json::json!({"type": "error", "message": "agent or LLM gateway not initialized"}))
+                    .await;
+                continue;
+            }
+        };
+
+        // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
+        let msg_id = format!("{:032x}", rand::random::<u128>());
+        let _ = agent
+            .db
+            .agent_add_message(&msg_id, &session_id, "user", content, None)
+            .await;
+
+        // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
+        let rt = match rt_cache.as_mut() {
+            Some(rt) => {
+                rt.messages.push(ChatMessage::text("user", content));
+                rt
+            }
+            None => {
+                let mut loaded = match SessionRuntime::load(&agent.db, &session_id, "").await {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = event_tx
+                            .send(serde_json::json!({"type": "error", "message": e}))
+                            .await;
+                        continue;
+                    }
+                };
+                // 模型为空 → 取 LLM 网关第一个可用模型
+                if loaded.model.is_empty() {
+                    if let Ok(models) =
+                        crate::server::llm::router::list_available_models(&llm).await
+                    {
+                        if let Some(first) = models.first() {
+                            if let Some(name) = first.get("id").and_then(|v| v.as_str()) {
+                                loaded.model = name.to_string();
+                            }
+                        }
+                    }
+                    if loaded.model.is_empty() {
+                        let _ = event_tx
+                            .send(serde_json::json!({"type": "error", "message": "no LLM model configured"}))
+                            .await;
+                        continue;
+                    }
+                }
+                rt_cache = Some(loaded);
+                rt_cache.as_mut().expect("rt_cache just assigned")
+            }
+        };
+
+        // 每个用户消息串行运行一个 agent turn（同一 WebSocket 循环内 await，消息天然排队）。
+        let tx = event_tx.clone();
+        let agent = agent.clone();
+        let llm = llm.clone();
+        let result = crate::server::agent::runner::run_agent_turn(agent, llm, rt, tx).await;
+        // 仅 Exhausted 场景 runner 会发终态 error 帧；其余 Err 路径需要在此兜底，
+        // 否则浏览器会一直等待。Exhausted 场景会重复一个 error 帧，MVP 下无害。
+        if let Err(e) = result {
+            let _ = event_tx
+                .send(serde_json::json!({"type": "error", "message": e}))
+                .await;
+        }
+    }
+
+    push_task.abort();
 }
 
 pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse {
