@@ -38,8 +38,18 @@ fn truncate_output(s: String) -> String {
     if s.len() <= MAX_OUTPUT {
         return s;
     }
-    let head = &s[..MAX_OUTPUT / 2];
-    let tail = &s[s.len() - MAX_OUTPUT / 2..];
+    // 快照到合法字符边界，避免在 UTF-8 多字节序列中间切分导致 panic
+    let half = MAX_OUTPUT / 2;
+    let mut head_end = half;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - half;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let head = &s[..head_end];
+    let tail = &s[tail_start..];
     format!("{head}\n[truncated]\n{tail}")
 }
 
@@ -328,5 +338,23 @@ mod tests {
             }
             other => panic!("expected Shell result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte_utf8() {
+        // 102,402B of '汉' (3 bytes each), just over MAX_OUTPUT: head cut at
+        // byte 51200 (51200 % 3 == 2) and tail cut at byte 51202 (51202 % 3 == 1)
+        // both land mid-char, exercising the char-boundary snapping
+        let s = "汉".repeat(34_134);
+        let out = truncate_output(s);
+        assert!(out.contains("[truncated]"));
+        // must not panic and must stay valid UTF-8 (String guarantees this if no panic)
+        assert!(out.len() <= MAX_OUTPUT + 64);
+    }
+
+    #[test]
+    fn test_truncate_output_short_unchanged() {
+        let s = "hello".to_string();
+        assert_eq!(truncate_output(s.clone()), s);
     }
 }
