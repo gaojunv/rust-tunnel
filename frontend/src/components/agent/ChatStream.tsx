@@ -41,7 +41,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   // running 的 ref 镜像：WS onmessage 闭包内避免读旧 state
   const runningRef = useRef(false);
 
-  // 历史消息（与 SidebarTabs 共享 queryKey，invalidate 后 Git 面板自动刷新）
+  // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）
   const { data: history } = useQuery({
     queryKey: ['agent-messages', sessionId],
     queryFn: () => listAgentMessages(sessionId),
@@ -130,7 +130,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         // 严格终态：工具全部回齐才解除 Running（防御乱序帧）
         if (pendingTools.size === 0) {
           stopRunning();
-          // 刷新共享的历史缓存，让 SidebarTabs（Git tab）拿到最新 tool 结果
+          // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果
           void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
         }
       } else if (msg.type === 'error') {
