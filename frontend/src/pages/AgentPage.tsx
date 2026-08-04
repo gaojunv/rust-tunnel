@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { PanelLeft, Plus, Sparkles } from 'lucide-react';
@@ -14,6 +15,7 @@ import SessionList from '../components/agent/SessionList';
 import WorkspaceDialog from '../components/agent/WorkspaceDialog';
 
 export default function AgentPage() {
+  const { t } = useTranslation();
   const [workspaceId, setWorkspaceId] = useState('');
   const [sessionId, setSessionId] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -49,9 +51,9 @@ export default function AgentPage() {
             setSessionId('');
           }}
           className="h-9 max-w-[220px] rounded-md border border-input bg-background px-3 py-1 text-sm"
-          aria-label="选择工作区"
+          aria-label={t('agent.selectWorkspaceAria')}
         >
-          <option value="">选择工作区…</option>
+          <option value="">{t('agent.selectWorkspace')}</option>
           {workspaces?.map((w) => (
             <option key={w.id} value={w.id}>
               {w.name}
@@ -60,12 +62,12 @@ export default function AgentPage() {
         </select>
         <Button variant="outline" size="sm" onClick={() => setShowWorkspaceDialog(true)}>
           <Plus className="mr-1 h-4 w-4" />
-          工作区
+          {t('agent.workspaces')}
         </Button>
         {workspaceId && (
           <Button variant="outline" size="sm" onClick={handleNewSession}>
             <Plus className="mr-1 h-4 w-4" />
-            新会话
+            {t('agent.newSession')}
           </Button>
         )}
         <Button
@@ -75,7 +77,7 @@ export default function AgentPage() {
           onClick={() => setSidebarOpen((o) => !o)}
         >
           <PanelLeft className="mr-1 h-4 w-4" />
-          {sidebarOpen ? '收起侧栏' : '展开侧栏'}
+          {sidebarOpen ? t('agent.collapseSidebar') : t('agent.expandSidebar')}
         </Button>
       </div>
 
@@ -94,7 +96,7 @@ export default function AgentPage() {
             <ChatStream key={sessionId} sessionId={sessionId} />
           ) : (
             <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
-              {workspaceId ? '选择或新建一个会话开始' : '先选择一个工作区'}
+              {workspaceId ? t('agent.selectOrNewSession') : t('agent.selectWorkspaceFirst')}
             </div>
           )}
         </div>

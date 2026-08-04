@@ -1,3 +1,4 @@
+import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { listAgentMessages } from '../../api/client';
@@ -15,6 +16,7 @@ interface ToolLog {
 }
 
 export default function SidebarTabs({ sessionId }: Props) {
+  const { t } = useTranslation();
   // 与 ChatStream 共享 queryKey：ChatStream 在回合结束后 invalidate，此处自动刷新
   const { data: messages } = useQuery<AgentMessage[]>({
     queryKey: ['agent-messages', sessionId],
@@ -41,20 +43,20 @@ export default function SidebarTabs({ sessionId }: Props) {
       <Tabs defaultValue="git">
         <TabsList className="w-full">
           <TabsTrigger value="files" className="flex-1">
-            文件
+            {t('agent.files')}
           </TabsTrigger>
           <TabsTrigger value="terminal" className="flex-1">
-            终端
+            {t('agent.terminal')}
           </TabsTrigger>
           <TabsTrigger value="git" className="flex-1">
-            Git
+            {t('agent.git')}
           </TabsTrigger>
         </TabsList>
         <TabsContent value="files" className="mt-2 text-xs text-muted-foreground">
-          文件树面板将在后续版本提供。Agent 的 ls / 文件操作输出已显示在对话流中。
+          {t('agent.filesComingSoon')}
         </TabsContent>
         <TabsContent value="terminal" className="mt-2 text-xs text-muted-foreground">
-          终端面板将在后续版本提供。命令输出已显示在对话流中。
+          {t('agent.terminalComingSoon')}
         </TabsContent>
         <TabsContent value="git" className="mt-2">
           {latestGitStatus ? (
@@ -63,7 +65,7 @@ export default function SidebarTabs({ sessionId }: Props) {
             </pre>
           ) : (
             <p className="text-xs text-muted-foreground">
-              暂无 git status 结果。让 Agent 运行 git status 后在此查看。
+              {t('agent.noGitStatus')}
             </p>
           )}
         </TabsContent>

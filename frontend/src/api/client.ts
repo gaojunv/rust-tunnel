@@ -545,6 +545,7 @@ export async function createAgentWorkspace(body: {
   runtime_type: string;
   root_path: string;
   docker_image?: string;
+  docker_container_id?: string;
 }): Promise<AgentWorkspace> {
   const { data } = await api.post('/agent/workspaces', body);
   return data;
