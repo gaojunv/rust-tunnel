@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles } from 'lucide-react';
@@ -22,6 +22,9 @@ export default function AgentPage() {
   const [sessionId, setSessionId] = useState('');
   const [model, setModel] = useState('');
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
+  // 自动选中守卫：切换 workspace / 新建会话 / 手动选择后允许自动选中最近会话；
+  // 删除当前会话后置 false，严格回引导态（不自动重选），直到用户再次手动选择或切 workspace。
+  const autoSelectRef = useRef(true);
 
   const { data: workspaces } = useQuery<AgentWorkspace[]>({
     queryKey: ['agent-workspaces'],
@@ -51,6 +54,8 @@ export default function AgentPage() {
   // 选中 workspace 后自动选中最近会话（sessions 已按 created_at DESC 排序）
   useEffect(() => {
     if (!workspaceId || !sessions) return;
+    // 删除当前会话后回引导态：显式清空（删除）后禁止自动重选，直到手动选择/切 workspace
+    if (!autoSelectRef.current) return;
     if (sessions.length === 0) {
       setSessionId('');
       return;
@@ -74,11 +79,26 @@ export default function AgentPage() {
       s,
       ...(old ?? []),
     ]);
+    autoSelectRef.current = true;
     setSessionId(s.id);
   };
 
   const handleSelectWorkspace = (id: string) => {
+    // 切换 workspace → 重新允许自动选中最近会话
+    autoSelectRef.current = true;
     setWorkspaceId(id);
+    setSessionId('');
+  };
+
+  // 手动选择会话 → 重新允许自动选中（后续列表变更时按需自愈）
+  const handleSelectSession = (id: string) => {
+    autoSelectRef.current = true;
+    setSessionId(id);
+  };
+
+  // 删除当前会话 → 严格回引导态：清空选中且禁止自动重选
+  const handleDeletedCurrent = () => {
+    autoSelectRef.current = false;
     setSessionId('');
   };
 
@@ -96,7 +116,8 @@ export default function AgentPage() {
           <SessionBar
             workspaceId={workspaceId}
             sessionId={sessionId}
-            onSelect={setSessionId}
+            onSelect={handleSelectSession}
+            onDeletedCurrent={handleDeletedCurrent}
             onNew={handleNewSession}
           />
         )}

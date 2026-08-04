@@ -30,6 +30,7 @@ const renderBar = (sessionId = 's1') => {
         workspaceId="w1"
         sessionId={sessionId}
         onSelect={vi.fn()}
+        onDeletedCurrent={vi.fn()}
         onNew={vi.fn()}
       />
     </QueryClientProvider>

@@ -20,11 +20,13 @@ interface Props {
   workspaceId: string;
   sessionId: string;
   onSelect: (id: string) => void;
+  /** 删除当前会话后回引导态（AgentPage 据此禁止自动重选）。 */
+  onDeletedCurrent: () => void;
   onNew: () => void;
 }
 
 /** 顶栏会话选择：下拉（项内改名/删除）+ 新建。 */
-export default function SessionBar({ workspaceId, sessionId, onSelect, onNew }: Props) {
+export default function SessionBar({ workspaceId, sessionId, onSelect, onDeletedCurrent, onNew }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -41,7 +43,7 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onNew }: 
   const handleDelete = async (id: string) => {
     await deleteAgentSession(id);
     refresh();
-    if (id === sessionId) onSelect(''); // 删的是当前会话 → 回引导态
+    if (id === sessionId) onDeletedCurrent(); // 删的是当前会话 → 回引导态（AgentPage 禁止自动重选）
   };
 
   const handleRename = async (id: string) => {
