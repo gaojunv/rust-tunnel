@@ -32,6 +32,34 @@ pub struct MeshServiceDef {
     pub local_addr: String,
 }
 
+/// A command the AI agent asks a client to execute (server -> client)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum AgentCommand {
+    Shell { cmd: String, cwd: Option<String> },
+    ReadFile { path: String },
+    WriteFile { path: String, content: String },
+    ListDir { path: String },
+    GitStatus,
+    GitDiff { path: Option<String> },
+    GitCommit { message: String },
+    GitPush,
+}
+
+/// Result of an agent command executed on the client (client -> server)
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum AgentResult {
+    Shell {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    /// Also used for ListDir / GitStatus / GitDiff textual output
+    FileContent { content: String },
+    /// WriteFile / GitCommit / GitPush 等无返回值的命令
+    Success,
+    Error { message: String },
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
     /// Client requests registration with protocol version, name, password, and client version
@@ -120,6 +148,18 @@ pub enum ControlMessage {
     },
     /// Client sends a batch of log entries
     LogBatch { entries: Vec<ClientLogEntry> },
+    /// Server asks an agent-capable client to execute a command
+    AgentExecRequest {
+        session_id: String,
+        request_id: String,
+        command: AgentCommand,
+    },
+    /// Client returns the result of an agent command
+    AgentExecResponse {
+        session_id: String,
+        request_id: String,
+        result: AgentResult,
+    },
 }
 
 impl ControlMessage {
@@ -609,6 +649,97 @@ mod tests {
                 assert_eq!(data, vec![1, 2, 3]);
             }
             _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_agent_exec_request_roundtrip() {
+        let msg = ControlMessage::AgentExecRequest {
+            session_id: "sess-1".into(),
+            request_id: "req-1".into(),
+            command: AgentCommand::Shell {
+                cmd: "ls -la".into(),
+                cwd: Some("/workspace".into()),
+            },
+        };
+        let bytes = msg.serialize().unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        match decoded {
+            ControlMessage::AgentExecRequest {
+                session_id,
+                request_id,
+                command,
+            } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(request_id, "req-1");
+                match command {
+                    AgentCommand::Shell { cmd, cwd } => {
+                        assert_eq!(cmd, "ls -la");
+                        assert_eq!(cwd.as_deref(), Some("/workspace"));
+                    }
+                    _ => panic!("wrong command variant"),
+                }
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_agent_exec_response_all_results_roundtrip() {
+        let results = vec![
+            AgentResult::Shell {
+                stdout: "out".into(),
+                stderr: "err".into(),
+                exit_code: 1,
+            },
+            AgentResult::FileContent {
+                content: "file body".into(),
+            },
+            AgentResult::Success,
+            AgentResult::Error {
+                message: "boom".into(),
+            },
+        ];
+        for result in results {
+            let msg = ControlMessage::AgentExecResponse {
+                session_id: "s".into(),
+                request_id: "r".into(),
+                result,
+            };
+            let bytes = msg.serialize().unwrap();
+            let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+            assert!(matches!(decoded, ControlMessage::AgentExecResponse { .. }));
+        }
+    }
+
+    #[test]
+    fn test_agent_command_all_variants_roundtrip() {
+        let commands = vec![
+            AgentCommand::ReadFile { path: "a.rs".into() },
+            AgentCommand::WriteFile {
+                path: "b.rs".into(),
+                content: "fn main() {}".into(),
+            },
+            AgentCommand::ListDir { path: ".".into() },
+            AgentCommand::GitStatus,
+            AgentCommand::GitDiff { path: None },
+            AgentCommand::GitDiff {
+                path: Some("src/main.rs".into()),
+            },
+            AgentCommand::GitCommit {
+                message: "fix bug".into(),
+            },
+            AgentCommand::GitPush,
+        ];
+        for command in commands {
+            let msg = ControlMessage::AgentExecRequest {
+                session_id: "s".into(),
+                request_id: "r".into(),
+                command,
+            };
+            let bytes = msg.serialize().unwrap();
+            let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+            assert!(matches!(decoded, ControlMessage::AgentExecRequest { .. }));
         }
     }
 }
