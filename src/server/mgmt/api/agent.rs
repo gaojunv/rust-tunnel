@@ -71,16 +71,35 @@ pub async fn agent_ws(
         .into_response()
 }
 
+/// Extract the user-message content from a WebSocket message; returns None for
+/// non-text, unparseable, or non-`user_message` frames.
+fn parse_user_message(msg: Message) -> Option<String> {
+    let Message::Text(text) = msg else {
+        return None;
+    };
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return None;
+    };
+    if body.get("type").and_then(|t| t.as_str()) != Some("user_message") {
+        return None;
+    }
+    body.get("content").and_then(|c| c.as_str()).map(str::to_string)
+}
+
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
 
-    // 推送任务：event_rx → WebSocket
+    // 推送任务：event_rx → WebSocket。对端断开导致 send 失败时不再 break，而是
+    // 继续 drain event_rx——runner 内部仍是阻塞式 send().await，但只要接收端持续
+    // 消费，64 槽 channel 就不会填满，runner 永不阻塞。所有发送方 drop 后
+    // recv() 返回 None，任务自然结束；外层循环退出后仍由 push_task.abort() 兜底。
     let push_task = tokio::spawn(async move {
+        let mut sink_alive = true;
         while let Some(ev) = event_rx.recv().await {
             let text = serde_json::to_string(&ev).unwrap_or_default();
-            if ws_sink.send(Message::Text(text)).await.is_err() {
-                break;
+            if sink_alive && ws_sink.send(Message::Text(text)).await.is_err() {
+                sink_alive = false;
             }
         }
     });
@@ -94,19 +113,22 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // WebSocket connection does reload, which may lose prior tool-call
     // structure; that is the accepted MVP tradeoff.
     let mut rt_cache: Option<SessionRuntime> = None;
+    // 回合进行中对端又发来的用户消息：最多缓冲一条，当前 turn 结束后优先处理。
+    let mut pending: Option<String> = None;
 
-    while let Some(Ok(msg)) = ws_stream.next().await {
-        let Message::Text(text) = msg else {
-            continue;
-        };
-        let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if body.get("type").and_then(|t| t.as_str()) != Some("user_message") {
-            continue;
-        }
-        let Some(content) = body.get("content").and_then(|c| c.as_str()) else {
-            continue;
+    loop {
+        // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
+        let content = if let Some(p) = pending.take() {
+            p
+        } else {
+            let msg = match ws_stream.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(m)) => m,
+            };
+            match parse_user_message(msg) {
+                Some(c) => c,
+                None => continue,
+            }
         };
 
         let (agent, llm) = match (
@@ -133,7 +155,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         let msg_id = format!("{:032x}", rand::random::<u128>());
         let _ = agent
             .db
-            .agent_add_message(&msg_id, &session_id, "user", content, None)
+            .agent_add_message(&msg_id, &session_id, "user", &content, None)
             .await;
 
         // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
@@ -175,11 +197,33 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         };
 
-        // 每个用户消息串行运行一个 agent turn（同一 WebSocket 循环内 await，消息天然排队）。
-        let tx = event_tx.clone();
-        let agent = agent.clone();
-        let llm = llm.clone();
-        let result = crate::server::agent::runner::run_agent_turn(agent, llm, rt, tx).await;
+        // 每个用户消息串行运行一个 agent turn。turn 期间持续观察 ws_stream：
+        // 对端断开则丢弃 turn future（取消该回合）并退出外层循环，避免连接任务
+        // 永久挂起（read 循环不再 poll ws_stream 导致 close 永远不可见）；若 turn
+        // 期间对端又发来 user_message，缓冲到 pending，turn 结束后优先处理。
+        let turn = crate::server::agent::runner::run_agent_turn(
+            agent.clone(),
+            llm.clone(),
+            rt,
+            event_tx.clone(),
+        );
+        tokio::pin!(turn);
+        let result = loop {
+            tokio::select! {
+                r = &mut turn => break Some(r),
+                msg = ws_stream.next() => match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break None,
+                    Some(Ok(m)) => {
+                        if let Some(c) = parse_user_message(m) {
+                            pending.get_or_insert(c);
+                        }
+                    }
+                },
+            }
+        };
+        let Some(result) = result else {
+            break;
+        };
         // 仅 Exhausted 场景 runner 会发终态 error 帧；其余 Err 路径需要在此兜底，
         // 否则浏览器会一直等待。Exhausted 场景会重复一个 error 帧，MVP 下无害。
         if let Err(e) = result {
