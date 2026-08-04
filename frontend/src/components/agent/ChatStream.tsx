@@ -3,7 +3,12 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Loader2, SendHorizontal, Wrench } from 'lucide-react';
-import { agentWsUrl, listAgentMessages, updateAgentSessionModel } from '../../api/client';
+import {
+  agentWsUrl,
+  getApiErrorMessage,
+  listAgentMessages,
+  updateAgentSessionModel,
+} from '../../api/client';
 import type { AgentWsEvent } from '../../types';
 import Markdown from './Markdown';
 import ModelSelect from './ModelSelect';
@@ -176,10 +181,21 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   };
 
   const handleModelChange = (id: string) => {
+    const prev = model;
     onModelChange(id);
-    void updateAgentSessionModel(sessionId, id).catch(() => {
-      /* 失败回滚由 AgentPage invalidate 处理，此处静默 */
-    });
+    void updateAgentSessionModel(sessionId, id)
+      .then(() => {
+        // 成功后 invalidate 会话列表缓存，让顶栏/会话列表的模型回显自愈
+        void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
+      })
+      .catch((err: unknown) => {
+        // 失败：本地 state 回滚到旧值 + 用户可见错误提示
+        onModelChange(prev);
+        setItems((prevItems) => [
+          ...prevItems,
+          { kind: 'assistant', content: `⚠️ ${t('agent.modelUpdateFailed')}: ${getApiErrorMessage(err)}` },
+        ]);
+      });
   };
 
   return (

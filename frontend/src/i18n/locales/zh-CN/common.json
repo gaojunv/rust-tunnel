@@ -41,7 +41,14 @@
     "tabs": {
       "general": "通用",
       "security": "安全",
-      "appearance": "外观"
+      "appearance": "外观",
+      "agent": "Agent"
+    },
+    "agent": {
+      "title": "AI 工作台",
+      "defaultModelDesc": "会话未单独设置模型时使用的默认模型。会话可在对话内单独覆盖；修改对新消息生效。",
+      "saved": "已保存",
+      "clearDefault": "清除（使用第一个可用模型）"
     },
     "general": {
       "system": "系统",
@@ -766,6 +773,7 @@
     "selectModel": "选择模型…",
     "defaultModel": "默认模型",
     "responseTimeout": "响应超时，请重试",
+    "modelUpdateFailed": "模型更新失败，已回滚到之前的模型",
     "delete": "删除",
     "cancel": "取消",
     "confirm": "确定",

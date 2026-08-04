@@ -41,7 +41,14 @@
     "tabs": {
       "general": "General",
       "security": "Security",
-      "appearance": "Appearance"
+      "appearance": "Appearance",
+      "agent": "Agent"
+    },
+    "agent": {
+      "title": "AI Workbench",
+      "defaultModelDesc": "Default model used when a session has no model of its own. Sessions can override it per chat; changes apply to new messages.",
+      "saved": "Saved",
+      "clearDefault": "Clear (use first available model)"
     },
     "general": {
       "system": "System",
@@ -766,6 +773,7 @@
     "selectModel": "Select model…",
     "defaultModel": "Default model",
     "responseTimeout": "Response timed out, please retry",
+    "modelUpdateFailed": "Failed to update model, reverted to previous selection",
     "delete": "Delete",
     "cancel": "Cancel",
     "confirm": "Confirm",

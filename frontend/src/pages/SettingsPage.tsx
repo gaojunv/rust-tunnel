@@ -5,6 +5,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import GeneralTab from '@/components/settings/GeneralTab';
 import SecurityTab from '@/components/settings/SecurityTab';
 import AppearanceTab from '@/components/settings/AppearanceTab';
+import AgentTab from '@/components/settings/AgentTab';
 
 export default function SettingsPage() {
   const { t } = useTranslation();
@@ -37,6 +38,12 @@ export default function SettingsPage() {
           >
             {t('settings.tabs.appearance')}
           </TabsTrigger>
+          <TabsTrigger
+            value="agent"
+            className="data-[state=active]:bg-primary/10 data-[state=active]:text-primary"
+          >
+            {t('settings.tabs.agent')}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="general">
@@ -47,6 +54,9 @@ export default function SettingsPage() {
         </TabsContent>
         <TabsContent value="appearance">
           <AppearanceTab />
+        </TabsContent>
+        <TabsContent value="agent">
+          <AgentTab />
         </TabsContent>
       </Tabs>
     </div>
