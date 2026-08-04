@@ -1,1 +1,248 @@
-//! Tool execution over tunnel.
+//! Tool definitions (JSON schema) and tool-call → AgentCommand conversion.
+use crate::common::AgentCommand;
+
+/// OpenAI tools 格式的工具声明，透传给上游 LLM。
+pub fn agent_tools_schema() -> Vec<serde_json::Value> {
+    let file_props = |extra: &[(&str, serde_json::Value)]| {
+        let mut props = serde_json::json!({
+            "path": {"type": "string", "description": "Relative path within the workspace"}
+        });
+        for (k, v) in extra {
+            props[k.to_string()] = v.clone();
+        }
+        props
+    };
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a shell command in the workspace. Returns stdout/stderr/exit_code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string", "description": "The shell command to run"},
+                        "cwd": {"type": "string", "description": "Optional subdirectory of the workspace to run in"}
+                    },
+                    "required": ["cmd"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file's content from the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": file_props(&[]),
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write content to a file in the workspace (creates parent dirs).",
+                "parameters": {
+                    "type": "object",
+                    "properties": file_props(&[("content", serde_json::json!({"type": "string", "description": "Full file content to write"}))]),
+                    "required": ["path", "content"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List entries of a directory in the workspace (dirs end with '/').",
+                "parameters": {
+                    "type": "object",
+                    "properties": file_props(&[]),
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_status",
+                "description": "Show git working-tree status of the workspace.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": "Show git diff of the workspace, optionally limited to one file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Optional file to diff"}
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_commit",
+                "description": "Stage all changes and commit with the given message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Commit message"}
+                    },
+                    "required": ["message"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "git_push",
+                "description": "Push the current branch to its upstream remote.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }),
+    ]
+}
+
+fn arg_str<'a>(args: &'a serde_json::Value, key: &str, tool: &str) -> Result<&'a str, String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("tool '{tool}' requires string argument '{key}'"))
+}
+
+fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+/// Convert an LLM function call into an AgentCommand. Errors are fed back to the model.
+pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|e| format!("invalid tool arguments: {e}"))?;
+    match name {
+        "shell" => Ok(AgentCommand::Shell {
+            cmd: arg_str(&args, "cmd", name)?.to_string(),
+            cwd: arg_opt_str(&args, "cwd"),
+        }),
+        "read_file" => Ok(AgentCommand::ReadFile {
+            path: arg_str(&args, "path", name)?.to_string(),
+        }),
+        "write_file" => Ok(AgentCommand::WriteFile {
+            path: arg_str(&args, "path", name)?.to_string(),
+            content: arg_str(&args, "content", name)?.to_string(),
+        }),
+        "list_dir" => Ok(AgentCommand::ListDir {
+            path: arg_str(&args, "path", name)?.to_string(),
+        }),
+        "git_status" => Ok(AgentCommand::GitStatus),
+        "git_diff" => Ok(AgentCommand::GitDiff {
+            path: arg_opt_str(&args, "path"),
+        }),
+        "git_commit" => Ok(AgentCommand::GitCommit {
+            message: arg_str(&args, "message", name)?.to_string(),
+        }),
+        "git_push" => Ok(AgentCommand::GitPush),
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_covers_all_commands() {
+        let schema = agent_tools_schema();
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "shell", "read_file", "write_file", "list_dir",
+            "git_status", "git_diff", "git_commit", "git_push",
+        ] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    #[test]
+    fn test_parse_shell() {
+        let cmd = parse_tool_call("shell", r#"{"cmd":"ls -la","cwd":"src"}"#).unwrap();
+        match cmd {
+            AgentCommand::Shell { cmd, cwd } => {
+                assert_eq!(cmd, "ls -la");
+                assert_eq!(cwd.as_deref(), Some("src"));
+            }
+            other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shell_cwd_optional() {
+        let cmd = parse_tool_call("shell", r#"{"cmd":"pwd"}"#).unwrap();
+        match cmd {
+            AgentCommand::Shell { cwd, .. } => assert!(cwd.is_none()),
+            other => panic!("expected Shell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_write_file() {
+        let cmd =
+            parse_tool_call("write_file", r#"{"path":"a.rs","content":"fn main(){}"}"#).unwrap();
+        match cmd {
+            AgentCommand::WriteFile { path, content } => {
+                assert_eq!(path, "a.rs");
+                assert_eq!(content, "fn main(){}");
+            }
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_missing_required_arg() {
+        assert!(parse_tool_call("read_file", r"{}").is_err());
+        assert!(parse_tool_call("shell", r"{}").is_err());
+    }
+
+    #[test]
+    fn test_parse_unknown_tool() {
+        assert!(parse_tool_call("delete_everything", r"{}").is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        assert!(parse_tool_call("shell", "not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_git_variants() {
+        assert!(matches!(
+            parse_tool_call("git_status", r"{}").unwrap(),
+            AgentCommand::GitStatus
+        ));
+        assert!(matches!(
+            parse_tool_call("git_push", r"{}").unwrap(),
+            AgentCommand::GitPush
+        ));
+        match parse_tool_call("git_commit", r#"{"message":"fix"}"#).unwrap() {
+            AgentCommand::GitCommit { message } => assert_eq!(message, "fix"),
+            other => panic!("expected GitCommit, got {other:?}"),
+        }
+        match parse_tool_call("git_diff", r#"{"path":"src/a.rs"}"#).unwrap() {
+            AgentCommand::GitDiff { path } => assert_eq!(path.as_deref(), Some("src/a.rs")),
+            other => panic!("expected GitDiff, got {other:?}"),
+        }
+        match parse_tool_call("git_diff", r"{}").unwrap() {
+            AgentCommand::GitDiff { path } => assert!(path.is_none()),
+            other => panic!("expected GitDiff, got {other:?}"),
+        }
+    }
+}
