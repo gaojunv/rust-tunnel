@@ -589,6 +589,68 @@ impl Database {
         Self::migrate_llm_usage_add_failover_from(pool).await?;
         Self::migrate_rag_documents_add_file_type(pool).await?;
 
+        // ============================================================
+        // Agent workbench tables
+        // ============================================================
+
+        // Agent workspaces
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_workspaces (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                runtime_type TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                docker_image TEXT,
+                docker_container_id TEXT,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // Agent sessions
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL REFERENCES agent_workspaces(id) ON DELETE CASCADE,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                model TEXT,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // Agent messages
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_calls TEXT,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_messages_session ON agent_messages(session_id)",
+        )
+        .execute(pool)
+        .await?;
+
         Ok(())
     }
 

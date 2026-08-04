@@ -6,6 +6,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 pub mod acme;
+pub mod agent;
 pub mod clients;
 pub mod dns;
 pub mod llm;
