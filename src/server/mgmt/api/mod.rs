@@ -406,6 +406,10 @@ pub async fn run_api_server(
             put(agent::update_session).delete(agent::delete_session),
         )
         .route(
+            "/api/agent/sessions/:id/model",
+            axum::routing::patch(agent::update_session_model),
+        )
+        .route(
             "/api/agent/sessions/:id/archive",
             post(agent::archive_session),
         )

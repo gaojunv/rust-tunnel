@@ -42,6 +42,12 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateSessionModelRequest {
+    /// 空串表示清除会话模型，回退到默认解析。
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateSessionRequest {
     pub title: String,
 }
@@ -398,6 +404,28 @@ pub async fn update_session(
     }
 }
 
+pub async fn update_session_model(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateSessionModelRequest>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // 会话不存在返回 404
+    match agent.db.agent_get_session(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let model = body.model.trim();
+    let model = if model.is_empty() { None } else { Some(model) };
+    match agent.db.agent_update_session_model(&id, model).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub async fn archive_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -558,6 +586,52 @@ mod tests {
             .await
             .into_response();
         // 消息列表对不存在的会话返回 404
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_update_session_model_endpoint() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 设置模型
+        let resp = update_session_model(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(UpdateSessionModelRequest {
+                model: "claude-opus-5".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5"));
+
+        // 空串清除
+        let resp = update_session_model(
+            State(state.clone()),
+            Path("s1".to_string()),
+            Json(UpdateSessionModelRequest { model: "  ".into() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(db.agent_get_session("s1").await.unwrap().unwrap().model.is_none());
+
+        // 不存在的会话 → 404
+        let resp = update_session_model(
+            State(state),
+            Path("nope".to_string()),
+            Json(UpdateSessionModelRequest { model: "x".into() }),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
