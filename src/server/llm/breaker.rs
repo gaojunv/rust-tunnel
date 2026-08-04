@@ -321,8 +321,8 @@ mod tests {
         b.force_cooldown_elapsed_for_test("m1");
         assert!(b.allow("m1")); // 抢到试探权，probe_in_flight=true
         assert!(!b.allow("m1")); // 单飞：并发请求被拒
-        // 不 record_* —— 模拟试探请求被客户端断开（record_success/failure 均不执行）
-        // 把 opened_at 拨到冷却 + 301s 之后（超过冷却 + 上游读超时 300s）→ 陈旧
+                                 // 不 record_* —— 模拟试探请求被客户端断开（record_success/failure 均不执行）
+                                 // 把 opened_at 拨到冷却 + 301s 之后（超过冷却 + 上游读超时 300s）→ 陈旧
         b.force_probe_stale_for_test("m1");
         assert!(b.allow("m1"), "陈旧试探应被回收，允许重新夺取");
         // 回收后仍保持单飞（重新夺取的试探在飞）
@@ -348,7 +348,8 @@ mod tests {
             let mut map = b.inner.lock().unwrap();
             let entry = map.get_mut("m1").unwrap();
             let open = entry.open.as_mut().unwrap();
-            open.opened_at = std::time::Instant::now() - open.cooldown - std::time::Duration::from_secs(1);
+            open.opened_at =
+                std::time::Instant::now() - open.cooldown - std::time::Duration::from_secs(1);
         }
         assert!(!b.allow("m1"), "窗口内的在飞试探不应被回收");
     }

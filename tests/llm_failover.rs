@@ -99,17 +99,16 @@ impl MockUpstream {
                         }
                     }
                     let body = String::from_utf8_lossy(&buf[header_end..]).to_string();
-                    recorded.lock().unwrap().push(RecordedRequest { body: body.clone() });
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(RecordedRequest { body: body.clone() });
                     hits.fetch_add(1, Ordering::SeqCst);
 
                     let is_stream = body.contains("\"stream\":true");
                     let response = match behavior {
-                        MockBehavior::Always500 => {
-                            mock_error_response("500 Internal Server Error")
-                        }
-                        MockBehavior::Always503 => {
-                            mock_error_response("503 Service Unavailable")
-                        }
+                        MockBehavior::Always500 => mock_error_response("500 Internal Server Error"),
+                        MockBehavior::Always503 => mock_error_response("503 Service Unavailable"),
                         MockBehavior::Ok => {
                             if is_stream {
                                 mock_sse_response()
@@ -124,7 +123,11 @@ impl MockUpstream {
             }
         });
 
-        Self { addr, recorded, hits }
+        Self {
+            addr,
+            recorded,
+            hits,
+        }
     }
 
     fn url(&self) -> String {
@@ -270,7 +273,11 @@ async fn create_provider_model(
             }),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED, "create provider failed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create provider failed: {body}"
+    );
     let pid = body["id"].as_str().unwrap().to_string();
 
     let (status, body) = api
@@ -306,7 +313,10 @@ async fn create_group_with_members(
             json!({"members": member_json}),
         )
         .await;
-    assert!(status.is_success(), "replace members failed: {status} {body}");
+    assert!(
+        status.is_success(),
+        "replace members failed: {status} {body}"
+    );
     gid
 }
 
@@ -373,7 +383,11 @@ async fn model_groups_mgmt_api() {
             }),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED, "create provider failed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create provider failed: {body}"
+    );
     let pid = body["id"].as_str().unwrap().to_string();
 
     let (status, body) = api
@@ -691,7 +705,10 @@ async fn e2e_breaker_opens_and_manual_reset() {
         assert_eq!(bad_member["breaker"]["state"], "open");
         assert_eq!(bad_member["breaker"]["consecutive_failures"], 5);
         assert!(
-            bad_member["breaker"]["cooldown_remaining_secs"].as_u64().unwrap() > 0,
+            bad_member["breaker"]["cooldown_remaining_secs"]
+                .as_u64()
+                .unwrap()
+                > 0,
             "open 时应有剩余冷却秒数"
         );
 

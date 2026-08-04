@@ -417,10 +417,11 @@ pub async fn call_upstream_stream_guarded(
         })??;
 
     // 拼"前缀 replay + 剩余流"的响应体
-    let prefix_stream = futures_util::stream::once(async move {
-        Ok::<_, std::io::Error>(prefix)
+    let prefix_stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(prefix) });
+    let rest_stream = stream.map(|r| {
+        r.map(|b| b.to_vec())
+            .map_err(|e| std::io::Error::other(e.to_string()))
     });
-    let rest_stream = stream.map(|r| r.map(|b| b.to_vec()).map_err(|e| std::io::Error::other(e.to_string())));
     let body = Body::from_stream(prefix_stream.chain(rest_stream));
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -490,7 +491,8 @@ pub async fn execute_with_failover(
         // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
         // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
         let result = if stream && chain.candidates.len() > 1 {
-            call_upstream_stream_guarded(&cand.provider.base_url, &cand.provider.api_key, &body).await
+            call_upstream_stream_guarded(&cand.provider.base_url, &cand.provider.api_key, &body)
+                .await
         } else {
             call_upstream_with_body(&cand.provider.base_url, &cand.provider.api_key, &body).await
         };
@@ -1072,10 +1074,14 @@ mod tests {
         // 默认（无 extra_config / 无该 key）为 true
         assert!(failover_on_429_enabled(None));
         assert!(failover_on_429_enabled(Some("{}")));
-        assert!(failover_on_429_enabled(Some(r#"{"compat_tool_history":true}"#)));
+        assert!(failover_on_429_enabled(Some(
+            r#"{"compat_tool_history":true}"#
+        )));
         // 显式配置
         assert!(failover_on_429_enabled(Some(r#"{"failover_on_429":true}"#)));
-        assert!(!failover_on_429_enabled(Some(r#"{"failover_on_429":false}"#)));
+        assert!(!failover_on_429_enabled(Some(
+            r#"{"failover_on_429":false}"#
+        )));
         // 非法 JSON 保守默认 true
         assert!(failover_on_429_enabled(Some("not-json")));
     }
@@ -1110,16 +1116,14 @@ mod tests {
         });
 
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let resp = call_upstream_stream_guarded(
-            &format!("http://{}", addr),
-            "k",
-            &req_body,
-        )
-        .await
-        .unwrap();
+        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // 读全量 body：应包含两个 chunk（前缀 replay + 续传）
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("hel"));
         assert!(text.contains("lo"));
@@ -1216,14 +1220,19 @@ mod tests {
     /// 测试辅助：起一个行为可控的 mock 上游（每个连接调 handler 一次）。
     async fn start_behavior_upstream<F>(mut on_conn: F) -> String
     where
-        F: FnMut(tokio::net::TcpStream) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-            + Send + 'static,
+        F: FnMut(
+                tokio::net::TcpStream,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + 'static,
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((sock, _)) = listener.accept().await else { break };
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
                 on_conn(sock).await;
             }
         });
@@ -1283,21 +1292,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_failover_first_candidate_500_then_success() {
-        let bad = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
-        })).await;
-        let good = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "200 OK", ok_sse_response_body()).await;
-        })).await;
+        let bad = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+            })
+        })
+        .await;
+        let good = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+            })
+        })
+        .await;
 
         let breakers = crate::server::llm::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let out = execute_with_failover(&breakers, &chain, &body, true).await;
-        let FailoverOutcome::Success { resp, candidate, failed_over } = out else {
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+        } = out
+        else {
             panic!("expected success");
         };
         assert!(failed_over);
@@ -1311,30 +1331,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_failover_exhausted_returns_last_error() {
-        let bad1 = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
-        })).await;
-        let bad2 = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "503 Service Unavailable", "{\"e\":2}").await;
-        })).await;
+        let bad1 = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+            })
+        })
+        .await;
+        let bad2 = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "503 Service Unavailable", "{\"e\":2}").await;
+            })
+        })
+        .await;
 
         let breakers = crate::server::llm::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         let out = execute_with_failover(&breakers, &chain, &body, false).await;
-        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+        let FailoverOutcome::Exhausted {
+            status,
+            failed_over,
+            ..
+        } = out
+        else {
             panic!("expected exhausted");
         };
         assert!(failed_over);
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "返回最后一个候选的错误");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "返回最后一个候选的错误"
+        );
     }
 
     #[tokio::test]
     async fn test_failover_400_not_retryable() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
         let hits = Arc::new(AtomicUsize::new(0));
         let h1 = hits.clone();
         let bad = start_behavior_upstream(move |mut s| {
@@ -1344,7 +1382,8 @@ mod tests {
                 drain_request(&mut s).await;
                 write_http(&mut s, "400 Bad Request", "{\"e\":\"bad\"}").await;
             })
-        }).await;
+        })
+        .await;
         let h2 = hits.clone();
         let never = start_behavior_upstream(move |mut s| {
             let h = h2.clone();
@@ -1353,14 +1392,20 @@ mod tests {
                 drain_request(&mut s).await;
                 write_http(&mut s, "200 OK", ok_sse_response_body()).await;
             })
-        }).await;
+        })
+        .await;
 
         let breakers = crate::server::llm::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         let out = execute_with_failover(&breakers, &chain, &body, false).await;
-        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+        let FailoverOutcome::Exhausted {
+            status,
+            failed_over,
+            ..
+        } = out
+        else {
             panic!("expected exhausted (400 应立即终止)");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1372,7 +1417,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_failover_skips_broken_candidate() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
         let bad_hits = Arc::new(AtomicUsize::new(0));
         let bh = bad_hits.clone();
         let bad = start_behavior_upstream(move |mut s| {
@@ -1382,11 +1430,15 @@ mod tests {
                 drain_request(&mut s).await;
                 write_http(&mut s, "500 Internal Server Error", "{}").await;
             })
-        }).await;
-        let good = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "200 OK", ok_sse_response_body()).await;
-        })).await;
+        })
+        .await;
+        let good = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+            })
+        })
+        .await;
 
         let breakers = crate::server::llm::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
@@ -1421,7 +1473,12 @@ mod tests {
         }
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
         let out = execute_with_failover(&breakers, &chain, &body, false).await;
-        let FailoverOutcome::Exhausted { status, message, failed_over } = out else {
+        let FailoverOutcome::Exhausted {
+            status,
+            message,
+            failed_over,
+        } = out
+        else {
             panic!("expected exhausted");
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1461,7 +1518,10 @@ mod tests {
         let started = std::time::Instant::now();
         let out = execute_with_failover(&breakers, &chain, &body, true).await;
         let ttfb = started.elapsed();
-        let FailoverOutcome::Success { resp, failed_over, .. } = out else {
+        let FailoverOutcome::Success {
+            resp, failed_over, ..
+        } = out
+        else {
             panic!("expected success");
         };
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1485,10 +1545,13 @@ mod tests {
         // 首选熔断跳过（allow=false 不计 attempts）+ 备选被尝试且失败 → attempts==1。
         // 修复前 failed_over 用 attempts>1 判定 → false（归因错误，model_name 记为首选）；
         // 修复后按 last_attempted（备选）≠ 首选判定 → true。
-        let backup = start_behavior_upstream(|mut s| Box::pin(async move {
-            drain_request(&mut s).await;
-            write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
-        })).await;
+        let backup = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "500 Internal Server Error", "{\"e\":1}").await;
+            })
+        })
+        .await;
 
         let breakers = crate::server::llm::breaker::ModelBreakers::new();
         // 手动机 5 连败把首选熔断
@@ -1502,7 +1565,12 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         let out = execute_with_failover(&breakers, &chain, &body, false).await;
-        let FailoverOutcome::Exhausted { status, failed_over, .. } = out else {
+        let FailoverOutcome::Exhausted {
+            status,
+            failed_over,
+            ..
+        } = out
+        else {
             panic!("expected exhausted");
         };
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

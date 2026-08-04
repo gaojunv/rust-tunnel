@@ -388,10 +388,22 @@ mod tests {
         let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k",
-            None::<&str>, None::<&str>, true).await.unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
         for (id, name, alias) in models {
-            db.llm_save_model(id, "p1", name, alias, "[]", true).await.unwrap();
+            db.llm_save_model(id, "p1", name, alias, "[]", true)
+                .await
+                .unwrap();
         }
         let state = LlmState::new(Some(db), None);
         (tmp, state)
@@ -400,7 +412,9 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_single_model_chain() {
         let (_t, state) = state_with_models(&[("m1", "deepseek-chat", "")]).await;
-        let chain = resolve_with_failover(&state, "deepseek-chat").await.unwrap();
+        let chain = resolve_with_failover(&state, "deepseek-chat")
+            .await
+            .unwrap();
         assert!(chain.group_name.is_none());
         assert_eq!(chain.candidates.len(), 1);
         assert_eq!(chain.candidates[0].model_name, "deepseek-chat");
@@ -413,16 +427,26 @@ mod tests {
             ("m1", "model-a", ""),
             ("m2", "model-b", ""),
             ("m3", "model-c", ""),
-        ]).await;
+        ])
+        .await;
         let db = state.db.as_ref().unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
-        db.llm_replace_group_members("g1", &[
-            ("m3".into(), 3), ("m1".into(), 1), ("m2".into(), 2),
-        ]).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members(
+            "g1",
+            &[("m3".into(), 3), ("m1".into(), 1), ("m2".into(), 2)],
+        )
+        .await
+        .unwrap();
 
         let chain = resolve_with_failover(&state, "router").await.unwrap();
         assert_eq!(chain.group_name.as_deref(), Some("router"));
-        let names: Vec<&str> = chain.candidates.iter().map(|c| c.model_name.as_str()).collect();
+        let names: Vec<&str> = chain
+            .candidates
+            .iter()
+            .map(|c| c.model_name.as_str())
+            .collect();
         assert_eq!(names, ["model-a", "model-b", "model-c"]);
         let prios: Vec<i64> = chain.candidates.iter().map(|c| c.priority).collect();
         assert_eq!(prios, [1, 2, 3]);
@@ -433,7 +457,9 @@ mod tests {
         // 解析优先级：model_name 先于组名——同名时组被遮蔽。
         let (_t, state) = state_with_models(&[("m1", "router", "")]).await;
         let db = state.db.as_ref().unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
 
         let chain = resolve_with_failover(&state, "router").await.unwrap();
         assert!(chain.group_name.is_none(), "model_name 命中时组不生效");
@@ -442,15 +468,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_filters_disabled_member() {
-        let (_t, state) = state_with_models(&[
-            ("m1", "model-a", ""),
-            ("m2", "model-b", ""),
-        ]).await;
+        let (_t, state) = state_with_models(&[("m1", "model-a", ""), ("m2", "model-b", "")]).await;
         let db = state.db.as_ref().unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
-        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m2".into(), 2)]).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m2".into(), 2)])
+            .await
+            .unwrap();
         // 禁用 m1
-        db.llm_save_model("m1", "p1", "model-a", "", "[]", false).await.unwrap();
+        db.llm_save_model("m1", "p1", "model-a", "", "[]", false)
+            .await
+            .unwrap();
 
         let chain = resolve_with_failover(&state, "router").await.unwrap();
         assert_eq!(chain.candidates.len(), 1);
@@ -461,9 +490,15 @@ mod tests {
     async fn test_group_empty_after_filter_is_not_found() {
         let (_t, state) = state_with_models(&[("m1", "model-a", "")]).await;
         let db = state.db.as_ref().unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
-        db.llm_replace_group_members("g1", &[("m1".into(), 1)]).await.unwrap();
-        db.llm_save_model("m1", "p1", "model-a", "", "[]", false).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1)])
+            .await
+            .unwrap();
+        db.llm_save_model("m1", "p1", "model-a", "", "[]", false)
+            .await
+            .unwrap();
 
         let err = resolve_with_failover(&state, "router").await.unwrap_err();
         assert!(matches!(err, ResolveError::ModelNotFound(_)));
@@ -473,8 +508,12 @@ mod tests {
     async fn test_group_disabled_is_not_found() {
         let (_t, state) = state_with_models(&[("m1", "model-a", "")]).await;
         let db = state.db.as_ref().unwrap();
-        db.llm_create_model_group("g1", "router", false).await.unwrap();
-        db.llm_replace_group_members("g1", &[("m1".into(), 1)]).await.unwrap();
+        db.llm_create_model_group("g1", "router", false)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1)])
+            .await
+            .unwrap();
 
         let err = resolve_with_failover(&state, "router").await.unwrap_err();
         assert!(matches!(err, ResolveError::ModelNotFound(_)));
@@ -485,14 +524,40 @@ mod tests {
         // provider 被禁用时其下组成员被过滤
         let (_t, state) = state_with_models(&[("m1", "model-a", ""), ("m2", "model-b", "")]).await;
         let db = state.db.as_ref().unwrap();
-        db.llm_save_provider("p2", "Kimi", "kimi", "https://api.moonshot.cn", "k2",
-            None::<&str>, None::<&str>, true).await.unwrap();
-        db.llm_save_model("m3", "p2", "kimi-k2", "", "[]", true).await.unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
-        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m3".into(), 2)]).await.unwrap();
+        db.llm_save_provider(
+            "p2",
+            "Kimi",
+            "kimi",
+            "https://api.moonshot.cn",
+            "k2",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model("m3", "p2", "kimi-k2", "", "[]", true)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m3".into(), 2)])
+            .await
+            .unwrap();
         // 禁用 p2
-        db.llm_save_provider("p2", "Kimi", "kimi", "https://api.moonshot.cn", "k2",
-            None::<&str>, None::<&str>, false).await.unwrap();
+        db.llm_save_provider(
+            "p2",
+            "Kimi",
+            "kimi",
+            "https://api.moonshot.cn",
+            "k2",
+            None::<&str>,
+            None::<&str>,
+            false,
+        )
+        .await
+        .unwrap();
 
         let chain = resolve_with_failover(&state, "router").await.unwrap();
         assert_eq!(chain.candidates.len(), 1);

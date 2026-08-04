@@ -716,12 +716,11 @@ impl Database {
     }
 
     pub async fn llm_group_member_count(&self, group_id: &str) -> Result<i64, sqlx::Error> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM llm_model_group_members WHERE group_id = ?",
-        )
-        .bind(group_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM llm_model_group_members WHERE group_id = ?")
+                .bind(group_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.0)
     }
 
@@ -732,13 +731,12 @@ impl Database {
         name: &str,
         exclude_group_id: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        let model_hit: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM llm_models WHERE model_name = ? OR alias = ?",
-        )
-        .bind(name)
-        .bind(name)
-        .fetch_one(&self.pool)
-        .await?;
+        let model_hit: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM llm_models WHERE model_name = ? OR alias = ?")
+                .bind(name)
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
         if model_hit.0 > 0 {
             return Ok(true);
         }
@@ -1146,7 +1144,11 @@ mod tests {
         assert_eq!(g.enabled, 1);
 
         // 按名查
-        let by_name = db.llm_find_group_by_name("smart-router").await.unwrap().unwrap();
+        let by_name = db
+            .llm_find_group_by_name("smart-router")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(by_name.id, "g1");
 
         // 改名 + 禁用
@@ -1173,9 +1175,18 @@ mod tests {
             .unwrap();
 
         // 准备 provider + 2 个模型
-        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
         db.llm_save_model("m1", "p1", "deepseek-chat", "chat", "[]", true)
             .await
             .unwrap();
@@ -1183,7 +1194,9 @@ mod tests {
             .await
             .unwrap();
 
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
         db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m2".into(), 2)])
             .await
             .unwrap();
@@ -1212,13 +1225,24 @@ mod tests {
         let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
         db.llm_save_model("m1", "p1", "deepseek-chat", "", "[]", true)
             .await
             .unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
         db.llm_replace_group_members("g1", &[("m1".into(), 1)])
             .await
             .unwrap();
@@ -1235,19 +1259,42 @@ mod tests {
         let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        db.llm_save_provider("p1", "DS", "deepseek", "https://api.deepseek.com", "k", None::<&str>, None::<&str>, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
         db.llm_save_model("m1", "p1", "deepseek-chat", "chat-alias", "[]", true)
             .await
             .unwrap();
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
 
-        assert!(db.llm_group_name_conflicts("deepseek-chat", None).await.unwrap()); // 撞 model_name
-        assert!(db.llm_group_name_conflicts("chat-alias", None).await.unwrap());    // 撞 alias
-        assert!(db.llm_group_name_conflicts("router", None).await.unwrap());        // 撞其他组名
-        assert!(!db.llm_group_name_conflicts("router", Some("g1")).await.unwrap()); // 排除自身
-        assert!(!db.llm_group_name_conflicts("free-name", None).await.unwrap());
+        assert!(db
+            .llm_group_name_conflicts("deepseek-chat", None)
+            .await
+            .unwrap()); // 撞 model_name
+        assert!(db
+            .llm_group_name_conflicts("chat-alias", None)
+            .await
+            .unwrap()); // 撞 alias
+        assert!(db.llm_group_name_conflicts("router", None).await.unwrap()); // 撞其他组名
+        assert!(!db
+            .llm_group_name_conflicts("router", Some("g1"))
+            .await
+            .unwrap()); // 排除自身
+        assert!(!db
+            .llm_group_name_conflicts("free-name", None)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

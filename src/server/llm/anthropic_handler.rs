@@ -1261,7 +1261,9 @@ mod tests {
         let bad_addr = bad_listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = bad_listener.accept().await else { break };
+                let Ok((mut s, _)) = bad_listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 16384];
                     let _ = s.read(&mut buf).await;
@@ -1279,7 +1281,9 @@ mod tests {
         let good_addr = good_listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = good_listener.accept().await else { break };
+                let Ok((mut s, _)) = good_listener.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 16384];
                     let _ = s.read(&mut buf).await;
