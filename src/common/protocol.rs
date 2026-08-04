@@ -152,6 +152,8 @@ pub enum ControlMessage {
     AgentExecRequest {
         session_id: String,
         request_id: String,
+        /// Workspace root directory on the client; the executor sandboxes into it
+        root_path: String,
         command: AgentCommand,
     },
     /// Client returns the result of an agent command
@@ -657,6 +659,7 @@ mod tests {
         let msg = ControlMessage::AgentExecRequest {
             session_id: "sess-1".into(),
             request_id: "req-1".into(),
+            root_path: "/workspace".into(),
             command: AgentCommand::Shell {
                 cmd: "ls -la".into(),
                 cwd: Some("/workspace".into()),
@@ -668,10 +671,12 @@ mod tests {
             ControlMessage::AgentExecRequest {
                 session_id,
                 request_id,
+                root_path,
                 command,
             } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(request_id, "req-1");
+                assert_eq!(root_path, "/workspace");
                 match command {
                     AgentCommand::Shell { cmd, cwd } => {
                         assert_eq!(cmd, "ls -la");
@@ -735,6 +740,7 @@ mod tests {
             let msg = ControlMessage::AgentExecRequest {
                 session_id: "s".into(),
                 request_id: "r".into(),
+                root_path: "/workspace".into(),
                 command,
             };
             let bytes = msg.serialize().unwrap();

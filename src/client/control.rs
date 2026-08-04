@@ -230,6 +230,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     ControlMessage::AgentExecRequest {
                         session_id,
                         request_id,
+                        root_path,
                         command,
                     } => {
                         let sender = state.control_sender.clone();
@@ -247,10 +248,9 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                             });
                             continue;
                         }
-                        // MVP: sandbox root is the client process cwd; Task 13
-                        // will deliver an explicit root_path via the protocol.
-                        let root = std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        // Sandbox root comes from the server-side workspace config
+                        // delivered in the request.
+                        let root = std::path::PathBuf::from(root_path);
                         tokio::spawn(async move {
                             let result = crate::client::agent::handle_exec_request(
                                 &command,
@@ -707,6 +707,7 @@ mod tests {
         ControlMessage::AgentExecRequest {
             session_id: "s".into(),
             request_id: "r1".into(),
+            root_path: ".".into(),
             command: crate::common::AgentCommand::Shell {
                 cmd: "echo hi".into(),
                 cwd: None,
@@ -754,6 +755,7 @@ mod tests {
         ControlMessage::AgentExecRequest {
             session_id: "s".into(),
             request_id: "r2".into(),
+            root_path: ".".into(),
             command: crate::common::AgentCommand::Shell {
                 cmd: "echo hello-agent".into(),
                 cwd: None,

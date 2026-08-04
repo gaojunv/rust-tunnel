@@ -305,6 +305,7 @@ impl ClientRegistry {
         &self,
         client_name: &str,
         session_id: &str,
+        root_path: &str,
         command: crate::common::AgentCommand,
         timeout: std::time::Duration,
     ) -> std::io::Result<crate::common::AgentResult> {
@@ -329,6 +330,7 @@ impl ClientRegistry {
             .send(ControlMessage::AgentExecRequest {
                 session_id: session_id.to_string(),
                 request_id: request_id.clone(),
+                root_path: root_path.to_string(),
                 command,
             })
             .await;
@@ -494,6 +496,7 @@ mod tests {
             .agent_exec(
                 "ghost",
                 "sess",
+                "/workspace",
                 crate::common::AgentCommand::GitStatus,
                 std::time::Duration::from_secs(1),
             )
@@ -522,8 +525,10 @@ mod tests {
                 ControlMessage::AgentExecRequest {
                     session_id,
                     request_id,
+                    root_path,
                     ..
                 } => {
+                    assert_eq!(root_path, "/workspace");
                     registry2
                         .deliver_agent_response(
                             "nas",
@@ -541,6 +546,7 @@ mod tests {
             .agent_exec(
                 "nas",
                 "sess",
+                "/workspace",
                 crate::common::AgentCommand::GitPush,
                 std::time::Duration::from_secs(2),
             )
@@ -565,6 +571,7 @@ mod tests {
             .agent_exec(
                 "nas",
                 "sess",
+                "/workspace",
                 crate::common::AgentCommand::GitPush,
                 std::time::Duration::from_millis(100),
             )
