@@ -92,6 +92,7 @@
     "ai": "AI",
     "llmGateway": "LLM 网关",
     "knowledgeBase": "知识库",
+    "agentWorkbench": "AI 工作台",
     "system": "系统",
     "logs": "日志",
     "settings": "设置",

@@ -92,6 +92,7 @@
     "ai": "AI",
     "llmGateway": "LLM Gateway",
     "knowledgeBase": "Knowledge Base",
+    "agentWorkbench": "AI Workbench",
     "system": "System",
     "logs": "Logs",
     "settings": "Settings",

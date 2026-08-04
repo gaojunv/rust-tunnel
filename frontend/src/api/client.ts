@@ -42,6 +42,9 @@ import type {
   TestEmbeddingResult,
   LlmModelGroup,
   LlmModelGroupDetail,
+  AgentWorkspace,
+  AgentSession,
+  AgentMessage,
 } from '../types';
 
 const API_BASE = '/api';
@@ -527,6 +530,57 @@ export async function replaceGroupMembers(
 export async function resetGroupBreaker(id: string): Promise<{ reset: number }> {
   const { data } = await api.post(`/llm/model-groups/${id}/reset-breaker`, {});
   return data;
+}
+
+// ── Agent Workbench ───────────────────────────────────────────
+
+export async function listAgentWorkspaces(): Promise<AgentWorkspace[]> {
+  const { data } = await api.get('/agent/workspaces');
+  return data;
+}
+
+export async function createAgentWorkspace(body: {
+  name: string;
+  client_id: string;
+  runtime_type: string;
+  root_path: string;
+  docker_image?: string;
+}): Promise<AgentWorkspace> {
+  const { data } = await api.post('/agent/workspaces', body);
+  return data;
+}
+
+export async function deleteAgentWorkspace(id: string): Promise<void> {
+  await api.delete(`/agent/workspaces/${id}`);
+}
+
+export async function listAgentSessions(workspaceId: string): Promise<AgentSession[]> {
+  const { data } = await api.get(`/agent/workspaces/${workspaceId}/sessions`);
+  return data;
+}
+
+export async function createAgentSession(
+  workspaceId: string,
+  title?: string,
+  model?: string
+): Promise<AgentSession> {
+  const { data } = await api.post(`/agent/workspaces/${workspaceId}/sessions`, { title, model });
+  return data;
+}
+
+export async function deleteAgentSession(id: string): Promise<void> {
+  await api.delete(`/agent/sessions/${id}`);
+}
+
+export async function listAgentMessages(sessionId: string): Promise<AgentMessage[]> {
+  const { data } = await api.get(`/agent/sessions/${sessionId}/messages`);
+  return data;
+}
+
+export function agentWsUrl(sessionId: string): string {
+  const token = localStorage.getItem('auth_token') ?? '';
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/api/agent/ws?session_id=${sessionId}&token=${encodeURIComponent(token)}`;
 }
 
 /**

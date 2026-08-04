@@ -516,3 +516,46 @@ export interface TestEmbeddingResult {
   latency_ms: number;
 }
 
+// === Agent Workbench ===
+
+export interface AgentWorkspace {
+  id: string;
+  name: string;
+  client_id: string;
+  runtime_type: 'host' | 'docker';
+  root_path: string;
+  docker_image?: string;
+  docker_container_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentSession {
+  id: string;
+  workspace_id: string;
+  title?: string;
+  status: 'active' | 'archived';
+  model?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentMessage {
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_calls?: string;
+  created_at: string;
+}
+
+export interface AgentWsEvent {
+  type: 'assistant_chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  content?: string;
+  id?: string;
+  name?: string;
+  args?: string;
+  result?: string;
+  message?: string;
+}
+

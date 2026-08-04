@@ -17,6 +17,7 @@ import ClientDetailPage from './pages/ClientDetailPage';
 import SettingsPage from './pages/SettingsPage';
 import LLMPage from './pages/LLMPage';
 import KbPage from './pages/KbPage';
+import AgentPage from './pages/AgentPage';
 import AppLayout from './components/layout/AppLayout';
 import './index.css';
 
@@ -63,6 +64,7 @@ const router = createBrowserRouter([
           { path: '/clients/:name', element: <ClientDetailPage /> },
           { path: '/llm', element: <LLMPage /> },
           { path: '/llm/kb', element: <KbPage /> },
+          { path: '/agent', element: <AgentPage /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },
