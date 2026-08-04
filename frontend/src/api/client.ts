@@ -578,6 +578,19 @@ export async function listAgentMessages(sessionId: string): Promise<AgentMessage
   return data;
 }
 
+export async function updateAgentSessionModel(id: string, model: string): Promise<void> {
+  await api.patch(`/agent/sessions/${id}/model`, { model });
+}
+
+export async function getAgentDefaultModel(): Promise<string> {
+  const { data } = await api.get('/agent/default-model');
+  return data.model ?? '';
+}
+
+export async function putAgentDefaultModel(model: string): Promise<void> {
+  await api.put('/agent/default-model', { model });
+}
+
 export function agentWsUrl(sessionId: string): string {
   const token = localStorage.getItem('auth_token') ?? '';
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
