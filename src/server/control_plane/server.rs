@@ -154,6 +154,13 @@ async fn handle_client_connection(
                         conns.remove(&connection_id);
                     }
                 }
+                ControlMessage::AgentExecResponse {
+                    request_id, result, ..
+                } => {
+                    registry
+                        .deliver_agent_response(&entry.name, &request_id, result)
+                        .await;
+                }
                 ControlMessage::Data {
                     connection_id,
                     data,
