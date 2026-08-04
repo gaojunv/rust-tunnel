@@ -120,6 +120,26 @@ pub async fn agent_ws(
         .into_response()
 }
 
+/// 会话模型「下一条消息生效」：每轮从 DB 重读 `session.model`，若已设置（非空）
+/// 且与运行时当前模型不同则覆盖。`session.model` 为 `None` 表示回退默认——保持
+/// `SessionRuntime::load` 的加载路径语义（此时 `rt.model` 已在 load/首轮解析为
+/// 默认或第一个可用模型），不据此覆盖，避免把已解析的模型改写为空串。
+async fn refresh_session_model(
+    db: &crate::server::db::Database,
+    session_id: &str,
+    rt_model: &mut String,
+) {
+    let Ok(Some(session)) = db.agent_get_session(session_id).await else {
+        return;
+    };
+    if let Some(model) = session.model {
+        let model = model.trim();
+        if !model.is_empty() && model != rt_model {
+            *rt_model = model.to_string();
+        }
+    }
+}
+
 /// Extract the user-message content from a WebSocket message; returns None for
 /// non-text, unparseable, or non-`user_message` frames.
 fn parse_user_message(msg: Message) -> Option<String> {
@@ -212,6 +232,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
         let rt = match rt_cache.as_mut() {
             Some(rt) => {
+                // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
+                // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
+                refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
                 rt.messages.push(ChatMessage::text("user", content));
                 rt
             }
@@ -682,6 +705,39 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_session_model_applies_patched_model() {
+        let (_state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+
+        // 会话模型已在 load 时解析为 gpt-4o；PATCH 落库新模型后，下一轮重读应覆盖。
+        let mut rt_model = "gpt-4o".to_string();
+        db.agent_update_session_model("s1", Some("claude-opus-5"))
+            .await
+            .unwrap();
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 模型值相同 → 保持原值，无多余写。
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 清除（None）→ 回退默认语义：保持加载路径已解析的模型，不覆盖为空串。
+        db.agent_update_session_model("s1", None).await.unwrap();
+        refresh_session_model(&db, "s1", &mut rt_model).await;
+        assert_eq!(rt_model, "claude-opus-5");
+
+        // 不存在的会话 → 静默保持原模型。
+        let mut other = "keep".to_string();
+        refresh_session_model(&db, "ghost", &mut other).await;
+        assert_eq!(other, "keep");
     }
 
     #[tokio::test]
