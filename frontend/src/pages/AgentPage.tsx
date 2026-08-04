@@ -8,6 +8,7 @@ import {
   createAgentSession,
   getAgentDefaultModel,
 } from '../api/client';
+import { listAgentSelectableModels } from '../api/agentModels';
 import type { AgentWorkspace, AgentSession } from '../types';
 import ChatStream from '../components/agent/ChatStream';
 import WorkspaceBar from '../components/agent/WorkspaceBar';
@@ -44,6 +45,13 @@ export default function AgentPage() {
     staleTime: 60_000,
   });
 
+  // 可用模型（会话与全局默认均未设置时回退第一个可用模型，与后端行为一致）
+  const { data: selectableModels } = useQuery({
+    queryKey: ['agent-selectable-models'],
+    queryFn: listAgentSelectableModels,
+    staleTime: 60_000,
+  });
+
   // 只有一个 workspace 时自动选中
   useEffect(() => {
     if (!workspaceId && workspaces?.length === 1) {
@@ -65,11 +73,15 @@ export default function AgentPage() {
     }
   }, [sessions, workspaceId, sessionId]);
 
-  // 会话切换：回显其模型（空则回退全局默认）
+  // 会话切换：回显其模型（空则回退全局默认，再空则回退第一个可用模型，与后端一致）
   useEffect(() => {
     const cur = sessions?.find((s) => s.id === sessionId);
-    setModel(cur?.model || defaultModel || '');
-  }, [sessionId, sessions, defaultModel]);
+    const sessionModel = cur?.model?.trim();
+    const globalDefault = defaultModel?.trim();
+    const fallback =
+      selectableModels?.models[0]?.id || selectableModels?.groups[0]?.id || '';
+    setModel(sessionModel || globalDefault || fallback);
+  }, [sessionId, sessions, defaultModel, selectableModels]);
 
   const handleNewSession = async () => {
     if (!workspaceId) return;

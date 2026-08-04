@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { listAgentWorkspaces, deleteAgentWorkspace } from '../../api/client';
+import { listAgentWorkspaces, deleteAgentWorkspace, getApiErrorMessage } from '../../api/client';
 import type { AgentWorkspace } from '../../types';
 
 interface Props {
@@ -17,6 +17,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const { data: workspaces } = useQuery<AgentWorkspace[]>({
     queryKey: ['agent-workspaces'],
     queryFn: listAgentWorkspaces,
@@ -24,14 +25,25 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew }: Props) {
 
   const handleDelete = async () => {
     if (!workspaceId) return;
-    await deleteAgentWorkspace(workspaceId);
-    setConfirming(false);
-    queryClient.invalidateQueries({ queryKey: ['agent-workspaces'] });
-    onSelect(''); // 清空选中，回到引导态
+    try {
+      await deleteAgentWorkspace(workspaceId);
+      setError(null);
+      setConfirming(false);
+      queryClient.invalidateQueries({ queryKey: ['agent-workspaces'] });
+      onSelect(''); // 清空选中，回到引导态
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+      setConfirming(false);
+    }
   };
 
   return (
     <div className="flex items-center gap-2">
+      {error && (
+        <span className="text-xs text-destructive" role="alert" aria-live="polite">
+          {error}
+        </span>
+      )}
       <select
         value={workspaceId}
         onChange={(e) => onSelect(e.target.value)}

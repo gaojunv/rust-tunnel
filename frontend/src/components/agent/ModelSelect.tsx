@@ -43,7 +43,7 @@ export default function ModelSelect({ value, onChange, disabled }: Props) {
             </SelectItem>
           ))}
         </SelectGroup>
-        {data && data.groups.length > 0 && (
+        {!!data?.groups.length && (
           <SelectGroup>
             <SelectLabel>{t('agent.modelGroups')}</SelectLabel>
             {data.groups.map((g) => (

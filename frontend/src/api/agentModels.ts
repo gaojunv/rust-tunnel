@@ -21,7 +21,10 @@ export async function listAgentSelectableModels(): Promise<AgentModelOptions> {
   return {
     models: models
       .filter((m) => m.enabled)
-      .map((m) => ({ id: m.alias || m.model_name, label: m.alias || m.model_name })),
+      .map((m) => {
+        const label = m.alias || m.model_name;
+        return { id: label, label };
+      }),
     groups: groups
       .filter((g) => g.enabled)
       .map((g) => ({ id: g.name, label: g.name })),

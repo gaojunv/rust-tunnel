@@ -33,6 +33,7 @@ export default function ActivityBar({ sessionId }: { sessionId: string }) {
             key={kind}
             type="button"
             aria-label={t(labelKey)}
+            aria-pressed={active === kind}
             title={t(labelKey)}
             onClick={() => toggle(kind)}
             className={cn(
@@ -50,6 +51,8 @@ export default function ActivityBar({ sessionId }: { sessionId: string }) {
         <div
           data-testid="activity-panel"
           data-panel={active}
+          role="region"
+          aria-label={t('agent.activityPanel')}
           className="w-72 overflow-y-auto border-r border-border/60 p-2"
         >
           {active === 'files' && <FilesPanel />}

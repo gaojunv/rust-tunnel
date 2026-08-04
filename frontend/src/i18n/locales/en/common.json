@@ -768,16 +768,15 @@
     "confirmDeleteWorkspace": "Delete this workspace and all its sessions? This cannot be undone.",
     "confirmDeleteSession": "Delete this session? This cannot be undone.",
     "sessionNamePlaceholder": "Session name",
+    "activityPanel": "Side panel",
     "model": "Models",
     "modelGroups": "Model Groups",
     "selectModel": "Select model…",
     "defaultModel": "Default model",
     "responseTimeout": "Response timed out, please retry",
     "modelUpdateFailed": "Failed to update model, reverted to previous selection",
-    "delete": "Delete",
     "cancel": "Cancel",
-    "confirm": "Confirm",
-    "save": "Save"
+    "confirm": "Confirm"
   },
   "logs": {
     "title": "Logs",

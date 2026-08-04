@@ -13,6 +13,7 @@ import {
   listAgentSessions,
   deleteAgentSession,
   updateAgentSessionTitle,
+  getApiErrorMessage,
 } from '../../api/client';
 import type { AgentSession } from '../../types';
 
@@ -31,6 +32,7 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const { data: sessions } = useQuery<AgentSession[]>({
     queryKey: ['agent-sessions', workspaceId],
     queryFn: () => listAgentSessions(workspaceId),
@@ -41,20 +43,39 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['agent-sessions', workspaceId] });
 
   const handleDelete = async (id: string) => {
-    await deleteAgentSession(id);
-    refresh();
-    if (id === sessionId) onDeletedCurrent(); // 删的是当前会话 → 回引导态（AgentPage 禁止自动重选）
+    try {
+      await deleteAgentSession(id);
+      setError(null);
+      refresh();
+      if (id === sessionId) onDeletedCurrent(); // 删的是当前会话 → 回引导态（AgentPage 禁止自动重选）
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+    }
   };
 
   const handleRename = async (id: string) => {
     const title = editTitle.trim();
-    if (title) await updateAgentSessionTitle(id, title);
-    setEditingId(null);
-    refresh();
+    if (!title) {
+      setEditingId(null);
+      return;
+    }
+    try {
+      await updateAgentSessionTitle(id, title);
+      setError(null);
+      setEditingId(null);
+      refresh();
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+    }
   };
 
   return (
     <div className="flex items-center gap-2">
+      {error && (
+        <span className="text-xs text-destructive" role="alert" aria-live="polite">
+          {error}
+        </span>
+      )}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" aria-label={t('agent.selectSessionAria')}>
@@ -81,10 +102,22 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
                       if (e.key === 'Escape') setEditingId(null);
                     }}
                   />
-                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleRename(s.id)}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 w-7 p-0"
+                    aria-label={t('common.save')}
+                    onClick={() => handleRename(s.id)}
+                  >
                     <Check className="h-3.5 w-3.5" />
                   </Button>
-                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditingId(null)}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 w-7 p-0"
+                    aria-label={t('common.cancel')}
+                    onClick={() => setEditingId(null)}
+                  >
                     <X className="h-3.5 w-3.5" />
                   </Button>
                 </>

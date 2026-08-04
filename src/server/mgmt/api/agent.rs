@@ -771,5 +771,20 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["model"], "deepseek-chat");
+
+        // 空串清除 → 读回空串
+        let resp = put_default_model(
+            State(state.clone()),
+            Json(UpdateSessionModelRequest { model: "".into() }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = get_default_model(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "");
     }
 }
