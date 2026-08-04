@@ -47,6 +47,46 @@ pub struct UpdateSessionModelRequest {
     pub model: String,
 }
 
+const DEFAULT_MODEL_KEY: &str = "agent_default_model";
+
+#[derive(Debug, serde::Serialize)]
+pub struct DefaultModelResponse {
+    pub model: String,
+}
+
+/// GET /api/agent/default-model — 读全局默认模型（未设置返回空串）。
+pub async fn get_default_model(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match agent.db.load_server_setting(DEFAULT_MODEL_KEY).await {
+        Ok(Some(m)) => Json(DefaultModelResponse { model: m }).into_response(),
+        Ok(None) => Json(DefaultModelResponse {
+            model: String::new(),
+        })
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// PUT /api/agent/default-model — 写全局默认模型（空串清除）。
+pub async fn put_default_model(
+    State(state): State<ApiState>,
+    Json(body): Json<UpdateSessionModelRequest>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match agent
+        .db
+        .save_server_setting(DEFAULT_MODEL_KEY, body.model.trim())
+        .await
+    {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateSessionRequest {
     pub title: String,
@@ -176,15 +216,24 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 rt
             }
             None => {
-                let mut loaded = match SessionRuntime::load(&agent.db, &session_id, "").await {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(serde_json::json!({"type": "error", "message": e}))
-                            .await;
-                        continue;
-                    }
-                };
+                // 全局默认模型：session.model 为空时优先于「第一个可用模型」。
+                let default_model = agent
+                    .db
+                    .load_server_setting(DEFAULT_MODEL_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let mut loaded =
+                    match SessionRuntime::load(&agent.db, &session_id, &default_model).await {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(serde_json::json!({"type": "error", "message": e}))
+                                .await;
+                            continue;
+                        }
+                    };
                 // 模型为空 → 取 LLM 网关第一个可用模型
                 if loaded.model.is_empty() {
                     if let Ok(models) =
@@ -633,5 +682,38 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_default_model_roundtrip() {
+        let (state, _db) = test_state().await;
+
+        // 未设置 → 空串
+        let resp = get_default_model(State(state.clone())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "");
+
+        // 写入
+        let resp = put_default_model(
+            State(state.clone()),
+            Json(UpdateSessionModelRequest {
+                model: "deepseek-chat".into(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 读回
+        let resp = get_default_model(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["model"], "deepseek-chat");
     }
 }

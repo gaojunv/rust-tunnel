@@ -417,6 +417,10 @@ pub async fn run_api_server(
             "/api/agent/sessions/:id/messages",
             get(agent::list_messages),
         )
+        .route(
+            "/api/agent/default-model",
+            get(agent::get_default_model).put(agent::put_default_model),
+        )
         // User preferences
         .route("/api/preferences", put(preferences::put_preferences))
         // Settings endpoints
