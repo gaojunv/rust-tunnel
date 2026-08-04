@@ -220,6 +220,21 @@ impl TestHarness {
     /// register with a name + password. Tunnel listeners are set up separately
     /// via `start_tcp_tunnel`.
     pub fn spawn_client(&mut self, client_name: Option<&str>) -> tokio::task::AbortHandle {
+        self.spawn_client_with_agent(client_name, false)
+    }
+
+    /// Spawn a client with the agent executor enabled (`enable_agent = true`),
+    /// so the server can run `ClientRegistry::agent_exec` commands against it
+    /// over the real control channel.
+    pub fn spawn_agent_client(&mut self, client_name: Option<&str>) -> tokio::task::AbortHandle {
+        self.spawn_client_with_agent(client_name, true)
+    }
+
+    fn spawn_client_with_agent(
+        &mut self,
+        client_name: Option<&str>,
+        enable_agent: bool,
+    ) -> tokio::task::AbortHandle {
         let name = client_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| "test-client".to_string());
@@ -237,7 +252,7 @@ impl TestHarness {
             tls: self.tls,
             tls_server_name: Some("localhost".to_string()),
             tls_insecure: true,
-            enable_agent: false,
+            enable_agent,
             log: "warn".to_string(),
         };
 
