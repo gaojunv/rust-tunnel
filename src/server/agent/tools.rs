@@ -122,22 +122,43 @@ fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Cap on a single tool input payload. The control-channel protocol cap is 1MB
+/// and is enforced on the client's read side, where an oversize frame kills the
+/// connection. Reject inputs below that cap here so an oversized write/shell cmd
+/// becomes a model-facing error instead of tearing down the client.
+const MAX_TOOL_INPUT: usize = 900 * 1024;
+
 /// Convert an LLM function call into an AgentCommand. Errors are fed back to the model.
 pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid tool arguments: {e}"))?;
     match name {
-        "shell" => Ok(AgentCommand::Shell {
-            cmd: arg_str(&args, "cmd", name)?.to_string(),
-            cwd: arg_opt_str(&args, "cwd"),
-        }),
+        "shell" => {
+            let cmd = arg_str(&args, "cmd", name)?;
+            if cmd.len() > MAX_TOOL_INPUT {
+                return Err("cmd too large (>900KB); split it into smaller commands".to_string());
+            }
+            Ok(AgentCommand::Shell {
+                cmd: cmd.to_string(),
+                cwd: arg_opt_str(&args, "cwd"),
+            })
+        }
         "read_file" => Ok(AgentCommand::ReadFile {
             path: arg_str(&args, "path", name)?.to_string(),
         }),
-        "write_file" => Ok(AgentCommand::WriteFile {
-            path: arg_str(&args, "path", name)?.to_string(),
-            content: arg_str(&args, "content", name)?.to_string(),
-        }),
+        "write_file" => {
+            let path = arg_str(&args, "path", name)?;
+            let content = arg_str(&args, "content", name)?;
+            if content.len() > MAX_TOOL_INPUT {
+                return Err(
+                    "content too large (>900KB); write the file in smaller chunks".to_string(),
+                );
+            }
+            Ok(AgentCommand::WriteFile {
+                path: path.to_string(),
+                content: content.to_string(),
+            })
+        }
         "list_dir" => Ok(AgentCommand::ListDir {
             path: arg_str(&args, "path", name)?.to_string(),
         }),
@@ -165,8 +186,14 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         for expected in [
-            "shell", "read_file", "write_file", "list_dir",
-            "git_status", "git_diff", "git_commit", "git_push",
+            "shell",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "git_status",
+            "git_diff",
+            "git_commit",
+            "git_push",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -204,6 +231,29 @@ mod tests {
             }
             other => panic!("expected WriteFile, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_shell_cmd() {
+        let big = "x".repeat(901 * 1024);
+        let args = serde_json::json!({"cmd": big}).to_string();
+        let err = parse_tool_call("shell", &args).unwrap_err();
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_write_content() {
+        let big = "x".repeat(901 * 1024);
+        let args = serde_json::json!({"path": "a.txt", "content": big}).to_string();
+        let err = parse_tool_call("write_file", &args).unwrap_err();
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn test_parse_accepts_just_under_limit() {
+        let ok = "x".repeat(899 * 1024);
+        let args = serde_json::json!({"cmd": ok}).to_string();
+        assert!(parse_tool_call("shell", &args).is_ok());
     }
 
     #[test]

@@ -40,6 +40,14 @@ impl SessionRuntime {
             .map_err(|e| format!("db error: {e}"))?;
         let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
         for r in records {
+            // Tool-result rows (role="tool") persist with empty content and no
+            // tool_call_id, and assistant tool_calls are never persisted. Replaying
+            // them produces {"role":"tool","content":""} without a tool_call_id,
+            // which upstream OpenAI rejects with a 400 — poisoning every later turn.
+            // Skip them; the UI reads agent_messages directly, so nothing is lost.
+            if r.role == "tool" {
+                continue;
+            }
             messages.push(ChatMessage {
                 role: r.role,
                 content: Some(r.content),
@@ -100,6 +108,31 @@ mod tests {
         assert_eq!(rt.messages.len(), 3);
         assert_eq!(rt.messages[0].role, "system");
         assert_eq!(rt.messages[1].role, "user");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_skips_tool_rows() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "改代码", None)
+            .await
+            .unwrap();
+        db.agent_add_message("m2", "s1", "tool", "", Some(r#"[{"name":"shell"}]"#))
+            .await
+            .unwrap();
+        db.agent_add_message("m3", "s1", "assistant", "已完成", None)
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        // system + user + assistant — the tool row must be skipped
+        let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
     }
 
     #[tokio::test]
