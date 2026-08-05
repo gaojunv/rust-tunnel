@@ -2,9 +2,43 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::{executor, session::SessionRuntime, tools, AgentState};
+use super::{executor, session::SessionRuntime, sse, tools, AgentState};
 use crate::common::AgentResult;
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
+
+/// 按行切分 SSE 字节流：HTTP chunk 边界可切断一行，未完结部分留缓冲。
+#[derive(Default)]
+struct LineBuf {
+    pending: Vec<u8>,
+}
+
+impl LineBuf {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
+            self.pending.drain(..=pos);
+            if !line.trim().is_empty() {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        if line.trim().is_empty() { None } else { Some(line) }
+    }
+}
+
+fn is_sse_response(content_type: &str) -> bool {
+    content_type.starts_with("text/event-stream")
+}
 
 /// One LLM response, parsed.
 pub enum LlmTurn {
@@ -87,6 +121,109 @@ fn agent_result_to_text(result: &AgentResult) -> String {
     }
 }
 
+/// 执行一轮工具调用：回填 assistant tool_calls 消息、逐个执行并落库/回填 tool 结果。
+async fn handle_tool_calls(
+    agent: &AgentState,
+    rt: &mut SessionRuntime,
+    ws_tx: &mpsc::Sender<serde_json::Value>,
+    calls: Vec<ParsedToolCall>,
+    raw_calls: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    rt.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(raw_calls.clone()),
+        tool_call_id: None,
+        name: None,
+    });
+    persist_message(
+        agent,
+        &rt.session_id,
+        "assistant",
+        "",
+        Some(&serde_json::to_string(&raw_calls).unwrap_or_default()),
+        None,
+        None,
+        "tool_calls",
+    )
+    .await;
+
+    for call in calls {
+        let _ = ws_tx
+            .send(serde_json::json!({
+                "type": "tool_call",
+                "id": &call.id,
+                "name": &call.name,
+                "args": &call.args,
+            }))
+            .await;
+
+        let result_text = match tools::parse_tool_call(&call.name, &call.args) {
+            Ok(command) => {
+                // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
+                // 避免静默回退到宿主机执行。
+                let result =
+                    if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+                        AgentResult::Error {
+                            message: "docker container not started".into(),
+                        }
+                    } else {
+                        executor::exec_on_client(
+                            agent,
+                            &rt.workspace_id,
+                            &rt.client_id,
+                            &rt.root_path,
+                            rt.docker_container.as_deref(),
+                            command,
+                        )
+                        .await
+                    };
+                let text = agent_result_to_text(&result);
+                let _ = ws_tx
+                    .send(serde_json::json!({
+                        "type": "tool_result",
+                        "id": &call.id,
+                        "name": &call.name,
+                        "result": &text,
+                    }))
+                    .await;
+                text
+            }
+            Err(e) => {
+                let _ = ws_tx
+                    .send(serde_json::json!({
+                        "type": "tool_result",
+                        "id": &call.id,
+                        "name": &call.name,
+                        "result": format!("error: {e}"),
+                    }))
+                    .await;
+                format!("error: {e}")
+            }
+        };
+
+        persist_message(
+            agent,
+            &rt.session_id,
+            "tool",
+            &result_text,
+            None,
+            Some(&call.id),
+            Some(&call.name),
+            "tool_result",
+        )
+        .await;
+        rt.messages.push(ChatMessage {
+            role: "tool".into(),
+            content: Some(result_text),
+            tool_calls: None,
+            tool_call_id: Some(call.id.clone()),
+            name: Some(call.name.clone()),
+        });
+    }
+    Ok(())
+}
+
 /// Run one full agent turn: send current messages to the LLM, execute any tool
 /// calls over the tunnel, feed results back, repeat until the model stops
 /// calling tools. Progress is streamed to `ws_tx` as JSON messages.
@@ -106,7 +243,7 @@ pub async fn run_agent_turn(
         let request = ChatCompletionRequest {
             model: rt.model.clone(),
             messages: rt.messages.clone(),
-            stream: false,
+            stream: true,
             max_tokens: None,
             temperature: None,
             top_p: None,
@@ -119,7 +256,7 @@ pub async fn run_agent_turn(
             &llm.breakers,
             &chain,
             &req_body,
-            false,
+            true,
         )
         .await;
 
@@ -133,16 +270,63 @@ pub async fn run_agent_turn(
             }
         };
 
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if is_sse_response(&content_type) {
+            // ── 流式路径 ──
+            use futures_util::StreamExt;
+            let mut agg = sse::SseAggregator::new();
+            let mut line_buf = LineBuf::default();
+            let mut byte_stream = resp.into_body().into_data_stream();
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = chunk.map_err(|e| format!("stream read failed: {e}"))?;
+                for line in line_buf.feed(&chunk) {
+                    match agg.feed_line(&line) {
+                        sse::SseFeed::Content(delta) => {
+                            let _ = ws_tx
+                                .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
+                                .await;
+                        }
+                        sse::SseFeed::Done => break,
+                        sse::SseFeed::None => {}
+                    }
+                }
+            }
+            if let Some(last) = line_buf.flush() {
+                let _ = agg.feed_line(&last);
+            }
+            let turn = agg.finish()?;
+            if turn.tool_calls.is_empty() {
+                // 文本回合：收尾 final chunk + 落库 + done
+                let _ = ws_tx
+                    .send(serde_json::json!({"type": "assistant_chunk", "content": "", "final": true}))
+                    .await;
+                rt.messages.push(ChatMessage::text("assistant", &turn.text));
+                persist_message(&agent, &rt.session_id, "assistant", &turn.text, None, None, None, "message")
+                    .await;
+                let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
+                return Ok(());
+            }
+            // tool 回合：转成与 parse_llm_turn 相同的处理流（见下）
+            handle_tool_calls(&agent, rt, &ws_tx, turn.tool_calls, turn.raw_tool_calls).await?;
+            continue;
+        }
+
+        // ── 非 SSE 回退（某些上游/代理返回普通 JSON）──
         let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
             .await
             .map_err(|e| format!("failed to read LLM response: {e}"))?;
         let body: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
-
         match parse_llm_turn(&body)? {
             LlmTurn::Text(text) => {
                 let _ = ws_tx
-                    .send(serde_json::json!({"type": "assistant_chunk", "content": &text}))
+                    .send(serde_json::json!({"type": "assistant_chunk", "content": &text, "final": true}))
                     .await;
                 rt.messages.push(ChatMessage::text("assistant", &text));
                 persist_message(&agent, &rt.session_id, "assistant", &text, None, None, None, "message")
@@ -151,102 +335,11 @@ pub async fn run_agent_turn(
                 return Ok(());
             }
             LlmTurn::ToolCalls(calls) => {
-                // 记录 assistant 的 tool_calls 消息（回填上下文需要）
-                let raw_calls = body["choices"][0]["message"]["tool_calls"].clone();
-                rt.messages.push(ChatMessage {
-                    role: "assistant".into(),
-                    content: None,
-                    tool_calls: Some(raw_calls.as_array().cloned().unwrap_or_default()),
-                    tool_call_id: None,
-                    name: None,
-                });
-
-                // assistant 的 tool_calls 原始 JSON 落库（kind=tool_calls），重放可恢复完整结构
-                persist_message(
-                    &agent,
-                    &rt.session_id,
-                    "assistant",
-                    "",
-                    Some(&serde_json::to_string(&raw_calls).unwrap_or_default()),
-                    None,
-                    None,
-                    "tool_calls",
-                )
-                .await;
-
-                for call in calls {
-                    let _ = ws_tx
-                        .send(serde_json::json!({
-                            "type": "tool_call",
-                            "id": &call.id,
-                            "name": &call.name,
-                            "args": &call.args,
-                        }))
-                        .await;
-
-                    let result_text = match tools::parse_tool_call(&call.name, &call.args) {
-                        Ok(command) => {
-                            // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
-                            // 避免静默回退到宿主机执行。
-                            let result =
-                                if rt.runtime_type == "docker" && rt.docker_container.is_none() {
-                                    AgentResult::Error {
-                                        message: "docker container not started".into(),
-                                    }
-                                } else {
-                                    executor::exec_on_client(
-                                        &agent,
-                                        &rt.workspace_id,
-                                        &rt.client_id,
-                                        &rt.root_path,
-                                        rt.docker_container.as_deref(),
-                                        command,
-                                    )
-                                    .await
-                                };
-                            let text = agent_result_to_text(&result);
-                            let _ = ws_tx
-                                .send(serde_json::json!({
-                                    "type": "tool_result",
-                                    "id": &call.id,
-                                    "name": &call.name,
-                                    "result": &text,
-                                }))
-                                .await;
-                            text
-                        }
-                        Err(e) => {
-                            let _ = ws_tx
-                                .send(serde_json::json!({
-                                    "type": "tool_result",
-                                    "id": &call.id,
-                                    "name": &call.name,
-                                    "result": format!("error: {e}"),
-                                }))
-                                .await;
-                            format!("error: {e}")
-                        }
-                    };
-
-                    persist_message(
-                        &agent,
-                        &rt.session_id,
-                        "tool",
-                        &result_text,
-                        None,
-                        Some(&call.id),
-                        Some(&call.name),
-                        "tool_result",
-                    )
-                    .await;
-                    rt.messages.push(ChatMessage {
-                        role: "tool".into(),
-                        content: Some(result_text),
-                        tool_calls: None,
-                        tool_call_id: Some(call.id.clone()),
-                        name: Some(call.name.clone()),
-                    });
-                }
+                let raw_calls = body["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                handle_tool_calls(&agent, rt, &ws_tx, calls, raw_calls).await?;
             }
         }
     }
@@ -329,6 +422,23 @@ mod tests {
     fn test_extract_malformed() {
         assert!(parse_llm_turn(&serde_json::json!({})).is_err());
         assert!(parse_llm_turn(&serde_json::json!({"choices": []})).is_err());
+    }
+
+    #[test]
+    fn test_is_sse_response() {
+        assert!(is_sse_response("text/event-stream; charset=utf-8"));
+        assert!(is_sse_response("text/event-stream"));
+        assert!(!is_sse_response("application/json"));
+    }
+
+    #[test]
+    fn test_line_splitter_handles_partial_chunks() {
+        // HTTP chunk 边界可能切断 SSE 行：缓冲拼行
+        let mut buf = LineBuf::default();
+        assert!(buf.feed(b"data: {\"a\":1}\r\n\r\nda").is_empty() == false);
+        // 第一行完整产出，"da" 留在缓冲
+        let lines = buf.feed(b"ta: [DONE]\n");
+        assert!(lines.iter().any(|l| l.contains("[DONE]")));
     }
 
     #[tokio::test]
