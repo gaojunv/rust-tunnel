@@ -104,6 +104,21 @@ pub async fn maybe_compact(
         .send(serde_json::json!({"type": "status", "message": "compacting context..."}))
         .await;
 
+    // 压缩前记录保留段对应的 DB 行（落库 summary 后重插用）。rt.messages[0] 是
+    // system 不落库，保留段 rt.messages[cut..] 对应 DB 中最后 kept_count 行——
+    // 会话全程 DB 与 rt.messages 同步追加，load 又从最后一个 summary 起重放，
+    // 故 DB 尾部即保留段。
+    let kept_count = rt.messages.len() - cut;
+    let kept_rows = agent
+        .db
+        .agent_list_messages(&rt.session_id)
+        .await
+        .map(|records| {
+            let start = records.len().saturating_sub(kept_count);
+            records[start..].to_vec()
+        })
+        .unwrap_or_default();
+
     let segment = rt.messages[1..cut].to_vec();
     let rendered = render_for_summary(&segment);
 
@@ -129,6 +144,30 @@ pub async fn maybe_compact(
 
     // 落库 summary 行（role=user，load 重放时从其开始取消息）
     super::runner::runner_persist_summary(agent, &rt.session_id, &replacement).await;
+
+    // 在 summary 之后重插保留段（新 id、按序），使 DB 物理顺序为 [..., summary,
+    // kept...]，与 load 的 rposition(kind=="summary") 重放语义对齐——否则 kept 段
+    // 落在 summary 之前，WS 重连/页面刷新后整段从 LLM 上下文丢失。旧 kept 行保留
+    // 不删：它们只落在最新 summary 之前、不再被 LLM 重放，UI 历史仍完整可见。
+    for row in &kept_rows {
+        let id = format!("{:032x}", rand::random::<u128>());
+        if let Err(e) = agent
+            .db
+            .agent_add_message_v2(
+                &id,
+                &row.session_id,
+                &row.role,
+                &row.content,
+                row.tool_calls.as_deref(),
+                row.tool_call_id.as_deref(),
+                row.name.as_deref(),
+                &row.kind,
+            )
+            .await
+        {
+            tracing::warn!("failed to re-persist kept segment during compaction: {}", e);
+        }
+    }
 
     let _ = ws_tx
         .send(serde_json::json!({"type": "status", "message": "context compacted"}))
@@ -273,5 +312,141 @@ mod tests {
         assert!(text.contains("user"));
         assert!(text.contains("帮我修 bug"));
         assert!(text.contains("shell"));
+    }
+
+    #[tokio::test]
+    async fn test_list_order_kept_before_summary_and_reinsert() {
+        // 排序语义（压缩修复依赖）：agent_list_messages 按 created_at(秒), rowid
+        // 排序。旧 kept 行落在前一秒 → 必在 summary（当前秒插入）之前；summary 与
+        // 重插 kept 行同秒靠 rowid（自增）保证先后。故 DB 顺序恒为 [旧 kept, summary,
+        // 重插 kept]，load 从最后一个 summary 起重放即可命中保留段。
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        // 旧 kept 行：10 秒前落库（模拟上一回合保留段）
+        db.agent_add_message("old1", "s1", "user", "旧保留", None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE agent_messages SET created_at = datetime('now', '-10 seconds') WHERE id = 'old1'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // summary + 重插 kept：当前秒插入，先后由 rowid 保证
+        db.agent_add_message_v2("sum1", "s1", "user", "[上下文摘要] 概要", None, None, None, "summary")
+            .await
+            .unwrap();
+        db.agent_add_message("kept1", "s1", "assistant", "保留1", None)
+            .await
+            .unwrap();
+        db.agent_add_message("kept2", "s1", "user", "保留2", None)
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["old1", "sum1", "kept1", "kept2"]);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_compact_reinserts_kept_segment_after_summary() {
+        // 端到端：per-model 极小阈值触发压缩；summarize 无 provider 可用 → 失败走
+        // 降级截断路径（无需 mock 上游）。修复前 kept 段落在 summary 之前，load
+        // 重放丢失整段（红）；修复后 DB 物理顺序 [..., summary, kept...]，重连/
+        // 刷新后 kept 段完整重放。
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, Some("big-model"))
+            .await
+            .unwrap();
+        // per-model 极小阈值：10 chars 即触发压缩（模型可解析、无可用 provider）
+        db.llm_save_provider("p1", "prov", "deepseek", "https://api", "key", None, None, true)
+            .await
+            .unwrap();
+        db.llm_save_model(
+            "m1",
+            "p1",
+            "big-model",
+            "",
+            "[]",
+            true,
+            Some(r#"{"agent_context_limit":10}"#),
+        )
+        .await
+        .unwrap();
+        // 10 条历史（system 由 load 注入，DB 只存 10 行）
+        for i in 0..5 {
+            db.agent_add_message(&format!("q{i}"), "s1", "user", &format!("问题{i}"), None)
+                .await
+                .unwrap();
+            db.agent_add_message(&format!("a{i}"), "s1", "assistant", &format!("回答{i}"), None)
+                .await
+                .unwrap();
+        }
+
+        let agent = crate::server::agent::AgentState::new(
+            crate::server::control::client_registry::ClientRegistry::new(db.clone()),
+            db.clone(),
+        );
+        // LlmState::new(None, None)：无 DB → summarize 的 resolve_with_failover 失败
+        // → 走降级截断路径。
+        let llm = std::sync::Arc::new(crate::server::llm::LlmState::new(None, None));
+        let (ws_tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let mut rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        assert_eq!(rt.messages.len(), 11); // system + 10 历史
+        // messages.len()=11, keep=6 → cut=5 → kept = messages[5..] 共 6 条
+        maybe_compact(&agent, &llm, &mut rt, &ws_tx).await.unwrap();
+
+        // 内存替换：system + 摘要 + kept 段
+        assert_eq!(rt.messages.len(), 8);
+        assert!(rt.messages[1].content.as_deref().unwrap().contains("上下文"));
+        let kept_in_mem: Vec<&str> = rt.messages[2..]
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(
+            kept_in_mem,
+            ["问题2", "回答2", "问题3", "回答3", "问题4", "回答4"]
+        );
+
+        // DB 物理顺序：summary 行之后紧跟 kept 重插行
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        let summary_pos = rows
+            .iter()
+            .rposition(|r| r.kind == "summary")
+            .expect("summary row must exist");
+        assert_eq!(rows.len(), 17); // 10 旧 + 1 summary + 6 重插
+        assert_eq!(
+            rows.len() - summary_pos - 1,
+            6,
+            "summary 之后应恰为 kept 重插的 6 行"
+        );
+        let after_summary: Vec<&str> = rows[summary_pos + 1..]
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect();
+        assert_eq!(
+            after_summary,
+            ["问题2", "回答2", "问题3", "回答3", "问题4", "回答4"]
+        );
+
+        // 重连/刷新后重放：load 从最后一个 summary 起重放，kept 段不再丢失
+        let rt2 = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        assert_eq!(rt2.messages.len(), 8);
+        assert!(rt2.messages[1].content.as_deref().unwrap().contains("上下文"));
+        let kept_reloaded: Vec<&str> = rt2.messages[2..]
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert_eq!(
+            kept_reloaded,
+            ["问题2", "回答2", "问题3", "回答3", "问题4", "回答4"]
+        );
     }
 }
