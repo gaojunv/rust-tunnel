@@ -65,7 +65,11 @@ pub fn render_for_summary(messages: &[ChatMessage]) -> String {
     for m in messages {
         match (m.role.as_str(), &m.content, &m.tool_calls) {
             ("tool", Some(c), _) => {
-                out.push_str(&format!("tool({}): {}\n", m.name.as_deref().unwrap_or("?"), c));
+                out.push_str(&format!(
+                    "tool({}): {}\n",
+                    m.name.as_deref().unwrap_or("?"),
+                    c
+                ));
             }
             (_, _, Some(calls)) => {
                 let names: Vec<&str> = calls
@@ -132,7 +136,10 @@ pub async fn maybe_compact(
             let _ = ws_tx
                 .send(serde_json::json!({"type": "status", "message": "compaction failed, truncated history"}))
                 .await;
-            format!("[上下文已截断] 早期 {n} 条消息因长度超限被移除", n = segment.len())
+            format!(
+                "[上下文已截断] 早期 {n} 条消息因长度超限被移除",
+                n = segment.len()
+            )
         }
     };
 
@@ -194,9 +201,13 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         raw_body: None,
     };
     let req_body = crate::server::llm::upstream::build_upstream_body(&request);
-    let outcome =
-        crate::server::llm::upstream::execute_with_failover(&llm.breakers, &chain, &req_body, false)
-            .await;
+    let outcome = crate::server::llm::upstream::execute_with_failover(
+        &llm.breakers,
+        &chain,
+        &req_body,
+        false,
+    )
+    .await;
     let resp = match outcome {
         crate::server::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
         crate::server::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
@@ -206,8 +217,8 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
     let body_bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
         .await
         .map_err(|e| format!("failed to read summary response: {e}"))?;
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| format!("invalid summary JSON: {e}"))?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid summary JSON: {e}"))?;
     match super::runner::parse_llm_turn(&body)? {
         super::runner::LlmTurn::Text(t) => Ok(t),
         super::runner::LlmTurn::ToolCalls(_) => Err("summary model returned tool calls".into()),
@@ -228,7 +239,9 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
-                tool_calls: Some(vec![serde_json::json!({"id": id, "type": "function", "function": {"name": "shell", "arguments": "{}"}})]),
+                tool_calls: Some(vec![
+                    serde_json::json!({"id": id, "type": "function", "function": {"name": "shell", "arguments": "{}"}}),
+                ]),
                 tool_call_id: None,
                 name: None,
             },
@@ -256,7 +269,11 @@ mod tests {
             },
         ];
         // 4 + 8 + tool_calls JSON 长度
-        let expect = 4 + 8 + serde_json::to_string(&vec![serde_json::json!({"id": "c1"})]).unwrap().len();
+        let expect = 4
+            + 8
+            + serde_json::to_string(&vec![serde_json::json!({"id": "c1"})])
+                .unwrap()
+                .len();
         assert_eq!(estimate_chars(&msgs), expect);
     }
 
@@ -289,19 +306,42 @@ mod tests {
     #[tokio::test]
     async fn test_context_limit_from_model_extra_config() {
         let db = crate::server::db::Database::new(":memory:").await.unwrap();
-        db.llm_save_provider("p1", "prov", "deepseek", "https://api", "key", None, None, true)
-            .await
-            .unwrap();
-        db.llm_save_model("m1", "p1", "big-model", "", "[]", true, Some(r#"{"agent_context_limit":200000}"#))
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "prov",
+            "deepseek",
+            "https://api",
+            "key",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model(
+            "m1",
+            "p1",
+            "big-model",
+            "",
+            "[]",
+            true,
+            Some(r#"{"agent_context_limit":200000}"#),
+        )
+        .await
+        .unwrap();
         db.llm_save_model("m2", "p1", "plain-model", "", "[]", true, None)
             .await
             .unwrap();
 
         assert_eq!(context_limit_for(&db, "big-model").await, 200_000);
-        assert_eq!(context_limit_for(&db, "plain-model").await, DEFAULT_CONTEXT_LIMIT_CHARS);
-        assert_eq!(context_limit_for(&db, "no-such-model").await, DEFAULT_CONTEXT_LIMIT_CHARS);
+        assert_eq!(
+            context_limit_for(&db, "plain-model").await,
+            DEFAULT_CONTEXT_LIMIT_CHARS
+        );
+        assert_eq!(
+            context_limit_for(&db, "no-such-model").await,
+            DEFAULT_CONTEXT_LIMIT_CHARS
+        );
     }
 
     #[test]
@@ -324,7 +364,9 @@ mod tests {
         db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
             .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         // 旧 kept 行：10 秒前落库（模拟上一回合保留段）
         db.agent_add_message("old1", "s1", "user", "旧保留", None)
             .await
@@ -336,9 +378,18 @@ mod tests {
         .await
         .unwrap();
         // summary + 重插 kept：当前秒插入，先后由 rowid 保证
-        db.agent_add_message_v2("sum1", "s1", "user", "[上下文摘要] 概要", None, None, None, "summary")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "sum1",
+            "s1",
+            "user",
+            "[上下文摘要] 概要",
+            None,
+            None,
+            None,
+            "summary",
+        )
+        .await
+        .unwrap();
         db.agent_add_message("kept1", "s1", "assistant", "保留1", None)
             .await
             .unwrap();
@@ -365,9 +416,18 @@ mod tests {
             .await
             .unwrap();
         // per-model 极小阈值：10 chars 即触发压缩（模型可解析、无可用 provider）
-        db.llm_save_provider("p1", "prov", "deepseek", "https://api", "key", None, None, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "prov",
+            "deepseek",
+            "https://api",
+            "key",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
         db.llm_save_model(
             "m1",
             "p1",
@@ -384,9 +444,15 @@ mod tests {
             db.agent_add_message(&format!("q{i}"), "s1", "user", &format!("问题{i}"), None)
                 .await
                 .unwrap();
-            db.agent_add_message(&format!("a{i}"), "s1", "assistant", &format!("回答{i}"), None)
-                .await
-                .unwrap();
+            db.agent_add_message(
+                &format!("a{i}"),
+                "s1",
+                "assistant",
+                &format!("回答{i}"),
+                None,
+            )
+            .await
+            .unwrap();
         }
 
         let agent = crate::server::agent::AgentState::new(
@@ -400,12 +466,16 @@ mod tests {
 
         let mut rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
         assert_eq!(rt.messages.len(), 11); // system + 10 历史
-        // messages.len()=11, keep=6 → cut=5 → kept = messages[5..] 共 6 条
+                                           // messages.len()=11, keep=6 → cut=5 → kept = messages[5..] 共 6 条
         maybe_compact(&agent, &llm, &mut rt, &ws_tx).await.unwrap();
 
         // 内存替换：system + 摘要 + kept 段
         assert_eq!(rt.messages.len(), 8);
-        assert!(rt.messages[1].content.as_deref().unwrap().contains("上下文"));
+        assert!(rt.messages[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("上下文"));
         let kept_in_mem: Vec<&str> = rt.messages[2..]
             .iter()
             .filter_map(|m| m.content.as_deref())
@@ -439,7 +509,11 @@ mod tests {
         // 重连/刷新后重放：load 从最后一个 summary 起重放，kept 段不再丢失
         let rt2 = SessionRuntime::load(&db, "s1", "m").await.unwrap();
         assert_eq!(rt2.messages.len(), 8);
-        assert!(rt2.messages[1].content.as_deref().unwrap().contains("上下文"));
+        assert!(rt2.messages[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("上下文"));
         let kept_reloaded: Vec<&str> = rt2.messages[2..]
             .iter()
             .filter_map(|m| m.content.as_deref())

@@ -212,11 +212,14 @@ mod tests {
     fn test_huge_index_skipped_not_panic() {
         let mut agg = SseAggregator::new();
         // 恶意 index：不 panic、不分配巨桶，正常调用不受影响
-        feed_all(&mut agg, &[
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1000000000,"id":"evil","function":{"name":"x","arguments":"{}"}}]},"index":0}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]},"index":0}]}"#,
-            "data: [DONE]",
-        ]);
+        feed_all(
+            &mut agg,
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1000000000,"id":"evil","function":{"name":"x","arguments":"{}"}}]},"index":0}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]},"index":0}]}"#,
+                "data: [DONE]",
+            ],
+        );
         let turn = agg.finish().unwrap();
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].id, "call_1");
@@ -226,11 +229,14 @@ mod tests {
     fn test_index_at_limit_boundary() {
         let mut agg = SseAggregator::new();
         // index 63 接受、64 跳过
-        feed_all(&mut agg, &[
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":63,"id":"ok63","function":{"name":"a","arguments":"{}"}}]},"index":0}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":64,"id":"skip64","function":{"name":"b","arguments":"{}"}}]},"index":0}]}"#,
-            "data: [DONE]",
-        ]);
+        feed_all(
+            &mut agg,
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":63,"id":"ok63","function":{"name":"a","arguments":"{}"}}]},"index":0}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":64,"id":"skip64","function":{"name":"b","arguments":"{}"}}]},"index":0}]}"#,
+                "data: [DONE]",
+            ],
+        );
         let turn = agg.finish().unwrap();
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].id, "ok63");

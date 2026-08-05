@@ -502,7 +502,13 @@ pub async fn update_model(
     let alias = body.alias.unwrap_or_default();
 
     if let Err(e) = db
-        .llm_update_model(&id, &body.model_name, &alias, &tags, body.extra_config.as_deref())
+        .llm_update_model(
+            &id,
+            &body.model_name,
+            &alias,
+            &tags,
+            body.extra_config.as_deref(),
+        )
         .await
     {
         return (

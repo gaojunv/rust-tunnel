@@ -663,7 +663,10 @@ impl Database {
     /// agent_messages 补全 tool_calls 结构列。幂等：列已存在时 ALTER 报错即跳过。
     async fn migrate_agent_messages_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         for (column, ddl) in [
-            ("tool_call_id", "ALTER TABLE agent_messages ADD COLUMN tool_call_id TEXT"),
+            (
+                "tool_call_id",
+                "ALTER TABLE agent_messages ADD COLUMN tool_call_id TEXT",
+            ),
             ("name", "ALTER TABLE agent_messages ADD COLUMN name TEXT"),
             (
                 "kind",

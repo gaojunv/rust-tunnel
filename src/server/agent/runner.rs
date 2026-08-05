@@ -32,7 +32,11 @@ impl LineBuf {
         }
         let line = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
-        if line.trim().is_empty() { None } else { Some(line) }
+        if line.trim().is_empty() {
+            None
+        } else {
+            Some(line)
+        }
     }
 }
 
@@ -162,22 +166,21 @@ async fn handle_tool_calls(
             Ok(command) => {
                 // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
                 // 避免静默回退到宿主机执行。
-                let result =
-                    if rt.runtime_type == "docker" && rt.docker_container.is_none() {
-                        AgentResult::Error {
-                            message: "docker container not started".into(),
-                        }
-                    } else {
-                        executor::exec_on_client(
-                            agent,
-                            &rt.workspace_id,
-                            &rt.client_id,
-                            &rt.root_path,
-                            rt.docker_container.as_deref(),
-                            command,
-                        )
-                        .await
-                    };
+                let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+                    AgentResult::Error {
+                        message: "docker container not started".into(),
+                    }
+                } else {
+                    executor::exec_on_client(
+                        agent,
+                        &rt.workspace_id,
+                        &rt.client_id,
+                        &rt.root_path,
+                        rt.docker_container.as_deref(),
+                        command,
+                    )
+                    .await
+                };
                 let text = agent_result_to_text(&result);
                 let _ = ws_tx
                     .send(serde_json::json!({
@@ -313,8 +316,17 @@ pub async fn run_agent_turn(
                     .send(serde_json::json!({"type": "assistant_chunk", "content": "", "final": true}))
                     .await;
                 rt.messages.push(ChatMessage::text("assistant", &turn.text));
-                persist_message(&agent, &rt.session_id, "assistant", &turn.text, None, None, None, "message")
-                    .await;
+                persist_message(
+                    &agent,
+                    &rt.session_id,
+                    "assistant",
+                    &turn.text,
+                    None,
+                    None,
+                    None,
+                    "message",
+                )
+                .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
                 return Ok(());
             }
@@ -335,8 +347,17 @@ pub async fn run_agent_turn(
                     .send(serde_json::json!({"type": "assistant_chunk", "content": &text, "final": true}))
                     .await;
                 rt.messages.push(ChatMessage::text("assistant", &text));
-                persist_message(&agent, &rt.session_id, "assistant", &text, None, None, None, "message")
-                    .await;
+                persist_message(
+                    &agent,
+                    &rt.session_id,
+                    "assistant",
+                    &text,
+                    None,
+                    None,
+                    None,
+                    "message",
+                )
+                .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
                 return Ok(());
             }
@@ -370,7 +391,16 @@ async fn persist_message(
     let id = format!("{:032x}", rand::random::<u128>());
     if let Err(e) = agent
         .db
-        .agent_add_message_v2(&id, session_id, role, content, tool_calls, tool_call_id, name, kind)
+        .agent_add_message_v2(
+            &id,
+            session_id,
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+            name,
+            kind,
+        )
         .await
     {
         tracing::warn!("failed to persist agent message: {}", e);
@@ -379,7 +409,10 @@ async fn persist_message(
 
 /// 落库一行 kind='summary' 的消息（压缩模块用）。
 pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, content: &str) {
-    persist_message(agent, session_id, "user", content, None, None, None, "summary").await;
+    persist_message(
+        agent, session_id, "user", content, None, None, None, "summary",
+    )
+    .await;
 }
 
 #[cfg(test)]

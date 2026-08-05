@@ -840,9 +840,17 @@ mod tests {
 
         // Add model
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast", "[\"coding\"]", true, None)
-            .await
-            .unwrap();
+        db.llm_save_model(
+            &mid,
+            &pid,
+            "deepseek-chat",
+            "fast",
+            "[\"coding\"]",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
 
         // List models for provider
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
@@ -874,9 +882,15 @@ mod tests {
             .is_none());
 
         // Update model
-        db.llm_update_model(&mid, "deepseek-chat", "fast-v2", "[\"coding\",\"cheap\"]", None)
-            .await
-            .unwrap();
+        db.llm_update_model(
+            &mid,
+            "deepseek-chat",
+            "fast-v2",
+            "[\"coding\",\"cheap\"]",
+            None,
+        )
+        .await
+        .unwrap();
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
         assert_eq!(models[0].alias, "fast-v2");
 
@@ -900,9 +914,18 @@ mod tests {
     #[tokio::test]
     async fn test_model_extra_config_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.llm_save_provider("p1", "prov", "deepseek", "https://api", "key", None, None, true)
-            .await
-            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "prov",
+            "deepseek",
+            "https://api",
+            "key",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
         db.llm_save_model(
             "m1",
             "p1",
@@ -969,9 +992,17 @@ mod tests {
 
         // 先插入“别名冲突”的模型，制造无序查询返回它的机会
         let alias_model = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&alias_model, &p2, "moonshot-v1-8k", "fast", "[]", true, None)
-            .await
-            .unwrap();
+        db.llm_save_model(
+            &alias_model,
+            &p2,
+            "moonshot-v1-8k",
+            "fast",
+            "[]",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
         // 后插入“名称精确匹配”的模型
         let name_model = uuid::Uuid::new_v4().to_string();
         db.llm_save_model(&name_model, &p1, "fast", "", "[]", true, None)

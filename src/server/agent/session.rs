@@ -238,9 +238,18 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_add_message_v2("m3", "s1", "tool", "fn main(){}", None, Some("c1"), Some("read_file"), "tool_result")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            "fn main(){}",
+            None,
+            Some("c1"),
+            Some("read_file"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
         db.agent_add_message("m4", "s1", "assistant", "文件里是 main 函数", None)
             .await
             .unwrap();
@@ -292,7 +301,11 @@ mod tests {
         // system + summary + 近期 user；summary 之前的消息被跳过
         let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, ["system", "user", "user"]);
-        assert!(rt.messages[1].content.as_deref().unwrap().contains("上下文摘要"));
+        assert!(rt.messages[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("上下文摘要"));
         assert_eq!(rt.messages[2].content.as_deref(), Some("近期问题"));
     }
 
