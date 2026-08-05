@@ -1,5 +1,6 @@
 //! AI agent workbench: server-side agent loop, tool execution over tunnel.
 
+pub mod compact;
 pub mod executor;
 pub mod runner;
 pub mod session;

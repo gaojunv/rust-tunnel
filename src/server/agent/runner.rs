@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::{executor, session::SessionRuntime, sse, tools, AgentState};
+use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
 use crate::common::AgentResult;
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
@@ -236,6 +236,8 @@ pub async fn run_agent_turn(
     const MAX_TOOL_ROUNDS: usize = 20;
 
     for _round in 0..MAX_TOOL_ROUNDS {
+        // 每轮 LLM 调用前检查上下文超限 → 压缩早期历史（失败降级截断，不阻断回合）
+        compact::maybe_compact(&agent, &llm, rt, &ws_tx).await?;
         let chain = crate::server::llm::router::resolve_with_failover(&llm, &rt.model)
             .await
             .map_err(|e| format!("model resolution failed: {e}"))?;
@@ -375,6 +377,11 @@ async fn persist_message(
     }
 }
 
+/// 落库一行 kind='summary' 的消息（压缩模块用）。
+pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, content: &str) {
+    persist_message(agent, session_id, "user", content, None, None, None, "summary").await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,7 +446,7 @@ mod tests {
     fn test_line_splitter_handles_partial_chunks() {
         // HTTP chunk 边界可能切断 SSE 行：缓冲拼行
         let mut buf = LineBuf::default();
-        assert!(buf.feed(b"data: {\"a\":1}\r\n\r\nda").is_empty() == false);
+        assert!(!buf.feed(b"data: {\"a\":1}\r\n\r\nda").is_empty());
         // 第一行完整产出，"da" 留在缓冲
         let lines = buf.feed(b"ta: [DONE]\n");
         assert!(lines.iter().any(|l| l.contains("[DONE]")));
