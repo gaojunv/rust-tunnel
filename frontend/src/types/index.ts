@@ -543,9 +543,12 @@ export interface AgentSession {
 export interface AgentMessage {
   id: string;
   session_id: string;
-  role: 'user' | 'assistant' | 'tool';
+  role: string;
   content: string;
-  tool_calls?: string;
+  tool_calls?: string | null;
+  tool_call_id?: string | null;
+  name?: string | null;
+  kind: string;
   created_at: string;
 }
 

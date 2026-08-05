@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { cleanup, render, screen, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { listAgentMessages } from '../../api/client';
 import ChatStream from './ChatStream';
 
 vi.mock('react-i18next', () => ({
@@ -112,5 +113,19 @@ describe('ChatStream running state', () => {
       timeoutCb?.();
     });
     expect(screen.queryByText('agent.running')).toBeNull();
+  });
+
+  it('renders new-format tool_calls/tool_result history', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下文件', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.rs"}' } }]), tool_call_id: null, name: null, kind: 'tool_calls', created_at: '2026-08-05' },
+      { id: 'm3', session_id: 's1', role: 'tool', content: 'fn main(){}', tool_calls: null, tool_call_id: 'c1', name: 'read_file', kind: 'tool_result', created_at: '2026-08-05' },
+      { id: 'm4', session_id: 's1', role: 'assistant', content: '文件里是 main 函数', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    // 工具名、参数、结果都渲染出来
+    expect(await screen.findByText('read_file')).toBeTruthy();
+    expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
+    expect(screen.getByText('文件里是 main 函数')).toBeTruthy();
   });
 });

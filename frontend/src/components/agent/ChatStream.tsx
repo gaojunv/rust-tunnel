@@ -57,8 +57,25 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     if (!history || loadedRef.current) return;
     loadedRef.current = true;
     const loaded: ChatItem[] = [];
+    // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args
+    const callArgs = new Map<string, { name: string; args: string }>();
     for (const m of history) {
-      if (m.role === 'tool' && m.tool_calls) {
+      if (m.kind === 'tool_calls' && m.tool_calls) {
+        try {
+          for (const c of JSON.parse(m.tool_calls) as { id: string; function?: { name?: string; arguments?: string } }[]) {
+            callArgs.set(c.id, { name: c.function?.name ?? '', args: c.function?.arguments ?? '' });
+          }
+        } catch {
+          /* ignore malformed tool_calls */
+        }
+      }
+    }
+    for (const m of history) {
+      if (m.kind === 'tool_result') {
+        const call = (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
+        loaded.push({ kind: 'tool', content: '', toolName: call.name, toolArgs: call.args, toolResult: m.content });
+      } else if (m.kind === 'tool' && m.tool_calls) {
+        // 旧格式：合并 tool_log JSON 行
         try {
           for (const t of JSON.parse(m.tool_calls)) {
             loaded.push({ kind: 'tool', content: '', toolName: t.name, toolArgs: t.args, toolResult: t.result });
@@ -66,9 +83,10 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         } catch {
           /* ignore malformed tool_calls */
         }
-      } else if (m.content) {
+      } else if ((m.kind === 'message' || m.kind === 'summary') && m.content) {
         loaded.push({ kind: m.role === 'user' ? 'user' : 'assistant', content: m.content });
       }
+      // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
     }
     setItems(loaded);
   }, [history]);
