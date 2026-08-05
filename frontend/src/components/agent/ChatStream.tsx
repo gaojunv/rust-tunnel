@@ -72,7 +72,30 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         }
       }
     }
-    for (const m of history) {
+    // 压缩重插去重：kept 段在 summary 前保留原始行（801c9a6），DB 物理顺序为
+    // [..., 原kept, summary, 重插kept...]，前端全量渲染会重复。重插行数 =
+    // summary 之后的行数 K（含 tool_calls/tool_result，与后端 kept_count 口径
+    // 一致），故跳过 summary 前的最后 K 行即可去掉重复副本（多次压缩同样成立：
+    // 每次压缩都恰把 summary 前最后 kept_count 行重插到 summary 后）。
+    const skipBeforeLastSummary = new Set<number>();
+    {
+      let summaryIdx = -1;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].kind === 'summary') {
+          summaryIdx = i;
+          break;
+        }
+      }
+      if (summaryIdx >= 0) {
+        const k = history.length - summaryIdx - 1;
+        for (let i = summaryIdx - 1; i >= Math.max(0, summaryIdx - k); i--) {
+          skipBeforeLastSummary.add(i);
+        }
+      }
+    }
+    for (let i = 0; i < history.length; i++) {
+      const m = history[i];
+      if (skipBeforeLastSummary.has(i)) continue;
       if (m.kind === 'tool_result') {
         const call = (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
         loaded.push({ kind: 'tool', content: '', toolName: call.name, toolArgs: call.args, toolResult: m.content });
@@ -85,8 +108,11 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         } catch {
           /* ignore malformed tool_calls */
         }
-      } else if ((m.kind === 'message' || m.kind === 'summary') && m.content) {
+      } else if (m.kind === 'message' && m.content) {
         loaded.push({ kind: m.role === 'user' ? 'user' : 'assistant', content: m.content });
+      } else if (m.kind === 'summary' && m.content) {
+        // summary 渲染为 assistant 气泡（muted 样式），避免与普通用户消息混淆
+        loaded.push({ kind: 'assistant', content: m.content });
       }
       // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
     }

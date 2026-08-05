@@ -186,4 +186,82 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('后续')).toBeTruthy();
     expect(screen.queryByText('流式后续')).toBeNull();
   });
+
+  it('dedups re-inserted kept segment after compaction (M3)', async () => {
+    // DB 物理顺序：[旧消息..., 原kept..., summary, 重插kept...]——压缩修复
+    // （801c9a6）使 kept 段以相同内容出现两次，前端必须只渲染一份。
+    // K = summary 后行数（含 tool_calls/tool_result 行），跳过 summary 前最后 K 行。
+    const row = (id: string, role: string, content: string, kind: string) => ({
+      id,
+      session_id: 's1',
+      role,
+      content,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind,
+      created_at: '2026-08-05',
+    });
+    const toolCalls = JSON.stringify([
+      { id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.rs"}' } },
+    ]);
+    const toolCallsRow = (id: string) => ({
+      ...row(id, 'assistant', '', 'tool_calls'),
+      tool_calls: toolCalls,
+    });
+    const toolResultRow = (id: string) => ({
+      ...row(id, 'tool', 'fn main(){}', 'tool_result'),
+      tool_call_id: 'c1',
+      name: 'read_file',
+    });
+    (listAgentMessages as Mock).mockResolvedValue([
+      row('old1', 'user', '早期问题', 'message'),
+      row('old2', 'assistant', '早期回答', 'message'),
+      // 原 kept 段（summary 前，含 tool 配对行）——应被跳过
+      row('k1', 'user', '保留问题', 'message'),
+      toolCallsRow('k2'),
+      toolResultRow('k3'),
+      row('sum', 'user', '[上下文摘要] 之前讨论了 A', 'summary'),
+      // 重插 kept 段（summary 后）——只渲染这一份
+      row('k1r', 'user', '保留问题', 'message'),
+      toolCallsRow('k2r'),
+      toolResultRow('k3r'),
+    ]);
+    renderChat();
+    // 旧消息与 summary 完整保留
+    expect(await screen.findByText('早期问题')).toBeTruthy();
+    expect(screen.getByText('早期回答')).toBeTruthy();
+    expect(screen.getByText('[上下文摘要] 之前讨论了 A')).toBeTruthy();
+    // 重插的 kept 段只渲染一次（原始 kept 行被跳过，无连续重复段）
+    expect(screen.getAllByText('保留问题')).toHaveLength(1);
+    // 工具卡片同样只渲染一份（read_file 工具名 + 结果）
+    expect(screen.getAllByText('read_file')).toHaveLength(1);
+    expect(screen.getAllByText(/fn main\(\)/)).toHaveLength(1);
+  });
+
+  it('renders summary rows as assistant bubbles (M5)', async () => {
+    const row = (id: string, role: string, content: string, kind: string) => ({
+      id,
+      session_id: 's1',
+      role,
+      content,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind,
+      created_at: '2026-08-05',
+    });
+    (listAgentMessages as Mock).mockResolvedValue([
+      row('u', 'user', '普通用户消息', 'message'),
+      row('s', 'user', '[上下文摘要] 之前讨论了 X', 'summary'),
+    ]);
+    renderChat();
+    const userEl = await screen.findByText('普通用户消息');
+    const summaryEl = screen.getByText('[上下文摘要] 之前讨论了 X');
+    // summary 走 assistant 气泡样式（mr-auto + bg-muted），而非用户气泡（ml-auto）
+    const userBubble = userEl.closest('[class*="ml-auto"]');
+    const summaryBubble = summaryEl.closest('[class*="mr-auto"]');
+    expect(userBubble?.className).toContain('bg-primary/10');
+    expect(summaryBubble?.className).toContain('bg-muted');
+  });
 });
