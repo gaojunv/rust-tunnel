@@ -283,7 +283,7 @@ pub async fn run_agent_turn(
             let mut agg = sse::SseAggregator::new();
             let mut line_buf = LineBuf::default();
             let mut byte_stream = resp.into_body().into_data_stream();
-            while let Some(chunk) = byte_stream.next().await {
+            'sse: while let Some(chunk) = byte_stream.next().await {
                 let chunk = chunk.map_err(|e| format!("stream read failed: {e}"))?;
                 for line in line_buf.feed(&chunk) {
                     match agg.feed_line(&line) {
@@ -292,13 +292,17 @@ pub async fn run_agent_turn(
                                 .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
                                 .await;
                         }
-                        sse::SseFeed::Done => break,
+                        sse::SseFeed::Done => break 'sse,
                         sse::SseFeed::None => {}
                     }
                 }
             }
             if let Some(last) = line_buf.flush() {
-                let _ = agg.feed_line(&last);
+                if let sse::SseFeed::Content(delta) = agg.feed_line(&last) {
+                    let _ = ws_tx
+                        .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
+                        .await;
+                }
             }
             let turn = agg.finish()?;
             if turn.tool_calls.is_empty() {
@@ -439,6 +443,25 @@ mod tests {
         // 第一行完整产出，"da" 留在缓冲
         let lines = buf.feed(b"ta: [DONE]\n");
         assert!(lines.iter().any(|l| l.contains("[DONE]")));
+    }
+
+    #[test]
+    fn test_flush_feeds_final_delta_to_aggregator() {
+        // 回归：flush() 丢弃返回值会丢最后一行的 content delta 推送。
+        // 组合验证 flush 取行 → feed_line 返回 Content（修复路径的行为，不测 ws 发送）。
+        let mut buf = LineBuf::default();
+        // 无换行的完整 data 行：feed 不会产出，留在缓冲
+        let line = r#"data: {"choices":[{"delta":{"content":"收尾"},"index":0}]}"#;
+        assert!(buf.feed(line.as_bytes()).is_empty());
+        let flushed = buf.flush().expect("flush should return buffered line");
+        assert_eq!(flushed, line);
+
+        let mut agg = sse::SseAggregator::new();
+        match agg.feed_line(&flushed) {
+            sse::SseFeed::Content(delta) => assert_eq!(delta, "收尾"),
+            sse::SseFeed::None => panic!("expected Content delta, got None"),
+            sse::SseFeed::Done => panic!("expected Content delta, got Done"),
+        }
     }
 
     #[tokio::test]
