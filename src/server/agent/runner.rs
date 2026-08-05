@@ -7,14 +7,38 @@ use crate::common::AgentResult;
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
 /// 按行切分 SSE 字节流：HTTP chunk 边界可切断一行，未完结部分留缓冲。
-#[derive(Default)]
 struct LineBuf {
     pending: Vec<u8>,
+    /// pending 超过上限（无换行的超长单行）→ true；runner 应终止流。
+    overflowed: bool,
+    limit: usize,
+}
+
+impl Default for LineBuf {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            overflowed: false,
+            limit: sse::MAX_STREAM_BYTES,
+        }
+    }
 }
 
 impl LineBuf {
+    /// 用自定义上限构造（测试用小 limit，避免测试分配 10MB）。
+    #[cfg(test)]
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
         self.pending.extend_from_slice(bytes);
+        if self.pending.len() > self.limit {
+            self.overflowed = true;
+        }
         let mut lines = Vec::new();
         while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
@@ -38,6 +62,37 @@ impl LineBuf {
             Some(line)
         }
     }
+
+    /// 非 SSE 嗅探：缓冲的首批字节是否已能判定为非 SSE 流。
+    ///
+    /// 判定条件：pending 长度足够（≥5，即 `data:` 长度），trim 后既不是
+    /// `data:` 前缀、也不是 SSE 允许的开头（空行/注释行 `:` 前缀）、也不是
+    /// 纯空白（需继续等待更多字节）。
+    fn has_non_sse_prefix(&self) -> bool {
+        if self.pending.len() < 5 {
+            return false;
+        }
+        let trimmed = std::str::from_utf8(&self.pending)
+            .unwrap_or_default()
+            .trim_start();
+        !trimmed.is_empty() && !trimmed.starts_with("data:") && !trimmed.starts_with(':')
+    }
+
+    fn pending(&self) -> &[u8] {
+        &self.pending
+    }
+
+    fn take_pending(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+/// 判断一行是否为合法的 SSE 首行（data 行或注释行；空行已被 LineBuf 过滤）。
+/// 首个非空行既不是 `data:` 也不是 `:` 注释 → 上游实际返回的是普通文本/JSON，
+/// 走非 SSE 回退。
+fn is_sse_line(line: &str) -> bool {
+    let line = line.trim_end_matches('\r');
+    line.starts_with("data:") || line.starts_with(':')
 }
 
 fn is_sse_response(content_type: &str) -> bool {
@@ -227,6 +282,48 @@ async fn handle_tool_calls(
     Ok(())
 }
 
+/// 处理一个已解析的完整 LLM 响应（非 SSE 回退与 SSE 嗅探回退共用）。
+/// 返回 Ok(true) = 文本回合已完成（已落库 + done，调用方结束回合）；
+/// Ok(false) = tool 回合已执行（调用方继续下一轮）。
+async fn handle_llm_turn_json(
+    agent: &AgentState,
+    rt: &mut SessionRuntime,
+    ws_tx: &mpsc::Sender<serde_json::Value>,
+    body: &serde_json::Value,
+) -> Result<bool, String> {
+    match parse_llm_turn(body)? {
+        LlmTurn::Text(text) => {
+            let _ = ws_tx
+                .send(
+                    serde_json::json!({"type": "assistant_chunk", "content": &text, "final": true}),
+                )
+                .await;
+            rt.messages.push(ChatMessage::text("assistant", &text));
+            persist_message(
+                agent,
+                &rt.session_id,
+                "assistant",
+                &text,
+                None,
+                None,
+                None,
+                "message",
+            )
+            .await;
+            let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
+            Ok(true)
+        }
+        LlmTurn::ToolCalls(calls) => {
+            let raw_calls = body["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            handle_tool_calls(agent, rt, ws_tx, calls, raw_calls).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// Run one full agent turn: send current messages to the LLM, execute any tool
 /// calls over the tunnel, feed results back, repeat until the model stops
 /// calling tools. Progress is streamed to `ws_tx` as JSON messages.
@@ -283,14 +380,68 @@ pub async fn run_agent_turn(
             .to_string();
 
         if is_sse_response(&content_type) {
-            // ── 流式路径 ──
+            // ── 流式路径（含非 SSE 嗅探回退）──
+            // relay 层无条件改写 Content-Type 为 text/event-stream，故上游忽略
+            // stream 标志返回的普通 JSON 也只能靠内容嗅探识别（见下）。
             use futures_util::StreamExt;
             let mut agg = sse::SseAggregator::new();
             let mut line_buf = LineBuf::default();
             let mut byte_stream = resp.into_body().into_data_stream();
+            // 非 SSE 嗅探：首个非空行或首批字节前缀不是 `data:`（且非注释/空行）
+            // → 判定为非 SSE，剩余流全量收集进 non_sse_buf，流结束后按 JSON 回退。
+            let mut sse_confirmed = false;
+            let mut non_sse_buf: Option<Vec<u8>> = None;
+            // 致命错误（读流失败 / 聚合超限 / 单行超长）：终止并走错误路径，
+            // 不落库半截消息。
+            let mut fatal = false;
+            let mut fatal_msg = String::new();
+
             'sse: while let Some(chunk) = byte_stream.next().await {
-                let chunk = chunk.map_err(|e| format!("stream read failed: {e}"))?;
-                for line in line_buf.feed(&chunk) {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        fatal = true;
+                        fatal_msg = format!("stream read failed: {e}");
+                        break 'sse;
+                    }
+                };
+                // 已判定非 SSE：剩余流全量收集
+                if let Some(buf) = &mut non_sse_buf {
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() > sse::MAX_STREAM_BYTES {
+                        fatal = true;
+                        fatal_msg = "stream size limit exceeded".to_string();
+                        break 'sse;
+                    }
+                    continue;
+                }
+                // 首批字节（尚无换行）即不是 data: → 非 SSE
+                if !sse_confirmed && line_buf.has_non_sse_prefix() {
+                    sse_confirmed = true;
+                    let mut buf = line_buf.take_pending();
+                    buf.extend_from_slice(&chunk);
+                    non_sse_buf = Some(buf);
+                    continue;
+                }
+                let lines = line_buf.feed(&chunk);
+                if line_buf.overflowed {
+                    fatal = true;
+                    fatal_msg = "stream line exceeded size limit".to_string();
+                    break 'sse;
+                }
+                for line in lines {
+                    if !sse_confirmed {
+                        if is_sse_line(&line) {
+                            sse_confirmed = true;
+                        } else {
+                            // 首个非空行非 data: → 非 SSE：该行 + 缓冲剩余字节进收集桶
+                            sse_confirmed = true;
+                            let mut buf = line.as_bytes().to_vec();
+                            buf.extend_from_slice(line_buf.pending());
+                            non_sse_buf = Some(buf);
+                            break;
+                        }
+                    }
                     match agg.feed_line(&line) {
                         sse::SseFeed::Content(delta) => {
                             let _ = ws_tx
@@ -298,18 +449,65 @@ pub async fn run_agent_turn(
                                 .await;
                         }
                         sse::SseFeed::Done => break 'sse,
+                        sse::SseFeed::Overflow => {
+                            fatal = true;
+                            fatal_msg = "stream size limit exceeded".to_string();
+                            break 'sse;
+                        }
                         sse::SseFeed::None => {}
                     }
                 }
             }
+
+            if fatal {
+                let _ = ws_tx
+                    .send(serde_json::json!({"type": "error", "message": fatal_msg}))
+                    .await;
+                return Err(fatal_msg);
+            }
+
+            // 流结束时 pending 残留首批非 SSE 字节（无换行的单 chunk JSON）→ 整包收集
+            if non_sse_buf.is_none() && !sse_confirmed && line_buf.has_non_sse_prefix() {
+                non_sse_buf = Some(line_buf.take_pending());
+            }
+
+            if let Some(buf) = non_sse_buf {
+                // 非 SSE 回退：收集到的整包 body 按 JSON 解析（与普通非 SSE 分支共用）
+                let body: serde_json::Value = serde_json::from_slice(&buf)
+                    .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
+                if handle_llm_turn_json(&agent, rt, &ws_tx, &body).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+
             if let Some(last) = line_buf.flush() {
-                if let sse::SseFeed::Content(delta) = agg.feed_line(&last) {
-                    let _ = ws_tx
-                        .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
-                        .await;
+                match agg.feed_line(&last) {
+                    sse::SseFeed::Content(delta) => {
+                        let _ = ws_tx
+                            .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
+                            .await;
+                    }
+                    sse::SseFeed::Overflow => {
+                        let _ = ws_tx
+                            .send(serde_json::json!({"type": "error", "message": "stream size limit exceeded"}))
+                            .await;
+                        return Err("stream size limit exceeded".to_string());
+                    }
+                    sse::SseFeed::Done | sse::SseFeed::None => {}
                 }
             }
+
+            let saw_data = agg.saw_data();
             let turn = agg.finish()?;
+            // 兜底：从未收到任何 data 行且无聚合产出 → 空流/伪装 SSE，
+            // 报错而非静默落库空消息（修复前真实内容/错误被吞）。
+            if turn.text.is_empty() && turn.tool_calls.is_empty() && !saw_data {
+                let _ = ws_tx
+                    .send(serde_json::json!({"type": "error", "message": "empty response from upstream (not an SSE stream?)"}))
+                    .await;
+                return Err("empty response from upstream (not an SSE stream?)".to_string());
+            }
             if turn.tool_calls.is_empty() {
                 // 文本回合：收尾 final chunk + 落库 + done
                 let _ = ws_tx
@@ -336,38 +534,13 @@ pub async fn run_agent_turn(
         }
 
         // ── 非 SSE 回退（某些上游/代理返回普通 JSON）──
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+        let body_bytes = axum::body::to_bytes(resp.into_body(), sse::MAX_STREAM_BYTES)
             .await
             .map_err(|e| format!("failed to read LLM response: {e}"))?;
         let body: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
-        match parse_llm_turn(&body)? {
-            LlmTurn::Text(text) => {
-                let _ = ws_tx
-                    .send(serde_json::json!({"type": "assistant_chunk", "content": &text, "final": true}))
-                    .await;
-                rt.messages.push(ChatMessage::text("assistant", &text));
-                persist_message(
-                    &agent,
-                    &rt.session_id,
-                    "assistant",
-                    &text,
-                    None,
-                    None,
-                    None,
-                    "message",
-                )
-                .await;
-                let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
-                return Ok(());
-            }
-            LlmTurn::ToolCalls(calls) => {
-                let raw_calls = body["choices"][0]["message"]["tool_calls"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                handle_tool_calls(&agent, rt, &ws_tx, calls, raw_calls).await?;
-            }
+        if handle_llm_turn_json(&agent, rt, &ws_tx, &body).await? {
+            return Ok(());
         }
     }
 
@@ -476,6 +649,58 @@ mod tests {
     }
 
     #[test]
+    fn test_line_buf_detects_non_sse_first_bytes() {
+        // 首批字节即不是 data:（JSON 开头，尚无换行）→ 判定非 SSE
+        let mut buf = LineBuf::default();
+        assert!(!buf.has_non_sse_prefix()); // 空缓冲不足判定
+        buf.feed(b"{\"c");
+        assert!(!buf.has_non_sse_prefix()); // 3 字节 < 5 → 继续等待
+        buf.feed(b"hoi");
+        assert!(buf.has_non_sse_prefix()); // 累计 ≥5，trim 后以 `{` 开头 → 非 SSE
+        assert_eq!(buf.pending(), b"{\"choi");
+    }
+
+    #[test]
+    fn test_line_buf_non_sse_prefix_allows_sse_leading() {
+        // SSE 流开头允许空行/注释行/`data:` 前缀（可跨 chunk 拼合）：不应误判
+        let mut buf = LineBuf::default();
+        buf.feed(b"\n\n: comment\r\n");
+        assert!(!buf.has_non_sse_prefix()); // trim 后以 `:` 开头 → SSE 注释
+
+        let mut buf = LineBuf::default();
+        buf.feed(b"\n\n  \n");
+        assert!(!buf.has_non_sse_prefix()); // 纯空白 → 继续等待
+
+        let mut buf = LineBuf::default();
+        buf.feed(b"da");
+        assert!(!buf.has_non_sse_prefix());
+        buf.feed(b"ta: ");
+        assert!(!buf.has_non_sse_prefix()); // data: 前缀跨 chunk 拼合 → 仍是 SSE
+    }
+
+    #[test]
+    fn test_first_line_sniff_is_sse_line() {
+        assert!(is_sse_line(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}"
+        ));
+        assert!(is_sse_line(": comment"));
+        assert!(is_sse_line("data: [DONE]"));
+        assert!(!is_sse_line("{\"choices\":["));
+        assert!(!is_sse_line("plain text"));
+    }
+
+    #[test]
+    fn test_line_buf_overflow_on_single_line() {
+        // 无换行的超长单行：pending 超过上限 → overflowed 标记（runner 据此终止）
+        let mut buf = LineBuf::with_limit(100);
+        assert!(!buf.overflowed);
+        buf.feed(&[b'x'; 150]);
+        assert!(buf.overflowed);
+        // 溢出后接口不 panic、不丢已解析行
+        assert!(buf.feed(b"y").is_empty());
+    }
+
+    #[test]
     fn test_line_splitter_handles_partial_chunks() {
         // HTTP chunk 边界可能切断 SSE 行：缓冲拼行
         let mut buf = LineBuf::default();
@@ -501,6 +726,7 @@ mod tests {
             sse::SseFeed::Content(delta) => assert_eq!(delta, "收尾"),
             sse::SseFeed::None => panic!("expected Content delta, got None"),
             sse::SseFeed::Done => panic!("expected Content delta, got Done"),
+            sse::SseFeed::Overflow => panic!("expected Content delta, got Overflow"),
         }
     }
 
