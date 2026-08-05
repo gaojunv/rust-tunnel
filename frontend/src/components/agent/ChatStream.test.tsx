@@ -138,4 +138,52 @@ describe('ChatStream running state', () => {
     expect(await screen.findByText('shell')).toBeTruthy();
     expect(screen.getByText('a.rs')).toBeTruthy();
   });
+
+  it('merges streamed assistant_chunk deltas into one bubble', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '你好', final: false });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '，世界', final: false });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '', final: true });
+    });
+    // 一个气泡，内容为拼接结果
+    const bubbles = screen.getAllByText('你好，世界');
+    expect(bubbles).toHaveLength(1);
+  });
+
+  it('renders status event as transient hint', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'status', message: 'compacting' });
+    });
+    expect(await screen.findByText(/compacting|压缩/)).toBeTruthy();
+  });
+
+  it('renders non-SSE fallback (content + final in one chunk) as a single bubble', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '非流式回退完整文本', final: true });
+    });
+    // 一条 content+final:true 消息：先追加内容再关闭气泡 → 单个完整气泡
+    const bubbles = screen.getAllByText('非流式回退完整文本');
+    expect(bubbles).toHaveLength(1);
+  });
+
+  it('status closes the current streaming bubble before appending the hint', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '流式', final: false });
+      wsInstance!.emit({ type: 'status', message: 'compacting' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '后续', final: false });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '', final: true });
+    });
+    // status 断开流式气泡：'流式' 与 '后续' 各自独立，不合并
+    expect(screen.getByText('流式')).toBeTruthy();
+    expect(screen.getByText('后续')).toBeTruthy();
+    expect(screen.queryByText('流式后续')).toBeNull();
+  });
 });

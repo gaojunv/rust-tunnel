@@ -45,6 +45,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // running 的 ref 镜像：WS onmessage 闭包内避免读旧 state
   const runningRef = useRef(false);
+  // 当前正在流式写入的气泡 index（assistant_chunk 增量合并用；final/新事件到达时置 null）
+  const streamingIdxRef = useRef<number | null>(null);
 
   // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）
   const { data: history } = useQuery({
@@ -130,13 +132,39 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       } catch {
         return;
       }
-      if (msg.type === 'assistant_chunk' && msg.content) {
-        setItems((prev) => [...prev, { kind: 'assistant', content: msg.content! }]);
+      if (msg.type === 'assistant_chunk') {
+        if (msg.content) {
+          setItems((prev) => {
+            const idx = streamingIdxRef.current;
+            if (idx !== null && prev[idx]?.kind === 'assistant') {
+              // 已有流式气泡 → 增量合并
+              const next = [...prev];
+              next[idx] = { ...next[idx], content: next[idx].content + msg.content! };
+              return next;
+            }
+            streamingIdxRef.current = prev.length;
+            return [...prev, { kind: 'assistant', content: msg.content! }];
+          });
+        }
+        if (msg.final) {
+          // 回合收尾：关闭也走更新队列，与增量合并的 ref 写入保持顺序。
+          // （若在 emit 时同步置 null，React 批量 flush 时可能截断同批次尚未合并的增量。
+          //   非 SSE 回退 content+final:true 同条 → 先追加再关闭，语义一致。）
+          setItems((prev) => {
+            streamingIdxRef.current = null;
+            return prev;
+          });
+        }
       } else if (msg.type === 'tool_call') {
         if (msg.id) pendingTools.add(msg.id);
         // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）
         armRunning();
-        setItems((prev) => [...prev, { kind: 'tool', content: '', toolName: msg.name, toolArgs: msg.args }]);
+        // 工具回合与文本回合交替：文本气泡必须断开（在更新队列内置 null，
+        // 与增量合并的 ref 写入保持顺序，避免批量 flush 时截断合并）
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return [...prev, { kind: 'tool', content: '', toolName: msg.name, toolArgs: msg.args }];
+        });
       } else if (msg.type === 'tool_result') {
         if (msg.id) pendingTools.delete(msg.id);
         setItems((prev) => {
@@ -149,15 +177,30 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           }
           return next;
         });
+      } else if (msg.type === 'status') {
+        // 轻量提示行（压缩等中间状态）：复用 assistant 气泡样式但标记 status；
+        // 不进气泡流 → 在更新队列内先关闭当前流式气泡再追加独立行
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }];
+        });
       } else if (msg.type === 'done') {
         // 严格终态：工具全部回齐才解除 Running（防御乱序帧）
+        // 关闭流式气泡（返回原 prev → React 跳过重渲染，仅执行 ref 关闭）
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return prev;
+        });
         if (pendingTools.size === 0) {
           stopRunning();
           // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果
           void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
         }
       } else if (msg.type === 'error') {
-        setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }];
+        });
         stopRunning();
       }
     };

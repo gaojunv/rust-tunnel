@@ -552,13 +552,11 @@ export interface AgentMessage {
   created_at: string;
 }
 
-export interface AgentWsEvent {
-  type: 'assistant_chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
-  content?: string;
-  id?: string;
-  name?: string;
-  args?: string;
-  result?: string;
-  message?: string;
-}
+export type AgentWsEvent =
+  | { type: 'assistant_chunk'; content?: string; final?: boolean }
+  | { type: 'tool_call'; id?: string; name?: string; args?: string }
+  | { type: 'tool_result'; id?: string; name?: string; result?: string }
+  | { type: 'status'; message?: string }
+  | { type: 'done' }
+  | { type: 'error'; message?: string };
 
