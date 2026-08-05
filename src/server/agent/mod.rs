@@ -1,8 +1,10 @@
 //! AI agent workbench: server-side agent loop, tool execution over tunnel.
 
+pub mod compact;
 pub mod executor;
 pub mod runner;
 pub mod session;
+pub mod sse;
 pub mod tools;
 
 use std::collections::HashMap;

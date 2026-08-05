@@ -19,7 +19,10 @@ export default function GitPanel({ sessionId }: { sessionId: string }) {
 
   let latestGitStatus: string | null = null;
   for (const m of messages ?? []) {
-    if (m.role === 'tool' && m.tool_calls) {
+    if (m.kind === 'tool_result' && m.name === 'git_status') {
+      latestGitStatus = m.content;
+    } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
+      // 旧格式兼容
       try {
         const logs = JSON.parse(m.tool_calls) as ToolLog[];
         for (const log of logs) {

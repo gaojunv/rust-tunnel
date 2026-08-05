@@ -416,6 +416,10 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Migration: old DBs lack extra_config column on llm_models (per-model config,
+        // 如 agent_context_limit，供压缩模块读取）。
+        Self::migrate_llm_models_extra_config(pool).await?;
+
         // LLM API keys table (gateway-level keys for external callers)
         sqlx::query(
             r#"
@@ -651,6 +655,35 @@ impl Database {
         .execute(pool)
         .await?;
 
+        Self::migrate_agent_messages_v2(pool).await?;
+
+        Ok(())
+    }
+
+    /// agent_messages 补全 tool_calls 结构列。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_messages_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "tool_call_id",
+                "ALTER TABLE agent_messages ADD COLUMN tool_call_id TEXT",
+            ),
+            ("name", "ALTER TABLE agent_messages ADD COLUMN name TEXT"),
+            (
+                "kind",
+                "ALTER TABLE agent_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // SQLite: "duplicate column name: xxx" —— 已迁移过
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_messages migration: column already exists");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -788,6 +821,18 @@ impl Database {
     /// Migration: old DBs lack `failover_from` on `llm_usage_logs`. Idempotent.
     async fn migrate_llm_usage_add_failover_from(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE llm_usage_logs ADD COLUMN failover_from TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// llm_models 加 extra_config JSON 列（per-model 配置，如 agent_context_limit）。幂等。
+    async fn migrate_llm_models_extra_config(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_models ADD COLUMN extra_config TEXT")
             .execute(pool)
             .await
         {

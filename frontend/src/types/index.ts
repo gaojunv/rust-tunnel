@@ -313,6 +313,7 @@ export interface LlmModel {
   alias: string;
   tags: string[];
   enabled: boolean;
+  extra_config?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -321,6 +322,7 @@ export interface CreateModelRequest {
   model_name: string;
   alias?: string;
   tags?: string[];
+  extra_config?: string | null;
 }
 
 export interface LlmApiKey {
@@ -543,19 +545,20 @@ export interface AgentSession {
 export interface AgentMessage {
   id: string;
   session_id: string;
-  role: 'user' | 'assistant' | 'tool';
+  role: string;
   content: string;
-  tool_calls?: string;
+  tool_calls?: string | null;
+  tool_call_id?: string | null;
+  name?: string | null;
+  kind: string;
   created_at: string;
 }
 
-export interface AgentWsEvent {
-  type: 'assistant_chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
-  content?: string;
-  id?: string;
-  name?: string;
-  args?: string;
-  result?: string;
-  message?: string;
-}
+export type AgentWsEvent =
+  | { type: 'assistant_chunk'; content?: string; final?: boolean }
+  | { type: 'tool_call'; id?: string; name?: string; args?: string }
+  | { type: 'tool_result'; id?: string; name?: string; result?: string }
+  | { type: 'status'; message?: string }
+  | { type: 'done' }
+  | { type: 'error'; message?: string };
 

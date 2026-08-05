@@ -1111,7 +1111,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true, None)
             .await
             .unwrap();
 
@@ -1328,10 +1328,10 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model("m-bad", "p-bad", "bad-model", "", "[]", true)
+        db.llm_save_model("m-bad", "p-bad", "bad-model", "", "[]", true, None)
             .await
             .unwrap();
-        db.llm_save_model("m-good", "p-good", "good-model", "", "[]", true)
+        db.llm_save_model("m-good", "p-good", "good-model", "", "[]", true, None)
             .await
             .unwrap();
         db.llm_create_model_group("g1", "router", true)
@@ -1507,7 +1507,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true, None)
             .await
             .unwrap();
 

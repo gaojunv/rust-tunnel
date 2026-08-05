@@ -32,6 +32,9 @@ pub struct AgentMessageRecord {
     pub role: String,
     pub content: String,
     pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
+    pub kind: String,
     pub created_at: String,
 }
 
@@ -212,14 +215,38 @@ impl Database {
         content: &str,
         tool_calls: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        // 旧接口兼容：role=tool 的合并行推导 kind="tool"（重放时按旧格式跳过），
+        // 其余为普通 message。
+        let kind = if role == "tool" { "tool" } else { "message" };
+        self.agent_add_message_v2(id, session_id, role, content, tool_calls, None, None, kind)
+            .await
+    }
+
+    /// 新格式消息写入（全列）。`kind` 取值：message / tool_calls / tool_result / summary。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn agent_add_message_v2(
+        &self,
+        id: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<&str>,
+        tool_call_id: Option<&str>,
+        name: Option<&str>,
+        kind: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO agent_messages (id, session_id, role, content, tool_calls) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO agent_messages (id, session_id, role, content, tool_calls, tool_call_id, name, kind) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(session_id)
         .bind(role)
         .bind(content)
         .bind(tool_calls)
+        .bind(tool_call_id)
+        .bind(name)
+        .bind(kind)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -409,5 +436,59 @@ mod tests {
         db.agent_delete_workspace("w1").await.unwrap();
         assert!(db.agent_list_sessions("w1").await.unwrap().is_empty());
         assert!(db.agent_list_messages("s1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_message_v2_columns_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // assistant tool_calls 行
+        db.agent_add_message_v2(
+            "m1",
+            "s1",
+            "assistant",
+            "",
+            Some(r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#),
+            None,
+            None,
+            "tool_calls",
+        )
+        .await
+        .unwrap();
+        // tool 结果行
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "tool",
+            "exit_code=0",
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
+        // 旧接口写入 → kind 自动推导
+        db.agent_add_message("m3", "s1", "user", "hi", None)
+            .await
+            .unwrap();
+        db.agent_add_message("m4", "s1", "tool", "", Some(r#"[{"name":"shell"}]"#))
+            .await
+            .unwrap();
+
+        let msgs = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(msgs[0].kind, "tool_calls");
+        assert!(msgs[0].tool_call_id.is_none());
+        assert_eq!(msgs[1].kind, "tool_result");
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(msgs[1].name.as_deref(), Some("shell"));
+        assert_eq!(msgs[2].kind, "message");
+        assert_eq!(msgs[3].kind, "tool"); // 旧格式保持 role=tool 的推导
     }
 }

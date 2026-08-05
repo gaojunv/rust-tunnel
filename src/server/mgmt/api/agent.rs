@@ -694,7 +694,13 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(db.agent_get_session("s1").await.unwrap().unwrap().model.is_none());
+        assert!(db
+            .agent_get_session("s1")
+            .await
+            .unwrap()
+            .unwrap()
+            .model
+            .is_none());
 
         // 不存在的会话 → 404
         let resp = update_session_model(
@@ -745,7 +751,9 @@ mod tests {
         let (state, _db) = test_state().await;
 
         // 未设置 → 空串
-        let resp = get_default_model(State(state.clone())).await.into_response();
+        let resp = get_default_model(State(state.clone()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
@@ -765,7 +773,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         // 读回
-        let resp = get_default_model(State(state.clone())).await.into_response();
+        let resp = get_default_model(State(state.clone()))
+            .await
+            .into_response();
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -780,7 +790,9 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = get_default_model(State(state.clone())).await.into_response();
+        let resp = get_default_model(State(state.clone()))
+            .await
+            .into_response();
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();

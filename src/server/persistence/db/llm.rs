@@ -24,6 +24,8 @@ pub struct LlmModelRecord {
     pub model_name: String,
     pub alias: String,
     pub tags: String,
+    /// per-model 配置（JSON 字符串，如 `{"agent_context_limit":200000}`）。非敏感，不加密。
+    pub extra_config: Option<String>,
     pub enabled: i32,
     pub created_at: String,
     pub updated_at: String,
@@ -274,6 +276,7 @@ impl Database {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn llm_save_model(
         &self,
         id: &str,
@@ -282,15 +285,17 @@ impl Database {
         alias: &str,
         tags: &str,
         enabled: bool,
+        extra_config: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO llm_models (id, provider_id, model_name, alias, tags, enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            INSERT INTO llm_models (id, provider_id, model_name, alias, tags, extra_config, enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
                 model_name = excluded.model_name,
                 alias = excluded.alias,
                 tags = excluded.tags,
+                extra_config = excluded.extra_config,
                 enabled = excluded.enabled,
                 updated_at = datetime('now')
             "#,
@@ -300,6 +305,7 @@ impl Database {
         .bind(model_name)
         .bind(alias)
         .bind(tags)
+        .bind(extra_config)
         .bind(enabled as i32)
         .execute(&self.pool)
         .await?;
@@ -312,13 +318,15 @@ impl Database {
         model_name: &str,
         alias: &str,
         tags: &str,
+        extra_config: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE llm_models SET model_name = ?, alias = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"
+            "UPDATE llm_models SET model_name = ?, alias = ?, tags = ?, extra_config = ?, updated_at = datetime('now') WHERE id = ?"
         )
         .bind(model_name)
         .bind(alias)
         .bind(tags)
+        .bind(extra_config)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -832,9 +840,17 @@ mod tests {
 
         // Add model
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast", "[\"coding\"]", true)
-            .await
-            .unwrap();
+        db.llm_save_model(
+            &mid,
+            &pid,
+            "deepseek-chat",
+            "fast",
+            "[\"coding\"]",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
 
         // List models for provider
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
@@ -866,9 +882,15 @@ mod tests {
             .is_none());
 
         // Update model
-        db.llm_update_model(&mid, "deepseek-chat", "fast-v2", "[\"coding\",\"cheap\"]")
-            .await
-            .unwrap();
+        db.llm_update_model(
+            &mid,
+            "deepseek-chat",
+            "fast-v2",
+            "[\"coding\",\"cheap\"]",
+            None,
+        )
+        .await
+        .unwrap();
         let models = db.llm_list_models_for_provider(&pid).await.unwrap();
         assert_eq!(models[0].alias, "fast-v2");
 
@@ -882,11 +904,59 @@ mod tests {
 
         // Cascade delete: delete provider should delete models
         let mid2 = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid2, &pid, "deepseek-r1", "", "[]", true)
+        db.llm_save_model(&mid2, &pid, "deepseek-r1", "", "[]", true, None)
             .await
             .unwrap();
         db.llm_delete_provider(&pid).await.unwrap();
         assert!(db.llm_list_models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_model_extra_config_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.llm_save_provider(
+            "p1",
+            "prov",
+            "deepseek",
+            "https://api",
+            "key",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model(
+            "m1",
+            "p1",
+            "gpt-x",
+            "alias-x",
+            "[]",
+            true,
+            Some(r#"{"agent_context_limit":200000}"#),
+        )
+        .await
+        .unwrap();
+
+        let m = db
+            .llm_find_model_by_name_or_alias("gpt-x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            m.extra_config.as_deref(),
+            Some(r#"{"agent_context_limit":200000}"#)
+        );
+
+        db.llm_update_model("m1", "gpt-x", "alias-x", "[]", None)
+            .await
+            .unwrap();
+        let m = db
+            .llm_find_model_by_name_or_alias("gpt-x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(m.extra_config.is_none());
     }
 
     #[tokio::test]
@@ -922,12 +992,20 @@ mod tests {
 
         // 先插入“别名冲突”的模型，制造无序查询返回它的机会
         let alias_model = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&alias_model, &p2, "moonshot-v1-8k", "fast", "[]", true)
-            .await
-            .unwrap();
+        db.llm_save_model(
+            &alias_model,
+            &p2,
+            "moonshot-v1-8k",
+            "fast",
+            "[]",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
         // 后插入“名称精确匹配”的模型
         let name_model = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&name_model, &p1, "fast", "", "[]", true)
+        db.llm_save_model(&name_model, &p1, "fast", "", "[]", true, None)
             .await
             .unwrap();
 
@@ -1187,10 +1265,10 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model("m1", "p1", "deepseek-chat", "chat", "[]", true)
+        db.llm_save_model("m1", "p1", "deepseek-chat", "chat", "[]", true, None)
             .await
             .unwrap();
-        db.llm_save_model("m2", "p1", "deepseek-reasoner", "", "[]", true)
+        db.llm_save_model("m2", "p1", "deepseek-reasoner", "", "[]", true, None)
             .await
             .unwrap();
 
@@ -1237,7 +1315,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model("m1", "p1", "deepseek-chat", "", "[]", true)
+        db.llm_save_model("m1", "p1", "deepseek-chat", "", "[]", true, None)
             .await
             .unwrap();
         db.llm_create_model_group("g1", "router", true)
@@ -1271,7 +1349,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model("m1", "p1", "deepseek-chat", "chat-alias", "[]", true)
+        db.llm_save_model("m1", "p1", "deepseek-chat", "chat-alias", "[]", true, None)
             .await
             .unwrap();
         db.llm_create_model_group("g1", "router", true)

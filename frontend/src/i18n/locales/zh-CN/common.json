@@ -565,6 +565,7 @@
       "modelNamePlaceholder": "模型名称（如 deepseek-chat）",
       "aliasPlaceholder": "别名",
       "tagsPlaceholder": "标签（逗号分隔）",
+      "contextLimitPlaceholder": "上下文上限(字符)",
       "deleteProviderConfirm": "删除此供应商及其所有模型？",
       "deleteModelConfirm": "删除模型「{{name}}」？",
       "addModel": "添加"

@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { useProviderModels, useAddModel, useUpdateModel, useDeleteModel, useToggleLlmProvider, useDeleteLlmProvider } from '@/api/hooks';
 import type { LlmProvider, LlmModel } from '@/types';
+import { parseContextLimit, mergeContextLimit } from './contextLimit';
 import { Trash2, Plus, Edit3, ChevronDown, ChevronRight, Check, X } from 'lucide-react';
 
 interface Props { provider: LlmProvider; onEdit: () => void; }
@@ -19,6 +20,7 @@ function ModelRow({ model }: { model: LlmModel }) {
   const [editing, setEditing] = useState(false);
   const [alias, setAlias] = useState(model.alias);
   const [tags, setTags] = useState(model.tags?.join(', ') ?? '');
+  const [contextLimit, setContextLimit] = useState(parseContextLimit(model.extra_config));
 
   const save = () => {
     updateModelMutation.mutate(
@@ -27,6 +29,7 @@ function ModelRow({ model }: { model: LlmModel }) {
         model_name: model.model_name,
         alias: alias.trim(),
         tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
+        extra_config: mergeContextLimit(model.extra_config, contextLimit),
       },
       { onSuccess: () => setEditing(false) },
     );
@@ -38,10 +41,17 @@ function ModelRow({ model }: { model: LlmModel }) {
         <span className="font-mono">{model.model_name}</span>
         <Input placeholder={t('llm.providerCard.aliasPlaceholder')} value={alias} onChange={(e) => setAlias(e.target.value)} className="h-7 w-32" />
         <Input placeholder={t('llm.providerCard.tagsPlaceholder')} value={tags} onChange={(e) => setTags(e.target.value)} className="h-7 flex-1" />
+        <Input
+          placeholder={t('llm.providerCard.contextLimitPlaceholder')}
+          value={contextLimit}
+          onChange={(e) => setContextLimit(e.target.value)}
+          className="h-7 w-28"
+          inputMode="numeric"
+        />
         <Button variant="ghost" size="icon" onClick={save} disabled={updateModelMutation.isPending}>
           <Check className="w-3 h-3" />
         </Button>
-        <Button variant="ghost" size="icon" onClick={() => setEditing(false)}>
+        <Button variant="ghost" size="icon" onClick={() => { setContextLimit(parseContextLimit(model.extra_config)); setEditing(false); }}>
           <X className="w-3 h-3" />
         </Button>
       </div>
@@ -56,7 +66,7 @@ function ModelRow({ model }: { model: LlmModel }) {
         {model.tags?.map((t) => <Badge key={t} variant="outline" className="ml-1 text-xs">{t}</Badge>)}
       </div>
       <div className="flex items-center">
-        <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setEditing(true); }}>
+        <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setContextLimit(parseContextLimit(model.extra_config)); setEditing(true); }}>
           <Edit3 className="w-3 h-3" />
         </Button>
         <Button variant="ghost" size="icon" onClick={() => { if (confirm(t('llm.providerCard.deleteModelConfirm', { name: model.model_name }))) deleteModelMutation.mutate(model.id); }}>
