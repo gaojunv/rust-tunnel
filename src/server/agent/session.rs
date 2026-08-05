@@ -38,23 +38,46 @@ impl SessionRuntime {
             .agent_list_messages(session_id)
             .await
             .map_err(|e| format!("db error: {e}"))?;
+
+        // 上下文压缩：只重放最后一个 summary 行及之后的消息（LLM 视角）。
+        // 被压缩的原始消息保留在 DB，UI 历史仍可见完整记录。
+        let start = records
+            .iter()
+            .rposition(|r| r.kind == "summary")
+            .unwrap_or(0);
+
         let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
-        for r in records {
-            // Tool-result rows (role="tool") persist with empty content and no
-            // tool_call_id, and assistant tool_calls are never persisted. Replaying
-            // them produces {"role":"tool","content":""} without a tool_call_id,
-            // which upstream OpenAI rejects with a 400 — poisoning every later turn.
-            // Skip them; the UI reads agent_messages directly, so nothing is lost.
-            if r.role == "tool" {
-                continue;
+        for r in &records[start..] {
+            match r.kind.as_str() {
+                // 旧格式（kind='tool' 的合并行、assistant tool_calls 未持久化）重放会产生
+                // 非法 OpenAI 序列（tool 消息无 tool_call_id），故跳过。新格式
+                // （tool_calls/tool_result 行）恢复完整结构；summary 行之后才是有效上下文。
+                "tool" => continue,
+                // 迁移前遗留行：SQLite DEFAULT 使 role='tool' 的旧行 kind='message'，
+                // 不能落入 _ 分支被当作普通工具文本消息重放，同样跳过。
+                "message" if r.role == "tool" => continue,
+                // assistant 的工具调用记录：恢复原始 tool_calls JSON。
+                "tool_calls" => messages.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: r
+                        .tool_calls
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok()),
+                    tool_call_id: None,
+                    name: None,
+                }),
+                // 单条工具结果：恢复 tool_call_id/name，与 tool_calls 配对。
+                "tool_result" => messages.push(ChatMessage {
+                    role: "tool".into(),
+                    content: Some(r.content.clone()),
+                    tool_calls: None,
+                    tool_call_id: r.tool_call_id.clone(),
+                    name: r.name.clone(),
+                }),
+                // message / summary：普通文本消息。
+                _ => messages.push(ChatMessage::text(&r.role, &r.content)),
             }
-            messages.push(ChatMessage {
-                role: r.role,
-                content: Some(r.content),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-            });
         }
 
         Ok(Self {
@@ -189,5 +212,114 @@ mod tests {
     async fn test_load_nonexistent_session() {
         let db = Database::new(":memory:").await.unwrap();
         assert!(SessionRuntime::load(&db, "ghost", "m").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_replays_new_format_tool_structure() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "看下文件", None)
+            .await
+            .unwrap();
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "assistant",
+            "",
+            Some(r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]"#),
+            None,
+            None,
+            "tool_calls",
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2("m3", "s1", "tool", "fn main(){}", None, Some("c1"), Some("read_file"), "tool_result")
+            .await
+            .unwrap();
+        db.agent_add_message("m4", "s1", "assistant", "文件里是 main 函数", None)
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        // system + user + assistant(tool_calls) + tool + assistant
+        assert_eq!(rt.messages.len(), 5);
+        assert_eq!(rt.messages[2].role, "assistant");
+        assert!(rt.messages[2].tool_calls.is_some());
+        assert_eq!(rt.messages[2].content, None);
+        assert_eq!(rt.messages[3].role, "tool");
+        assert_eq!(rt.messages[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(rt.messages[3].name.as_deref(), Some("read_file"));
+        assert_eq!(rt.messages[3].content.as_deref(), Some("fn main(){}"));
+    }
+
+    #[tokio::test]
+    async fn test_load_resumes_from_last_summary() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "早期对话", None)
+            .await
+            .unwrap();
+        db.agent_add_message("m2", "s1", "assistant", "早期回复", None)
+            .await
+            .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "user",
+            "[上下文摘要] 之前讨论了 X",
+            None,
+            None,
+            None,
+            "summary",
+        )
+        .await
+        .unwrap();
+        db.agent_add_message("m4", "s1", "user", "近期问题", None)
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        // system + summary + 近期 user；summary 之前的消息被跳过
+        let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "user"]);
+        assert!(rt.messages[1].content.as_deref().unwrap().contains("上下文摘要"));
+        assert_eq!(rt.messages[2].content.as_deref(), Some("近期问题"));
+    }
+
+    #[tokio::test]
+    async fn test_load_skips_legacy_tool_rows() {
+        // 迁移前遗留行：SQLite DEFAULT 把 kind 补成 'message'，role='tool' 的旧合并行
+        // 必须被跳过（不能落入普通文本消息分支产生非法 OpenAI 序列）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "改代码", None)
+            .await
+            .unwrap();
+        db.agent_add_message_v2("m2", "s1", "tool", "", None, None, None, "message")
+            .await
+            .unwrap();
+        db.agent_add_message("m3", "s1", "assistant", "已完成", None)
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        assert_eq!(rt.messages.len(), 3);
     }
 }
