@@ -3,6 +3,7 @@
 pub mod executor;
 pub mod runner;
 pub mod session;
+pub mod sse;
 pub mod tools;
 
 use std::collections::HashMap;
