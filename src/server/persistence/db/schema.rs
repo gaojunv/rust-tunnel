@@ -651,6 +651,32 @@ impl Database {
         .execute(pool)
         .await?;
 
+        Self::migrate_agent_messages_v2(pool).await?;
+
+        Ok(())
+    }
+
+    /// agent_messages 补全 tool_calls 结构列。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_messages_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            ("tool_call_id", "ALTER TABLE agent_messages ADD COLUMN tool_call_id TEXT"),
+            ("name", "ALTER TABLE agent_messages ADD COLUMN name TEXT"),
+            (
+                "kind",
+                "ALTER TABLE agent_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    // SQLite: "duplicate column name: xxx" —— 已迁移过
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_messages migration: column already exists");
+                }
+            }
+        }
         Ok(())
     }
 
