@@ -1,6 +1,10 @@
 //! SSE 增量解析：OpenAI 流式 chat.completion 的 delta 聚合。
 use super::runner::ParsedToolCall;
 
+/// 单回合 tool_calls 上限：实践中 LLM 并行调用不超过数十；
+/// 无界 index 直接 resize 会被恶意上游用作 OOM/panic 向量。
+const MAX_TOOL_CALLS: usize = 64;
+
 /// 一个回合的聚合结果。
 pub struct AggregatedTurn {
     pub text: String,
@@ -56,6 +60,9 @@ impl SseAggregator {
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in calls {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                if index >= MAX_TOOL_CALLS {
+                    continue; // 恶意/畸形 index：跳过该增量，不中断流
+                }
                 if self.calls.len() <= index {
                     self.calls
                         .resize(index + 1, (String::new(), String::new(), String::new()));
@@ -199,5 +206,33 @@ mod tests {
         );
         let turn = agg.finish().unwrap();
         assert_eq!(turn.text, "半句");
+    }
+
+    #[test]
+    fn test_huge_index_skipped_not_panic() {
+        let mut agg = SseAggregator::new();
+        // 恶意 index：不 panic、不分配巨桶，正常调用不受影响
+        feed_all(&mut agg, &[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1000000000,"id":"evil","function":{"name":"x","arguments":"{}"}}]},"index":0}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]},"index":0}]}"#,
+            "data: [DONE]",
+        ]);
+        let turn = agg.finish().unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn test_index_at_limit_boundary() {
+        let mut agg = SseAggregator::new();
+        // index 63 接受、64 跳过
+        feed_all(&mut agg, &[
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":63,"id":"ok63","function":{"name":"a","arguments":"{}"}}]},"index":0}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":64,"id":"skip64","function":{"name":"b","arguments":"{}"}}]},"index":0}]}"#,
+            "data: [DONE]",
+        ]);
+        let turn = agg.finish().unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "ok63");
     }
 }
