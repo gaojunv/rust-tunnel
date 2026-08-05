@@ -74,7 +74,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       if (m.kind === 'tool_result') {
         const call = (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
         loaded.push({ kind: 'tool', content: '', toolName: call.name, toolArgs: call.args, toolResult: m.content });
-      } else if (m.kind === 'tool' && m.tool_calls) {
+      } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
         // 旧格式：合并 tool_log JSON 行
         try {
           for (const t of JSON.parse(m.tool_calls)) {

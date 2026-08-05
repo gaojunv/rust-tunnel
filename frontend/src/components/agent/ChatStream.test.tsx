@@ -128,4 +128,14 @@ describe('ChatStream running state', () => {
     expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
     expect(screen.getByText('文件里是 main 函数')).toBeTruthy();
   });
+
+  it('renders legacy-format tool row with kind=message role=tool', async () => {
+    // 迁移前遗留行：SQLite ALTER TABLE DEFAULT 补 role='tool' 但 kind='message'
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'tool', content: '', tool_calls: JSON.stringify([{ name: 'shell', args: '{"cmd":"ls"}', result: 'a.rs' }]), tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    expect(await screen.findByText('shell')).toBeTruthy();
+    expect(screen.getByText('a.rs')).toBeTruthy();
+  });
 });
