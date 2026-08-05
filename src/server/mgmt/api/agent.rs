@@ -222,6 +222,13 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         };
 
+        // 会话级互斥：同一 session 的并发连接（多标签页/重连叠旧连接）各自跑
+        // turn 会并发写库、消息交错、tool_call_id 失配。user 落库 + rt 重建 +
+        // 整回合全程持锁，把并发 turn 串行化。等待中的连接在锁释放后从 DB 重载
+        // （rt_cache 仍是 None），能看到前者写入的全部消息。
+        let session_lock = agent.session_lock(&session_id).await;
+        let _session_guard = session_lock.lock().await;
+
         // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
         let msg_id = format!("{:032x}", rand::random::<u128>());
         let _ = agent

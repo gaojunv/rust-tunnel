@@ -79,6 +79,7 @@ impl SessionRuntime {
                 _ => messages.push(ChatMessage::text(&r.role, &r.content)),
             }
         }
+        sanitize_tool_pairs(&mut messages);
 
         Ok(Self {
             session_id: session_id.to_string(),
@@ -94,6 +95,108 @@ impl SessionRuntime {
 }
 
 const SYSTEM_PROMPT: &str = "You are an AI programming assistant running inside a workspace on a remote machine. Use the provided tools (shell/read_file/write_file/list_dir/git_*) to inspect and modify the project. Prefer small, verifiable steps: read before write, run tests after changes. All paths are relative to the workspace root.";
+
+/// 清洗孤儿工具消息，保证 assistant tool_calls 与 tool 结果一一配对。
+///
+/// 两种孤儿形态（都是 OpenAI/Anthropic 非法序列，一旦混入上下文模型直接 400）：
+/// 1. 孤儿 tool 结果（tool_call_id 无配对 tool_calls）：压缩切割边界恰好把
+///    assistant tool_calls 行压掉、留下配对的 tool 结果行时产生（find_cut_point
+///    只在切割点落在 tool 序列中间时对齐，切割点落在 assistant tool_calls 行
+///    正后方时对齐不到）。
+/// 2. 缺结果的 tool_calls（assistant 声明的 tool_call 没有对应 tool 结果）：
+///    工具执行中途连接断开/取消导致 runner 只落了部分 tool 结果。处理方式：
+///    补齐一条 "[interrupted: tool execution did not complete]" 占位结果——
+///    保留 assistant 意图（对摘要/上下文有信息量），避免整条丢弃。
+fn sanitize_tool_pairs(messages: &mut Vec<ChatMessage>) {
+    use std::collections::HashSet;
+    let mut declared: HashSet<String> = HashSet::new();
+    let mut removed_orphan_tools = 0usize;
+    let mut patched_missing = 0usize;
+
+    // 第一遍：丢弃孤儿 tool 结果（tool_call_id 未在此前任何 assistant tool_calls 中声明）。
+    messages.retain(|m| {
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                if let Some(id) = c.get("id").and_then(|v| v.as_str()) {
+                    declared.insert(id.to_string());
+                }
+            }
+            return true;
+        }
+        if m.role == "tool" {
+            let paired = m
+                .tool_call_id
+                .as_ref()
+                .is_some_and(|id| declared.contains(id));
+            if !paired {
+                removed_orphan_tools += 1;
+            }
+            return paired;
+        }
+        true
+    });
+
+    // 第二遍：assistant tool_calls 中声明但缺结果的，原位补齐占位 tool 结果。
+    // （OpenAI 要求每个 tool_call 都有紧跟的 tool 结果，缺一条即 400。）
+    let mut i = 0;
+    while i < messages.len() {
+        let Some(calls) = messages[i].tool_calls.clone() else {
+            i += 1;
+            continue;
+        };
+        // 紧跟其后、已配对的 tool 结果 id 集合
+        let mut j = i + 1;
+        let mut have: HashSet<&str> = HashSet::new();
+        while j < messages.len() && messages[j].role == "tool" {
+            if let Some(id) = messages[j].tool_call_id.as_deref() {
+                have.insert(id);
+            }
+            j += 1;
+        }
+        let missing: Vec<(String, String)> = calls
+            .iter()
+            .filter_map(|c| {
+                let id = c.get("id")?.as_str()?.to_string();
+                if have.contains(id.as_str()) {
+                    return None;
+                }
+                let name = c
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                Some((id, name))
+            })
+            .collect();
+        if !missing.is_empty() {
+            patched_missing += missing.len();
+            let placeholders: Vec<ChatMessage> = missing
+                .into_iter()
+                .map(|(id, name)| ChatMessage {
+                    role: "tool".into(),
+                    content: Some(
+                        "[interrupted: tool execution did not complete]".to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: Some(id),
+                    name: Some(name),
+                })
+                .collect();
+            let insert_at = j;
+            messages.splice(insert_at..insert_at, placeholders);
+            i = insert_at;
+        }
+        i += 1;
+    }
+
+    if removed_orphan_tools > 0 || patched_missing > 0 {
+        tracing::warn!(
+            removed_orphan_tools,
+            patched_missing,
+            "sanitize_tool_pairs: cleaned unpaired tool messages"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -307,6 +410,83 @@ mod tests {
             .unwrap()
             .contains("上下文摘要"));
         assert_eq!(rt.messages[2].content.as_deref(), Some("近期问题"));
+    }
+
+    #[tokio::test]
+    async fn test_load_patches_missing_tool_results() {
+        // 工具执行中断：assistant 声明了 2 个 tool_calls，只有第 1 个有结果落库。
+        // 清洗后应为第 2 个补齐占位结果，序列合法（无 400）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "改两处", None)
+            .await
+            .unwrap();
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "assistant",
+            "",
+            Some(
+                r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#,
+            ),
+            None,
+            None,
+            "tool_calls",
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        // system + user + assistant(tool_calls) + tool(c1) + tool(c2 占位)
+        assert_eq!(rt.messages.len(), 5);
+        assert_eq!(rt.messages[3].tool_call_id.as_deref(), Some("c1"));
+        let patched = &rt.messages[4];
+        assert_eq!(patched.role, "tool");
+        assert_eq!(patched.tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(patched.name.as_deref(), Some("read_file"));
+        assert!(patched
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn test_load_drops_orphan_tool_results() {
+        // 压缩切割点落在 assistant tool_calls 行正后方：tool 结果保留但配对行被压掉。
+        // 清洗后孤儿 tool 结果应被丢弃。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "q", None)
+            .await
+            .unwrap();
+        // summary 之后只有孤儿 tool 结果（tool_calls 行落在 summary 之前被跳过）
+        db.agent_add_message_v2("m2", "s1", "user", "[上下文摘要] ...", None, None, None, "summary")
+            .await
+            .unwrap();
+        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
+            .await
+            .unwrap();
+        db.agent_add_message("m4", "s1", "assistant", "继续", None)
+            .await
+            .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
     }
 
     #[tokio::test]

@@ -669,14 +669,13 @@
   },
   "kb": {
     "title": "知识库",
-    "description": "管理 LLM 网关检索增强使用的 RAG 知识库",
+    "description": "描述",
     "listTitle": "知识库",
     "newKb": "新建知识库",
     "editKb": "编辑知识库",
     "noSelection": "从列表中选择一个知识库以查看和管理其文档",
     "empty": "还没有知识库。创建一个开始使用。",
     "name": "名称",
-    "description": "描述",
     "enabled": "已启用",
     "disabled": "已禁用",
     "docCount": "{{count}} 个文档",
@@ -777,7 +776,11 @@
     "responseTimeout": "响应超时，请重试",
     "modelUpdateFailed": "模型更新失败，已回滚到之前的模型",
     "cancel": "取消",
-    "confirm": "确定"
+    "confirm": "确定",
+    "connectionInterrupted": "连接中断，正在重连；刚发送的消息可能未被处理，请确认后重发",
+    "reconnecting": "连接已断开，正在自动重连…",
+    "expandLines": "展开剩余 {{count}} 行",
+    "collapse": "收起"
   },
   "logs": {
     "title": "日志",

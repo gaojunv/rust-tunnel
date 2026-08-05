@@ -21,6 +21,7 @@ vi.mock('../../api/agentModels', () => ({
 }));
 
 // 捕获 ws 实例以便手动触发 onmessage
+const wsInstances: FakeWs[] = [];
 let wsInstance: FakeWs | null = null;
 class FakeWs {
   static OPEN = 1;
@@ -29,9 +30,11 @@ class FakeWs {
   onmessage: ((ev: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onopen: (() => void) | null = null;
   constructor() {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- 捕获实例以便手动触发 onmessage
     wsInstance = this;
+    wsInstances.push(this);
   }
   send(s: string) {
     this.sent.push(s);
@@ -43,7 +46,14 @@ class FakeWs {
 }
 
 const renderChat = () => {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc = new QueryClient({
+    defaultOptions: {
+      // refetchOnMount:false — ChatStream 的 history effect 依赖「挂载时只装载一次」
+      // （done/重连后显式 invalidate 才会重新装载）。默认 refetchOnMount 会让 WS
+      // effect 触发的无关 state 更新也引发 refetch → 覆盖聊天区实时增量。
+      queries: { retry: false, refetchOnMount: false },
+    },
+  });
   return render(
     <QueryClientProvider client={qc}>
       <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
@@ -55,6 +65,7 @@ describe('ChatStream running state', () => {
   beforeEach(() => {
     vi.stubGlobal('WebSocket', FakeWs as unknown as typeof WebSocket);
     wsInstance = null;
+    wsInstances.length = 0;
   });
   afterEach(() => {
     cleanup();
@@ -90,6 +101,59 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'error', message: 'boom' });
     });
     expect(screen.queryByText('agent.running')).toBeNull();
+  });
+
+  it('clears running on done even with lost tool_result frames', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    // tool_result 帧丢失（断线场景），done 到达即应解除 running
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByText('agent.running')).toBeNull();
+  });
+
+  it('reconnects after close and shows reconnecting banner', async () => {
+    // 重连退避首次 1s → 本测试内压缩到 1ms 以同步触发（spy 随 afterEach 恢复）
+    const origSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((cb: () => void, ms?: number) => {
+      return origSetTimeout(cb, ms !== undefined && ms >= 1000 && ms <= 15000 ? 1 : ms) as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    renderChat();
+    expect(wsInstances).toHaveLength(1);
+    act(() => {
+      wsInstances[0].onclose?.();
+    });
+    // 断线横幅出现
+    expect(screen.getByText('agent.reconnecting')).toBeTruthy();
+    // 退避（测试内 1ms）后自动重连
+    await act(async () => {
+      await new Promise((r) => origSetTimeout(r, 20));
+    });
+    expect(wsInstances.length).toBeGreaterThan(1);
+    act(() => {
+      wsInstances[wsInstances.length - 1].onopen?.();
+    });
+    expect(screen.queryByText('agent.reconnecting')).toBeNull();
+  });
+
+  it('warns about possibly-lost message when closed mid-run', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // tool_call 引发状态更新 → React Query 对 stale 查询后台 refetch → 挂载过
+    // 的 history effect 重新执行（loadedRef 已 true，直接跳过），但 WS effect
+    // 不会因此重建——取「当前活跃连接」（wsInstance）触发关闭。
+    act(() => {
+      wsInstance!.onclose?.();
+    });
+    // running 解除 + 中断提示（刚发的消息可能未处理）
+    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.getByText(/agent.connectionInterrupted/)).toBeTruthy();
   });
 
   it('force-clears running after 10min timeout', async () => {
@@ -237,6 +301,45 @@ describe('ChatStream running state', () => {
     // 工具卡片同样只渲染一份（read_file 工具名 + 结果）
     expect(screen.getAllByText('read_file')).toHaveLength(1);
     expect(screen.getAllByText(/fn main\(\)/)).toHaveLength(1);
+  });
+
+  it('keeps legit history when new messages follow compaction (over-skip fix)', async () => {
+    // 压缩后用户继续对话：DB 顺序 [..., 原kept, summary, 重插kept, 新消息...]。
+    // 旧去重逻辑把「summary 后行数」当作重插行数，会多跳掉 summary 前没有重复
+    // 副本的合法旧行；内容匹配去重应只跳过真正的重复原件。
+    const row = (id: string, role: string, content: string, kind: string) => ({
+      id,
+      session_id: 's1',
+      role,
+      content,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind,
+      created_at: '2026-08-05',
+    });
+    (listAgentMessages as Mock).mockResolvedValue([
+      row('old1', 'user', '最早的问题', 'message'),
+      row('old2', 'assistant', '最早的回答', 'message'),
+      row('k1', 'user', '保留问题', 'message'),
+      row('k2', 'assistant', '保留回答', 'message'),
+      row('sum', 'user', '[上下文摘要] 之前讨论了 A', 'summary'),
+      row('k1r', 'user', '保留问题', 'message'),
+      row('k2r', 'assistant', '保留回答', 'message'),
+      // 压缩之后的新对话（排在 summary 后，但不是重插副本）
+      row('new1', 'user', '压缩后的新问题', 'message'),
+      row('new2', 'assistant', '压缩后的新回答', 'message'),
+    ]);
+    renderChat();
+    // 合法旧消息不能被多跳掉
+    expect(await screen.findByText('最早的问题')).toBeTruthy();
+    expect(screen.getByText('最早的回答')).toBeTruthy();
+    // 重插 kept 只渲染一份
+    expect(screen.getAllByText('保留问题')).toHaveLength(1);
+    expect(screen.getAllByText('保留回答')).toHaveLength(1);
+    // 压缩后的新消息正常渲染
+    expect(screen.getByText('压缩后的新问题')).toBeTruthy();
+    expect(screen.getByText('压缩后的新回答')).toBeTruthy();
   });
 
   it('renders summary rows as assistant bubbles (M5)', async () => {

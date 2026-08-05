@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
-import { Loader2, SendHorizontal, Wrench } from 'lucide-react';
+import { Loader2, SendHorizontal } from 'lucide-react';
 import {
   agentWsUrl,
   getApiErrorMessage,
@@ -10,18 +10,13 @@ import {
   updateAgentSessionModel,
 } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
-import Markdown from './Markdown';
+import type { ChatItem } from './types';
+import MessageBubble from './MessageBubble';
 import ModelSelect from './ModelSelect';
 
-interface ChatItem {
-  kind: 'user' | 'assistant' | 'tool';
-  content: string;
-  toolName?: string;
-  toolArgs?: string;
-  toolResult?: string;
-}
-
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
+/** 流式 chunk 合并 flush 间隔：token 级 WS 帧攒批后一次性写 state，避免每 token 全列表重渲染。 */
+const STREAM_FLUSH_MS = 50;
 
 interface Props {
   sessionId: string;
@@ -35,6 +30,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
+  const [disconnected, setDisconnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
@@ -47,15 +43,28 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
   const runningRef = useRef(false);
   // 当前正在流式写入的气泡 index（assistant_chunk 增量合并用；final/新事件到达时置 null）
   const streamingIdxRef = useRef<number | null>(null);
+  // 流式 chunk 攒批缓冲：WS 帧先追加到这里，定时 flush 进 items（节流渲染）
+  const chunkBufRef = useRef('');
+  const chunkFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 用户是否接近底部（流式时仅接近底部才自动滚动，上翻读历史不被拽回）
+  const stickToBottomRef = useRef(true);
+  // 会话内最新 history 的 ref 镜像：done/重连后按状态决定是否需要重新装载
+  // （React Query 后台 refetch 也会更新 history，不能仅凭引用变化就覆盖聊天区）
+  const historyRef = useRef<typeof history>(undefined);
 
-  // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）
+  // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）。
+  // 关键：staleTime 0 + refetchOnMount 'always'。staleTime Infinity 会留下陈旧
+  // 缓存——切到别的 session 再切回时 key={sessionId} 触发全新挂载，但 React
+  // Query 直接命中旧缓存、不发请求，若离开期间回合已在服务端跑完落库，聊天区
+  // 永远停留在旧内容。挂载时总是拉取，配合下面的「增量装载」保证不覆盖流式增量。
   const { data: history } = useQuery({
     queryKey: ['agent-messages', sessionId],
     queryFn: () => listAgentMessages(sessionId),
-    staleTime: Infinity,
+    refetchOnMount: 'always',
     refetchOnWindowFocus: false,
   });
   useEffect(() => {
+    historyRef.current = history;
     if (!history || loadedRef.current) return;
     loadedRef.current = true;
     const loaded: ChatItem[] = [];
@@ -73,29 +82,51 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       }
     }
     // 压缩重插去重：kept 段在 summary 前保留原始行（801c9a6），DB 物理顺序为
-    // [..., 原kept, summary, 重插kept...]，前端全量渲染会重复。重插行数 =
-    // summary 之后的行数 K（含 tool_calls/tool_result，与后端 kept_count 口径
-    // 一致），故跳过 summary 前的最后 K 行即可去掉重复副本（多次压缩同样成立：
-    // 每次压缩都恰把 summary 前最后 kept_count 行重插到 summary 后）。
-    const skipBeforeLastSummary = new Set<number>();
-    {
-      let summaryIdx = -1;
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i].kind === 'summary') {
-          summaryIdx = i;
+    // [..., 原kept, summary, 重插kept, 压缩后新消息...]，前端全量渲染会重复。
+    // 不能用「summary 之后的行数」当作重插行数（压缩后新消息也排在 summary 后，
+    // 会把行数放大、多跳掉没有重复副本的合法旧行）。改为内容匹配：对每个
+    // summary，以「summary 后紧跟的重插段」为模板，从 summary 前紧邻行向前找
+    // 等长且逐行全等（kind/role/content/tool_calls/tool_call_id/name）的连续
+    // 段——重插段是 kept 段原样复制，故 summary 前必存在这样一段原件。
+    // 重插段长度未知：先取「summary 后到下一个 summary/末尾」的行数作为上界，
+    // 逐步缩短直到匹配上（首个全等的段长即 kept_count，余下的是压缩后新消息）。
+    // 对每个 summary（含多次压缩）都做，因为每个 summary 各对应一次重插。
+    const normNull = (v: unknown) => (v === undefined ? null : v);
+    const rowEquals = (a: (typeof history)[number], b: (typeof history)[number]) =>
+      a.kind === b.kind &&
+      a.role === b.role &&
+      a.content === b.content &&
+      normNull(a.tool_calls) === normNull(b.tool_calls) &&
+      normNull(a.tool_call_id) === normNull(b.tool_call_id) &&
+      normNull(a.name) === normNull(b.name);
+    const skipBeforeSummary = new Set<number>();
+    for (let s = 0; s < history.length; s++) {
+      if (history[s].kind !== 'summary') continue;
+      // summary 后、到下一个 summary（或数组末尾）之间的行数 = 重插段长上界
+      let upper = 0;
+      while (s + 1 + upper < history.length && history[s + 1 + upper].kind !== 'summary') upper++;
+      // 从长到短尝试：找到「summary 前紧邻 len 行」与「summary 后前 len 行」全等的最大 len
+      let matched = 0;
+      for (let len = Math.min(upper, s); len >= 1; len--) {
+        let all = true;
+        for (let m = 0; m < len; m++) {
+          if (!rowEquals(history[s - len + m], history[s + 1 + m])) {
+            all = false;
+            break;
+          }
+        }
+        if (all) {
+          matched = len;
           break;
         }
       }
-      if (summaryIdx >= 0) {
-        const k = history.length - summaryIdx - 1;
-        for (let i = summaryIdx - 1; i >= Math.max(0, summaryIdx - k); i--) {
-          skipBeforeLastSummary.add(i);
-        }
+      for (let m = 0; m < matched; m++) {
+        skipBeforeSummary.add(s - matched + m);
       }
     }
     for (let i = 0; i < history.length; i++) {
       const m = history[i];
-      if (skipBeforeLastSummary.has(i)) continue;
+      if (skipBeforeSummary.has(i)) continue;
       if (m.kind === 'tool_result') {
         const call = (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
         loaded.push({ kind: 'tool', content: '', toolName: call.name, toolArgs: call.args, toolResult: m.content });
@@ -126,6 +157,38 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     }
   }, []);
 
+  // running 的 ref 镜像供 onclose 闭包使用（onclose 里读不到最新 state）。
+  // armRunning/stopRunning 是 useCallback，同步维护。
+  // 把攒批的 chunk 缓冲一次性合并进流式气泡（新建或追加）。同步置 ref 保证
+  // 与后续 setItems 更新的顺序一致（WS 回调在 React 外，flush 时机不依赖渲染）。
+  const flushChunks = useCallback(() => {
+    if (chunkFlushTimerRef.current) {
+      clearTimeout(chunkFlushTimerRef.current);
+      chunkFlushTimerRef.current = null;
+    }
+    const pending = chunkBufRef.current;
+    if (!pending) return;
+    chunkBufRef.current = '';
+    setItems((prev) => {
+      const idx = streamingIdxRef.current;
+      if (idx !== null && prev[idx]?.kind === 'assistant') {
+        const next = [...prev];
+        next[idx] = { ...next[idx], content: next[idx].content + pending };
+        return next;
+      }
+      streamingIdxRef.current = prev.length;
+      return [...prev, { kind: 'assistant', content: pending }];
+    });
+  }, []);
+
+  const scheduleChunkFlush = useCallback(() => {
+    if (chunkFlushTimerRef.current) return;
+    chunkFlushTimerRef.current = globalThis.setTimeout(() => {
+      chunkFlushTimerRef.current = null;
+      flushChunks();
+    }, STREAM_FLUSH_MS);
+  }, [flushChunks]);
+
   const stopRunning = useCallback(() => {
     runningRef.current = false;
     setRunning(false);
@@ -145,13 +208,34 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     }, RUNNING_TIMEOUT_MS);
   }, [clearRunningTimeout, stopRunning, t]);
 
-  // WebSocket
+  // WebSocket：断线自动重连（指数退避 1s→15s）。后端支持重连（新连接从 DB 重载
+  // 会话，见 agent.rs handle_agent_socket），断线不应废掉整个会话的流式功能。
   useEffect(() => {
-    const ws = new WebSocket(agentWsUrl(sessionId));
+    let ws: WebSocket | null = null;
+    let attempts = 0;
+    let closedByCleanup = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // 断线且重连成功时需要重载历史：服务端在断线期间可能已把回合跑完并落库
+    let needHistoryReload = false;
     // ref 在组件生命周期内恒定，复制到局部变量供 handler/cleanup 使用（exhaustive-deps）
     const pendingTools = pendingToolsRef.current;
-    wsRef.current = ws;
-    ws.onmessage = (ev) => {
+
+    const connect = () => {
+      ws = new WebSocket(agentWsUrl(sessionId));
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        attempts = 0;
+        setDisconnected(false);
+        if (needHistoryReload) {
+          needHistoryReload = false;
+          // 允许历史 effect 重新装载（与断线期间服务端已落库的内容对齐）
+          loadedRef.current = false;
+          void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
+        }
+      };
+
+      ws.onmessage = (ev) => {
       let msg: AgentWsEvent;
       try {
         msg = JSON.parse(ev.data) as AgentWsEvent;
@@ -160,22 +244,14 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       }
       if (msg.type === 'assistant_chunk') {
         if (msg.content) {
-          setItems((prev) => {
-            const idx = streamingIdxRef.current;
-            if (idx !== null && prev[idx]?.kind === 'assistant') {
-              // 已有流式气泡 → 增量合并
-              const next = [...prev];
-              next[idx] = { ...next[idx], content: next[idx].content + msg.content! };
-              return next;
-            }
-            streamingIdxRef.current = prev.length;
-            return [...prev, { kind: 'assistant', content: msg.content! }];
-          });
+          // 攒批：先入缓冲，节流 flush（避免每 token 全列表重渲染）
+          chunkBufRef.current += msg.content;
+          scheduleChunkFlush();
         }
         if (msg.final) {
-          // 回合收尾：关闭也走更新队列，与增量合并的 ref 写入保持顺序。
-          // （若在 emit 时同步置 null，React 批量 flush 时可能截断同批次尚未合并的增量。
-          //   非 SSE 回退 content+final:true 同条 → 先追加再关闭，语义一致。）
+          // 收尾：先冲掉缓冲里的增量（同帧 content+final 的非 SSE 回退也在此落齐），
+          // 再关闭流式气泡（ref 置 null 走更新队列，与 flush 的 ref 写入保持顺序）。
+          flushChunks();
           setItems((prev) => {
             streamingIdxRef.current = null;
             return prev;
@@ -185,8 +261,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         if (msg.id) pendingTools.add(msg.id);
         // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）
         armRunning();
-        // 工具回合与文本回合交替：文本气泡必须断开（在更新队列内置 null，
-        // 与增量合并的 ref 写入保持顺序，避免批量 flush 时截断合并）
+        // 工具回合与文本回合交替：先冲掉缓冲里的文本增量（保证气泡顺序），
+        // 再断开流式气泡追加工具卡片
+        flushChunks();
         setItems((prev) => {
           streamingIdxRef.current = null;
           return [...prev, { kind: 'tool', content: '', toolName: msg.name, toolArgs: msg.args }];
@@ -205,24 +282,26 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         });
       } else if (msg.type === 'status') {
         // 轻量提示行（压缩等中间状态）：复用 assistant 气泡样式但标记 status；
-        // 不进气泡流 → 在更新队列内先关闭当前流式气泡再追加独立行
+        // 不进气泡流 → 冲掉缓冲后断开流式气泡再追加独立行
+        flushChunks();
         setItems((prev) => {
           streamingIdxRef.current = null;
           return [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }];
         });
       } else if (msg.type === 'done') {
-        // 严格终态：工具全部回齐才解除 Running（防御乱序帧）
-        // 关闭流式气泡（返回原 prev → React 跳过重渲染，仅执行 ref 关闭）
+        // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
+        // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
+        flushChunks();
         setItems((prev) => {
           streamingIdxRef.current = null;
           return prev;
         });
-        if (pendingTools.size === 0) {
-          stopRunning();
-          // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果
-          void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
-        }
+        stopRunning();
+        // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果；
+        // 不影响聊天区（history effect 有 loadedRef 守卫，不会重复装载）
+        void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
       } else if (msg.type === 'error') {
+        flushChunks();
         setItems((prev) => {
           streamingIdxRef.current = null;
           return [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }];
@@ -230,20 +309,60 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         stopRunning();
       }
     };
-    ws.onclose = () => stopRunning();
-    ws.onerror = () => stopRunning();
+
+      ws.onclose = () => {
+        wsRef.current = null;
+        if (closedByCleanup) return;
+        // 断线：本地回合状态作废（服务端可能还在跑，也可能已丢），重连后按
+        // DB 历史对齐。用户消息已发出去但服务端未必收到——提示而非静默重发。
+        if (runningRef.current) {
+          setItems((prev) => [
+            ...prev,
+            { kind: 'assistant', content: `⚠️ ${t('agent.connectionInterrupted')}` },
+          ]);
+        }
+        stopRunning();
+        setDisconnected(true);
+        needHistoryReload = true;
+        const delay = Math.min(1000 * 2 ** attempts, 15000);
+        attempts++;
+        reconnectTimer = globalThis.setTimeout(connect, delay);
+      };
+      ws.onerror = () => {
+        // onerror 之后浏览器必发 onclose，统一在那里处理重连
+      };
+    };
+
+    connect();
     return () => {
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.close();
+      closedByCleanup = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (ws) {
+        ws.onclose = null;
+        ws.onerror = null;
+        ws.onopen = null;
+        ws.close();
+      }
+      wsRef.current = null;
       clearRunningTimeout();
+      if (chunkFlushTimerRef.current) {
+        clearTimeout(chunkFlushTimerRef.current);
+        chunkFlushTimerRef.current = null;
+      }
+      chunkBufRef.current = '';
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, t]);
 
   useEffect(() => {
-    // jsdom 未实现 scrollIntoView，?.() 保证测试环境不抛错
-    bottomRef.current?.scrollIntoView?.({ behavior: 'smooth' });
+    // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
+    // 避免逐 token smooth 动画互相堆积。jsdom 未实现 scrollIntoView，?.() 保底。
+    if (stickToBottomRef.current) {
+      bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
+    }
   }, [items]);
 
   const send = () => {
@@ -287,47 +406,19 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex-1 space-y-3 overflow-y-auto p-4">
+      <div
+        className="flex-1 space-y-3 overflow-y-auto p-4"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
+          stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        }}
+      >
         {items.length === 0 && !running && (
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
         {items.map((it, i) => (
-          <div
-            key={i}
-            className={
-              it.kind === 'user'
-                ? 'ml-auto max-w-[80%] rounded-lg bg-primary/10 px-3 py-2'
-                : it.kind === 'assistant'
-                  ? 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2'
-                  : 'mr-auto max-w-[90%] rounded-lg border bg-background px-3 py-2 text-sm font-mono'
-            }
-          >
-            {it.kind === 'tool' ? (
-              <div>
-                <div className="mb-1 flex items-center gap-1 text-xs font-semibold">
-                  <Wrench className="h-3.5 w-3.5 text-primary" />
-                  {it.toolName}
-                </div>
-                {it.toolArgs && (
-                  <pre className="whitespace-pre-wrap text-xs text-muted-foreground">{it.toolArgs}</pre>
-                )}
-                {it.toolResult ? (
-                  <pre className="mt-2 whitespace-pre-wrap border-t pt-2 text-xs text-muted-foreground">
-                    {it.toolResult}
-                  </pre>
-                ) : (
-                  <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    {t('agent.toolRunning')}
-                  </div>
-                )}
-              </div>
-            ) : it.kind === 'assistant' ? (
-              <Markdown content={it.content} />
-            ) : (
-              <div className="whitespace-pre-wrap">{it.content}</div>
-            )}
-          </div>
+          <MessageBubble key={i} item={it} />
         ))}
         {running && (
           <div className="flex items-center gap-1 text-sm text-muted-foreground">
@@ -340,6 +431,12 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
 
       {/* 一体化输入框：模型选择(左下) + 发送图标(右下) 内嵌 */}
       <div className="border-t p-2">
+        {disconnected && (
+          <div className="mb-1.5 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            {t('agent.reconnecting')}
+          </div>
+        )}
         <div className="rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
           <textarea
             value={input}

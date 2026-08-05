@@ -669,14 +669,13 @@
   },
   "kb": {
     "title": "Knowledge Base",
-    "description": "Manage RAG knowledge bases used for LLM gateway retrieval",
+    "description": "Description",
     "listTitle": "Knowledge Bases",
     "newKb": "New KB",
     "editKb": "Edit Knowledge Base",
     "noSelection": "Select a knowledge base from the list to view and manage its documents",
     "empty": "No knowledge bases yet. Create one to get started.",
     "name": "Name",
-    "description": "Description",
     "enabled": "Enabled",
     "disabled": "Disabled",
     "docCount": "{{count}} docs",
@@ -777,7 +776,11 @@
     "responseTimeout": "Response timed out, please retry",
     "modelUpdateFailed": "Failed to update model, reverted to previous selection",
     "cancel": "Cancel",
-    "confirm": "Confirm"
+    "confirm": "Confirm",
+    "connectionInterrupted": "Connection interrupted, reconnecting; the message just sent may not have been processed — please verify and resend",
+    "reconnecting": "Connection lost, reconnecting automatically…",
+    "expandLines": "Expand {{count}} more lines",
+    "collapse": "Collapse"
   },
   "logs": {
     "title": "Logs",
