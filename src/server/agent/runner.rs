@@ -145,7 +145,8 @@ pub async fn run_agent_turn(
                     .send(serde_json::json!({"type": "assistant_chunk", "content": &text}))
                     .await;
                 rt.messages.push(ChatMessage::text("assistant", &text));
-                persist_message(&agent, &rt.session_id, "assistant", &text, None).await;
+                persist_message(&agent, &rt.session_id, "assistant", &text, None, None, None, "message")
+                    .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
                 return Ok(());
             }
@@ -160,7 +161,19 @@ pub async fn run_agent_turn(
                     name: None,
                 });
 
-                let mut tool_log = Vec::new();
+                // assistant 的 tool_calls 原始 JSON 落库（kind=tool_calls），重放可恢复完整结构
+                persist_message(
+                    &agent,
+                    &rt.session_id,
+                    "assistant",
+                    "",
+                    Some(&serde_json::to_string(&raw_calls).unwrap_or_default()),
+                    None,
+                    None,
+                    "tool_calls",
+                )
+                .await;
+
                 for call in calls {
                     let _ = ws_tx
                         .send(serde_json::json!({
@@ -215,11 +228,17 @@ pub async fn run_agent_turn(
                         }
                     };
 
-                    tool_log.push(serde_json::json!({
-                        "name": &call.name,
-                        "args": &call.args,
-                        "result": &result_text,
-                    }));
+                    persist_message(
+                        &agent,
+                        &rt.session_id,
+                        "tool",
+                        &result_text,
+                        None,
+                        Some(&call.id),
+                        Some(&call.name),
+                        "tool_result",
+                    )
+                    .await;
                     rt.messages.push(ChatMessage {
                         role: "tool".into(),
                         content: Some(result_text),
@@ -228,15 +247,6 @@ pub async fn run_agent_turn(
                         name: Some(call.name.clone()),
                     });
                 }
-
-                persist_message(
-                    &agent,
-                    &rt.session_id,
-                    "tool",
-                    "",
-                    Some(&serde_json::to_string(&tool_log).unwrap_or_default()),
-                )
-                .await;
             }
         }
     }
@@ -247,17 +257,21 @@ pub async fn run_agent_turn(
     Err("tool round limit reached".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_message(
     agent: &AgentState,
     session_id: &str,
     role: &str,
     content: &str,
     tool_calls: Option<&str>,
+    tool_call_id: Option<&str>,
+    name: Option<&str>,
+    kind: &str,
 ) {
     let id = format!("{:032x}", rand::random::<u128>());
     if let Err(e) = agent
         .db
-        .agent_add_message(&id, session_id, role, content, tool_calls)
+        .agent_add_message_v2(&id, session_id, role, content, tool_calls, tool_call_id, name, kind)
         .await
     {
         tracing::warn!("failed to persist agent message: {}", e);
@@ -315,5 +329,40 @@ mod tests {
     fn test_extract_malformed() {
         assert!(parse_llm_turn(&serde_json::json!({})).is_err());
         assert!(parse_llm_turn(&serde_json::json!({"choices": []})).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_persist_message_v2_writes_all_columns() {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        let agent = test_agent_state(db.clone()).await;
+        persist_message(
+            &agent,
+            "s1",
+            "tool",
+            "exit_code=0",
+            None,
+            Some("call_1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await;
+
+        let msgs = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind, "tool_result");
+        assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msgs[0].name.as_deref(), Some("shell"));
+    }
+
+    async fn test_agent_state(db: crate::server::db::Database) -> AgentState {
+        let server_state = crate::server::control::ServerState::with_db(db);
+        server_state.agent_state.expect("agent_state initialized")
     }
 }
