@@ -287,7 +287,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true, None)
             .await
             .unwrap();
 
@@ -326,7 +326,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true, None)
             .await
             .unwrap();
 
@@ -360,7 +360,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "", "[]", true, None)
             .await
             .unwrap();
 
@@ -401,7 +401,7 @@ mod tests {
         .await
         .unwrap();
         for (id, name, alias) in models {
-            db.llm_save_model(id, "p1", name, alias, "[]", true)
+            db.llm_save_model(id, "p1", name, alias, "[]", true, None)
                 .await
                 .unwrap();
         }
@@ -477,7 +477,7 @@ mod tests {
             .await
             .unwrap();
         // 禁用 m1
-        db.llm_save_model("m1", "p1", "model-a", "", "[]", false)
+        db.llm_save_model("m1", "p1", "model-a", "", "[]", false, None)
             .await
             .unwrap();
 
@@ -496,7 +496,7 @@ mod tests {
         db.llm_replace_group_members("g1", &[("m1".into(), 1)])
             .await
             .unwrap();
-        db.llm_save_model("m1", "p1", "model-a", "", "[]", false)
+        db.llm_save_model("m1", "p1", "model-a", "", "[]", false, None)
             .await
             .unwrap();
 
@@ -536,7 +536,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model("m3", "p2", "kimi-k2", "", "[]", true)
+        db.llm_save_model("m3", "p2", "kimi-k2", "", "[]", true, None)
             .await
             .unwrap();
         db.llm_create_model_group("g1", "router", true)

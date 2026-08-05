@@ -410,6 +410,7 @@ pub async fn list_provider_models(
             model_name: r.model_name,
             alias: r.alias,
             tags: serde_json::from_str(&r.tags).unwrap_or_default(),
+            extra_config: r.extra_config,
             enabled: r.enabled != 0,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -441,6 +442,7 @@ pub async fn list_all_models(State(state): State<ApiState>) -> impl IntoResponse
             model_name: r.model_name,
             alias: r.alias,
             tags: serde_json::from_str(&r.tags).unwrap_or_default(),
+            extra_config: r.extra_config,
             enabled: r.enabled != 0,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -463,7 +465,15 @@ pub async fn add_model(
     let alias = body.alias.unwrap_or_default();
 
     if let Err(e) = db
-        .llm_save_model(&id, &provider_id, &body.model_name, &alias, &tags, true)
+        .llm_save_model(
+            &id,
+            &provider_id,
+            &body.model_name,
+            &alias,
+            &tags,
+            true,
+            body.extra_config.as_deref(),
+        )
         .await
     {
         return (
@@ -492,7 +502,7 @@ pub async fn update_model(
     let alias = body.alias.unwrap_or_default();
 
     if let Err(e) = db
-        .llm_update_model(&id, &body.model_name, &alias, &tags)
+        .llm_update_model(&id, &body.model_name, &alias, &tags, body.extra_config.as_deref())
         .await
     {
         return (

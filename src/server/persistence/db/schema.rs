@@ -416,6 +416,10 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Migration: old DBs lack extra_config column on llm_models (per-model config,
+        // 如 agent_context_limit，供压缩模块读取）。
+        Self::migrate_llm_models_extra_config(pool).await?;
+
         // LLM API keys table (gateway-level keys for external callers)
         sqlx::query(
             r#"
@@ -814,6 +818,18 @@ impl Database {
     /// Migration: old DBs lack `failover_from` on `llm_usage_logs`. Idempotent.
     async fn migrate_llm_usage_add_failover_from(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE llm_usage_logs ADD COLUMN failover_from TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// llm_models 加 extra_config JSON 列（per-model 配置，如 agent_context_limit）。幂等。
+    async fn migrate_llm_models_extra_config(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE llm_models ADD COLUMN extra_config TEXT")
             .execute(pool)
             .await
         {

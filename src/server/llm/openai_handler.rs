@@ -668,7 +668,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true, None)
             .await
             .unwrap();
 
@@ -713,7 +713,7 @@ mod tests {
         .await
         .unwrap();
         let mid = uuid::Uuid::new_v4().to_string();
-        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true)
+        db.llm_save_model(&mid, &pid, "deepseek-chat", "fast-model", "[]", true, None)
             .await
             .unwrap();
 

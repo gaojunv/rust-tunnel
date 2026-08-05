@@ -142,6 +142,8 @@ pub struct ModelConfig {
     pub model_name: String,
     pub alias: String,
     pub tags: Vec<String>,
+    /// per-model 配置（JSON 字符串，如 `{"agent_context_limit":200000}`）。非敏感，不加密。
+    pub extra_config: Option<String>,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -153,6 +155,8 @@ pub struct ModelRequest {
     pub model_name: String,
     pub alias: Option<String>,
     pub tags: Option<Vec<String>>,
+    /// per-model 配置（JSON 字符串）。缺省/`null` = 不设置（或覆盖为无配置）。
+    pub extra_config: Option<String>,
 }
 
 /// API key view (returned to management UI).
