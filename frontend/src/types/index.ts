@@ -313,6 +313,7 @@ export interface LlmModel {
   alias: string;
   tags: string[];
   enabled: boolean;
+  extra_config?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -321,6 +322,7 @@ export interface CreateModelRequest {
   model_name: string;
   alias?: string;
   tags?: string[];
+  extra_config?: string | null;
 }
 
 export interface LlmApiKey {

@@ -565,6 +565,7 @@
       "modelNamePlaceholder": "Model name (e.g., deepseek-chat)",
       "aliasPlaceholder": "Alias",
       "tagsPlaceholder": "Tags (comma separated)",
+      "contextLimitPlaceholder": "Context limit (chars)",
       "deleteProviderConfirm": "Delete this provider and all its models?",
       "deleteModelConfirm": "Delete model \"{{name}}\"?",
       "addModel": "Add"
