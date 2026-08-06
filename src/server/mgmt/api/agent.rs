@@ -567,6 +567,71 @@ pub async fn delete_workspace(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceFilesQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+/// 单引号 shell 转义：' → '\''（标准做法），包裹后任意输入安全。
+fn shell_escape_q(q: &str) -> String {
+    format!("'{}'", q.replace('\'', r"'\''"))
+}
+
+/// GET /api/agent/workspaces/:id/files?q=<前缀>&limit=<n>
+/// @补全数据源：经隧道在沙箱内 find+grep 过滤文件路径。Windows 客户端无 find/grep
+/// 时 grep 报错 → 返回空列表（前端降级手输路径），不视为错误。
+pub async fn list_workspace_files(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<WorkspaceFilesQuery>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let ws = match agent.db.agent_get_workspace(&id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 50);
+    let q = params.q.trim();
+    let cmd = if q.is_empty() {
+        format!(
+            "find . -path ./.git -prune -o -type f -print | head -{}",
+            limit
+        )
+    } else {
+        format!(
+            "find . -path ./.git -prune -o -type f -print | grep -i -F -- {} | head -{}",
+            shell_escape_q(q),
+            limit
+        )
+    };
+    let result = crate::server::agent::executor::exec_on_client(
+        agent,
+        &ws.id,
+        &ws.client_id,
+        &ws.root_path,
+        ws.docker_container_id.as_deref(),
+        crate::common::AgentCommand::Shell { cmd, cwd: None },
+    )
+    .await;
+    let files: Vec<String> = match result {
+        crate::common::AgentResult::Shell { stdout, .. } => stdout
+            .lines()
+            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        // 隧道失败/grep 错误（如 Windows 无 grep）→ 空列表降级
+        _ => Vec::new(),
+    };
+    Json(serde_json::json!({ "files": files })).into_response()
+}
+
 pub async fn list_sessions(
     State(state): State<ApiState>,
     Path(workspace_id): Path<String>,
@@ -969,6 +1034,26 @@ mod tests {
         let mut other = "keep".to_string();
         refresh_session_model(&db, "ghost", &mut other).await;
         assert_eq!(other, "keep");
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_files_workspace_not_found() {
+        let (state, _db) = test_state().await;
+        let resp = list_workspace_files(
+            State(state),
+            Path("ghost".to_string()),
+            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_shell_escape_q() {
+        assert_eq!(shell_escape_q("main"), "'main'");
+        assert_eq!(shell_escape_q("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_escape_q("a';b|rm"), r#"'a'\'';b|rm'"#); // 单引号转义后特殊字符在引号内安全
     }
 
     #[tokio::test]
