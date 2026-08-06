@@ -43,6 +43,20 @@ pub enum AgentCommand {
     GitDiff { path: Option<String> },
     GitCommit { message: String },
     GitPush,
+    /// 在工作区内搜索文件内容（字面量子串匹配），返回 path:line:content 列表
+    Search {
+        pattern: String,
+        /// 相对工作区根的起始目录（"." 表示根）
+        path: String,
+        /// 文件名后缀 glob 过滤（仅支持 "*.ext" 或精确文件名），None 搜索全部文本文件
+        include: Option<String>,
+    },
+    /// 锚点字符串替换：old_string 必须在文件中恰好出现一次
+    PatchFile {
+        path: String,
+        old_string: String,
+        new_string: String,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -759,6 +773,32 @@ mod tests {
             let bytes = msg.serialize().unwrap();
             let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
             assert!(matches!(decoded, ControlMessage::AgentExecRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn test_agent_command_search_patch_roundtrip() {
+        let cmds = vec![
+            AgentCommand::Search {
+                pattern: "fn main".into(),
+                path: "src".into(),
+                include: Some("*.rs".into()),
+            },
+            AgentCommand::Search {
+                pattern: "TODO".into(),
+                path: ".".into(),
+                include: None,
+            },
+            AgentCommand::PatchFile {
+                path: "src/a.rs".into(),
+                old_string: "old".into(),
+                new_string: "new".into(),
+            },
+        ];
+        for cmd in cmds {
+            let bytes = bincode::serialize(&cmd).unwrap();
+            let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{:?}", cmd));
         }
     }
 }

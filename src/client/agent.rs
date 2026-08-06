@@ -258,6 +258,9 @@ pub async fn handle_exec_request(
             .await
         }
         AgentCommand::GitPush => git_exec(&["push"], root_path, docker_container, timeout).await,
+        AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => AgentResult::Error {
+            message: "not implemented".into(),
+        },
     }
 }
 
