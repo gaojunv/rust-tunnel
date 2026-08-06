@@ -162,42 +162,51 @@ fn search_in_workspace<'a>(
     })
 }
 
-/// 将 docker 分支 `grep` 的 `Shell` 结果转换为与 host `search_in_workspace` 一致的
-/// `FileContent` 形态：exit 0 → 命中行；exit 1 → no matches；其他 → Error。
+/// 将 docker 分支 `grep ... | head -N+1` 的 `Shell` 结果转换为与 host
+/// `search_in_workspace` 一致的 `FileContent` 形态。判定基于 stdout/stderr：
+/// 因 sh 管道 exit code 取末元素 head（恒为 0），grep 的 exit 1（无命中）/exit 2
+/// （错误）均被掩盖，故判定按以下优先级：
+/// 1. stderr 非空（无论 exit_code）→ Error 保留 stderr（grep 错误经 stderr 暴露）；
+/// 2. exit_code != 0 且 stderr 为空 → 保守 Error（保留 exit_code 信息）；
+/// 3. exit 0 且 stdout 为空 → no matches；
+/// 4. exit 0 且有 stdout → 命中行。
+///
 /// 命中行数超过 `SEARCH_MAX_HITS` 时只保留前 N 行并追加与 host 相同的截断标记
 /// （`head -N+1` 预取一行以检测超限）。非 `Shell` 结果（如 spawn 失败）原样透传。
 fn docker_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
     match shell_result {
         AgentResult::Shell {
             stdout, stderr, exit_code,
-        } => match exit_code {
-            0 => {
-                let mut lines: Vec<&str> = stdout.lines().collect();
-                let truncated = lines.len() > SEARCH_MAX_HITS;
-                if truncated {
-                    lines.truncate(SEARCH_MAX_HITS);
-                }
-                let mut content = lines.join("\n");
-                if truncated {
-                    content.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
-                }
-                AgentResult::FileContent {
-                    content: truncate_output(content),
-                }
-            }
-            1 => AgentResult::FileContent {
-                content: format!("no matches for '{pattern}'"),
-            },
-            _ => {
-                let stderr = stderr.trim();
-                let message = if stderr.is_empty() {
-                    format!("grep failed with exit code {exit_code}")
-                } else {
-                    format!("grep failed with exit code {exit_code}: {stderr}")
+        } => {
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                return AgentResult::Error {
+                    message: format!("grep failed: {stderr}"),
                 };
-                AgentResult::Error { message }
             }
-        },
+            if exit_code != 0 {
+                return AgentResult::Error {
+                    message: format!("grep failed with exit code {exit_code}"),
+                };
+            }
+            if stdout.trim().is_empty() {
+                return AgentResult::FileContent {
+                    content: format!("no matches for '{pattern}'"),
+                };
+            }
+            let mut lines: Vec<&str> = stdout.lines().collect();
+            let truncated = lines.len() > SEARCH_MAX_HITS;
+            if truncated {
+                lines.truncate(SEARCH_MAX_HITS);
+            }
+            let mut content = lines.join("\n");
+            if truncated {
+                content.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
+            }
+            AgentResult::FileContent {
+                content: truncate_output(content),
+            }
+        }
         other => other,
     }
 }
@@ -1184,13 +1193,16 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_exit_1_is_no_matches() {
+    fn test_docker_search_result_empty_stdout_is_no_matches() {
+        // sh 管道 `grep ... | head -N+1` 的 exit code 取管道末元素 head（恒为 0），
+        // grep 的 exit 1（无命中）被掩盖，因此判定基于 stdout/stderr：
+        // exit 0 + stdout 为空 → 无命中。
         let result = docker_search_result(
             "zzz",
             AgentResult::Shell {
                 stdout: String::new(),
                 stderr: String::new(),
-                exit_code: 1,
+                exit_code: 0,
             },
         );
         let AgentResult::FileContent { content } = result else {
@@ -1223,20 +1235,38 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_other_exit_keeps_error() {
+    fn test_docker_search_result_stderr_yields_error() {
+        // sh 管道 exit code 取 head（恒 0），grep 错误（目录不存在/权限拒绝）经
+        // stderr 暴露：stderr 非空（无论 exit code 是否 0）→ 返回 Error 保留 stderr。
         let result = docker_search_result(
             "main",
             AgentResult::Shell {
-                stdout: String::new(),
+                stdout: "a.rs:1:fn main()".into(),
                 stderr: "grep: .: No such file or directory".into(),
-                exit_code: 2,
+                exit_code: 0,
             },
         );
         let AgentResult::Error { message } = result else {
             panic!("expected Error");
         };
-        assert!(message.contains("exit code 2"), "message = {message:?}");
         assert!(message.contains("No such file"), "message = {message:?}");
+    }
+
+    #[test]
+    fn test_docker_search_result_nonzero_exit_empty_stderr_is_error() {
+        // 保守回退：exit_code != 0 且 stderr 为空 → Error 并保留 exit_code 信息。
+        let result = docker_search_result(
+            "main",
+            AgentResult::Shell {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 1,
+            },
+        );
+        let AgentResult::Error { message } = result else {
+            panic!("expected Error");
+        };
+        assert!(message.contains("exit code 1"), "message = {message:?}");
     }
 
     #[test]
