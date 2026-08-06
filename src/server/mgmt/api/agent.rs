@@ -353,11 +353,15 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 .flatten()
                 .is_some_and(|s| s.title.as_deref().is_none_or(|t| t.trim().is_empty()));
             if needs_title {
+                // 标题帧只发到触发连接（event_tx 归本连接的 push_task 消费）：
+                // 不广播同 session 的其他标签页——需广播则要在 AgentState 维护
+                // 连接表，YAGNI 不做；其他标签页的 SessionBar 在下次 refetch 时自愈。
                 tokio::spawn(crate::server::agent::title::maybe_generate_title(
                     agent.clone(),
                     llm.clone(),
                     session_id.clone(),
                     turn_model,
+                    Some(event_tx.clone()),
                 ));
             }
         }

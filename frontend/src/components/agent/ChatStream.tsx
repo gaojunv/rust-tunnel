@@ -311,6 +311,10 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         // 回合成功结束 → 服务端异步生成会话标题，刷新会话列表让标题回显
         // （前缀匹配命中 SessionBar 的 ['agent-sessions', workspaceId]）
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
+      } else if (msg.type === 'session_title') {
+        // 服务端标题已写库（生成晚于 done 帧，故此处单独广播）：刷新会话列表
+        // 让 SessionBar 及时回显新标题
+        void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
       } else if (msg.type === 'error') {
         flushChunks();
         setItems((prev) => {

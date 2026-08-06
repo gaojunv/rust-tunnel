@@ -383,6 +383,26 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('agent.running')).toBeNull();
   });
 
+  it('invalidates agent-sessions cache on session_title frame', async () => {
+    // 标题生成晚于 done 帧（需数秒），done 时 refetch 早于标题写库——服务端
+    // 写库后另发 session_title 帧，前端据此刷新会话列表让 SessionBar 回显。
+    // 与 done 帧的 invalidate 同一判定方式：spy QueryClient.invalidateQueries。
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnMount: false } },
+    });
+    const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={qc}>
+        <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
+      </QueryClientProvider>
+    );
+    act(() => {
+      wsInstance!.emit({ type: 'session_title', title: '修复登录 bug', session_id: 's1' });
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['agent-sessions'] });
+  });
+
   it('renders summary rows as assistant bubbles (M5)', async () => {
     const row = (id: string, role: string, content: string, kind: string) => ({
       id,

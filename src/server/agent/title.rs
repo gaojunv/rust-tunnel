@@ -22,15 +22,43 @@ fn clean_title(raw: &str) -> Option<String> {
 
 /// 生成并写回会话标题。调用方负责只在 title 为空时触发；本函数内部重读
 /// title 做竞态守卫（生成期间用户可能已手动改名）。
+///
+/// `title_tx` 为触发连接的事件通道：标题成功写库后经它广播一条
+/// `session_title` 帧，让 SessionBar 实时回显。此通道属于触发连接的 WebSocket，
+/// 不会广播到同 session 的其他标签页——若需广播需在 AgentState 维护连接表，
+/// 权衡后不做（YAGNI）：其他标签页的 SessionBar 会在下次 refetch 时自愈。
 pub async fn maybe_generate_title(
     agent: AgentState,
     llm: Arc<LlmState>,
     session_id: String,
     model: String,
+    title_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
 ) {
-    if let Err(e) = generate_title_inner(&agent, &llm, &session_id, &model).await {
-        tracing::warn!(session_id, "auto title generation failed: {e}");
+    match generate_title_inner(&agent, &llm, &session_id, &model).await {
+        Ok(Some(title)) => {
+            if let Some(tx) = &title_tx {
+                notify_title(tx, &session_id, &title).await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(session_id, "auto title generation failed: {e}"),
     }
+}
+
+/// 构造并发送 `session_title` 帧到触发连接的事件通道。发送失败静默忽略
+/// （连接已断，push_task 不再消费该通道）。
+pub async fn notify_title(
+    tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
+    session_id: &str,
+    title: &str,
+) {
+    let _ = tx
+        .send(serde_json::json!({
+            "type": "session_title",
+            "title": title,
+            "session_id": session_id,
+        }))
+        .await;
 }
 
 async fn generate_title_inner(
@@ -38,7 +66,7 @@ async fn generate_title_inner(
     llm: &Arc<LlmState>,
     session_id: &str,
     model: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // 竞态守卫：title 已非空则不覆盖
     let session = agent
         .db
@@ -47,7 +75,7 @@ async fn generate_title_inner(
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "session not found".to_string())?;
     if session.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-        return Ok(());
+        return Ok(None);
     }
 
     // 首条 user 消息
@@ -117,7 +145,7 @@ async fn generate_title_inner(
         .as_deref()
         .is_some_and(|t| !t.trim().is_empty())
     {
-        return Ok(());
+        return Ok(None);
     }
     agent
         .db
@@ -125,12 +153,13 @@ async fn generate_title_inner(
         .await
         .map_err(|e| format!("db error: {e}"))?;
     tracing::info!(session_id, title, "auto-generated session title");
-    Ok(())
+    Ok(Some(title))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_clean_title() {
@@ -140,5 +169,27 @@ mod tests {
         assert_eq!(clean_title(""), None);
         let long = "标".repeat(50);
         assert_eq!(clean_title(&long).unwrap().chars().count(), TITLE_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn test_notify_title_sends_session_title_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+        notify_title(&tx, "sess-123", "修复登录 bug").await;
+        let frame = rx.recv().await.expect("frame should be sent");
+        assert_eq!(frame, json!({
+            "type": "session_title",
+            "title": "修复登录 bug",
+            "session_id": "sess-123",
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_notify_title_dropped_receiver_is_noop() {
+        // 连接已断：接收端（push_task）已停。tokio mpsc 的 send 在 receiver 被 drop
+        // 后立即返回 Err，`let _ =` 静默忽略——不 panic、不阻塞。
+        let (tx, rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+        drop(rx);
+        notify_title(&tx, "sess-123", "修复登录 bug").await;
+        assert!(tx.is_closed());
     }
 }

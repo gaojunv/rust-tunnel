@@ -561,5 +561,6 @@ export type AgentWsEvent =
   | { type: 'status'; message?: string }
   | { type: 'done' }
   | { type: 'stopped' }
+  | { type: 'session_title'; title?: string; session_id?: string }
   | { type: 'error'; message?: string };
 
