@@ -608,6 +608,8 @@ impl Database {
                 root_path TEXT NOT NULL,
                 docker_image TEXT,
                 docker_container_id TEXT,
+                approval_mode TEXT NOT NULL DEFAULT 'safe',
+                system_prompt TEXT,
                 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
                 updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
@@ -656,6 +658,7 @@ impl Database {
         .await?;
 
         Self::migrate_agent_messages_v2(pool).await?;
+        Self::migrate_agent_workspaces_v2(pool).await?;
 
         Ok(())
     }
@@ -681,6 +684,31 @@ impl Database {
                         return Err(e);
                     }
                     tracing::debug!(column, "agent_messages migration: column already exists");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_workspaces 补全审批模式与自定义提示词列。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_workspaces_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "approval_mode",
+                "ALTER TABLE agent_workspaces ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'safe'",
+            ),
+            (
+                "system_prompt",
+                "ALTER TABLE agent_workspaces ADD COLUMN system_prompt TEXT",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_workspaces migration: column already exists");
                 }
             }
         }

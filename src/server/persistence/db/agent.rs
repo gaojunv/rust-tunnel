@@ -10,6 +10,8 @@ pub struct AgentWorkspaceRecord {
     pub root_path: String,
     pub docker_image: Option<String>,
     pub docker_container_id: Option<String>,
+    pub approval_mode: String,
+    pub system_prompt: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -320,6 +322,12 @@ mod tests {
 
         db.agent_delete_workspace("w1").await.unwrap();
         assert!(db.agent_get_workspace("w1").await.unwrap().is_none());
+
+        // approval_mode / system_prompt 默认值与读写
+        let ws = db.agent_get_workspace("w2").await.unwrap().unwrap();
+        assert_eq!(ws.approval_mode, "safe");
+        assert!(ws.system_prompt.is_none());
+
         db.agent_delete_workspace("w2").await.unwrap();
         assert!(db.agent_get_workspace("w2").await.unwrap().is_none());
     }
