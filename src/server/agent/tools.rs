@@ -107,6 +107,38 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
                 "parameters": {"type": "object", "properties": {}}
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search file contents in the workspace (literal substring match). Returns up to 200 lines of 'path:line:content'. Skips binary files, .git, and files >1MB.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Literal substring to search for"},
+                        "path": {"type": "string", "description": "Starting directory relative to the workspace root ('.' for root)"},
+                        "include": {"type": "string", "description": "Optional filename filter: '*.ext' suffix glob or exact filename"}
+                    },
+                    "required": ["pattern", "path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": "Replace a unique anchor string in a file. old_string must occur EXACTLY ONCE in the file; on 0 or multiple matches the call fails — read_file first to confirm the exact current content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path within the workspace"},
+                        "old_string": {"type": "string", "description": "Exact text to find (must appear exactly once)"},
+                        "new_string": {"type": "string", "description": "Replacement text"}
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }
+            }
+        }),
     ]
 }
 
@@ -170,6 +202,30 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
             message: arg_str(&args, "message", name)?.to_string(),
         }),
         "git_push" => Ok(AgentCommand::GitPush),
+        "search" => {
+            let pattern = arg_str(&args, "pattern", name)?;
+            if pattern.len() > MAX_TOOL_INPUT {
+                return Err("pattern too large (>900KB)".to_string());
+            }
+            Ok(AgentCommand::Search {
+                pattern: pattern.to_string(),
+                path: arg_str(&args, "path", name)?.to_string(),
+                include: arg_opt_str(&args, "include"),
+            })
+        }
+        "patch_file" => {
+            let path = arg_str(&args, "path", name)?;
+            let old_string = arg_str(&args, "old_string", name)?;
+            let new_string = arg_str(&args, "new_string", name)?;
+            if old_string.len() + new_string.len() > MAX_TOOL_INPUT {
+                return Err("patch payload too large (>900KB); patch in smaller chunks".to_string());
+            }
+            Ok(AgentCommand::PatchFile {
+                path: path.to_string(),
+                old_string: old_string.to_string(),
+                new_string: new_string.to_string(),
+            })
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -265,6 +321,75 @@ mod tests {
     #[test]
     fn test_parse_unknown_tool() {
         assert!(parse_tool_call("delete_everything", r"{}").is_err());
+    }
+
+    #[test]
+    fn test_schema_covers_search_patch() {
+        let schema = agent_tools_schema();
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"patch_file"));
+    }
+
+    #[test]
+    fn test_parse_search() {
+        let cmd = parse_tool_call(
+            "search",
+            r#"{"pattern":"fn main","path":"src","include":"*.rs"}"#,
+        )
+        .unwrap();
+        match cmd {
+            AgentCommand::Search {
+                pattern,
+                path,
+                include,
+            } => {
+                assert_eq!(pattern, "fn main");
+                assert_eq!(path, "src");
+                assert_eq!(include.as_deref(), Some("*.rs"));
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+        // include 可选
+        let cmd = parse_tool_call("search", r#"{"pattern":"x","path":"."}"#).unwrap();
+        match cmd {
+            AgentCommand::Search { include, .. } => assert!(include.is_none()),
+            other => panic!("expected Search, got {other:?}"),
+        }
+        // 缺必填
+        assert!(parse_tool_call("search", r#"{"pattern":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_patch_file() {
+        let cmd = parse_tool_call(
+            "patch_file",
+            r#"{"path":"a.rs","old_string":"o","new_string":"n"}"#,
+        )
+        .unwrap();
+        match cmd {
+            AgentCommand::PatchFile {
+                path,
+                old_string,
+                new_string,
+            } => {
+                assert_eq!(path, "a.rs");
+                assert_eq!(old_string, "o");
+                assert_eq!(new_string, "n");
+            }
+            other => panic!("expected PatchFile, got {other:?}"),
+        }
+        assert!(parse_tool_call("patch_file", r#"{"path":"a.rs"}"#).is_err());
+        // 超上限拒绝
+        let big = "x".repeat(901 * 1024);
+        let args =
+            serde_json::json!({"path":"a.rs","old_string":"o","new_string": big}).to_string();
+        assert!(parse_tool_call("patch_file", &args)
+            .unwrap_err()
+            .contains("too large"));
     }
 
     #[test]

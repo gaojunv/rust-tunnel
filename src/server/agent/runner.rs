@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
-use crate::common::AgentResult;
+use crate::common::{AgentCommand, AgentResult};
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
 /// 按行切分 SSE 字节流：HTTP chunk 边界可切断一行，未完结部分留缓冲。
@@ -167,6 +167,30 @@ pub fn parse_llm_turn(body: &serde_json::Value) -> Result<LlmTurn, String> {
     Ok(LlmTurn::Text(content))
 }
 
+/// 首个支持 Search/PatchFile 命令的客户端版本（随本特性发布 bump）。
+const MIN_SEARCH_PATCH_CLIENT_VERSION: (u64, u64, u64) = (0, 2, 0);
+
+/// 解析 "x.y.z"（允许 v 前缀）为数字三元组；非严格 semver 输入返回 None。
+fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.strip_prefix('v').unwrap_or(s);
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// 客户端版本是否支持 search/patch；版本缺失/非法视为不支持（保守策略，
+/// 避免老客户端收到未知 bincode 变体后反序列化失败断开控制连接）。
+fn client_supports_search_patch(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_SEARCH_PATCH_CLIENT_VERSION)
+}
+
 fn agent_result_to_text(result: &AgentResult) -> String {
     match result {
         AgentResult::Shell {
@@ -219,6 +243,38 @@ async fn handle_tool_calls(
 
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
+                // 老客户端不认识 Search/PatchFile 变体：bincode 按索引反序列化，
+                // 未知索引直接导致控制连接断开。版本不足时在服务端短路为错误喂回模型。
+                let needs_new_client = matches!(
+                    command,
+                    AgentCommand::Search { .. } | AgentCommand::PatchFile { .. }
+                );
+                if needs_new_client {
+                    let version = agent
+                        .registry
+                        .get(&rt.client_id)
+                        .await
+                        .and_then(|e| e.client_version.clone());
+                    if !client_supports_search_patch(version.as_deref()) {
+                        let text = format!(
+                            "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
+                            call.name,
+                            MIN_SEARCH_PATCH_CLIENT_VERSION.0,
+                            MIN_SEARCH_PATCH_CLIENT_VERSION.1,
+                            MIN_SEARCH_PATCH_CLIENT_VERSION.2,
+                        );
+                        let _ = ws_tx
+                            .send(serde_json::json!({
+                                "type": "tool_result",
+                                "id": &call.id,
+                                "name": &call.name,
+                                "result": &text,
+                            }))
+                            .await;
+                        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+                        continue;
+                    }
+                }
                 // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
                 // 避免静默回退到宿主机执行。
                 let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
@@ -260,24 +316,7 @@ async fn handle_tool_calls(
             }
         };
 
-        persist_message(
-            agent,
-            &rt.session_id,
-            "tool",
-            &result_text,
-            None,
-            Some(&call.id),
-            Some(&call.name),
-            "tool_result",
-        )
-        .await;
-        rt.messages.push(ChatMessage {
-            role: "tool".into(),
-            content: Some(result_text),
-            tool_calls: None,
-            tool_call_id: Some(call.id.clone()),
-            name: Some(call.name.clone()),
-        });
+        record_tool_result(agent, rt, &call.id, &call.name, result_text).await;
     }
     Ok(())
 }
@@ -580,6 +619,36 @@ async fn persist_message(
     }
 }
 
+/// 把一条 tool 结果消息同时写入 DB（kind='tool_result'）与内存上下文
+/// （role='tool'，带 tool_call_id/name）。handle_tool_calls 的正常路径与
+/// 版本门控拒绝路径共用，保证两者落库行为一致。
+async fn record_tool_result(
+    agent: &AgentState,
+    rt: &mut SessionRuntime,
+    call_id: &str,
+    call_name: &str,
+    content: String,
+) {
+    persist_message(
+        agent,
+        &rt.session_id,
+        "tool",
+        &content,
+        None,
+        Some(call_id),
+        Some(call_name),
+        "tool_result",
+    )
+    .await;
+    rt.messages.push(ChatMessage {
+        role: "tool".into(),
+        content: Some(content),
+        tool_calls: None,
+        tool_call_id: Some(call_id.to_string()),
+        name: Some(call_name.to_string()),
+    });
+}
+
 /// 落库一行 kind='summary' 的消息（压缩模块用）。
 pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, content: &str) {
     persist_message(
@@ -646,6 +715,24 @@ mod tests {
         assert!(is_sse_response("text/event-stream; charset=utf-8"));
         assert!(is_sse_response("text/event-stream"));
         assert!(!is_sse_response("application/json"));
+    }
+
+    #[test]
+    fn test_parse_version() {
+        assert_eq!(parse_version("0.2.0"), Some((0, 2, 0)));
+        assert_eq!(parse_version("1.10.3"), Some((1, 10, 3)));
+        assert_eq!(parse_version("v0.2.0"), Some((0, 2, 0))); // 允许 v 前缀
+        assert_eq!(parse_version("0.2"), None);
+        assert_eq!(parse_version("abc"), None);
+    }
+
+    #[test]
+    fn test_client_supports_search_patch() {
+        assert!(!client_supports_search_patch(Some("0.1.0")));
+        assert!(client_supports_search_patch(Some("0.2.0")));
+        assert!(client_supports_search_patch(Some("1.0.0")));
+        assert!(!client_supports_search_patch(None)); // 缺失视为过旧
+        assert!(!client_supports_search_patch(Some("garbage")));
     }
 
     #[test]
