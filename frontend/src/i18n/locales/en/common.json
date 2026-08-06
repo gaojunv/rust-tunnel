@@ -726,6 +726,7 @@
     "selectWorkspace": "Select workspace…",
     "selectWorkspaceAria": "Select workspace",
     "newWorkspace": "New Workspace",
+    "editWorkspace": "Edit Workspace",
     "workspaces": "Workspaces",
     "newSession": "New Session",
     "selectOrNewSession": "Select or create a session to start",
@@ -798,7 +799,8 @@
     "approvalMode_full_auto": "Full auto",
     "approvalModeHint_full_auto": "All operations run automatically (not recommended)",
     "systemPrompt": "Custom system prompt",
-    "systemPromptPlaceholder": "Appended after the built-in prompt for workspace-specific instructions (optional)"
+    "systemPromptPlaceholder": "Appended after the built-in prompt for workspace-specific instructions (optional)",
+    "noMatchingFiles": "No matching files"
   },
   "logs": {
     "title": "Logs",

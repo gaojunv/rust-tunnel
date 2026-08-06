@@ -38,6 +38,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const [refs, setRefs] = useState<string[]>([]);
   // @ 弹层状态：start 为光标前最近 @ 的下标，query 为其后到光标的前缀
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
+  // 弹层高亮（受控）：父组件持 有 state，↑↓ 循环驱动，Enter/Tab 选中；MentionPopup
+  // 通过 onFilesChange 上报可选中列表、列表变化时经 onActiveIdxChange 回卷首项
+  const [mentionFiles, setMentionFiles] = useState<string[]>([]);
+  const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
+  // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -462,8 +468,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         return;
       }
     }
-    setMention(null);
+    closeMention();
   };
+
+  // 关闭 @ 弹层并清空受控高亮/列表状态：避免重开弹层时选中上一次的陈旧结果
+  const closeMention = useCallback(() => {
+    setMention(null);
+    setMentionFiles([]);
+    setMentionActiveIdx(0);
+  }, []);
 
   // 选中文件：把 @query 段从文本移除，路径进 refs chip（chip 独立展示，不占 textarea）
   const selectMention = (path: string) => {
@@ -472,9 +485,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     const after = input.slice(mention.start + 1 + mention.query.length);
     setInput(before + after);
     setRefs((prev) => (prev.includes(path) ? prev : [...prev, path]));
-    setMention(null);
+    closeMention();
+    if (blurTimerRef.current) {
+      clearTimeout(blurTimerRef.current);
+      blurTimerRef.current = null;
+    }
     textareaRef.current?.focus();
   };
+
+  // 稳定回调（供 MentionPopup 的 effect 依赖）：setState 函数恒等，避免触发渲染循环
+  const handleMentionFilesChange = useCallback((files: string[]) => {
+    setMentionFiles(files);
+  }, []);
+  const handleMentionActiveIdxChange = useCallback((idx: number) => {
+    setMentionActiveIdx(idx);
+  }, []);
 
   const send = () => {
     const text = input.trim();
@@ -581,8 +606,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             <MentionPopup
               workspaceId={workspaceId}
               query={mention.query}
+              activeIdx={mentionActiveIdx}
+              onActiveIdxChange={handleMentionActiveIdxChange}
+              onFilesChange={handleMentionFilesChange}
               onSelect={selectMention}
-              onClose={() => setMention(null)}
             />
           )}
           <textarea
@@ -591,16 +618,45 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             onChange={handleInputChange}
             onKeyDown={(e) => {
               if (e.key === 'Escape') {
-                setMention(null);
+                closeMention();
                 return;
               }
-              if (mention && e.key === 'Enter') {
-                e.preventDefault();
-                return;
+              if (mention) {
+                // 弹层打开时键盘操作：↑↓ 循环移动高亮、Enter/Tab 选中、Shift+Enter 放行换行
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const n = mentionFiles.length;
+                  if (n > 0) {
+                    setMentionActiveIdx((prev) =>
+                      e.key === 'ArrowDown' ? (prev + 1) % n : (prev - 1 + n) % n,
+                    );
+                  }
+                  return;
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                  e.preventDefault();
+                  const target = mentionFiles[mentionActiveIdx];
+                  if (target) selectMention(target);
+                  return;
+                }
+                // Shift+Enter 或其它键：不拦截，交给下方 Enter/默认行为
               }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 send();
+              }
+            }}
+            onBlur={() => {
+              // 点击弹层项会先触发 textarea blur：延迟 150ms 关闭，让 click 先选中
+              if (mention) {
+                blurTimerRef.current = globalThis.setTimeout(closeMention, 150);
+              }
+            }}
+            onFocus={() => {
+              // 用户回到输入框（或弹层项选中后主动 focus）→ 取消待执行的关闭
+              if (blurTimerRef.current) {
+                clearTimeout(blurTimerRef.current);
+                blurTimerRef.current = null;
               }
             }}
             placeholder={t('agent.inputPlaceholder')}

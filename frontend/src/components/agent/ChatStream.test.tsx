@@ -594,4 +594,62 @@ describe('ChatStream running state', () => {
       ws.sent.some((s) => s.includes('"type":"user_message"') && s.includes('"refs":["src/main.rs"]')),
     ).toBe(true);
   });
+
+  it('selects the highlighted mention item on Enter without sending', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // 弹层打开时按 Enter → 选中高亮项，而非发送消息
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(screen.getByText('@src/main.rs')).toBeTruthy();
+    expect(textarea.value).toBe('');
+    // 任何连接的 WS 实例都没有发出 user_message 帧（断言覆盖 i18n mock 引发的实例轮换）
+    expect(wsInstances.every((w) => !w.sent.some((s) => s.includes('"type":"user_message"')))).toBe(true);
+    // 弹层关闭
+    expect(screen.queryByText('src/main.rs')).toBeNull();
+  });
+
+  it('moves highlight with ArrowDown and selects the second item on Enter', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/a.rs', 'src/b.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@sr' } });
+    expect(await screen.findByText('src/a.rs')).toBeTruthy();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // ↓ 移动高亮到第二项 → Enter 选中 src/b.rs
+    fireEvent.keyDown(textarea, { key: 'ArrowDown' });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(await screen.findByText('@src/b.rs')).toBeTruthy();
+    expect(screen.queryByText('@src/a.rs')).toBeNull();
+    expect(textarea.value).toBe('');
+  });
+
+  it('closes the mention popup on Escape', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    fireEvent.keyDown(screen.getByPlaceholderText('agent.inputPlaceholder'), { key: 'Escape' });
+    expect(screen.queryByText('src/main.rs')).toBeNull();
+  });
+
+  it('removes a single chip independently', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/a.rs', 'src/b.rs'] });
+    renderChat();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // 依次选择两个文件 → 两个 chip
+    fireEvent.change(textarea, { target: { value: '@sr' } });
+    fireEvent.click(await screen.findByText('src/a.rs'));
+    fireEvent.change(textarea, { target: { value: '@sr' } });
+    fireEvent.click(await screen.findByText('src/b.rs'));
+    expect(screen.getByText('@src/a.rs')).toBeTruthy();
+    expect(screen.getByText('@src/b.rs')).toBeTruthy();
+    // 单独删除 src/a.rs 的 chip，src/b.rs 保留
+    const chipA = screen.getByText('@src/a.rs');
+    const removeBtn = chipA.parentElement!.querySelector('button')!;
+    fireEvent.click(removeBtn);
+    expect(screen.queryByText('@src/a.rs')).toBeNull();
+    expect(screen.getByText('@src/b.rs')).toBeTruthy();
+  });
 });

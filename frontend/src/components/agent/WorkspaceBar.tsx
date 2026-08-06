@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Settings, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { listAgentWorkspaces, deleteAgentWorkspace, getApiErrorMessage } from '../../api/client';
 import type { AgentWorkspace } from '../../types';
@@ -10,10 +10,12 @@ interface Props {
   workspaceId: string;
   onSelect: (id: string) => void;
   onNew: () => void;
+  /** 编辑当前工作区（齿轮入口，需已选中工作区） */
+  onEdit: () => void;
 }
 
-/** 顶栏工作区选择：下拉 + 新建 + 删除。 */
-export default function WorkspaceBar({ workspaceId, onSelect, onNew }: Props) {
+/** 顶栏工作区选择：下拉 + 设置 + 新建 + 删除。 */
+export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
@@ -57,6 +59,15 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew }: Props) {
           </option>
         ))}
       </select>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={onEdit}
+        disabled={!workspaceId}
+        aria-label={t('agent.editWorkspace')}
+      >
+        <Settings className="h-4 w-4" />
+      </Button>
       <Button variant="outline" size="sm" onClick={onNew} aria-label={t('agent.newWorkspace')}>
         <Plus className="h-4 w-4" />
       </Button>

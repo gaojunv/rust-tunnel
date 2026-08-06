@@ -726,6 +726,7 @@
     "selectWorkspace": "选择工作区…",
     "selectWorkspaceAria": "选择工作区",
     "newWorkspace": "新建工作区",
+    "editWorkspace": "编辑工作区",
     "workspaces": "工作区",
     "newSession": "新会话",
     "selectOrNewSession": "选择或新建一个会话开始",
@@ -798,7 +799,8 @@
     "approvalMode_full_auto": "全自动",
     "approvalModeHint_full_auto": "所有操作自动执行（不推荐）",
     "systemPrompt": "自定义提示词",
-    "systemPromptPlaceholder": "追加到内置提示词之后，用于该工作区的定制指令（可选）"
+    "systemPromptPlaceholder": "追加到内置提示词之后，用于该工作区的定制指令（可选）",
+    "noMatchingFiles": "无匹配文件"
   },
   "logs": {
     "title": "日志",
