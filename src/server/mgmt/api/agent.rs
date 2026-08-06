@@ -299,6 +299,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 对端断开则丢弃 turn future（取消该回合）并退出外层循环，避免连接任务
         // 永久挂起（read 循环不再 poll ws_stream 导致 close 永远不可见）；若 turn
         // 期间对端又发来 user_message，缓冲到 pending，turn 结束后优先处理。
+        // rt 是 &mut 借用且被移入 turn future——回合成功后的标题生成需要会话模型，
+        // 故在此先 clone（借用仍在期，turn 结束后无法再访问 rt）。
+        let turn_model = rt.model.clone();
         let turn = crate::server::agent::runner::run_agent_turn(
             agent.clone(),
             llm.clone(),
@@ -340,6 +343,23 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             let _ = event_tx
                 .send(serde_json::json!({"type": "error", "message": e}))
                 .await;
+        } else {
+            // 回合成功结束：title 为空时异步生成（内部有非空竞态守卫）
+            let needs_title = agent
+                .db
+                .agent_get_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.title.as_deref().is_none_or(|t| t.trim().is_empty()));
+            if needs_title {
+                tokio::spawn(crate::server::agent::title::maybe_generate_title(
+                    agent.clone(),
+                    llm.clone(),
+                    session_id.clone(),
+                    turn_model,
+                ));
+            }
         }
     }
 

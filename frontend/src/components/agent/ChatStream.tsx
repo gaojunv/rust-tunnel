@@ -308,6 +308,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果；
         // 不影响聊天区（history effect 有 loadedRef 守卫，不会重复装载）
         void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
+        // 回合成功结束 → 服务端异步生成会话标题，刷新会话列表让标题回显
+        // （前缀匹配命中 SessionBar 的 ['agent-sessions', workspaceId]）
+        void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
       } else if (msg.type === 'error') {
         flushChunks();
         setItems((prev) => {
