@@ -162,6 +162,46 @@ fn search_in_workspace<'a>(
     })
 }
 
+/// 将 docker 分支 `grep` 的 `Shell` 结果转换为与 host `search_in_workspace` 一致的
+/// `FileContent` 形态：exit 0 → 命中行；exit 1 → no matches；其他 → Error。
+/// 命中行数超过 `SEARCH_MAX_HITS` 时只保留前 N 行并追加与 host 相同的截断标记
+/// （`head -N+1` 预取一行以检测超限）。非 `Shell` 结果（如 spawn 失败）原样透传。
+fn docker_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
+    match shell_result {
+        AgentResult::Shell {
+            stdout, stderr, exit_code,
+        } => match exit_code {
+            0 => {
+                let mut lines: Vec<&str> = stdout.lines().collect();
+                let truncated = lines.len() > SEARCH_MAX_HITS;
+                if truncated {
+                    lines.truncate(SEARCH_MAX_HITS);
+                }
+                let mut content = lines.join("\n");
+                if truncated {
+                    content.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
+                }
+                AgentResult::FileContent {
+                    content: truncate_output(content),
+                }
+            }
+            1 => AgentResult::FileContent {
+                content: format!("no matches for '{pattern}'"),
+            },
+            _ => {
+                let stderr = stderr.trim();
+                let message = if stderr.is_empty() {
+                    format!("grep failed with exit code {exit_code}")
+                } else {
+                    format!("grep failed with exit code {exit_code}: {stderr}")
+                };
+                AgentResult::Error { message }
+            }
+        },
+        other => other,
+    }
+}
+
 /// 锚点字符串替换：old_string 恰好出现一次才替换。
 async fn patch_file_host(abs: &Path, old_string: &str, new_string: &str) -> AgentResult {
     if old_string.is_empty() {
@@ -409,25 +449,41 @@ pub async fn handle_exec_request(
             pattern,
             path,
             include,
-        } => match docker_container {
-            // docker：走容器内 grep（-F 字面量、-rn 带行号），include 经 --include 透传
-            Some(c) => {
-                let workdir = match resolve_sandboxed(root_path, path) {
-                    Ok(p) => p,
-                    Err(e) => return AgentResult::Error { message: e },
+        } => {
+            // 统一前置校验：空 pattern 在 docker/host 两条路径都拒绝
+            // （host 的 search_in_workspace 内部另有双保险校验）。
+            if pattern.is_empty() {
+                return AgentResult::Error {
+                    message: "pattern must not be empty".into(),
                 };
-                let include_arg = include
-                    .as_deref()
-                    .map(|g| format!("--include={}", sh_quote(g)))
-                    .unwrap_or_default();
-                let cmd = format!(
-                    "grep -rnF {include_arg} -- {} . | head -{SEARCH_MAX_HITS}",
-                    sh_quote(pattern),
-                );
-                shell_exec(&cmd, None, &workdir, Some(c), timeout).await
             }
-            None => search_in_workspace(root_path, pattern, path, include.as_deref()).await,
-        },
+            match docker_container {
+                // docker：走容器内 grep（-F 字面量、-rn 带行号、-I 跳过二进制、
+                // --exclude-dir=.git 跳过版本库目录），include 经 --include 透传。
+                // 容器侧无法做 host 的 500 字符单行截断（grep 输出不能逐行控制），
+                // 可接受：grep 输出本身已按行组织，超长行只会影响单条命中展示。
+                Some(c) => {
+                    let workdir = match resolve_sandboxed(root_path, path) {
+                        Ok(p) => p,
+                        Err(e) => return AgentResult::Error { message: e },
+                    };
+                    let include_arg = include
+                        .as_deref()
+                        .map(|g| format!("--include={}", sh_quote(g)))
+                        .unwrap_or_default();
+                    // head 取 N+1 行预检超限，随后在 docker_search_result 中裁剪并
+                    // 追加与 host 一致的截断标记
+                    let cmd = format!(
+                        "grep -rnF -I --exclude-dir=.git {include_arg} -- {} . | head -{}",
+                        sh_quote(pattern),
+                        SEARCH_MAX_HITS + 1,
+                    );
+                    let shell_result = shell_exec(&cmd, None, &workdir, Some(c), timeout).await;
+                    docker_search_result(pattern, shell_result)
+                }
+                None => search_in_workspace(root_path, pattern, path, include.as_deref()).await,
+            }
+        }
         AgentCommand::PatchFile {
             path,
             old_string,
@@ -1023,6 +1079,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_rejects_empty_pattern_on_both_paths() {
+        // 统一前置校验点：docker/host 两条路径在进入分支前都拒绝空 pattern，
+        // docker 路径无需真实 docker daemon
+        let root = temp_workspace(&[("a.txt", "hello\n")]);
+        let cmd = AgentCommand::Search {
+            pattern: String::new(),
+            path: ".".into(),
+            include: None,
+        };
+        for container in [None, Some("agent-test")] {
+            let result =
+                handle_exec_request(&cmd, &root, Duration::from_secs(10), container).await;
+            let AgentResult::Error { message } = result else {
+                panic!("expected Error for container = {container:?}");
+            };
+            assert_eq!(message, "pattern must not be empty");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn test_patch_unique_replacement() {
         let root = temp_workspace(&[("a.rs", "fn old() {}\nrest\n")]);
         let result = patch_file_host(&root.join("a.rs"), "fn old()", "fn new()").await;
@@ -1088,6 +1165,90 @@ mod tests {
             cmd,
             "docker exec -w '/workspace' 'dev-ctr' git 'diff' '--' 'my file.rs'"
         );
+    }
+
+    #[test]
+    fn test_docker_search_result_exit_0_maps_to_file_content() {
+        let result = docker_search_result(
+            "main",
+            AgentResult::Shell {
+                stdout: "a.rs:1:fn main()\nb.rs:2:main".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        );
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert_eq!(content, "a.rs:1:fn main()\nb.rs:2:main");
+    }
+
+    #[test]
+    fn test_docker_search_result_exit_1_is_no_matches() {
+        let result = docker_search_result(
+            "zzz",
+            AgentResult::Shell {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 1,
+            },
+        );
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert_eq!(content, "no matches for 'zzz'");
+    }
+
+    #[test]
+    fn test_docker_search_result_truncates_at_max_hits() {
+        // N+1 行输入（模拟 head -N+1 预取）：保留前 N 行并追加与 host 一致的截断标记
+        let hits: Vec<String> = (0..=SEARCH_MAX_HITS)
+            .map(|i| format!("f{i}.rs:1:hit"))
+            .collect();
+        let result = docker_search_result(
+            "hit",
+            AgentResult::Shell {
+                stdout: hits.join("\n"),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        );
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert_eq!(content.lines().count(), SEARCH_MAX_HITS + 1);
+        assert!(content.contains("f0.rs:1:hit"));
+        assert!(!content.contains(&format!("f{}.rs", SEARCH_MAX_HITS)));
+        assert!(content.ends_with(&format!("\n[truncated at {} hits]", SEARCH_MAX_HITS)));
+    }
+
+    #[test]
+    fn test_docker_search_result_other_exit_keeps_error() {
+        let result = docker_search_result(
+            "main",
+            AgentResult::Shell {
+                stdout: String::new(),
+                stderr: "grep: .: No such file or directory".into(),
+                exit_code: 2,
+            },
+        );
+        let AgentResult::Error { message } = result else {
+            panic!("expected Error");
+        };
+        assert!(message.contains("exit code 2"), "message = {message:?}");
+        assert!(message.contains("No such file"), "message = {message:?}");
+    }
+
+    #[test]
+    fn test_docker_search_result_passes_through_non_shell() {
+        // spawn 失败等 Error 结果原样透传，不做 shell 解释
+        let result = docker_search_result(
+            "main",
+            AgentResult::Error {
+                message: "spawn shell failed".into(),
+            },
+        );
+        assert!(matches!(result, AgentResult::Error { .. }));
     }
 
     // ── Docker 集成测试（需本地 docker daemon）────────────────────────────────
