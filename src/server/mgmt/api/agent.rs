@@ -144,7 +144,8 @@ async fn refresh_session_model(
 
 /// `WS` 客户端帧分类：`user_message` / `cancel` / `approval_response` / 其他（忽略）。
 enum WsFrame {
-    UserMessage(String),
+    /// 用户消息：content + 可选 @引用文件路径列表
+    UserMessage { content: String, refs: Vec<String> },
     Cancel,
     /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具
     ApprovalResponse {
@@ -163,10 +164,23 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
         return WsFrame::Other;
     };
     match body.get("type").and_then(|t| t.as_str()) {
-        Some("user_message") => body
-            .get("content")
-            .and_then(|c| c.as_str())
-            .map_or(WsFrame::Other, |c| WsFrame::UserMessage(c.to_string())),
+        Some("user_message") => {
+            let content = body.get("content").and_then(|c| c.as_str()).map(str::to_string);
+            let refs = body
+                .get("refs")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .take(crate::server::agent::runner::MAX_REFS)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match content {
+                Some(c) => WsFrame::UserMessage { content: c, refs },
+                None => WsFrame::Other,
+            }
+        }
         Some("cancel") => WsFrame::Cancel,
         Some("approval_response") => {
             let request_id = body
@@ -236,11 +250,11 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // structure; that is the accepted MVP tradeoff.
     let mut rt_cache: Option<SessionRuntime> = None;
     // 回合进行中对端又发来的用户消息：最多缓冲一条，当前 turn 结束后优先处理。
-    let mut pending: Option<String> = None;
+    let mut pending: Option<(String, Vec<String>)> = None;
 
     loop {
         // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
-        let content = if let Some(p) = pending.take() {
+        let (content, refs) = if let Some(p) = pending.take() {
             p
         } else {
             let msg = match ws_stream.next().await {
@@ -248,7 +262,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 Some(Ok(m)) => m,
             };
             match parse_ws_frame(msg) {
-                WsFrame::UserMessage(c) => c,
+                WsFrame::UserMessage { content, refs } => (content, refs),
                 // 非 turn 期间的 cancel/审批响应：幂等忽略（迟到的审批响应可能已
                 // 超时自清，pending map 仍挂着等超时，此处丢弃即可）
                 WsFrame::Cancel | WsFrame::ApprovalResponse { .. } | WsFrame::Other => continue,
@@ -282,20 +296,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         let session_lock = agent.session_lock(&session_id).await;
         let _session_guard = session_lock.lock().await;
 
-        // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
-        let msg_id = format!("{:032x}", rand::random::<u128>());
-        let _ = agent
-            .db
-            .agent_add_message(&msg_id, &session_id, "user", &content, None)
-            .await;
-
-        // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
+        // 首个用户消息：从 DB 重建运行时；后续消息直接追加到内存 messages。
+        // user 消息的落库与内存追加统一放在 refs 注入之后（见下），加载阶段
+        // 不再写库——先落原始 content 再注入会造成 DB 与内存内容不一致。
         let rt = match rt_cache.as_mut() {
             Some(rt) => {
                 // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
                 // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
                 refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
-                rt.messages.push(ChatMessage::text("user", content));
                 rt
             }
             None => {
@@ -340,6 +348,48 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         };
 
+        // @引用注入：逐个经隧道 ReadFile，合成完整 user 消息后落库 + 进上下文。
+        // 超总量限制的 refs 标注拒绝；读失败的标注 [无法读取]，均不阻断回合。
+        let content = if refs.is_empty() {
+            content
+        } else {
+            let mut ref_files: Vec<(String, Result<String, String>)> = Vec::new();
+            let mut total = 0usize;
+            for path in &refs {
+                if total >= crate::server::agent::runner::MAX_REFS_TOTAL_BYTES {
+                    ref_files.push((path.clone(), Err("refs total size limit".to_string())));
+                    continue;
+                }
+                let result = crate::server::agent::executor::exec_on_client(
+                    &agent,
+                    &rt.workspace_id,
+                    &rt.client_id,
+                    &rt.root_path,
+                    rt.docker_container.as_deref(),
+                    crate::common::AgentCommand::ReadFile { path: path.clone() },
+                )
+                .await;
+                match result {
+                    crate::common::AgentResult::FileContent { content: c } => {
+                        total += c.len();
+                        ref_files.push((path.clone(), Ok(c)));
+                    }
+                    _ => ref_files.push((path.clone(), Err("read failed".to_string()))),
+                }
+            }
+            crate::server::agent::runner::compose_user_message(&content, &ref_files)
+        };
+
+        // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
+        // 落的是注入后的 content——DB 中就是一条完整的 user 消息。
+        let msg_id = format!("{:032x}", rand::random::<u128>());
+        let _ = agent
+            .db
+            .agent_add_message(&msg_id, &session_id, "user", &content, None)
+            .await;
+        // 内存上下文追加的同样是注入后的 content。
+        rt.messages.push(ChatMessage::text("user", content));
+
         // 每个用户消息串行运行一个 agent turn。turn 期间持续观察 ws_stream：
         // 对端断开则丢弃 turn future（取消该回合）并退出外层循环，避免连接任务
         // 永久挂起（read 循环不再 poll ws_stream 导致 close 永远不可见）；若 turn
@@ -363,8 +413,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     msg = ws_stream.next() => match msg {
                         None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break TurnOutcome::Disconnected,
                         Some(Ok(m)) => match parse_ws_frame(m) {
-                            WsFrame::UserMessage(c) => {
-                                pending.get_or_insert(c);
+                            WsFrame::UserMessage { content, refs } => {
+                                pending.get_or_insert((content, refs));
                             }
                             // 中断式取消：drop turn future（与断连路径一致），但连接保留，
                             // 回发 stopped 帧后继续外层循环等下一条消息。
@@ -796,7 +846,19 @@ mod tests {
         let user = parse_ws_frame(Message::Text(
             r#"{"type":"user_message","content":"hi"}"#.into(),
         ));
-        assert!(matches!(user, WsFrame::UserMessage(c) if c == "hi"));
+        assert!(matches!(
+            user,
+            WsFrame::UserMessage { content, refs } if content == "hi" && refs.is_empty()
+        ));
+
+        // @引用：refs 数组解析；无 refs 字段默认空列表
+        let user_refs = parse_ws_frame(Message::Text(
+            r#"{"type":"user_message","content":"看下","refs":["src/main.rs","a/b.rs"]}"#.into(),
+        ));
+        assert!(matches!(
+            user_refs,
+            WsFrame::UserMessage { content, refs } if content == "看下" && refs == ["src/main.rs", "a/b.rs"]
+        ));
 
         let cancel = parse_ws_frame(Message::Text(r#"{"type":"cancel"}"#.into()));
         assert!(matches!(cancel, WsFrame::Cancel));
