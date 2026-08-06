@@ -57,113 +57,9 @@ fn truncate_output(s: String) -> String {
 const SEARCH_MAX_HITS: usize = 200;
 /// search 单行内容截断长度（字符）
 const SEARCH_MAX_LINE: usize = 500;
-/// search 跳过的单文件大小上限
-const SEARCH_MAX_FILE: u64 = 1024 * 1024;
 
-/// include 过滤：支持 "*.ext" 后缀模式与精确文件名；None 全部通过。
-fn match_include(file_name: &str, include: Option<&str>) -> bool {
-    match include {
-        None => true,
-        Some(pat) => {
-            if let Some(suffix) = pat.strip_prefix('*') {
-                file_name.ends_with(suffix)
-            } else {
-                file_name == pat
-            }
-        }
-    }
-}
-
-/// 简单二进制判定：首 8KB 内含 NUL 字节。
-fn looks_binary(head: &[u8]) -> bool {
-    head.contains(&0)
-}
-
-/// 在工作区沙箱内递归搜索字面量子串。输出 `相对路径:行号:行内容` 多行文本；
-/// 跳过 .git、二进制与超大文件；命中超限追加 [truncated]。
-fn search_in_workspace<'a>(
-    root: &'a Path,
-    pattern: &'a str,
-    path: &'a str,
-    include: Option<&'a str>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
-    Box::pin(async move {
-        if pattern.is_empty() {
-            return AgentResult::Error {
-                message: "pattern must not be empty".into(),
-            };
-        }
-        let start = match resolve_sandboxed(root, path) {
-            Ok(p) => p,
-            Err(e) => return AgentResult::Error { message: e },
-        };
-        let mut hits: Vec<String> = Vec::new();
-        let mut truncated = false;
-        // 栈式遍历避免递归 async fn 复杂度（read_dir 层级用显式栈）
-        let mut stack = vec![start];
-        'walk: while let Some(dir) = stack.pop() {
-            let mut entries = match tokio::fs::read_dir(&dir).await {
-                Ok(e) => e,
-                Err(_) => continue, // 无权限/非目录：跳过
-            };
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == ".git" {
-                    continue;
-                }
-                let p = entry.path();
-                let Ok(meta) = entry.metadata().await else { continue };
-                if meta.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
-                if !meta.is_file()
-                    || meta.len() > SEARCH_MAX_FILE
-                    || !match_include(&name, include)
-                {
-                    continue;
-                }
-                let Ok(bytes) = tokio::fs::read(&p).await else { continue };
-                if looks_binary(&bytes[..bytes.len().min(8192)]) {
-                    continue;
-                }
-                let Ok(text) = String::from_utf8(bytes) else { continue };
-                let rel = p
-                    .strip_prefix(root)
-                    .map(|r| r.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| name.clone());
-                for (idx, line) in text.lines().enumerate() {
-                    if line.contains(pattern) {
-                        let line = if line.chars().count() > SEARCH_MAX_LINE {
-                            line.chars().take(SEARCH_MAX_LINE).collect::<String>()
-                        } else {
-                            line.to_string()
-                        };
-                        hits.push(format!("{rel}:{}:{line}", idx + 1));
-                        if hits.len() >= SEARCH_MAX_HITS {
-                            truncated = true;
-                            break 'walk;
-                        }
-                    }
-                }
-            }
-        }
-        let mut out = if hits.is_empty() {
-            format!("no matches for '{pattern}'")
-        } else {
-            hits.join("\n")
-        };
-        if truncated {
-            out.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
-        }
-        AgentResult::FileContent {
-            content: truncate_output(out),
-        }
-    })
-}
-
-/// 将 docker 分支 `grep ... | head -N+1` 的 `Shell` 结果转换为与 host
-/// `search_in_workspace` 一致的 `FileContent` 形态。判定基于 stdout/stderr：
+/// 将 `grep ... | head -N+1` 的 `Shell` 结果（host/docker 统一分支）转换为
+/// `FileContent` 形态。判定基于 stdout/stderr：
 /// 因 sh 管道 exit code 取末元素 head（恒为 0），grep 的 exit 1（无命中）/exit 2
 /// （错误）均被掩盖，故判定按以下优先级：
 /// 1. stderr 非空（无论 exit_code）→ Error 保留 stderr（grep 错误经 stderr 暴露）；
@@ -171,9 +67,10 @@ fn search_in_workspace<'a>(
 /// 3. exit 0 且 stdout 为空 → no matches；
 /// 4. exit 0 且有 stdout → 命中行。
 ///
-/// 命中行数超过 `SEARCH_MAX_HITS` 时只保留前 N 行并追加与 host 相同的截断标记
-/// （`head -N+1` 预取一行以检测超限）。非 `Shell` 结果（如 spawn 失败）原样透传。
-fn docker_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
+/// 命中行数超过 `SEARCH_MAX_HITS` 时只保留前 N 行并追加截断标记
+/// （`head -N+1` 预取一行以检测超限）；单行超过 `SEARCH_MAX_LINE` 字符时截断到
+/// 前 500 字符。非 `Shell` 结果（如 spawn 失败）原样透传。
+fn grep_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
     match shell_result {
         AgentResult::Shell {
             stdout, stderr, exit_code,
@@ -199,7 +96,17 @@ fn docker_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult
             if truncated {
                 lines.truncate(SEARCH_MAX_HITS);
             }
-            let mut content = lines.join("\n");
+            let mut content = lines
+                .into_iter()
+                .map(|line| {
+                    if line.chars().count() > SEARCH_MAX_LINE {
+                        line.chars().take(SEARCH_MAX_LINE).collect::<String>()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             if truncated {
                 content.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
             }
@@ -459,39 +366,29 @@ pub async fn handle_exec_request(
             path,
             include,
         } => {
-            // 统一前置校验：空 pattern 在 docker/host 两条路径都拒绝
-            // （host 的 search_in_workspace 内部另有双保险校验）。
             if pattern.is_empty() {
                 return AgentResult::Error {
                     message: "pattern must not be empty".into(),
                 };
             }
-            match docker_container {
-                // docker：走容器内 grep（-F 字面量、-rn 带行号、-I 跳过二进制、
-                // --exclude-dir=.git 跳过版本库目录），include 经 --include 透传。
-                // 容器侧无法做 host 的 500 字符单行截断（grep 输出不能逐行控制），
-                // 可接受：grep 输出本身已按行组织，超长行只会影响单条命中展示。
-                Some(c) => {
-                    let workdir = match resolve_sandboxed(root_path, path) {
-                        Ok(p) => p,
-                        Err(e) => return AgentResult::Error { message: e },
-                    };
-                    let include_arg = include
-                        .as_deref()
-                        .map(|g| format!("--include={}", sh_quote(g)))
-                        .unwrap_or_default();
-                    // head 取 N+1 行预检超限，随后在 docker_search_result 中裁剪并
-                    // 追加与 host 一致的截断标记
-                    let cmd = format!(
-                        "grep -rnF -I --exclude-dir=.git {include_arg} -- {} . | head -{}",
-                        sh_quote(pattern),
-                        SEARCH_MAX_HITS + 1,
-                    );
-                    let shell_result = shell_exec(&cmd, None, &workdir, Some(c), timeout).await;
-                    docker_search_result(pattern, shell_result)
-                }
-                None => search_in_workspace(root_path, pattern, path, include.as_deref()).await,
-            }
+            let workdir = match resolve_sandboxed(root_path, path) {
+                Ok(p) => p,
+                Err(e) => return AgentResult::Error { message: e },
+            };
+            let include_arg = include
+                .as_deref()
+                .map(|g| format!("--include={}", sh_quote(g)))
+                .unwrap_or_default();
+            // host 与 docker 统一走 grep ERE：-E 正则、-rn 带行号、-I 跳过二进制、
+            // --exclude-dir=.git 跳过版本库。head 取 N+1 行预检超限，grep_search_result
+            // 裁剪并追加截断标记。docker 分支由 shell_exec 的 container 参数加 docker exec。
+            let cmd = format!(
+                "grep -rnE -I --exclude-dir=.git {include_arg} -- {} . | head -{}",
+                sh_quote(pattern),
+                SEARCH_MAX_HITS + 1,
+            );
+            let shell_result = shell_exec(&cmd, None, &workdir, docker_container, timeout).await;
+            grep_search_result(pattern, shell_result)
         }
         AgentCommand::PatchFile {
             path,
@@ -1026,15 +923,6 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn test_match_include_patterns() {
-        assert!(match_include("main.rs", Some("*.rs")));
-        assert!(!match_include("main.go", Some("*.rs")));
-        assert!(match_include("Makefile", Some("Makefile")));
-        assert!(!match_include("Makefile.bak", Some("Makefile")));
-        assert!(match_include("anything.txt", None));
-    }
-
     #[tokio::test]
     async fn test_search_finds_literal_matches() {
         let root = temp_workspace(&[
@@ -1042,11 +930,12 @@ mod tests {
             ("src/b.rs", "no match here\n"),
             ("notes.txt", "main entry\n"),
         ]);
-        let result = search_in_workspace(&root, "main", "src", Some("*.rs")).await;
+        let result = search_exec(&root, "main", "src", Some("*.rs"), None).await;
         let AgentResult::FileContent { content } = result else {
             panic!("expected FileContent");
         };
-        assert!(content.contains("src/a.rs:1:fn main() {}"));
+        // grep 在起始目录内执行，命中路径相对起始目录（与 docker 分支一致）
+        assert!(content.contains("a.rs:1:fn main() {}"));
         assert!(!content.contains("notes.txt")); // include 过滤 + 起始目录过滤
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1058,7 +947,8 @@ mod tests {
             ("bin.dat", "main\u{0}binary"),
             ("ok.txt", "main\n"),
         ]);
-        let result = search_in_workspace(&root, "main", ".", None).await;
+        // grep -I 跳过二进制、--exclude-dir=.git 跳过版本库
+        let result = search_exec(&root, "main", ".", None, None).await;
         let AgentResult::FileContent { content } = result else {
             panic!("expected FileContent");
         };
@@ -1071,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_no_match_returns_empty() {
         let root = temp_workspace(&[("a.txt", "hello\n")]);
-        let result = search_in_workspace(&root, "zzz", ".", None).await;
+        let result = search_exec(&root, "zzz", ".", None, None).await;
         let AgentResult::FileContent { content } = result else {
             panic!("expected FileContent");
         };
@@ -1082,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_rejects_escaping_path() {
         let root = temp_workspace(&[]);
-        let result = search_in_workspace(&root, "x", "../etc", None).await;
+        let result = search_exec(&root, "x", "../etc", None, None).await;
         assert!(matches!(result, AgentResult::Error { .. }));
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1104,6 +994,92 @@ mod tests {
                 panic!("expected Error for container = {container:?}");
             };
             assert_eq!(message, "pattern must not be empty");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 经 handle_exec_request 执行 Search（host/docker 共用路径）。
+    async fn search_exec(
+        root: &Path,
+        pattern: &str,
+        path: &str,
+        include: Option<&str>,
+        container: Option<&str>,
+    ) -> AgentResult {
+        handle_exec_request(
+            &AgentCommand::Search {
+                pattern: pattern.into(),
+                path: path.into(),
+                include: include.map(str::to_string),
+            },
+            root,
+            Duration::from_secs(10),
+            container,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_search_regex_matches() {
+        let root = temp_workspace(&[
+            ("src/a.rs", "fn main() {}\nfn helper() {}\nlet x = 1;\n"),
+            ("src/b.rs", "not a function\n"),
+            ("notes.txt", "fn something() {}\n"),
+        ]);
+        let result = search_exec(&root, r"fn\s+\w+\(", "src", Some("*.rs"), None).await;
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        // ERE 正则命中函数定义行（旧字面量实现搜不到此模式）；
+        // 命中路径相对起始目录 src（与 docker 分支一致）
+        assert!(content.contains("a.rs:1:fn main() {}"));
+        assert!(content.contains("a.rs:2:fn helper() {}"));
+        // include 过滤与起始目录过滤
+        assert!(!content.contains("b.rs"));
+        assert!(!content.contains("notes.txt"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_literal_still_works() {
+        // 无特殊字符的字面量模式是 ERE 子集，行为不变
+        let root = temp_workspace(&[
+            ("src/a.rs", "fn main() {}\n"),
+            ("notes.txt", "main entry\n"),
+        ]);
+        let result = search_exec(&root, "main", ".", None, None).await;
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert!(content.contains("src/a.rs:1:fn main() {}"));
+        assert!(content.contains("notes.txt:1:main entry"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_special_chars_need_escape() {
+        let root = temp_workspace(&[("a.rs", "main(x) {}\n")]);
+        // "main(" 是不闭合的分组，ERE 下 grep 报错 → 归一为 Error
+        let bad = search_exec(&root, "main(", ".", None, None).await;
+        assert!(matches!(bad, AgentResult::Error { .. }));
+        // "main\(" 转义后按字面量命中
+        let ok = search_exec(&root, r"main\(", ".", None, None).await;
+        let AgentResult::FileContent { content } = ok else {
+            panic!("expected FileContent");
+        };
+        assert!(content.contains("a.rs:1:main(x) {}"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_invalid_regex_returns_grep_error() {
+        let root = temp_workspace(&[("a.rs", "fn main() {}\n")]);
+        let result = search_exec(&root, "[unclosed", ".", None, None).await;
+        match result {
+            AgentResult::Error { message } => {
+                assert!(message.contains("grep"), "message = {message:?}")
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1177,8 +1153,8 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_exit_0_maps_to_file_content() {
-        let result = docker_search_result(
+    fn test_grep_search_result_exit_0_maps_to_file_content() {
+        let result = grep_search_result(
             "main",
             AgentResult::Shell {
                 stdout: "a.rs:1:fn main()\nb.rs:2:main".into(),
@@ -1193,11 +1169,11 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_empty_stdout_is_no_matches() {
+    fn test_grep_search_result_empty_stdout_is_no_matches() {
         // sh 管道 `grep ... | head -N+1` 的 exit code 取管道末元素 head（恒为 0），
         // grep 的 exit 1（无命中）被掩盖，因此判定基于 stdout/stderr：
         // exit 0 + stdout 为空 → 无命中。
-        let result = docker_search_result(
+        let result = grep_search_result(
             "zzz",
             AgentResult::Shell {
                 stdout: String::new(),
@@ -1212,12 +1188,12 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_truncates_at_max_hits() {
+    fn test_grep_search_result_truncates_at_max_hits() {
         // N+1 行输入（模拟 head -N+1 预取）：保留前 N 行并追加与 host 一致的截断标记
         let hits: Vec<String> = (0..=SEARCH_MAX_HITS)
             .map(|i| format!("f{i}.rs:1:hit"))
             .collect();
-        let result = docker_search_result(
+        let result = grep_search_result(
             "hit",
             AgentResult::Shell {
                 stdout: hits.join("\n"),
@@ -1235,10 +1211,29 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_stderr_yields_error() {
+    fn test_grep_search_result_truncates_long_line() {
+        // 单行超过 SEARCH_MAX_LINE 时截断到前 500 字符（对齐宿主旧实现语义）
+        let long = "x".repeat(SEARCH_MAX_LINE + 100);
+        let result = grep_search_result(
+            "x",
+            AgentResult::Shell {
+                stdout: format!("f.rs:1:{long}"),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        );
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        let line = content.lines().next().unwrap();
+        assert_eq!(line.chars().count(), SEARCH_MAX_LINE);
+    }
+
+    #[test]
+    fn test_grep_search_result_stderr_yields_error() {
         // sh 管道 exit code 取 head（恒 0），grep 错误（目录不存在/权限拒绝）经
         // stderr 暴露：stderr 非空（无论 exit code 是否 0）→ 返回 Error 保留 stderr。
-        let result = docker_search_result(
+        let result = grep_search_result(
             "main",
             AgentResult::Shell {
                 stdout: "a.rs:1:fn main()".into(),
@@ -1253,9 +1248,9 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_nonzero_exit_empty_stderr_is_error() {
+    fn test_grep_search_result_nonzero_exit_empty_stderr_is_error() {
         // 保守回退：exit_code != 0 且 stderr 为空 → Error 并保留 exit_code 信息。
-        let result = docker_search_result(
+        let result = grep_search_result(
             "main",
             AgentResult::Shell {
                 stdout: String::new(),
@@ -1270,9 +1265,9 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_search_result_passes_through_non_shell() {
+    fn test_grep_search_result_passes_through_non_shell() {
         // spawn 失败等 Error 结果原样透传，不做 shell 解释
-        let result = docker_search_result(
+        let result = grep_search_result(
             "main",
             AgentResult::Error {
                 message: "spawn shell failed".into(),

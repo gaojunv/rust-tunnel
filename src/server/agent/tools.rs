@@ -111,11 +111,11 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "search",
-                "description": "Search file contents in the workspace (literal substring match). Returns up to 200 lines of 'path:line:content'. Skips binary files, .git, and files >1MB.",
+                "description": "Search file contents with POSIX extended regex (ERE). Returns up to 200 lines of 'path:line:content'. Skips binary files and .git.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": {"type": "string", "description": "Literal substring to search for"},
+                        "pattern": {"type": "string", "description": "ERE regex pattern"},
                         "path": {"type": "string", "description": "Starting directory relative to the workspace root ('.' for root)"},
                         "include": {"type": "string", "description": "Optional filename filter: '*.ext' suffix glob or exact filename"}
                     },
