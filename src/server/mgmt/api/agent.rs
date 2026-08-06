@@ -621,13 +621,15 @@ pub async fn list_workspace_files(
     )
     .await;
     let files: Vec<String> = match result {
+        // grep 无命中 / Windows 无 grep 报错（走 stderr，stdout 为空）→ 空列表 200，降级语义保留
         crate::common::AgentResult::Shell { stdout, .. } => stdout
             .lines()
             .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
             .filter(|l| !l.is_empty())
             .collect(),
-        // 隧道失败/grep 错误（如 Windows 无 grep）→ 空列表降级
-        _ => Vec::new(),
+        // 客户端离线/隧道失败/exec 错误 → 503，前端据此区分「离线」与「无匹配」。
+        // Windows 无 sh 时 spawn 失败也归入此分支（规格内取舍：503 对前端同样是降级）。
+        _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(serde_json::json!({ "files": files })).into_response()
 }
@@ -1047,6 +1049,24 @@ mod tests {
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_files_client_offline_returns_503() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
+        // 立即返回 AgentResult::Error，handler 应回 503 供前端区分「离线」与「无匹配」。
+        let resp = list_workspace_files(
+            State(state),
+            Path("w1".to_string()),
+            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
