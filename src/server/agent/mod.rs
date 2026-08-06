@@ -20,6 +20,40 @@ use crate::server::db::Database;
 /// `clippy::type_complexity` 在多层嵌套字段上触发。
 type PendingApprovals = HashMap<String, (String, oneshot::Sender<bool>)>;
 
+/// `request_approval` 的清理 guard：future 被 drop（cancel/断连）时移除 pending 条目，
+/// 防止泄漏。正常完成时通过 [`Self::disarm`] 避免重复移除（无害但省一次锁）。
+struct ApprovalGuard {
+    approvals: Arc<Mutex<PendingApprovals>>,
+    request_id: String,
+    armed: bool,
+}
+
+impl ApprovalGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let approvals = self.approvals.clone();
+            let id = std::mem::take(&mut self.request_id);
+            // Drop 不能 await：try_lock 失败则 spawn 异步清理（锁竞争极短，几乎不会失败）。
+            // try_lock 的 Result 持有借用直至被显式 drop，先绑定再用 drop 释放以允许 move。
+            let lock = approvals.try_lock();
+            if let Ok(mut map) = lock {
+                map.remove(&id);
+            } else {
+                drop(lock);
+                tokio::spawn(async move {
+                    approvals.lock().await.remove(&id);
+                });
+            }
+        }
+    }
+}
+
 /// Shared agent state, hung on `ServerState`.
 #[derive(Clone)]
 pub struct AgentState {
@@ -84,6 +118,12 @@ impl AgentState {
             .lock()
             .await
             .insert(request_id.clone(), (tool.to_string(), tx));
+        // 清理 guard：future 被 drop（cancel/断连）时兜底移除 pending 条目，防止泄漏。
+        let mut guard = ApprovalGuard {
+            approvals: self.approvals.clone(),
+            request_id: request_id.clone(),
+            armed: true,
+        };
         let _ = ws_tx
             .send(serde_json::json!({
                 "type": "approval_request",
@@ -98,6 +138,7 @@ impl AgentState {
             Ok(Ok(true))
         );
         self.approvals.lock().await.remove(&request_id);
+        guard.disarm();
         let _ = session_id; // 预留：审计日志可按 session 记录
         approved
     }
@@ -137,5 +178,11 @@ impl AgentState {
             .entry(session_id.to_string())
             .or_default()
             .insert(tool.to_string());
+    }
+
+    /// 当前挂起的审批请求数（仅测试用：泄漏检测）。
+    #[cfg(test)]
+    pub(crate) async fn pending_approvals_count(&self) -> usize {
+        self.approvals.lock().await.len()
     }
 }

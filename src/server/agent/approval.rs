@@ -17,16 +17,29 @@ const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
     ":(){ :|:& };:",
 ];
 
-/// git push 强制推送：含独立 token "push"（git 上下文）且出现独立 token --force/-f/--force-with-lease。
+/// git push 强制推送：含独立 token "push"（git 上下文）且出现 force 标志。
 fn is_force_push(cmd_lower: &str) -> bool {
-    let has_git = cmd_lower
-        .split_whitespace()
-        .any(|t| t == "git" || t.ends_with("/git"));
-    let has_push = cmd_lower.split_whitespace().any(|t| t == "push");
-    let has_force = cmd_lower
-        .split_whitespace()
-        .any(|t| matches!(t, "--force" | "-f" | "--force-with-lease"));
-    has_git && has_push && has_force
+    let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
+    let has_git = tokens.iter().any(|t| *t == "git" || t.ends_with("/git"));
+    let has_push = tokens.contains(&"push");
+    // force 标志归一化：--force/-f/--force-with-lease（含等号形态 prefix），以及
+    // 合并短选项（-uf/-fu 等以 "-" 开头、非 "--"、长度>2 且含 'f'）一律视为 force。
+    // 保守方向可接受：普通 -u 长度为 2 被排除，git pushup -f 仍被上方 git+push 门槛挡下。
+    let force_flag = |t: &str| {
+        matches!(t, "--force" | "-f") || t.starts_with("--force-with-lease")
+            || (t.starts_with('-') && !t.starts_with("--") && t.len() > 2 && t.contains('f'))
+    };
+    has_git && has_push && tokens.iter().any(|&t| force_flag(t))
+}
+
+/// git push（任何形态）：命令含 git 上下文（独立 token "git" 或以 "/git" 结尾）且含
+/// 独立 token "push"。shell 形态的 push 必须与 GitPush 工具同等对待（矩阵：safe 与
+/// auto_write 都需确认），否则模型可用 shell 绕过审批。
+fn is_git_push(cmd_lower: &str) -> bool {
+    let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
+    let has_git = tokens.iter().any(|t| *t == "git" || t.ends_with("/git"));
+    let has_push = tokens.contains(&"push");
+    has_git && has_push
 }
 
 /// dd 写盘：命令含独立 token "dd" 且任一 token 以 "if=" 开头（参数序无关）。
@@ -46,6 +59,7 @@ pub fn is_dangerous_shell(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     DANGEROUS_SHELL_PATTERNS.iter().any(|p| lower.contains(p))
         || is_force_push(&lower)
+        || is_git_push(&lower) // 对 auto_write 而言所有 push 都是"危险"需确认；safe 档本来就全确认
         || is_dd_write(&lower)
         || redirects_to_device(&lower)
 }
@@ -192,6 +206,13 @@ mod tests {
             "auto_write",
             &shell("git push -f origin main")
         ));
+        // 核心回归：shell 形态 git push（非 force）同样需确认——与 GitPush 工具同等对待，
+        // 否则模型可用 shell 绕过审批矩阵
+        assert!(needs_approval("auto_write", &shell("git push origin main")));
+        assert!(needs_approval("auto_write", &shell("git push -u origin main")));
+        // 非 push 形态不误伤
+        assert!(!needs_approval("auto_write", &shell("git pushup origin")));
+        assert!(!needs_approval("auto_write", &shell("git-push origin")));
         // git_push 始终确认
         assert!(needs_approval("auto_write", &AgentCommand::GitPush));
     }
@@ -209,21 +230,44 @@ mod tests {
         assert!(is_dangerous_shell("dd if=/dev/zero of=/dev/sda"));
         assert!(is_dangerous_shell("kill -9 1234"));
         assert!(!is_dangerous_shell("rm file.txt"));
-        assert!(!is_dangerous_shell("git push origin main"));
+        // shell 形态 push 视为危险（与 GitPush 工具同等对待）
+        assert!(is_dangerous_shell("git push origin main"));
         assert!(!is_dangerous_shell("npm run rebuild")); // 含 "rebuild" 不含 "reboot"
+        // 非 push 不误伤
+        assert!(!is_dangerous_shell("git pushup origin"));
+        assert!(!is_dangerous_shell("git-push origin"));
     }
 
     #[test]
     fn test_is_force_push() {
         // 选项后置/前置均命中
-        assert!(is_dangerous_shell("git push origin main --force"));
-        assert!(is_dangerous_shell("git push -f origin"));
-        assert!(is_dangerous_shell("git push origin main -f"));
-        assert!(is_dangerous_shell("git push --force-with-lease"));
+        assert!(is_force_push("git push origin main --force"));
+        assert!(is_force_push("git push -f origin"));
+        assert!(is_force_push("git push origin main -f"));
+        assert!(is_force_push("git push --force-with-lease"));
+        // 等号形态 prefix 命中（--force-with-lease=ref）
+        assert!(is_force_push("git push --force-with-lease=main"));
+        // 合并短选项含 f 命中（-uf / -fu）
+        assert!(is_force_push("git push -uf origin main"));
+        assert!(is_force_push("git push -fu origin main"));
         // 普通推送 / 非独立 "push" token 不命中
-        assert!(!is_dangerous_shell("git push origin main"));
-        assert!(!is_dangerous_shell("git push -u origin main"));
-        assert!(!is_dangerous_shell("git pushup -f"));
+        assert!(!is_force_push("git push origin main"));
+        assert!(!is_force_push("git push -u origin main"));
+        assert!(!is_force_push("git pushup -f"));
+        assert!(!is_force_push("git pull -f"));
+    }
+
+    #[test]
+    fn test_is_git_push() {
+        // 任何形态的 git push（含 -C 变体）都命中
+        assert!(is_git_push("git push origin main"));
+        assert!(is_git_push("git push -u origin main"));
+        assert!(is_git_push("git -C /path/to/repo push origin main"));
+        // 非 push 不命中：pushup 非独立 token、git-push 连字符、push 出现在别处
+        assert!(!is_git_push("git pushup origin"));
+        assert!(!is_git_push("git-push origin"));
+        assert!(!is_git_push("git commit -m 'push stuff'"));
+        assert!(!is_git_push("git status"));
     }
 
     #[test]
@@ -340,5 +384,24 @@ mod tests {
         assert!(!state.is_allowed_for_session("s2", "shell").await);
         // 不同工具互不影响
         assert!(!state.is_allowed_for_session("s1", "git_push").await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_abort_cleans_pending() {
+        // 泄漏回归：turn future 被 drop（cancel/断连）时，ApprovalGuard 必须清掉 pending 条目，
+        // 否则 approvals 表永久残留。
+        let state = test_state().await;
+        let (tx, _rx) = mpsc::channel(8);
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+                .await
+        });
+        // 等条目真正插入并挂起在 oneshot 上（避免竞态：abort 前必须已 insert）
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        // 短暂 yield 让运行时 drop task，触发 guard 的 Drop 清理
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(state.pending_approvals_count().await, 0);
     }
 }
