@@ -140,10 +140,16 @@ async fn refresh_session_model(
     }
 }
 
-/// WS 客户端帧分类：user_message / cancel / 其他（忽略）。
+/// `WS` 客户端帧分类：`user_message` / `cancel` / `approval_response` / 其他（忽略）。
 enum WsFrame {
     UserMessage(String),
     Cancel,
+    /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具
+    ApprovalResponse {
+        request_id: String,
+        approved: bool,
+        remember: bool,
+    },
     Other,
 }
 
@@ -160,6 +166,27 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
             .and_then(|c| c.as_str())
             .map_or(WsFrame::Other, |c| WsFrame::UserMessage(c.to_string())),
         Some("cancel") => WsFrame::Cancel,
+        Some("approval_response") => {
+            let request_id = body
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if request_id.is_empty() {
+                return WsFrame::Other;
+            }
+            WsFrame::ApprovalResponse {
+                request_id,
+                approved: body
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                remember: matches!(
+                    body.get("remember").and_then(|v| v.as_str()),
+                    Some("session")
+                ),
+            }
+        }
         _ => WsFrame::Other,
     }
 }
@@ -220,8 +247,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             };
             match parse_ws_frame(msg) {
                 WsFrame::UserMessage(c) => c,
-                // 非 turn 期间的 cancel：幂等忽略
-                WsFrame::Cancel | WsFrame::Other => continue,
+                // 非 turn 期间的 cancel/审批响应：幂等忽略（迟到的审批响应可能已
+                // 超时自清，pending map 仍挂着等超时，此处丢弃即可）
+                WsFrame::Cancel | WsFrame::ApprovalResponse { .. } | WsFrame::Other => continue,
             }
         };
 
@@ -346,6 +374,22 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                 // 下一轮外层循环继续消费它们。
                                 pending = None;
                                 break TurnOutcome::Cancelled;
+                            }
+                            WsFrame::ApprovalResponse {
+                                request_id,
+                                approved,
+                                remember,
+                            } => {
+                                // 唤醒挂起的审批（跨 runner future 边界，靠 AgentState
+                                // 的 pending map 可达）；未知 request_id 静默忽略。
+                                agent
+                                    .resolve_approval(
+                                        &session_id,
+                                        &request_id,
+                                        approved,
+                                        remember,
+                                    )
+                                    .await;
                             }
                             WsFrame::Other => {}
                         },
@@ -674,6 +718,37 @@ mod tests {
 
         let malformed = parse_ws_frame(Message::Text("not json".into()));
         assert!(matches!(malformed, WsFrame::Other));
+
+        let approve = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r1","approved":true,"remember":"session"}"#
+                .into(),
+        ));
+        assert!(matches!(
+            approve,
+            WsFrame::ApprovalResponse {
+                request_id,
+                approved: true,
+                remember: true
+            } if request_id == "r1"
+        ));
+
+        let deny = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r2","approved":false}"#.into(),
+        ));
+        assert!(matches!(
+            deny,
+            WsFrame::ApprovalResponse {
+                approved: false,
+                remember: false,
+                ..
+            }
+        ));
+
+        // 缺 request_id → Other
+        let bad = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","approved":true}"#.into(),
+        ));
+        assert!(matches!(bad, WsFrame::Other));
     }
 
     async fn test_state() -> (ApiState, Database) {

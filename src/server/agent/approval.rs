@@ -200,4 +200,85 @@ mod tests {
         let long = shell(&"x".repeat(200));
         assert!(approval_summary(&long).chars().count() <= 121);
     }
+
+    use tokio::sync::mpsc;
+
+    async fn test_state() -> crate::server::agent::AgentState {
+        let db = crate::server::db::Database::new(":memory:").await.unwrap();
+        let server_state = crate::server::control::ServerState::with_db(db);
+        server_state.agent_state.expect("agent_state initialized")
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_approve_flow() {
+        let state = test_state().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+                .await
+        });
+        // 收到 approval_request 帧
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame["type"], "approval_request");
+        assert_eq!(frame["tool"], "shell");
+        let req_id = frame["request_id"].as_str().unwrap().to_string();
+        // 模拟 WS 收到批准响应
+        state.resolve_approval("s1", &req_id, true, false).await;
+        assert!(handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_deny_flow() {
+        let state = test_state().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "git_push", "git push", "{}", &tx)
+                .await
+        });
+        let frame = rx.recv().await.unwrap();
+        let req_id = frame["request_id"].as_str().unwrap().to_string();
+        state.resolve_approval("s1", &req_id, false, false).await;
+        assert!(!handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_remember_writes_session_allowed() {
+        // 协议备注修订：remember=true 且批准时，resolve_approval 内部写 session_allowed，
+        // 后续同 session 同类工具免审批。
+        let state = test_state().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+                .await
+        });
+        let frame = rx.recv().await.unwrap();
+        let req_id = frame["request_id"].as_str().unwrap().to_string();
+        state.resolve_approval("s1", &req_id, true, true).await;
+        assert!(handle.await.unwrap());
+        assert!(state.is_allowed_for_session("s1", "shell").await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_unknown_response_ignored() {
+        let state = test_state().await;
+        // 未知 request_id：不 panic、不误唤醒
+        state
+            .resolve_approval("s1", "nonexistent", true, false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_session_remember_set() {
+        let state = test_state().await;
+        assert!(!state.is_allowed_for_session("s1", "shell").await);
+        state.remember_for_session("s1", "shell").await;
+        assert!(state.is_allowed_for_session("s1", "shell").await);
+        // 不同 session 互不影响
+        assert!(!state.is_allowed_for_session("s2", "shell").await);
+        // 不同工具互不影响
+        assert!(!state.is_allowed_for_session("s1", "git_push").await);
+    }
 }

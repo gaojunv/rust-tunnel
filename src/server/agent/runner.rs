@@ -271,6 +271,39 @@ async fn handle_tool_calls(
 
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
+                // 审批：session 记忆集命中 → 放行；否则按 workspace approval_mode 判定，
+                // 需确认时发 approval_request 挂起等待。拒绝落库 [denied by user]，
+                // 回合不中断（模型看到拒绝可自行换方案）。
+                if !agent
+                    .is_allowed_for_session(&rt.session_id, &call.name)
+                    .await
+                    && super::approval::needs_approval(&rt.approval_mode, &command)
+                {
+                    let summary = super::approval::approval_summary(&command);
+                    let args_preview: String = call.args.chars().take(500).collect();
+                    let approved = agent
+                        .request_approval(
+                            &rt.session_id,
+                            &call.name,
+                            &summary,
+                            &args_preview,
+                            ws_tx,
+                        )
+                        .await;
+                    if !approved {
+                        let text = "[denied by user]".to_string();
+                        let _ = ws_tx
+                            .send(serde_json::json!({
+                                "type": "tool_result",
+                                "id": &call.id,
+                                "name": &call.name,
+                                "result": &text,
+                            }))
+                            .await;
+                        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+                        continue;
+                    }
+                }
                 // 老客户端不认识 Search/PatchFile 变体：bincode 按索引反序列化，
                 // 未知索引直接导致控制连接断开。版本不足时在服务端短路为错误喂回模型。
                 let needs_new_client = matches!(

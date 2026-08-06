@@ -12,6 +12,8 @@ pub struct SessionRuntime {
     /// workspace is docker-typed but has no container yet (or host runtime).
     pub docker_container: Option<String>,
     pub model: String,
+    /// `workspace` 审批模式（`safe`/`auto_write`/`full_auto`），`load` 时从 workspace `record` 读取。
+    pub approval_mode: String,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -89,6 +91,7 @@ impl SessionRuntime {
             root_path: workspace.root_path,
             docker_container: workspace.docker_container_id,
             model: session.model.unwrap_or_else(|| default_model.to_string()),
+            approval_mode: workspace.approval_mode.clone(),
             messages,
         })
     }
