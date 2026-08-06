@@ -3,26 +3,49 @@ use crate::common::AgentCommand;
 
 /// shell 危险模式（大小写不敏感子串匹配）。仅 auto_write 档用于判定 shell；
 /// safe 档下所有写操作都需确认，不经此表。
+/// 强制 push / dd 写盘 / 重定向进块设备无法用连续子串可靠表达，由
+/// [`is_force_push`] / [`is_dd_write`] / [`redirects_to_device`] 单独判定。
 const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
     "rm -rf",
     "rm -fr",
     "rm -r /",
-    "git push --force",
-    "git push -f",
     "git reset --hard",
     "mkfs",
-    "dd if=",
     "shutdown",
     "reboot",
     "kill -9",
-    "> /dev/",
     ":(){ :|:& };:",
 ];
+
+/// git push 强制推送：含独立 token "push"（git 上下文）且出现独立 token --force/-f/--force-with-lease。
+fn is_force_push(cmd_lower: &str) -> bool {
+    let has_git = cmd_lower.split_whitespace().any(|t| t == "git" || t.ends_with("/git"));
+    let has_push = cmd_lower.split_whitespace().any(|t| t == "push");
+    let has_force = cmd_lower
+        .split_whitespace()
+        .any(|t| matches!(t, "--force" | "-f" | "--force-with-lease"));
+    has_git && has_push && has_force
+}
+
+/// dd 写盘：命令含独立 token "dd" 且任一 token 以 "if=" 开头（参数序无关）。
+fn is_dd_write(cmd_lower: &str) -> bool {
+    let mut tokens = cmd_lower.split_whitespace();
+    let has_dd = tokens.any(|t| t == "dd" || t.ends_with("/dd"));
+    has_dd && cmd_lower.split_whitespace().any(|t| t.starts_with("if="))
+}
+
+/// 重定向进块设备："> /dev/xxx" 但排除良性的 /dev/null。
+fn redirects_to_device(cmd_lower: &str) -> bool {
+    cmd_lower.contains("> /dev/") && !cmd_lower.contains("> /dev/null")
+}
 
 /// 该 shell 命令是否命中危险模式。
 pub fn is_dangerous_shell(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     DANGEROUS_SHELL_PATTERNS.iter().any(|p| lower.contains(p))
+        || is_force_push(&lower)
+        || is_dd_write(&lower)
+        || redirects_to_device(&lower)
 }
 
 /// 按审批模式判定工具调用是否需用户确认。非法 mode 按 "safe" 处理（保守）。
@@ -131,6 +154,39 @@ mod tests {
         assert!(!is_dangerous_shell("rm file.txt"));
         assert!(!is_dangerous_shell("git push origin main"));
         assert!(!is_dangerous_shell("npm run rebuild")); // 含 "rebuild" 不含 "reboot"
+    }
+
+    #[test]
+    fn test_is_force_push() {
+        // 选项后置/前置均命中
+        assert!(is_dangerous_shell("git push origin main --force"));
+        assert!(is_dangerous_shell("git push -f origin"));
+        assert!(is_dangerous_shell("git push origin main -f"));
+        assert!(is_dangerous_shell("git push --force-with-lease"));
+        // 普通推送 / 非独立 "push" token 不命中
+        assert!(!is_dangerous_shell("git push origin main"));
+        assert!(!is_dangerous_shell("git push -u origin main"));
+        assert!(!is_dangerous_shell("git pushup -f"));
+    }
+
+    #[test]
+    fn test_is_dd_write() {
+        // 参数序无关均命中
+        assert!(is_dangerous_shell("dd if=/dev/zero of=/dev/sda"));
+        assert!(is_dangerous_shell("sudo dd bs=1M if=x of=y"));
+        // 非独立 token 或只有 of= 不命中
+        assert!(!is_dangerous_shell("ddd if=x"));
+        assert!(!is_dangerous_shell("dd of=x"));
+    }
+
+    #[test]
+    fn test_redirects_to_device() {
+        // 良性 /dev/null 排除
+        assert!(!is_dangerous_shell("npm run build > /dev/null 2>&1"));
+        assert!(!is_dangerous_shell("echo hi 2> /dev/null"));
+        // 真实块设备命中
+        assert!(is_dangerous_shell("dd of=x > /dev/sda"));
+        assert!(is_dangerous_shell("cat x > /dev/mmcblk0"));
     }
 
     #[test]
