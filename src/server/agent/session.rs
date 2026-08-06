@@ -177,9 +177,7 @@ fn sanitize_tool_pairs(messages: &mut Vec<ChatMessage>) {
                 .into_iter()
                 .map(|(id, name)| ChatMessage {
                     role: "tool".into(),
-                    content: Some(
-                        "[interrupted: tool execution did not complete]".to_string(),
-                    ),
+                    content: Some("[interrupted: tool execution did not complete]".to_string()),
                     tool_calls: None,
                     tool_call_id: Some(id),
                     name: Some(name),
@@ -443,9 +441,18 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            "ok",
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
 
         let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
         // system + user + assistant(tool_calls) + tool(c1) + tool(c2 占位)
@@ -455,11 +462,7 @@ mod tests {
         assert_eq!(patched.role, "tool");
         assert_eq!(patched.tool_call_id.as_deref(), Some("c2"));
         assert_eq!(patched.name.as_deref(), Some("read_file"));
-        assert!(patched
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("interrupted"));
+        assert!(patched.content.as_deref().unwrap().contains("interrupted"));
     }
 
     #[tokio::test]
@@ -477,12 +480,30 @@ mod tests {
             .await
             .unwrap();
         // summary 之后只有孤儿 tool 结果（tool_calls 行落在 summary 之前被跳过）
-        db.agent_add_message_v2("m2", "s1", "user", "[上下文摘要] ...", None, None, None, "summary")
-            .await
-            .unwrap();
-        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "user",
+            "[上下文摘要] ...",
+            None,
+            None,
+            None,
+            "summary",
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            "ok",
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
         db.agent_add_message("m4", "s1", "assistant", "继续", None)
             .await
             .unwrap();

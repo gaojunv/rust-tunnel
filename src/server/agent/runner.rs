@@ -923,7 +923,10 @@ mod tests {
 
     #[test]
     fn test_truncate_tool_result_by_lines() {
-        let text = (0..400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..400)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = truncate_tool_result(text);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() <= TOOL_RESULT_MAX_LINES + 1); // +1 为 truncated 标记行

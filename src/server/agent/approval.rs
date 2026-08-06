@@ -19,7 +19,9 @@ const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
 
 /// git push 强制推送：含独立 token "push"（git 上下文）且出现独立 token --force/-f/--force-with-lease。
 fn is_force_push(cmd_lower: &str) -> bool {
-    let has_git = cmd_lower.split_whitespace().any(|t| t == "git" || t.ends_with("/git"));
+    let has_git = cmd_lower
+        .split_whitespace()
+        .any(|t| t == "git" || t.ends_with("/git"));
     let has_push = cmd_lower.split_whitespace().any(|t| t == "push");
     let has_force = cmd_lower
         .split_whitespace()
@@ -63,12 +65,10 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
         | AgentCommand::GitDiff { .. } => false,
-        AgentCommand::Shell { cmd, .. } => {
-            mode == "safe" || is_dangerous_shell(cmd)
-        }
-        AgentCommand::WriteFile { .. } | AgentCommand::PatchFile { .. } | AgentCommand::GitCommit { .. } => {
-            mode == "safe"
-        }
+        AgentCommand::Shell { cmd, .. } => mode == "safe" || is_dangerous_shell(cmd),
+        AgentCommand::WriteFile { .. }
+        | AgentCommand::PatchFile { .. }
+        | AgentCommand::GitCommit { .. } => mode == "safe",
         AgentCommand::GitPush => true, // safe 与 auto_write 都需确认
     }
 }
@@ -97,44 +97,101 @@ mod tests {
     use super::*;
 
     fn shell(cmd: &str) -> AgentCommand {
-        AgentCommand::Shell { cmd: cmd.into(), cwd: None }
+        AgentCommand::Shell {
+            cmd: cmd.into(),
+            cwd: None,
+        }
     }
 
     #[test]
     fn test_full_auto_never_approves() {
         assert!(!needs_approval("full_auto", &shell("rm -rf /")));
         assert!(!needs_approval("full_auto", &AgentCommand::GitPush));
-        assert!(!needs_approval("full_auto", &AgentCommand::WriteFile { path: "a".into(), content: "x".into() }));
+        assert!(!needs_approval(
+            "full_auto",
+            &AgentCommand::WriteFile {
+                path: "a".into(),
+                content: "x".into()
+            }
+        ));
     }
 
     #[test]
     fn test_safe_mode_readonly_free() {
-        assert!(!needs_approval("safe", &AgentCommand::ReadFile { path: "a".into() }));
-        assert!(!needs_approval("safe", &AgentCommand::ListDir { path: ".".into() }));
-        assert!(!needs_approval("safe", &AgentCommand::Search { pattern: "x".into(), path: ".".into(), include: None }));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::ReadFile { path: "a".into() }
+        ));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::ListDir { path: ".".into() }
+        ));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::Search {
+                pattern: "x".into(),
+                path: ".".into(),
+                include: None
+            }
+        ));
         assert!(!needs_approval("safe", &AgentCommand::GitStatus));
-        assert!(!needs_approval("safe", &AgentCommand::GitDiff { path: None }));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::GitDiff { path: None }
+        ));
     }
 
     #[test]
     fn test_safe_mode_writes_and_shell_need_approval() {
         assert!(needs_approval("safe", &shell("ls")));
-        assert!(needs_approval("safe", &AgentCommand::WriteFile { path: "a".into(), content: "x".into() }));
-        assert!(needs_approval("safe", &AgentCommand::PatchFile { path: "a".into(), old_string: "o".into(), new_string: "n".into() }));
-        assert!(needs_approval("safe", &AgentCommand::GitCommit { message: "m".into() }));
+        assert!(needs_approval(
+            "safe",
+            &AgentCommand::WriteFile {
+                path: "a".into(),
+                content: "x".into()
+            }
+        ));
+        assert!(needs_approval(
+            "safe",
+            &AgentCommand::PatchFile {
+                path: "a".into(),
+                old_string: "o".into(),
+                new_string: "n".into()
+            }
+        ));
+        assert!(needs_approval(
+            "safe",
+            &AgentCommand::GitCommit {
+                message: "m".into()
+            }
+        ));
         assert!(needs_approval("safe", &AgentCommand::GitPush));
     }
 
     #[test]
     fn test_auto_write_mode() {
         // 写操作自动放行
-        assert!(!needs_approval("auto_write", &AgentCommand::WriteFile { path: "a".into(), content: "x".into() }));
-        assert!(!needs_approval("auto_write", &AgentCommand::GitCommit { message: "m".into() }));
+        assert!(!needs_approval(
+            "auto_write",
+            &AgentCommand::WriteFile {
+                path: "a".into(),
+                content: "x".into()
+            }
+        ));
+        assert!(!needs_approval(
+            "auto_write",
+            &AgentCommand::GitCommit {
+                message: "m".into()
+            }
+        ));
         // 普通 shell 自动放行
         assert!(!needs_approval("auto_write", &shell("npm test")));
         // 危险 shell 需确认
         assert!(needs_approval("auto_write", &shell("rm -rf node_modules")));
-        assert!(needs_approval("auto_write", &shell("git push -f origin main")));
+        assert!(needs_approval(
+            "auto_write",
+            &shell("git push -f origin main")
+        ));
         // git_push 始终确认
         assert!(needs_approval("auto_write", &AgentCommand::GitPush));
     }
@@ -193,7 +250,10 @@ mod tests {
     fn test_approval_summary() {
         assert_eq!(approval_summary(&shell("npm install")), "npm install");
         assert_eq!(
-            approval_summary(&AgentCommand::WriteFile { path: "src/a.rs".into(), content: "x".into() }),
+            approval_summary(&AgentCommand::WriteFile {
+                path: "src/a.rs".into(),
+                content: "x".into()
+            }),
             "src/a.rs"
         );
         assert_eq!(approval_summary(&AgentCommand::GitPush), "git push");
