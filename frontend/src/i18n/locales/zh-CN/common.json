@@ -782,7 +782,13 @@
     "connectionInterrupted": "连接中断，正在重连；刚发送的消息可能未被处理，请确认后重发",
     "reconnecting": "连接已断开，正在自动重连…",
     "expandLines": "展开剩余 {{count}} 行",
-    "collapse": "收起"
+    "collapse": "收起",
+    "approvalRequired": "需要确认",
+    "approveOnce": "允许一次",
+    "approveSession": "本会话允许此类",
+    "deny": "拒绝",
+    "approved": "已允许",
+    "denied": "已拒绝"
   },
   "logs": {
     "title": "日志",

@@ -782,7 +782,13 @@
     "connectionInterrupted": "Connection interrupted, reconnecting; the message just sent may not have been processed — please verify and resend",
     "reconnecting": "Connection lost, reconnecting automatically…",
     "expandLines": "Expand {{count}} more lines",
-    "collapse": "Collapse"
+    "collapse": "Collapse",
+    "approvalRequired": "Approval required",
+    "approveOnce": "Approve once",
+    "approveSession": "Allow for this session",
+    "deny": "Deny",
+    "approved": "Approved",
+    "denied": "Denied"
   },
   "logs": {
     "title": "Logs",

@@ -428,4 +428,67 @@ describe('ChatStream running state', () => {
     expect(userBubble?.className).toContain('bg-primary/10');
     expect(summaryBubble?.className).toContain('bg-muted');
   });
+
+  it('renders approval card and responds on approve', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 approval_request 帧：卡片应出现（标题 + 工具名 + 摘要）
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{"cmd":"rm -rf /tmp/x"}',
+      });
+    });
+    // 标题文案后紧跟冒号与工具名（跨元素），用子串匹配
+    expect(screen.getByText(/agent\.approvalRequired/)).toBeTruthy();
+    expect(screen.getByText('shell')).toBeTruthy();
+    expect(screen.getByText('rm -rf /tmp/x')).toBeTruthy();
+    // 三个操作按钮齐全（mock t 返回 key 作为按钮文案）
+    expect(screen.getByRole('button', { name: 'agent.approveOnce' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.approveSession' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.deny' })).toBeTruthy();
+    // 点击「允许一次」→ 捕获当前连接，断言发出 approval_response
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.approveOnce' }));
+    expect(
+      ws.sent.some(
+        (s) =>
+          s.includes('"type":"approval_response"') &&
+          s.includes('"request_id":"req1"') &&
+          s.includes('"approved":true') &&
+          s.includes('"remember":"none"'),
+      ),
+    ).toBe(true);
+    // 卡片变为已允许：操作按钮消失、状态文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.getByText(/agent.approved/)).toBeTruthy();
+  });
+
+  it('denies approval and approve-session sends remember=session', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'approval_request', request_id: 'req2', tool: 'shell', summary: 'echo hi', args_preview: '{}' });
+    });
+    // 拒绝：approved=false, remember=none，卡片变为已拒绝
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.deny' }));
+    expect(
+      ws.sent.some((s) => s.includes('"type":"approval_response"') && s.includes('"request_id":"req2"') && s.includes('"approved":false') && s.includes('"remember":"none"')),
+    ).toBe(true);
+    expect(screen.getByText(/agent.denied/)).toBeTruthy();
+    // 新的审批请求 → 点击「本会话允许」：remember=session
+    act(() => {
+      wsInstance!.emit({ type: 'approval_request', request_id: 'req3', tool: 'write_file', summary: 'write x', args_preview: '{}' });
+    });
+    const ws2 = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.approveSession' }));
+    expect(
+      ws2.sent.some((s) => s.includes('"type":"approval_response"') && s.includes('"request_id":"req3"') && s.includes('"approved":true') && s.includes('"remember":"session"')),
+    ).toBe(true);
+    expect(screen.getByText(/agent.approved/)).toBeTruthy();
+  });
 });

@@ -11,6 +11,7 @@ import {
 } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
 import type { ChatItem } from './types';
+import ApprovalCard from './ApprovalCard';
 import MessageBubble from './MessageBubble';
 import ModelSelect from './ModelSelect';
 
@@ -315,6 +316,20 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         // 服务端标题已写库（生成晚于 done 帧，故此处单独广播）：刷新会话列表
         // 让 SessionBar 及时回显新标题
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
+      } else if (msg.type === 'approval_request') {
+        // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）
+        flushChunks();
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return [...prev, {
+            kind: 'approval',
+            content: '',
+            approvalId: msg.request_id,
+            approvalTool: msg.tool,
+            approvalSummary: msg.summary,
+            approvalStatus: 'pending',
+          }];
+        });
       } else if (msg.type === 'error') {
         flushChunks();
         setItems((prev) => {
@@ -380,9 +395,31 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     }
   }, [items]);
 
+  // 存在未响应的审批卡片时禁止继续发送（服务端在该审批响应前挂起回合）
+  const hasPendingApproval = items.some((it) => it.kind === 'approval' && it.approvalStatus === 'pending');
+
+  // 审批响应：approved=true 时 remember 决定「仅本次」还是「本会话记住」；
+  // 无论 WS 是否可用都先落本地状态（卡片从 pending 变 approved/denied）
+  const respondApproval = (id: string, approved: boolean, remember: boolean) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'approval_response',
+        request_id: id,
+        approved,
+        remember: remember ? 'session' : 'none',
+      }));
+    }
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'approval' && it.approvalId === id
+        ? { ...it, approvalStatus: approved ? 'approved' : 'denied' }
+        : it
+    ));
+  };
+
   const send = () => {
     const text = input.trim();
-    if (!text || running) return;
+    if (!text || running || hasPendingApproval) return;
     const ws = wsRef.current;
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
@@ -446,7 +483,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
         {items.map((it, i) => (
-          <MessageBubble key={i} item={it} />
+          it.kind === 'approval'
+            ? <ApprovalCard key={i} item={it} onRespond={respondApproval} />
+            : <MessageBubble key={i} item={it} />
         ))}
         {running && (
           <div className="flex items-center gap-1 text-sm text-muted-foreground">
@@ -494,7 +533,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
             ) : (
               <Button
                 onClick={send}
-                disabled={!input.trim()}
+                disabled={!input.trim() || hasPendingApproval}
                 size="sm"
                 variant="ghost"
                 aria-label={t('agent.send')}
