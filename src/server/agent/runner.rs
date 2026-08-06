@@ -171,8 +171,12 @@ pub fn parse_llm_turn(body: &serde_json::Value) -> Result<LlmTurn, String> {
 const MIN_SEARCH_PATCH_CLIENT_VERSION: (u64, u64, u64) = (0, 2, 0);
 
 /// 解析 "x.y.z"（允许 v 前缀）为数字三元组；非严格 semver 输入返回 None。
+/// 客户端在 agent 模式下上报 `{CARGO_PKG_VERSION}+agent`，故解析前须剥离
+/// semver 构建元数据（`+`）与预发布（`-`）后缀。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.strip_prefix('v').unwrap_or(s);
+    // 顺序：先 strip 'v' 前缀，再切掉 +（构建元数据）/ -（预发布）后缀。
+    let s = s.split(['+', '-']).next().unwrap_or(s);
     let mut parts = s.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -748,6 +752,11 @@ mod tests {
         assert_eq!(parse_version("v0.2.0"), Some((0, 2, 0))); // 允许 v 前缀
         assert_eq!(parse_version("0.2"), None);
         assert_eq!(parse_version("abc"), None);
+        // agent 模式客户端上报 `{CARGO_PKG_VERSION}+agent`：构建元数据须剥离
+        assert_eq!(parse_version("0.2.0+agent"), Some((0, 2, 0)));
+        // 预发布后缀同样剥离（robustness）
+        assert_eq!(parse_version("0.2.0-rc.1"), Some((0, 2, 0)));
+        assert_eq!(parse_version("v0.2.0+agent"), Some((0, 2, 0)));
     }
 
     #[test]
@@ -757,6 +766,9 @@ mod tests {
         assert!(client_supports_search_patch(Some("1.0.0")));
         assert!(!client_supports_search_patch(None)); // 缺失视为过旧
         assert!(!client_supports_search_patch(Some("garbage")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
+        assert!(client_supports_search_patch(Some("0.2.0+agent")));
+        assert!(!client_supports_search_patch(Some("0.1.0+agent")));
     }
 
     #[test]

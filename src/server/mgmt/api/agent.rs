@@ -164,6 +164,21 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
     }
 }
 
+/// 单个 agent turn 的终态。取消（cancel 帧）与断连需与正常完成/失败区分：
+/// - 取消的回合不算"成功"：不发 error 帧、不生成标题，且内存 rt_cache 作废
+///   （turn 可能已把无配对 tool 结果的 assistant tool_calls 写进 rt.messages，
+///   内存路径没有 sanitize_tool_pairs 兜底，直接复用会把非法序列发给 LLM 导致
+///   400；置 None 后下一条消息从 DB 重建，DB 重放路径的占位补齐保证序列合法）。
+/// - 断连（对端关闭/错误）：退出外层循环。
+enum TurnOutcome {
+    /// 回合正常结束（成功或失败）
+    Completed(Result<(), String>),
+    /// 收到 cancel 帧，turn future 被丢弃
+    Cancelled,
+    /// 对端断开/协议错误，需退出外层循环
+    Disconnected,
+}
+
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
@@ -308,61 +323,77 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             rt,
             event_tx.clone(),
         );
-        tokio::pin!(turn);
-        let result = loop {
-            tokio::select! {
-                r = &mut turn => break Some(r),
-                msg = ws_stream.next() => match msg {
-                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break None,
-                    Some(Ok(m)) => match parse_ws_frame(m) {
-                        WsFrame::UserMessage(c) => {
-                            pending.get_or_insert(c);
-                        }
-                        // 中断式取消：drop turn future（与断连路径一致），但连接保留，
-                        // 回发 stopped 帧后继续外层循环等下一条消息。
-                        WsFrame::Cancel => {
-                            let _ = event_tx
-                                .send(serde_json::json!({"type": "stopped"}))
-                                .await;
-                            // 停止的意图是"都停下"：清空已缓冲的排队消息，避免
-                            // 下一轮外层循环继续消费它们。
-                            pending = None;
-                            break Some(Ok(()));
-                        }
-                        WsFrame::Other => {}
+        // turn future 独占 rt 的可变借用：把 select 循环放进独立块，块结束时
+        // turn 被 drop、借用随之结束——取消分支需置空 rt_cache，必须在块外赋值。
+        let outcome = {
+            tokio::pin!(turn);
+            loop {
+                tokio::select! {
+                    r = &mut turn => break TurnOutcome::Completed(r),
+                    msg = ws_stream.next() => match msg {
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break TurnOutcome::Disconnected,
+                        Some(Ok(m)) => match parse_ws_frame(m) {
+                            WsFrame::UserMessage(c) => {
+                                pending.get_or_insert(c);
+                            }
+                            // 中断式取消：drop turn future（与断连路径一致），但连接保留，
+                            // 回发 stopped 帧后继续外层循环等下一条消息。
+                            WsFrame::Cancel => {
+                                let _ = event_tx
+                                    .send(serde_json::json!({"type": "stopped"}))
+                                    .await;
+                                // 停止的意图是"都停下"：清空已缓冲的排队消息，避免
+                                // 下一轮外层循环继续消费它们。
+                                pending = None;
+                                break TurnOutcome::Cancelled;
+                            }
+                            WsFrame::Other => {}
+                        },
                     },
-                },
+                }
             }
         };
-        let Some(result) = result else {
-            break;
-        };
-        // 仅 Exhausted 场景 runner 会发终态 error 帧；其余 Err 路径需要在此兜底，
-        // 否则浏览器会一直等待。Exhausted 场景会重复一个 error 帧，MVP 下无害。
-        if let Err(e) = result {
-            let _ = event_tx
-                .send(serde_json::json!({"type": "error", "message": e}))
-                .await;
-        } else {
-            // 回合成功结束：title 为空时异步生成（内部有非空竞态守卫）
-            let needs_title = agent
-                .db
-                .agent_get_session(&session_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|s| s.title.as_deref().is_none_or(|t| t.trim().is_empty()));
-            if needs_title {
-                // 标题帧只发到触发连接（event_tx 归本连接的 push_task 消费）：
-                // 不广播同 session 的其他标签页——需广播则要在 AgentState 维护
-                // 连接表，YAGNI 不做；其他标签页的 SessionBar 在下次 refetch 时自愈。
-                tokio::spawn(crate::server::agent::title::maybe_generate_title(
-                    agent.clone(),
-                    llm.clone(),
-                    session_id.clone(),
-                    turn_model,
-                    Some(event_tx.clone()),
-                ));
+        // 取消的回合把运行时作废：turn 可能已把无配对 tool 结果的 assistant
+        // tool_calls 推进 rt.messages（handle_tool_calls 先落库/入内存再逐条执行），
+        // 内存路径没有 sanitize_tool_pairs 兜底，直接复用下一轮会把非法序列发给
+        // LLM（400）。置 None 后下一条消息从 DB 重建——DB 重放路径的占位补齐
+        // 保证序列合法。取消语义统一："取消后运行时状态作废，从 DB 对齐"。
+        if matches!(outcome, TurnOutcome::Cancelled) {
+            rt_cache = None;
+        }
+        match outcome {
+            // 对端断开/协议错误：退出外层循环（原 break None 语义，保持不变）。
+            TurnOutcome::Disconnected => break,
+            // 取消：stopped 帧已回发，无 error 帧、无标题生成，继续等下一条消息。
+            TurnOutcome::Cancelled => {}
+            TurnOutcome::Completed(Err(e)) => {
+                // 仅 Exhausted 场景 runner 会发终态 error 帧；其余 Err 路径需要在此兜底，
+                // 否则浏览器会一直等待。Exhausted 场景会重复一个 error 帧，MVP 下无害。
+                let _ = event_tx
+                    .send(serde_json::json!({"type": "error", "message": e}))
+                    .await;
+            }
+            TurnOutcome::Completed(Ok(())) => {
+                // 回合成功结束：title 为空时异步生成（内部有非空竞态守卫）
+                let needs_title = agent
+                    .db
+                    .agent_get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.title.as_deref().is_none_or(|t| t.trim().is_empty()));
+                if needs_title {
+                    // 标题帧只发到触发连接（event_tx 归本连接的 push_task 消费）：
+                    // 不广播同 session 的其他标签页——需广播则要在 AgentState 维护
+                    // 连接表，YAGNI 不做；其他标签页的 SessionBar 在下次 refetch 时自愈。
+                    tokio::spawn(crate::server::agent::title::maybe_generate_title(
+                        agent.clone(),
+                        llm.clone(),
+                        session_id.clone(),
+                        turn_model,
+                        Some(event_tx.clone()),
+                    ));
+                }
             }
         }
     }
@@ -600,6 +631,30 @@ mod tests {
     use crate::server::control::ServerState;
     use crate::server::db::Database;
     use std::sync::Arc;
+
+    #[test]
+    fn test_turn_outcome_cancel_is_not_success() {
+        // 回归：取消此前被编码为 break Some(Ok(()))，会落入 `Ok` 分支触发
+        // 标题生成（浪费一次 LLM 调用并可能生成误导性标题）。改为可区分的
+        // 终态后，取消/断连/失败都不算回合成功，仅 Completed(Ok) 才进入
+        // 标题生成路径。
+        assert!(matches!(
+            TurnOutcome::Completed(Ok(())),
+            TurnOutcome::Completed(Ok(()))
+        ));
+        assert!(!matches!(
+            TurnOutcome::Cancelled,
+            TurnOutcome::Completed(Ok(()))
+        ));
+        assert!(!matches!(
+            TurnOutcome::Disconnected,
+            TurnOutcome::Completed(Ok(()))
+        ));
+        assert!(!matches!(
+            TurnOutcome::Completed(Err("boom".into())),
+            TurnOutcome::Completed(Ok(()))
+        ));
+    }
 
     #[test]
     fn test_parse_ws_frame_variants() {
