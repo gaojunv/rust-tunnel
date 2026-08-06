@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from 'vitest';
-import { cleanup, render, screen, act } from '@testing-library/react';
+import { cleanup, render, screen, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { listAgentMessages } from '../../api/client';
 import ChatStream from './ChatStream';
@@ -187,8 +187,9 @@ describe('ChatStream running state', () => {
       { id: 'm4', session_id: 's1', role: 'assistant', content: '文件里是 main 函数', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 工具名、参数、结果都渲染出来
+    // 工具名、参数、结果都渲染出来（工具卡片默认收起，先点头部展开再断言 args/result）
     expect(await screen.findByText('read_file')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
     expect(screen.getByText('文件里是 main 函数')).toBeTruthy();
   });
@@ -200,6 +201,8 @@ describe('ChatStream running state', () => {
     ]);
     renderChat();
     expect(await screen.findByText('shell')).toBeTruthy();
+    // 工具卡片默认收起，先展开再断言结果
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.getByText('a.rs')).toBeTruthy();
   });
 
@@ -298,8 +301,9 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('[上下文摘要] 之前讨论了 A')).toBeTruthy();
     // 重插的 kept 段只渲染一次（原始 kept 行被跳过，无连续重复段）
     expect(screen.getAllByText('保留问题')).toHaveLength(1);
-    // 工具卡片同样只渲染一份（read_file 工具名 + 结果）
+    // 工具卡片同样只渲染一份（read_file 工具名 + 结果；默认收起，先展开再断言结果）
     expect(screen.getAllByText('read_file')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.getAllByText(/fn main\(\)/)).toHaveLength(1);
   });
 

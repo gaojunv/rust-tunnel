@@ -48,25 +48,57 @@ function CollapsiblePre({ text, className }: { text: string; className?: string 
   );
 }
 
-/** 单条消息气泡：user / assistant（Markdown）/ tool（参数 + 结果卡片）。
- *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。 */
-export default memo(function MessageBubble({ item }: { item: ChatItem }) {
+/** 从 toolArgs JSON 提取一行摘要：shell→cmd；文件类→path；search→path + pattern。 */
+function toolSummary(name: string | undefined, args: string | undefined): string | null {
+  if (!args) return null;
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>;
+    const str = (k: string) => (typeof parsed[k] === 'string' ? (parsed[k] as string) : null);
+    switch (name) {
+      case 'shell':
+        return str('cmd');
+      case 'search': {
+        const path = str('path') ?? '.';
+        const pattern = str('pattern');
+        return pattern ? `${path} ⌕ ${pattern}` : path;
+      }
+      case 'read_file':
+      case 'write_file':
+      case 'patch_file':
+      case 'list_dir':
+        return str('path');
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** 工具调用卡片：默认收起为一行头部（工具名 + 摘要），点击展开 args/result。 */
+function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
-  const cls =
-    item.kind === 'user'
-      ? 'ml-auto max-w-[80%] rounded-lg bg-primary/10 px-3 py-2'
-      : item.kind === 'assistant'
-        ? 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2'
-        : 'mr-auto max-w-[90%] rounded-lg border bg-background px-3 py-2 text-sm font-mono';
+  const [open, setOpen] = useState(false);
+  const summary = toolSummary(item.toolName, item.toolArgs);
 
   return (
-    <div className={cls}>
-      {item.kind === 'tool' ? (
-        <div>
-          <div className="mb-1 flex items-center gap-1 text-xs font-semibold">
-            <Wrench className="h-3.5 w-3.5 text-primary" />
-            {item.toolName}
-          </div>
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 text-left text-xs font-semibold"
+        aria-expanded={open}
+      >
+        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+        <Wrench className="h-3.5 w-3.5 shrink-0 text-primary" />
+        <span>{item.toolName}</span>
+        {summary && (
+          <span className="truncate font-normal text-muted-foreground">{summary}</span>
+        )}
+        {!item.toolResult && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />}
+      </button>
+      {open && (
+        <div className="mt-1">
           {item.toolArgs && <CollapsiblePre text={item.toolArgs} />}
           {item.toolResult ? (
             <CollapsiblePre text={item.toolResult} className="mt-2 border-t pt-2" />
@@ -77,6 +109,25 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
             </div>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** 单条消息气泡：user / assistant（Markdown）/ tool（默认收起的工具卡片）。
+ *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。 */
+export default memo(function MessageBubble({ item }: { item: ChatItem }) {
+  const cls =
+    item.kind === 'user'
+      ? 'ml-auto max-w-[80%] rounded-lg bg-primary/10 px-3 py-2'
+      : item.kind === 'assistant'
+        ? 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2'
+        : 'mr-auto max-w-[90%] rounded-lg border bg-background px-3 py-2 text-sm font-mono';
+
+  return (
+    <div className={cls}>
+      {item.kind === 'tool' ? (
+        <ToolCard item={item} />
       ) : item.kind === 'assistant' ? (
         <Markdown content={item.content} />
       ) : (

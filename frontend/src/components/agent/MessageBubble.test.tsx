@@ -18,7 +18,8 @@ describe('MessageBubble tool output collapsing', () => {
         item={{ kind: 'tool', content: '', toolName: 'shell', toolArgs: '{}', toolResult: longResult }}
       />,
     );
-    // 折叠态：只显示前 3 行（args='{}' 不折叠，result 是页面里第二个 pre）
+    // 工具卡片默认收起：先点头部展开，再检查行级折叠（args='{}' 不折叠，result 是页面里第二个 pre）
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     const pres = document.querySelectorAll('pre');
     const resultPre = pres[pres.length - 1];
     expect(resultPre.textContent).toBe('line-1\nline-2\nline-3');
@@ -39,6 +40,7 @@ describe('MessageBubble tool output collapsing', () => {
         item={{ kind: 'tool', content: '', toolName: 'shell', toolArgs: '{}', toolResult: 'short output' }}
       />,
     );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.queryByText(/agent.expandLines/)).toBeNull();
     expect(screen.getByText('short output')).toBeTruthy();
   });
@@ -48,6 +50,7 @@ describe('MessageBubble tool output collapsing', () => {
     render(
       <MessageBubble item={{ kind: 'tool', content: '', toolName: 'shell', toolArgs: longArgs }} />,
     );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.getByText(/agent.expandLines/)).toBeTruthy();
   });
 
@@ -55,5 +58,81 @@ describe('MessageBubble tool output collapsing', () => {
     render(<MessageBubble item={{ kind: 'user', content: 'hello' }} />);
     expect(screen.getByText('hello')).toBeTruthy();
     expect(screen.queryByText(/agent.expandLines/)).toBeNull();
+  });
+});
+
+describe('MessageBubble tool card collapsing', () => {
+  afterEach(cleanup);
+
+  it('tool 卡片默认收起，仅显示工具名与摘要', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs"}',
+          toolResult: 'pub fn main() {}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('read_file');
+    expect(header.textContent).toContain('src/main.rs');
+    // 未展开：args 与 result 均不可见
+    expect(screen.queryByText('{"path":"src/main.rs"}')).toBeNull();
+    expect(screen.queryByText('pub fn main() {}')).toBeNull();
+    expect(screen.queryAllByRole('button', { expanded: true })).toHaveLength(0);
+  });
+
+  it('点击头部展开完整 args 与 result', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'shell',
+          toolArgs: '{"cmd":"ls -la"}',
+          toolResult: 'total 4',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
+    expect(screen.getByText('{"cmd":"ls -la"}')).toBeTruthy();
+    expect(screen.getByText('total 4')).toBeTruthy();
+  });
+
+  it('shell 工具摘要显示 cmd', () => {
+    render(<MessageBubble item={{ kind: 'tool', content: '', toolName: 'shell', toolArgs: '{"cmd":"ls -la"}' }} />);
+    expect(screen.getByRole('button', { expanded: false }).textContent).toContain('ls -la');
+  });
+
+  it('search 工具摘要显示 path + pattern', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'search',
+          toolArgs: '{"path":"src","pattern":"todo"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('src');
+    expect(header.textContent).toContain('todo');
+  });
+
+  it('运行中卡片显示 spinner 状态', () => {
+    render(
+      <MessageBubble item={{ kind: 'tool', content: '', toolName: 'read_file', toolArgs: '{"path":"x"}' }} />,
+    );
+    // 折叠态头部即显示 spinner 图标
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.querySelector('svg')).toBeTruthy();
+    // 展开后显示 toolRunning 文案
+    fireEvent.click(header);
+    expect(screen.getByText('agent.toolRunning')).toBeTruthy();
   });
 });
