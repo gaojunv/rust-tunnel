@@ -53,6 +53,153 @@ fn truncate_output(s: String) -> String {
     format!("{head}\n[truncated]\n{tail}")
 }
 
+/// search 命中条数上限
+const SEARCH_MAX_HITS: usize = 200;
+/// search 单行内容截断长度（字符）
+const SEARCH_MAX_LINE: usize = 500;
+/// search 跳过的单文件大小上限
+const SEARCH_MAX_FILE: u64 = 1024 * 1024;
+
+/// include 过滤：支持 "*.ext" 后缀模式与精确文件名；None 全部通过。
+fn match_include(file_name: &str, include: Option<&str>) -> bool {
+    match include {
+        None => true,
+        Some(pat) => {
+            if let Some(suffix) = pat.strip_prefix('*') {
+                file_name.ends_with(suffix)
+            } else {
+                file_name == pat
+            }
+        }
+    }
+}
+
+/// 简单二进制判定：首 8KB 内含 NUL 字节。
+fn looks_binary(head: &[u8]) -> bool {
+    head.contains(&0)
+}
+
+/// 在工作区沙箱内递归搜索字面量子串。输出 `相对路径:行号:行内容` 多行文本；
+/// 跳过 .git、二进制与超大文件；命中超限追加 [truncated]。
+fn search_in_workspace<'a>(
+    root: &'a Path,
+    pattern: &'a str,
+    path: &'a str,
+    include: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
+    Box::pin(async move {
+        if pattern.is_empty() {
+            return AgentResult::Error {
+                message: "pattern must not be empty".into(),
+            };
+        }
+        let start = match resolve_sandboxed(root, path) {
+            Ok(p) => p,
+            Err(e) => return AgentResult::Error { message: e },
+        };
+        let mut hits: Vec<String> = Vec::new();
+        let mut truncated = false;
+        // 栈式遍历避免递归 async fn 复杂度（read_dir 层级用显式栈）
+        let mut stack = vec![start];
+        'walk: while let Some(dir) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
+                Err(_) => continue, // 无权限/非目录：跳过
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == ".git" {
+                    continue;
+                }
+                let p = entry.path();
+                let Ok(meta) = entry.metadata().await else { continue };
+                if meta.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if !meta.is_file()
+                    || meta.len() > SEARCH_MAX_FILE
+                    || !match_include(&name, include)
+                {
+                    continue;
+                }
+                let Ok(bytes) = tokio::fs::read(&p).await else { continue };
+                if looks_binary(&bytes[..bytes.len().min(8192)]) {
+                    continue;
+                }
+                let Ok(text) = String::from_utf8(bytes) else { continue };
+                let rel = p
+                    .strip_prefix(root)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| name.clone());
+                for (idx, line) in text.lines().enumerate() {
+                    if line.contains(pattern) {
+                        let line = if line.chars().count() > SEARCH_MAX_LINE {
+                            line.chars().take(SEARCH_MAX_LINE).collect::<String>()
+                        } else {
+                            line.to_string()
+                        };
+                        hits.push(format!("{rel}:{}:{line}", idx + 1));
+                        if hits.len() >= SEARCH_MAX_HITS {
+                            truncated = true;
+                            break 'walk;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = if hits.is_empty() {
+            format!("no matches for '{pattern}'")
+        } else {
+            hits.join("\n")
+        };
+        if truncated {
+            out.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
+        }
+        AgentResult::FileContent {
+            content: truncate_output(out),
+        }
+    })
+}
+
+/// 锚点字符串替换：old_string 恰好出现一次才替换。
+async fn patch_file_host(abs: &Path, old_string: &str, new_string: &str) -> AgentResult {
+    if old_string.is_empty() {
+        return AgentResult::Error {
+            message: "old_string must not be empty".into(),
+        };
+    }
+    let content = match tokio::fs::read_to_string(abs).await {
+        Ok(c) => c,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            }
+        }
+    };
+    let count = content.matches(old_string).count();
+    match count {
+        0 => AgentResult::Error {
+            message: format!("old_string not found in {}", abs.display()),
+        },
+        1 => {
+            let updated = content.replacen(old_string, new_string, 1);
+            match tokio::fs::write(abs, updated).await {
+                Ok(()) => AgentResult::Success,
+                Err(e) => AgentResult::Error {
+                    message: format!("write {} failed: {e}", abs.display()),
+                },
+            }
+        }
+        n => AgentResult::Error {
+            message: format!(
+                "old_string matches {n} times in {}; provide more context to make it unique",
+                abs.display()
+            ),
+        },
+    }
+}
+
 /// 将一个字符串包成单个 shell 单引号词（POSIX sh）。内嵌 `'` 用 `'\''` 转义，
 /// 可安全地嵌在 `sh -c '...'` 的正文中。
 fn sh_quote(s: &str) -> String {
@@ -258,8 +405,64 @@ pub async fn handle_exec_request(
             .await
         }
         AgentCommand::GitPush => git_exec(&["push"], root_path, docker_container, timeout).await,
-        AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => AgentResult::Error {
-            message: "not implemented".into(),
+        AgentCommand::Search {
+            pattern,
+            path,
+            include,
+        } => match docker_container {
+            // docker：走容器内 grep（-F 字面量、-rn 带行号），include 经 --include 透传
+            Some(c) => {
+                let workdir = match resolve_sandboxed(root_path, path) {
+                    Ok(p) => p,
+                    Err(e) => return AgentResult::Error { message: e },
+                };
+                let include_arg = include
+                    .as_deref()
+                    .map(|g| format!("--include={}", sh_quote(g)))
+                    .unwrap_or_default();
+                let cmd = format!(
+                    "grep -rnF {include_arg} -- {} . | head -{SEARCH_MAX_HITS}",
+                    sh_quote(pattern),
+                );
+                shell_exec(&cmd, None, &workdir, Some(c), timeout).await
+            }
+            None => search_in_workspace(root_path, pattern, path, include.as_deref()).await,
+        },
+        AgentCommand::PatchFile {
+            path,
+            old_string,
+            new_string,
+        } => match resolve_sandboxed(root_path, path) {
+            Ok(abs) => match docker_container {
+                // docker：读全文 → 本地匹配替换 → 写回（复用既有原语）
+                Some(c) => {
+                    let content = match docker_read_file(c, &abs, timeout).await {
+                        AgentResult::FileContent { content } => content,
+                        other => return other,
+                    };
+                    if old_string.is_empty() {
+                        return AgentResult::Error {
+                            message: "old_string must not be empty".into(),
+                        };
+                    }
+                    match content.matches(old_string.as_str()).count() {
+                        0 => AgentResult::Error {
+                            message: format!("old_string not found in {path}"),
+                        },
+                        1 => {
+                            let updated = content.replacen(old_string, new_string, 1);
+                            docker_write_file(c, &abs, &updated, timeout).await
+                        }
+                        n => AgentResult::Error {
+                            message: format!(
+                                "old_string matches {n} times in {path}; provide more context to make it unique"
+                            ),
+                        },
+                    }
+                }
+                None => patch_file_host(&abs, old_string, new_string).await,
+            },
+            Err(e) => AgentResult::Error { message: e },
         },
     }
 }
@@ -744,6 +947,104 @@ mod tests {
         )
         .await;
         assert!(matches!(result, AgentResult::Error { .. }));
+    }
+
+    // ── Search / PatchFile ────────────────────────────────────────────────────
+
+    fn temp_workspace(files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-test-{:016x}", rand::random::<u64>()));
+        for (rel, content) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_match_include_patterns() {
+        assert!(match_include("main.rs", Some("*.rs")));
+        assert!(!match_include("main.go", Some("*.rs")));
+        assert!(match_include("Makefile", Some("Makefile")));
+        assert!(!match_include("Makefile.bak", Some("Makefile")));
+        assert!(match_include("anything.txt", None));
+    }
+
+    #[tokio::test]
+    async fn test_search_finds_literal_matches() {
+        let root = temp_workspace(&[
+            ("src/a.rs", "fn main() {}\nfn helper() {}\n"),
+            ("src/b.rs", "no match here\n"),
+            ("notes.txt", "main entry\n"),
+        ]);
+        let result = search_in_workspace(&root, "main", "src", Some("*.rs")).await;
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert!(content.contains("src/a.rs:1:fn main() {}"));
+        assert!(!content.contains("notes.txt")); // include 过滤 + 起始目录过滤
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_skips_binary_and_git() {
+        let root = temp_workspace(&[
+            (".git/config", "main"),
+            ("bin.dat", "main\u{0}binary"),
+            ("ok.txt", "main\n"),
+        ]);
+        let result = search_in_workspace(&root, "main", ".", None).await;
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert!(content.contains("ok.txt"));
+        assert!(!content.contains("config"));
+        assert!(!content.contains("bin.dat"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_no_match_returns_empty() {
+        let root = temp_workspace(&[("a.txt", "hello\n")]);
+        let result = search_in_workspace(&root, "zzz", ".", None).await;
+        let AgentResult::FileContent { content } = result else {
+            panic!("expected FileContent");
+        };
+        assert!(content.contains("no matches"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_search_rejects_escaping_path() {
+        let root = temp_workspace(&[]);
+        let result = search_in_workspace(&root, "x", "../etc", None).await;
+        assert!(matches!(result, AgentResult::Error { .. }));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_patch_unique_replacement() {
+        let root = temp_workspace(&[("a.rs", "fn old() {}\nrest\n")]);
+        let result = patch_file_host(&root.join("a.rs"), "fn old()", "fn new()").await;
+        assert!(matches!(result, AgentResult::Success));
+        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "fn new() {}\nrest\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn test_patch_not_found_and_ambiguous() {
+        let root = temp_workspace(&[("a.rs", "dup\ndup\n")]);
+        let r1 = patch_file_host(&root.join("a.rs"), "missing", "x").await;
+        let AgentResult::Error { message } = r1 else { panic!() };
+        assert!(message.contains("not found"));
+
+        let r2 = patch_file_host(&root.join("a.rs"), "dup", "x").await;
+        let AgentResult::Error { message } = r2 else { panic!() };
+        assert!(message.contains("2 times"));
+
+        let r3 = patch_file_host(&root.join("a.rs"), "", "x").await;
+        assert!(matches!(r3, AgentResult::Error { .. }));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // ── Docker 命令翻译（纯函数，无需 docker daemon）─────────────────────────
