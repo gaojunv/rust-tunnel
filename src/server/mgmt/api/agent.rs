@@ -140,21 +140,28 @@ async fn refresh_session_model(
     }
 }
 
-/// Extract the user-message content from a WebSocket message; returns None for
-/// non-text, unparseable, or non-`user_message` frames.
-fn parse_user_message(msg: Message) -> Option<String> {
+/// WS 客户端帧分类：user_message / cancel / 其他（忽略）。
+enum WsFrame {
+    UserMessage(String),
+    Cancel,
+    Other,
+}
+
+fn parse_ws_frame(msg: Message) -> WsFrame {
     let Message::Text(text) = msg else {
-        return None;
+        return WsFrame::Other;
     };
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return None;
+        return WsFrame::Other;
     };
-    if body.get("type").and_then(|t| t.as_str()) != Some("user_message") {
-        return None;
+    match body.get("type").and_then(|t| t.as_str()) {
+        Some("user_message") => body
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map_or(WsFrame::Other, |c| WsFrame::UserMessage(c.to_string())),
+        Some("cancel") => WsFrame::Cancel,
+        _ => WsFrame::Other,
     }
-    body.get("content")
-        .and_then(|c| c.as_str())
-        .map(str::to_string)
 }
 
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
@@ -196,9 +203,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(m)) => m,
             };
-            match parse_user_message(msg) {
-                Some(c) => c,
-                None => continue,
+            match parse_ws_frame(msg) {
+                WsFrame::UserMessage(c) => c,
+                // 非 turn 期间的 cancel：幂等忽略
+                WsFrame::Cancel | WsFrame::Other => continue,
             }
         };
 
@@ -303,11 +311,23 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 r = &mut turn => break Some(r),
                 msg = ws_stream.next() => match msg {
                     None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break None,
-                    Some(Ok(m)) => {
-                        if let Some(c) = parse_user_message(m) {
+                    Some(Ok(m)) => match parse_ws_frame(m) {
+                        WsFrame::UserMessage(c) => {
                             pending.get_or_insert(c);
                         }
-                    }
+                        // 中断式取消：drop turn future（与断连路径一致），但连接保留，
+                        // 回发 stopped 帧后继续外层循环等下一条消息。
+                        WsFrame::Cancel => {
+                            let _ = event_tx
+                                .send(serde_json::json!({"type": "stopped"}))
+                                .await;
+                            // 停止的意图是"都停下"：清空已缓冲的排队消息，避免
+                            // 下一轮外层循环继续消费它们。
+                            pending = None;
+                            break Some(Ok(()));
+                        }
+                        WsFrame::Other => {}
+                    },
                 },
             }
         };
@@ -556,6 +576,26 @@ mod tests {
     use crate::server::control::ServerState;
     use crate::server::db::Database;
     use std::sync::Arc;
+
+    #[test]
+    fn test_parse_ws_frame_variants() {
+        let user = parse_ws_frame(Message::Text(
+            r#"{"type":"user_message","content":"hi"}"#.into(),
+        ));
+        assert!(matches!(user, WsFrame::UserMessage(c) if c == "hi"));
+
+        let cancel = parse_ws_frame(Message::Text(r#"{"type":"cancel"}"#.into()));
+        assert!(matches!(cancel, WsFrame::Cancel));
+
+        let unknown = parse_ws_frame(Message::Text(r#"{"type":"ping"}"#.into()));
+        assert!(matches!(unknown, WsFrame::Other));
+
+        let binary = parse_ws_frame(Message::Binary(vec![1, 2, 3]));
+        assert!(matches!(binary, WsFrame::Other));
+
+        let malformed = parse_ws_frame(Message::Text("not json".into()));
+        assert!(matches!(malformed, WsFrame::Other));
+    }
 
     async fn test_state() -> (ApiState, Database) {
         let db = Database::new(":memory:").await.unwrap();
