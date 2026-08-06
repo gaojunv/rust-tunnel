@@ -2,7 +2,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { cleanup, render, screen, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { listAgentMessages } from '../../api/client';
+import { listAgentMessages, listWorkspaceFiles } from '../../api/client';
 import ChatStream from './ChatStream';
 
 vi.mock('react-i18next', () => ({
@@ -13,6 +13,7 @@ vi.mock('../../api/client', () => ({
   listAgentMessages: vi.fn().mockResolvedValue([]),
   updateAgentSessionModel: vi.fn().mockResolvedValue(undefined),
   getAgentDefaultModel: vi.fn().mockResolvedValue(''),
+  listWorkspaceFiles: vi.fn().mockResolvedValue({ files: [] }),
   agentWsUrl: () => 'ws://test/ws',
 }));
 
@@ -56,7 +57,7 @@ const renderChat = () => {
   });
   return render(
     <QueryClientProvider client={qc}>
-      <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
+      <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
     </QueryClientProvider>
   );
 };
@@ -394,7 +395,7 @@ describe('ChatStream running state', () => {
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
     render(
       <QueryClientProvider client={qc}>
-        <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
+        <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
       </QueryClientProvider>
     );
     act(() => {
@@ -573,5 +574,24 @@ describe('ChatStream running state', () => {
     // 输入文本后发送按钮恢复可用
     fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
     expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows mention popup on @ and sends refs with message', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    // 输入 @mai → @ 弹层出现，列出匹配文件
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    // 选中文件 → @query 段从文本移除，路径进引用 chip
+    fireEvent.click(screen.getByText('src/main.rs'));
+    expect(screen.getByText('@src/main.rs')).toBeTruthy();
+    expect((screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement).value).toBe('');
+    // 输入消息并发送 → WS 帧带 refs
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '检查这个文件' } });
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.send' }));
+    expect(
+      ws.sent.some((s) => s.includes('"type":"user_message"') && s.includes('"refs":["src/main.rs"]')),
+    ).toBe(true);
   });
 });

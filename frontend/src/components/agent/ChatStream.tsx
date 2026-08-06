@@ -12,6 +12,7 @@ import {
 import type { AgentWsEvent } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
+import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import ModelSelect from './ModelSelect';
 
@@ -21,19 +22,25 @@ const STREAM_FLUSH_MS = 50;
 
 interface Props {
   sessionId: string;
+  workspaceId: string;
   model: string;
   onModelChange: (id: string) => void;
 }
 
-export default function ChatStream({ sessionId, model, onModelChange }: Props) {
+export default function ChatStream({ sessionId, workspaceId, model, onModelChange }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
+  // @补全引用：选中的文件路径 chip（发送时随 user_message 帧带 refs 字段）
+  const [refs, setRefs] = useState<string[]>([]);
+  // @ 弹层状态：start 为光标前最近 @ 的下标，query 为其后到光标的前缀
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
@@ -440,6 +447,35 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     ));
   };
 
+  // @ 弹层触发检测：光标前找最近的 @（前面是空格/行首），其后到光标为 query。
+  // 命中则打开弹层；query 含空白（@ 后直接空格）或光标前无 @ 则关闭。
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const v = e.target.value;
+    setInput(v);
+    const pos = e.target.selectionStart ?? v.length;
+    const before = v.slice(0, pos);
+    const at = before.lastIndexOf('@');
+    if (at >= 0 && (at === 0 || /\s/.test(before[at - 1]))) {
+      const q = before.slice(at + 1);
+      if (!/\s/.test(q)) {
+        setMention({ start: at, query: q });
+        return;
+      }
+    }
+    setMention(null);
+  };
+
+  // 选中文件：把 @query 段从文本移除，路径进 refs chip（chip 独立展示，不占 textarea）
+  const selectMention = (path: string) => {
+    if (!mention) return;
+    const before = input.slice(0, mention.start);
+    const after = input.slice(mention.start + 1 + mention.query.length);
+    setInput(before + after);
+    setRefs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    setMention(null);
+    textareaRef.current?.focus();
+  };
+
   const send = () => {
     const text = input.trim();
     if (!text || running || hasPendingApproval) return;
@@ -451,13 +487,14 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       return;
     }
     try {
-      ws.send(JSON.stringify({ type: 'user_message', content: text }));
+      ws.send(JSON.stringify({ type: 'user_message', content: text, refs }));
     } catch {
       setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` }]);
       return;
     }
     setItems((prev) => [...prev, { kind: 'user', content: text }]);
     setInput('');
+    setRefs([]);
     armRunning();
   };
 
@@ -529,11 +566,38 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
             {t('agent.reconnecting')}
           </div>
         )}
-        <div className="rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+        <div className="relative rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+          {refs.length > 0 && (
+            <div className="flex flex-wrap gap-1 px-2 pt-1.5">
+              {refs.map((r) => (
+                <span key={r} className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                  @{r}
+                  <button type="button" onClick={() => setRefs((prev) => prev.filter((x) => x !== r))} className="hover:text-destructive">×</button>
+                </span>
+              ))}
+            </div>
+          )}
+          {mention && (
+            <MentionPopup
+              workspaceId={workspaceId}
+              query={mention.query}
+              onSelect={selectMention}
+              onClose={() => setMention(null)}
+            />
+          )}
           <textarea
+            ref={textareaRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={handleInputChange}
             onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setMention(null);
+                return;
+              }
+              if (mention && e.key === 'Enter') {
+                e.preventDefault();
+                return;
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 send();

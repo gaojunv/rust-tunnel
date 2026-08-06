@@ -789,7 +789,16 @@
     "deny": "Deny",
     "approved": "Approved",
     "denied": "Denied",
-    "approvalExpired": "Expired"
+    "approvalExpired": "Expired",
+    "approvalMode": "Approval Mode",
+    "approvalMode_safe": "Safe",
+    "approvalModeHint_safe": "Write operations and shell commands require confirmation",
+    "approvalMode_auto_write": "Auto-write",
+    "approvalModeHint_auto_write": "File writes run automatically; dangerous shell and git push require confirmation",
+    "approvalMode_full_auto": "Full auto",
+    "approvalModeHint_full_auto": "All operations run automatically (not recommended)",
+    "systemPrompt": "Custom system prompt",
+    "systemPromptPlaceholder": "Appended after the built-in prompt for workspace-specific instructions (optional)"
   },
   "logs": {
     "title": "Logs",

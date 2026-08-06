@@ -555,6 +555,15 @@ export async function deleteAgentWorkspace(id: string): Promise<void> {
   await api.delete(`/agent/workspaces/${id}`);
 }
 
+export const updateAgentWorkspace = (
+  id: string,
+  body: { name: string; root_path: string; system_prompt?: string; approval_mode?: string },
+) => api.put(`/agent/workspaces/${id}`, body);
+
+export const listWorkspaceFiles = (workspaceId: string, q: string) =>
+  api.get<{ files: string[] }>(`/agent/workspaces/${workspaceId}/files`, { params: { q, limit: 20 } })
+    .then((r) => r.data);
+
 export async function listAgentSessions(workspaceId: string): Promise<AgentSession[]> {
   const { data } = await api.get(`/agent/workspaces/${workspaceId}/sessions`);
   return data;

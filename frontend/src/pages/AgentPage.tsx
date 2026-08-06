@@ -145,6 +145,7 @@ export default function AgentPage() {
             <ChatStream
               key={sessionId}
               sessionId={sessionId}
+              workspaceId={workspaceId}
               model={model}
               onModelChange={setModel}
             />

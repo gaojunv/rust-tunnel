@@ -12,7 +12,12 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
-import { clientsApi, createAgentWorkspace, getApiErrorMessage } from '@/api/client';
+import {
+  clientsApi,
+  createAgentWorkspace,
+  getApiErrorMessage,
+  updateAgentWorkspace,
+} from '@/api/client';
 import type { AgentWorkspace, Client } from '@/types';
 
 interface Props {
@@ -34,6 +39,8 @@ export default function WorkspaceDialog({ onClose, onCreated }: Props) {
   const [rootPath, setRootPath] = useState('');
   const [dockerImage, setDockerImage] = useState('');
   const [dockerContainerId, setDockerContainerId] = useState('');
+  const [approvalMode, setApprovalMode] = useState<'safe' | 'auto_write' | 'full_auto'>('safe');
+  const [systemPrompt, setSystemPrompt] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -56,6 +63,23 @@ export default function WorkspaceDialog({ onClose, onCreated }: Props) {
         docker_image: runtimeType === 'docker' ? dockerImage.trim() : undefined,
         docker_container_id: runtimeType === 'docker' ? dockerContainerId.trim() : undefined,
       });
+      // 后端 create 不含 system_prompt/approval_mode 字段（仅在 PUT 支持），
+      // 用户在新建对话框设置的非默认值需创建成功后经 PUT 补写，否则静默丢失。
+      const trimmedPrompt = systemPrompt.trim();
+      if (trimmedPrompt !== '' || approvalMode !== 'safe') {
+        try {
+          await updateAgentWorkspace(w.id, {
+            name: w.name,
+            root_path: w.root_path,
+            system_prompt: trimmedPrompt || undefined,
+            approval_mode: approvalMode,
+          });
+        } catch (err) {
+          // 工作区已创建成功，仅设置未落库：不阻断流程（可稍后重新设置）
+          console.warn('failed to persist workspace settings after create:', err);
+        }
+      }
+      // 先补写设置再刷新列表缓存，避免 refetch 返回未含设置的旧数据
       await queryClient.invalidateQueries({ queryKey: ['agent-workspaces'] });
       onCreated(w);
     } catch (err) {
@@ -121,6 +145,30 @@ export default function WorkspaceDialog({ onClose, onCreated }: Props) {
               value={rootPath}
               onChange={(e) => setRootPath(e.target.value)}
               placeholder={runtimeType === 'host' ? t('agent.rootPathPlaceholderHost') : t('agent.rootPathPlaceholderDocker')}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>{t('agent.approvalMode')}</Label>
+            <div className="space-y-1.5">
+              {(['safe', 'auto_write', 'full_auto'] as const).map((m) => (
+                <label key={m} className="flex items-start gap-2 text-sm">
+                  <input type="radio" checked={approvalMode === m} onChange={() => setApprovalMode(m)} className="mt-1" />
+                  <span>
+                    <span className="font-medium">{t(`agent.approvalMode_${m}`)}</span>
+                    <span className="ml-1.5 text-xs text-muted-foreground">{t(`agent.approvalModeHint_${m}`)}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Label>{t('agent.systemPrompt')}</Label>
+            <textarea
+              value={systemPrompt}
+              onChange={(e) => setSystemPrompt(e.target.value)}
+              placeholder={t('agent.systemPromptPlaceholder')}
+              rows={3}
+              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
             />
           </div>
           {runtimeType === 'docker' && (
