@@ -435,6 +435,43 @@ pub async fn run_agent_turn(
 ) -> Result<(), String> {
     const MAX_TOOL_ROUNDS: usize = 20;
 
+    // 首个回合前读 AGENTS.md（rt.agents_md 为 None 表示尚未尝试）。读不到/为空
+    // 静默跳过；读到则重建 system 消息并缓存（同会话后续回合不重读）。
+    if rt.agents_md.is_none() {
+        let content = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+            String::new()
+        } else {
+            match executor::exec_on_client(
+                &agent,
+                &rt.workspace_id,
+                &rt.client_id,
+                &rt.root_path,
+                rt.docker_container.as_deref(),
+                AgentCommand::ReadFile {
+                    path: "AGENTS.md".to_string(),
+                },
+            )
+            .await
+            {
+                AgentResult::FileContent { content } => content,
+                _ => String::new(),
+            }
+        };
+        let content = content.trim().to_string();
+        if !content.is_empty() {
+            let base = rt.messages[0].content.as_deref().unwrap_or_default();
+            // base 是「内置 + workspace」两层（load 构建、无 AGENTS.md 段），直接追加第三段。
+            rt.messages[0] = ChatMessage::text(
+                "system",
+                format!(
+                    "{base}\n\n---\n\n# Project instructions (AGENTS.md):\n{}",
+                    crate::server::agent::session::truncate_agents_md(&content)
+                ),
+            );
+        }
+        rt.agents_md = Some(content);
+    }
+
     for _round in 0..MAX_TOOL_ROUNDS {
         // 每轮 LLM 调用前检查上下文超限 → 压缩早期历史（失败降级截断，不阻断回合）
         compact::maybe_compact(&agent, &llm, rt, &ws_tx).await?;

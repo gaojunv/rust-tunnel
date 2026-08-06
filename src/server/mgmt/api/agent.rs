@@ -33,6 +33,8 @@ pub struct CreateWorkspaceRequest {
 pub struct UpdateWorkspaceRequest {
     pub name: String,
     pub root_path: String,
+    pub system_prompt: Option<String>,
+    pub approval_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,12 +519,34 @@ pub async fn update_workspace(
     Path(id): Path<String>,
     Json(body): Json<UpdateWorkspaceRequest>,
 ) -> impl IntoResponse {
+    // approval_mode 校验：非法值拒绝（而不是静默落库）
+    if let Some(m) = body.approval_mode.as_deref() {
+        if !matches!(m, "safe" | "auto_write" | "full_auto") {
+            return (
+                StatusCode::BAD_REQUEST,
+                "approval_mode must be safe|auto_write|full_auto",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // 空串归一化为 None（保持字段语义：未设置 ≠ 空串）
+    let system_prompt = body
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match agent
         .db
-        .agent_update_workspace(&id, &body.name, &body.root_path)
+        .agent_update_workspace(
+            &id,
+            &body.name,
+            &body.root_path,
+            system_prompt,
+            body.approval_mode.as_deref(),
+        )
         .await
     {
         Ok(()) => get_workspace(State(state), Path(id)).await.into_response(),

@@ -96,12 +96,17 @@ impl Database {
         id: &str,
         name: &str,
         root_path: &str,
+        system_prompt: Option<&str>,
+        approval_mode: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE agent_workspaces SET name = ?, root_path = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+             approval_mode = COALESCE(?, approval_mode), updated_at = datetime('now') WHERE id = ?",
         )
         .bind(name)
         .bind(root_path)
+        .bind(system_prompt)
+        .bind(approval_mode)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -313,7 +318,7 @@ mod tests {
 
         assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 2);
 
-        db.agent_update_workspace("w1", "renamed", "/new/path")
+        db.agent_update_workspace("w1", "renamed", "/new/path", None, None)
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
