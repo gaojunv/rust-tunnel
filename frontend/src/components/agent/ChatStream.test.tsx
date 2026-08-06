@@ -548,4 +548,30 @@ describe('ChatStream running state', () => {
     fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
     expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
   });
+
+  it('expires pending approval cards on disconnect (onclose) and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    // 断线：服务端 turn 被 drop、审批按 deny 落定；重连后历史 refetch 若失败，
+    // 本地卡片不置终态会让 hasPendingApproval 恒 true → 发送按钮永久锁死
+    act(() => {
+      wsInstance!.onclose?.();
+    });
+    // 断线 → 卡片过期：操作按钮消失、过期文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.deny' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    // 输入文本后发送按钮恢复可用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });

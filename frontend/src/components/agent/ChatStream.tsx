@@ -372,6 +372,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           ]);
         }
         stopRunning();
+        // 断线时服务端 turn 被 drop、未响应审批按 deny 落定；本地卡片同样置
+        // expired，否则重连后历史 refetch 失败会永久锁死发送按钮
+        expirePendingApprovals();
         setDisconnected(true);
         needHistoryReload = true;
         const delay = Math.min(1000 * 2 ** attempts, 15000);
