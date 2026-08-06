@@ -34,7 +34,9 @@ export default function ApprovalCard({ item, onRespond }: Props) {
         </div>
       ) : (
         <p className="text-xs text-muted-foreground">
-          {item.approvalStatus === 'approved' ? `✓ ${t('agent.approved')}` : `✗ ${t('agent.denied')}`}
+          {item.approvalStatus === 'approved' && `✓ ${t('agent.approved')}`}
+          {item.approvalStatus === 'denied' && `✗ ${t('agent.denied')}`}
+          {item.approvalStatus === 'expired' && t('agent.approvalExpired')}
         </p>
       )}
     </div>

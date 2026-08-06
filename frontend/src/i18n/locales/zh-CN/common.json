@@ -788,7 +788,8 @@
     "approveSession": "本会话允许此类",
     "deny": "拒绝",
     "approved": "已允许",
-    "denied": "已拒绝"
+    "denied": "已拒绝",
+    "approvalExpired": "已过期"
   },
   "logs": {
     "title": "日志",

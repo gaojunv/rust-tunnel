@@ -788,7 +788,8 @@
     "approveSession": "Allow for this session",
     "deny": "Deny",
     "approved": "Approved",
-    "denied": "Denied"
+    "denied": "Denied",
+    "approvalExpired": "Expired"
   },
   "logs": {
     "title": "Logs",

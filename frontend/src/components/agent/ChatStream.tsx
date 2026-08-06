@@ -197,17 +197,30 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     pendingToolsRef.current.clear();
   }, [clearRunningTimeout]);
 
+  // 回合终态处理：done/stopped/error/本地停止/10 分钟超时都把仍在 pending 的审批
+  // 卡片置为 expired。否则卡片永久 pending → hasPendingApproval 恒 true → 发送按钮
+  // 被锁死（服务端 5 分钟审批超时实际按 deny 继续回合，UI 必须与服务端结果对齐）。
+  // expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝。
+  const expirePendingApprovals = useCallback(() => {
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'approval' && it.approvalStatus === 'pending'
+        ? { ...it, approvalStatus: 'expired' }
+        : it
+    ));
+  }, []);
+
   const armRunning = useCallback(() => {
     if (runningRef.current) return;
     runningRef.current = true;
     setRunning(true);
     clearRunningTimeout();
-    // 10 分钟超时兜底：到点未终态则强制解除
+    // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
     timeoutRef.current = globalThis.setTimeout(() => {
       setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+      expirePendingApprovals();
       stopRunning();
     }, RUNNING_TIMEOUT_MS);
-  }, [clearRunningTimeout, stopRunning, t]);
+  }, [clearRunningTimeout, stopRunning, expirePendingApprovals, t]);
 
   // WebSocket：断线自动重连（指数退避 1s→15s）。后端支持重连（新连接从 DB 重载
   // 会话，见 agent.rs handle_agent_socket），断线不应废掉整个会话的流式功能。
@@ -297,6 +310,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return prev;
         });
         stopRunning();
+        // 回合已终态，未响应的审批请求随回合作废 → 卡片过期
+        expirePendingApprovals();
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
@@ -306,6 +321,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return prev;
         });
         stopRunning();
+        // 回合成功结束：服务端 5 分钟审批超时按 deny 继续回合，仍 pending 的
+        // 卡片必须过期，否则 hasPendingApproval 恒 true 锁死发送按钮
+        expirePendingApprovals();
         // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果；
         // 不影响聊天区（history effect 有 loadedRef 守卫，不会重复装载）
         void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
@@ -337,6 +355,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }];
         });
         stopRunning();
+        // 回合以错误终态结束，未响应的审批卡片一并过期
+        expirePendingApprovals();
       }
     };
 
@@ -385,7 +405,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       chunkBufRef.current = '';
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, t]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, t]);
 
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
@@ -448,6 +468,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       }
     }
     stopRunning();
+    // 本地停止路径同样作废未响应的审批卡片（cancel 帧可能因断线永远不回来）
+    expirePendingApprovals();
     setItems((prev) => [...prev, { kind: 'assistant', content: `⏹️ ${t('agent.stopped')}` }]);
   };
 

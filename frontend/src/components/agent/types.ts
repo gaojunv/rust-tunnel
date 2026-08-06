@@ -9,5 +9,6 @@ export interface ChatItem {
   approvalId?: string;
   approvalTool?: string;
   approvalSummary?: string;
-  approvalStatus?: 'pending' | 'approved' | 'denied';
+  /** pending=等待用户响应；approved/denied=用户主动处理；expired=回合终态被动过期 */
+  approvalStatus?: 'pending' | 'approved' | 'denied' | 'expired';
 }

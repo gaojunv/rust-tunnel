@@ -491,4 +491,61 @@ describe('ChatStream running state', () => {
     ).toBe(true);
     expect(screen.getByText(/agent.approved/)).toBeTruthy();
   });
+
+  it('expires pending approval cards on done frame and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    // 输入文本后发送按钮仍被 pending 审批禁用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(true);
+    // done 帧到达（服务端 5 分钟审批超时按 deny 继续回合）→ 卡片过期、发送解锁
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.deny' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('expires pending approval cards on stop and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 危险工具调用进入 running → 服务端发审批请求挂起回合
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req2',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 点击前捕获当前连接（stop 触发 state 更新后 WS 实例轮换，cancel 发在旧实例）
+    const ws = wsInstance!;
+    act(() => {
+      screen.getByRole('button', { name: 'agent.stop' }).click();
+    });
+    expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
+    expect(screen.queryByText('agent.running')).toBeNull();
+    // 停止 → 卡片过期：操作按钮消失、过期文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    // 输入文本后发送按钮恢复可用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });
