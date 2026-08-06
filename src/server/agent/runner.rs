@@ -191,8 +191,31 @@ fn client_supports_search_patch(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_SEARCH_PATCH_CLIENT_VERSION)
 }
 
+/// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
+const TOOL_RESULT_MAX_LINES: usize = 300;
+const TOOL_RESULT_MAX_BYTES: usize = 30 * 1024;
+
+fn truncate_tool_result(text: String) -> String {
+    let total_lines = text.lines().count();
+    if total_lines <= TOOL_RESULT_MAX_LINES && text.len() <= TOOL_RESULT_MAX_BYTES {
+        return text;
+    }
+    // 先按字节截断到安全边界，再按行数截断（两者取更严）
+    let mut cut = TOOL_RESULT_MAX_BYTES.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let byte_cut = &text[..cut];
+    let line_cut: String = byte_cut
+        .lines()
+        .take(TOOL_RESULT_MAX_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{line_cut}\n[truncated, total {total_lines} lines]")
+}
+
 fn agent_result_to_text(result: &AgentResult) -> String {
-    match result {
+    let text = match result {
         AgentResult::Shell {
             stdout,
             stderr,
@@ -201,7 +224,8 @@ fn agent_result_to_text(result: &AgentResult) -> String {
         AgentResult::FileContent { content } => content.clone(),
         AgentResult::Success => "ok".to_string(),
         AgentResult::Error { message } => format!("error: {message}"),
-    }
+    };
+    truncate_tool_result(text)
 }
 
 /// 执行一轮工具调用：回填 assistant tool_calls 消息、逐个执行并落库/回填 tool 结果。
@@ -850,5 +874,37 @@ mod tests {
     async fn test_agent_state(db: crate::server::db::Database) -> AgentState {
         let server_state = crate::server::control::ServerState::with_db(db);
         server_state.agent_state.expect("agent_state initialized")
+    }
+
+    #[test]
+    fn test_truncate_tool_result_by_lines() {
+        let text = (0..400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let out = truncate_tool_result(text);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() <= TOOL_RESULT_MAX_LINES + 1); // +1 为 truncated 标记行
+        assert!(out.contains("[truncated"));
+        assert!(out.contains("400")); // 总行数写入标记
+    }
+
+    #[test]
+    fn test_truncate_tool_result_by_bytes() {
+        let text = "x".repeat(40 * 1024);
+        let out = truncate_tool_result(text);
+        assert!(out.len() < 35 * 1024);
+        assert!(out.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_truncate_tool_result_short_unchanged() {
+        let text = "short output".to_string();
+        assert_eq!(truncate_tool_result(text.clone()), text);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_multibyte_safe() {
+        // 截断点落在 UTF-8 多字节序列中间不得 panic
+        let text = "汉".repeat(15 * 1024); // ~45KB
+        let out = truncate_tool_result(text);
+        assert!(out.contains("[truncated"));
     }
 }
