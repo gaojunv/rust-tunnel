@@ -757,6 +757,8 @@
     "chatEmptyHint": "发送消息开始与 Agent 对话。可让它查看文件、运行命令或执行 git 操作。",
     "toolRunning": "执行中…",
     "running": "Agent 运行中…",
+    "stop": "停止",
+    "stopped": "已停止当前回合",
     "inputPlaceholder": "描述你的需求… (Enter 发送, Shift+Enter 换行)",
     "send": "发送",
     "connectionLost": "连接已断开，请刷新重试",

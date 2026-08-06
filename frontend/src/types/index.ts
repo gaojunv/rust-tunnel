@@ -560,5 +560,6 @@ export type AgentWsEvent =
   | { type: 'tool_result'; id?: string; name?: string; result?: string }
   | { type: 'status'; message?: string }
   | { type: 'done' }
+  | { type: 'stopped' }
   | { type: 'error'; message?: string };
 

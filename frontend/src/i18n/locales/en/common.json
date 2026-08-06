@@ -757,6 +757,8 @@
     "chatEmptyHint": "Send a message to start chatting with the agent. Ask it to inspect files, run commands, or perform git operations.",
     "toolRunning": "Running…",
     "running": "Agent is running…",
+    "stop": "Stop",
+    "stopped": "Turn stopped",
     "inputPlaceholder": "Describe what you need… (Enter to send, Shift+Enter for newline)",
     "send": "Send",
     "connectionLost": "Connection lost. Please refresh and try again.",

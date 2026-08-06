@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
-import { Loader2, SendHorizontal } from 'lucide-react';
+import { Loader2, SendHorizontal, Square } from 'lucide-react';
 import {
   agentWsUrl,
   getApiErrorMessage,
@@ -288,6 +288,14 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           streamingIdxRef.current = null;
           return [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }];
         });
+      } else if (msg.type === 'stopped') {
+        // 服务端确认取消（本连接或另一标签页发起的 cancel 都会广播到本连接的处理逻辑）
+        flushChunks();
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return prev;
+        });
+        stopRunning();
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
@@ -386,6 +394,19 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     armRunning();
   };
 
+  const stop = () => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: 'cancel' }));
+      } catch {
+        /* 发送失败也走本地停止 */
+      }
+    }
+    stopRunning();
+    setItems((prev) => [...prev, { kind: 'assistant', content: `⏹️ ${t('agent.stopped')}` }]);
+  };
+
   const handleModelChange = (id: string) => {
     const prev = model;
     onModelChange(id);
@@ -453,20 +474,28 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           />
           <div className="flex items-center justify-between px-2 pb-1.5">
             <ModelSelect value={model} onChange={handleModelChange} disabled={running} />
-            <Button
-              onClick={send}
-              disabled={running || !input.trim()}
-              size="sm"
-              variant="ghost"
-              aria-label={t('agent.send')}
-              className="h-8 w-8 rounded-full p-0"
-            >
-              {running ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
+            {running ? (
+              <Button
+                onClick={stop}
+                size="sm"
+                variant="ghost"
+                aria-label={t('agent.stop')}
+                className="h-8 w-8 rounded-full p-0 text-destructive hover:text-destructive"
+              >
+                <Square className="h-4 w-4 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                onClick={send}
+                disabled={!input.trim()}
+                size="sm"
+                variant="ghost"
+                aria-label={t('agent.send')}
+                className="h-8 w-8 rounded-full p-0"
+              >
                 <SendHorizontal className="h-4 w-4" />
-              )}
-            </Button>
+              </Button>
+            )}
           </div>
         </div>
       </div>

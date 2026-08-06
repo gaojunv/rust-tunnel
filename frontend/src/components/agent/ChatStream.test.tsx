@@ -342,6 +342,43 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('压缩后的新回答')).toBeTruthy();
   });
 
+  it('running 时显示停止按钮，点击发送 cancel 并解除 running', async () => {
+    renderChat();
+    // 进入 running：与既有 running 测试一致，用 tool_call 帧驱动 armRunning
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 停止按钮（aria-label = t('agent.stop')）替代发送按钮
+    const stopBtn = screen.getByRole('button', { name: 'agent.stop' });
+    expect(stopBtn).toBeTruthy();
+    // 捕获当前活跃连接：i18n mock 的 t 每次渲染返回新引用 → armRunning（WS effect
+    // 依赖）不稳定 → 每次 state 更新都重建 WebSocket（实例轮换），点击后 wsInstance
+    // 已指向更新的实例；在点击前捕获当前实例再断言其 send。
+    const ws = wsInstance!;
+    act(() => {
+      stopBtn.click();
+    });
+    // mockWs.send 被调用且 payload 含 '"type":"cancel"'
+    expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
+    // running 指示消失 + 停止提示气泡出现
+    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.getByText(/agent.stopped/)).toBeTruthy();
+  });
+
+  it('收到 stopped 帧解除 running', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 服务端确认取消（本连接或其他标签页的 cancel 都经 WS 广播 stopped）
+    act(() => {
+      wsInstance!.emit({ type: 'stopped' });
+    });
+    expect(screen.queryByText('agent.running')).toBeNull();
+  });
+
   it('renders summary rows as assistant bubbles (M5)', async () => {
     const row = (id: string, role: string, content: string, kind: string) => ({
       id,
