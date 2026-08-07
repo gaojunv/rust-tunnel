@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配有 React/TypeScript 前端管理界面。服务器运行在公网，暴露端口将流量通过加密控制通道转发到内网客户端。同时内置 Shadowsocks 和 Trojan 代理服务器和实时连接质量监控。
+rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配有 React/TypeScript 前端管理界面。服务器运行在公网，暴露端口将流量通过加密控制通道转发到内网客户端。同时内置 Shadowsocks 和 Trojan 代理服务器、实时连接质量监控、LLM 网关（含 RAG 知识库）和 AI agent 工作台（服务端 agent 循环 + 隧道内工具执行）。
 
 ## 常用开发命令
 
@@ -13,7 +13,7 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
 cargo build                    # 调试构建
 cargo build --release          # 发布构建
 cargo check                    # 快速编译检查
-cargo test                     # 运行所有测试
+cargo test                     # 运行所有测试（注意内存限制：环境内存小，用 cargo test -- -j 2 避免 OOM）
 cargo test test_name           # 运行单个测试
 cargo test -- --nocapture      # 运行测试并显示输出
 cargo test -p rust-tunnel --test '*' module::test_name  # 按模块筛选
@@ -30,7 +30,8 @@ cd frontend
 npm install                    # 安装依赖
 npm run dev                    # 开发服务器（Vite HMR，/api 代理到 localhost:3000）
 npm run build                  # tsc 类型检查 + Vite 构建
-npm run lint                   # ESLint 检查
+npm run lint                   # ESLint 检查（--max-warnings 0）
+npm test                       # Vitest 单元/组件测试（jsdom 环境）
 ```
 
 ### 部署前端到嵌入式资源
@@ -79,6 +80,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `llm/` — LLM 网关：OpenAI/Anthropic 双协议入口（`openai_handler.rs`/`anthropic_handler.rs`）、provider/model/api-key 管理、用量日志、compat 工具调用改写；`llm/rag/` — RAG 知识库：`extractor`（多格式文本提取：PDF/Word/Excel/PPT→Markdown）、`chunker`（Markdown 分块）、`embedder`（远端 embedding）、`store`（qdrant-edge 向量 shard）、`retriever`（检索+注入）、`ingest`（后台摄入任务）
 - `pki/` — 证书与 ACME 自动续签
 - `net/` — 网络基建（listener/dns/mesh）
+- `agent/` — AI agent 工作台：`runner`（agent 循环/回合）、`tools`（工具 schema：shell/read_file/write_file/patch_file/list_dir/search/git_*，工具经隧道在内网客户端执行）、`executor`（命令执行）、`approval`（审批矩阵：危险工具挂起等待用户批准，支持"本会话记住"）、`session`/`title`/`compact`（会话管理、自动标题、上下文压缩）、`sse`（WebSocket 事件流）。`AgentState` 挂在 `ServerState` 上，含 per-workspace 执行锁（git 状态安全）和 per-session 回合锁（多标签页/重连防并发写库）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
 
 **`src/client/`** — 客户端实现（零配置范式的端侧）
@@ -89,24 +91,25 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### 前端架构
 - 位于 `frontend/`，构建产物输出到 `frontend-dist/`（gitignored，由 `rust-embed` 嵌入）
-- **无路由库** — 通过 `App.tsx` 中的状态条件渲染切换页面
+- **react-router-dom v6** — `App.tsx` 中 `createBrowserRouter` + `ProtectedRoute` 守卫路由
 - **React Query v5**（`@tanstack/react-query`）— 数据获取和缓存
 - **无全局状态管理库** — 状态通过 React Query + 组件本地状态管理
 - Vite 开发服务器将 `/api` 代理到 `localhost:3000`（服务器 API 端口）
 - 共享组件在 `frontend/src/components/shared/`：`ChartContainer`、`StatCard`、`TimeRangeSelector`、`MobileBottomNav`
-- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）
+- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）；AI agent 工作台（`AgentPage`，含 `components/agent/`：会话列表、消息流、审批弹层、@文件引用、workspace 管理）
 - TypeScript 类型定义集中 在 `frontend/src/types/index.ts`
 - API 客户端在 `frontend/src/api/client.ts`：Axios + JWT 拦截器
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`）
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`）、`agent_workspaces` / `agent_sessions` / `agent_messages`（agent 工作台）
 
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`、`GET /api/llm/kb/events`（SSE，`?token=` 认证）
 - 受保护（设置密码时需 JWT）：`/api/clients`、`/api/server-auth`、`/api/traffic`、`/api/metrics`、`/api/quality/*`、`/api/shadowsocks/*`、`/api/trojan/*`、`/api/logs/*`、`POST /api/logout`
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`
 - RAG 知识库（新）：`/api/llm/kb`（CRUD）、`/api/llm/kb/:id`、`/api/llm/kb/:id/docs`、`/api/llm/kb/:id/docs/:doc_id`（含 `/reindex`）、`/api/llm/kb/test-embedding`、`/api/llm/kb/:id/query`
+- AI agent（新）：`GET /api/agent/ws`（WebSocket 回合/事件流）、`/api/agent/workspaces`（CRUD，含 `/files`、`/sessions`）、`/api/agent/sessions/:id`（含 `/model`、`/archive`、`/messages`）、`/api/agent/default-model`
 - 完整列表见 `src/server/mgmt/api/mod.rs`
 
 ## 代码模式
