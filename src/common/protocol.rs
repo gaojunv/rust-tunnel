@@ -183,6 +183,11 @@ pub enum ControlMessage {
         request_id: String,
         result: AgentResult,
     },
+    /// Server asks an agent-capable client to kill the running exec for a
+    /// request (真取消：停止回合时杀掉内网侧正在执行的命令)。
+    AgentExecCancel {
+        request_id: String,
+    },
 }
 
 impl ControlMessage {
@@ -711,6 +716,19 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_agent_exec_cancel_roundtrip() {
+        let msg = ControlMessage::AgentExecCancel {
+            request_id: "req-cancel-1".into(),
+        };
+        let bytes = msg.serialize().unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMessage::AgentExecCancel { request_id } if request_id == "req-cancel-1"
+        ));
     }
 
     #[test]
