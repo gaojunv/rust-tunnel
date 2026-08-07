@@ -1,53 +1,91 @@
-import { memo } from 'react';
-import { Streamdown } from 'streamdown';
-import { code } from '@streamdown/code';
+import { memo, isValidElement, cloneElement } from 'react';
+import { Streamdown, CodeBlockCopyButton, type Components } from 'streamdown';
+import { code as codePlugin } from '@streamdown/code';
 import { cjk } from '@streamdown/cjk';
 import 'streamdown/styles.css';
 
-/** 助手消息 Markdown 渲染：Streamdown（流式半截语法容错 + Shiki 高亮 + 代码/表格控件）。
- *  memo 化：流式期间列表整体重渲染时，内容未变的气泡跳过重解析。
- *
- *  高亮主题跟随页面明暗：[亮色, 暗色] 双主题由 Streamdown/Shiki 按 html.dark 切换。
- *  light-plus / dark-plus 即 VS Code 默认的 Light+/Dark+（Shiki 内置主题中无
- *  "2026" 命名，VS Code 现行默认配色就是这两个）。
- *
- *  排版覆盖（容器 [&_...]:! 任意变体，特异性高于组件内联类）：
- *  - 标题字号收敛：默认 h1 text-3xl 在对话流里过于突兀，统一压到 xl/lg/base 梯度
- *  - 行高 1.75：CJK 长文阅读更舒适
- *  - 代码块：bg-sidebar 容器改为透明（去掉与内层 body 的"双层框"），仅保留内层
- *    border + bg-muted/40；行号列略放大提高可读性
- *  - 表格：默认只有横线（divide-y），补上竖向 divide-x 与单元格边框，恢复网格感
- *  - controls：仅保留复制，关闭下载/全屏等重交互控件 */
+/** pre 组件覆盖：Streamdown 默认 pre 只是 cloneElement 透传，code 插件管线会把
+ *  Shiki 高亮 token 直接注入 <code> 的 children——所以透传的 code 元素里高亮
+ *  是完整的。自己画单层框（对齐 Vercel AI Chatbot 的定制渲染器）：
+ *  语言头（左语言名，右官方 CodeBlockCopyButton）+ 透传 code 高亮本体。
+ *  不包官方 CodeBlock 容器——它的容器/头部/悬浮按钮三层结构正是要丢弃的部分。 */
+const PreFrame: Components['pre'] = ({ children }) => {
+  if (!isValidElement(children)) return <>{children}</>;
+  const codeEl = children as React.ReactElement<Record<string, unknown>>;
+  const codeProps = (codeEl.props ?? {}) as Record<string, unknown> & { children?: React.ReactNode };
+  const language = /language-([\w-]+)/.exec((codeProps.className as string | undefined) ?? '')?.[1] ?? '';
+  // code 的 children 是 <span>{raw}</span>（hast pre>code 结构），取原始代码串
+  let raw = '';
+  const inner = codeProps.children;
+  if (isValidElement(inner) && typeof (inner.props as { children?: unknown }).children === 'string') {
+    raw = (inner.props as { children: string }).children;
+  } else if (typeof inner === 'string') {
+    raw = inner;
+  }
+  return (
+    <div className="my-3 overflow-hidden rounded-lg border border-border bg-muted/40">
+      <div className="flex items-center justify-between border-b border-border/70 px-3 py-1.5">
+        <span className="font-mono text-xs lowercase text-muted-foreground">{language || 'text'}</span>
+        <CodeBlockCopyButton code={raw} />
+      </div>
+      {cloneElement(codeEl, {
+        // data-block 是默认 pre 用来标记块级 code 的约定（code 组件靠它区分行内/块级），
+        // 覆盖 pre 后必须保留，否则 code 退成行内渲染、丢失高亮；className 保留
+        // 原值（含 language-xxx），code 组件靠它提取语言交给官方 CodeBlock
+        'data-block': 'true',
+        className: codeProps.className,
+      } as Record<string, unknown>)}
+    </div>
+  );
+};
+
+/** 表格（components.table 覆盖）：横向滚动容器 + 完整网格（横竖线）。
+ *  Streamdown 默认在表格外再套一层带复制按钮的 wrapper，结构臃肿，这里简化为单层。 */
+const Table: Components['table'] = ({ children }) => (
+  <div className="my-3 overflow-x-auto rounded-lg border border-border">
+    <table className="w-full border-collapse text-sm">{children}</table>
+  </div>
+);
+
+/** 助手消息 Markdown 渲染：Streamdown（流式半截语法容错 + Shiki 高亮），
+ *  代码块/表格通过 components 覆盖为定制单层结构（见上）。
+ *  高亮主题跟随页面明暗：light-plus / dark-plus（VS Code Light+/Dark+）。
+ *  排版覆盖（容器 [&_...]:! 任意变体，特异性高于 Streamdown 内联类）：
+ *  - 标题字号收敛到 xl/lg/base 梯度；正文/列表 leading-7 适配 CJK 长文
+ *  - 表格单元格 th/td 横竖线 + 表头底色
+ *  - pre 的 shiki 内联底色（--shiki-dark-bg 中性灰）置透明，由容器统一承载 */
 const MD_CLASS = [
   'text-sm leading-7',
-  // 标题梯度：对话内不需要 3xl/2xl 的展示级字号
   '[&_h1]:!mt-4 [&_h1]:!mb-2 [&_h1]:!text-xl',
   '[&_h2]:!mt-4 [&_h2]:!mb-2 [&_h2]:!text-lg',
   '[&_h3]:!mt-3 [&_h3]:!mb-1.5 [&_h3]:!text-base',
-  // 段落/列表行高与间距
   '[&_p]:!leading-7 [&_li]:!leading-7 [&_li]:!py-0.5 [&_ul]:!my-2 [&_ol]:!my-2',
-  // 代码块：外层容器去背景去 padding（单层框），body 自带 border + 柔和底色
-  '[&_[data-streamdown=code-block]]:!gap-0 [&_[data-streamdown=code-block]]:!border-0 [&_[data-streamdown=code-block]]:!bg-transparent [&_[data-streamdown=code-block]]:!p-0 [&_[data-streamdown=code-block]]:!pt-8',
-  // pre 的 shiki 内联背景（--sdm-bg/--shiki-dark-bg，如 Dark+ 的 #1e1e1e 中性灰）
-  // 与页面主题底色（暗色为深蓝）不一致 → 置透明，由 body 的 bg-muted/40 统一承载底色
-  '[&_[data-streamdown=code-block-body]]:!bg-muted/40',
-  '[&_[data-streamdown=code-block-body]_pre]:!bg-transparent dark:[&_[data-streamdown=code-block-body]_pre]:!bg-transparent',
-  // 行号列：默认 13px 偏小，与正文字号对齐
-  '[&_[data-streamdown=code-block-body]_.block]:before:!text-[13px]',
-  // 表格：横线之外补竖线（divide-x + 单元格右边框），表头保持底色区分
-  '[&_[data-streamdown=table-wrapper]]:!gap-0 [&_[data-streamdown=table-wrapper]]:!bg-transparent [&_[data-streamdown=table-wrapper]]:!p-0 [&_[data-streamdown=table-wrapper]]:!pt-6',
-  '[&_[data-streamdown=table]]:!divide-x [&_[data-streamdown=table]]:!divide-border',
-  '[&_[data-streamdown=table-header-cell]]:!border-r [&_[data-streamdown=table-header-cell]]:!border-border last:[&_[data-streamdown=table-header-cell]]:!border-r-0',
-  '[&_[data-streamdown=table-cell]]:!border-r [&_[data-streamdown=table-cell]]:!border-border last:[&_[data-streamdown=table-cell]]:!border-r-0',
+  // 表格单元格网格线（table 本体已被覆盖为 border-collapse 单层框）
+  '[&_th]:!border [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium',
+  '[&_td]:!border [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5',
+  // 行内代码
+  '[&_code:not(pre_code)]:!rounded [&_code:not(pre_code)]:!bg-muted [&_code:not(pre_code)]:!px-1.5 [&_code:not(pre_code)]:!py-0.5 [&_code:not(pre_code)]:!text-[0.875em]',
+  // 代码块：PreFrame 里官方 CodeBlock 容器嵌在我的框内——压掉官方三层结构实现
+  // 单层视觉：容器去边距/边框/背景/padding、官方头部隐藏（语言名我的框已显示）、
+  // 官方悬浮 actions 条隐藏（复制按钮我的框已提供）、body 去自身边框/背景只剩滚动区
+  '[&_[data-streamdown=code-block]]:!m-0 [&_[data-streamdown=code-block]]:!gap-0 [&_[data-streamdown=code-block]]:!rounded-none [&_[data-streamdown=code-block]]:!border-0 [&_[data-streamdown=code-block]]:!bg-transparent [&_[data-streamdown=code-block]]:!p-0',
+  '[&_[data-streamdown=code-block-header]]:!hidden',
+  '[&_[data-streamdown=code-block-actions]]:!hidden',
+  '[&_[data-streamdown=code-block]>.pointer-events-none]:!hidden',
+  '[&_[data-streamdown=code-block-body]]:!rounded-none [&_[data-streamdown=code-block-body]]:!border-0 [&_[data-streamdown=code-block-body]]:!bg-transparent [&_[data-streamdown=code-block-body]]:!p-3',
+  // shiki 内联底色（--shiki-dark-bg 中性灰）置透明，由我的容器 bg-muted/40 统一承载
+  '[&_pre]:!bg-transparent dark:[&_pre]:!bg-transparent',
+  '[&_pre_.block]:before:!text-[13px]',
 ].join(' ');
 
 export default memo(function Markdown({ content }: { content: string }) {
   return (
     <Streamdown
       className={MD_CLASS}
-      plugins={{ code, cjk }}
+      plugins={{ code: codePlugin, cjk }}
       shikiTheme={['light-plus', 'dark-plus']}
-      controls={{ code: { copy: true, download: false }, table: { copy: true, download: false, fullscreen: false } }}
+      controls={{ code: { copy: false, download: false } }}
+      components={{ pre: PreFrame, table: Table }}
     >
       {content}
     </Streamdown>
