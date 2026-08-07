@@ -55,7 +55,9 @@ export default function TerminalPanel({ workspaceId }: { workspaceId: string }) 
 
     const dataSub = term.onData((d) => {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(d);
+        // 必须编码为字节发送 Binary 帧：`ws.send(string)` 会发 Text 帧，
+        // 后端 bridge_terminal 只消费 Message::Binary，Text 帧被静默丢弃 → 按键全丢。
+        ws.send(new TextEncoder().encode(d));
       }
     });
 

@@ -56,7 +56,7 @@ class FakeWs {
   readyState = 1;
   binaryType = '';
   url = '';
-  sent: (string | ArrayBuffer)[] = [];
+  sent: (string | ArrayBuffer | Uint8Array)[] = [];
   onmessage: ((ev: { data: unknown }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
@@ -67,7 +67,7 @@ class FakeWs {
     wsInstance = this;
     wsInstances.push(this);
   }
-  send(d: string | ArrayBuffer) {
+  send(d: string | ArrayBuffer | Uint8Array) {
     this.sent.push(d);
   }
   close() {}
@@ -118,12 +118,21 @@ describe('TerminalPanel', () => {
     expect(screen.getByText('agent.terminalConnecting')).toBeTruthy();
   });
 
-  it('forwards terminal input to the WebSocket', () => {
+  it('forwards terminal input to the WebSocket as binary (not Text frame)', () => {
+    // 协议约定双向仅用 Binary 帧：后端 bridge_terminal 只消费 Message::Binary，
+    // Text 帧被静默忽略——输入必须编码为字节而非字符串（回归：曾用 ws.send(string)
+    // 发送 Text 帧导致按键全部丢失）。
     render(<TerminalPanel workspaceId="w1" />);
     act(() => {
       h.terminals[0].emitData('ls');
     });
-    expect(wsInstances[0].sent).toContain('ls');
+    expect(wsInstances[0].sent).toHaveLength(1);
+    const sent = wsInstances[0].sent[0];
+    // 必须是二进制帧而非字符串（Text 帧）。jsdom 与 Node 的 Uint8Array 属不同
+    // realm，跨 realm 的 instanceof 会失败——用 ArrayBuffer.isView + 内容断言。
+    expect(sent).not.toBeTypeOf('string');
+    expect(ArrayBuffer.isView(sent)).toBe(true);
+    expect(new TextDecoder().decode(sent as Uint8Array)).toBe('ls');
   });
 
   it('writes binary frames from the server into the terminal', () => {
