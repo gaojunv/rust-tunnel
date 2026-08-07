@@ -53,4 +53,45 @@ describe('ActivityBar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'agent.files' }));
     expect(screen.getByTestId('activity-panel').getAttribute('data-panel')).toBe('files');
   });
+
+  it('shows a resize handle only when a panel is open', () => {
+    renderBar();
+    expect(screen.queryByTestId('activity-panel-resizer')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'agent.files' }));
+    expect(screen.getByTestId('activity-panel-resizer')).toBeTruthy();
+  });
+
+  it('resizes the panel by dragging the handle and clamps to min width', () => {
+    renderBar();
+    fireEvent.click(screen.getByRole('button', { name: 'agent.files' }));
+    const panel = screen.getByTestId('activity-panel');
+    const handle = screen.getByTestId('activity-panel-resizer');
+    // 默认 288px
+    expect(panel.style.width).toBe('288px');
+    // 向右拖 100px → 388px
+    fireEvent.pointerDown(handle, { clientX: 500 });
+    fireEvent.pointerMove(window, { clientX: 600 });
+    fireEvent.pointerUp(window);
+    expect(panel.style.width).toBe('388px');
+    // 向左拖超过最小宽度 → 钳到 200px
+    fireEvent.pointerDown(handle, { clientX: 500 });
+    fireEvent.pointerMove(window, { clientX: 0 });
+    fireEvent.pointerUp(window);
+    expect(panel.style.width).toBe('200px');
+  });
+
+  it('remembers width per panel kind', () => {
+    renderBar();
+    fireEvent.click(screen.getByRole('button', { name: 'agent.git' }));
+    const handle = screen.getByTestId('activity-panel-resizer');
+    fireEvent.pointerDown(handle, { clientX: 500 });
+    fireEvent.pointerMove(window, { clientX: 560 });
+    fireEvent.pointerUp(window);
+    expect(screen.getByTestId('activity-panel').style.width).toBe('380px');
+    // 切到 files 再切回 git，宽度保持
+    fireEvent.click(screen.getByRole('button', { name: 'agent.files' }));
+    expect(screen.getByTestId('activity-panel').style.width).toBe('288px');
+    fireEvent.click(screen.getByRole('button', { name: 'agent.git' }));
+    expect(screen.getByTestId('activity-panel').style.width).toBe('380px');
+  });
 });

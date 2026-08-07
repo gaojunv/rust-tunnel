@@ -775,6 +775,7 @@
     "confirmDeleteSession": "Delete this session? This cannot be undone.",
     "sessionNamePlaceholder": "Session name",
     "activityPanel": "Side panel",
+    "resizePanel": "Drag to resize panel",
     "model": "Models",
     "modelGroups": "Model Groups",
     "selectModel": "Select model…",

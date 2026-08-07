@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Folder, TerminalSquare, GitBranch } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -18,12 +18,19 @@ const ICONS: {
   { kind: 'git', Icon: GitBranch, labelKey: 'agent.git' },
 ];
 
-/** 面板宽度按内容类型映射：终端需要足够列宽（80 列等宽字符），文件树/git 列表用默认窄栏。 */
-const PANEL_WIDTH: Record<PanelKind, string> = {
-  files: 'w-72',
-  git: 'w-80',
-  terminal: 'w-[36rem] max-w-[60vw]',
+/** 面板默认/最小宽度（px）：终端需要足够列宽（80 列等宽字符），文件树/git 列表用窄栏。 */
+const PANEL_DEFAULT_WIDTH: Record<PanelKind, number> = {
+  files: 288,
+  git: 320,
+  terminal: 576,
 };
+const PANEL_MIN_WIDTH: Record<PanelKind, number> = {
+  files: 200,
+  git: 220,
+  terminal: 320,
+};
+/** 面板最大宽度：不超过外层容器宽度的 80%（至少保留对话区可见）。 */
+const MAX_WIDTH_RATIO = 0.8;
 
 interface ActivityBarProps {
   sessionId: string;
@@ -33,11 +40,72 @@ interface ActivityBarProps {
 export default function ActivityBar({ sessionId, workspaceId }: ActivityBarProps) {
   const { t } = useTranslation();
   const [active, setActive] = useState<PanelKind | null>(null);
+  // 每种面板各自记住拖动后的宽度（px）
+  const [widths, setWidths] = useState<Record<PanelKind, number>>({ ...PANEL_DEFAULT_WIDTH });
+  const [dragging, setDragging] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
 
   const toggle = (kind: PanelKind) => setActive((cur) => (cur === kind ? null : kind));
 
+  const onHandlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!active) return;
+      e.preventDefault();
+      const kind = active;
+      const startX = e.clientX;
+      const startWidth = widths[kind];
+      const containerWidth =
+        rootRef.current?.parentElement?.clientWidth || window.innerWidth;
+      const maxWidth = Math.max(
+        PANEL_MIN_WIDTH[kind],
+        Math.floor(containerWidth * MAX_WIDTH_RATIO)
+      );
+      setDragging(true);
+      const onMove = (ev: PointerEvent) => {
+        const w = Math.min(
+          maxWidth,
+          Math.max(PANEL_MIN_WIDTH[kind], startWidth + ev.clientX - startX)
+        );
+        setWidths((cur) => ({ ...cur, [kind]: w }));
+      };
+      const onUp = () => {
+        setDragging(false);
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    [active, widths]
+  );
+
+  // 窗口尺寸变化时把超出上限的宽度钳回合法范围
+  useEffect(() => {
+    const onResize = () => {
+      const containerWidth =
+        rootRef.current?.parentElement?.clientWidth || window.innerWidth;
+      setWidths((cur) => {
+        let changed = false;
+        const next = { ...cur };
+        (Object.keys(next) as PanelKind[]).forEach((k) => {
+          const max = Math.max(
+            PANEL_MIN_WIDTH[k],
+            Math.floor(containerWidth * MAX_WIDTH_RATIO)
+          );
+          if (next[k] > max) {
+            next[k] = max;
+            changed = true;
+          }
+        });
+        return changed ? next : cur;
+      });
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
   return (
-    <div className="flex h-full shrink-0">
+    <div ref={rootRef} className="flex h-full shrink-0">
       {/* 极窄图标栏（VS Code Activity Bar） */}
       <div className="flex w-12 flex-col items-center gap-1 border-r border-border/60 py-2">
         {ICONS.map(({ kind, Icon, labelKey }) => (
@@ -58,22 +126,43 @@ export default function ActivityBar({ sessionId, workspaceId }: ActivityBarProps
         ))}
       </div>
 
-      {/* 可展开面板 */}
+      {/* 可展开面板（宽度可拖动，VS Code 式分隔条） */}
       {active && (
         <div
           data-testid="activity-panel"
           data-panel={active}
           role="region"
           aria-label={t('agent.activityPanel')}
-          className={cn(
-            'flex min-h-0 flex-col overflow-hidden border-r border-border/60',
-            PANEL_WIDTH[active]
-          )}
+          style={{ width: widths[active] }}
+          className="flex min-h-0 shrink-0 flex-col overflow-hidden border-r border-border/60"
         >
           {active === 'files' && <FilesPanel workspaceId={workspaceId} />}
           {active === 'terminal' && <TerminalPanel workspaceId={workspaceId} />}
           {active === 'git' && <GitPanel sessionId={sessionId} workspaceId={workspaceId} />}
         </div>
+      )}
+
+      {/* 拖动手柄：面板展开时位于面板右缘 */}
+      {active && (
+        <div
+          data-testid="activity-panel-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={t('agent.resizePanel')}
+          onPointerDown={onHandlePointerDown}
+          className={cn(
+            'w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/40',
+            dragging ? 'bg-primary/60' : 'bg-transparent'
+          )}
+        />
+      )}
+
+      {/* 拖动中禁用指针事件与文本选择，避免 iframe/终端吞掉 pointermove */}
+      {dragging && (
+        <div
+          className="fixed inset-0 z-50 cursor-col-resize select-none"
+          data-testid="activity-panel-drag-overlay"
+        />
       )}
     </div>
   );

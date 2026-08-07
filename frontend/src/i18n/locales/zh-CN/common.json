@@ -775,6 +775,7 @@
     "confirmDeleteSession": "确定删除该会话？此操作不可撤销。",
     "sessionNamePlaceholder": "会话名称",
     "activityPanel": "侧边面板",
+    "resizePanel": "拖动调整面板宽度",
     "model": "模型",
     "modelGroups": "模型组",
     "selectModel": "选择模型…",
