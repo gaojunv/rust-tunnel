@@ -1,4 +1,5 @@
 import tailwindcssAnimate from "tailwindcss-animate";
+import typography from "@tailwindcss/typography";
 
 /** @type {import('tailwindcss').Config} */
 export default {
@@ -6,6 +7,8 @@ export default {
   content: [
     "./index.html",
     "./src/**/*.{js,ts,jsx,tsx}",
+    // Streamdown 的代码块/表格控件用 Tailwind 类渲染，必须纳入扫描否则生产构建被 purge
+    "./node_modules/streamdown/dist/*.js",
   ],
   theme: {
     container: {
@@ -50,6 +53,7 @@ export default {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        sidebar: "hsl(var(--sidebar))",
         chart: {
           1: "hsl(var(--chart-1))",
           2: "hsl(var(--chart-2))",
@@ -68,5 +72,5 @@ export default {
       },
     },
   },
-  plugins: [tailwindcssAnimate],
+  plugins: [tailwindcssAnimate, typography],
 }

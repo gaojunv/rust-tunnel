@@ -86,22 +86,28 @@ function ToolCard({ item }: { item: ChatItem }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 text-left text-xs font-semibold"
+        className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         <Wrench className="h-3.5 w-3.5 shrink-0 text-primary" />
-        <span>{item.toolName}</span>
+        <span className="font-medium text-foreground/90">{item.toolName}</span>
         {summary && (
-          <span className="truncate font-normal text-muted-foreground">{summary}</span>
+          <span className="min-w-0 truncate font-mono text-muted-foreground">{summary}</span>
         )}
-        {!item.toolResult && <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {!item.toolResult && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+          {open ? (
+            <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+          )}
+        </span>
       </button>
       {open && (
-        <div className="mt-1">
+        <div className="mt-2 border-t border-border/60 pt-2">
           {item.toolArgs && <CollapsiblePre text={item.toolArgs} />}
           {item.toolResult ? (
-            <CollapsiblePre text={item.toolResult} className="mt-2 border-t pt-2" />
+            <CollapsiblePre text={item.toolResult} className={item.toolArgs ? 'mt-2 border-t border-border/60 pt-2' : undefined} />
           ) : (
             <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -115,14 +121,19 @@ function ToolCard({ item }: { item: ChatItem }) {
 }
 
 /** 单条消息气泡：user / assistant（Markdown）/ tool（默认收起的工具卡片）。
- *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。 */
+ *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。
+ *  布局策略（对标主流 AI 聊天 UI）：
+ *  - user：右对齐小气泡（primary 淡底），用户消息一般短，气泡让双方身份一眼可辨
+ *  - assistant：全宽无气泡正文。LLM 回复是长文（标题/列表/表格/代码块），
+ *    套 max-w-[80%] 的圆角盒子会压缩排版空间、且圆角背景让长文显得拥挤
+ *  - tool：全宽细线卡片，视觉上弱于正文（工具是过程，正文是结论） */
 export default memo(function MessageBubble({ item }: { item: ChatItem }) {
   const cls =
     item.kind === 'user'
-      ? 'ml-auto max-w-[80%] rounded-lg bg-primary/10 px-3 py-2'
+      ? 'ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-primary/10 px-3.5 py-2 text-sm leading-relaxed'
       : item.kind === 'assistant'
-        ? 'mr-auto max-w-[80%] rounded-lg bg-muted px-3 py-2'
-        : 'mr-auto max-w-[90%] rounded-lg border bg-background px-3 py-2 text-sm font-mono';
+        ? 'w-full py-0.5'
+        : 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
 
   return (
     <div className={cls}>

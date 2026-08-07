@@ -559,7 +559,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   return (
     <div className="flex h-full flex-col">
       <div
-        className="flex-1 space-y-3 overflow-y-auto p-4"
+        className="flex-1 space-y-4 overflow-y-auto px-5 py-4"
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
@@ -575,7 +575,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             : <MessageBubble key={i} item={it} />
         ))}
         {running && (
-          <div className="flex items-center gap-1 text-sm text-muted-foreground">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
             {t('agent.running')}
           </div>

@@ -423,11 +423,11 @@ describe('ChatStream running state', () => {
     renderChat();
     const userEl = await screen.findByText('普通用户消息');
     const summaryEl = screen.getByText('[上下文摘要] 之前讨论了 X');
-    // summary 走 assistant 气泡样式（mr-auto + bg-muted），而非用户气泡（ml-auto）
+    // 新布局：user 为右对齐小气泡（ml-auto + bg-primary/10）；summary 走
+    // assistant 全宽正文（无气泡，Streamdown 渲染为带 data-streamdown 标记的 DOM）
     const userBubble = userEl.closest('[class*="ml-auto"]');
-    const summaryBubble = summaryEl.closest('[class*="mr-auto"]');
     expect(userBubble?.className).toContain('bg-primary/10');
-    expect(summaryBubble?.className).toContain('bg-muted');
+    expect(summaryEl.closest('[class*="ml-auto"]')).toBeNull();
   });
 
   it('renders approval card and responds on approve', async () => {
