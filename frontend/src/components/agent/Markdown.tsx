@@ -41,12 +41,12 @@ const PreFrame: Components['pre'] = ({ children }) => {
 
 /** 表格（components.table 覆盖）：横向滚动容器 + 干净网格。
  *  Streamdown 默认在表格外再套一层带复制按钮的 wrapper，结构臃肿，这里简化为单层。
- *  边框用 border-separate + 单边（th/td 只画左边+下边）——容器 border 补上边+右边，
- *  拼成完整网格且任意两条线不重合；若用 border-collapse + 每格全 border，单元格
- *  与容器边缘的线会粘成双层、相邻格角点发虚。 */
+ *  边框用 border-collapse：表格边缘的单元格边线会向外塌陷、与容器 border 合并成
+ *  一条，相邻单元格共享边线也合并成一条——整张表任意位置都只有一条 1px 线，
+ *  不会出现"容器边 + 单元格边"的双层。 */
 const Table: Components['table'] = ({ children }) => (
   <div className="my-3 overflow-x-auto rounded-lg border border-border">
-    <table className="w-full border-separate border-spacing-0 text-sm">{children}</table>
+    <table className="w-full border-collapse text-sm">{children}</table>
   </div>
 );
 
@@ -63,9 +63,9 @@ const MD_CLASS = [
   '[&_h2]:!mt-4 [&_h2]:!mb-2 [&_h2]:!text-lg',
   '[&_h3]:!mt-3 [&_h3]:!mb-1.5 [&_h3]:!text-base',
   '[&_p]:!leading-7 [&_li]:!leading-7 [&_li]:!py-0.5 [&_ul]:!my-2 [&_ol]:!my-2',
-  // 表格网格线：border-separate + 单边（左+下），上/右由容器 border 补齐（见 Table）
-  '[&_th]:!border-0 [&_th]:!border-l [&_th]:!border-b [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium first:[&_th]:!border-l-0',
-  '[&_td]:!border-0 [&_td]:!border-l [&_td]:!border-b [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5 first:[&_td]:!border-l-0',
+  // 表格网格线：border-collapse 下单元格画全 border，相邻边与容器边各自合并成一条
+  '[&_th]:!border [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium',
+  '[&_td]:!border [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5',
   // 行内代码
   '[&_code:not(pre_code)]:!rounded [&_code:not(pre_code)]:!bg-muted [&_code:not(pre_code)]:!px-1.5 [&_code:not(pre_code)]:!py-0.5 [&_code:not(pre_code)]:!text-[0.875em]',
   // 代码块：PreFrame 里官方 CodeBlock 容器嵌在我的框内——压掉官方三层结构实现
