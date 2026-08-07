@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
+
 use crate::common::{AgentCommand, AgentResult};
 
 /// 单条命令输出上限（协议 1MB 消息上限内留足余量）
@@ -188,6 +190,7 @@ fn docker_git_cmd(container: &str, root: &str, args: &[&str]) -> String {
 }
 
 /// 单次宿主命令的输出（已按 MAX_OUTPUT 截断）。
+#[derive(Debug)]
 struct CmdOutput {
     stdout: String,
     stderr: String,
@@ -195,13 +198,15 @@ struct CmdOutput {
 }
 
 /// 通过宿主 `sh -c <cmd>` 执行一条命令。`cwd` 为宿主工作目录；docker 模式下传
-/// `None`（工作目录交给 `docker exec -w` 处理，容器路径在宿主机上不一定存在）。
-/// `stdin_data` 为 `Some` 时经 stdin 管道写入子进程（用于 docker write_file）。
+/// `None`（工作目录交给 `docker exec -w` 处理）。`stdin_data` 为 `Some` 时经 stdin
+/// 管道写入子进程。`cancel_rx` 为 `Some` 时支持中途取消：进程以进程组方式 spawn，
+/// 取消或超时都 SIGKILL 整个进程组（含孙进程，避免 `sh` 被杀而 `cargo build` 成孤儿）。
 async fn run_host(
     cmd: &str,
     cwd: Option<&Path>,
     stdin_data: Option<&str>,
     timeout: Duration,
+    cancel_rx: Option<&mut oneshot::Receiver<()>>,
 ) -> Result<CmdOutput, String> {
     let mut command = tokio::process::Command::new("sh");
     command
@@ -210,6 +215,10 @@ async fn run_host(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        command.process_group(0); // 子进程成为进程组组长，pid == pgid
+    }
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
@@ -223,7 +232,7 @@ async fn run_host(
         .spawn()
         .map_err(|e| format!("spawn shell failed: {e}"))?;
 
-    // 写入 stdin 的任务独立于 wait_with_output 运行，避免读写互相阻塞。
+    // stdin 写入 task（独立于 wait 运行，避免读写互相阻塞）。
     let writer = match (stdin_data, child.stdin.take()) {
         (Some(data), Some(mut si)) => {
             let data = data.to_string();
@@ -236,31 +245,88 @@ async fn run_host(
         _ => None,
     };
 
-    let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let output = match output {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            if let Some(w) = writer {
-                let _ = w.await;
+    // stdout/stderr 读 task：各自持有管道并把输出搬进独立 Vec，child 只被 wait
+    // （保留 kill 能力）。wait 结束后 join 回收读出的字节。
+    let stdout_reader = child.stdout.take().map(|mut so| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match so.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
             }
-            return Err(format!("spawn shell failed: {e}"));
-        }
-        Err(_) => {
-            if let Some(w) = writer {
-                let _ = w.await;
+            out
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut se| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut out = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match se.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
             }
-            return Err(format!("command timed out after {}s", timeout.as_secs()));
+            out
+        })
+    });
+
+    // 进程组 kill：取消/超时统一走这里。
+    fn kill_group(child: &mut tokio::process::Child) {
+        if let Some(pid) = child.id() {
+            // SAFETY: 只 kill 本次 spawn 建立的进程组，pid 为组长。
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
-    };
-    if let Some(w) = writer {
-        let _ = w.await;
     }
 
-    Ok(CmdOutput {
-        stdout: truncate_output(String::from_utf8_lossy(&output.stdout).into_owned()),
-        stderr: truncate_output(String::from_utf8_lossy(&output.stderr).into_owned()),
-        exit_code: output.status.code().unwrap_or(-1),
-    })
+    let outcome = if let Some(cr) = cancel_rx {
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| format!("wait failed: {e}")),
+            _ = cr => Err("command cancelled".to_string()),
+            _ = tokio::time::sleep(timeout) => Err(format!("command timed out after {}s", timeout.as_secs())),
+        }
+    } else {
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(e)) => Err(format!("wait failed: {e}")),
+            Err(_) => Err(format!("command timed out after {}s", timeout.as_secs())),
+        }
+    };
+
+    let output = match outcome {
+        Ok(status) => {
+            if let Some(w) = writer {
+                let _ = w.await;
+            }
+            let stdout = match stdout_reader {
+                Some(h) => h.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let stderr = match stderr_reader {
+                Some(h) => h.await.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            CmdOutput {
+                stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
+                stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
+                exit_code: status.code().unwrap_or(-1),
+            }
+        }
+        Err(msg) => {
+            kill_group(&mut child);
+            let _ = child.wait().await; // 收割僵尸
+            if let Some(w) = writer {
+                let _ = w.await;
+            }
+            return Err(msg);
+        }
+    };
+    Ok(output)
 }
 
 /// 执行一条 AgentCommand，全部在 root_path 沙箱内；永不 panic，错误归一为
@@ -447,7 +513,7 @@ async fn shell_exec(
         Some(c) => (docker_shell_cmd(c, &workdir.to_string_lossy(), cmd), None),
         None => (cmd.to_string(), Some(workdir.as_path())),
     };
-    match run_host(&host_cmd, host_cwd, None, timeout).await {
+    match run_host(&host_cmd, host_cwd, None, timeout, None).await {
         Ok(out) => AgentResult::Shell {
             stdout: out.stdout,
             stderr: out.stderr,
@@ -485,7 +551,7 @@ async fn docker_read_file(container: &str, abs: &Path, timeout: Duration) -> Age
         sh_quote(container),
         sh_quote(&abs.to_string_lossy()),
     );
-    match run_host(&cmd, None, None, timeout).await {
+    match run_host(&cmd, None, None, timeout, None).await {
         Ok(out) if out.exit_code == 0 => AgentResult::FileContent {
             content: out.stdout,
         },
@@ -510,7 +576,7 @@ async fn docker_write_file(
         sh_quote(container),
         sh_quote(&inner)
     );
-    match run_host(&cmd, None, Some(content), timeout).await {
+    match run_host(&cmd, None, Some(content), timeout, None).await {
         Ok(out) if out.exit_code == 0 => AgentResult::Success,
         Ok(out) => AgentResult::Error {
             message: format!("write {} failed: {}", abs.display(), out.stderr.trim()),
@@ -526,7 +592,7 @@ async fn docker_list_dir(container: &str, abs: &Path, timeout: Duration) -> Agen
         sh_quote(container),
         sh_quote(&abs.to_string_lossy()),
     );
-    match run_host(&cmd, None, None, timeout).await {
+    match run_host(&cmd, None, None, timeout, None).await {
         Ok(out) if out.exit_code == 0 => {
             let mut lines: Vec<String> = out.stdout.lines().map(str::to_string).collect();
             lines.sort();
@@ -553,7 +619,7 @@ async fn git_exec(
     let output = match docker_container {
         Some(c) => {
             let cmd = docker_git_cmd(c, &root_path.to_string_lossy(), args);
-            match run_host(&cmd, None, None, timeout).await {
+            match run_host(&cmd, None, None, timeout, None).await {
                 Ok(out) => out,
                 Err(message) => return AgentResult::Error { message },
             }
@@ -760,6 +826,25 @@ mod tests {
             AgentResult::Error { message } => assert!(message.contains("timed out")),
             other => panic!("expected timeout Error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_host_cancel_kills_process_group() {
+        use tokio::sync::oneshot;
+        let (tx, mut rx) = oneshot::channel();
+        // 起一个会生成子进程的 sleep，验证进程组整体被杀
+        let handle = tokio::spawn(async move {
+            run_host("sleep 30 & wait", None, None, Duration::from_secs(60), Some(&mut rx))
+                .await
+        });
+        // 给 spawn + 进程组建立留时间
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = tx.send(());
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("cancel should not hang")
+            .unwrap(); // 移除 JoinError 层，得到 run_host 的 Result
+        assert!(res.is_err(), "cancel should yield Err, got {:?}", res);
     }
 
     #[tokio::test]

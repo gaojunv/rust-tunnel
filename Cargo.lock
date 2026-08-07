@@ -4572,6 +4572,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "jsonwebtoken",
+ "libc",
  "lopdf",
  "md-5",
  "mime_guess",

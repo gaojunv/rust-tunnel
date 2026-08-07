@@ -147,3 +147,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures-util = "0.3"
 # 集成测试用纯 Rust SS 客户端（ProxyClientStream），版本与主依赖保持一致
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
+
+# 进程组 kill（run_host 取消/超时时 SIGKILL 整个进程组，避免孙进程成孤儿）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
