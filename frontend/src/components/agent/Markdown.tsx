@@ -41,8 +41,9 @@ const PreFrame: Components['pre'] = ({ children }) => {
 
 /** 表格（components.table 覆盖）：横向滚动容器 + 干净网格。
  *  Streamdown 默认在表格外再套一层带复制按钮的 wrapper，结构臃肿，这里简化为单层。
- *  边框：容器 border 提供外框（下/右），tr 画顶线、th/td 画右+下（border-collapse
- *  合并相邻共享边）——任何位置只有一条 1px 线，不出现容器边与单元格边并列的 2px。 */
+ *  边框：容器 border 提供外框，单元格只画内部线（竖线 border-r 去末列，
+ *  横线由 tr border-t 承担、表头行除外）——容器边框与任何单元格边框都不相邻，
+ *  任何位置只有一条 1px 线，无双层。 */
 const Table: Components['table'] = ({ children }) => (
   <div className="my-3 overflow-x-auto rounded-lg border border-border">
     <table className="w-full border-collapse text-sm">{children}</table>
@@ -62,11 +63,15 @@ const MD_CLASS = [
   '[&_h2]:!mt-4 [&_h2]:!mb-2 [&_h2]:!text-lg',
   '[&_h3]:!mt-3 [&_h3]:!mb-1.5 [&_h3]:!text-base',
   '[&_p]:!leading-7 [&_li]:!leading-7 [&_li]:!py-0.5 [&_ul]:!my-2 [&_ol]:!my-2',
-  // 表格网格线：border-collapse + 单元格只画右/下——内部相邻边 collapse 合并成一条；
-  // 左/上/容器边各补一条，任何位置都不出现"容器边 + 单元格边"并列的 2px 粗线
-  '[&_th]:!border-0 [&_th]:!border-r [&_th]:!border-b [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium',
-  '[&_td]:!border-0 [&_td]:!border-r [&_td]:!border-b [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5',
-  '[&_tr]:!border-0 [&_tr]:!border-t [&_tr]:!border-border first:[&_tr]:!border-t-0',
+  // 表格网格线：容器 div 的 border 不参与表格的 border-collapse 模型，所以
+  // 任何贴着表格外缘的单元格边框都会与容器边框并列成双层 2px。规则：
+  // - 竖线：th/td 只画 border-r，且末列去掉（否则与容器右边框双层）
+  // - 横线：全部由 tr 的 border-t 承担（行顶线永远碰不到容器顶/底边框），
+  //   表头行去顶线（[thead_tr] 精确选择；不能用 first: 变体——它作用于容器自身）
+  // - 单元格不画 border-b（否则末行与容器底边框双层）
+  '[&_th]:!border-0 [&_th]:!border-r [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium [&_th:last-child]:!border-r-0',
+  '[&_td]:!border-0 [&_td]:!border-r [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5 [&_td:last-child]:!border-r-0',
+  '[&_tr]:!border-0 [&_tr]:!border-t [&_tr]:!border-border [&_thead_tr]:!border-t-0',
   // 行内代码
   '[&_code:not(pre_code)]:!rounded [&_code:not(pre_code)]:!bg-muted [&_code:not(pre_code)]:!px-1.5 [&_code:not(pre_code)]:!py-0.5 [&_code:not(pre_code)]:!text-[0.875em]',
   // 代码块：PreFrame 里官方 CodeBlock 容器嵌在我的框内——压掉官方三层结构实现
