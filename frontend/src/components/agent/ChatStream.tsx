@@ -18,7 +18,7 @@ import ModelSelect from './ModelSelect';
 
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
 /** 流式 chunk 合并 flush 间隔：token 级 WS 帧攒批后一次性写 state，避免每 token 全列表重渲染。 */
-const STREAM_FLUSH_MS = 50;
+export const STREAM_FLUSH_MS = 50;
 
 interface Props {
   sessionId: string;
@@ -285,12 +285,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           });
         }
       } else if (msg.type === 'stream_reset') {
-        // 上游流传输失败重试：丢弃已缓冲的半截增量，移除当前流式气泡，
-        // 让重试的完整文本从新气泡开始（后续 status 帧会提示重试次数）。
+        // 上游流传输失败重试：丢弃已缓冲的半截增量，并真正移除已 flush 实体化
+        // 的半截气泡，让重试的完整文本从新气泡开始（后续 status 帧会提示重试次数）。
+        const idx = streamingIdxRef.current;
         chunkBufRef.current = '';
-        flushChunks();
+        flushChunks(); // 清缓冲后为 no-op，仅取消 pending flush 定时器
         setItems((prev) => {
           streamingIdxRef.current = null;
+          if (idx !== null && prev[idx]?.kind === 'assistant') {
+            return prev.filter((_, i) => i !== idx); // 真正移除半截气泡
+          }
           return prev;
         });
       } else if (msg.type === 'tool_call') {

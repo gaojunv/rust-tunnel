@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from 'vite
 import { cleanup, render, screen, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { listAgentMessages, listWorkspaceFiles } from '../../api/client';
-import ChatStream from './ChatStream';
+import ChatStream, { STREAM_FLUSH_MS } from './ChatStream';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
@@ -251,6 +251,45 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'assistant_chunk', content: '完整内容', final: true });
     });
     // 半截内容被丢弃：界面上只出现「正在重试」提示 + 完整内容气泡
+    expect(screen.getByText(/上游连接中断，正在重试/)).toBeTruthy();
+    expect(screen.getByText('完整内容')).toBeTruthy();
+    expect(screen.queryByText('半截内容')).toBeNull();
+  });
+
+  it('stream_reset 真正移除已 flush 实体化的半截气泡（定时 flush 后重置）', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    // 捕获 STREAM_FLUSH_MS 定时器回调并手动触发：真实浏览器里 50ms 定时器在
+    // 流式期间必然已触发，半截早已实体化为可见气泡，stream_reset 必须按 idx
+    // 真正移除它（不能只断开流式引用）。task-9 报告：vitest v4 + jsdom 下
+    // vi.advanceTimersByTime 驱动不了模块内 setTimeout，故用 spy 捕获手动触发
+    // （与「10 分钟超时」测试同款手法）。帧序与真实服务端一致：半截 chunk →
+    // stream_reset → status(重试提示) → 完整 chunk（见 runner.rs 传输层失败重试）。
+    let flushCb: (() => void) | undefined;
+    const origSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        if (ms === STREAM_FLUSH_MS) {
+          flushCb = cb;
+          return {} as unknown as ReturnType<typeof setTimeout>; // 不真正调度，测试手动触发
+        }
+        return origSetTimeout(cb, ms ?? 0) as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+    );
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '半截内容', final: false });
+    });
+    // 模拟 STREAM_FLUSH_MS 后定时 flush：半截内容实体化为可见气泡
+    act(() => {
+      flushCb?.();
+    });
+    expect(screen.getByText('半截内容')).toBeTruthy();
+    act(() => {
+      wsInstance!.emit({ type: 'stream_reset' });
+      wsInstance!.emit({ type: 'status', message: '上游连接中断，正在重试 (1/2)' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '完整内容', final: true });
+    });
+    // 半截气泡被真正移除：界面上只剩重试提示 + 完整内容
     expect(screen.getByText(/上游连接中断，正在重试/)).toBeTruthy();
     expect(screen.getByText('完整内容')).toBeTruthy();
     expect(screen.queryByText('半截内容')).toBeNull();
