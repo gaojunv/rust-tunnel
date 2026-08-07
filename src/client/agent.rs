@@ -370,10 +370,12 @@ pub async fn handle_exec_request(
     root_path: &Path,
     timeout: Duration,
     docker_container: Option<&str>,
+    cancel_rx: Option<&mut oneshot::Receiver<()>>,
 ) -> AgentResult {
     match command {
         AgentCommand::Shell { cmd, cwd } => {
-            shell_exec(cmd, cwd.as_deref(), root_path, docker_container, timeout).await
+            shell_exec(cmd, cwd.as_deref(), root_path, docker_container, timeout, cancel_rx)
+                .await
         }
         AgentCommand::ReadFile { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
@@ -486,7 +488,8 @@ pub async fn handle_exec_request(
                 sh_quote(pattern),
                 SEARCH_MAX_HITS + 1,
             );
-            let shell_result = shell_exec(&cmd, None, &workdir, docker_container, timeout).await;
+            let shell_result =
+                shell_exec(&cmd, None, &workdir, docker_container, timeout, cancel_rx).await;
             grep_search_result(pattern, shell_result)
         }
         AgentCommand::PatchFile {
@@ -534,6 +537,7 @@ async fn shell_exec(
     root_path: &Path,
     docker_container: Option<&str>,
     timeout: Duration,
+    cancel_rx: Option<&mut oneshot::Receiver<()>>,
 ) -> AgentResult {
     let workdir = match cwd {
         Some(c) => match resolve_sandboxed(root_path, c) {
@@ -546,7 +550,7 @@ async fn shell_exec(
         Some(c) => (docker_shell_cmd(c, &workdir.to_string_lossy(), cmd), None),
         None => (cmd.to_string(), Some(workdir.as_path())),
     };
-    match run_host(&host_cmd, host_cwd, None, timeout, None).await {
+    match run_host(&host_cmd, host_cwd, None, timeout, cancel_rx).await {
         Ok(out) => AgentResult::Shell {
             stdout: out.stdout,
             stderr: out.stderr,
@@ -736,6 +740,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await;
         match result {
@@ -763,6 +768,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await;
         match result {
@@ -787,6 +793,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await;
         assert!(matches!(wr, AgentResult::Success));
@@ -797,6 +804,7 @@ mod tests {
             },
             dir.path(),
             Duration::from_secs(5),
+            None,
             None,
         )
         .await;
@@ -816,6 +824,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(5),
             None,
+            None,
         )
         .await;
         assert!(matches!(rd, AgentResult::Error { .. }));
@@ -830,6 +839,7 @@ mod tests {
             &AgentCommand::ListDir { path: ".".into() },
             dir.path(),
             Duration::from_secs(5),
+            None,
             None,
         )
         .await;
@@ -852,6 +862,7 @@ mod tests {
             },
             dir.path(),
             Duration::from_millis(200),
+            None,
             None,
         )
         .await;
@@ -957,6 +968,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(10),
             None,
+            None,
         )
         .await;
         match result {
@@ -1014,6 +1026,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(10),
             None,
+            None,
         )
         .await;
         match status {
@@ -1028,6 +1041,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(10),
             None,
+            None,
         )
         .await;
         match commit {
@@ -1040,6 +1054,7 @@ mod tests {
             &AgentCommand::GitStatus,
             dir.path(),
             Duration::from_secs(10),
+            None,
             None,
         )
         .await;
@@ -1061,6 +1076,7 @@ mod tests {
             dir.path(),
             Duration::from_secs(10),
             None,
+            None,
         )
         .await;
 
@@ -1069,6 +1085,7 @@ mod tests {
             &AgentCommand::GitDiff { path: None },
             dir.path(),
             Duration::from_secs(10),
+            None,
             None,
         )
         .await;
@@ -1088,6 +1105,7 @@ mod tests {
             &AgentCommand::GitStatus,
             dir.path(),
             Duration::from_secs(10),
+            None,
             None,
         )
         .await;
@@ -1172,7 +1190,7 @@ mod tests {
         };
         for container in [None, Some("agent-test")] {
             let result =
-                handle_exec_request(&cmd, &root, Duration::from_secs(10), container).await;
+                handle_exec_request(&cmd, &root, Duration::from_secs(10), container, None).await;
             let AgentResult::Error { message } = result else {
                 panic!("expected Error for container = {container:?}");
             };
@@ -1198,6 +1216,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             container,
+            None,
         )
         .await
     }
@@ -1475,6 +1494,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         match result {
@@ -1502,6 +1522,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         // 父目录不存在 → cat 失败，返回 Error（MVP 行为，文档中已注明）
@@ -1516,6 +1537,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         assert!(matches!(mk, AgentResult::Shell { exit_code: 0, .. }));
@@ -1528,6 +1550,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         assert!(matches!(wr, AgentResult::Success));
@@ -1539,6 +1562,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         match rd {
@@ -1551,6 +1575,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
         match ls {
@@ -1569,6 +1594,7 @@ mod tests {
             root,
             Duration::from_secs(10),
             Some("agent-test"),
+            None,
         )
         .await;
     }

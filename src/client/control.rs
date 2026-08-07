@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{debug, error, info, warn};
@@ -41,6 +41,8 @@ pub struct ClientState {
     /// Sender for control messages to server
     pub control_sender: ControlSender,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
+    /// 进行中的 agent exec 取消句柄：request_id → cancel 信号发送端。
+    exec_cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
 }
 
 impl ClientState {
@@ -49,6 +51,7 @@ impl ClientState {
             config,
             control_sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            exec_cancels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -135,6 +138,31 @@ impl ClientState {
 
     pub async fn close_connection(&self, connection_id: u64) {
         self.remove_connection(connection_id).await;
+    }
+
+    /// 注册一次 exec 的取消句柄；`handle_exec_request` 结束后由调用方注销。
+    pub async fn register_exec_cancel(&self, request_id: &str, tx: oneshot::Sender<()>) {
+        self.exec_cancels
+            .lock()
+            .await
+            .insert(request_id.to_string(), tx);
+    }
+
+    /// 收到 `AgentExecCancel`：触发对应 exec 取消。返回 false 表示无此执行
+    /// （命令已结束/超时），调用方静默忽略。
+    pub async fn cancel_exec(&self, request_id: &str) -> bool {
+        let removed = self.exec_cancels.lock().await.remove(request_id);
+        if let Some(tx) = removed {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 注销一个 exec 的取消句柄（执行正常结束后）。
+    pub async fn deregister_exec_cancel(&self, request_id: &str) {
+        self.exec_cancels.lock().await.remove(request_id);
     }
 }
 
@@ -253,14 +281,19 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         // delivered in the request (in docker mode it is the
                         // container-side root; commands are wrapped in `docker exec`).
                         let root = std::path::PathBuf::from(root_path);
+                        let state2 = state.clone();
+                        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+                        state.register_exec_cancel(&request_id, cancel_tx).await;
                         tokio::spawn(async move {
                             let result = crate::client::agent::handle_exec_request(
                                 &command,
                                 &root,
                                 std::time::Duration::from_secs(120),
                                 docker_container.as_deref(),
+                                Some(&mut cancel_rx),
                             )
                             .await;
+                            state2.deregister_exec_cancel(&request_id).await;
                             let _ = sender
                                 .send(ControlMessage::AgentExecResponse {
                                     session_id,
@@ -269,6 +302,11 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                 })
                                 .await;
                         });
+                    }
+                    ControlMessage::AgentExecCancel { request_id } => {
+                        if !state.cancel_exec(&request_id).await {
+                            debug!("cancel for unknown exec request_id {}", request_id);
+                        }
                     }
                     ControlMessage::Disconnect { reason } => {
                         info!("Server requested disconnect: {}", reason);
@@ -796,5 +834,20 @@ mod tests {
             }
             other => panic!("expected AgentExecResponse, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_cancel_roundtrip_on_control_channel() {
+        // 最小化验证：AgentExecCancel 经 ControlMessage 可序列化/反序列化并触发 cancel_exec
+        let msg = ControlMessage::AgentExecCancel {
+            request_id: "req-x".into(),
+        };
+        let bytes = msg.serialize().unwrap();
+        // serialize 输出为 4 字节长度前缀 + bincode 载荷；deserialize 仅解析载荷
+        let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlMessage::AgentExecCancel { request_id } if request_id == "req-x"
+        ));
     }
 }
