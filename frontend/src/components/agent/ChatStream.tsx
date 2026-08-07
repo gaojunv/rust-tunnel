@@ -284,6 +284,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             return prev;
           });
         }
+      } else if (msg.type === 'stream_reset') {
+        // 上游流传输失败重试：丢弃已缓冲的半截增量，移除当前流式气泡，
+        // 让重试的完整文本从新气泡开始（后续 status 帧会提示重试次数）。
+        chunkBufRef.current = '';
+        flushChunks();
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return prev;
+        });
       } else if (msg.type === 'tool_call') {
         if (msg.id) pendingTools.add(msg.id);
         // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）

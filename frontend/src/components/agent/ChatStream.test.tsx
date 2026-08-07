@@ -240,6 +240,22 @@ describe('ChatStream running state', () => {
     expect(bubbles).toHaveLength(1);
   });
 
+  it('stream_reset 清空半截流式气泡并保留后续新流', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      // 流式增量 → stream_reset → 状态提示 → 重试后的完整文本
+      wsInstance!.emit({ type: 'assistant_chunk', content: '半截内容', final: false });
+      wsInstance!.emit({ type: 'stream_reset' });
+      wsInstance!.emit({ type: 'status', message: '上游连接中断，正在重试 (1/2)' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '完整内容', final: true });
+    });
+    // 半截内容被丢弃：界面上只出现「正在重试」提示 + 完整内容气泡
+    expect(screen.getByText(/上游连接中断，正在重试/)).toBeTruthy();
+    expect(screen.getByText('完整内容')).toBeTruthy();
+    expect(screen.queryByText('半截内容')).toBeNull();
+  });
+
   it('status closes the current streaming bubble before appending the hint', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();

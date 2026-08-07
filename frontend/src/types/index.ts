@@ -565,7 +565,9 @@ export type AgentWsEvent =
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }
   | { type: 'approval_request'; request_id: string; tool: string; summary: string; args_preview: string }
-  | { type: 'error'; message?: string };
+  | { type: 'error'; message?: string }
+  // 上游流传输失败重试信号：前端应丢弃已缓冲的半截增量，等重试后的完整文本从新气泡开始
+  | { type: 'stream_reset' };
 
 export interface FsEntry {
   name: string;
