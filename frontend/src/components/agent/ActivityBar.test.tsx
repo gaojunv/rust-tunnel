@@ -20,7 +20,7 @@ const renderBar = () => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <ActivityBar sessionId="s1" />
+      <ActivityBar sessionId="s1" workspaceId="w1" />
     </QueryClientProvider>
   );
 };

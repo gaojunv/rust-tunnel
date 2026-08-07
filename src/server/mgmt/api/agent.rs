@@ -10,9 +10,10 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::server::agent::session::SessionRuntime;
-use crate::server::auth::validate_token;
+use crate::server::auth::{validate_token, AuthConfig};
 use crate::server::llm::ChatMessage;
 
 use super::ApiState;
@@ -120,6 +121,216 @@ pub async fn agent_ws(
     }
     ws.on_upgrade(move |socket| handle_agent_socket(state, socket, params.session_id))
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalWsQuery {
+    pub workspace_id: String,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+    pub token: Option<String>,
+}
+
+/// GET `/api/agent/terminal/ws?workspace_id=xxx&cols=..&rows=..&token=<jwt>`
+/// Public route; JWT validated from query param（同 `agent_ws`，浏览器 WebSocket
+/// 无法带 Authorization header）。
+pub async fn terminal_ws(
+    State(state): State<ApiState>,
+    Query(params): Query<TerminalWsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    // 与 agent_ws 相同的 JWT 校验；抽成纯函数以便单测——WebSocketUpgrade 无法在
+    // 单元测试中构造（内部字段私有、依赖真实握手），见 tests::test_terminal_ws_auth_status。
+    if let Some(status) = terminal_ws_auth_status(&state.auth_config, params.token.as_deref()) {
+        return status.into_response();
+    }
+    ws.on_upgrade(move |socket| handle_terminal_socket(state, socket, params))
+        .into_response()
+}
+
+/// WS 公共路由的 JWT 校验：auth 未启用 → None（放行）；启用且 token 缺失/非法
+/// → Some(401)。与 `agent_ws` 的内联 4 行逻辑等价，抽出来只为让拒绝路径可单测。
+fn terminal_ws_auth_status(auth_config: &AuthConfig, token: Option<&str>) -> Option<StatusCode> {
+    if auth_config.is_enabled() {
+        let token = token.unwrap_or("");
+        if token.is_empty() || validate_token(token, &auth_config.jwt_secret).is_err() {
+            return Some(StatusCode::UNAUTHORIZED);
+        }
+    }
+    None
+}
+
+/// PTY 协商帧：首行 JSON，`\n` 结尾（`client::pty` 服务端协议约定）。shell 为
+/// None（host runtime）时不带该字段，客户端回退系统默认 shell。
+#[derive(serde::Serialize)]
+struct PtyNegotiation<'a> {
+    rows: u16,
+    cols: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shell: Option<&'a str>,
+}
+
+/// 向 WebSocket 下发一个文本错误帧（终端协议错误上报方式：握手完成后无 HTTP
+/// 状态码，错误以文本帧传达后由调用方关闭连接）。
+async fn send_ws_error<S>(sink: &mut S, message: &str)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let _ = sink.send(Message::Text(message.to_string())).await;
+}
+
+/// 浏览器 ↔ WebSocket ↔ `OpenTunnel` 字节流 ↔ 客户端回环 PTY 服务的桥接入口。
+/// 握手已完成，错误无 HTTP 状态码可用，统一以文本错误帧下发后关闭连接。
+async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: TerminalWsQuery) {
+    // 终端尺寸钳制到 1..=500，防止畸形 query 让客户端分配超大 PTY。
+    let cols = params.cols.unwrap_or(80).clamp(1, 500);
+    let rows = params.rows.unwrap_or(24).clamp(1, 500);
+
+    let (mut ws_sink, ws_stream) = socket.split();
+
+    // 1. agent 工作台未初始化（配置未启用）→ 错误帧
+    let Some(agent) = state.server_state.agent_state else {
+        send_ws_error(&mut ws_sink, "agent workbench not initialized").await;
+        return;
+    };
+
+    // 2. workspace 记录加载；不存在 → 错误帧
+    let ws = match agent.db.agent_get_workspace(&params.workspace_id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => {
+            send_ws_error(&mut ws_sink, "workspace not found").await;
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("terminal ws: load workspace failed: {e}");
+            send_ws_error(&mut ws_sink, "failed to load workspace").await;
+            return;
+        }
+    };
+
+    // docker 运行时必须有 container_id，否则没有 shell 可 exec
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        send_ws_error(&mut ws_sink, "docker container not started").await;
+        return;
+    }
+
+    // 3. 版本门控：离线（get 返回 None，无版本信息）与过旧（< 0.3.0）都视为
+    //    不支持——老客户端没有 PTY 服务，建隧道只会连到客户端上不存在的端口。
+    let entry = agent.registry.get(&ws.client_id).await;
+    let version = entry.as_ref().and_then(|e| e.client_version.clone());
+    if !crate::server::agent::runner::client_supports_terminal(version.as_deref()) {
+        let message = if entry.is_none() {
+            "client offline or too old (requires >= 0.3.0)"
+        } else {
+            "terminal requires client >= 0.3.0; please upgrade the client"
+        };
+        send_ws_error(&mut ws_sink, message).await;
+        return;
+    }
+
+    // 4. 协商帧的 shell 字段：host 用系统默认 shell（缺省）；docker 用整串
+    //    `docker exec -it <ctr> sh`。container_id 来自用户配置，理论上可含空格/
+    //    引号——但这是 JSON 字符串而非 shell 拼接，客户端 `sh -c` 自行处理，
+    //    服务端原样透传即可。
+    let shell: Option<String> = match ws.runtime_type.as_str() {
+        "docker" => Some(format!(
+            "docker exec -it {} sh",
+            ws.docker_container_id
+                .as_deref()
+                .expect("docker container id checked above")
+        )),
+        _ => None,
+    };
+
+    // 5. 建立到客户端回环 PTY 服务的隧道。MVP：客户端 `--agent-pty-port` 可覆盖
+    //    监听端口，但服务端无从得知覆盖值，只能硬编码默认端口常量。
+    let target = format!("127.0.0.1:{}", crate::client::pty::DEFAULT_PTY_PORT);
+    let mut tunnel = match agent.registry.open_tunnel(&ws.client_id, &target).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("terminal ws: open tunnel to {target} failed: {e}");
+            send_ws_error(
+                &mut ws_sink,
+                &format!("failed to open tunnel to client PTY service: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // 6. 写首行协商帧（JSON + '\n'）。写失败说明隧道已断，直接返回；
+    //    tunnel drop 会自动向客户端发 Close 释放对端 PTY 连接。
+    let negotiation = PtyNegotiation {
+        rows,
+        cols,
+        shell: shell.as_deref(),
+    };
+    let mut frame = serde_json::to_vec(&negotiation)
+        .expect("serde_json::to_vec on a flat struct is infallible");
+    frame.push(b'\n');
+    if let Err(e) = tunnel.write_all(&frame).await {
+        tracing::warn!("terminal ws: write PTY negotiation frame failed: {e}");
+        return;
+    }
+
+    // 7. 双向桥接：WS binary ↔ 隧道字节流。
+    bridge_terminal(ws_sink, ws_stream, tunnel).await;
+}
+
+/// 双向桥接：WS binary ↔ 隧道字节流。任一方向结束即整体退出（tunnel drop 发
+/// Close 给客户端，WS 连接随之关闭）。`tokio::io::split` 把隧道拆成读/写两半，
+/// 供 select! 两个分支同时借用。
+async fn bridge_terminal(
+    mut ws_sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut ws_stream: futures_util::stream::SplitStream<WebSocket>,
+    tunnel: crate::server::tunnel_stream::ClientTunnelStream,
+) {
+    let (mut tunnel_rd, mut tunnel_wr) = tokio::io::split(tunnel);
+    let mut buf = vec![0u8; 4096];
+    tokio::select! {
+        // 方向一：隧道 → WebSocket。隧道 EOF（读 0）或任一侧出错即结束。
+        res = async {
+            loop {
+                match tunnel_rd.read(&mut buf).await {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => {
+                        if ws_sink.send(Message::Binary(buf[..n].to_vec())).await.is_err() {
+                            break Err("ws send failed".to_string());
+                        }
+                    }
+                    Err(e) => break Err(format!("tunnel read failed: {e}")),
+                }
+            }
+        } => {
+            match res {
+                Ok(()) => tracing::debug!("terminal ws: tunnel EOF, closing"),
+                Err(e) => tracing::warn!("terminal ws: tunnel→ws ended: {e}"),
+            }
+        }
+        // 方向二：WebSocket → 隧道。Close/EOF/错误即结束；Text/Ping/Pong 忽略
+        // （协议只用 Binary；浏览器对服务端 ping 自动回 pong，且自身从不发 ping）。
+        res = async {
+            loop {
+                match ws_stream.next().await {
+                    Some(Ok(Message::Binary(data))) => {
+                        if tunnel_wr.write_all(&data).await.is_err() {
+                            break Err("tunnel write failed".to_string());
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break Ok(()),
+                    // Text/Ping/Pong 忽略：协议只用 Binary。浏览器对服务端 ping 自动
+                    // 回 pong、且自身从不发 ping，服务端无需处理。
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break Err("ws stream error".to_string()),
+                }
+            }
+        } => {
+            match res {
+                Ok(()) => tracing::debug!("terminal ws: ws closed by peer, ending"),
+                Err(e) => tracing::warn!("terminal ws: ws→tunnel ended: {e}"),
+            }
+        }
+    }
 }
 
 /// 会话模型「下一条消息生效」：每轮从 DB 重读 `session.model`，若已设置（非空）
@@ -621,6 +832,198 @@ pub async fn delete_workspace(
 pub struct WorkspaceFilesQuery {
     pub q: String,
     pub limit: Option<usize>,
+}
+
+/// 面板执行辅助：加载 workspace、docker container 存在性检查、经隧道执行命令。
+/// 错误一律映射为 HTTP 响应（404/503），与 `list_workspace_files` 的语义一致：
+/// 客户端离线/隧道失败/exec 错误 → 503（前端区分「离线」与「空结果」）。
+async fn workspace_exec(
+    state: &ApiState,
+    workspace_id: &str,
+    command: crate::common::AgentCommand,
+) -> Result<crate::common::AgentResult, axum::response::Response> {
+    let Some(agent) = &state.server_state.agent_state else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let ws = match agent.db.agent_get_workspace(workspace_id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let result = crate::server::agent::executor::exec_on_client(
+        agent,
+        &ws.id,
+        &ws.client_id,
+        &ws.root_path,
+        ws.docker_container_id.as_deref(),
+        command,
+    )
+    .await;
+    match result {
+        crate::common::AgentResult::Error { .. } => {
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+        ok => Ok(ok),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FsPathQuery {
+    /// 相对工作区根的路径；tree 默认 "."，file 必填。
+    pub path: Option<String>,
+}
+
+/// GET /api/agent/workspaces/:id/fs/tree?path=<rel>
+/// FilesPanel 目录树数据源：ListDir 输出（目录以 '/' 结尾）解析为结构化 JSON。
+pub async fn get_fs_tree(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<FsPathQuery>,
+) -> impl IntoResponse {
+    let path = params.path.unwrap_or_else(|| ".".to_string());
+    let result = match workspace_exec(&state, &id, crate::common::AgentCommand::ListDir { path })
+        .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let crate::common::AgentResult::FileContent { content } = result else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let entries: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let is_dir = l.ends_with('/');
+            let name = l.strip_suffix('/').unwrap_or(l);
+            serde_json::json!({ "name": name, "is_dir": is_dir })
+        })
+        .collect();
+    Json(serde_json::json!({ "entries": entries })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/fs/file?path=<rel>
+/// FilesPanel 文件预览：返回内容与截断标记（客户端 100KB 截断惯例 `[truncated]`）。
+pub async fn get_fs_file(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<FsPathQuery>,
+) -> impl IntoResponse {
+    let Some(path) = params.path.filter(|p| !p.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    };
+    let result = match workspace_exec(&state, &id, crate::common::AgentCommand::ReadFile { path })
+        .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let crate::common::AgentResult::FileContent { content } = result else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let truncated = content.contains("[truncated]");
+    Json(serde_json::json!({ "content": content, "truncated": truncated })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutFsFileRequest {
+    pub path: String,
+    pub content: String,
+    /// 前端确认后重发携带：跳过审批检查（用户已在面板确认）。
+    pub approved: Option<bool>,
+}
+
+/// PUT /api/agent/workspaces/:id/fs/file
+/// FilesPanel 文件保存。按 workspace approval_mode 判定：需审批且未确认 → 409
+/// `{needs_approval:true}`，前端弹确认后带 `approved:true` 重发。
+pub async fn put_fs_file(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<PutFsFileRequest>,
+) -> impl IntoResponse {
+    if body.path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+    // 审批判定需要 approval_mode：先取 workspace（workspace_exec 内部还会再取一次，
+    // 多一次 DB 读换取 helper 复用，面板低频操作可接受）。
+    let approval_mode = match &state.server_state.agent_state {
+        Some(agent) => match agent.db.agent_get_workspace(&id).await {
+            Ok(Some(ws)) => ws.approval_mode,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let command = crate::common::AgentCommand::WriteFile {
+        path: body.path,
+        content: body.content,
+    };
+    if !body.approved.unwrap_or(false)
+        && crate::server::agent::approval::needs_approval(&approval_mode, &command)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "needs_approval": true })),
+        )
+            .into_response();
+    }
+    match workspace_exec(&state, &id, command).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// GET /api/agent/workspaces/:id/git/status
+/// GitPanel 数据源：`git status --porcelain=v1 -b` 原文（解析放前端）。
+pub async fn get_git_status(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let result = match workspace_exec(
+        &state,
+        &id,
+        crate::common::AgentCommand::Shell {
+            cmd: "git status --porcelain=v1 -b".to_string(),
+            cwd: None,
+        },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let crate::common::AgentResult::Shell { stdout, stderr, .. } = result else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    Json(serde_json::json!({ "status": stdout, "stderr": stderr })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/git/diff?path=<rel>
+/// GitPanel 文件 diff：path 为空时返回整个工作区 diff。
+pub async fn get_git_diff(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<FsPathQuery>,
+) -> impl IntoResponse {
+    let result = match workspace_exec(
+        &state,
+        &id,
+        crate::common::AgentCommand::GitDiff {
+            path: params.path.filter(|p| !p.is_empty()),
+        },
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let crate::common::AgentResult::FileContent { content } = result else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    Json(serde_json::json!({ "diff": content })).into_response()
 }
 
 /// 单引号 shell 转义：' → '\''（标准做法），包裹后任意输入安全。
@@ -1131,6 +1534,184 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn test_fs_endpoints_workspace_not_found() {
+        let (state, _db) = test_state().await;
+        let resp = get_fs_tree(
+            State(state.clone()),
+            Path("ghost".to_string()),
+            Query(FsPathQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = get_fs_file(
+            State(state.clone()),
+            Path("ghost".to_string()),
+            Query(FsPathQuery {
+                path: Some("a.rs".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = get_git_status(State(state.clone()), Path("ghost".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = get_git_diff(
+            State(state),
+            Path("ghost".to_string()),
+            Query(FsPathQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fs_endpoints_client_offline_returns_503() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        // 客户端离线：所有面板端点统一 503（前端据此显示「客户端离线」而非空态）。
+        let resp = get_fs_tree(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Query(FsPathQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = get_fs_file(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Query(FsPathQuery {
+                path: Some("a.rs".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = get_git_status(State(state.clone()), Path("w1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = get_git_diff(
+            State(state),
+            Path("w1".to_string()),
+            Query(FsPathQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_fs_file_requires_path() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        let resp = get_fs_file(
+            State(state),
+            Path("w1".to_string()),
+            Query(FsPathQuery { path: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_put_fs_file_safe_mode_needs_approval_409() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        // 默认 approval_mode = safe：WriteFile 需确认。未确认 → 409 needs_approval，
+        // 且不会触碰隧道（客户端离线也不会 503）。
+        let resp = put_fs_file(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(PutFsFileRequest {
+                path: "a.rs".into(),
+                content: "fn main() {}".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["needs_approval"], true);
+
+        // 确认后重发 → 通过审批层，走到隧道（客户端离线 → 503）。
+        let resp = put_fs_file(
+            State(state),
+            Path("w1".to_string()),
+            Json(PutFsFileRequest {
+                path: "a.rs".into(),
+                content: "fn main() {}".into(),
+                approved: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_put_fs_file_full_auto_skips_approval() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"))
+            .await
+            .unwrap();
+        // full_auto：未确认也直接放行 → 客户端离线 503（而非 409）。
+        let resp = put_fs_file(
+            State(state),
+            Path("w1".to_string()),
+            Json(PutFsFileRequest {
+                path: "a.rs".into(),
+                content: "x".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_put_fs_file_workspace_not_found() {
+        let (state, _db) = test_state().await;
+        let resp = put_fs_file(
+            State(state),
+            Path("ghost".to_string()),
+            Json(PutFsFileRequest {
+                path: "a.rs".into(),
+                content: "x".into(),
+                approved: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn test_shell_escape_q() {
         assert_eq!(shell_escape_q("main"), "'main'");
@@ -1190,5 +1771,62 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["model"], "");
+    }
+
+    #[test]
+    fn test_terminal_ws_auth_status_requires_token() {
+        // `terminal_ws` 的 JWT 拒绝路径。端到端 WS 握手测试需要真实 upgrade
+        // （WebSocketUpgrade 字段私有、OnUpgrade 扩展仅真实连接存在），这里跳过；
+        // 直接测 handler 使用的纯函数 `terminal_ws_auth_status`，覆盖
+        // 「auth enabled 且无 token → 401」的拒绝分支（与 agent_ws 同款校验）。
+        let auth = AuthConfig::new(Some("pw".into()), Some("secret".into()));
+        // auth enabled：无 token / 空 token / 非法 token → 401
+        assert_eq!(
+            terminal_ws_auth_status(&auth, None),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            terminal_ws_auth_status(&auth, Some("")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            terminal_ws_auth_status(&auth, Some("bogus-token")),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        // 合法 token → 放行
+        let token = crate::server::auth::create_token("secret").unwrap();
+        assert_eq!(terminal_ws_auth_status(&auth, Some(token.as_str())), None);
+        // auth 未启用 → 一律放行（与受保护路由中间件的语义一致）
+        let disabled = AuthConfig::new(None, None);
+        assert_eq!(terminal_ws_auth_status(&disabled, None), None);
+        assert_eq!(
+            terminal_ws_auth_status(&disabled, Some("anything")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_terminal_negotiation_frame_omits_shell_when_none() {
+        // host runtime：shell 字段不出现在协商帧中（客户端回退系统默认 shell）
+        let frame = serde_json::to_vec(&PtyNegotiation {
+            rows: 24,
+            cols: 80,
+            shell: None,
+        })
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(json["rows"], 24);
+        assert_eq!(json["cols"], 80);
+        assert!(json.get("shell").is_none());
+
+        // docker runtime：shell 原样透传
+        let frame = serde_json::to_vec(&PtyNegotiation {
+            rows: 40,
+            cols: 120,
+            shell: Some("docker exec -it dev-ctr sh"),
+        })
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(json["shell"], "docker exec -it dev-ctr sh");
     }
 }

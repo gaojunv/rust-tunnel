@@ -502,6 +502,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: crate::client::pty::DEFAULT_PTY_PORT,
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);

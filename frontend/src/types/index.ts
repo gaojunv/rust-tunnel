@@ -567,3 +567,22 @@ export type AgentWsEvent =
   | { type: 'approval_request'; request_id: string; tool: string; summary: string; args_preview: string }
   | { type: 'error'; message?: string };
 
+export interface FsEntry {
+  name: string;
+  is_dir: boolean;
+}
+
+export interface FsFileContent {
+  content: string;
+  truncated: boolean;
+}
+
+export interface GitStatusResult {
+  status: string;
+  stderr: string;
+}
+
+export interface GitDiffResult {
+  diff: string;
+}
+

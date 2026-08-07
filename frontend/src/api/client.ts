@@ -45,6 +45,9 @@ import type {
   AgentWorkspace,
   AgentSession,
   AgentMessage,
+  FsEntry,
+  FsFileContent,
+  GitStatusResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -608,6 +611,56 @@ export function agentWsUrl(sessionId: string): string {
   const token = localStorage.getItem('auth_token') ?? '';
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/api/agent/ws?session_id=${sessionId}&token=${encodeURIComponent(token)}`;
+}
+
+export async function getFsTree(workspaceId: string, path?: string): Promise<FsEntry[]> {
+  const { data } = await api.get<{ entries: FsEntry[] }>(
+    `/agent/workspaces/${workspaceId}/fs/tree`,
+    { params: path ? { path } : undefined },
+  );
+  return data.entries;
+}
+
+export async function getFsFile(workspaceId: string, path: string): Promise<FsFileContent> {
+  const { data } = await api.get<FsFileContent>(
+    `/agent/workspaces/${workspaceId}/fs/file`,
+    { params: { path } },
+  );
+  return data;
+}
+
+export async function putFsFile(
+  workspaceId: string,
+  path: string,
+  content: string,
+  approved?: boolean,
+): Promise<void> {
+  await api.put(`/agent/workspaces/${workspaceId}/fs/file`, {
+    path,
+    content,
+    ...(approved !== undefined ? { approved } : {}),
+  });
+}
+
+export async function getAgentGitStatus(workspaceId: string): Promise<GitStatusResult> {
+  const { data } = await api.get<GitStatusResult>(
+    `/agent/workspaces/${workspaceId}/git/status`,
+  );
+  return data;
+}
+
+export async function getAgentGitDiff(workspaceId: string, path?: string): Promise<string> {
+  const { data } = await api.get<{ diff: string }>(
+    `/agent/workspaces/${workspaceId}/git/diff`,
+    { params: path ? { path } : undefined },
+  );
+  return data.diff;
+}
+
+export function agentTerminalWsUrl(workspaceId: string, cols: number, rows: number): string {
+  const token = localStorage.getItem('auth_token') ?? '';
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/api/agent/terminal/ws?workspace_id=${workspaceId}&cols=${cols}&rows=${rows}&token=${encodeURIComponent(token)}`;
 }
 
 /**

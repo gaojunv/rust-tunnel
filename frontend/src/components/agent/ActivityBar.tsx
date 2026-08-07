@@ -18,7 +18,19 @@ const ICONS: {
   { kind: 'git', Icon: GitBranch, labelKey: 'agent.git' },
 ];
 
-export default function ActivityBar({ sessionId }: { sessionId: string }) {
+/** 面板宽度按内容类型映射：终端需要足够列宽（80 列等宽字符），文件树/git 列表用默认窄栏。 */
+const PANEL_WIDTH: Record<PanelKind, string> = {
+  files: 'w-72',
+  git: 'w-80',
+  terminal: 'w-[36rem] max-w-[60vw]',
+};
+
+interface ActivityBarProps {
+  sessionId: string;
+  workspaceId: string;
+}
+
+export default function ActivityBar({ sessionId, workspaceId }: ActivityBarProps) {
   const { t } = useTranslation();
   const [active, setActive] = useState<PanelKind | null>(null);
 
@@ -53,11 +65,14 @@ export default function ActivityBar({ sessionId }: { sessionId: string }) {
           data-panel={active}
           role="region"
           aria-label={t('agent.activityPanel')}
-          className="w-72 overflow-y-auto border-r border-border/60 p-2"
+          className={cn(
+            'flex min-h-0 flex-col overflow-hidden border-r border-border/60',
+            PANEL_WIDTH[active]
+          )}
         >
-          {active === 'files' && <FilesPanel />}
-          {active === 'terminal' && <TerminalPanel />}
-          {active === 'git' && <GitPanel sessionId={sessionId} />}
+          {active === 'files' && <FilesPanel workspaceId={workspaceId} />}
+          {active === 'terminal' && <TerminalPanel workspaceId={workspaceId} />}
+          {active === 'git' && <GitPanel sessionId={sessionId} workspaceId={workspaceId} />}
         </div>
       )}
     </div>

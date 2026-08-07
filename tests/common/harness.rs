@@ -253,6 +253,7 @@ impl TestHarness {
             tls_server_name: Some("localhost".to_string()),
             tls_insecure: true,
             enable_agent,
+            agent_pty_port: rust_tunnel::client::pty::DEFAULT_PTY_PORT,
             log: "warn".to_string(),
         };
 

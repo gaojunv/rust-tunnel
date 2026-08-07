@@ -36,6 +36,17 @@ async fn run() -> TunnelResult<()> {
         tracing::info!("Agent executor enabled (accepting AgentExecRequest)");
     }
 
+    // PTY 服务生命周期 = 客户端进程生命周期：enable_agent 时启动一次，不随控制
+    // 通道重连重启。listen 失败只 warn 不退出——服务端会按客户端版本门控降级。
+    if config.enable_agent {
+        let port = config.agent_pty_port;
+        tokio::spawn(async move {
+            if let Err(e) = rust_tunnel::client::pty::serve(port).await {
+                tracing::warn!("agent PTY service disabled: {e}");
+            }
+        });
+    }
+
     let mut backoff_secs = INITIAL_BACKOFF_SECS;
 
     loop {

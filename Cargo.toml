@@ -1,6 +1,6 @@
 [package]
 name = "rust-tunnel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A simple intranet penetration tool with server and client"
 license = "MIT"
@@ -76,6 +76,9 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macr
 
 # Get hostname
 gethostname = "0.4"
+
+# PTY for the agent terminal loopback service (wezterm-maintained, Unix/ConPTY)
+portable-pty = "0.9"
 
 # Configuration file support
 toml = "0.8"

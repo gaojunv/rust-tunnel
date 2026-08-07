@@ -147,7 +147,7 @@ export default function AgentPage() {
 
       <div className="flex min-h-0 flex-1">
         {/* VS Code 式 Activity Bar（选中会话后可用） */}
-        {sessionId && <ActivityBar sessionId={sessionId} />}
+        {sessionId && <ActivityBar sessionId={sessionId} workspaceId={workspaceId} />}
 
         {/* 对话区 */}
         <div className="min-w-0 flex-1">

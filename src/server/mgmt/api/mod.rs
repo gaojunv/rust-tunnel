@@ -222,6 +222,7 @@ pub async fn run_api_server(
         .route("/api/logs/stream", get(logs::sse_log_stream))
         .route("/api/llm/kb/events", get(rag::sse_kb_events))
         .route("/api/agent/ws", get(agent::agent_ws))
+        .route("/api/agent/terminal/ws", get(agent::terminal_ws))
         .route("/api/preferences", get(preferences::get_preferences));
 
     // Protected routes (require auth only when password is set)
@@ -400,6 +401,22 @@ pub async fn run_api_server(
         .route(
             "/api/agent/workspaces/:id/files",
             get(agent::list_workspace_files),
+        )
+        .route(
+            "/api/agent/workspaces/:id/fs/tree",
+            get(agent::get_fs_tree),
+        )
+        .route(
+            "/api/agent/workspaces/:id/fs/file",
+            get(agent::get_fs_file).put(agent::put_fs_file),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/status",
+            get(agent::get_git_status),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/diff",
+            get(agent::get_git_diff),
         )
         .route(
             "/api/agent/workspaces/:id/sessions",

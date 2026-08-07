@@ -57,6 +57,10 @@ pub struct ClientCli {
     #[clap(long)]
     pub enable_agent: bool,
 
+    /// Agent PTY service loopback port (default: 45631); only used with --enable-agent
+    #[clap(long = "agent-pty-port")]
+    pub agent_pty_port: Option<u16>,
+
     /// Log level (trace, debug, info, warn, error)
     #[clap(long)]
     pub log: Option<String>,
@@ -74,6 +78,7 @@ pub struct ClientConfigFile {
     pub mesh_name: Option<String>,
     pub mesh_services: Option<Vec<String>>,
     pub enable_agent: Option<bool>,
+    pub agent_pty_port: Option<u16>,
     pub log: Option<String>,
 }
 
@@ -96,6 +101,8 @@ pub struct ClientConfig {
     pub tls_insecure: bool,
     /// Enable the agent executor (accept AgentExecRequest from server)
     pub enable_agent: bool,
+    /// Agent PTY service loopback port
+    pub agent_pty_port: u16,
     pub log: String,
 }
 
@@ -112,6 +119,7 @@ impl Default for ClientConfig {
             tls_server_name: None,
             tls_insecure: true, // Accept self-signed certs by default (TOFU mode)
             enable_agent: false,
+            agent_pty_port: crate::client::pty::DEFAULT_PTY_PORT,
             log: "info".to_string(),
         }
     }
@@ -166,6 +174,9 @@ impl ClientConfig {
                 }
                 if let Some(v) = file_config.enable_agent {
                     config.enable_agent = v;
+                }
+                if let Some(v) = file_config.agent_pty_port {
+                    config.agent_pty_port = v;
                 }
             } else {
                 return Err(format!("Config file not found: {}", config_path));
@@ -238,6 +249,9 @@ impl ClientConfig {
         // CLI flag can only enable (there is no --disable-agent); a file-set
         // true value is preserved when the flag is absent.
         config.enable_agent = config.enable_agent || cli.enable_agent;
+        if let Some(v) = cli.agent_pty_port {
+            config.agent_pty_port = v;
+        }
 
         // Validate required fields
         if config.server.is_empty() {
@@ -269,6 +283,7 @@ mod tests {
         assert!(config.name.is_none());
         assert!(config.tls); // TLS enabled by default
         assert!(config.tls_insecure); // Accept self-signed certs by default
+        assert_eq!(config.agent_pty_port, crate::client::pty::DEFAULT_PTY_PORT);
         assert_eq!(config.log, "info");
     }
 
@@ -286,6 +301,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: Some("debug".to_string()),
         };
 
@@ -316,6 +332,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: true,
+            agent_pty_port: None,
             log: None,
         };
         let cfg = ClientConfig::from_cli(cli).unwrap();
@@ -337,6 +354,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: None,
         };
         let cfg = ClientConfig::from_cli(cli).unwrap();
@@ -357,6 +375,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: None,
         };
 
@@ -385,6 +404,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: None,
         };
         let err = ClientConfig::from_cli(cli).unwrap_err();
@@ -412,6 +432,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: None,
         };
         let cfg = ClientConfig::from_cli(cli).unwrap();
@@ -432,6 +453,7 @@ mod tests {
             mesh_name: Some("my-client".to_string()),
             mesh_services: vec!["db:mysql:localhost:3306".to_string()],
             enable_agent: true,
+            agent_pty_port: 45631,
             log: "debug".into(),
         };
 
@@ -446,7 +468,37 @@ mod tests {
         assert_eq!(config.mesh_name, cloned.mesh_name);
         assert_eq!(config.mesh_services, cloned.mesh_services);
         assert_eq!(config.enable_agent, cloned.enable_agent);
+        assert_eq!(config.agent_pty_port, cloned.agent_pty_port);
         assert_eq!(config.log, cloned.log);
+    }
+
+    #[test]
+    fn test_agent_pty_port_override() {
+        // CLI --agent-pty-port 覆盖默认端口
+        let cli = ClientCli {
+            config_file: None,
+            server: Some("host:8080".into()),
+            name: None,
+            password: Some("pw".into()),
+            tls: None,
+            tls_server_name: None,
+            tls_insecure: None,
+            mesh: None,
+            mesh_name: None,
+            mesh_services: vec![],
+            enable_agent: true,
+            agent_pty_port: Some(9999),
+            log: None,
+        };
+        let cfg = ClientConfig::from_cli(cli).unwrap();
+        assert_eq!(cfg.agent_pty_port, 9999);
+
+        // 未指定时回落到默认端口
+        let default_cfg = ClientConfig::default();
+        assert_eq!(
+            default_cfg.agent_pty_port,
+            crate::client::pty::DEFAULT_PTY_PORT
+        );
     }
 
     #[test]
@@ -463,6 +515,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
+            agent_pty_port: None,
             log: None,
         };
 

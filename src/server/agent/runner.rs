@@ -207,7 +207,7 @@ const MIN_SEARCH_PATCH_CLIENT_VERSION: (u64, u64, u64) = (0, 2, 0);
 /// 解析 "x.y.z"（允许 v 前缀）为数字三元组；非严格 semver 输入返回 None。
 /// 客户端在 agent 模式下上报 `{CARGO_PKG_VERSION}+agent`，故解析前须剥离
 /// semver 构建元数据（`+`）与预发布（`-`）后缀。
-fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.strip_prefix('v').unwrap_or(s);
     // 顺序：先 strip 'v' 前缀，再切掉 +（构建元数据）/ -（预发布）后缀。
     let s = s.split(['+', '-']).next().unwrap_or(s);
@@ -227,6 +227,16 @@ fn client_supports_search_patch(version: Option<&str>) -> bool {
     version
         .and_then(parse_version)
         .is_some_and(|v| v >= MIN_SEARCH_PATCH_CLIENT_VERSION)
+}
+
+/// 首个带回环 PTY 服务（交互式终端）的客户端版本。
+const MIN_TERMINAL_CLIENT_VERSION: (u64, u64, u64) = (0, 3, 0);
+
+/// 客户端版本是否支持交互式终端（PTY 服务）；缺失/非法视为不支持。
+pub(crate) fn client_supports_terminal(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_TERMINAL_CLIENT_VERSION)
 }
 
 /// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
@@ -873,6 +883,18 @@ mod tests {
         // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
         assert!(client_supports_search_patch(Some("0.2.0+agent")));
         assert!(!client_supports_search_patch(Some("0.1.0+agent")));
+    }
+
+    #[test]
+    fn test_client_supports_terminal() {
+        assert!(!client_supports_terminal(Some("0.2.0")));
+        assert!(client_supports_terminal(Some("0.3.0")));
+        assert!(client_supports_terminal(Some("1.0.0")));
+        assert!(!client_supports_terminal(None)); // 缺失/离线视为不支持
+        assert!(!client_supports_terminal(Some("garbage")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
+        assert!(client_supports_terminal(Some("0.3.0+agent")));
+        assert!(!client_supports_terminal(Some("0.2.0+agent")));
     }
 
     #[test]
