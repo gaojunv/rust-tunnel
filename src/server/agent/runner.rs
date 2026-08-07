@@ -1054,23 +1054,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_retry_on_stream_read_failure() {
-        // 使用 runner 的 SSE 读流 + 聚合逻辑，验证传输层失败后重试帧序列。
-        // 直接测试内部函数较重，这里验证重试判定函数（纯逻辑）。
-        let mut attempts = 0usize;
-        // 模拟：第一次 read 失败，第二次成功
-        let mut decide = || {
-            attempts += 1;
-            if attempts == 1 {
-                Err("stream read failed")
-            } else {
-                Ok(())
-            }
-        };
-        assert!(decide().is_err());
-        assert!(decide().is_ok());
-    }
+    // SSE 流传输层失败重试的回归覆盖见 `tests/agent_basic.rs`：
+    // `agent_stream_retry_succeeds_with_full_text`（重试成功：stream_reset + status
+    // 帧 + 最终文本完整）与 `agent_stream_retry_exhausted_sends_error`（耗尽走
+    // 错误路径）。本文件的旧 `test_retry_on_stream_read_failure` 只测本地闭包，
+    // 零回归价值，已删除。
 
     #[tokio::test]
     async fn test_persist_message_v2_writes_all_columns() {

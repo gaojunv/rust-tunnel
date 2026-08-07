@@ -729,7 +729,7 @@ async fn send_cancel_to_client(
     agent: &crate::server::agent::AgentState,
     workspace_id: &str,
     client_id: &str,
-    event_tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
+    _event_tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
 ) {
     let Some(request_id) = agent.inflight_take(workspace_id).await else {
         return;
@@ -746,7 +746,6 @@ async fn send_cancel_to_client(
     if !agent.registry.send_agent_cancel(client_id, &request_id).await {
         tracing::debug!("send_agent_cancel failed for client {}", client_id);
     }
-    let _ = event_tx; // 预留：可扩展发 status 提示
 }
 
 pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse {

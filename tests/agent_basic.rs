@@ -601,3 +601,363 @@ async fn agent_denied_tool_result_recorded() {
     .await;
     result.expect("test timed out after 60s");
 }
+
+// ── SSE 流传输层重试 e2e：runner 重试块的真实回归 ──────────────
+
+/// 流重试 mock LLM：前 `fail_hits` 次请求回"部分 SSE 后中途断连"，之后的请求回
+/// 完整 SSE 文本。
+///
+/// 中途断连的做法：响应头声明 `Transfer-Encoding: chunked`，写一个合法 chunk
+/// 后不写终止块（`0\r\n\r\n`）直接关闭连接 → hyper 读到 incomplete chunked →
+/// reqwest `bytes_stream()` 报错 → `relay_upstream_stream` 映射为 io::Error →
+/// runner 的 `byte_stream.next()` 返回 `Err`（正是重试块的触发条件）。
+struct RetryMockLlm {
+    addr: SocketAddr,
+    hits: Arc<AtomicUsize>,
+}
+
+impl RetryMockLlm {
+    async fn start(fail_hits: usize) -> Self {
+        Self::start_with_text(fail_hits, "半截", "完整文本").await
+    }
+
+    async fn start_with_text(
+        fail_hits: usize,
+        partial_text: &'static str,
+        full_text: &'static str,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let hits = hits_task.clone();
+                tokio::spawn(async move {
+                    // 读 headers + body（按 Content-Length 收全）。
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let header_end = loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                {
+                                    break pos + 4;
+                                }
+                            }
+                        }
+                    };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+
+                    let hit = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    if hit <= fail_hits {
+                        // 失败响应：一个完整 chunk 的 SSE 事件后断连（无终止块）。
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes()).await;
+                        let payload = format!(
+                            r#"data: {{"choices":[{{"delta":{{"content":"{partial_text}"}},"index":0}}]}}"#
+                        );
+                        // 末尾带空行：SSE 事件完整（\n\n），部分内容真正进入聚合器后
+                        // 连接才断——这样 agg 重置的正确性也被覆盖（半截残留会污染
+                        // 最终落库文本，成功路径断言即失败）。
+                        let payload_with_eol = format!("{payload}\n\n");
+                        let frame = format!("{:x}\r\n{}\r\n", payload_with_eol.len(), payload_with_eol);
+                        let _ = stream.write_all(frame.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        return; // drop 连接，不写终止 chunk
+                    }
+                    // 成功响应：完整文本 + [DONE]，Content-Length 精确闭合。
+                    let data1 = format!(
+                        r#"data: {{"choices":[{{"delta":{{"content":"{full_text}"}},"index":0}}]}}"#
+                    );
+                    let body = format!("{data1}\n\ndata: [DONE]\n\n");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self { addr, hits }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn hit_count(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// 纯文本回合 e2e 环境：真实 agent 客户端在线 + mock LLM 上游 + 已落库 session。
+struct TextTurnEnv {
+    session_id: String,
+    /// 保持 tempdir 存活（root_path 指向它）。
+    _root: tempfile::TempDir,
+}
+
+async fn setup_text_turn_env(
+    harness: &mut TestHarness,
+    client_name: &str,
+    base_url: &str,
+    model_name: &str,
+) -> TextTurnEnv {
+    // 先确认客户端在线（AGENTS.md 读取经真实控制通道，agent_exec 需要注册条目）。
+    spawn_online_agent_client(harness, client_name).await;
+
+    // 注册 provider + model，base_url 直指 mock 上游（单候选 → 直连，无需网关）。
+    let api = harness.api_client();
+    let (status, body) = api
+        .post_json(
+            "/api/llm/providers",
+            serde_json::json!({
+                "name": "retry-mock",
+                "provider_type": "deepseek",
+                "base_url": base_url,
+                "api_key": "sk-test",
+            }),
+        )
+        .await;
+    assert!(status.is_success(), "create provider: {status} {body}");
+    let pid = body["id"].as_str().unwrap().to_string();
+    let (status, body) = api
+        .post_json(
+            &format!("/api/llm/providers/{pid}/models"),
+            serde_json::json!({"model_name": model_name, "alias": model_name}),
+        )
+        .await;
+    assert!(status.is_success(), "create model: {status} {body}");
+
+    // workspace + session，直接走 DB（与 API 同库）。
+    let db = harness.server_state.db().expect("harness db");
+    let root = tempfile::tempdir().expect("tempdir");
+    let root_str = root.path().to_string_lossy().to_string();
+    db.agent_create_workspace(
+        "ws-retry-e2e",
+        "retry-e2e",
+        client_name,
+        "host",
+        &root_str,
+        None,
+        None,
+    )
+    .await
+    .expect("create workspace");
+    let session_id = "sess-retry-e2e";
+    db.agent_create_session(session_id, "ws-retry-e2e", None, Some(model_name))
+        .await
+        .expect("create session");
+
+    TextTurnEnv {
+        session_id: session_id.to_string(),
+        _root: root,
+    }
+}
+
+/// 直接驱动 `run_agent_turn`，收集到 done/error 为止的全部 WS 帧，返回回合结果。
+async fn run_turn_collect(
+    harness: &TestHarness,
+    session_id: &str,
+) -> (Result<(), String>, Vec<serde_json::Value>) {
+    let agent = harness
+        .server_state
+        .agent_state
+        .clone()
+        .expect("harness agent_state");
+    let llm = harness
+        .server_state
+        .proxy_state
+        .llm_state
+        .read()
+        .await
+        .clone()
+        .expect("harness llm_state");
+    let mut rt = SessionRuntime::load(&agent.db, session_id, "default")
+        .await
+        .expect("load session runtime");
+    let (ws_tx, mut ws_rx) = mpsc::channel(64);
+
+    let turn = tokio::spawn(async move {
+        rust_tunnel::server::agent::runner::run_agent_turn(agent, llm, &mut rt, ws_tx).await
+    });
+
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(15), ws_rx.recv())
+            .await
+            .expect("timed out waiting for ws frame")
+            .expect("ws channel closed before turn finished");
+        let ftype = frame["type"].as_str().unwrap_or("").to_string();
+        let terminal = matches!(ftype.as_str(), "done" | "error");
+        frames.push(frame);
+        if terminal {
+            break;
+        }
+    }
+    let result = turn.await.expect("turn task panicked");
+    (result, frames)
+}
+
+/// 流重试成功路径：首次读流中途断连 → stream_reset + status (1/2) → 重试成功，
+/// 最终落库文本完整（无半截残留）、不发 error 帧。
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_stream_retry_succeeds_with_full_text() {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut harness = TestHarness::spawn(HarnessOpts::default()).await;
+        let mock = RetryMockLlm::start_with_text(1, "半截", "完整文本").await;
+        let env = setup_text_turn_env(&mut harness, "agent-retry-ok", &mock.url(), "retry-model")
+            .await;
+
+        let (turn_result, frames) = run_turn_collect(&harness, &env.session_id).await;
+        turn_result.expect("turn should complete after a successful retry");
+
+        // 半截内容先作为 assistant_chunk 流出，随后才是 stream_reset（前端据此
+        // 丢弃 partial bubble）——证明重试前聚合器确实已收到部分内容，agg 重置
+        // 的正确性被真实覆盖（若重置失效，最终文本会残留半截）。
+        let partial_at = frames
+            .iter()
+            .position(|f| f["type"] == "assistant_chunk" && f["content"] == "半截")
+            .expect("partial content must be streamed before the retry");
+        let reset_at = frames
+            .iter()
+            .position(|f| f["type"] == "stream_reset")
+            .expect("stream_reset frame on retry");
+        assert!(
+            partial_at < reset_at,
+            "partial content must precede stream_reset, got: {frames:?}"
+        );
+
+        // 且发过 status 帧声明正在重试 (1/2)。
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "status"
+                    && f.get("message").and_then(|m| m.as_str())
+                        == Some("上游连接中断，正在重试 (1/2)")
+            }),
+            "missing retry status frame, got: {frames:?}"
+        );
+
+        // 上游被调用两次：首次失败 + 重试成功。
+        assert_eq!(mock.hit_count(), 2);
+
+        // 最终文本完整（DB 落库为权威来源）：无半截残留、无 error 帧。
+        let agent = harness
+            .server_state
+            .agent_state
+            .clone()
+            .expect("harness agent_state");
+        let msgs = agent
+            .db
+            .agent_list_messages(&env.session_id)
+            .await
+            .expect("list messages");
+        let assistant = msgs
+            .iter()
+            .find(|m| m.role == "assistant" && m.kind == "message")
+            .expect("assistant message persisted");
+        assert_eq!(assistant.content, "完整文本");
+        assert!(
+            frames.iter().all(|f| f["type"] != "error"),
+            "no error frame on the successful retry path, got: {frames:?}"
+        );
+    })
+    .await;
+    result.expect("test timed out after 60s");
+}
+
+/// 流重试耗尽路径：每次读流都中途断连 → 重试 2 次后走 fatal 错误路径发 error 帧，
+/// 回合以 Err 结束、半截内容不落库。
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_stream_retry_exhausted_sends_error() {
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut harness = TestHarness::spawn(HarnessOpts::default()).await;
+        // fail_hits=3：首次 + 2 次重试全部失败，触发 fatal 错误路径。
+        let mock = RetryMockLlm::start(3).await;
+        let env = setup_text_turn_env(
+            &mut harness,
+            "agent-retry-exhausted",
+            &mock.url(),
+            "retry-model",
+        )
+        .await;
+
+        let (turn_result, frames) = run_turn_collect(&harness, &env.session_id).await;
+        assert!(
+            turn_result.is_err(),
+            "exhausted retries must fail the turn, got: {turn_result:?}"
+        );
+
+        // 两次重试各发一次 stream_reset；status 依次为 (1/2) 和 (2/2)。
+        let resets = frames
+            .iter()
+            .filter(|f| f["type"] == "stream_reset")
+            .count();
+        assert_eq!(resets, 2, "two retries → two stream_reset frames, got: {frames:?}");
+        for expected in ["上游连接中断，正在重试 (1/2)", "上游连接中断，正在重试 (2/2)"] {
+            assert!(
+                frames.iter().any(|f| {
+                    f["type"] == "status"
+                        && f.get("message").and_then(|m| m.as_str()) == Some(expected)
+                }),
+                "missing status frame {expected}, got: {frames:?}"
+            );
+        }
+
+        // 上游共被调用 3 次（首次 + 2 次重试）。
+        assert_eq!(mock.hit_count(), 3);
+
+        // 错误路径发 error 帧（stream read failed），半截内容未落库。
+        let err = frames
+            .iter()
+            .find(|f| f["type"] == "error")
+            .expect("error frame on exhausted retries");
+        assert!(
+            err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("stream read failed")),
+            "unexpected error frame: {err:?}"
+        );
+        let agent = harness
+            .server_state
+            .agent_state
+            .clone()
+            .expect("harness agent_state");
+        let msgs = agent
+            .db
+            .agent_list_messages(&env.session_id)
+            .await
+            .expect("list messages");
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.role == "assistant" && m.kind == "message"),
+            "no assistant message should be persisted after exhausted retries"
+        );
+    })
+    .await;
+    result.expect("test timed out after 60s");
+}

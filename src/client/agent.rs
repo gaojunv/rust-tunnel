@@ -365,6 +365,9 @@ async fn run_host(
 /// 执行一条 AgentCommand，全部在 root_path 沙箱内；永不 panic，错误归一为
 /// AgentResult::Error。`docker_container = Some(c)` 时所有命令经 `docker exec`
 /// 在容器 `c` 内执行（root_path 为容器内路径）；`None` 时直接在宿主机执行。
+///
+/// 取消边界：仅 shell/search 可取消（走 `cancel_rx` 进程组 kill），其余命令
+/// （read/write/list/git）收到 AgentExecCancel 静默忽略、按原超时跑完。
 pub async fn handle_exec_request(
     command: &AgentCommand,
     root_path: &Path,
@@ -647,6 +650,9 @@ async fn docker_list_dir(container: &str, abs: &Path, timeout: Duration) -> Agen
 /// 在沙箱内执行一条 git 命令；成功时返回 stdout（为空则返回 stderr）作为
 /// FileContent，非零退出码归一为 Error。输出同样受 MAX_OUTPUT 截断。
 /// `docker_container = Some(c)` 时改为在容器 `c` 内执行（root_path 为容器内路径）。
+///
+/// 取消边界：git 命令不进 `exec_cancels` 可取消路径（规格 YAGNI：快速命令不改造），
+/// 取消信号（AgentExecCancel）到达时被忽略、命令跑完 ≤120s（exec 超时兜底）。
 async fn git_exec(
     args: &[&str],
     root_path: &Path,

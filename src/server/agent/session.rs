@@ -453,6 +453,7 @@ mod tests {
     async fn test_load_patches_missing_tool_results() {
         // 工具执行中断：assistant 声明了 2 个 tool_calls，只有第 1 个有结果落库。
         // 清洗后应为第 2 个补齐占位结果，序列合法（无 400）。
+        // 取消链路（AgentExecCancel 停止回合）依赖 sanitize_tool_pairs 占位补齐。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
             .await
