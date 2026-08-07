@@ -232,6 +232,12 @@ async fn run_host(
         .spawn()
         .map_err(|e| format!("spawn shell failed: {e}"))?;
 
+    // 进程组组长 pid（process_group(0) 使组长 pid == pgid）。必须在 wait() 收割前
+    // 捕获：`Child::id()` 收割后返回 None，而 drain 超时路径（child 已退出、孙进程
+    // 仍持管道写端）仍需 kill 整个进程组。
+    #[cfg(unix)]
+    let child_pid = child.id();
+
     // stdin 写入 task（独立于 wait 运行，避免读写互相阻塞）。
     let writer = match (stdin_data, child.stdin.take()) {
         (Some(data), Some(mut si)) => {
@@ -276,22 +282,29 @@ async fn run_host(
         })
     });
 
-    // 进程组 kill：取消/超时统一走这里。
-    fn kill_group(child: &mut tokio::process::Child) {
-        if let Some(pid) = child.id() {
+    // 进程组 kill：取消/超时统一走这里。与 process_group(0) 一致，仅 unix 可用。
+    // 取 spawn 时捕获的 child_pid（wait 收割后 Child::id() 为 None）。
+    #[cfg(unix)]
+    fn kill_group(pid: Option<u32>) {
+        if let Some(pid) = pid {
             // SAFETY: 只 kill 本次 spawn 建立的进程组，pid 为组长。
             unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
     }
 
+    // wait + stdout/stderr drain 纳入同一 deadline：`sh -c 'nohup server &'` 这类
+    // 后台化孙进程继承管道时，sh 虽秒退，读 task 的 join 也不能拖过 timeout。
+    let deadline = std::time::Instant::now() + timeout;
+    let deadline_ts = tokio::time::Instant::from_std(deadline);
+
     let outcome = if let Some(cr) = cancel_rx {
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}")),
             _ = cr => Err("command cancelled".to_string()),
-            _ = tokio::time::sleep(timeout) => Err(format!("command timed out after {}s", timeout.as_secs())),
+            _ = tokio::time::sleep_until(deadline_ts) => Err(format!("command timed out after {}s", timeout.as_secs())),
         }
     } else {
-        match tokio::time::timeout(timeout, child.wait()).await {
+        match tokio::time::timeout_at(deadline_ts, child.wait()).await {
             Ok(Ok(status)) => Ok(status),
             Ok(Err(e)) => Err(format!("wait failed: {e}")),
             Err(_) => Err(format!("command timed out after {}s", timeout.as_secs())),
@@ -303,22 +316,42 @@ async fn run_host(
             if let Some(w) = writer {
                 let _ = w.await;
             }
-            let stdout = match stdout_reader {
-                Some(h) => h.await.unwrap_or_default(),
-                None => Vec::new(),
+            // drain 同样受 deadline 约束：孙进程继承 stdout/stderr 写端时，
+            // join 到点即终止，恢复旧 wait_with_output 的"子进程退出 + 管道
+            // 排空"整体纳入超时的语义。
+            let drain = async {
+                let stdout = match stdout_reader {
+                    Some(h) => h.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let stderr = match stderr_reader {
+                    Some(h) => h.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                (stdout, stderr)
             };
-            let stderr = match stderr_reader {
-                Some(h) => h.await.unwrap_or_default(),
-                None => Vec::new(),
-            };
-            CmdOutput {
-                stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
-                stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
-                exit_code: status.code().unwrap_or(-1),
+            match tokio::time::timeout_at(deadline_ts, drain).await {
+                Ok((stdout, stderr)) => CmdOutput {
+                    stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
+                    stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
+                    exit_code: status.code().unwrap_or(-1),
+                },
+                Err(_) => {
+                    // writer 已在 drain 前 await 过（child 退出即 EPIPE 收尾），无需再等
+                    #[cfg(unix)]
+                    {
+                        kill_group(child_pid);
+                    }
+                    let _ = child.wait().await; // 收割（tokio 缓存状态，立即返回）
+                    return Err(format!("command timed out after {}s", timeout.as_secs()));
+                }
             }
         }
         Err(msg) => {
-            kill_group(&mut child);
+            #[cfg(unix)]
+            {
+                kill_group(child_pid);
+            }
             let _ = child.wait().await; // 收割僵尸
             if let Some(w) = writer {
                 let _ = w.await;
@@ -828,6 +861,45 @@ mod tests {
         }
     }
 
+    /// 统计 `ps` 仍可见的 `sleep 30` 进程（用于断言进程组整体被杀）。
+    /// 优先 `ps`；若环境无 `ps` 则回退到 `/proc` 扫描各进程 cmdline。
+    fn leftover_sleep30_procs() -> Vec<String> {
+        match std::process::Command::new("ps")
+            .args(["-eo", "pid,pgid,args"])
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains("sleep 30"))
+                .map(str::to_string)
+                .collect(),
+            Err(_) => {
+                // /proc 回退：遍历 PID 目录读 cmdline，拼回整行后判断
+                let mut found = Vec::new();
+                if let Ok(entries) = std::fs::read_dir("/proc") {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+                            continue;
+                        };
+                        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                            continue;
+                        };
+                        let joined = raw
+                            .split(|&b| b == 0)
+                            .filter(|c| !c.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(&b' ');
+                        if String::from_utf8_lossy(&joined).contains("sleep 30") {
+                            found.push(pid.to_string());
+                        }
+                    }
+                }
+                found
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_run_host_cancel_kills_process_group() {
         use tokio::sync::oneshot;
@@ -845,6 +917,32 @@ mod tests {
             .expect("cancel should not hang")
             .unwrap(); // 移除 JoinError 层，得到 run_host 的 Result
         assert!(res.is_err(), "cancel should yield Err, got {:?}", res);
+
+        // cancel 返回后进程组已整体 SIGKILL；留 500ms 让 kill 生效并等 init 收割
+        // 僵尸，再确认孙进程 `sleep 30` 无残留（在 Rust 里过滤 ps 输出，
+        // 等价于 `grep "[s]leep 30"` 的避免自匹配技巧）。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leftover = leftover_sleep30_procs();
+        assert!(
+            leftover.is_empty(),
+            "grandchild `sleep 30` should be killed with the process group, leftover: {leftover:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_host_timeout_covers_backgrounded_grandchild() {
+        // `sleep 30 &` 让 sh 秒退、孙进程继承 stdout 管道写端：drain 必须受同一
+        // deadline 约束并在到点时 kill 进程组，否则 run_host 会挂到孙进程退出
+        // （30s）而旁路 timeout。
+        let start = std::time::Instant::now();
+        let res = run_host("sleep 30 &", None, None, Duration::from_millis(300), None).await;
+        let msg = res.expect_err("expected timeout Err");
+        assert!(msg.contains("timed out"), "unexpected message: {msg}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run_host should return at the deadline, elapsed={:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
