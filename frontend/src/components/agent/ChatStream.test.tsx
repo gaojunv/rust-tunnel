@@ -2,7 +2,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { cleanup, render, screen, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { listAgentMessages } from '../../api/client';
+import { listAgentMessages, listWorkspaceFiles } from '../../api/client';
 import ChatStream from './ChatStream';
 
 vi.mock('react-i18next', () => ({
@@ -13,6 +13,7 @@ vi.mock('../../api/client', () => ({
   listAgentMessages: vi.fn().mockResolvedValue([]),
   updateAgentSessionModel: vi.fn().mockResolvedValue(undefined),
   getAgentDefaultModel: vi.fn().mockResolvedValue(''),
+  listWorkspaceFiles: vi.fn().mockResolvedValue({ files: [] }),
   agentWsUrl: () => 'ws://test/ws',
 }));
 
@@ -56,7 +57,7 @@ const renderChat = () => {
   });
   return render(
     <QueryClientProvider client={qc}>
-      <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
+      <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
     </QueryClientProvider>
   );
 };
@@ -394,7 +395,7 @@ describe('ChatStream running state', () => {
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
     render(
       <QueryClientProvider client={qc}>
-        <ChatStream sessionId="s1" model="" onModelChange={vi.fn()} />
+        <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
       </QueryClientProvider>
     );
     act(() => {
@@ -427,5 +428,228 @@ describe('ChatStream running state', () => {
     const summaryBubble = summaryEl.closest('[class*="mr-auto"]');
     expect(userBubble?.className).toContain('bg-primary/10');
     expect(summaryBubble?.className).toContain('bg-muted');
+  });
+
+  it('renders approval card and responds on approve', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 approval_request 帧：卡片应出现（标题 + 工具名 + 摘要）
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{"cmd":"rm -rf /tmp/x"}',
+      });
+    });
+    // 标题文案后紧跟冒号与工具名（跨元素），用子串匹配
+    expect(screen.getByText(/agent\.approvalRequired/)).toBeTruthy();
+    expect(screen.getByText('shell')).toBeTruthy();
+    expect(screen.getByText('rm -rf /tmp/x')).toBeTruthy();
+    // 三个操作按钮齐全（mock t 返回 key 作为按钮文案）
+    expect(screen.getByRole('button', { name: 'agent.approveOnce' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.approveSession' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.deny' })).toBeTruthy();
+    // 点击「允许一次」→ 捕获当前连接，断言发出 approval_response
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.approveOnce' }));
+    expect(
+      ws.sent.some(
+        (s) =>
+          s.includes('"type":"approval_response"') &&
+          s.includes('"request_id":"req1"') &&
+          s.includes('"approved":true') &&
+          s.includes('"remember":"none"'),
+      ),
+    ).toBe(true);
+    // 卡片变为已允许：操作按钮消失、状态文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.getByText(/agent.approved/)).toBeTruthy();
+  });
+
+  it('denies approval and approve-session sends remember=session', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'approval_request', request_id: 'req2', tool: 'shell', summary: 'echo hi', args_preview: '{}' });
+    });
+    // 拒绝：approved=false, remember=none，卡片变为已拒绝
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.deny' }));
+    expect(
+      ws.sent.some((s) => s.includes('"type":"approval_response"') && s.includes('"request_id":"req2"') && s.includes('"approved":false') && s.includes('"remember":"none"')),
+    ).toBe(true);
+    expect(screen.getByText(/agent.denied/)).toBeTruthy();
+    // 新的审批请求 → 点击「本会话允许」：remember=session
+    act(() => {
+      wsInstance!.emit({ type: 'approval_request', request_id: 'req3', tool: 'write_file', summary: 'write x', args_preview: '{}' });
+    });
+    const ws2 = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.approveSession' }));
+    expect(
+      ws2.sent.some((s) => s.includes('"type":"approval_response"') && s.includes('"request_id":"req3"') && s.includes('"approved":true') && s.includes('"remember":"session"')),
+    ).toBe(true);
+    expect(screen.getByText(/agent.approved/)).toBeTruthy();
+  });
+
+  it('expires pending approval cards on done frame and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    // 输入文本后发送按钮仍被 pending 审批禁用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(true);
+    // done 帧到达（服务端 5 分钟审批超时按 deny 继续回合）→ 卡片过期、发送解锁
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.deny' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('expires pending approval cards on stop and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 危险工具调用进入 running → 服务端发审批请求挂起回合
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req2',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 点击前捕获当前连接（stop 触发 state 更新后 WS 实例轮换，cancel 发在旧实例）
+    const ws = wsInstance!;
+    act(() => {
+      screen.getByRole('button', { name: 'agent.stop' }).click();
+    });
+    expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
+    expect(screen.queryByText('agent.running')).toBeNull();
+    // 停止 → 卡片过期：操作按钮消失、过期文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    // 输入文本后发送按钮恢复可用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('expires pending approval cards on disconnect (onclose) and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req1',
+        tool: 'shell',
+        summary: 'rm -rf /tmp/x',
+        args_preview: '{}',
+      });
+    });
+    // 断线：服务端 turn 被 drop、审批按 deny 落定；重连后历史 refetch 若失败，
+    // 本地卡片不置终态会让 hasPendingApproval 恒 true → 发送按钮永久锁死
+    act(() => {
+      wsInstance!.onclose?.();
+    });
+    // 断线 → 卡片过期：操作按钮消失、过期文案出现
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.deny' })).toBeNull();
+    expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
+    // 输入文本后发送按钮恢复可用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows mention popup on @ and sends refs with message', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    // 输入 @mai → @ 弹层出现，列出匹配文件
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    // 选中文件 → @query 段从文本移除，路径进引用 chip
+    fireEvent.click(screen.getByText('src/main.rs'));
+    expect(screen.getByText('@src/main.rs')).toBeTruthy();
+    expect((screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement).value).toBe('');
+    // 输入消息并发送 → WS 帧带 refs
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '检查这个文件' } });
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.send' }));
+    expect(
+      ws.sent.some((s) => s.includes('"type":"user_message"') && s.includes('"refs":["src/main.rs"]')),
+    ).toBe(true);
+  });
+
+  it('selects the highlighted mention item on Enter without sending', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // 弹层打开时按 Enter → 选中高亮项，而非发送消息
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(screen.getByText('@src/main.rs')).toBeTruthy();
+    expect(textarea.value).toBe('');
+    // 任何连接的 WS 实例都没有发出 user_message 帧（断言覆盖 i18n mock 引发的实例轮换）
+    expect(wsInstances.every((w) => !w.sent.some((s) => s.includes('"type":"user_message"')))).toBe(true);
+    // 弹层关闭
+    expect(screen.queryByText('src/main.rs')).toBeNull();
+  });
+
+  it('moves highlight with ArrowDown and selects the second item on Enter', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/a.rs', 'src/b.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@sr' } });
+    expect(await screen.findByText('src/a.rs')).toBeTruthy();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // ↓ 移动高亮到第二项 → Enter 选中 src/b.rs
+    fireEvent.keyDown(textarea, { key: 'ArrowDown' });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(await screen.findByText('@src/b.rs')).toBeTruthy();
+    expect(screen.queryByText('@src/a.rs')).toBeNull();
+    expect(textarea.value).toBe('');
+  });
+
+  it('closes the mention popup on Escape', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/main.rs'] });
+    renderChat();
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '@mai' } });
+    expect(await screen.findByText('src/main.rs')).toBeTruthy();
+    fireEvent.keyDown(screen.getByPlaceholderText('agent.inputPlaceholder'), { key: 'Escape' });
+    expect(screen.queryByText('src/main.rs')).toBeNull();
+  });
+
+  it('removes a single chip independently', async () => {
+    (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/a.rs', 'src/b.rs'] });
+    renderChat();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    // 依次选择两个文件 → 两个 chip
+    fireEvent.change(textarea, { target: { value: '@sr' } });
+    fireEvent.click(await screen.findByText('src/a.rs'));
+    fireEvent.change(textarea, { target: { value: '@sr' } });
+    fireEvent.click(await screen.findByText('src/b.rs'));
+    expect(screen.getByText('@src/a.rs')).toBeTruthy();
+    expect(screen.getByText('@src/b.rs')).toBeTruthy();
+    // 单独删除 src/a.rs 的 chip，src/b.rs 保留
+    const chipA = screen.getByText('@src/a.rs');
+    const removeBtn = chipA.parentElement!.querySelector('button')!;
+    fireEvent.click(removeBtn);
+    expect(screen.queryByText('@src/a.rs')).toBeNull();
+    expect(screen.getByText('@src/b.rs')).toBeTruthy();
   });
 });

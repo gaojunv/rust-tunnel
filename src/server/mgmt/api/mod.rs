@@ -398,6 +398,10 @@ pub async fn run_api_server(
                 .delete(agent::delete_workspace),
         )
         .route(
+            "/api/agent/workspaces/:id/files",
+            get(agent::list_workspace_files),
+        )
+        .route(
             "/api/agent/workspaces/:id/sessions",
             get(agent::list_sessions).post(agent::create_session),
         )

@@ -33,6 +33,8 @@ pub struct CreateWorkspaceRequest {
 pub struct UpdateWorkspaceRequest {
     pub name: String,
     pub root_path: String,
+    pub system_prompt: Option<String>,
+    pub approval_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,10 +142,17 @@ async fn refresh_session_model(
     }
 }
 
-/// WS 客户端帧分类：user_message / cancel / 其他（忽略）。
+/// `WS` 客户端帧分类：`user_message` / `cancel` / `approval_response` / 其他（忽略）。
 enum WsFrame {
-    UserMessage(String),
+    /// 用户消息：content + 可选 @引用文件路径列表
+    UserMessage { content: String, refs: Vec<String> },
     Cancel,
+    /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具
+    ApprovalResponse {
+        request_id: String,
+        approved: bool,
+        remember: bool,
+    },
     Other,
 }
 
@@ -155,11 +164,45 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
         return WsFrame::Other;
     };
     match body.get("type").and_then(|t| t.as_str()) {
-        Some("user_message") => body
-            .get("content")
-            .and_then(|c| c.as_str())
-            .map_or(WsFrame::Other, |c| WsFrame::UserMessage(c.to_string())),
+        Some("user_message") => {
+            let content = body.get("content").and_then(|c| c.as_str()).map(str::to_string);
+            let refs = body
+                .get("refs")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .take(crate::server::agent::runner::MAX_REFS)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match content {
+                Some(c) => WsFrame::UserMessage { content: c, refs },
+                None => WsFrame::Other,
+            }
+        }
         Some("cancel") => WsFrame::Cancel,
+        Some("approval_response") => {
+            let request_id = body
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if request_id.is_empty() {
+                return WsFrame::Other;
+            }
+            WsFrame::ApprovalResponse {
+                request_id,
+                approved: body
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                remember: matches!(
+                    body.get("remember").and_then(|v| v.as_str()),
+                    Some("session")
+                ),
+            }
+        }
         _ => WsFrame::Other,
     }
 }
@@ -207,11 +250,11 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // structure; that is the accepted MVP tradeoff.
     let mut rt_cache: Option<SessionRuntime> = None;
     // 回合进行中对端又发来的用户消息：最多缓冲一条，当前 turn 结束后优先处理。
-    let mut pending: Option<String> = None;
+    let mut pending: Option<(String, Vec<String>)> = None;
 
     loop {
         // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
-        let content = if let Some(p) = pending.take() {
+        let (content, refs) = if let Some(p) = pending.take() {
             p
         } else {
             let msg = match ws_stream.next().await {
@@ -219,9 +262,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 Some(Ok(m)) => m,
             };
             match parse_ws_frame(msg) {
-                WsFrame::UserMessage(c) => c,
-                // 非 turn 期间的 cancel：幂等忽略
-                WsFrame::Cancel | WsFrame::Other => continue,
+                WsFrame::UserMessage { content, refs } => (content, refs),
+                // 非 turn 期间的 cancel/审批响应：幂等忽略（迟到的审批响应可能已
+                // 超时自清，pending map 仍挂着等超时，此处丢弃即可）
+                WsFrame::Cancel | WsFrame::ApprovalResponse { .. } | WsFrame::Other => continue,
             }
         };
 
@@ -252,20 +296,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         let session_lock = agent.session_lock(&session_id).await;
         let _session_guard = session_lock.lock().await;
 
-        // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
-        let msg_id = format!("{:032x}", rand::random::<u128>());
-        let _ = agent
-            .db
-            .agent_add_message(&msg_id, &session_id, "user", &content, None)
-            .await;
-
-        // 首个用户消息：从 DB 重建运行时（含刚写入的 user 消息）；后续消息直接追加到内存 messages。
+        // 首个用户消息：从 DB 重建运行时；后续消息直接追加到内存 messages。
+        // user 消息的落库与内存追加统一放在 refs 注入之后（见下），加载阶段
+        // 不再写库——先落原始 content 再注入会造成 DB 与内存内容不一致。
         let rt = match rt_cache.as_mut() {
             Some(rt) => {
                 // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
                 // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
                 refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
-                rt.messages.push(ChatMessage::text("user", content));
                 rt
             }
             None => {
@@ -310,6 +348,48 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             }
         };
 
+        // @引用注入：逐个经隧道 ReadFile，合成完整 user 消息后落库 + 进上下文。
+        // 超总量限制的 refs 标注拒绝；读失败的标注 [无法读取]，均不阻断回合。
+        let content = if refs.is_empty() {
+            content
+        } else {
+            let mut ref_files: Vec<(String, Result<String, String>)> = Vec::new();
+            let mut total = 0usize;
+            for path in &refs {
+                if total >= crate::server::agent::runner::MAX_REFS_TOTAL_BYTES {
+                    ref_files.push((path.clone(), Err("refs total size limit".to_string())));
+                    continue;
+                }
+                let result = crate::server::agent::executor::exec_on_client(
+                    &agent,
+                    &rt.workspace_id,
+                    &rt.client_id,
+                    &rt.root_path,
+                    rt.docker_container.as_deref(),
+                    crate::common::AgentCommand::ReadFile { path: path.clone() },
+                )
+                .await;
+                match result {
+                    crate::common::AgentResult::FileContent { content: c } => {
+                        total += c.len();
+                        ref_files.push((path.clone(), Ok(c)));
+                    }
+                    _ => ref_files.push((path.clone(), Err("read failed".to_string()))),
+                }
+            }
+            crate::server::agent::runner::compose_user_message(&content, &ref_files)
+        };
+
+        // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
+        // 落的是注入后的 content——DB 中就是一条完整的 user 消息。
+        let msg_id = format!("{:032x}", rand::random::<u128>());
+        let _ = agent
+            .db
+            .agent_add_message(&msg_id, &session_id, "user", &content, None)
+            .await;
+        // 内存上下文追加的同样是注入后的 content。
+        rt.messages.push(ChatMessage::text("user", content));
+
         // 每个用户消息串行运行一个 agent turn。turn 期间持续观察 ws_stream：
         // 对端断开则丢弃 turn future（取消该回合）并退出外层循环，避免连接任务
         // 永久挂起（read 循环不再 poll ws_stream 导致 close 永远不可见）；若 turn
@@ -333,8 +413,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     msg = ws_stream.next() => match msg {
                         None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break TurnOutcome::Disconnected,
                         Some(Ok(m)) => match parse_ws_frame(m) {
-                            WsFrame::UserMessage(c) => {
-                                pending.get_or_insert(c);
+                            WsFrame::UserMessage { content, refs } => {
+                                pending.get_or_insert((content, refs));
                             }
                             // 中断式取消：drop turn future（与断连路径一致），但连接保留，
                             // 回发 stopped 帧后继续外层循环等下一条消息。
@@ -346,6 +426,22 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                 // 下一轮外层循环继续消费它们。
                                 pending = None;
                                 break TurnOutcome::Cancelled;
+                            }
+                            WsFrame::ApprovalResponse {
+                                request_id,
+                                approved,
+                                remember,
+                            } => {
+                                // 唤醒挂起的审批（跨 runner future 边界，靠 AgentState
+                                // 的 pending map 可达）；未知 request_id 静默忽略。
+                                agent
+                                    .resolve_approval(
+                                        &session_id,
+                                        &request_id,
+                                        approved,
+                                        remember,
+                                    )
+                                    .await;
                             }
                             WsFrame::Other => {}
                         },
@@ -473,12 +569,34 @@ pub async fn update_workspace(
     Path(id): Path<String>,
     Json(body): Json<UpdateWorkspaceRequest>,
 ) -> impl IntoResponse {
+    // approval_mode 校验：非法值拒绝（而不是静默落库）
+    if let Some(m) = body.approval_mode.as_deref() {
+        if !matches!(m, "safe" | "auto_write" | "full_auto") {
+            return (
+                StatusCode::BAD_REQUEST,
+                "approval_mode must be safe|auto_write|full_auto",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // 空串归一化为 None（保持字段语义：未设置 ≠ 空串）
+    let system_prompt = body
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match agent
         .db
-        .agent_update_workspace(&id, &body.name, &body.root_path)
+        .agent_update_workspace(
+            &id,
+            &body.name,
+            &body.root_path,
+            system_prompt,
+            body.approval_mode.as_deref(),
+        )
         .await
     {
         Ok(()) => get_workspace(State(state), Path(id)).await.into_response(),
@@ -497,6 +615,73 @@ pub async fn delete_workspace(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceFilesQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+/// 单引号 shell 转义：' → '\''（标准做法），包裹后任意输入安全。
+fn shell_escape_q(q: &str) -> String {
+    format!("'{}'", q.replace('\'', r"'\''"))
+}
+
+/// GET /api/agent/workspaces/:id/files?q=<前缀>&limit=<n>
+/// @补全数据源：经隧道在沙箱内 find+grep 过滤文件路径。Windows 客户端无 find/grep
+/// 时 grep 报错 → 返回空列表（前端降级手输路径），不视为错误。
+pub async fn list_workspace_files(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<WorkspaceFilesQuery>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let ws = match agent.db.agent_get_workspace(&id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 50);
+    let q = params.q.trim();
+    let cmd = if q.is_empty() {
+        format!(
+            "find . -path ./.git -prune -o -type f -print | head -{}",
+            limit
+        )
+    } else {
+        format!(
+            "find . -path ./.git -prune -o -type f -print | grep -i -F -- {} | head -{}",
+            shell_escape_q(q),
+            limit
+        )
+    };
+    let result = crate::server::agent::executor::exec_on_client(
+        agent,
+        &ws.id,
+        &ws.client_id,
+        &ws.root_path,
+        ws.docker_container_id.as_deref(),
+        crate::common::AgentCommand::Shell { cmd, cwd: None },
+    )
+    .await;
+    let files: Vec<String> = match result {
+        // grep 无命中 / Windows 无 grep 报错（走 stderr，stdout 为空）→ 空列表 200，降级语义保留
+        crate::common::AgentResult::Shell { stdout, .. } => stdout
+            .lines()
+            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        // 客户端离线/隧道失败/exec 错误 → 503，前端据此区分「离线」与「无匹配」。
+        // Windows 无 sh 时 spawn 失败也归入此分支（规格内取舍：503 对前端同样是降级）。
+        _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(serde_json::json!({ "files": files })).into_response()
 }
 
 pub async fn list_sessions(
@@ -661,7 +846,19 @@ mod tests {
         let user = parse_ws_frame(Message::Text(
             r#"{"type":"user_message","content":"hi"}"#.into(),
         ));
-        assert!(matches!(user, WsFrame::UserMessage(c) if c == "hi"));
+        assert!(matches!(
+            user,
+            WsFrame::UserMessage { content, refs } if content == "hi" && refs.is_empty()
+        ));
+
+        // @引用：refs 数组解析；无 refs 字段默认空列表
+        let user_refs = parse_ws_frame(Message::Text(
+            r#"{"type":"user_message","content":"看下","refs":["src/main.rs","a/b.rs"]}"#.into(),
+        ));
+        assert!(matches!(
+            user_refs,
+            WsFrame::UserMessage { content, refs } if content == "看下" && refs == ["src/main.rs", "a/b.rs"]
+        ));
 
         let cancel = parse_ws_frame(Message::Text(r#"{"type":"cancel"}"#.into()));
         assert!(matches!(cancel, WsFrame::Cancel));
@@ -674,6 +871,37 @@ mod tests {
 
         let malformed = parse_ws_frame(Message::Text("not json".into()));
         assert!(matches!(malformed, WsFrame::Other));
+
+        let approve = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r1","approved":true,"remember":"session"}"#
+                .into(),
+        ));
+        assert!(matches!(
+            approve,
+            WsFrame::ApprovalResponse {
+                request_id,
+                approved: true,
+                remember: true
+            } if request_id == "r1"
+        ));
+
+        let deny = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r2","approved":false}"#.into(),
+        ));
+        assert!(matches!(
+            deny,
+            WsFrame::ApprovalResponse {
+                approved: false,
+                remember: false,
+                ..
+            }
+        ));
+
+        // 缺 request_id → Other
+        let bad = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","approved":true}"#.into(),
+        ));
+        assert!(matches!(bad, WsFrame::Other));
     }
 
     async fn test_state() -> (ApiState, Database) {
@@ -870,6 +1098,44 @@ mod tests {
         let mut other = "keep".to_string();
         refresh_session_model(&db, "ghost", &mut other).await;
         assert_eq!(other, "keep");
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_files_workspace_not_found() {
+        let (state, _db) = test_state().await;
+        let resp = list_workspace_files(
+            State(state),
+            Path("ghost".to_string()),
+            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_workspace_files_client_offline_returns_503() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
+        // 立即返回 AgentResult::Error，handler 应回 503 供前端区分「离线」与「无匹配」。
+        let resp = list_workspace_files(
+            State(state),
+            Path("w1".to_string()),
+            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_shell_escape_q() {
+        assert_eq!(shell_escape_q("main"), "'main'");
+        assert_eq!(shell_escape_q("it's"), r#"'it'\''s'"#);
+        assert_eq!(shell_escape_q("a';b|rm"), r#"'a'\'';b|rm'"#); // 单引号转义后特殊字符在引号内安全
     }
 
     #[tokio::test]

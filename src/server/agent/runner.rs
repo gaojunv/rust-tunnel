@@ -6,6 +6,40 @@ use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
 use crate::common::{AgentCommand, AgentResult};
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
+/// @引用限制：个数、单文件字节、总字节。
+pub const MAX_REFS: usize = 10;
+pub const MAX_REF_FILE_BYTES: usize = 50 * 1024;
+pub const MAX_REFS_TOTAL_BYTES: usize = 200 * 1024;
+
+/// 把用户消息与引用文件内容合成单条 user 消息（落库/进上下文的都是这条）。
+pub fn compose_user_message(
+    content: &str,
+    ref_files: &[(String, Result<String, String>)],
+) -> String {
+    if ref_files.is_empty() {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    for (path, result) in ref_files {
+        match result {
+            Ok(text) => {
+                let truncated = if text.len() > MAX_REF_FILE_BYTES {
+                    let mut cut = MAX_REF_FILE_BYTES;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    format!("{}\n[truncated]", &text[..cut])
+                } else {
+                    text.clone()
+                };
+                out.push_str(&format!("\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```"));
+            }
+            Err(_) => out.push_str(&format!("\n\n[无法读取: {path}]")),
+        }
+    }
+    out
+}
+
 /// 按行切分 SSE 字节流：HTTP chunk 边界可切断一行，未完结部分留缓冲。
 struct LineBuf {
     pending: Vec<u8>,
@@ -271,6 +305,39 @@ async fn handle_tool_calls(
 
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
+                // 审批：session 记忆集命中 → 放行；否则按 workspace approval_mode 判定，
+                // 需确认时发 approval_request 挂起等待。拒绝落库 [denied by user]，
+                // 回合不中断（模型看到拒绝可自行换方案）。
+                if !agent
+                    .is_allowed_for_session(&rt.session_id, &call.name)
+                    .await
+                    && super::approval::needs_approval(&rt.approval_mode, &command)
+                {
+                    let summary = super::approval::approval_summary(&command);
+                    let args_preview: String = call.args.chars().take(500).collect();
+                    let approved = agent
+                        .request_approval(
+                            &rt.session_id,
+                            &call.name,
+                            &summary,
+                            &args_preview,
+                            ws_tx,
+                        )
+                        .await;
+                    if !approved {
+                        let text = "[denied by user]".to_string();
+                        let _ = ws_tx
+                            .send(serde_json::json!({
+                                "type": "tool_result",
+                                "id": &call.id,
+                                "name": &call.name,
+                                "result": &text,
+                            }))
+                            .await;
+                        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+                        continue;
+                    }
+                }
                 // 老客户端不认识 Search/PatchFile 变体：bincode 按索引反序列化，
                 // 未知索引直接导致控制连接断开。版本不足时在服务端短路为错误喂回模型。
                 let needs_new_client = matches!(
@@ -401,6 +468,43 @@ pub async fn run_agent_turn(
     ws_tx: mpsc::Sender<serde_json::Value>,
 ) -> Result<(), String> {
     const MAX_TOOL_ROUNDS: usize = 20;
+
+    // 首个回合前读 AGENTS.md（rt.agents_md 为 None 表示尚未尝试）。读不到/为空
+    // 静默跳过；读到则重建 system 消息并缓存（同会话后续回合不重读）。
+    if rt.agents_md.is_none() {
+        let content = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+            String::new()
+        } else {
+            match executor::exec_on_client(
+                &agent,
+                &rt.workspace_id,
+                &rt.client_id,
+                &rt.root_path,
+                rt.docker_container.as_deref(),
+                AgentCommand::ReadFile {
+                    path: "AGENTS.md".to_string(),
+                },
+            )
+            .await
+            {
+                AgentResult::FileContent { content } => content,
+                _ => String::new(),
+            }
+        };
+        let content = content.trim().to_string();
+        if !content.is_empty() {
+            let base = rt.messages[0].content.as_deref().unwrap_or_default();
+            // base 是「内置 + workspace」两层（load 构建、无 AGENTS.md 段），直接追加第三段。
+            rt.messages[0] = ChatMessage::text(
+                "system",
+                format!(
+                    "{base}\n\n---\n\n# Project instructions (AGENTS.md):\n{}",
+                    crate::server::agent::session::truncate_agents_md(&content)
+                ),
+            );
+        }
+        rt.agents_md = Some(content);
+    }
 
     for _round in 0..MAX_TOOL_ROUNDS {
         // 每轮 LLM 调用前检查上下文超限 → 压缩早期历史（失败降级截断，不阻断回合）
@@ -890,7 +994,10 @@ mod tests {
 
     #[test]
     fn test_truncate_tool_result_by_lines() {
-        let text = (0..400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..400)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = truncate_tool_result(text);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.len() <= TOOL_RESULT_MAX_LINES + 1); // +1 为 truncated 标记行
@@ -918,5 +1025,35 @@ mod tests {
         let text = "汉".repeat(15 * 1024); // ~45KB
         let out = truncate_tool_result(text);
         assert!(out.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_compose_user_message_with_refs() {
+        let msg = compose_user_message("帮我重构", &[
+            ("src/main.rs".to_string(), Ok("fn main() {}".to_string())),
+        ]);
+        assert!(msg.starts_with("帮我重构"));
+        assert!(msg.contains("--- 引用文件: src/main.rs ---"));
+        assert!(msg.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn test_compose_user_message_ref_failure_annotated() {
+        let msg = compose_user_message("看下这个", &[
+            ("missing.rs".to_string(), Err("not found".to_string())),
+        ]);
+        assert!(msg.contains("[无法读取: missing.rs]"));
+    }
+
+    #[test]
+    fn test_compose_user_message_no_refs_passthrough() {
+        assert_eq!(compose_user_message("纯文本", &[]), "纯文本");
+    }
+
+    #[test]
+    fn test_compose_user_message_file_truncated() {
+        let big = "x".repeat(60 * 1024);
+        let msg = compose_user_message("看", &[("big.rs".to_string(), Ok(big))]);
+        assert!(msg.contains("[truncated]"));
     }
 }

@@ -11,6 +11,8 @@ import {
 } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
 import type { ChatItem } from './types';
+import ApprovalCard from './ApprovalCard';
+import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import ModelSelect from './ModelSelect';
 
@@ -20,19 +22,31 @@ const STREAM_FLUSH_MS = 50;
 
 interface Props {
   sessionId: string;
+  workspaceId: string;
   model: string;
   onModelChange: (id: string) => void;
 }
 
-export default function ChatStream({ sessionId, model, onModelChange }: Props) {
+export default function ChatStream({ sessionId, workspaceId, model, onModelChange }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
+  // @补全引用：选中的文件路径 chip（发送时随 user_message 帧带 refs 字段）
+  const [refs, setRefs] = useState<string[]>([]);
+  // @ 弹层状态：start 为光标前最近 @ 的下标，query 为其后到光标的前缀
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
+  // 弹层高亮（受控）：父组件持 有 state，↑↓ 循环驱动，Enter/Tab 选中；MentionPopup
+  // 通过 onFilesChange 上报可选中列表、列表变化时经 onActiveIdxChange 回卷首项
+  const [mentionFiles, setMentionFiles] = useState<string[]>([]);
+  const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
+  // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
@@ -196,17 +210,30 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     pendingToolsRef.current.clear();
   }, [clearRunningTimeout]);
 
+  // 回合终态处理：done/stopped/error/本地停止/10 分钟超时都把仍在 pending 的审批
+  // 卡片置为 expired。否则卡片永久 pending → hasPendingApproval 恒 true → 发送按钮
+  // 被锁死（服务端 5 分钟审批超时实际按 deny 继续回合，UI 必须与服务端结果对齐）。
+  // expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝。
+  const expirePendingApprovals = useCallback(() => {
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'approval' && it.approvalStatus === 'pending'
+        ? { ...it, approvalStatus: 'expired' }
+        : it
+    ));
+  }, []);
+
   const armRunning = useCallback(() => {
     if (runningRef.current) return;
     runningRef.current = true;
     setRunning(true);
     clearRunningTimeout();
-    // 10 分钟超时兜底：到点未终态则强制解除
+    // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
     timeoutRef.current = globalThis.setTimeout(() => {
       setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+      expirePendingApprovals();
       stopRunning();
     }, RUNNING_TIMEOUT_MS);
-  }, [clearRunningTimeout, stopRunning, t]);
+  }, [clearRunningTimeout, stopRunning, expirePendingApprovals, t]);
 
   // WebSocket：断线自动重连（指数退避 1s→15s）。后端支持重连（新连接从 DB 重载
   // 会话，见 agent.rs handle_agent_socket），断线不应废掉整个会话的流式功能。
@@ -296,6 +323,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return prev;
         });
         stopRunning();
+        // 回合已终态，未响应的审批请求随回合作废 → 卡片过期
+        expirePendingApprovals();
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
@@ -305,6 +334,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return prev;
         });
         stopRunning();
+        // 回合成功结束：服务端 5 分钟审批超时按 deny 继续回合，仍 pending 的
+        // 卡片必须过期，否则 hasPendingApproval 恒 true 锁死发送按钮
+        expirePendingApprovals();
         // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果；
         // 不影响聊天区（history effect 有 loadedRef 守卫，不会重复装载）
         void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
@@ -315,6 +347,20 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
         // 服务端标题已写库（生成晚于 done 帧，故此处单独广播）：刷新会话列表
         // 让 SessionBar 及时回显新标题
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
+      } else if (msg.type === 'approval_request') {
+        // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）
+        flushChunks();
+        setItems((prev) => {
+          streamingIdxRef.current = null;
+          return [...prev, {
+            kind: 'approval',
+            content: '',
+            approvalId: msg.request_id,
+            approvalTool: msg.tool,
+            approvalSummary: msg.summary,
+            approvalStatus: 'pending',
+          }];
+        });
       } else if (msg.type === 'error') {
         flushChunks();
         setItems((prev) => {
@@ -322,6 +368,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           return [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }];
         });
         stopRunning();
+        // 回合以错误终态结束，未响应的审批卡片一并过期
+        expirePendingApprovals();
       }
     };
 
@@ -337,6 +385,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           ]);
         }
         stopRunning();
+        // 断线时服务端 turn 被 drop、未响应审批按 deny 落定；本地卡片同样置
+        // expired，否则重连后历史 refetch 失败会永久锁死发送按钮
+        expirePendingApprovals();
         setDisconnected(true);
         needHistoryReload = true;
         const delay = Math.min(1000 * 2 ** attempts, 15000);
@@ -370,7 +421,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       chunkBufRef.current = '';
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, t]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, t]);
 
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
@@ -380,9 +431,79 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
     }
   }, [items]);
 
+  // 存在未响应的审批卡片时禁止继续发送（服务端在该审批响应前挂起回合）
+  const hasPendingApproval = items.some((it) => it.kind === 'approval' && it.approvalStatus === 'pending');
+
+  // 审批响应：approved=true 时 remember 决定「仅本次」还是「本会话记住」；
+  // 无论 WS 是否可用都先落本地状态（卡片从 pending 变 approved/denied）
+  const respondApproval = (id: string, approved: boolean, remember: boolean) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'approval_response',
+        request_id: id,
+        approved,
+        remember: remember ? 'session' : 'none',
+      }));
+    }
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'approval' && it.approvalId === id
+        ? { ...it, approvalStatus: approved ? 'approved' : 'denied' }
+        : it
+    ));
+  };
+
+  // @ 弹层触发检测：光标前找最近的 @（前面是空格/行首），其后到光标为 query。
+  // 命中则打开弹层；query 含空白（@ 后直接空格）或光标前无 @ 则关闭。
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const v = e.target.value;
+    setInput(v);
+    const pos = e.target.selectionStart ?? v.length;
+    const before = v.slice(0, pos);
+    const at = before.lastIndexOf('@');
+    if (at >= 0 && (at === 0 || /\s/.test(before[at - 1]))) {
+      const q = before.slice(at + 1);
+      if (!/\s/.test(q)) {
+        setMention({ start: at, query: q });
+        return;
+      }
+    }
+    closeMention();
+  };
+
+  // 关闭 @ 弹层并清空受控高亮/列表状态：避免重开弹层时选中上一次的陈旧结果
+  const closeMention = useCallback(() => {
+    setMention(null);
+    setMentionFiles([]);
+    setMentionActiveIdx(0);
+  }, []);
+
+  // 选中文件：把 @query 段从文本移除，路径进 refs chip（chip 独立展示，不占 textarea）
+  const selectMention = (path: string) => {
+    if (!mention) return;
+    const before = input.slice(0, mention.start);
+    const after = input.slice(mention.start + 1 + mention.query.length);
+    setInput(before + after);
+    setRefs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    closeMention();
+    if (blurTimerRef.current) {
+      clearTimeout(blurTimerRef.current);
+      blurTimerRef.current = null;
+    }
+    textareaRef.current?.focus();
+  };
+
+  // 稳定回调（供 MentionPopup 的 effect 依赖）：setState 函数恒等，避免触发渲染循环
+  const handleMentionFilesChange = useCallback((files: string[]) => {
+    setMentionFiles(files);
+  }, []);
+  const handleMentionActiveIdxChange = useCallback((idx: number) => {
+    setMentionActiveIdx(idx);
+  }, []);
+
   const send = () => {
     const text = input.trim();
-    if (!text || running) return;
+    if (!text || running || hasPendingApproval) return;
     const ws = wsRef.current;
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
@@ -391,13 +512,14 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       return;
     }
     try {
-      ws.send(JSON.stringify({ type: 'user_message', content: text }));
+      ws.send(JSON.stringify({ type: 'user_message', content: text, refs }));
     } catch {
       setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` }]);
       return;
     }
     setItems((prev) => [...prev, { kind: 'user', content: text }]);
     setInput('');
+    setRefs([]);
     armRunning();
   };
 
@@ -411,6 +533,8 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
       }
     }
     stopRunning();
+    // 本地停止路径同样作废未响应的审批卡片（cancel 帧可能因断线永远不回来）
+    expirePendingApprovals();
     setItems((prev) => [...prev, { kind: 'assistant', content: `⏹️ ${t('agent.stopped')}` }]);
   };
 
@@ -446,7 +570,9 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
         {items.map((it, i) => (
-          <MessageBubble key={i} item={it} />
+          it.kind === 'approval'
+            ? <ApprovalCard key={i} item={it} onRespond={respondApproval} />
+            : <MessageBubble key={i} item={it} />
         ))}
         {running && (
           <div className="flex items-center gap-1 text-sm text-muted-foreground">
@@ -465,14 +591,72 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
             {t('agent.reconnecting')}
           </div>
         )}
-        <div className="rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+        <div className="relative rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+          {refs.length > 0 && (
+            <div className="flex flex-wrap gap-1 px-2 pt-1.5">
+              {refs.map((r) => (
+                <span key={r} className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2 py-0.5 text-xs text-primary">
+                  @{r}
+                  <button type="button" onClick={() => setRefs((prev) => prev.filter((x) => x !== r))} className="hover:text-destructive">×</button>
+                </span>
+              ))}
+            </div>
+          )}
+          {mention && (
+            <MentionPopup
+              workspaceId={workspaceId}
+              query={mention.query}
+              activeIdx={mentionActiveIdx}
+              onActiveIdxChange={handleMentionActiveIdxChange}
+              onFilesChange={handleMentionFilesChange}
+              onSelect={selectMention}
+            />
+          )}
           <textarea
+            ref={textareaRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={handleInputChange}
             onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                closeMention();
+                return;
+              }
+              if (mention) {
+                // 弹层打开时键盘操作：↑↓ 循环移动高亮、Enter/Tab 选中、Shift+Enter 放行换行
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const n = mentionFiles.length;
+                  if (n > 0) {
+                    setMentionActiveIdx((prev) =>
+                      e.key === 'ArrowDown' ? (prev + 1) % n : (prev - 1 + n) % n,
+                    );
+                  }
+                  return;
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                  e.preventDefault();
+                  const target = mentionFiles[mentionActiveIdx];
+                  if (target) selectMention(target);
+                  return;
+                }
+                // Shift+Enter 或其它键：不拦截，交给下方 Enter/默认行为
+              }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 send();
+              }
+            }}
+            onBlur={() => {
+              // 点击弹层项会先触发 textarea blur：延迟 150ms 关闭，让 click 先选中
+              if (mention) {
+                blurTimerRef.current = globalThis.setTimeout(closeMention, 150);
+              }
+            }}
+            onFocus={() => {
+              // 用户回到输入框（或弹层项选中后主动 focus）→ 取消待执行的关闭
+              if (blurTimerRef.current) {
+                clearTimeout(blurTimerRef.current);
+                blurTimerRef.current = null;
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
@@ -494,7 +678,7 @@ export default function ChatStream({ sessionId, model, onModelChange }: Props) {
             ) : (
               <Button
                 onClick={send}
-                disabled={!input.trim()}
+                disabled={!input.trim() || hasPendingApproval}
                 size="sm"
                 variant="ghost"
                 aria-label={t('agent.send')}

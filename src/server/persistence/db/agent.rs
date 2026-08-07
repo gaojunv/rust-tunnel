@@ -10,6 +10,8 @@ pub struct AgentWorkspaceRecord {
     pub root_path: String,
     pub docker_image: Option<String>,
     pub docker_container_id: Option<String>,
+    pub approval_mode: String,
+    pub system_prompt: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -94,12 +96,17 @@ impl Database {
         id: &str,
         name: &str,
         root_path: &str,
+        system_prompt: Option<&str>,
+        approval_mode: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "UPDATE agent_workspaces SET name = ?, root_path = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+             approval_mode = COALESCE(?, approval_mode), updated_at = datetime('now') WHERE id = ?",
         )
         .bind(name)
         .bind(root_path)
+        .bind(system_prompt)
+        .bind(approval_mode)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -311,7 +318,7 @@ mod tests {
 
         assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 2);
 
-        db.agent_update_workspace("w1", "renamed", "/new/path")
+        db.agent_update_workspace("w1", "renamed", "/new/path", None, None)
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -320,6 +327,12 @@ mod tests {
 
         db.agent_delete_workspace("w1").await.unwrap();
         assert!(db.agent_get_workspace("w1").await.unwrap().is_none());
+
+        // approval_mode / system_prompt 默认值与读写
+        let ws = db.agent_get_workspace("w2").await.unwrap().unwrap();
+        assert_eq!(ws.approval_mode, "safe");
+        assert!(ws.system_prompt.is_none());
+
         db.agent_delete_workspace("w2").await.unwrap();
         assert!(db.agent_get_workspace("w2").await.unwrap().is_none());
     }

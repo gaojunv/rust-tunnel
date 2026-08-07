@@ -23,6 +23,8 @@ export default function AgentPage() {
   const [sessionId, setSessionId] = useState('');
   const [model, setModel] = useState('');
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
+  // 编辑模式：传入当前工作区则 WorkspaceDialog 走 PUT（client/运行时不可改）
+  const [editingWorkspace, setEditingWorkspace] = useState<AgentWorkspace | null>(null);
   // 自动选中守卫：切换 workspace / 新建会话 / 手动选择后允许自动选中最近会话；
   // 删除当前会话后置 false，严格回引导态（不自动重选），直到用户再次手动选择或切 workspace。
   const autoSelectRef = useRef(true);
@@ -114,6 +116,13 @@ export default function AgentPage() {
     setSessionId('');
   };
 
+  // 齿轮入口：打开编辑模式的 WorkspaceDialog（预填当前工作区，client/运行时不可改）
+  const openEditWorkspace = () => {
+    const w = workspaces?.find((x) => x.id === workspaceId) ?? null;
+    setEditingWorkspace(w);
+    setShowWorkspaceDialog(true);
+  };
+
   return (
     <div className="flex h-[calc(100dvh-7.5rem)] min-h-[480px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card">
       {/* 顶栏：logo + WorkspaceBar + SessionBar */}
@@ -123,6 +132,7 @@ export default function AgentPage() {
           workspaceId={workspaceId}
           onSelect={handleSelectWorkspace}
           onNew={() => setShowWorkspaceDialog(true)}
+          onEdit={openEditWorkspace}
         />
         {workspaceId && (
           <SessionBar
@@ -145,6 +155,7 @@ export default function AgentPage() {
             <ChatStream
               key={sessionId}
               sessionId={sessionId}
+              workspaceId={workspaceId}
               model={model}
               onModelChange={setModel}
             />
@@ -158,11 +169,17 @@ export default function AgentPage() {
 
       {showWorkspaceDialog && (
         <WorkspaceDialog
-          onClose={() => setShowWorkspaceDialog(false)}
+          editing={editingWorkspace ?? undefined}
+          onClose={() => {
+            setShowWorkspaceDialog(false);
+            setEditingWorkspace(null);
+          }}
           onCreated={(w) => {
             setWorkspaceId(w.id);
-            setSessionId('');
+            // 编辑模式保留当前会话（只是改设置）；新建才回到引导态
+            if (!editingWorkspace) setSessionId('');
             setShowWorkspaceDialog(false);
+            setEditingWorkspace(null);
           }}
         />
       )}

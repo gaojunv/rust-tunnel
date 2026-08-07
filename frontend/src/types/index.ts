@@ -528,6 +528,8 @@ export interface AgentWorkspace {
   root_path: string;
   docker_image?: string;
   docker_container_id?: string;
+  approval_mode: 'safe' | 'auto_write' | 'full_auto';
+  system_prompt: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -562,5 +564,6 @@ export type AgentWsEvent =
   | { type: 'done' }
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }
+  | { type: 'approval_request'; request_id: string; tool: string; summary: string; args_preview: string }
   | { type: 'error'; message?: string };
 

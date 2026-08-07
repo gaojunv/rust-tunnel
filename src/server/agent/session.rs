@@ -12,6 +12,11 @@ pub struct SessionRuntime {
     /// workspace is docker-typed but has no container yet (or host runtime).
     pub docker_container: Option<String>,
     pub model: String,
+    /// `workspace` 审批模式（`safe`/`auto_write`/`full_auto`），`load` 时从 workspace `record` 读取。
+    pub approval_mode: String,
+    /// AGENTS.md 内容缓存：None = 尚未尝试读取；Some("") = 已读但不存在/为空；
+    /// Some(非空) = 已注入。runner 据此决定是否发起首次读取。
+    pub agents_md: Option<String>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -46,7 +51,10 @@ impl SessionRuntime {
             .rposition(|r| r.kind == "summary")
             .unwrap_or(0);
 
-        let mut messages = vec![ChatMessage::text("system", SYSTEM_PROMPT)];
+        let mut messages = vec![ChatMessage::text(
+            "system",
+            build_system_prompt(workspace.system_prompt.as_deref(), None),
+        )];
         for r in &records[start..] {
             match r.kind.as_str() {
                 // 旧格式（kind='tool' 的合并行、assistant tool_calls 未持久化）重放会产生
@@ -89,12 +97,43 @@ impl SessionRuntime {
             root_path: workspace.root_path,
             docker_container: workspace.docker_container_id,
             model: session.model.unwrap_or_else(|| default_model.to_string()),
+            approval_mode: workspace.approval_mode.clone(),
+            agents_md: None,
             messages,
         })
     }
 }
 
 const SYSTEM_PROMPT: &str = "You are an AI programming assistant running inside a workspace on a remote machine. Use the provided tools (shell/read_file/write_file/list_dir/git_*) to inspect and modify the project. Prefer small, verifiable steps: read before write, run tests after changes. All paths are relative to the workspace root.";
+
+/// AGENTS.md 注入上限（字节），超出截断。
+const AGENTS_MD_MAX_BYTES: usize = 20 * 1024;
+
+/// 截断 AGENTS.md 到注入上限（UTF-8 边界安全）。
+pub fn truncate_agents_md(content: &str) -> String {
+    if content.len() <= AGENTS_MD_MAX_BYTES {
+        return content.to_string();
+    }
+    let mut cut = AGENTS_MD_MAX_BYTES;
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n[truncated]", &content[..cut])
+}
+
+/// 三层合成系统提示词：内置 → workspace 自定义 → AGENTS.md。
+/// 非空段按序用分隔线拼成单条 system 消息（多 system 消息有 provider 兼容性风险）。
+pub fn build_system_prompt(workspace_prompt: Option<&str>, agents_md: Option<&str>) -> String {
+    let mut parts = vec![SYSTEM_PROMPT.to_string()];
+    if let Some(ws) = workspace_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(ws.to_string());
+    }
+    if let Some(md) = agents_md.map(str::trim).filter(|s| !s.is_empty()) {
+        let truncated = truncate_agents_md(md);
+        parts.push(format!("# Project instructions (AGENTS.md):\n{truncated}"));
+    }
+    parts.join("\n\n---\n\n")
+}
 
 /// 清洗孤儿工具消息，保证 assistant tool_calls 与 tool 结果一一配对。
 ///
@@ -174,9 +213,7 @@ fn sanitize_tool_pairs(messages: &mut Vec<ChatMessage>) {
                 .into_iter()
                 .map(|(id, name)| ChatMessage {
                     role: "tool".into(),
-                    content: Some(
-                        "[interrupted: tool execution did not complete]".to_string(),
-                    ),
+                    content: Some("[interrupted: tool execution did not complete]".to_string()),
                     tool_calls: None,
                     tool_call_id: Some(id),
                     name: Some(name),
@@ -440,9 +477,18 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            "ok",
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
 
         let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
         // system + user + assistant(tool_calls) + tool(c1) + tool(c2 占位)
@@ -452,11 +498,7 @@ mod tests {
         assert_eq!(patched.role, "tool");
         assert_eq!(patched.tool_call_id.as_deref(), Some("c2"));
         assert_eq!(patched.name.as_deref(), Some("read_file"));
-        assert!(patched
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("interrupted"));
+        assert!(patched.content.as_deref().unwrap().contains("interrupted"));
     }
 
     #[tokio::test]
@@ -474,12 +516,30 @@ mod tests {
             .await
             .unwrap();
         // summary 之后只有孤儿 tool 结果（tool_calls 行落在 summary 之前被跳过）
-        db.agent_add_message_v2("m2", "s1", "user", "[上下文摘要] ...", None, None, None, "summary")
-            .await
-            .unwrap();
-        db.agent_add_message_v2("m3", "s1", "tool", "ok", None, Some("c1"), Some("shell"), "tool_result")
-            .await
-            .unwrap();
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "user",
+            "[上下文摘要] ...",
+            None,
+            None,
+            None,
+            "summary",
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            "ok",
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+        )
+        .await
+        .unwrap();
         db.agent_add_message("m4", "s1", "assistant", "继续", None)
             .await
             .unwrap();
@@ -514,5 +574,43 @@ mod tests {
         let roles: Vec<&str> = rt.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, ["system", "user", "assistant"]);
         assert_eq!(rt.messages.len(), 3);
+    }
+
+    #[test]
+    fn test_build_system_prompt_layers() {
+        // 仅内置
+        let p = build_system_prompt(None, None);
+        assert!(p.contains("AI programming assistant"));
+        assert!(!p.contains("AGENTS.md"));
+
+        // + workspace 段
+        let p = build_system_prompt(Some("Use Rust 2024 edition."), None);
+        assert!(p.contains("AI programming assistant"));
+        assert!(p.contains("Use Rust 2024 edition."));
+        assert!(p.contains("\n\n---\n\n"));
+
+        // + AGENTS.md 段
+        let p = build_system_prompt(Some("ws-rules"), Some("# Project\nAlways run tests."));
+        assert!(p.contains("ws-rules"));
+        assert!(p.contains("# Project instructions (AGENTS.md):"));
+        assert!(p.contains("Always run tests."));
+        // 顺序：内置 → workspace → AGENTS.md
+        let builtin_pos = p.find("AI programming assistant").unwrap();
+        let ws_pos = p.find("ws-rules").unwrap();
+        let md_pos = p.find("Project instructions").unwrap();
+        assert!(builtin_pos < ws_pos && ws_pos < md_pos);
+
+        // 空白 workspace 段视为无
+        let p = build_system_prompt(Some("   "), None);
+        assert!(!p.contains("---"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_truncates_agents_md() {
+        let big = "x".repeat(25 * 1024);
+        let p = build_system_prompt(None, Some(&big));
+        assert!(p.contains("[truncated]"));
+        // 截断后 AGENTS.md 段不超过 20KB + 标记
+        assert!(p.len() < 21 * 1024 + SYSTEM_PROMPT.len() + 200);
     }
 }
