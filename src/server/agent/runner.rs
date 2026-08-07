@@ -239,6 +239,17 @@ pub(crate) fn client_supports_terminal(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_TERMINAL_CLIENT_VERSION)
 }
 
+/// 首个支持 `AgentExecCancel`（真取消）的客户端版本。
+const MIN_CANCEL_CLIENT_VERSION: (u64, u64, u64) = (0, 4, 0);
+
+/// 客户端版本是否支持真取消（AgentExecCancel）；缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_cancel(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_CANCEL_CLIENT_VERSION)
+}
+
 /// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
 const TOOL_RESULT_MAX_LINES: usize = 300;
 const TOOL_RESULT_MAX_BYTES: usize = 30 * 1024;
@@ -895,6 +906,16 @@ mod tests {
         // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
         assert!(client_supports_terminal(Some("0.3.0+agent")));
         assert!(!client_supports_terminal(Some("0.2.0+agent")));
+    }
+
+    #[test]
+    fn test_client_supports_cancel() {
+        assert!(client_supports_cancel(Some("0.4.0")));
+        assert!(client_supports_cancel(Some("v0.4.1")));
+        assert!(!client_supports_cancel(Some("0.3.9")));
+        assert!(!client_supports_cancel(Some("0.3.0+agent")));
+        assert!(!client_supports_cancel(None));
+        assert!(!client_supports_cancel(Some("garbage")));
     }
 
     #[test]

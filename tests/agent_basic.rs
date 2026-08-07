@@ -43,6 +43,7 @@ async fn shell_ok(registry: &ClientRegistry, client: &str, root: &str, cmd: &str
     match registry
         .agent_exec(
             client,
+            "e2e-shell",
             "e2e-session",
             root,
             None,
@@ -105,6 +106,7 @@ async fn agent_write_then_read_file() {
         match registry
             .agent_exec(
                 "agent-file-client",
+                "e2e-write",
                 "e2e-session",
                 &root_str,
                 None,
@@ -124,6 +126,7 @@ async fn agent_write_then_read_file() {
         match registry
             .agent_exec(
                 "agent-file-client",
+                "e2e-read",
                 "e2e-session",
                 &root_str,
                 None,
@@ -169,6 +172,7 @@ async fn agent_git_lifecycle() {
         match registry
             .agent_exec(
                 client,
+                "e2e-write-app",
                 "e2e-session",
                 &root_str,
                 None,
@@ -188,6 +192,7 @@ async fn agent_git_lifecycle() {
         match registry
             .agent_exec(
                 client,
+                "e2e-status",
                 "e2e-session",
                 &root_str,
                 None,
@@ -210,6 +215,7 @@ async fn agent_git_lifecycle() {
         match registry
             .agent_exec(
                 client,
+                "e2e-commit",
                 "e2e-session",
                 &root_str,
                 None,
@@ -228,6 +234,7 @@ async fn agent_git_lifecycle() {
         match registry
             .agent_exec(
                 client,
+                "e2e-status-clean",
                 "e2e-session",
                 &root_str,
                 None,
@@ -262,6 +269,7 @@ async fn agent_exec_offline_client() {
         let err = registry
             .agent_exec(
                 "no-such-client",
+                "e2e-offline",
                 "e2e-session",
                 &root_str,
                 None,

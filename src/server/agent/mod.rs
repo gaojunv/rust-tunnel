@@ -70,6 +70,9 @@ pub struct AgentState {
     approvals: Arc<Mutex<PendingApprovals>>,
     /// "本会话允许此类工具"记忆集：`session_id` → 工具名集合。内存态，进程重启清零。
     session_allowed: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// 进行中的 exec：workspace_id → request_id。WS cancel/断连时据此把取消
+    /// 信号下发到客户端。锁短持有（仅索引），与 workspace_locks 分离。
+    exec_inflight: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AgentState {
@@ -81,6 +84,7 @@ impl AgentState {
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
+            exec_inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -184,5 +188,26 @@ impl AgentState {
     #[cfg(test)]
     pub(crate) async fn pending_approvals_count(&self) -> usize {
         self.approvals.lock().await.len()
+    }
+
+    /// 生成新 exec 的 request_id 并记入 inflight，返回 id。
+    /// WS cancel 用 `inflight_take` 取走；exec 结束后 `inflight_end` 清除。
+    pub async fn inflight_begin(&self, workspace_id: &str) -> String {
+        let id = format!("{:032x}", rand::random::<u128>());
+        self.exec_inflight
+            .lock()
+            .await
+            .insert(workspace_id.to_string(), id.clone());
+        id
+    }
+
+    /// exec 正常结束后清除（幂等）。
+    pub async fn inflight_end(&self, workspace_id: &str) {
+        self.exec_inflight.lock().await.remove(workspace_id);
+    }
+
+    /// 取出进行中的 exec request_id 并清除（cancel/断连时用，先取后清防重复取消）。
+    pub async fn inflight_take(&self, workspace_id: &str) -> Option<String> {
+        self.exec_inflight.lock().await.remove(workspace_id)
     }
 }

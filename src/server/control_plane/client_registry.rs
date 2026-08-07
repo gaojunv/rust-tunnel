@@ -297,13 +297,19 @@ impl ClientRegistry {
 
     /// Execute an agent command on a client over the control channel.
     ///
+    /// `request_id` 由调用方（`AgentState::inflight_begin`）预生成，供 WS cancel
+    /// 分支经 `send_agent_cancel` 下发真取消；本方法不再内部生成。
+    ///
     /// # Errors
     /// - `NotConnected` — client offline
     /// - `BrokenPipe` — control channel closed while sending
     /// - `TimedOut` — no response within `timeout`
+    // 显式 request_id + 7 个字段：每个参数语义单一，拆 struct 反而绕（brief 指定签名）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn agent_exec(
         &self,
         client_name: &str,
+        request_id: &str,
         session_id: &str,
         root_path: &str,
         docker_container: Option<&str>,
@@ -319,7 +325,7 @@ impl ClientRegistry {
             )
         })?;
 
-        let request_id = format!("{:032x}", rand::random::<u128>());
+        let request_id = request_id.to_string();
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = entry.agent_pending.lock().await;
@@ -343,10 +349,11 @@ impl ClientRegistry {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "response channel dropped",
-            )),
+            Ok(Err(_)) => {
+                // rx 被 drop（调用方取消/断连）：清理 pending 防泄漏，结果不可达。
+                entry.agent_pending.lock().await.remove(&request_id);
+                Err(Error::new(ErrorKind::BrokenPipe, "response channel dropped"))
+            }
             Err(_) => {
                 entry.agent_pending.lock().await.remove(&request_id);
                 Err(Error::new(ErrorKind::TimedOut, "agent exec timed out"))
@@ -369,6 +376,21 @@ impl ClientRegistry {
                 debug!("agent response for unknown request_id {}", request_id);
             }
         }
+    }
+
+    /// 向客户端下发 `AgentExecCancel`。**调用方必须先用 `client_supports_cancel`
+    /// 判定版本**；本方法只负责发送，客户端离线时静默返回 false。
+    pub async fn send_agent_cancel(&self, client_name: &str, request_id: &str) -> bool {
+        let Some(entry) = self.get(client_name).await else {
+            return false;
+        };
+        entry
+            .control_sender
+            .send(ControlMessage::AgentExecCancel {
+                request_id: request_id.to_string(),
+            })
+            .await
+            .is_ok()
     }
 }
 
@@ -500,6 +522,7 @@ mod tests {
         let result = registry
             .agent_exec(
                 "ghost",
+                "req-x",
                 "sess",
                 "/workspace",
                 None,
@@ -537,6 +560,8 @@ mod tests {
                 } => {
                     assert_eq!(root_path, "/workspace");
                     assert_eq!(docker_container.as_deref(), Some("dev-ctr"));
+                    // request_id 由调用方预生成并显式传入，模拟客户端应原样收到
+                    assert_eq!(request_id, "req-test-1");
                     registry2
                         .deliver_agent_response(
                             "nas",
@@ -553,6 +578,7 @@ mod tests {
         let result = registry
             .agent_exec(
                 "nas",
+                "req-test-1",
                 "sess",
                 "/workspace",
                 Some("dev-ctr"),
@@ -579,6 +605,7 @@ mod tests {
         let result = registry
             .agent_exec(
                 "nas",
+                "req-x",
                 "sess",
                 "/workspace",
                 None,

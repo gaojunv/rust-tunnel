@@ -608,6 +608,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // rt 是 &mut 借用且被移入 turn future——回合成功后的标题生成需要会话模型，
         // 故在此先 clone（借用仍在期，turn 结束后无法再访问 rt）。
         let turn_model = rt.model.clone();
+        // select 循环内 rt 被 turn future 独占借用，cancel/断连分支要下发取消信号，
+        // 此处先 clone workspace/client 标识备用（仅两个 String，代价可忽略）。
+        let cancel_workspace_id = rt.workspace_id.clone();
+        let cancel_client_id = rt.client_id.clone();
         let turn = crate::server::agent::runner::run_agent_turn(
             agent.clone(),
             llm.clone(),
@@ -622,14 +626,23 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 tokio::select! {
                     r = &mut turn => break TurnOutcome::Completed(r),
                     msg = ws_stream.next() => match msg {
-                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break TurnOutcome::Disconnected,
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
+                            // 断连：若有进行中的 exec，把取消信号下发到客户端，避免
+                            // 内网机器上的命令失去监督仍在运行。
+                            send_cancel_to_client(&agent, &cancel_workspace_id, &cancel_client_id, &event_tx).await;
+                            break TurnOutcome::Disconnected;
+                        }
                         Some(Ok(m)) => match parse_ws_frame(m) {
                             WsFrame::UserMessage { content, refs } => {
                                 pending.get_or_insert((content, refs));
                             }
-                            // 中断式取消：drop turn future（与断连路径一致），但连接保留，
+                            // 中断式取消：先下发真取消信号（支持新协议的客户端），
+                            // 再 drop turn future（与断连路径一致），但连接保留，
                             // 回发 stopped 帧后继续外层循环等下一条消息。
                             WsFrame::Cancel => {
+                                // 真取消：先把进行中的 exec 请求 id 下发到客户端
+                                // （仅支持新协议的客户端；老客户端退化为停止等待）。
+                                send_cancel_to_client(&agent, &cancel_workspace_id, &cancel_client_id, &event_tx).await;
                                 let _ = event_tx
                                     .send(serde_json::json!({"type": "stopped"}))
                                     .await;
@@ -706,6 +719,34 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     }
 
     push_task.abort();
+}
+
+/// 把当前 workspace 进行中的 exec 取消信号下发到客户端（版本门控）。断连/取消
+/// 共用。执行已结束（inflight 为空）或无匹配 id 时静默 no-op。
+/// 入参用 workspace_id/client_id 而非 &SessionRuntime：select 循环内 rt 已被
+/// turn future 独占借用，调用方在移入 turn 前 clone 这两个标识。
+async fn send_cancel_to_client(
+    agent: &crate::server::agent::AgentState,
+    workspace_id: &str,
+    client_id: &str,
+    event_tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
+) {
+    let Some(request_id) = agent.inflight_take(workspace_id).await else {
+        return;
+    };
+    let version = agent
+        .registry
+        .get(client_id)
+        .await
+        .and_then(|e| e.client_version.clone());
+    if !crate::server::agent::runner::client_supports_cancel(version.as_deref()) {
+        tracing::debug!("client {} does not support cancel, skipping", client_id);
+        return;
+    }
+    if !agent.registry.send_agent_cancel(client_id, &request_id).await {
+        tracing::debug!("send_agent_cancel failed for client {}", client_id);
+    }
+    let _ = event_tx; // 预留：可扩展发 status 提示
 }
 
 pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse {
