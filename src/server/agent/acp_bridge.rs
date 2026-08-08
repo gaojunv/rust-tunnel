@@ -69,11 +69,19 @@ struct SpawnedAgent {
     /// WS 事件通道（map_update 映射帧推前端）；ensure_session 时注册/刷新。
     /// 注意：ACP 回合异步执行，事件在 WS 连接关闭后仍可能短暂推送——handler
     /// 退出时 [`AcpBridge::detach_ws_tx`] 清空，避免无消费端长期占位。
+    /// 连接任务的通知/请求处理器**每次事件**都经 [`current_ws_tx`] 动态读此
+    /// 字段，重连（dedup 刷新）后流式帧自动切到新连接。
     ws_tx: Option<mpsc::Sender<serde_json::Value>>,
     /// 回合进行中标记：prompt 置位、PromptResponse 到达/cancel 清位。防并发
     /// prompt（ACP 单连接不支持并发回合；WS session_lock 只串行化分派，
     /// 不跨异步回合）。
     busy: bool,
+    /// 回合被取消标记：`cancel` 置位。杀进程后 `on_receiving_result` 会以 Err
+    /// 到达（stopped 帧已由 WS handler 回发），终态回调据此抑制 done/error 帧，
+    /// 避免取消后再补一条误导性的 error 帧。终态回调处理时读取并复位（只对
+    /// 本回合生效）。不用 exited 判定——进程自行崩溃（非用户取消）时 exited
+    /// 也会置位，此时仍须把错误上报前端。
+    cancelled: bool,
     /// 最近活动时间（prompt / cancel / stdio / ACP 通知都会刷新；idle reaper 依据）。
     last_activity: std::time::Instant,
     /// AgentSpawnExit 已到达（进程结束）。
@@ -245,6 +253,7 @@ impl AcpBridge {
                     client_id: workspace.client_id.clone(),
                     ws_tx: Some(ws_tx.clone()),
                     busy: false,
+                    cancelled: false,
                     last_activity: std::time::Instant::now(),
                     exited: false,
                 },
@@ -284,8 +293,9 @@ impl AcpBridge {
                     SPAWN_TIMEOUT,
                 )
                 .await?;
-            // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线）
-            self.acp_handshake(session_id, &ws_tx).await
+            // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线；
+            // ws_tx 由连接任务的处理器每次事件从会话条目动态解析，无需传入）
+            self.acp_handshake(session_id).await
         }
         .await;
         if outcome.is_err() {
@@ -302,17 +312,13 @@ impl AcpBridge {
     /// `initialize` + `session/new`，把 `ConnectionTo<Agent>` 与 ACP session id
     /// 写回会话条目；随后 main_fn 挂起等待 incoming EOF（保持连接存活，
     /// 直到进程退出/会话被杀）。通知（`session/update`）经
-    /// [`map_update`] 映射后推 ws_tx；权限请求（`session/request_permission`）
-    /// 走审批回调。
+    /// [`map_update`] 映射后推会话条目当前的 ws_tx——处理器每次事件动态解析，
+    /// 重连自动切到新连接；权限请求（`session/request_permission`）走审批回调。
     ///
     /// 注意：`agent_client_protocol::Client` 是角色标记（unit struct），并非
     /// 连接句柄；连接句柄是 `ConnectionTo<Agent>`。每 session 一条专用连接，
     /// 通知无需按 session id 过滤。
-    async fn acp_handshake(
-        &self,
-        session_id: &str,
-        ws_tx: &mpsc::Sender<serde_json::Value>,
-    ) -> Result<(), String> {
+    async fn acp_handshake(&self, session_id: &str) -> Result<(), String> {
         // 取走 duplex 的 ACP 端（占用即移除；后续 kill 不再持有）。
         let agent_io = {
             let mut sessions = self.sessions.lock().await;
@@ -325,7 +331,6 @@ impl AcpBridge {
         };
 
         let sid = session_id.to_string();
-        let ws_tx = ws_tx.clone();
         let approval = self.approval.clone();
         let sessions = self.sessions.clone();
         let (setup_tx, setup_rx) = oneshot::channel();
@@ -339,18 +344,15 @@ impl AcpBridge {
                 .on_receive_notification(
                     {
                         let sid = sid.clone();
-                        let ws_tx = ws_tx.clone();
                         let sessions = sessions.clone();
                         // tool_call_id → 工具名 缓存：ACP 的 ToolCallUpdate 常不带
                         // title，而前端 ChatStream 按 tool_result.name === tool_call.name
                         // 匹配卡片——从前序 ToolCall 事件的 title 补名，保证结果能挂上。
                         let mut tool_names: HashMap<String, String> = HashMap::new();
                         async move |notification: SessionNotification, _cx| {
-                            // 专用连接：所有通知都属于本 session。先刷新活动
-                            // （长回合无 stdout 时不被 idle reaper 误回收）。
-                            if let Some(a) = sessions.lock().await.get_mut(&sid) {
-                                a.last_activity = std::time::Instant::now();
-                            }
+                            // 专用连接：所有通知都属于本 session。tool_call 名缓存
+                            // 先填（会话 detached 期间也可累积，重连后 tool_result
+                            // 仍能补名）。
                             if let agent_client_protocol::schema::v1::SessionUpdate::ToolCall(tc) =
                                 &notification.update
                             {
@@ -359,6 +361,16 @@ impl AcpBridge {
                                     tc.title.clone(),
                                 );
                             }
+                            // 每次事件动态解析 WS 通道（评审 Finding 1）：handshake
+                            // 时捕获的 ws_tx 在重连后会过时——ensure_session 的 dedup
+                            // 刷新与 detach_ws_tx 清空只改条目里的 ws_tx，处理器必须
+                            // 读最新值，否则流式帧会推给已断开的旧连接（try_send
+                            // 静默失败，新连接只能看到 done）。顺带刷新 last_activity
+                            // （长回合无 stdout 时不被 idle reaper 误回收）。
+                            let Some(ws_tx) = current_ws_tx(&sessions, &sid).await else {
+                                // 会话已回收 / WS 已断开：无可推送者，丢弃本帧。
+                                return Ok(());
+                            };
                             if let Some(mut frame) = map_update(&notification.update) {
                                 // ToolCallUpdate 缺 title 时从缓存补 name。
                                 if frame["type"] == "tool_result"
@@ -388,9 +400,22 @@ impl AcpBridge {
                 .on_receive_request(
                     {
                         let sid = sid.clone();
-                        let ws_tx = ws_tx.clone();
                         let approval = approval.clone();
+                        let sessions = sessions.clone();
                         async move |request: RequestPermissionRequest, responder, _cx| {
+                            // 动态解析当前 WS 通道（同 notification，评审 Finding 1）：
+                            // 审批弹层要推给最新连接，而非 handshake 时捕获的旧通道。
+                            let ws_tx = match current_ws_tx(&sessions, &sid).await {
+                                Some(tx) => tx,
+                                // 会话已回收 / WS 已断开：构造一个立即失效的通道传给
+                                // 审批回调，request_approval 发帧失败即按拒绝短路返回
+                                // （评审 Finding 2：避免 5 分钟超时占用连接任务，阻塞
+                                // agent 下一个工具调用）。
+                                None => {
+                                    let (tx, _rx) = mpsc::channel::<serde_json::Value>(1);
+                                    tx
+                                }
+                            };
                             let tool_name = request
                                 .tool_call
                                 .fields
@@ -409,7 +434,7 @@ impl AcpBridge {
                                 tool_name,
                                 "ACP 工具调用请求".to_string(),
                                 args_preview,
-                                ws_tx.clone(),
+                                ws_tx,
                             )
                             .await;
                             let outcome = if approved {
@@ -511,10 +536,12 @@ impl AcpBridge {
     /// 向 ACP 会话发送一条 prompt（fire-and-forget）。
     ///
     /// 发送 `session/prompt` 后立即返回；回合内的 `session/update` 通知经
-    /// [`map_update`] 推送 ws_tx，`PromptResponse` 到达时回调发 `{"type":"done"}`
-    /// 帧。回合进行中重复 prompt 报错（`busy` 守卫；ACP 单连接不支持并发回合）。
+    /// [`map_update`] 推送会话条目当前的 ws_tx，`PromptResponse` 到达时回调发
+    /// `{"type":"done"}` 帧。回合进行中重复 prompt 报错（`busy` 守卫；ACP 单连接
+    /// 不支持并发回合）。取消/杀进程后的终态帧被抑制（stopped 帧已由 WS handler
+    /// 回发，再补 error/done 会造成误导）。
     pub async fn prompt(&self, session_id: &str, content: &str) -> Result<(), String> {
-        let (connection, acp_session_id, ws_tx) = {
+        let (connection, acp_session_id) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
                 .get_mut(session_id)
@@ -534,13 +561,9 @@ impl AcpBridge {
                 .acp_session_id
                 .clone()
                 .ok_or_else(|| "ACP handshake not complete".to_string())?;
-            let ws_tx = agent
-                .ws_tx
-                .clone()
-                .ok_or_else(|| "ACP session has no ws channel".to_string())?;
             agent.busy = true;
             agent.last_activity = std::time::Instant::now();
-            (connection, acp_session_id, ws_tx)
+            (connection, acp_session_id)
         };
 
         let sessions = self.sessions.clone();
@@ -552,10 +575,29 @@ impl AcpBridge {
                 PromptRequest::new(acp_session_id, prompt),
             )
             .on_receiving_result(async move |result| {
-                // 回合结束（成功/失败/取消）：清 busy + 发终态帧。
-                if let Some(a) = sessions.lock().await.get_mut(&sid) {
-                    a.busy = false;
-                }
+                // 回合终态：清 busy + 取当前 WS 通道（重连后 done/error 推给最新
+                // 连接，与通知处理器同语义）。若回合被取消/会话已被杀（条目移除），
+                // 抑制终态帧——取消路径的 stopped 帧已由 WS handler 回发，再补
+                // error/done 会造成误导（评审 Finding 4）。注意抑制条件只用 cancelled
+                // 而非 exited：进程自行崩溃（非用户取消）时 exited 也会置位，此时
+                // 必须把错误上报前端，不能吞。
+                let ws_tx = {
+                    let mut map = sessions.lock().await;
+                    match map.get_mut(&sid) {
+                        Some(a) => {
+                            a.busy = false;
+                            if a.cancelled {
+                                a.cancelled = false; // 取消标记只对本回合终态生效
+                                return Ok(());
+                            }
+                            a.ws_tx.clone()
+                        }
+                        None => return Ok(()), // 会话已 kill/回收：不再发终态帧
+                    }
+                };
+                let Some(ws_tx) = ws_tx else {
+                    return Ok(()); // 前端已断开：无消费端，终态帧不发
+                };
                 match result {
                     Ok(_resp) => {
                         // 终态帧走阻塞发送：低频、必须送达；前端在时通道很快被
@@ -596,6 +638,9 @@ impl AcpBridge {
                 Some(agent) => {
                     agent.last_activity = std::time::Instant::now();
                     agent.busy = false;
+                    // 标记本回合已取消：杀进程后 on_receiving_result 会以 Err 到达，
+                    // 终态回调据此抑制 error 帧（stopped 帧已由 WS handler 回发）。
+                    agent.cancelled = true;
                     (
                         agent.client_id.clone(),
                         agent.connection.clone(),
@@ -768,6 +813,22 @@ impl AcpBridge {
     }
 }
 
+/// 动态解析会话当前的 WS 事件通道：重连/多标签页时 `ensure_session` 的 dedup
+/// 刷新、连接关闭时 [`AcpBridge::detach_ws_tx`] 清空，都会改动条目里的
+/// `ws_tx`。连接任务的通知/请求处理器**每次事件**都读最新值，避免流式帧/审批
+/// 弹层推给已断开的旧连接（旧 sender 的 try_send 会静默失败，前端只看到 done）。
+/// 顺带刷新 last_activity——长回合无 stdout 时不被 idle reaper 误回收。
+/// 会话不存在返回 None。
+async fn current_ws_tx(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) -> Option<mpsc::Sender<serde_json::Value>> {
+    let mut map = sessions.lock().await;
+    let agent = map.get_mut(sid)?;
+    agent.last_activity = std::time::Instant::now();
+    agent.ws_tx.clone()
+}
+
 /// stdio pump：进程 stdout（`stdout_rx`，即 `AgentSpawnData{stdin:false}` 转来）
 /// → 写 duplex 喂 ACP crate；ACP crate 写出的字节从 duplex 读回 → 以
 /// `AgentSpawnData{stdin:true}` 下发客户端进程 stdin。
@@ -925,9 +986,45 @@ mod tests {
             client_id: "nas".into(),
             ws_tx: None,
             busy: false,
+            cancelled: false,
             last_activity: std::time::Instant::now(),
             exited: false,
         }
+    }
+
+    /// 装配 mock agent（duplex → pump → mock_acp_agent）并完成 ACP handshake。
+    /// `ws_tx` 注册为会话条目的初始事件通道；连接任务的通知处理器此后每次事件
+    /// 从条目动态解析通道（见 `current_ws_tx`）。
+    async fn setup_handshake(
+        bridge: &AcpBridge,
+        ws_tx: mpsc::Sender<serde_json::Value>,
+    ) {
+        let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
+        let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
+
+        let mut agent = spawned_agent();
+        agent.agent_io = Some(agent_io);
+        agent.stdout_tx = Some(stdout_tx.clone());
+        agent.ws_tx = Some(ws_tx.clone());
+        bridge
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), agent);
+
+        tokio::spawn(run_stdio_pump(
+            pump_io,
+            stdout_rx,
+            control_tx,
+            "sess-1".into(),
+        ));
+        tokio::spawn(mock_acp_agent(control_rx, stdout_tx));
+
+        bridge
+            .acp_handshake("sess-1")
+            .await
+            .expect("handshake should complete");
     }
 
     /// 构造一个注册了模拟客户端 + 自动应答协商请求的 bridge。
@@ -1412,35 +1509,7 @@ mod tests {
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
 
         let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
-        let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
-        let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
-        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
-
-        // 注册会话条目（含 duplex ACP 端 + pump 通道）
-        let mut agent = spawned_agent();
-        agent.agent_io = Some(agent_io);
-        agent.stdout_tx = Some(stdout_tx.clone());
-        agent.ws_tx = Some(ws_tx.clone());
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), agent);
-
-        // pump + mock agent
-        tokio::spawn(run_stdio_pump(
-            pump_io,
-            stdout_rx,
-            control_tx,
-            "sess-1".into(),
-        ));
-        tokio::spawn(mock_acp_agent(control_rx, stdout_tx));
-
-        // ACP handshake：initialize → session/new
-        bridge
-            .acp_handshake("sess-1", &ws_tx)
-            .await
-            .expect("handshake should complete");
+        setup_handshake(&bridge, ws_tx.clone()).await;
         // 写回连接句柄与 ACP session id
         {
             let s = bridge.sessions.lock().await;
@@ -1477,5 +1546,110 @@ mod tests {
         assert_eq!(events[3]["type"], "done");
         // 回合结束：busy 复位，可再次 prompt
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_swaps_ws_channel_for_streaming() {
+        // 回归（评审 Finding 1）：连接任务的通知处理器在 handshake 时捕获过一次
+        // ws_tx，重连后 ensure_session 的 dedup 只刷新条目里的 ws_tx——旧捕获会把
+        // 流式帧推给已断开的旧连接（try_send 静默失败，新连接只能看到 done）。
+        // 修复后处理器每次事件动态解析，流式帧应全部到达新连接。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        // 旧连接 A：handshake 建立常驻连接任务。
+        let (ws_tx_a, mut ws_rx_a) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake(&bridge, ws_tx_a).await;
+
+        // 新连接 B：重连 → ensure_session dedup 把条目里的 ws_tx 刷新到 B。
+        let (ws_tx_b, mut ws_rx_b) = mpsc::channel::<serde_json::Value>(16);
+        bridge
+            .ensure_session("sess-1", &acp_workspace(), ws_tx_b)
+            .await
+            .expect("reconnect dedup should refresh ws_tx");
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+
+        // 流式帧（assistant_chunk / tool_call / tool_result）+ done 应全部到达 B。
+        for expected in ["assistant_chunk", "tool_call", "tool_result", "done"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_b.recv())
+                .await
+                .expect("timed out waiting for ws event on new channel")
+                .expect("ws channel closed");
+            assert_eq!(ev["type"], expected, "event on new channel: {ev}");
+        }
+        // 旧连接 A 不应收到任何帧（handshake 后捕获的旧 sender 已不再被使用）。
+        // 注意：swap 后 A 通道所有 sender 都已 drop，recv 会以 Ok(None)（通道关闭）
+        // 或 Err（超时）返回——两者都表示"没有帧"，只有 Ok(Some(..)) 才是泄漏。
+        let stale = tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv())
+            .await;
+        assert!(
+            !matches!(stale, Ok(Some(_))),
+            "old channel should receive nothing after reconnect: {stale:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_suppresses_terminal_frame() {
+        // 回归（评审 Finding 4）：取消/杀进程后 PromptResponse 才到达时，
+        // on_receiving_result 不应再发 done/error 终态帧（stopped 帧已由 WS
+        // handler 回发；kill 后回调以 Err 到达，不抑制会再补一条误导性 error）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake(&bridge, ws_tx.clone()).await;
+
+        // 模拟 cancel 已执行（标记条目；cancel 同时会清 busy，这里直接置位）。
+        bridge
+            .sessions
+            .lock()
+            .await
+            .get_mut("sess-1")
+            .unwrap()
+            .cancelled = true;
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+
+        // 流式通知不受取消抑制（mock agent 仍在回话）；终态 done 应被抑制。
+        for expected in ["assistant_chunk", "tool_call", "tool_result"] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for streamed event")
+                .expect("ws channel closed");
+            assert_eq!(ev["type"], expected, "event: {ev}");
+        }
+        let terminal = tokio::time::timeout(std::time::Duration::from_millis(300), ws_rx.recv())
+            .await;
+        assert!(
+            terminal.is_err(),
+            "cancelled turn must not emit a terminal frame"
+        );
+        // busy 已复位（回合状态不被卡死），且取消标记已消费（供下一回合从干净态开始）
+        {
+            let s = bridge.sessions.lock().await;
+            assert!(!s.get("sess-1").unwrap().busy);
+            assert!(!s.get("sess-1").unwrap().cancelled);
+        }
     }
 }

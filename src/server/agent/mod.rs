@@ -152,8 +152,10 @@ impl AgentState {
             .clone()
     }
 
-    /// 发审批请求帧并挂起等待用户响应。返回是否批准；5 分钟超时、
-    /// 连接取消（sender 被 drop）一律视为 deny。
+    /// 发审批请求帧并挂起等待用户响应。返回是否批准；发送失败（前端已断开）、
+    /// 5 分钟超时、连接取消（sender 被 drop）一律视为 deny。发送失败立即返回，
+    /// 不等超时——否则调用方（ACP 连接任务的请求处理器）会被占用 5 分钟，
+    /// 阻塞 agent 下一个工具调用。
     pub async fn request_approval(
         &self,
         session_id: &str,
@@ -174,7 +176,7 @@ impl AgentState {
             request_id: request_id.clone(),
             armed: true,
         };
-        let _ = ws_tx
+        let send_ok = ws_tx
             .send(serde_json::json!({
                 "type": "approval_request",
                 "request_id": &request_id,
@@ -182,7 +184,15 @@ impl AgentState {
                 "summary": summary,
                 "args_preview": args_preview,
             }))
-            .await;
+            .await
+            .is_ok();
+        if !send_ok {
+            // 审批弹层无法送达（前端已断开/通道关闭）：直接视为拒绝并立即返回，
+            // 不等待 5 分钟超时。pending 条目在此显式清理（guard 同时 disarmed）。
+            self.approvals.lock().await.remove(&request_id);
+            guard.disarm();
+            return false;
+        }
         let approved = matches!(
             tokio::time::timeout(std::time::Duration::from_mins(5), rx).await,
             Ok(Ok(true))

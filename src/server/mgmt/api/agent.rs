@@ -439,15 +439,66 @@ fn use_acp_path(workspace: &crate::server::persistence::db::agent::AgentWorkspac
     !workspace.agent_type.is_empty()
 }
 
-/// 按 session 加载其 workspace 记录（分派 ACP 路径用）。session/workspace 缺失
-/// 或读库失败返回 None——由调用方回退到自研 runner 路径（其内部会再报错）。
+/// 按 session 加载其 workspace 记录（分派 ACP 路径用）。
+/// `Ok(None)` = session/workspace 不存在（可回退自研 runner 路径，其内部会再报错）；
+/// `Err` = 读库失败（瞬态 DB 错误）。调用方对 `Err` 应发 error 帧并跳过本回合，
+/// 不能静默回退——否则 ACP 配置的 workspace 会落到自研 runner（用错引擎）。
 async fn load_workspace_for_session(
     db: &crate::server::db::Database,
     session_id: &str,
-) -> Option<crate::server::persistence::db::agent::AgentWorkspaceRecord> {
-    let session = db.agent_get_session(session_id).await.ok()?;
-    let session = session?;
-    db.agent_get_workspace(&session.workspace_id).await.ok()?
+) -> Result<Option<crate::server::persistence::db::agent::AgentWorkspaceRecord>, String> {
+    let session = match db.agent_get_session(session_id).await {
+        Ok(session) => session,
+        Err(e) => return Err(format!("load session failed: {e}")),
+    };
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    db.agent_get_workspace(&session.workspace_id)
+        .await
+        .map_err(|e| format!("load workspace failed: {e}"))
+}
+
+/// 读取 @引用文件并合成完整 user 消息（自研 runner 与 ACP 两条路径共用）。
+/// 超总量限制的 refs 标注拒绝；读失败的标注 `[无法读取]`，均不阻断回合。
+/// refs 为空时原样返回 content。
+async fn inject_refs(
+    agent: &crate::server::agent::AgentState,
+    workspace_id: &str,
+    client_id: &str,
+    root_path: &str,
+    docker_container: Option<&str>,
+    content: &str,
+    refs: &[String],
+) -> String {
+    if refs.is_empty() {
+        return content.to_string();
+    }
+    let mut ref_files: Vec<(String, Result<String, String>)> = Vec::new();
+    let mut total = 0usize;
+    for path in refs {
+        if total >= crate::server::agent::runner::MAX_REFS_TOTAL_BYTES {
+            ref_files.push((path.clone(), Err("refs total size limit".to_string())));
+            continue;
+        }
+        let result = crate::server::agent::executor::exec_on_client(
+            agent,
+            workspace_id,
+            client_id,
+            root_path,
+            docker_container,
+            crate::common::AgentCommand::ReadFile { path: path.clone() },
+        )
+        .await;
+        match result {
+            crate::common::AgentResult::FileContent { content: c } => {
+                total += c.len();
+                ref_files.push((path.clone(), Ok(c)));
+            }
+            _ => ref_files.push((path.clone(), Err("read failed".to_string()))),
+        }
+    }
+    crate::server::agent::runner::compose_user_message(content, &ref_files)
 }
 
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
@@ -560,9 +611,21 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 否则保持下方自研 runner 路径。workspace 记录在此按需加载——runner
         // 路径的 SessionRuntime::load 内部还会再读一次，多一次低频 DB 读换取
         // 分派正确性可接受。
-        if let Some(acp_workspace) = load_workspace_for_session(&agent.db, &session_id).await {
-            if use_acp_path(&acp_workspace) {
+        match load_workspace_for_session(&agent.db, &session_id).await {
+            Ok(Some(acp_workspace)) if use_acp_path(&acp_workspace) => {
                 acp_active = true;
+                // @引用注入（与 runner 路径共用语义）：refs 内容进 prompt，不静默
+                // 丢弃（评审补充项）。读取经隧道在客户端进行，同 runner 路径。
+                let content = inject_refs(
+                    &agent,
+                    &acp_workspace.id,
+                    &acp_workspace.client_id,
+                    &acp_workspace.root_path,
+                    acp_workspace.docker_container_id.as_deref(),
+                    &content,
+                    &refs,
+                )
+                .await;
                 let Some(bridge) = agent.acp_bridge.clone() else {
                     let _ = event_tx
                         .send(serde_json::json!({
@@ -586,6 +649,16 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         .send(serde_json::json!({"type": "error", "message": e}))
                         .await;
                 }
+                continue;
+            }
+            // workspace 未配置 ACP / session 缺失：落入下方自研 runner 路径。
+            Ok(_) => {}
+            // 读库失败：不静默回退自研 runner（ACP workspace 用错引擎），
+            // 发 error 帧并跳过本回合（评审 Finding 3）。
+            Err(e) => {
+                let _ = event_tx
+                    .send(serde_json::json!({"type": "error", "message": e}))
+                    .await;
                 continue;
             }
         }
@@ -644,35 +717,16 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
 
         // @引用注入：逐个经隧道 ReadFile，合成完整 user 消息后落库 + 进上下文。
         // 超总量限制的 refs 标注拒绝；读失败的标注 [无法读取]，均不阻断回合。
-        let content = if refs.is_empty() {
-            content
-        } else {
-            let mut ref_files: Vec<(String, Result<String, String>)> = Vec::new();
-            let mut total = 0usize;
-            for path in &refs {
-                if total >= crate::server::agent::runner::MAX_REFS_TOTAL_BYTES {
-                    ref_files.push((path.clone(), Err("refs total size limit".to_string())));
-                    continue;
-                }
-                let result = crate::server::agent::executor::exec_on_client(
-                    &agent,
-                    &rt.workspace_id,
-                    &rt.client_id,
-                    &rt.root_path,
-                    rt.docker_container.as_deref(),
-                    crate::common::AgentCommand::ReadFile { path: path.clone() },
-                )
-                .await;
-                match result {
-                    crate::common::AgentResult::FileContent { content: c } => {
-                        total += c.len();
-                        ref_files.push((path.clone(), Ok(c)));
-                    }
-                    _ => ref_files.push((path.clone(), Err("read failed".to_string()))),
-                }
-            }
-            crate::server::agent::runner::compose_user_message(&content, &ref_files)
-        };
+        let content = inject_refs(
+            &agent,
+            &rt.workspace_id,
+            &rt.client_id,
+            &rt.root_path,
+            rt.docker_container.as_deref(),
+            &content,
+            &refs,
+        )
+        .await;
 
         // 持久化 user 消息（保持会话历史完整，供 Web 端与重连后的首轮恢复）。
         // 落的是注入后的 content——DB 中就是一条完整的 user 消息。
@@ -1490,6 +1544,36 @@ mod tests {
         assert!(use_acp_path(&ws));
         ws.agent_type = "claude-code".into();
         assert!(use_acp_path(&ws));
+    }
+
+    #[tokio::test]
+    async fn test_load_workspace_for_session_not_found_is_ok_none() {
+        // 评审 Finding 3：session/workspace「不存在」是 Ok(None)（可回退 runner），
+        // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
+        let (_state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        // 存在 → Some(workspace)
+        let ws = load_workspace_for_session(&db, "s1")
+            .await
+            .expect("load ok")
+            .expect("workspace exists");
+        assert_eq!(ws.id, "w1");
+        // session 不存在 → Ok(None)，不 panic
+        assert!(load_workspace_for_session(&db, "ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_inject_refs_empty_passthrough() {
+        // 无 @引用：原样返回，不触碰隧道（exec_on_client 也不被调用）。
+        let (state, _db) = test_state().await;
+        let agent = state.server_state.agent_state.as_ref().unwrap().clone();
+        let out = inject_refs(&agent, "w1", "nas", "/p", None, "hello", &[]).await;
+        assert_eq!(out, "hello");
     }
 
     #[tokio::test]

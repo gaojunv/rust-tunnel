@@ -404,4 +404,27 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(state.pending_approvals_count().await, 0);
     }
+
+    #[tokio::test]
+    async fn test_request_approval_send_failure_denies_fast() {
+        // 回归（评审 Finding 2）：前端已断开（WS 通道接收端被 drop）时，
+        // approval_request 帧发送失败应立即按拒绝返回，而不是等满 5 分钟超时——
+        // 否则调用方（ACP 连接任务的请求处理器）被长期占用，阻塞 agent 下一个
+        // 工具调用。
+        let state = test_state().await;
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx); // 模拟前端断开：接收端被 drop，send 立即 Err
+        let st = state.clone();
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+                .await
+        });
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("request_approval must return promptly when send fails")
+            .expect("task panicked");
+        assert!(!approved, "send failure should be treated as deny");
+        // pending 条目已清理，无泄漏
+        assert_eq!(state.pending_approvals_count().await, 0);
+    }
 }
