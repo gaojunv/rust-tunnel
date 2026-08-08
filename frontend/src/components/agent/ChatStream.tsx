@@ -57,6 +57,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const runningRef = useRef(false);
   // 当前正在流式写入的气泡 index（assistant_chunk 增量合并用；final/新事件到达时置 null）
   const streamingIdxRef = useRef<number | null>(null);
+  // 流式气泡的种类：文本与 thought 分气泡（kind 切换即断流）
+  const streamingKindRef = useRef<'assistant' | 'thought' | null>(null);
+  // 在飞 tool_call id 顺序表：tool_result 缺 name 时按 id 回退匹配卡片
+  const toolIdsRef = useRef<string[]>([]);
   // 流式 chunk 攒批缓冲：WS 帧先追加到这里，定时 flush 进 items（节流渲染）
   const chunkBufRef = useRef('');
   const chunkFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -183,16 +187,23 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     const pending = chunkBufRef.current;
     if (!pending) return;
     chunkBufRef.current = '';
+    const bubbleKind = streamingKindRef.current ?? 'assistant';
     setItems((prev) => {
       const idx = streamingIdxRef.current;
-      if (idx !== null && prev[idx]?.kind === 'assistant') {
+      if (idx !== null && prev[idx]?.kind === bubbleKind) {
         const next = [...prev];
         next[idx] = { ...next[idx], content: next[idx].content + pending };
         return next;
       }
       streamingIdxRef.current = prev.length;
-      return [...prev, { kind: 'assistant', content: pending }];
+      return [...prev, { kind: bubbleKind, content: pending }];
     });
+  }, []);
+
+  // 断开当前流式气泡（新事件类型到达/终态）：同步 ref，配合 setItems 队列语义
+  const breakStream = useCallback(() => {
+    streamingIdxRef.current = null;
+    streamingKindRef.current = null;
   }, []);
 
   const scheduleChunkFlush = useCallback(() => {
@@ -271,7 +282,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       }
       if (msg.type === 'assistant_chunk') {
         if (msg.content) {
-          // 攒批：先入缓冲，节流 flush（避免每 token 全列表重渲染）
+          // thought 与正文分气泡：kind 切换先 flush 并断开当前流式气泡
+          const nextKind = msg.thought ? 'thought' : 'assistant';
+          if (streamingKindRef.current !== null && streamingKindRef.current !== nextKind) {
+            flushChunks();
+            breakStream();
+          }
+          streamingKindRef.current = nextKind;
           chunkBufRef.current += msg.content;
           scheduleChunkFlush();
         }
@@ -279,10 +296,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           // 收尾：先冲掉缓冲里的增量（同帧 content+final 的非 SSE 回退也在此落齐），
           // 再关闭流式气泡（ref 置 null 走更新队列，与 flush 的 ref 写入保持顺序）。
           flushChunks();
-          setItems((prev) => {
-            streamingIdxRef.current = null;
-            return prev;
-          });
+          breakStream();
         }
       } else if (msg.type === 'stream_reset') {
         // 上游流传输失败重试：丢弃已缓冲的半截增量，并真正移除已 flush 实体化
@@ -290,51 +304,108 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         const idx = streamingIdxRef.current;
         chunkBufRef.current = '';
         flushChunks(); // 清缓冲后为 no-op，仅取消 pending flush 定时器
+        breakStream();
         setItems((prev) => {
-          streamingIdxRef.current = null;
-          if (idx !== null && prev[idx]?.kind === 'assistant') {
-            return prev.filter((_, i) => i !== idx); // 真正移除半截气泡
+          if (idx !== null) {
+            const k = prev[idx]?.kind;
+            if (k === 'assistant' || k === 'thought') {
+              return prev.filter((_, i) => i !== idx); // 真正移除半截气泡
+            }
           }
           return prev;
         });
       } else if (msg.type === 'tool_call') {
-        if (msg.id) pendingTools.add(msg.id);
+        if (msg.id) {
+          pendingTools.add(msg.id);
+          toolIdsRef.current.push(msg.id);
+        }
         // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）
         armRunning();
         // 工具回合与文本回合交替：先冲掉缓冲里的文本增量（保证气泡顺序），
         // 再断开流式气泡追加工具卡片
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return [...prev, { kind: 'tool', content: '', toolName: msg.name, toolArgs: msg.args }];
-        });
+        breakStream();
+        setItems((prev) => [
+          ...prev,
+          {
+            kind: 'tool',
+            content: '',
+            toolName: msg.name,
+            toolArgs: msg.args,
+            toolKind: msg.tool_kind,
+            toolStatus: msg.status ?? 'in_progress',
+            toolDiffs: msg.diffs,
+            toolLocations: msg.locations,
+          },
+        ]);
       } else if (msg.type === 'tool_result') {
-        if (msg.id) pendingTools.delete(msg.id);
+        if (msg.id) {
+          pendingTools.delete(msg.id);
+          toolIdsRef.current = toolIdsRef.current.filter((x) => x !== msg.id);
+        }
         setItems((prev) => {
           const next = [...prev];
-          for (let i = next.length - 1; i >= 0; i--) {
-            if (next[i].kind === 'tool' && next[i].toolName === msg.name && !next[i].toolResult) {
-              next[i] = { ...next[i], toolResult: msg.result };
-              break;
+          const patch = (i: number) => {
+            next[i] = {
+              ...next[i],
+              toolResult: msg.result,
+              toolStatus: msg.status ?? 'completed',
+              toolName: next[i].toolName ?? msg.name,
+              toolKind: next[i].toolKind ?? msg.tool_kind,
+              toolDiffs: next[i].toolDiffs ?? msg.diffs,
+              toolLocations: next[i].toolLocations ?? msg.locations,
+            };
+          };
+          // 优先按 name 匹配（runner/旧帧语义）
+          if (msg.name) {
+            for (let i = next.length - 1; i >= 0; i--) {
+              if (next[i].kind === 'tool' && next[i].toolName === msg.name && next[i].toolResult == null) {
+                patch(i);
+                return next;
+              }
+            }
+          }
+          // name 缺失/未命中：按 id 回退——id 在 toolIdsRef 的序号对应倒序未完成卡片
+          if (msg.id) {
+            const pendingIdx: number[] = [];
+            for (let i = 0; i < next.length; i++) {
+              if (next[i].kind === 'tool' && next[i].toolResult == null) pendingIdx.push(i);
+            }
+            // toolIdsRef 已移除本 id；用 pendingTools 快照不可靠，直接按到达顺序：
+            // 同名匹配失败后取最早未完成卡片（ACP 工具按序完成，最早未完成即当前）
+            if (pendingIdx.length > 0) {
+              patch(pendingIdx[0]);
             }
           }
           return next;
         });
+      } else if (msg.type === 'plan') {
+        flushChunks();
+        breakStream();
+        const entries = msg.entries ?? [];
+        setItems((prev) => {
+          // 就地更新最后一条 plan 气泡（ACP plan 是全量替换语义）；无则追加
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].kind === 'plan') {
+              const next = [...prev];
+              next[i] = { ...next[i], planEntries: entries };
+              return next;
+            }
+          }
+          return [...prev, { kind: 'plan', content: '', planEntries: entries }];
+        });
+      } else if (msg.type === 'usage') {
+        // MVP：仅实时推送不落库不渲染（保留帧类型兼容，静默忽略）
       } else if (msg.type === 'status') {
         // 轻量提示行（压缩等中间状态）：复用 assistant 气泡样式但标记 status；
         // 不进气泡流 → 冲掉缓冲后断开流式气泡再追加独立行
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }];
-        });
+        breakStream();
+        setItems((prev) => [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }]);
       } else if (msg.type === 'stopped') {
         // 服务端确认取消（本连接或另一标签页发起的 cancel 都会广播到本连接的处理逻辑）
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return prev;
-        });
+        breakStream();
         stopRunning();
         // 回合已终态，未响应的审批请求随回合作废 → 卡片过期
         expirePendingApprovals();
@@ -342,10 +413,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return prev;
-        });
+        breakStream();
         stopRunning();
         // 回合成功结束：服务端 5 分钟审批超时按 deny 继续回合，仍 pending 的
         // 卡片必须过期，否则 hasPendingApproval 恒 true 锁死发送按钮
@@ -363,23 +431,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       } else if (msg.type === 'approval_request') {
         // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return [...prev, {
-            kind: 'approval',
-            content: '',
-            approvalId: msg.request_id,
-            approvalTool: msg.tool,
-            approvalSummary: msg.summary,
-            approvalStatus: 'pending',
-          }];
-        });
+        breakStream();
+        setItems((prev) => [...prev, {
+          kind: 'approval',
+          content: '',
+          approvalId: msg.request_id,
+          approvalTool: msg.tool,
+          approvalSummary: msg.summary,
+          approvalStatus: 'pending',
+        }]);
       } else if (msg.type === 'error') {
         flushChunks();
-        setItems((prev) => {
-          streamingIdxRef.current = null;
-          return [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }];
-        });
+        breakStream();
+        setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
         stopRunning();
         // 回合以错误终态结束，未响应的审批卡片一并过期
         expirePendingApprovals();
@@ -434,7 +498,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       chunkBufRef.current = '';
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, t]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream, t]);
 
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，

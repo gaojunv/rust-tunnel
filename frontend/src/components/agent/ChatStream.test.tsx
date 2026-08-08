@@ -707,4 +707,75 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('@src/a.rs')).toBeNull();
     expect(screen.getByText('@src/b.rs')).toBeTruthy();
   });
+
+  it('renders thought chunks as thought bubble separate from text', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '正文' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '推理', thought: true });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '续正文' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    // thought 与正文是分开的气泡：正文两段各自成气泡，thought 默认折叠不可见
+    expect(screen.getByText('正文')).toBeTruthy();
+    expect(screen.getByText('续正文')).toBeTruthy();
+    expect(screen.queryByText('推理')).not.toBeTruthy();
+  });
+
+  it('tool_call frame carries kind/diffs into card', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'c1', name: 'Edit a.ts', tool_kind: 'edit',
+        diffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      });
+      wsInstance!.emit({ type: 'tool_result', id: 'c1', name: 'Edit a.ts', status: 'completed', result: 'ok' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.getByText('✓')).toBeTruthy();
+    // 展开卡片应看到 diff（点击头部）
+    fireEvent.click(screen.getByText('Edit a.ts'));
+    expect(screen.getByText('a.ts')).toBeTruthy();
+  });
+
+  it('tool_result without name falls back to id matching', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'Read x', tool_kind: 'read' });
+      wsInstance!.emit({ type: 'tool_call', id: 'c2', name: 'Read y', tool_kind: 'read' });
+      // c1 的结果不带 name（ACP ToolCallUpdate 常缺 title）
+      wsInstance!.emit({ type: 'tool_result', id: 'c1', status: 'completed', result: 'r1' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    // c1 完成、不占用 c2 的卡片（按 id 回退：r1 落在 c1 的卡片）
+    fireEvent.click(screen.getByText('Read y'));
+    // c2 卡片仍在执行中（r1 没有误挂到 c2）
+    expect(screen.getAllByText('agent.toolRunning').length).toBeGreaterThan(0);
+  });
+
+  it('plan frame updates the last plan bubble in place', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'plan', entries: [{ content: '甲', status: 'in_progress' }] });
+      wsInstance!.emit({ type: 'plan', entries: [{ content: '甲', status: 'completed' }] });
+      wsInstance!.emit({ type: 'done' });
+    });
+    // 只有一条 plan 气泡，内容为最新状态
+    expect(screen.getAllByText('甲')).toHaveLength(1);
+    expect(screen.getByText('✓')).toBeTruthy();
+  });
+
+  it('usage frame does not render or crash', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'usage', used: 100, size: 200000 });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByText(/100/)).not.toBeTruthy();
+  });
 });
