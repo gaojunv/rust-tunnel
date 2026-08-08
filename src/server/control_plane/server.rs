@@ -161,6 +161,30 @@ async fn handle_client_connection(
                         .deliver_agent_response(&entry.name, &request_id, result)
                         .await;
                 }
+                // spawn 协商响应：与 spawn_negotiate 的挂起等待者配对
+                m @ (ControlMessage::AgentSpawnResponse { .. }
+                | ControlMessage::AgentLlmProxyReady { .. }) => {
+                    let session_id = match &m {
+                        ControlMessage::AgentSpawnResponse { session_id, .. } => session_id.clone(),
+                        ControlMessage::AgentLlmProxyReady { session_id, .. } => session_id.clone(),
+                        _ => unreachable!(),
+                    };
+                    if !registry.resolve_spawn_pending(&session_id, m).await {
+                        debug!(
+                            "spawn response for unknown session '{session_id}' from '{}'",
+                            entry.name
+                        );
+                    }
+                }
+                // spawn stdio / LLM 请求代理：Task 5 转交 AgentState，本 Task 先留占位
+                m @ (ControlMessage::AgentSpawnData { .. }
+                | ControlMessage::AgentSpawnExit { .. }
+                | ControlMessage::AgentLlmProxyRequest { .. }) => {
+                    debug!(
+                        "spawn/llm-proxy msg from client '{}' (Task 5 wiring): {:?}",
+                        entry.name, m
+                    );
+                }
                 ControlMessage::Data {
                     connection_id,
                     data,

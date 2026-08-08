@@ -5,6 +5,7 @@ pub mod compact;
 pub mod executor;
 pub mod runner;
 pub mod session;
+pub mod spawner;
 pub mod sse;
 pub mod title;
 pub mod tools;

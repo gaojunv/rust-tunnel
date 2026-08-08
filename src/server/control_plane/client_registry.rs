@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -79,6 +80,9 @@ pub struct ClientRegistry {
     db: Database,
     /// 统一统计采集器（None = 不记录，测试默认）
     stats_collector: Option<crate::server::stats::StatsCollector>,
+    /// session_id -> oneshot 等待协商响应（AgentSpawnResponse / AgentLlmProxyReady）。
+    /// 全局表：session_id 服务端唯一生成，跨客户端不会碰撞。
+    spawn_pending: Arc<Mutex<HashMap<String, oneshot::Sender<ControlMessage>>>>,
 }
 
 impl ClientRegistry {
@@ -87,6 +91,7 @@ impl ClientRegistry {
             entries: Arc::new(RwLock::new(HashMap::new())),
             db,
             stats_collector: None,
+            spawn_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -392,6 +397,61 @@ impl ClientRegistry {
             .await
             .is_ok()
     }
+
+    /// 发送控制消息并等待以 session_id 匹配的响应（AgentSpawnResponse/AgentLlmProxyReady）。
+    ///
+    /// # Errors
+    /// - `NotConnected` — client offline
+    /// - `BrokenPipe` — control channel closed while sending / responder dropped
+    /// - `TimedOut` — no response within `timeout`
+    pub async fn spawn_negotiate(
+        &self,
+        client_name: &str,
+        session_id: &str,
+        request: ControlMessage,
+        timeout: Duration,
+    ) -> std::io::Result<ControlMessage> {
+        use std::io::{Error, ErrorKind};
+
+        let entry = self.get(client_name).await.ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotConnected,
+                format!("client '{client_name}' offline"),
+            )
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.spawn_pending
+            .lock()
+            .await
+            .insert(session_id.to_string(), tx);
+        if entry.control_sender.send(request).await.is_err() {
+            self.spawn_pending.lock().await.remove(session_id);
+            return Err(Error::new(ErrorKind::BrokenPipe, "control channel closed"));
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => {
+                // rx 被 drop（调用方取消/断连）：清理 pending 防泄漏，结果不可达。
+                self.spawn_pending.lock().await.remove(session_id);
+                Err(Error::new(ErrorKind::BrokenPipe, "responder dropped"))
+            }
+            Err(_) => {
+                self.spawn_pending.lock().await.remove(session_id);
+                Err(Error::new(ErrorKind::TimedOut, "spawn negotiate timeout"))
+            }
+        }
+    }
+
+    /// 控制面收到 AgentSpawnResponse/AgentLlmProxyReady 时调用，完成配对。
+    /// 返回是否找到挂起的等待者（未知 session_id = 已超时/取消，静默忽略）。
+    pub async fn resolve_spawn_pending(&self, session_id: &str, msg: ControlMessage) -> bool {
+        if let Some(tx) = self.spawn_pending.lock().await.remove(session_id) {
+            let _ = tx.send(msg);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +670,112 @@ mod tests {
                 "/workspace",
                 None,
                 crate::common::AgentCommand::GitPush,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_negotiate_offline_client() {
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = ClientRegistry::new(db);
+        let result = registry
+            .spawn_negotiate(
+                "ghost",
+                "sess-1",
+                ControlMessage::AgentLlmProxyStart {
+                    session_id: "sess-1".into(),
+                },
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_negotiate_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+
+        // 模拟客户端：收到 AgentSpawnRequest 后回 AgentSpawnResponse
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            let msg = rx.recv().await.unwrap();
+            match msg {
+                ControlMessage::AgentSpawnRequest {
+                    session_id, command, ..
+                } => {
+                    assert_eq!(session_id, "sess-1");
+                    assert_eq!(command, "gemini");
+                    let sid = session_id.clone();
+                    registry2
+                        .resolve_spawn_pending(
+                            &sid,
+                            ControlMessage::AgentSpawnResponse {
+                                session_id,
+                                success: true,
+                                error: None,
+                            },
+                        )
+                        .await;
+                }
+                other => panic!("expected AgentSpawnRequest, got {other:?}"),
+            }
+        });
+
+        let resp = registry
+            .spawn_negotiate(
+                "nas",
+                "sess-1",
+                ControlMessage::AgentSpawnRequest {
+                    session_id: "sess-1".into(),
+                    command: "gemini".into(),
+                    args: vec!["--experimental-acp".into()],
+                    env: vec![("OPENAI_BASE_URL".into(), "http://127.0.0.1:1/v1".into())],
+                    cwd: Some("/workspace".into()),
+                },
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            resp,
+            ControlMessage::AgentSpawnResponse {
+                success: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_negotiate_timeout() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, _rx) = mpsc::channel(32); // 无人消费 → 永远等不到响应
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+
+        let result = registry
+            .spawn_negotiate(
+                "nas",
+                "sess-1",
+                ControlMessage::AgentLlmProxyStart {
+                    session_id: "sess-1".into(),
+                },
                 std::time::Duration::from_millis(100),
             )
             .await;
