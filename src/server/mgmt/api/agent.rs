@@ -433,6 +433,23 @@ enum TurnOutcome {
     Disconnected,
 }
 
+/// 选择回合执行路径：workspace 配置了 `agent_type`（非空）走 ACP 远程 agent，
+/// 否则走自研 runner（保留）。
+fn use_acp_path(workspace: &crate::server::persistence::db::agent::AgentWorkspaceRecord) -> bool {
+    !workspace.agent_type.is_empty()
+}
+
+/// 按 session 加载其 workspace 记录（分派 ACP 路径用）。session/workspace 缺失
+/// 或读库失败返回 None——由调用方回退到自研 runner 路径（其内部会再报错）。
+async fn load_workspace_for_session(
+    db: &crate::server::db::Database,
+    session_id: &str,
+) -> Option<crate::server::persistence::db::agent::AgentWorkspaceRecord> {
+    let session = db.agent_get_session(session_id).await.ok()?;
+    let session = session?;
+    db.agent_get_workspace(&session.workspace_id).await.ok()?
+}
+
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
@@ -462,6 +479,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     let mut rt_cache: Option<SessionRuntime> = None;
     // 回合进行中对端又发来的用户消息：最多缓冲一条，当前 turn 结束后优先处理。
     let mut pending: Option<(String, Vec<String>)> = None;
+    // 本连接是否已分派到 ACP 路径（workspace 配置了 agent_type）。ACP 回合
+    // 异步执行，两轮之间的 cancel/approval_response 帧也要在此处理。
+    let mut acp_active = false;
 
     loop {
         // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
@@ -474,9 +494,37 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             };
             match parse_ws_frame(msg) {
                 WsFrame::UserMessage { content, refs } => (content, refs),
-                // 非 turn 期间的 cancel/审批响应：幂等忽略（迟到的审批响应可能已
-                // 超时自清，pending map 仍挂着等超时，此处丢弃即可）
-                WsFrame::Cancel | WsFrame::ApprovalResponse { .. } | WsFrame::Other => continue,
+                // ACP 路径：回合在 bridge 里异步跑，cancel/审批响应在「两轮之间」
+                // 到达，必须在这里处理（runner 路径的审批响应仍在 turn 内循环处理，
+                // 二者共用 AgentState 的 pending map；未知 request_id 幂等忽略）。
+                WsFrame::Cancel => {
+                    if acp_active {
+                        if let Some(agent) = state.server_state.agent_state.as_ref() {
+                            if let Some(bridge) = agent.acp_bridge.as_ref() {
+                                bridge.cancel(&session_id).await;
+                                let _ = event_tx
+                                    .send(serde_json::json!({"type": "stopped"}))
+                                    .await;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                WsFrame::ApprovalResponse {
+                    request_id,
+                    approved,
+                    remember,
+                } => {
+                    if acp_active {
+                        if let Some(agent) = state.server_state.agent_state.as_ref() {
+                            agent
+                                .resolve_approval(&session_id, &request_id, approved, remember)
+                                .await;
+                        }
+                    }
+                    continue;
+                }
+                WsFrame::Other => continue,
             }
         };
 
@@ -506,6 +554,41 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // （rt_cache 仍是 None），能看到前者写入的全部消息。
         let session_lock = agent.session_lock(&session_id).await;
         let _session_guard = session_lock.lock().await;
+
+        // ACP 分派：workspace 配置了 agent_type（非空）→ 走 ACP 远程 agent 路径
+        // （agent 进程经隧道 spawn，事件经 acp_events::map_update 推前端）；
+        // 否则保持下方自研 runner 路径。workspace 记录在此按需加载——runner
+        // 路径的 SessionRuntime::load 内部还会再读一次，多一次低频 DB 读换取
+        // 分派正确性可接受。
+        if let Some(acp_workspace) = load_workspace_for_session(&agent.db, &session_id).await {
+            if use_acp_path(&acp_workspace) {
+                acp_active = true;
+                let Some(bridge) = agent.acp_bridge.clone() else {
+                    let _ = event_tx
+                        .send(serde_json::json!({
+                            "type": "error",
+                            "message": "ACP bridge not initialized"
+                        }))
+                        .await;
+                    continue;
+                };
+                if let Err(e) = bridge
+                    .ensure_session(&session_id, &acp_workspace, event_tx.clone())
+                    .await
+                {
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "error", "message": e}))
+                        .await;
+                    continue;
+                }
+                if let Err(e) = bridge.prompt(&session_id, &content).await {
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "error", "message": e}))
+                        .await;
+                }
+                continue;
+            }
+        }
 
         // 首个用户消息：从 DB 重建运行时；后续消息直接追加到内存 messages。
         // user 消息的落库与内存追加统一放在 refs 注入之后（见下），加载阶段
@@ -714,6 +797,17 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         Some(event_tx.clone()),
                     ));
                 }
+            }
+        }
+    }
+
+    // 连接关闭：若本连接持有 ACP 会话的 WS 事件通道，清空之——ACP 回合在
+    // 断连后仍可能存活（服务端 agent 继续跑），保留旧 sender 会让通知
+    // try_send 持续成功而事件无人消费、reaper 据此误刷新活动。
+    if acp_active {
+        if let Some(agent) = state.server_state.agent_state.as_ref() {
+            if let Some(bridge) = agent.acp_bridge.as_ref() {
+                bridge.detach_ws_tx(&session_id).await;
             }
         }
     }
@@ -1215,6 +1309,10 @@ pub async fn archive_session(
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // 归档即终结：杀掉该 session 的 ACP agent 进程（不存在则 no-op）。
+    if let Some(bridge) = agent.acp_bridge.as_ref() {
+        bridge.kill(&id).await;
+    }
     match agent.db.agent_archive_session(&id).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1228,6 +1326,10 @@ pub async fn delete_session(
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // 删除即终结：杀掉该 session 的 ACP agent 进程（不存在则 no-op）。
+    if let Some(bridge) = agent.acp_bridge.as_ref() {
+        bridge.kill(&id).await;
+    }
     match agent.db.agent_delete_session(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1358,6 +1460,36 @@ mod tests {
             },
             db,
         )
+    }
+
+    fn ws_record() -> crate::server::persistence::db::agent::AgentWorkspaceRecord {
+        crate::server::persistence::db::agent::AgentWorkspaceRecord {
+            id: "w1".into(),
+            name: "proj".into(),
+            client_id: "nas".into(),
+            runtime_type: "host".into(),
+            root_path: "/p".into(),
+            docker_image: None,
+            docker_container_id: None,
+            approval_mode: "safe".into(),
+            system_prompt: None,
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn test_use_acp_path() {
+        // agent_type 为空 → 自研 runner 路径；非空 → ACP 路径
+        assert!(!use_acp_path(&ws_record()));
+        let mut ws = ws_record();
+        ws.agent_type = "gemini".into();
+        assert!(use_acp_path(&ws));
+        ws.agent_type = "claude-code".into();
+        assert!(use_acp_path(&ws));
     }
 
     #[tokio::test]

@@ -88,17 +88,33 @@ pub struct AgentState {
 
 impl AgentState {
     pub fn new(registry: ClientRegistry, db: Database) -> Self {
-        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone());
-        Self {
-            registry,
-            db,
+        // ACP 桥构造在前、AgentState 尚不完整：先建占位（acp_bridge=None），
+        // 用克隆（仅用于审批，不触碰 acp_bridge）注入审批回调后回填。
+        let mut state = Self {
+            registry: registry.clone(),
+            db: db.clone(),
             workspace_locks: Arc::new(Mutex::new(HashMap::new())),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
-            acp_bridge: Some(bridge),
-        }
+            acp_bridge: None,
+        };
+        // 审批走 AgentState::request_approval（与 runner 共用审批弹层/pending map；
+        // 克隆只有 acp_bridge=None，request_approval 不依赖它）。
+        let approval_agent = state.clone();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db).with_approval(Arc::new(
+            move |session_id, tool, summary, args_preview, ws_tx| {
+                let agent = approval_agent.clone();
+                Box::pin(async move {
+                    agent
+                        .request_approval(&session_id, &tool, &summary, &args_preview, &ws_tx)
+                        .await
+                })
+            },
+        ));
+        state.acp_bridge = Some(bridge);
+        state
     }
 
     /// 把 LLM 网关的主密钥解密器注入 ACP 桥。

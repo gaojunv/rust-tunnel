@@ -123,6 +123,14 @@ impl AgentSpawner {
             .await
             .map(|entry| entry.control_sender.clone())
     }
+
+    /// 向客户端下发 `AgentExecCancel`（ACP 路径取消/杀进程用）。
+    ///
+    /// ACP 会话能 spawn 成功即意味着客户端 ≥ 0.4.0（agent spawn 协议与
+    /// `AgentExecCancel` 同批引入），无需再按版本门控；客户端离线静默返回 false。
+    pub async fn send_agent_cancel(&self, client_id: &str, request_id: &str) -> bool {
+        self.registry.send_agent_cancel(client_id, request_id).await
+    }
 }
 
 #[cfg(test)]
