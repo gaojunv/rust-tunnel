@@ -46,6 +46,9 @@ class FakeWs {
   }
 }
 
+// 当前测试的 QueryClient 实例：loadedRef 自愈测试需手动 invalidateQueries 触发 refetch
+let queryClient: QueryClient | null = null;
+
 const renderChat = () => {
   const qc = new QueryClient({
     defaultOptions: {
@@ -55,6 +58,7 @@ const renderChat = () => {
       queries: { retry: false, refetchOnMount: false },
     },
   });
+  queryClient = qc;
   return render(
     <QueryClientProvider client={qc}>
       <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
@@ -777,5 +781,50 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'done' });
     });
     expect(screen.queryByText(/100/)).not.toBeTruthy();
+  });
+
+  it('restores acp history: tool diff card, thought, plan (last only)', async () => {
+    const acpCall = JSON.stringify([{
+      id: 'c1', name: 'Edit a.ts', arguments: '{"file_path":"a.ts"}',
+      tool_kind: 'edit', diffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      locations: [{ path: 'a.ts', line: 1 }],
+    }]);
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '改一下', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '想一下', tool_calls: null, tool_call_id: null, name: 'thought', kind: 'message', created_at: '2026-08-08' },
+      { id: 'm3', session_id: 's1', role: 'assistant', content: '', tool_calls: acpCall, tool_call_id: 'c1', name: 'Edit a.ts', kind: 'tool_calls', created_at: '2026-08-08' },
+      { id: 'm4', session_id: 's1', role: 'assistant', content: 'done ok', tool_calls: null, tool_call_id: 'c1', name: 'Edit a.ts', kind: 'tool_result', created_at: '2026-08-08' },
+      { id: 'm5', session_id: 's1', role: 'assistant', content: JSON.stringify([{ content: '旧计划', status: 'pending' }]), tool_calls: null, tool_call_id: null, name: 'plan', kind: 'message', created_at: '2026-08-08' },
+      { id: 'm6', session_id: 's1', role: 'assistant', content: JSON.stringify([{ content: '新计划', status: 'completed' }]), tool_calls: null, tool_call_id: null, name: 'plan', kind: 'message', created_at: '2026-08-08' },
+      { id: 'm7', session_id: 's1', role: 'assistant', content: '已完成', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
+    ]);
+    renderChat();
+    expect(await screen.findByText('改一下')).toBeTruthy();
+    expect(await screen.findByText('已完成')).toBeTruthy();
+    // 只渲染最后一条 plan
+    expect(screen.queryByText('旧计划')).not.toBeTruthy();
+    expect(await screen.findByText('新计划')).toBeTruthy();
+    // tool 卡片带完成态；展开见 diff
+    expect(await screen.findByText('Edit a.ts')).toBeTruthy();
+    await act(async () => {
+      screen.getByText('Edit a.ts').click();
+    });
+    expect(screen.getByText('+ y')).toBeTruthy();
+    // thought 折叠
+    expect(screen.queryByText('想一下')).not.toBeTruthy();
+  });
+
+  it('reloads when cached history was empty but refetch returns rows', async () => {
+    // loadedRef 自愈：首轮装载空历史后，refetch 拿到非空历史必须重新装载
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    await act(async () => {});
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '迟到的历史', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
+    ]);
+    await act(async () => {
+      await queryClient!.invalidateQueries({ queryKey: ['agent-messages', 's1'] });
+    });
+    expect(await screen.findByText('迟到的历史')).toBeTruthy();
   });
 });

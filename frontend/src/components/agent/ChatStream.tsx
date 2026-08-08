@@ -10,7 +10,8 @@ import {
   updateAgentSessionModel,
 } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
-import type { ChatItem } from './types';
+import { parseAcpToolJson, parsePlanEntries } from './types';
+import type { ChatItem, ToolDiff, ToolKind, ToolLocation } from './types';
 import ApprovalCard from './ApprovalCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
@@ -50,6 +51,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
+  // items 的 ref 镜像：历史 effect 自愈守卫读（避免把 items 加入 effect 依赖）
+  const itemsRef = useRef<ChatItem[]>([]);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
   // 在飞工具调用（按 id 追踪），running 解除需其清空
   const pendingToolsRef = useRef<Set<string>>(new Set());
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -83,16 +89,37 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   });
   useEffect(() => {
     historyRef.current = history;
-    if (!history || loadedRef.current) return;
+    if (!history) return;
+    // 自愈：已装载但聊天区为空而历史转非空（陈旧空缓存被 refetch 纠正）→ 允许重装
+    if (loadedRef.current && !(itemsRef.current.length === 0 && history.length > 0)) return;
     loadedRef.current = true;
     const loaded: ChatItem[] = [];
-    // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args
-    const callArgs = new Map<string, { name: string; args: string }>();
+    // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args；
+    // 同时保留 ACP 新格式的 tool_kind/diffs/locations 供 tool_result 行合并
+    const callArgs = new Map<string, {
+      name: string;
+      args: string;
+      toolKind?: ToolKind;
+      toolDiffs?: ToolDiff[];
+      toolLocations?: ToolLocation[];
+    }>();
     for (const m of history) {
       if (m.kind === 'tool_calls' && m.tool_calls) {
         try {
-          for (const c of JSON.parse(m.tool_calls) as { id: string; function?: { name?: string; arguments?: string } }[]) {
-            callArgs.set(c.id, { name: c.function?.name ?? '', args: c.function?.arguments ?? '' });
+          const parsed = JSON.parse(m.tool_calls) as {
+            id: string;
+            function?: { name?: string; arguments?: string };
+          }[];
+          const acp = parseAcpToolJson(m.tool_calls);
+          for (const c of parsed) {
+            callArgs.set(c.id, {
+              // ACP 新格式：name/arguments 平铺；runner 旧格式：function 嵌套
+              name:
+                (c as { name?: string }).name ?? c.function?.name ?? m.name ?? '',
+              args:
+                (c as { arguments?: string }).arguments ?? c.function?.arguments ?? '',
+              ...acp,
+            });
           }
         } catch {
           /* ignore malformed tool_calls */
@@ -142,12 +169,25 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         skipBeforeSummary.add(s - matched + m);
       }
     }
+    // 历史中多条 plan 行只保留最后一条（ACP plan 全量替换语义）：先记录索引
+    let lastPlanIdx = -1;
     for (let i = 0; i < history.length; i++) {
       const m = history[i];
       if (skipBeforeSummary.has(i)) continue;
       if (m.kind === 'tool_result') {
-        const call = (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
-        loaded.push({ kind: 'tool', content: '', toolName: call.name, toolArgs: call.args, toolResult: m.content });
+        const call: { name: string; args: string; toolKind?: ToolKind; toolDiffs?: ToolDiff[]; toolLocations?: ToolLocation[] } =
+          (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
+        loaded.push({
+          kind: 'tool',
+          content: '',
+          toolName: call.name,
+          toolArgs: call.args,
+          toolResult: m.content,
+          toolStatus: 'completed',
+          toolKind: call.toolKind,
+          toolDiffs: call.toolDiffs,
+          toolLocations: call.toolLocations,
+        });
       } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
         // 旧格式：合并 tool_log JSON 行
         try {
@@ -157,6 +197,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         } catch {
           /* ignore malformed tool_calls */
         }
+      } else if (m.kind === 'message' && m.name === 'thought' && m.content) {
+        loaded.push({ kind: 'thought', content: m.content });
+      } else if (m.kind === 'message' && m.name === 'plan') {
+        // 只保留最后一条 plan（ACP plan 全量替换语义）：先记录索引，循环后处理
+        lastPlanIdx = loaded.length;
+        loaded.push({ kind: 'plan', content: '', planEntries: parsePlanEntries(m.content) });
       } else if (m.kind === 'message' && m.content) {
         loaded.push({ kind: m.role === 'user' ? 'user' : 'assistant', content: m.content });
       } else if (m.kind === 'summary' && m.content) {
@@ -165,7 +211,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       }
       // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
     }
-    setItems(loaded);
+    // 历史中多条 plan 行只渲染最后一条
+    const finalLoaded = lastPlanIdx >= 0
+      ? loaded.filter((it, i) => it.kind !== 'plan' || i === lastPlanIdx)
+      : loaded;
+    setItems(finalLoaded);
   }, [history]);
 
   const clearRunningTimeout = useCallback(() => {
