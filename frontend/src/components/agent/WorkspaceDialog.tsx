@@ -17,9 +17,24 @@ import {
   createAgentWorkspace,
   getApiErrorMessage,
   listAllLlmModels,
+  listLlmModelGroups,
+  listLlmProviders,
   updateAgentWorkspace,
 } from '@/api/client';
-import type { AgentWorkspace, Client, LlmModel } from '@/types';
+import type {
+  AgentWorkspace,
+  Client,
+  LlmModel,
+  LlmModelGroup,
+  LlmProvider,
+} from '@/types';
+
+/** 历史裸值（model uuid / alias / 组名）归一化为带类型前缀的引用；已带前缀原样返回。 */
+const normalizeLlmRef = (raw?: string): string => {
+  if (!raw) return '';
+  if (raw.startsWith('model:') || raw.startsWith('group:')) return raw;
+  return `model:${raw}`;
+};
 
 interface Props {
   /** 传入则为编辑模式：仅可改 name/root_path/system_prompt/approval_mode 及 ACP 字段（client/运行时不可变） */
@@ -35,10 +50,19 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     queryKey: ['clients'],
     queryFn: clientsApi.list,
   });
-  // LLM 模型下拉数据源（workspace llm_model_id 存 llm_models.id，需用全量列表而非 alias）
+  // LLM 模型下拉数据源：workspace llm_model_id 存「model:<id> / group:<id>」带类型
+  // 前缀的引用，需用全量列表（而非 alias 名），并映射 provider_id → 供应商名。
   const { data: models } = useQuery<LlmModel[]>({
     queryKey: ['llm-models', 'all'],
     queryFn: listAllLlmModels,
+  });
+  const { data: groups } = useQuery<LlmModelGroup[]>({
+    queryKey: ['llm-model-groups', 'all'],
+    queryFn: listLlmModelGroups,
+  });
+  const { data: providers } = useQuery<LlmProvider[]>({
+    queryKey: ['llm-providers'],
+    queryFn: listLlmProviders,
   });
 
   const [name, setName] = useState(editing?.name ?? '');
@@ -56,9 +80,12 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     editing?.agent_type ?? '',
   );
   const [agentPath, setAgentPath] = useState(editing?.agent_path ?? '');
-  const [llmModelId, setLlmModelId] = useState(editing?.llm_model_id ?? '');
+  // 历史库中 llm_model_id 可能是裸 uuid，编辑时归一化为 `model:<id>` 以匹配下拉选项
+  const [llmModelId, setLlmModelId] = useState(normalizeLlmRef(editing?.llm_model_id));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // provider_id → 供应商名（模型下拉展示「模型名（供应商名）」）
+  const providerName = new Map((providers ?? []).map((p) => [p.id, p.name]));
   // 新建流程 create 成功后、补写 PUT 失败时记录已创建的工作区：用户点「创建」重试
   // 时不再重复 create（只重试补写），避免生成重复工作区。
   const createdRef = useRef<AgentWorkspace | null>(null);
@@ -242,13 +269,34 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                   className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                 >
                   <option value="">{t('agent.selectModel')}</option>
-                  {(models ?? [])
-                    .filter((m) => m.enabled)
-                    .map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.alias || m.model_name}
-                      </option>
-                    ))}
+                  <optgroup label={t('agent.model')}>
+                    {(models ?? [])
+                      .filter((m) => m.enabled)
+                      .map((m) => {
+                        const pname = m.provider_id
+                          ? providerName.get(m.provider_id)
+                          : undefined;
+                        const label = pname
+                          ? `${m.model_name}（${pname}）`
+                          : m.model_name;
+                        return (
+                          <option key={m.id} value={`model:${m.id}`}>
+                            {label}
+                          </option>
+                        );
+                      })}
+                  </optgroup>
+                  {(groups ?? []).some((g) => g.enabled) && (
+                    <optgroup label={t('agent.modelGroups')}>
+                      {(groups ?? [])
+                        .filter((g) => g.enabled)
+                        .map((g) => (
+                          <option key={g.id} value={`group:${g.id}`}>
+                            {g.name}
+                          </option>
+                        ))}
+                    </optgroup>
+                  )}
                 </select>
               </div>
             </>

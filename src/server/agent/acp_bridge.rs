@@ -245,12 +245,6 @@ impl AcpBridge {
             if workspace.runtime_type != "host" {
                 return Err("ACP 模式暂不支持 docker workspace，请改用 host 模式".into());
             }
-            // spawn 前校验模型已配置（不缓存；AgentLlmProxyRequest 按 session
-            // 从 DB 解析，保证配置变更即时生效）
-            workspace
-                .llm_model_id
-                .as_deref()
-                .ok_or_else(|| "workspace 未配置 LLM 模型（llm_model_id）".to_string())?;
             let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
             let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
             sessions.insert(
@@ -286,6 +280,19 @@ impl AcpBridge {
 
         let agent_type = &workspace.agent_type;
         let outcome = async {
+            // 0) 模型配置门禁：session.model / workspace.llm_model_id / 全局默认
+            //    任一即可。实际 LLM 请求按 session 从 DB 解析（resolve_effective_model，
+            //    含「第一个可用」兜底），此处只防 spawn 后才发现无模型。校验失败走
+            //    通用错误路径（outcome Err → 占位被移除，允许重试）。
+            if !super::session::has_any_model_config(
+                &self.db,
+                session_id,
+                workspace.llm_model_id.as_deref(),
+            )
+            .await?
+            {
+                return Err("workspace 与 session 均未配置 LLM 模型".into());
+            }
             // 1) 客户端内嵌 LLM 回环代理
             let port = self
                 .spawner
@@ -1091,7 +1098,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_session_missing_model_id_rejected() {
+    async fn test_ensure_session_missing_model_config_rejected() {
+        // workspace/session/全局默认均未配置模型 → spawn 前门禁拦截（不发起任何请求）
         let bridge = mock_bridge(|_| unreachable!("missing model should not spawn")).await;
         let mut ws = acp_workspace();
         ws.llm_model_id = None;
@@ -1099,8 +1107,62 @@ mod tests {
         let err = bridge
             .ensure_session("sess-1", &ws, ws_tx)
             .await
-            .expect_err("workspace without llm_model_id should be rejected");
-        assert!(err.contains("llm_model_id"), "err: {err}");
+            .expect_err("no model config should be rejected");
+        assert!(err.contains("未配置"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_session_session_model_passes_gate() {
+        // session.model 已配置、workspace 未配 llm_model_id → 门禁放行，进入 spawn
+        // 路径（此处 LLM 代理绑定失败 → 错误是 bind，而非「未配置」）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let sid = match &req {
+                    ControlMessage::AgentSpawnRequest { session_id, .. } => session_id.clone(),
+                    ControlMessage::AgentLlmProxyStart { session_id } => session_id.clone(),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let resp = match &req {
+                    ControlMessage::AgentLlmProxyStart { session_id } => {
+                        ControlMessage::AgentLlmProxyReady {
+                            session_id: session_id.clone(),
+                            port: 0, // 绑定失败：spawn 快速失败，验证门禁已过
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                registry2.resolve_spawn_pending(&sid, resp).await;
+            }
+        });
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let mut ws = acp_workspace();
+        ws.llm_model_id = None;
+        let (ws_tx, _rx) = mpsc::channel(16);
+        let err = bridge
+            .ensure_session("sess-1", &ws, ws_tx)
+            .await
+            .expect_err("spawn should be attempted past the model gate");
+        assert!(
+            err.contains("failed to bind"),
+            "error should be from spawn, not model gate: {err}"
+        );
     }
 
     #[tokio::test]

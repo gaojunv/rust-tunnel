@@ -47,8 +47,9 @@ pub struct AgentLlmProxyChunk {
 
 /// 处理一个 LLM 代理请求，返回 `AgentLlmProxyChunk` 流。
 ///
-/// 解析链路：`session_id` → workspace.llm_model_id → model_name，改写请求体
-/// `model` 字段后按路径分发到网关 handler（`/v1/messages` → Anthropic 入口；
+/// 解析链路：`resolve_effective_model`（session.model → workspace.llm_model_id →
+/// 全局默认 → 第一个可用）得到网关可解析的模型引用，改写请求体 `model` 字段后
+/// 按路径分发到网关 handler（`/v1/messages` → Anthropic 入口；
 /// `/v1/chat/completions` → OpenAI 入口）。网关自动完成模型组故障转移、
 /// 格式转换、用量统计、RAG 注入等管线。
 ///
@@ -81,9 +82,15 @@ pub fn forward(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        // 2. session → workspace.llm_model_id → model_name，注入到请求体
-        //    （网关的下游 resolve_with_failover 按此 model_name/alias 解析）。
-        let model_name = match resolve_model_name(&db, &session_id).await {
+        // 2. 统一模型解析（session → workspace → 全局默认 → 第一个可用），
+        //    注入到请求体（网关的下游 resolve_with_failover 按此引用解析）。
+        let model_name = match super::session::resolve_effective_model(
+            &db,
+            Some(gateway.llm_state.as_ref()),
+            &session_id,
+        )
+        .await
+        {
             Ok(name) => name,
             Err(e) => {
                 tracing::warn!(
@@ -176,32 +183,6 @@ pub fn forward(
             status,
         };
     }
-}
-
-/// `session_id` → workspace.llm_model_id → model_name（用于注入请求体 `model` 字段）。
-async fn resolve_model_name(db: &Database, session_id: &str) -> Result<String, String> {
-    let session = db
-        .agent_get_session(session_id)
-        .await
-        .map_err(|e| format!("db error reading session: {e}"))?
-        .ok_or_else(|| format!("agent session not found: {session_id}"))?;
-    let ws = db
-        .agent_get_workspace(&session.workspace_id)
-        .await
-        .map_err(|e| format!("db error reading workspace: {e}"))?
-        .ok_or_else(|| "agent workspace not found".to_string())?;
-    let llm_model_id = ws
-        .llm_model_id
-        .ok_or_else(|| "workspace 未配置 LLM 模型（llm_model_id）".to_string())?;
-    let model = db
-        .llm_get_model(&llm_model_id)
-        .await
-        .map_err(|e| format!("db error reading model: {e}"))?
-        .ok_or_else(|| format!("llm model not found: {llm_model_id}"))?;
-    if model.enabled == 0 {
-        return Err(format!("llm model disabled: {llm_model_id}"));
-    }
-    Ok(model.model_name)
 }
 
 #[cfg(test)]
@@ -300,7 +281,12 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].done);
         assert_eq!(chunks[0].status, 502);
-        assert!(String::from_utf8_lossy(&chunks[0].data).contains("llm_model_id"));
+        // workspace/session/全局默认均未配置 → "no LLM model configured"
+        assert!(
+            String::from_utf8_lossy(&chunks[0].data).contains("no LLM model configured"),
+            "err body: {}",
+            String::from_utf8_lossy(&chunks[0].data)
+        );
     }
 
     #[tokio::test]
@@ -348,8 +334,8 @@ mod tests {
         // 不在白名单内的路径 → 404 done（对应 llm_handle 的路径白名单）
         let db = Database::new(":memory:").await.unwrap();
         let gw = test_gateway(&db).await;
-        // 注意：必须先有有效 session，否则在路径白名单检查之前就被
-        // resolve_model_name 的 502 拦截（模型注入在路径分发之前）。
+        // 注意：必须先有有效 session + 模型配置，否则在路径白名单检查之前就被
+        // resolve_effective_model 的 502 拦截（模型注入在路径分发之前）。
         seed_configured_session(&db, "sess-1", "model-1").await;
         save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
         let stream = forward(

@@ -41,6 +41,13 @@ vi.mock('../../api/client', () => ({
       updated_at: '',
     },
   ]),
+  listLlmModelGroups: vi.fn().mockResolvedValue([
+    { id: 'g1', name: 'router', enabled: true, created_at: '', updated_at: '' },
+    { id: 'g2', name: 'off', enabled: false, created_at: '', updated_at: '' },
+  ]),
+  listLlmProviders: vi.fn().mockResolvedValue([
+    { id: 'p1', name: 'OpenAI', provider_type: 'openai', base_url: '', enabled: true, created_at: '', updated_at: '' },
+  ]),
 }));
 
 const editingWs: AgentWorkspace = {
@@ -84,14 +91,19 @@ describe('WorkspaceDialog ACP config', () => {
     expect(screen.queryByPlaceholderText('agent.agentPathPlaceholder')).toBeNull();
 
     selectEngine('gemini');
-    // path 输入框 + LLM 模型下拉出现；仅启用的模型可选
+    // path 输入框 + LLM 模型下拉出现；仅启用的模型/组可选（带类型前缀）
     expect(screen.getByPlaceholderText('agent.agentPathPlaceholder')).toBeTruthy();
     const modelSelect = screen.getByLabelText('agent.workspaceLlmModel') as HTMLSelectElement;
     await waitFor(() => {
       const values = Array.from(modelSelect.options).map((o) => o.value);
-      expect(values).toContain('m1');
-      expect(values).not.toContain('m2');
+      expect(values).toContain('model:m1');
+      expect(values).not.toContain('model:m2');
+      expect(values).toContain('group:g1');
+      expect(values).not.toContain('group:g2');
     });
+    // 模型展示为「模型名（供应商名）」，不用别名
+    const labels = Array.from(modelSelect.options).map((o) => o.text);
+    expect(labels).toContain('gpt-4o（OpenAI）');
     // host 模式无 docker 提示
     expect(screen.queryByText('agent.acpDockerUnsupportedHint')).toBeNull();
   });
@@ -115,7 +127,7 @@ describe('WorkspaceDialog ACP config', () => {
     ).toBe('/opt/gemini');
     await waitFor(() => {
       expect((screen.getByLabelText('agent.workspaceLlmModel') as HTMLSelectElement).value).toBe(
-        'm1',
+        'model:m1',
       );
     });
 
@@ -132,7 +144,7 @@ describe('WorkspaceDialog ACP config', () => {
         approval_mode: 'safe',
         agent_type: 'gemini',
         agent_path: '/usr/bin/gemini-acp',
-        llm_model_id: 'm1',
+        llm_model_id: 'model:m1',
       });
     });
   });
@@ -156,10 +168,10 @@ describe('WorkspaceDialog ACP config', () => {
     // 等待模型列表加载后选择
     await waitFor(() => {
       const modelSelect = screen.getByLabelText('agent.workspaceLlmModel') as HTMLSelectElement;
-      expect(Array.from(modelSelect.options).map((o) => o.value)).toContain('m1');
+      expect(Array.from(modelSelect.options).map((o) => o.value)).toContain('model:m1');
     });
     fireEvent.change(screen.getByLabelText('agent.workspaceLlmModel'), {
-      target: { value: 'm1' },
+      target: { value: 'model:m1' },
     });
 
     fireEvent.click(screen.getByText('agent.create'));
@@ -173,7 +185,7 @@ describe('WorkspaceDialog ACP config', () => {
         docker_container_id: undefined,
         agent_type: 'gemini',
         agent_path: '/opt/gemini',
-        llm_model_id: 'm1',
+        llm_model_id: 'model:m1',
       });
     });
   });

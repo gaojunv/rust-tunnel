@@ -73,7 +73,8 @@ pub struct UpdateSessionModelRequest {
     pub model: String,
 }
 
-const DEFAULT_MODEL_KEY: &str = "agent_default_model";
+// 共享常量：session.rs 的 resolve_effective_model / has_any_model_config 同用。
+use crate::server::agent::session::DEFAULT_MODEL_KEY;
 
 #[derive(Debug, serde::Serialize)]
 pub struct DefaultModelResponse {

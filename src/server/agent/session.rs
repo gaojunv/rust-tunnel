@@ -1,6 +1,145 @@
 //! Session runtime: rebuilds conversation state from DB.
 use crate::server::db::Database;
-use crate::server::llm::ChatMessage;
+use crate::server::llm::{ChatMessage, LlmState};
+
+/// 全局默认模型的 server_setting key（agent.rs 的 PUT /api/agent/default-model 共用）。
+pub const DEFAULT_MODEL_KEY: &str = "agent_default_model";
+
+/// 把 workspace 的 `llm_model_id`（可为 `model:<id>` / `group:<id>` / 历史裸值）
+/// 解析为网关可解析的模型引用（model_name / 组名 / 原样名字）。
+///
+/// - `model:<id>` → 查 `llm_models` 得 model_name（模型不存在/禁用报错）。
+/// - `group:<id>` → 查 `llm_model_groups` 得组名（组不存在/禁用报错）。
+/// - 历史裸值：命中 `llm_models.id` → model_name；未命中 → 原样直通（可能是
+///   alias/model_name/组名，交给网关 `resolve_with_failover` 解析）。
+/// - `None`/空 → Ok(None)（未配置）。
+pub async fn resolve_workspace_model_ref(
+    db: &Database,
+    llm_model_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(raw) = llm_model_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(id) = raw.strip_prefix("model:") {
+        let m = db
+            .llm_get_model(id)
+            .await
+            .map_err(|e| format!("db error reading model: {e}"))?
+            .ok_or_else(|| format!("llm model not found: {id}"))?;
+        if m.enabled == 0 {
+            return Err(format!("llm model disabled: {id}"));
+        }
+        return Ok(Some(m.model_name));
+    }
+    if let Some(id) = raw.strip_prefix("group:") {
+        let g = db
+            .llm_get_model_group(id)
+            .await
+            .map_err(|e| format!("db error reading model group: {e}"))?
+            .ok_or_else(|| format!("llm model group not found: {id}"))?;
+        if g.enabled == 0 {
+            return Err(format!("llm model group disabled: {id}"));
+        }
+        return Ok(Some(g.name));
+    }
+    // 历史裸值：命中 llm_models.id → model_name（保持既有「禁用即报错」语义）
+    if let Some(m) = db
+        .llm_get_model(raw)
+        .await
+        .map_err(|e| format!("db error reading model: {e}"))?
+    {
+        if m.enabled == 0 {
+            return Err(format!("llm model disabled: {raw}"));
+        }
+        return Ok(Some(m.model_name));
+    }
+    // 未命中：原样直通（网关按 alias/model_name/组名解析）
+    Ok(Some(raw.to_string()))
+}
+
+/// 统一模型解析（内置 runner 与 ACP 两条路径共用）：
+/// `session.model` → `workspace.llm_model_id`（经 [`resolve_workspace_model_ref`]）
+/// → 全局默认（`agent_default_model`）→ 第一个可用模型。
+/// 返回网关可解析的模型引用（model_name / 别名 / 组名）。
+/// `llm` 用于「第一个可用」兜底；`None` 时该层跳过。
+pub async fn resolve_effective_model(
+    db: &Database,
+    llm: Option<&LlmState>,
+    session_id: &str,
+) -> Result<String, String> {
+    let session = db
+        .agent_get_session(session_id)
+        .await
+        .map_err(|e| format!("db error reading session: {e}"))?
+        .ok_or_else(|| format!("agent session not found: {session_id}"))?;
+    // 1. session.model：前端 ModelSelect 存 alias/model_name/组名，直接作网关引用
+    if let Some(m) = session
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(m.to_string());
+    }
+    // 2. workspace.llm_model_id
+    let ws = db
+        .agent_get_workspace(&session.workspace_id)
+        .await
+        .map_err(|e| format!("db error reading workspace: {e}"))?
+        .ok_or_else(|| "agent workspace not found".to_string())?;
+    if let Some(r) = resolve_workspace_model_ref(db, ws.llm_model_id.as_deref()).await? {
+        return Ok(r);
+    }
+    // 3. 全局默认
+    if let Ok(Some(d)) = db.load_server_setting(DEFAULT_MODEL_KEY).await {
+        let d = d.trim();
+        if !d.is_empty() {
+            return Ok(d.to_string());
+        }
+    }
+    // 4. 第一个可用模型
+    if let Some(llm) = llm {
+        if let Ok(models) = crate::server::llm::router::list_available_models(llm).await {
+            if let Some(first) = models.first() {
+                if let Some(name) = first.get("id").and_then(|v| v.as_str()) {
+                    return Ok(name.to_string());
+                }
+            }
+        }
+    }
+    Err("no LLM model configured".into())
+}
+
+/// 是否存在任一显式模型配置（`session.model` / `workspace.llm_model_id` /
+/// 全局默认）。ACP `ensure_session` spawn 前门禁用——实际解析由
+/// [`resolve_effective_model`] 按 session 从 DB 完成，这里只防「spawn 后才发现
+/// 无模型」。session 不存在时视为无 session.model。
+pub async fn has_any_model_config(
+    db: &Database,
+    session_id: &str,
+    workspace_llm_model_id: Option<&str>,
+) -> Result<bool, String> {
+    let session = db
+        .agent_get_session(session_id)
+        .await
+        .map_err(|e| format!("db error reading session: {e}"))?;
+    if session
+        .as_ref()
+        .and_then(|s| s.model.as_deref())
+        .is_some_and(|m| !m.trim().is_empty())
+    {
+        return Ok(true);
+    }
+    if workspace_llm_model_id.is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(true);
+    }
+    if let Ok(Some(d)) = db.load_server_setting(DEFAULT_MODEL_KEY).await {
+        if !d.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 pub struct SessionRuntime {
     pub session_id: String,
@@ -96,7 +235,25 @@ impl SessionRuntime {
             runtime_type: workspace.runtime_type,
             root_path: workspace.root_path,
             docker_container: workspace.docker_container_id,
-            model: session.model.unwrap_or_else(|| default_model.to_string()),
+            // 模型优先级：session.model → workspace.llm_model_id → 全局默认。
+            // workspace 引用解析失败（model/group 不存在或禁用）→ 整个 load 报错，
+            // 不静默回退默认（显式配置了就必须可用）。
+            model: {
+                if let Some(m) = session
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    m.to_string()
+                } else if let Some(r) =
+                    resolve_workspace_model_ref(db, workspace.llm_model_id.as_deref()).await?
+                {
+                    r
+                } else {
+                    default_model.to_string()
+                }
+            },
             approval_mode: workspace.approval_mode.clone(),
             agents_md: None,
             messages,
@@ -238,6 +395,252 @@ fn sanitize_tool_pairs(messages: &mut Vec<ChatMessage>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 建 provider + model（固定 prov-1 启用）。
+    async fn save_named_model(db: &Database, model_id: &str, model_name: &str, enabled: bool) {
+        db.llm_save_provider(
+            "prov-1",
+            "test-provider",
+            "deepseek",
+            "https://llm.example.test",
+            "sk-test-123",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model(model_id, "prov-1", model_name, "", "", enabled, None)
+            .await
+            .unwrap();
+    }
+
+    // ── resolve_workspace_model_ref ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_workspace_ref_none_is_ok() {
+        let db = Database::new(":memory:").await.unwrap();
+        assert_eq!(resolve_workspace_model_ref(&db, None).await.unwrap(), None);
+        assert_eq!(
+            resolve_workspace_model_ref(&db, Some("  ")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_model_prefix() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", true).await;
+        assert_eq!(
+            resolve_workspace_model_ref(&db, Some("model:m1")).await.unwrap(),
+            Some("deepseek-chat".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_group_prefix() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "model-a", true).await;
+        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1)])
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_workspace_model_ref(&db, Some("group:g1")).await.unwrap(),
+            Some("router".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_legacy_uuid_hit() {
+        // 历史裸 model id：命中 llm_models.id → model_name
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "model-1", "gpt-legacy", true).await;
+        assert_eq!(
+            resolve_workspace_model_ref(&db, Some("model-1")).await.unwrap(),
+            Some("gpt-legacy".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_legacy_name_passthrough() {
+        // 历史裸值未命中 llm_models.id（可能是 alias/model_name/组名）→ 原样直通
+        let db = Database::new(":memory:").await.unwrap();
+        assert_eq!(
+            resolve_workspace_model_ref(&db, Some("deepseek-chat")).await.unwrap(),
+            Some("deepseek-chat".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_model_disabled_errors() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", false).await;
+        let err = resolve_workspace_model_ref(&db, Some("model:m1"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("disabled"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_group_disabled_errors() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "model-a", true).await;
+        db.llm_create_model_group("g1", "router", false).await.unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1)])
+            .await
+            .unwrap();
+        let err = resolve_workspace_model_ref(&db, Some("group:g1"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("disabled"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_ref_model_not_found_errors() {
+        let db = Database::new(":memory:").await.unwrap();
+        let err = resolve_workspace_model_ref(&db, Some("model:ghost"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found"), "err: {err}");
+    }
+
+    // ── resolve_effective_model 优先级 ──────────────────────────
+
+    async fn seed_ws(db: &Database, ws_id: &str, llm_model_id: Option<&str>) {
+        db.agent_create_workspace(ws_id, "proj", "nas", "host", "/p", None, None, "", None, None)
+            .await
+            .unwrap();
+        if let Some(mid) = llm_model_id {
+            db.agent_set_workspace_llm_model_id(ws_id, mid).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_session_wins() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "ws-model", true).await;
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+
+        let name = resolve_effective_model(&db, None, "s1").await.unwrap();
+        assert_eq!(name, "gpt-4o", "session 模型应优先于 workspace");
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_workspace_fallback() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", true).await;
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let name = resolve_effective_model(&db, None, "s1").await.unwrap();
+        assert_eq!(name, "deepseek-chat");
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_global_default_fallback() {
+        let db = Database::new(":memory:").await.unwrap();
+        seed_ws(&db, "w1", None).await;
+        db.save_server_setting(DEFAULT_MODEL_KEY, "claude-opus-5").await.unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let name = resolve_effective_model(&db, None, "s1").await.unwrap();
+        assert_eq!(name, "claude-opus-5");
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_first_available() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", true).await;
+        seed_ws(&db, "w1", None).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let state = crate::server::llm::LlmState::new(Some(db.clone()), None);
+        let name = resolve_effective_model(&db, Some(&state), "s1").await.unwrap();
+        assert_eq!(name, "deepseek-chat", "无显式配置 → 第一个可用模型");
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_none_configured_errors() {
+        let db = Database::new(":memory:").await.unwrap();
+        seed_ws(&db, "w1", None).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let err = resolve_effective_model(&db, None, "s1").await.unwrap_err();
+        assert!(err.contains("no LLM model configured"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_effective_model_session_not_found() {
+        let db = Database::new(":memory:").await.unwrap();
+        let err = resolve_effective_model(&db, None, "ghost").await.unwrap_err();
+        assert!(err.contains("session not found"), "err: {err}");
+    }
+
+    // ── has_any_model_config ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_has_model_config_session_model() {
+        let db = Database::new(":memory:").await.unwrap();
+        seed_ws(&db, "w1", None).await;
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+        assert!(has_any_model_config(&db, "s1", None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_model_config_workspace_ref() {
+        let db = Database::new(":memory:").await.unwrap();
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        assert!(has_any_model_config(&db, "s1", Some("model:m1")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_model_config_none() {
+        let db = Database::new(":memory:").await.unwrap();
+        seed_ws(&db, "w1", None).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        assert!(!has_any_model_config(&db, "s1", None).await.unwrap());
+    }
+
+    // ── load 的 workspace 层 ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_load_uses_workspace_model_when_session_unset() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", true).await;
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "default-model").await.unwrap();
+        assert_eq!(rt.model, "deepseek-chat");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_model_beats_workspace() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", true).await;
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "default-model").await.unwrap();
+        assert_eq!(rt.model, "gpt-4o");
+    }
+
+    #[tokio::test]
+    async fn test_load_workspace_model_disabled_errors() {
+        let db = Database::new(":memory:").await.unwrap();
+        save_named_model(&db, "m1", "deepseek-chat", false).await;
+        seed_ws(&db, "w1", Some("model:m1")).await;
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        let err = match SessionRuntime::load(&db, "s1", "default-model").await {
+            Err(e) => e,
+            Ok(rt) => panic!("expected error, got model={}", rt.model),
+        };
+        assert!(err.contains("disabled"), "err: {err}");
+    }
 
     #[tokio::test]
     async fn test_load_session_rebuilds_history() {
