@@ -8,7 +8,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use crate::client::logs::{spawn_log_forwarder, ClientLogLayer};
-use crate::client::{proxy, ClientConfig};
+use crate::client::{proxy, spawn::SpawnManager, ClientConfig};
 use crate::common::{
     connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, MeshServiceDef,
     TunnelError, TunnelResult,
@@ -43,6 +43,8 @@ pub struct ClientState {
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
     /// 进行中的 agent exec 取消句柄：request_id → cancel 信号发送端。
     exec_cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    /// 长生命周期 agent 进程的 spawn 管理器（AgentSpawn* 消息）。
+    spawn_manager: SpawnManager,
 }
 
 impl ClientState {
@@ -52,6 +54,7 @@ impl ClientState {
             control_sender,
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             exec_cancels: Arc::new(Mutex::new(HashMap::new())),
+            spawn_manager: SpawnManager::new(),
         }
     }
 
@@ -307,6 +310,48 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         if !state.cancel_exec(&request_id).await {
                             debug!("cancel for unknown exec request_id {}", request_id);
                         }
+                        // spawn 进程的 session_id 与 exec 的 request_id 共用取消通道
+                        if !state.spawn_manager.kill(&request_id).await {
+                            debug!("no spawned process for request_id {}", request_id);
+                        }
+                    }
+                    ControlMessage::AgentSpawnRequest {
+                        session_id,
+                        command,
+                        args,
+                        env,
+                        cwd,
+                    } => {
+                        if !state.config.enable_agent {
+                            let sender = state.control_sender.clone();
+                            tokio::spawn(async move {
+                                let _ = sender
+                                    .send(ControlMessage::AgentSpawnResponse {
+                                        session_id,
+                                        success: false,
+                                        error: Some("agent not enabled".into()),
+                                    })
+                                    .await;
+                            });
+                        } else {
+                            let mgr = state.spawn_manager.clone();
+                            let tx = state.control_sender.clone();
+                            tokio::spawn(async move {
+                                mgr.handle_spawn(session_id, command, args, env, cwd, tx).await;
+                            });
+                        }
+                    }
+                    ControlMessage::AgentSpawnData {
+                        session_id,
+                        data,
+                        stdin: true,
+                    } => {
+                        if let Err(e) = state.spawn_manager.write_stdin(&session_id, data).await {
+                            warn!("spawn stdin write failed: {e}");
+                        }
+                    }
+                    ControlMessage::AgentSpawnData { stdin: false, .. } => {
+                        warn!("client received unexpected server-stdout spawn data");
                     }
                     ControlMessage::Disconnect { reason } => {
                         info!("Server requested disconnect: {}", reason);

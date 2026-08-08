@@ -4,5 +4,6 @@ pub mod control;
 pub mod logs;
 pub mod proxy;
 pub mod pty;
+pub mod spawn;
 
 pub use config::*;
