@@ -41,7 +41,7 @@ use crate::server::llm::crypto::LlmCipher;
 use crate::server::persistence::db::agent::AgentWorkspaceRecord;
 
 use super::acp_events::map_update;
-use super::llm_bridge;
+use super::llm_bridge::{self, LlmGatewayEndpoint};
 use super::spawner::AgentSpawner;
 
 /// spawn/协商超时：LLM 代理启动与 agent 进程拉起各限 30s。
@@ -115,6 +115,8 @@ pub struct AcpBridge {
     approval: Arc<ApproveFn>,
     /// 本服务端进程的活跃 ACP 会话表：session_id → SpawnedAgent。
     sessions: Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    /// LLM 网关入口（内部 HTTP 回环调用）；未注入时 LLM 代理请求全部 502。
+    gateway: Option<LlmGatewayEndpoint>,
 }
 
 impl AcpBridge {
@@ -125,6 +127,7 @@ impl AcpBridge {
             cipher: None,
             approval: Arc::new(|_, _, _, _, _| Box::pin(async { false })),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            gateway: None,
         };
         bridge.start_idle_reaper();
         bridge
@@ -135,6 +138,13 @@ impl AcpBridge {
     #[must_use]
     pub fn with_cipher(mut self, cipher: Option<LlmCipher>) -> Self {
         self.cipher = cipher;
+        self
+    }
+
+    /// 注入 LLM 网关入口（内部 HTTP 回环地址 + API key + 双协议域名）。
+    #[must_use]
+    pub fn with_llm_gateway(mut self, gateway: LlmGatewayEndpoint) -> Self {
+        self.gateway = Some(gateway);
         self
     }
 
@@ -763,8 +773,9 @@ impl AcpBridge {
         }
     }
 
-    /// AgentLlmProxyRequest：解析模型配置 → 服务端注入 key → 上游流式转发，
-    /// 响应块经客户端控制通道回发。**必须**以 done=true chunk 收尾（契约）。
+    /// AgentLlmProxyRequest：经内部 HTTP 回环调 LLM 网关入口（`/v1/messages`
+    /// 或 `/v1/chat/completions`），网关自动完成模型组故障转移、格式转换、
+    /// 用量统计等全管线。响应块经客户端控制通道流式回发。
     async fn handle_llm_proxy_request(
         &self,
         client_name: &str,
@@ -778,8 +789,7 @@ impl AcpBridge {
             tracing::warn!(client_name, %request_id, "llm proxy: client offline, dropping request");
             return;
         };
-        // 会话必须已登记（ensure_session 已跑）。未登记（LLM 代理请求先于
-        // ensure_session）时无法解析模型，按契约发 502 done chunk。
+        // 会话必须已登记（ensure_session 已跑）。未登记时无法解析模型，按契约发 502 done chunk。
         if !self.sessions.lock().await.contains_key(&session_id) {
             let _ = control_tx
                 .send(ControlMessage::AgentLlmProxyChunk {
@@ -791,12 +801,21 @@ impl AcpBridge {
                 .await;
             return;
         }
+        // 网关未注入（生产启动应在 init_llm_state 后注入）：全部 502。
+        let Some(gateway) = self.gateway.clone() else {
+            let _ = control_tx
+                .send(ControlMessage::AgentLlmProxyChunk {
+                    request_id,
+                    data: b"llm gateway not configured (missing inject after init)".to_vec(),
+                    done: true,
+                    status: 502,
+                })
+                .await;
+            return;
+        };
         let db = self.db.clone();
-        let cipher = self.cipher.clone();
         tokio::spawn(async move {
-            // forward 内部按 session → workspace.llm_model_id → model → provider
-            // 解析，服务端注入 api key 后调上游。
-            let stream = llm_bridge::forward(db, cipher, session_id, request_id.clone(), path, body);
+            let stream = llm_bridge::forward(db, session_id, request_id.clone(), gateway, path, body);
             futures_util::pin_mut!(stream);
             while let Some(chunk) = stream.next().await {
                 let msg = ControlMessage::AgentLlmProxyChunk {

@@ -21,6 +21,7 @@ use crate::server::client_registry::ClientRegistry;
 use crate::server::db::Database;
 
 use self::acp_bridge::AcpBridge;
+use self::llm_bridge::LlmGatewayEndpoint;
 use self::spawner::AgentSpawner;
 
 /// 挂起的审批请求表：`request_id` → (工具名, 唤醒 `sender`)。别名化避免
@@ -130,6 +131,19 @@ impl AgentState {
     ) -> Self {
         if let Some(bridge) = self.acp_bridge.take() {
             self.acp_bridge = Some(bridge.with_cipher(cipher));
+        }
+        self
+    }
+
+    /// 把 LLM 网关入口（内部回环地址 + API key + 双协议域名）注入 ACP 桥。
+    ///
+    /// 注入后 agent LLM 代理请求经内部 HTTP 回环走网关全管线（模型组故障转移、
+    /// 格式转换、用量统计、RAG 注入等），而非直接透传到上游。生产启动在
+    /// `init_llm_state` 之后调用本方法补注；缺注全部 502。
+    #[must_use]
+    pub fn with_llm_gateway(mut self, gateway: LlmGatewayEndpoint) -> Self {
+        if let Some(bridge) = self.acp_bridge.take() {
+            self.acp_bridge = Some(bridge.with_llm_gateway(gateway));
         }
         self
     }
