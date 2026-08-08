@@ -88,7 +88,8 @@ impl SpawnManager {
             }
         });
 
-        // stdout: process -> control channel（按行切分，ACP 是 newline-delimited JSON-RPC）
+        // stdout: process -> control channel（原始字节块透传，按 read 大小切分；
+        // ACP 的 newline-delimited JSON-RPC 重组由服务端接收方负责）
         let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
         let sid = session_id.to_string();
         let tx = control_tx.clone();
