@@ -80,7 +80,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `llm/` — LLM 网关：OpenAI/Anthropic 双协议入口（`openai_handler.rs`/`anthropic_handler.rs`）、provider/model/api-key 管理、用量日志、compat 工具调用改写；`llm/rag/` — RAG 知识库：`extractor`（多格式文本提取：PDF/Word/Excel/PPT→Markdown）、`chunker`（Markdown 分块）、`embedder`（远端 embedding）、`store`（qdrant-edge 向量 shard）、`retriever`（检索+注入）、`ingest`（后台摄入任务）
 - `pki/` — 证书与 ACME 自动续签
 - `net/` — 网络基建（listener/dns/mesh）
-- `agent/` — AI agent 工作台：`runner`（agent 循环/回合）、`tools`（工具 schema：shell/read_file/write_file/patch_file/list_dir/search/git_*，工具经隧道在内网客户端执行）、`executor`（命令执行）、`approval`（审批矩阵：危险工具挂起等待用户批准，支持"本会话记住"）、`session`/`title`/`compact`（会话管理、自动标题、上下文压缩）、`sse`（WebSocket 事件流）。`AgentState` 挂在 `ServerState` 上，含 per-workspace 执行锁（git 状态安全）和 per-session 回合锁（多标签页/重连防并发写库）
+- `agent/` — AI agent 工作台：`runner`（自研 agent 循环/回合，保留但不再作为运行时路径）、`tools`（工具 schema：shell/read_file/write_file/patch_file/list_dir/search/git_*，工具经隧道在内网客户端执行）、`executor`（命令执行）、`approval`（审批矩阵：危险工具挂起等待用户批准，支持"本会话记住"）、`session`/`title`/`compact`（会话管理、自动标题、上下文压缩）、`sse`（WebSocket 事件流）、`spawner`（ACP 路径：经控制通道 negotiate AgentSpawnRequest/AgentLlmProxyStart，在客户端 spawn agent 进程）、`acp_bridge`（ACP 路径：管理 ACP session 生命周期、stdio pump、idle reaper、断线恢复）、`acp_events`（ACP `SessionUpdate` → 现有 WS 帧映射）、`llm_bridge`（AgentLlmProxyRequest → 服务端 LLM 网关转发，服务端注入认证）。`AgentState` 挂在 `ServerState` 上，含 per-workspace 执行锁（git 状态安全）和 per-session 回合锁（多标签页/重连防并发写库）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
 
 **`src/client/`** — 客户端实现（零配置范式的端侧）
@@ -96,7 +96,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - **无全局状态管理库** — 状态通过 React Query + 组件本地状态管理
 - Vite 开发服务器将 `/api` 代理到 `localhost:3000`（服务器 API 端口）
 - 共享组件在 `frontend/src/components/shared/`：`ChartContainer`、`StatCard`、`TimeRangeSelector`、`MobileBottomNav`
-- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）；AI agent 工作台（`AgentPage`，含 `components/agent/`：会话列表、消息流、审批弹层、@文件引用、workspace 管理）
+- 页面在 `frontend/src/pages/`；LLM 网关管理（`LLMPage`）与 RAG 知识库管理（`KbPage`，含 `components/llm/kb/` 下的 `KbList`/`KbDetail`/`KbDialog`）；AI agent 工作台（`AgentPage`，含 `components/agent/`：会话列表、消息流、审批弹层、@文件引用、workspace 管理——含 ACP 引擎配置：agent_type/agent_path/llm_model_id）
 - TypeScript 类型定义集中 在 `frontend/src/types/index.ts`
 - API 客户端在 `frontend/src/api/client.ts`：Axios + JWT 拦截器
 
