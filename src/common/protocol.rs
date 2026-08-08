@@ -188,6 +188,50 @@ pub enum ControlMessage {
     AgentExecCancel {
         request_id: String,
     },
+    /// Server asks client to spawn a long-lived agent/LLM-proxy process.
+    /// stdio flows via AgentSpawnData; process exit reported via AgentSpawnExit.
+    AgentSpawnRequest {
+        session_id: String,
+        command: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+    },
+    /// Client reports spawn result
+    AgentSpawnResponse {
+        session_id: String,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Bidirectional stdio for a spawned process.
+    /// stdin=true: server -> client (write to process stdin);
+    /// stdin=false: client -> server (process stdout).
+    AgentSpawnData {
+        session_id: String,
+        data: Vec<u8>,
+        stdin: bool,
+    },
+    /// Client reports spawned process exit
+    AgentSpawnExit {
+        session_id: String,
+        code: Option<i32>,
+    },
+    /// Client-side LLM loop proxy forwards an LLM API request to the server
+    AgentLlmProxyRequest {
+        request_id: String,
+        /// Owning ACP session; server uses it to resolve workspace -> model/key
+        session_id: String,
+        /// e.g. "/v1/chat/completions" or "/v1/messages"
+        path: String,
+        body: Vec<u8>,
+    },
+    /// Server streams LLM response back (SSE chunks; done=true ends)
+    AgentLlmProxyChunk {
+        request_id: String,
+        data: Vec<u8>,
+        done: bool,
+        status: u16,
+    },
 }
 
 impl ControlMessage {
@@ -818,5 +862,71 @@ mod tests {
             let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
             assert_eq!(format!("{back:?}"), format!("{:?}", cmd));
         }
+    }
+
+    #[test]
+    fn test_agent_spawn_messages_roundtrip() {
+        let req = ControlMessage::AgentSpawnRequest {
+            session_id: "sess-1".into(),
+            command: "gemini".into(),
+            args: vec!["--experimental-acp".into()],
+            env: vec![("OPENAI_BASE_URL".into(), "http://127.0.0.1:8080".into())],
+            cwd: Some("/home/user/project".into()),
+        };
+        let encoded = bincode::serialize(&req).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            ControlMessage::AgentSpawnRequest { session_id, command, args, env, cwd } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(command, "gemini");
+                assert_eq!(args, vec!["--experimental-acp"]);
+                assert_eq!(env.len(), 1);
+                assert_eq!(cwd.as_deref(), Some("/home/user/project"));
+            }
+            other => panic!("expected AgentSpawnRequest, got {other:?}"),
+        }
+
+        let data = ControlMessage::AgentSpawnData {
+            session_id: "sess-1".into(),
+            data: b"{\"jsonrpc\":\"2.0\"}".to_vec(),
+            stdin: false,
+        };
+        let encoded = bincode::serialize(&data).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        assert!(matches!(decoded, ControlMessage::AgentSpawnData { stdin: false, .. }));
+
+        let exit = ControlMessage::AgentSpawnExit { session_id: "sess-1".into(), code: Some(0) };
+        let encoded = bincode::serialize(&exit).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        assert!(matches!(decoded, ControlMessage::AgentSpawnExit { code: Some(0), .. }));
+    }
+
+    #[test]
+    fn test_agent_llm_proxy_messages_roundtrip() {
+        let req = ControlMessage::AgentLlmProxyRequest {
+            request_id: "req-1".into(),
+            session_id: "sess-1".into(),
+            path: "/v1/chat/completions".into(),
+            body: b"{\"model\":\"gpt-4\"}".to_vec(),
+        };
+        let encoded = bincode::serialize(&req).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            ControlMessage::AgentLlmProxyRequest { request_id, path, .. } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(path, "/v1/chat/completions");
+            }
+            other => panic!("expected AgentLlmProxyRequest, got {other:?}"),
+        }
+
+        let chunk = ControlMessage::AgentLlmProxyChunk {
+            request_id: "req-1".into(),
+            data: b"data: {}".to_vec(),
+            done: false,
+            status: 200,
+        };
+        let encoded = bincode::serialize(&chunk).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        assert!(matches!(decoded, ControlMessage::AgentLlmProxyChunk { done: false, status: 200, .. }));
     }
 }
