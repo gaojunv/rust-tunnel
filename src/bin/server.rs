@@ -369,29 +369,17 @@ async fn main() -> TunnelResult<()> {
         }
     }
 
-    // LLM 网关初始化后，把网关入口（内部回环地址 + API key + 域名）注入 ACP 桥。
-    // agent LLM 代理请求经内部 HTTP 回环走网关全管线（模型组、格式转换、用量、
-    // RAG 等），而非直连上游。缺注 = 全部 502。
+    // LLM 网关初始化后，把网关入口（LlmState + 内部 API key）注入 ACP 桥。
+    // agent LLM 代理请求直接函数调用网关 handler，走网关全管线（模型组、
+    // 格式转换、用量、RAG 等），与外部 HTTP 流量共享同一条代码路径。
+    // 缺注 = 全部 502。
     {
         use rust_tunnel::server::agent::llm_bridge::LlmGatewayEndpoint;
         use rust_tunnel::server::llm::auth::generate_api_key;
 
-        let gateway_opt = {
-            let llm_guard = state.proxy_state.llm_state.read().await;
-            let llm = llm_guard.as_ref();
-            llm.and_then(|llm_state| {
-                let cfg = llm_state.gateway_config.try_read().ok()?;
-                cfg.as_ref().map(|c| {
-                    let port = c.listen.rsplit(':').next().unwrap_or("443");
-                    let base_url = format!("127.0.0.1:{port}");
-                    let openai_domain = c.openai_domain.clone().unwrap_or_default();
-                    let anthropic_domain = c.anthropic_domain.clone().unwrap_or_default();
-                    (base_url, openai_domain, anthropic_domain)
-                })
-            })
-        };
+        let llm_state_opt = state.proxy_state.llm_state.read().await.clone();
 
-        if let Some((base_url, openai_domain, anthropic_domain)) = gateway_opt {
+        if let Some(llm_state) = llm_state_opt {
             // 创建/复用内部 API key（稳定的 id，幂等 INSERT OR REPLACE 模式）。
             // 用 raw key hash 存 DB，明文只保留在内存中传给 llm_bridge。
             let (raw_key, key_hash, key_prefix) = generate_api_key();
@@ -405,10 +393,8 @@ async fn main() -> TunnelResult<()> {
                 }
             }
             let gateway = LlmGatewayEndpoint {
-                base_url,
+                llm_state,
                 api_key: raw_key,
-                openai_domain,
-                anthropic_domain,
             };
             if let Some(agent_state) = state.agent_state.take() {
                 state.agent_state = Some(agent_state.with_llm_gateway(gateway));

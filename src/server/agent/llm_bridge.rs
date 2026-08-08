@@ -3,40 +3,32 @@
 //!
 //! 客户端内嵌 LLM 回环代理把 agent 进程的 LLM API 请求经控制通道转交服务端，
 //! 本模块按 workspace 的 `llm_model_id` 解析 model_name，改写请求体 `model`
-//! 字段后经内部 HTTP 回环调用 LLM 网关入口（`/v1/messages` 或
-//! `/v1/chat/completions`），让网关的模型组故障转移、格式转换、用量统计、
-//! RAG 注入等管线全部生效。**LLM secret 只在服务端接触，客户端永不持有。**
+//! 字段后**直接函数调用** LLM 网关 handler（`handle_messages` /
+//! `handle_chat_completions`），让网关的模型组故障转移、格式转换、用量统计、
+//! RAG 注入等管线全部生效——与外部 HTTP 流量共享同一条代码路径。
+//! **LLM secret 只在服务端接触，客户端永不持有。**
 
-use std::sync::LazyLock;
+use std::sync::Arc;
 
+use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderValue};
+use axum::Json;
 use futures_util::{Stream, StreamExt};
-use reqwest::Client;
 use serde_json::Value;
 
 use crate::server::db::Database;
+use crate::server::llm::openai_handler::LlmHandlerState;
+use crate::server::llm::{anthropic_handler, openai_handler, LlmProtocol, LlmState};
 
-/// LLM 网关入口（内部回环 HTTP 调用时用）。
+/// LLM 网关入口（直接函数调用 handler 时用）。
 #[derive(Debug, Clone)]
 pub struct LlmGatewayEndpoint {
-    /// 网关基地址，如 `http://127.0.0.1:8443`。
-    pub base_url: String,
-    /// 内部 API key（agent 内部调网关入口时附上，绕开外部认证）。
+    /// 网关共享状态（handler 的 `State<LlmHandlerState>` 来源）。
+    pub llm_state: Arc<LlmState>,
+    /// 内部 API key（`Authorization: Bearer` 头注入，绕开外部认证；
+    /// 用量统计以此 key 归属 ACP 流量）。
     pub api_key: String,
-    /// OpenAI 入口域名（`/v1/chat/completions` 请求用此 Host 头）。
-    pub openai_domain: String,
-    /// Anthropic 入口域名（`/v1/messages` 请求用此 Host 头）。
-    pub anthropic_domain: String,
 }
-
-/// 内部回环 HTTP 客户端（调 LLM 网关入口）。不连外网，超时可短。
-static GATEWAY_CLIENT: LazyLock<Client> = LazyLock::new(|| {
-    Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(300))
-        .tcp_keepalive(std::time::Duration::from_secs(60))
-        .build()
-        .expect("failed to build gateway HTTP client")
-});
 
 /// 一个 LLM 代理响应块，对应 `ControlMessage::AgentLlmProxyChunk` 的载荷。
 /// 独立 struct 让 [`forward`] 返回精确的 Stream 类型；调用方（AcpBridge）
@@ -56,9 +48,9 @@ pub struct AgentLlmProxyChunk {
 /// 处理一个 LLM 代理请求，返回 `AgentLlmProxyChunk` 流。
 ///
 /// 解析链路：`session_id` → workspace.llm_model_id → model_name，改写请求体
-/// `model` 字段后经内部 HTTP 回环调用 LLM 网关入口。路径 `/v1/messages` 使用
-/// Anthropic 入口域名；`/v1/chat/completions` 使用 OpenAI 入口域名。网关自动
-/// 完成模型组故障转移、格式转换、用量统计、RAG 注入等管线。
+/// `model` 字段后按路径分发到网关 handler（`/v1/messages` → Anthropic 入口；
+/// `/v1/chat/completions` → OpenAI 入口）。网关自动完成模型组故障转移、
+/// 格式转换、用量统计、RAG 注入等管线。
 ///
 /// # 契约
 /// 无论成功/失败，流总是以 `done=true` 的 chunk 结束（见 [`AgentLlmProxyChunk`]）。
@@ -111,59 +103,44 @@ pub fn forward(
         };
         body_json["model"] = Value::String(model_name);
 
-        // 3. 按路径选协议入口域名（网关据此走对应 handler）。
-        let host = if path.contains("messages") {
-            gateway.anthropic_domain.as_str()
-        } else {
-            gateway.openai_domain.as_str()
-        };
-        if host.is_empty() {
+        // 3. 按路径分发到协议入口 handler（与 shared_listener 的 llm_handle
+        //    白名单一致；path 可能带 query，如 `/v1/messages?beta=true`）。
+        let clean_path = path.split('?').next().unwrap_or("/");
+        let is_messages = clean_path == "/v1/messages";
+        let is_chat_completions = clean_path == "/v1/chat/completions";
+        let is_models = clean_path == "/v1/models";
+        if !is_messages && !is_chat_completions && !is_models {
             yield AgentLlmProxyChunk {
                 request_id,
-                data: b"no gateway domain configured for protocol".to_vec(),
+                data: format!("unsupported llm proxy path: {clean_path}").into_bytes(),
                 done: true,
-                status: 502,
+                status: 404,
             };
             return;
         }
-        let url = format!(
-            "http://{}{}",
-            gateway.base_url.trim_start_matches("http://"),
-            path,
-        );
+        let protocol = if is_messages { LlmProtocol::Anthropic } else { LlmProtocol::OpenAI };
 
-        // 4. 内部 HTTP 回环调用 LLM 网关入口。
-        let resp = match GATEWAY_CLIENT
-            .post(&url)
-            .header("Host", host)
-            .header("Authorization", format!("Bearer {}", gateway.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body_json)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    session_id,
-                    request_id = %request_id,
-                    error = %e,
-                    url = %url,
-                    "llm proxy: gateway connection failed"
-                );
-                yield AgentLlmProxyChunk {
-                    request_id,
-                    data: format!("gateway connection failed: {e}").into_bytes(),
-                    done: true,
-                    status: 502,
-                };
-                return;
-            }
+        // 4. 直接函数调用网关 handler——手工构造 axum extractor 实参
+        //    （State/Json 只是元组包装；handler 逻辑不依赖 axum 运行时）。
+        let handler_state = LlmHandlerState {
+            llm: gateway.llm_state.clone(),
+            protocol: Some(protocol),
+        };
+        let mut headers = HeaderMap::new();
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", gateway.api_key)) {
+            headers.insert(header::AUTHORIZATION, v);
+        }
+        let resp = if is_models {
+            openai_handler::handle_list_models(State(handler_state), headers).await
+        } else if is_messages {
+            anthropic_handler::handle_messages(State(handler_state), headers, Json(body_json)).await
+        } else {
+            openai_handler::handle_chat_completions(State(handler_state), headers, Json(body_json)).await
         };
 
-        // 5. 流式/非流式统一走 body byte stream 回传。
+        // 5. 流式/非流式统一走 body data stream 回传。
         let status = resp.status().as_u16();
-        let mut stream = resp.bytes_stream();
+        let mut stream = resp.into_body().into_data_stream();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(bytes) => {
@@ -230,14 +207,18 @@ async fn resolve_model_name(db: &Database, session_id: &str) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::llm::auth::generate_api_key;
     use futures_util::StreamExt;
 
-    fn test_gateway() -> LlmGatewayEndpoint {
+    /// 构造带 DB 的 endpoint：API key 写入 DB（authenticate 走 hash 查询）。
+    async fn test_gateway(db: &Database) -> LlmGatewayEndpoint {
+        let (raw_key, key_hash, key_prefix) = generate_api_key();
+        db.llm_save_api_key("__acp_internal__", &key_hash, &key_prefix, "ACP Internal", None)
+            .await
+            .unwrap();
         LlmGatewayEndpoint {
-            base_url: "127.0.0.1:1".into(), // 不可达地址（无实际网关）
-            api_key: "sk-000000000000000000000000000000000000000000000000".into(),
-            openai_domain: "oa.local".into(),
-            anthropic_domain: "an.local".into(),
+            llm_state: Arc::new(LlmState::new(Some(db.clone()), None)),
+            api_key: raw_key,
         }
     }
 
@@ -275,11 +256,12 @@ mod tests {
     #[tokio::test]
     async fn test_forward_unconfigured_session_returns_502_done() {
         let db = Database::new(":memory:").await.unwrap();
+        let gw = test_gateway(&db).await;
         let stream = forward(
             db,
             "sess-missing".into(),
             "req-1".into(),
-            test_gateway(),
+            gw,
             "/v1/chat/completions".into(),
             br#"{"model":"gpt-test","stream":true}"#.to_vec(),
         );
@@ -304,12 +286,13 @@ mod tests {
         db.agent_create_session("sess-1", "w1", None, None)
             .await
             .unwrap();
+        let gw = test_gateway(&db).await;
 
         let stream = forward(
             db,
             "sess-1".into(),
             "req-1".into(),
-            test_gateway(),
+            gw,
             "/v1/chat/completions".into(),
             br#"{"model":"gpt-test","stream":true}"#.to_vec(),
         );
@@ -325,12 +308,13 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_provider_model(&db, "model-off", "https://llm.example.test", false).await;
         seed_configured_session(&db, "sess-1", "model-off").await;
+        let gw = test_gateway(&db).await;
 
         let stream = forward(
             db,
             "sess-1".into(),
             "req-1".into(),
-            test_gateway(),
+            gw,
             "/v1/chat/completions".into(),
             br#"{"model":"gpt-test","stream":true}"#.to_vec(),
         );
@@ -344,11 +328,12 @@ mod tests {
     #[tokio::test]
     async fn test_forward_malformed_body_returns_400_done() {
         let db = Database::new(":memory:").await.unwrap();
+        let gw = test_gateway(&db).await;
         let stream = forward(
             db,
             "sess-1".into(),
             "req-1".into(),
-            test_gateway(),
+            gw,
             "/v1/chat/completions".into(),
             b"not json".to_vec(),
         );
@@ -359,79 +344,137 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_forward_offline_gateway_ends_with_502_done() {
-        // session + model 配置完整，但网关不可达 → 502 done
+    async fn test_forward_unknown_path_returns_404_done() {
+        // 不在白名单内的路径 → 404 done（对应 llm_handle 的路径白名单）
         let db = Database::new(":memory:").await.unwrap();
-        save_provider_model(&db, "model-1", "https://unused.example.test", true).await;
+        let gw = test_gateway(&db).await;
+        // 注意：必须先有有效 session，否则在路径白名单检查之前就被
+        // resolve_model_name 的 502 拦截（模型注入在路径分发之前）。
         seed_configured_session(&db, "sess-1", "model-1").await;
-
-        let stream = forward(
-            db,
-            "sess-1".into(),
-            "req-1".into(),
-            test_gateway(), // port 1 — 连接必定失败
-            "/v1/chat/completions".into(),
-            br#"{"model":"gpt-test","stream":false}"#.to_vec(),
-        );
-        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
-        assert_eq!(chunks.len(), 1, "gateway failure must emit exactly one chunk");
-        assert!(chunks[0].done, "gateway failure must end with done=true");
-        assert_eq!(chunks[0].status, 502);
-    }
-
-    #[tokio::test]
-    async fn test_forward_messages_path_uses_anthropic_domain() {
-        // Anthropic 路径场景：Host 头应使用 anthropic_domain。
-        // 用空 anthropic_domain → 502，验证路由逻辑生效（否则
-        // 会走到网关连接失败分支）。
-        let db = Database::new(":memory:").await.unwrap();
-        save_provider_model(&db, "model-1", "https://unused.example.test", true).await;
-        seed_configured_session(&db, "sess-1", "model-1").await;
-
-        let gw = LlmGatewayEndpoint {
-            anthropic_domain: "".into(), // 未配置 Anthropic 入口
-            ..test_gateway()
-        };
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
         let stream = forward(
             db,
             "sess-1".into(),
             "req-1".into(),
             gw,
-            "/v1/messages".into(), // Claude Code 路径
-            br#"{"model":"gpt-test","stream":true}"#.to_vec(),
+            "/v1/unknown".into(),
+            br#"{"model":"gpt-test"}"#.to_vec(),
         );
         let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].done);
-        assert_eq!(chunks[0].status, 502);
-        assert!(
-            String::from_utf8_lossy(&chunks[0].data).contains("no gateway domain"),
-            "err body: {}",
-            String::from_utf8_lossy(&chunks[0].data)
-        );
+        assert_eq!(chunks[0].status, 404);
+        assert!(String::from_utf8_lossy(&chunks[0].data).contains("unsupported llm proxy path"));
     }
 
     #[tokio::test]
-    async fn test_forward_injects_model_name_into_body() {
-        // 模型名注入后应真正发起 HTTP 请求（发到不可达端口→502）；
-        // 若无注入逻辑提前报错（model 字段缺失/不对），则证明注入正确。
+    async fn test_forward_upstream_unreachable_ends_with_done() {
+        // session + model 配置完整，handler 正常运行，但上游 provider
+        // 不可达 → 网关回 5xx 错误响应（done=true 收尾，契约不变）
         let db = Database::new(":memory:").await.unwrap();
-        save_provider_model(&db, "model-1", "https://unused.example.test", true).await;
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
         seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
 
         let stream = forward(
             db,
             "sess-1".into(),
             "req-1".into(),
-            test_gateway(),
+            gw,
+            "/v1/chat/completions".into(),
+            br#"{"model":"gpt-test","stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done, "must end with done=true");
+        assert!(last.status >= 400, "upstream failure → error status, got {}", last.status);
+    }
+
+    #[tokio::test]
+    async fn test_forward_messages_path_reaches_anthropic_handler() {
+        // `/v1/messages`（可带 query，如 `?beta=true`）应路由到 Anthropic
+        // handler：错误响应须为 Anthropic 格式（顶层 `type: "error"`）。
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/messages?beta=true".into(), // Claude Code 路径（带 query）
+            br#"{"model":"gpt-test","stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        assert!(last.status >= 400);
+        let body: String = chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        assert!(
+            body.contains("\"type\":\"error\""),
+            "anthropic error format expected, body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_bad_key_returns_401_done() {
+        // endpoint 的 api_key 不在 DB 中 → handler 认证失败 → 401
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = LlmGatewayEndpoint {
+            llm_state: Arc::new(LlmState::new(Some(db.clone()), None)),
+            api_key: "sk-not-in-db".into(),
+        };
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            br#"{"model":"gpt-test","stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        assert_eq!(last.status, 401);
+    }
+
+    #[tokio::test]
+    async fn test_forward_injects_model_name_into_body() {
+        // model_name 注入后请求应通过 handler 的 model 校验与路由解析
+        // （进入上游调用阶段，失败→5xx），而非因缺 model 字段 400。
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
             "/v1/chat/completions".into(),
             br#"{"stream":false}"#.to_vec(), // 没有 model 字段
         );
         let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
-        // model_name 已注入 → 请求能到网关连接阶段（失败→502），
-        // 而非卡在 JSON 解析/模型名缺失上。
-        assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].done);
-        assert_eq!(chunks[0].status, 502);
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        // model 注入生效的标志：错误不再是 "model is required"，
+        // 而是更靠后的管线阶段（此处为 handler 参数校验 "messages is required"）。
+        let body: String = chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        assert!(
+            !body.contains("model is required"),
+            "model injected → must not fail on missing model, body: {body}"
+        );
     }
 }
