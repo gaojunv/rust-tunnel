@@ -388,16 +388,14 @@ impl AcpBridge {
                                     tc.title.clone(),
                                 );
                             }
-                            // 每次事件动态解析 WS 通道（评审 Finding 1）：handshake
-                            // 时捕获的 ws_tx 在重连后会过时——ensure_session 的 dedup
-                            // 刷新与 detach_ws_tx 清空只改条目里的 ws_tx，处理器必须
-                            // 读最新值，否则流式帧会推给已断开的旧连接（try_send
-                            // 静默失败，新连接只能看到 done）。顺带刷新 last_activity
-                            // （长回合无 stdout 时不被 idle reaper 误回收）。
-                            let Some(ws_tx) = current_ws_tx(&sessions, &sid).await else {
-                                // 会话已回收 / WS 已断开：无可推送者，丢弃本帧。
+                            // 会话存活守卫（评审修复：persist 移出 ws_tx guard）：
+                            // touch_activity 只刷新 last_activity、不读 ws_tx——断线
+                            // （detach_ws_tx 置 None）期间到达的事件必须继续落库，
+                            // 后台跑完的回合同样可追溯。条目被 kill/reaper 回收后
+                            // 返回 false，本帧放弃（不落库、不推送）。
+                            if !touch_activity(&sessions, &sid).await {
                                 return Ok(());
-                            };
+                            }
                             if let Some(mut frame) = map_update(&notification.update) {
                                 // ToolCallUpdate 缺 title 时从缓存补 name。
                                 if frame["type"] == "tool_result"
@@ -413,13 +411,20 @@ impl AcpBridge {
                                     }
                                 }
                                 // 落库（best-effort，不依赖 WS 存活）：tool/plan 直接
-                                // 落；文本/thought 缓冲到终态合并落一行。
+                                // 落；文本/thought 缓冲到终态合并落一行。断线期间
+                                // 到达的帧同样落库——落库在推送之前、与推送解耦。
                                 persist_acp_frame(&db, &sessions, &sid, &frame).await;
-                                // 流式帧 try_send：前端消费跟不上时丢帧（实时流可
-                                // 容忍），避免连接已关闭但 ACP 会话存活时通知处理器
-                                // 阻塞卡死整个 ACP 连接。
-                                if ws_tx.try_send(frame).is_err() {
-                                    tracing::trace!(session_id = %sid, "acp event dropped (ws channel full/closed)");
+                                // 推送：每次事件动态解析当前 WS 通道（评审 Finding 1）——
+                                // handshake 时捕获的 ws_tx 在重连后会过时，ensure_session
+                                // 的 dedup 刷新与 detach_ws_tx 清空只改条目里的 ws_tx，
+                                // 必须读最新值，否则流式帧会推给已断开的旧连接（try_send
+                                // 静默失败，新连接只能看到 done）。断线（None）则跳过推送，
+                                // 不影响已完成的落库。try_send 丢帧（前端消费跟不上）是
+                                // 实时流可容忍的，避免阻塞卡死整个 ACP 连接。
+                                if let Some(ws_tx) = current_ws_tx(&sessions, &sid).await {
+                                    if ws_tx.try_send(frame).is_err() {
+                                        tracing::trace!(session_id = %sid, "acp event dropped (ws channel full/closed)");
+                                    }
                                 }
                             }
                             Ok(())
@@ -870,6 +875,26 @@ async fn current_ws_tx(
     let agent = map.get_mut(sid)?;
     agent.last_activity = std::time::Instant::now();
     agent.ws_tx.clone()
+}
+
+/// 刷新会话活动时间并返回条目是否存在。与 [`current_ws_tx`] 的锁内刷新
+/// 语义一致，但不读 `ws_tx`——通知处理器用它对会话做存活守卫：条目在
+/// （即使断线 `ws_tx=None`）就继续落库，条目被 kill/reaper 回收后返回
+/// false 放弃本帧（落库与推送都依赖会话条目，回收后两者都无意义）。
+/// 断线期间不依赖 WS 通道存活即落库，是「断线期间后台跑完的回合同样可
+/// 追溯」的前提（评审修复：persist 移出 ws_tx guard 之前）。
+async fn touch_activity(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) -> bool {
+    let mut map = sessions.lock().await;
+    match map.get_mut(sid) {
+        Some(a) => {
+            a.last_activity = std::time::Instant::now();
+            true
+        }
+        None => false,
+    }
 }
 
 /// 把规范化 WS 帧落库（best-effort：失败仅记日志，不影响实时推送）。
@@ -1982,7 +2007,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_acp_persistence_survives_ws_disconnect() {
-        // 断线（ws_rx drop / detach）期间回合跑完：消息仍落库
+        // 断线（detach_ws_tx 置 ws_tx=None）期间回合跑完：消息仍落库。
+        // 用真实断线路径 detach_ws_tx——区别于 drop(ws_rx) 只关接收端
+        // （后者 ws_tx 仍占位，通知处理器仍能过 current_ws_tx 守卫，落库
+        // 本来就发生）；detach 后条目 ws_tx=None，验证 persist 已移出 ws_tx
+        // guard 之前（评审修复）：断线点之后到达的帧同样落库。
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
@@ -2001,16 +2030,21 @@ mod tests {
             .unwrap();
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
 
-        let (ws_tx, ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         setup_handshake(&bridge, ws_tx).await;
-        drop(ws_rx); // 模拟前端断开（通道关闭）
+        bridge.detach_ws_tx("sess-1").await; // 真实断线：清空条目 WS 通道
         bridge.prompt("sess-1", "hello").await.expect("prompt");
-        // 等终态回调落库完成：轮询 DB（终态帧发送失败但落库必须先发生）
+        // 等终态回调落库完成：轮询 DB（断线下无终态帧，只能轮询落库结果）。
+        // break 条件要求 tool_result 与终态 flush 的文本行（kind='message' 且
+        // name=None）都已落库，避免「tool_result 已落、终态 flush 未完成」的
+        // 理论 flake 窗口。
         let mut rows = Vec::new();
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             rows = db.agent_list_messages("sess-1").await.unwrap();
-            if rows.iter().any(|r| r.kind == "tool_result") {
+            if rows.iter().any(|r| r.kind == "tool_result")
+                && rows.iter().any(|r| r.kind == "message" && r.name.is_none())
+            {
                 break;
             }
         }
