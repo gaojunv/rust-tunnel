@@ -101,6 +101,23 @@ impl AgentState {
         }
     }
 
+    /// 把 LLM 网关的主密钥解密器注入 ACP 桥。
+    ///
+    /// `AgentState::new`（`ServerState::with_db`）时 LLM 网关尚未初始化、拿不到
+    /// `LlmState.cipher`；生产启动在 `init_llm_state` 之后调用本方法补注。主密钥
+    /// 配置后（默认生产路径）provider API Key 落库加密，agent LLM 代理请求必须
+    /// 在服务端解密后才能调上游——缺注会全部 502。
+    #[must_use]
+    pub fn with_acp_cipher(
+        mut self,
+        cipher: Option<crate::server::llm::crypto::LlmCipher>,
+    ) -> Self {
+        if let Some(bridge) = self.acp_bridge.take() {
+            self.acp_bridge = Some(bridge.with_cipher(cipher));
+        }
+        self
+    }
+
     /// Get (or create) the execution mutex for a workspace.
     pub async fn workspace_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.workspace_locks.lock().await;

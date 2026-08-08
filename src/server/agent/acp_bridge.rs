@@ -86,8 +86,16 @@ impl AcpBridge {
                     .map(|(id, _)| id.clone())
                     .collect();
                 for id in stale {
-                    sessions.lock().await.remove(&id);
-                    tracing::info!(session_id = %id, "killed idle ACP agent");
+                    // 二次锁内复查：收集 stale 到移除之间条目可能被新活动刷新
+                    // （prompt/cancel/stdio），此时不应误删。
+                    let mut guard = sessions.lock().await;
+                    let still_stale = guard
+                        .get(&id)
+                        .is_some_and(|a| a.last_activity.elapsed() > IDLE_TIMEOUT);
+                    if still_stale {
+                        guard.remove(&id);
+                        tracing::info!(session_id = %id, "evicted idle ACP session");
+                    }
                     // TODO(Task 6): 经 registry 下发进程退出语义
                     // （AgentExecCancel request_id = session_id，由客户端
                     //  spawn manager 终止对应进程）。
@@ -115,8 +123,16 @@ impl AcpBridge {
         // 校验也在此锁内做（无 await，持锁开销可忽略）。
         {
             let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(session_id) {
-                return Ok(());
+            match sessions.get(session_id) {
+                Some(agent) if !agent.exited => return Ok(()),
+                // 进程已退出的陈旧条目：视为不存在，移除后走 spawn 路径重拉。
+                // 否则死进程会阻塞 respawn 直到 30 分钟 reaper 清掉它，后续
+                // prompt 一直报 "agent process has exited"。
+                Some(_) => {
+                    tracing::info!(session_id, "re-spawning exited ACP session");
+                    sessions.remove(session_id);
+                }
+                None => {}
             }
             if workspace.runtime_type != "host" {
                 return Err("ACP 模式暂不支持 docker workspace，请改用 host 模式".into());
@@ -491,6 +507,36 @@ mod tests {
             .ensure_session("sess-1", &acp_workspace(), ws_tx)
             .await
             .expect("dedup should return Ok");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_session_exited_entry_respawns() {
+        // 回归：exited=true 的陈旧条目不能短路 dedup。用离线客户端让 spawn
+        // 路径快速失败——若 ensure_session 直接 Ok（bug 行为）则 expect_err panic。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        bridge.sessions.lock().await.insert(
+            "sess-1".into(),
+            SpawnedAgent {
+                acp_session_id: None,
+                last_activity: std::time::Instant::now(),
+                exited: true,
+            },
+        );
+        let mut ws = acp_workspace();
+        ws.client_id = "ghost".into();
+        let (ws_tx, _rx) = mpsc::channel(16);
+        let err = bridge
+            .ensure_session("sess-1", &ws, ws_tx)
+            .await
+            .expect_err("exited entry must attempt respawn, not short-circuit Ok");
+        assert!(err.contains("llm proxy start failed"), "err: {err}");
+        // 陈旧条目已被移除（spawn 失败后不留占位），再次 ensure_session 仍可重试
+        assert!(
+            !bridge.sessions.lock().await.contains_key("sess-1"),
+            "stale exited entry should be gone"
+        );
     }
 
     #[tokio::test]

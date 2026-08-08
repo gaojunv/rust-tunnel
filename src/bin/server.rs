@@ -352,6 +352,23 @@ async fn main() -> TunnelResult<()> {
         )
         .await;
 
+    // LLM 网关初始化后，把主密钥解密器注入 ACP 桥：provider API Key 落库加密
+    // 时（配置了主密钥即默认生产路径），agent 的 LLM 代理请求须在服务端解密
+    // 后才能调上游；不注入则 decrypt_field(None, ...) 失败、所有请求 502。
+    // 注意要在任何 state.clone() 之前完成，确保所有后续克隆共享注入后的桥。
+    {
+        let llm_cipher = state
+            .proxy_state
+            .llm_state
+            .read()
+            .await
+            .as_ref()
+            .and_then(|llm| llm.cipher.clone());
+        if let Some(agent_state) = state.agent_state.take() {
+            state.agent_state = Some(agent_state.with_acp_cipher(llm_cipher));
+        }
+    }
+
     {
         let addrs = state.proxy_state.distinct_http_listen_addrs().await;
         for addr in addrs {

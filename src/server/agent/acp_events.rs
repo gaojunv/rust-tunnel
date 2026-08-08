@@ -33,7 +33,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                 "status": status_str(Some(tc.status)),
             });
             if let Some(args) = &tc.raw_input {
-                frame["args"] = args.clone();
+                frame["args"] = serde_json::Value::String(encode_raw(args));
             }
             Some(frame)
         }
@@ -47,11 +47,23 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                 frame["name"] = serde_json::Value::String(title.clone());
             }
             if let Some(output) = &upd.fields.raw_output {
-                frame["result"] = output.clone();
+                frame["result"] = serde_json::Value::String(encode_raw(output));
             }
             Some(frame)
         }
         _ => None,
+    }
+}
+
+/// 把 ACP 的 raw 输入/输出（`serde_json::Value`）编码成 WS 帧里的字符串。
+///
+/// 前端契约 `args?: string` / `result?: string`（`frontend/src/types/index.ts`，
+/// 前端对 args 做 `JSON.parse`）。raw 值是 JSON 对象时序列化为 JSON 文本；
+/// 本身已是字符串则直接透传，避免双重编码。
+fn encode_raw(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
@@ -109,7 +121,22 @@ mod tests {
         assert_eq!(frame["id"], "call_1");
         assert_eq!(frame["name"], "shell");
         assert_eq!(frame["status"], "running");
-        assert_eq!(frame["args"]["cmd"], "ls");
+        // raw 值是 JSON 对象 → args 序列化为 JSON 文本字符串（前端 JSON.parse）
+        assert_eq!(frame["args"], "{\"cmd\":\"ls\"}");
+    }
+
+    #[test]
+    fn test_map_tool_call_string_args_passthrough() {
+        // raw 值已是字符串（如 shell 命令）→ 直接透传，不双重编码
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "shell",
+            "status": "completed",
+            "rawInput": "ls -la"
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(frame["args"], "ls -la");
     }
 
     #[test]
@@ -124,7 +151,21 @@ mod tests {
         assert_eq!(frame["type"], "tool_result");
         assert_eq!(frame["id"], "call_1");
         assert_eq!(frame["status"], "completed");
+        // raw 值是字符串 → result 直接透传
         assert_eq!(frame["result"], "a.rs");
+    }
+
+    #[test]
+    fn test_map_tool_call_update_object_result_serialized() {
+        // raw 值是 JSON 对象（如文件内容结构化输出）→ result 序列化为 JSON 文本
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_1",
+            "status": "completed",
+            "rawOutput": {"path": "/tmp/a.rs", "size": 42}
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["result"], "{\"path\":\"/tmp/a.rs\",\"size\":42}");
     }
 
     #[test]
