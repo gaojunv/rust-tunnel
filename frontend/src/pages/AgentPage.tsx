@@ -19,8 +19,12 @@ import WorkspaceDialog from '../components/agent/WorkspaceDialog';
 export default function AgentPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [workspaceId, setWorkspaceId] = useState('');
-  const [sessionId, setSessionId] = useState('');
+  const [workspaceId, setWorkspaceId] = useState(
+    () => localStorage.getItem('agent.lastWorkspaceId') ?? '',
+  );
+  const [sessionId, setSessionId] = useState(
+    () => localStorage.getItem('agent.lastSessionId') ?? '',
+  );
   const [model, setModel] = useState('');
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
   // 编辑模式：传入当前工作区则 WorkspaceDialog 走 PUT（client/运行时不可改）
@@ -115,6 +119,12 @@ export default function AgentPage() {
     autoSelectRef.current = false;
     setSessionId('');
   };
+
+  // 刷新恢复：选中变化即持久化，F5 后回到刷新前的 workspace/session
+  useEffect(() => {
+    if (workspaceId) localStorage.setItem('agent.lastWorkspaceId', workspaceId);
+    localStorage.setItem('agent.lastSessionId', sessionId);
+  }, [workspaceId, sessionId]);
 
   // 齿轮入口：打开编辑模式的 WorkspaceDialog（预填当前工作区，client/运行时不可改）
   const openEditWorkspace = () => {

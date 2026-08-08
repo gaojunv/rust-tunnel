@@ -3,9 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import AgentPage from './AgentPage';
-import { agentWsUrl } from '../api/client';
 
-const sessions = vi.hoisted(() => ({
+const sessionFixtures = vi.hoisted(() => ({
   s1: {
     id: 's1',
     workspace_id: 'w1',
@@ -22,6 +21,22 @@ const sessions = vi.hoisted(() => ({
     created_at: '2026-08-04T00:00:00Z',
     updated_at: '',
   },
+  sNew: {
+    id: 's-new',
+    workspace_id: 'w1',
+    title: 'newest',
+    status: 'active',
+    created_at: '2026-08-05T00:00:00Z',
+    updated_at: '',
+  },
+  sOld: {
+    id: 's-old',
+    workspace_id: 'w1',
+    title: 'older',
+    status: 'active',
+    created_at: '2026-08-04T00:00:00Z',
+    updated_at: '',
+  },
 }));
 
 const api = vi.hoisted(() => ({
@@ -31,6 +46,13 @@ const api = vi.hoisted(() => ({
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
+}));
+
+// ChatStream 替身：仅渲染会话 id 供断言（刷新恢复/回退逻辑观察点在挂载的 sessionId）
+vi.mock('../components/agent/ChatStream', () => ({
+  default: ({ sessionId }: { sessionId: string }) => (
+    <div data-testid="chat-stream" data-session-id={sessionId} />
+  ),
 }));
 
 vi.mock('../api/client', () => ({
@@ -62,26 +84,6 @@ vi.mock('../api/agentModels', () => ({
   listAgentSelectableModels: vi.fn().mockResolvedValue({ models: [], groups: [] }),
 }));
 
-// jsdom 无 WebSocket/ResizeObserver 实现，桩掉（ChatStream 挂载即 new WebSocket）
-class FakeWs {
-  static OPEN = 1;
-  readyState = 1;
-  sent: string[] = [];
-  onmessage: ((ev: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
-  onerror: (() => void) | null = null;
-  send(s: string) {
-    this.sent.push(s);
-  }
-  close() {}
-}
-
-class FakeResizeObserver {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-}
-
 const renderPage = () => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -91,27 +93,29 @@ const renderPage = () => {
   );
 };
 
+const sessionIdOf = (el: HTMLElement) => el.getAttribute('data-session-id');
+
 describe('AgentPage', () => {
   beforeEach(() => {
-    vi.stubGlobal('WebSocket', FakeWs as unknown as typeof WebSocket);
-    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+    // 刷新恢复用 localStorage：用例间清空，避免污染
+    localStorage.clear();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
   });
 
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
-    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
   it('auto-selects the most recent session after selecting a workspace', async () => {
-    api.listAgentSessions.mockResolvedValue([sessions.s1, sessions.s2]);
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.s1, sessionFixtures.s2]);
 
     renderPage();
 
-    // 选中 workspace 后自动选中最近会话（s1）→ ChatStream 挂载并打开其 WS
-    await waitFor(() => expect(vi.mocked(agentWsUrl)).toHaveBeenCalledWith('s1'));
+    // 选中 workspace 后自动选中最近会话（s1）→ ChatStream 挂载
+    const stream = await screen.findByTestId('chat-stream');
+    expect(sessionIdOf(stream)).toBe('s1');
     // 顶栏显示当前会话标题
     expect(screen.getByText('session one')).toBeTruthy();
     // 引导态文本不应出现
@@ -120,12 +124,13 @@ describe('AgentPage', () => {
 
   it('returns to guide state after deleting the current session (no auto-reselect)', async () => {
     api.listAgentSessions
-      .mockResolvedValueOnce([sessions.s1, sessions.s2])
-      .mockResolvedValue([sessions.s2]);
+      .mockResolvedValueOnce([sessionFixtures.s1, sessionFixtures.s2])
+      .mockResolvedValue([sessionFixtures.s2]);
     api.deleteAgentSession.mockResolvedValue(undefined);
 
     renderPage();
-    await waitFor(() => expect(vi.mocked(agentWsUrl)).toHaveBeenCalledWith('s1'));
+    const stream = await screen.findByTestId('chat-stream');
+    expect(sessionIdOf(stream)).toBe('s1');
 
     // 打开会话下拉，删除当前会话（s1，列表第一项）
     const trigger = screen.getByLabelText('agent.selectSessionAria');
@@ -137,9 +142,45 @@ describe('AgentPage', () => {
 
     // 回引导态：不自动重选任何会话（即使 refetch 后列表只剩 s2）
     await waitFor(() => expect(screen.getByText('agent.selectOrNewSession')).toBeTruthy());
-    // 不再挂载 ChatStream：WS 只开过一次（初始 s1），不重新打开 s1/s2
-    expect(vi.mocked(agentWsUrl)).toHaveBeenCalledTimes(1);
+    // 不再挂载 ChatStream
+    expect(screen.queryByTestId('chat-stream')).toBeNull();
     // 顶栏回到「选择会话」占位
     expect(screen.getByText('agent.selectSession')).toBeTruthy();
+  });
+
+  it('restores last selected session from localStorage after remount', async () => {
+    localStorage.setItem('agent.lastWorkspaceId', 'w1');
+    localStorage.setItem('agent.lastSessionId', 's-old');
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.sNew, sessionFixtures.sOld]);
+
+    renderPage();
+
+    // ChatStream 收到恢复的 s-old，而非列表最新的 s-new
+    const stream = await screen.findByTestId('chat-stream');
+    expect(sessionIdOf(stream)).toBe('s-old');
+  });
+
+  it('falls back to newest session when stored id is gone', async () => {
+    localStorage.setItem('agent.lastWorkspaceId', 'w1');
+    localStorage.setItem('agent.lastSessionId', 's-deleted');
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.sNew, sessionFixtures.sOld]);
+
+    renderPage();
+
+    // 恢复的 id 已不存在（会话被删）：挂载时先短暂显示 s-deleted，sessions
+    // 到达后回退到最新的 s-new——等待回退完成而非首次出现
+    await waitFor(() => {
+      const stream = screen.getByTestId('chat-stream');
+      expect(sessionIdOf(stream)).toBe('s-new');
+    });
+  });
+
+  it('persists selection to localStorage on manual select', async () => {
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.sNew, sessionFixtures.sOld]);
+
+    renderPage();
+    await screen.findByTestId('chat-stream');
+    // 自动选中 s-new 后 localStorage 同步更新
+    expect(localStorage.getItem('agent.lastSessionId')).toBe('s-new');
   });
 });
