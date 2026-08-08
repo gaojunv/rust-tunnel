@@ -86,6 +86,10 @@ struct SpawnedAgent {
     last_activity: std::time::Instant,
     /// AgentSpawnExit 已到达（进程结束）。
     exited: bool,
+    /// 回合内 assistant 文本缓冲（chunk 逐条到达，终态合并落一行库）。
+    text_buf: String,
+    /// 回合内 thought 文本缓冲（终态落 `name='thought'` 行）。
+    thought_buf: String,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -260,6 +264,8 @@ impl AcpBridge {
                     cancelled: false,
                     last_activity: std::time::Instant::now(),
                     exited: false,
+                    text_buf: String::new(),
+                    thought_buf: String::new(),
                 },
             );
             Some((pump_io, stdout_rx))
@@ -352,6 +358,7 @@ impl AcpBridge {
         let cwd = cwd.to_string();
         let approval = self.approval.clone();
         let sessions = self.sessions.clone();
+        let db = self.db.clone();
         let (setup_tx, setup_rx) = oneshot::channel();
 
         // 常驻连接任务：connect_with 的 main_fn 完成 handshake 后保持挂起，
@@ -364,6 +371,7 @@ impl AcpBridge {
                     {
                         let sid = sid.clone();
                         let sessions = sessions.clone();
+                        let db = db.clone();
                         // tool_call_id → 工具名 缓存：ACP 的 ToolCallUpdate 常不带
                         // title，而前端 ChatStream 按 tool_result.name === tool_call.name
                         // 匹配卡片——从前序 ToolCall 事件的 title 补名，保证结果能挂上。
@@ -404,6 +412,9 @@ impl AcpBridge {
                                         }
                                     }
                                 }
+                                // 落库（best-effort，不依赖 WS 存活）：tool/plan 直接
+                                // 落；文本/thought 缓冲到终态合并落一行。
+                                persist_acp_frame(&db, &sessions, &sid, &frame).await;
                                 // 流式帧 try_send：前端消费跟不上时丢帧（实时流可
                                 // 容忍），避免连接已关闭但 ACP 会话存活时通知处理器
                                 // 阻塞卡死整个 ACP 连接。
@@ -586,6 +597,7 @@ impl AcpBridge {
         };
 
         let sessions = self.sessions.clone();
+        let db = self.db.clone();
         let sid = session_id.to_string();
         let prompt = vec![ContentBlock::Text(TextContent::new(content.to_string()))];
         let send_result = connection
@@ -594,6 +606,9 @@ impl AcpBridge {
                 PromptRequest::new(acp_session_id, prompt),
             )
             .on_receiving_result(async move |result| {
+                // 终态落库先行：缓冲文本/thought 合并落库必须在 done 帧之前完成，
+                // 否则前端 done 后 invalidate 的历史 refetch 可能读不到本回合并本。
+                flush_acp_turn_buffers(&db, &sessions, &sid).await;
                 // 回合终态：清 busy + 取当前 WS 通道（重连后 done/error 推给最新
                 // 连接，与通知处理器同语义）。若回合被取消/会话已被杀（条目移除），
                 // 抑制终态帧——取消路径的 stopped 帧已由 WS handler 回发，再补
@@ -857,6 +872,127 @@ async fn current_ws_tx(
     agent.ws_tx.clone()
 }
 
+/// 把规范化 WS 帧落库（best-effort：失败仅记日志，不影响实时推送）。
+///
+/// - 文本/thought：按 session 缓冲在 `SpawnedAgent`，终态回调统一落一行；
+/// - tool_call/tool_result/plan：到达即落；session_title 写回 sessions 表。
+///
+/// 落库不依赖 WS 连接存活——断线期间后台跑完的回合同样可追溯。
+async fn persist_acp_frame(
+    db: &Database,
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+    frame: &serde_json::Value,
+) {
+    match frame["type"].as_str().unwrap_or("") {
+        "assistant_chunk" => {
+            let mut map = sessions.lock().await;
+            if let Some(a) = map.get_mut(sid) {
+                let content = frame["content"].as_str().unwrap_or("");
+                if frame["thought"].as_bool().unwrap_or(false) {
+                    a.thought_buf.push_str(content);
+                } else {
+                    a.text_buf.push_str(content);
+                }
+            }
+        }
+        "tool_call" => {
+            let call = serde_json::json!([{
+                "id": frame["id"],
+                "name": frame["name"],
+                "arguments": frame.get("args").cloned().unwrap_or(serde_json::Value::Null),
+                "tool_kind": frame["tool_kind"],
+                "diffs": frame.get("diffs").cloned().unwrap_or(serde_json::Value::Null),
+                "locations": frame.get("locations").cloned().unwrap_or(serde_json::Value::Null),
+            }]);
+            let msg_id = format!("{:032x}", rand::random::<u128>());
+            if let Err(e) = db
+                .agent_add_message_v2(
+                    &msg_id,
+                    sid,
+                    "assistant",
+                    "",
+                    Some(&call.to_string()),
+                    frame["id"].as_str(),
+                    frame["name"].as_str(),
+                    "tool_calls",
+                )
+                .await
+            {
+                tracing::warn!(session_id = %sid, "persist tool_call failed: {e}");
+            }
+        }
+        "tool_result" => {
+            let msg_id = format!("{:032x}", rand::random::<u128>());
+            if let Err(e) = db
+                .agent_add_message_v2(
+                    &msg_id,
+                    sid,
+                    "assistant",
+                    frame["result"].as_str().unwrap_or(""),
+                    None,
+                    frame["id"].as_str(),
+                    frame["name"].as_str(),
+                    "tool_result",
+                )
+                .await
+            {
+                tracing::warn!(session_id = %sid, "persist tool_result failed: {e}");
+            }
+        }
+        "plan" => {
+            let msg_id = format!("{:032x}", rand::random::<u128>());
+            let entries = frame["entries"].to_string();
+            if let Err(e) = db
+                .agent_add_message_v2(
+                    &msg_id, sid, "assistant", &entries, None, None, Some("plan"), "message",
+                )
+                .await
+            {
+                tracing::warn!(session_id = %sid, "persist plan failed: {e}");
+            }
+        }
+        "session_title" => {
+            if let Some(title) = frame["title"].as_str() {
+                if let Err(e) = db.agent_update_session_title(sid, title).await {
+                    tracing::warn!(session_id = %sid, "persist session title failed: {e}");
+                }
+            }
+        }
+        _ => {} // usage 等：仅实时推送，不落库
+    }
+}
+
+/// 回合终态：把缓冲的 assistant 文本 / thought 各落一行并清空缓冲。
+/// 取消/错误/断线终态同样落已有缓冲（用户能看到的那部分回合过程可追溯）。
+async fn flush_acp_turn_buffers(
+    db: &Database,
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) {
+    let (text, thought) = {
+        let mut map = sessions.lock().await;
+        let Some(a) = map.get_mut(sid) else {
+            return;
+        };
+        (std::mem::take(&mut a.text_buf), std::mem::take(&mut a.thought_buf))
+    };
+    for (name, content) in [(None, text), (Some("thought"), thought)] {
+        if content.is_empty() {
+            continue;
+        }
+        let msg_id = format!("{:032x}", rand::random::<u128>());
+        if let Err(e) = db
+            .agent_add_message_v2(
+                &msg_id, sid, "assistant", &content, None, None, name, "message",
+            )
+            .await
+        {
+            tracing::warn!(session_id = %sid, "persist turn text failed: {e}");
+        }
+    }
+}
+
 /// stdio pump：进程 stdout（`stdout_rx`，即 `AgentSpawnData{stdin:false}` 转来）
 /// → 写 duplex 喂 ACP crate；ACP crate 写出的字节从 duplex 读回 → 以
 /// `AgentSpawnData{stdin:true}` 下发客户端进程 stdin。
@@ -1017,6 +1153,8 @@ mod tests {
             cancelled: false,
             last_activity: std::time::Instant::now(),
             exited: false,
+            text_buf: String::new(),
+            thought_buf: String::new(),
         }
     }
 
@@ -1557,6 +1695,20 @@ mod tests {
                                     "toolCallId": "call_1", "status": "completed",
                                     "rawOutput": "a.rs" } }
                         }));
+                        // plan + thought：验证新事件类型的落库
+                        out_lines.push(serde_json::json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": { "sessionId": "acp-1",
+                                "update": { "sessionUpdate": "agent_thought_chunk",
+                                    "content": { "type": "text", "text": "思考一下" } } }
+                        }));
+                        out_lines.push(serde_json::json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": { "sessionId": "acp-1",
+                                "update": { "sessionUpdate": "plan",
+                                    "entries": [ { "content": "步骤一", "priority": "high",
+                                        "status": "in_progress" } ] } }
+                        }));
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": { "stopReason": "end_turn" }
@@ -1610,9 +1762,10 @@ mod tests {
             .await
             .expect("prompt should send");
 
-        // 事件序列：assistant_chunk → tool_call → tool_result(名从缓存补) → done
+        // 事件序列：assistant_chunk → tool_call → tool_result(名从缓存补)
+        // → assistant_chunk(thought) → plan → done
         let mut events = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
                 .await
                 .expect("timed out waiting for ws event")
@@ -1626,7 +1779,12 @@ mod tests {
         assert_eq!(events[2]["type"], "tool_result");
         assert_eq!(events[2]["name"], "shell", "name should be cached from ToolCall");
         assert_eq!(events[2]["result"], "a.rs");
-        assert_eq!(events[3]["type"], "done");
+        assert_eq!(events[3]["type"], "assistant_chunk");
+        assert_eq!(events[3]["thought"], true);
+        assert_eq!(events[3]["content"], "思考一下");
+        assert_eq!(events[4]["type"], "plan");
+        assert_eq!(events[4]["entries"][0]["content"], "步骤一");
+        assert_eq!(events[5]["type"], "done");
         // 回合结束：busy 复位，可再次 prompt
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
     }
@@ -1663,8 +1821,16 @@ mod tests {
             .await
             .expect("prompt should send");
 
-        // 流式帧（assistant_chunk / tool_call / tool_result）+ done 应全部到达 B。
-        for expected in ["assistant_chunk", "tool_call", "tool_result", "done"] {
+        // 流式帧（assistant_chunk / tool_call / tool_result / thought / plan）+
+        // done 应全部到达 B。
+        for expected in [
+            "assistant_chunk",
+            "tool_call",
+            "tool_result",
+            "assistant_chunk",
+            "plan",
+            "done",
+        ] {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_b.recv())
                 .await
                 .expect("timed out waiting for ws event on new channel")
@@ -1714,8 +1880,15 @@ mod tests {
             .await
             .expect("prompt should send");
 
-        // 流式通知不受取消抑制（mock agent 仍在回话）；终态 done 应被抑制。
-        for expected in ["assistant_chunk", "tool_call", "tool_result"] {
+        // 流式通知不受取消抑制（mock agent 仍在回话：assistant_chunk / tool_call /
+        // tool_result / thought / plan）；终态 done 应被抑制。
+        for expected in [
+            "assistant_chunk",
+            "tool_call",
+            "tool_result",
+            "assistant_chunk",
+            "plan",
+        ] {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
                 .await
                 .expect("timed out waiting for streamed event")
@@ -1734,5 +1907,121 @@ mod tests {
             assert!(!s.get("sess-1").unwrap().busy);
             assert!(!s.get("sess-1").unwrap().cancelled);
         }
+    }
+
+    #[tokio::test]
+    async fn test_acp_events_persisted_to_db() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake(&bridge, ws_tx.clone()).await;
+        bridge.prompt("sess-1", "hello").await.expect("prompt");
+        // 收完终态帧：此时终态回调的落库已完成（done 帧在落库之后发送）
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out")
+                .expect("closed");
+            if ev["type"] == "done" {
+                break;
+            }
+        }
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        // assistant 文本（缓冲到终态落一行）
+        let texts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "message" && r.name.is_none())
+            .collect();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].content, "hello from mock");
+        // thought 行
+        let thoughts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.name.as_deref() == Some("thought"))
+            .collect();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts[0].content, "思考一下");
+        // plan 行（entries JSON）
+        let plans: Vec<_> = rows
+            .iter()
+            .filter(|r| r.name.as_deref() == Some("plan"))
+            .collect();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].content.contains("步骤一"));
+        // tool_calls 行：tool_calls JSON 含 tool_kind
+        let calls: Vec<_> = rows.iter().filter(|r| r.kind == "tool_calls").collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_call_id.as_deref(), Some("call_1"));
+        let call_json: serde_json::Value =
+            serde_json::from_str(calls[0].tool_calls.as_deref().unwrap()).unwrap();
+        assert_eq!(call_json[0]["tool_kind"], "other"); // mock 未带 kind → 默认
+        assert_eq!(call_json[0]["arguments"], "{\"cmd\":\"ls\"}");
+        // tool_result 行
+        let results: Vec<_> = rows.iter().filter(|r| r.kind == "tool_result").collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(results[0].content, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn test_acp_persistence_survives_ws_disconnect() {
+        // 断线（ws_rx drop / detach）期间回合跑完：消息仍落库
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+
+        let (ws_tx, ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake(&bridge, ws_tx).await;
+        drop(ws_rx); // 模拟前端断开（通道关闭）
+        bridge.prompt("sess-1", "hello").await.expect("prompt");
+        // 等终态回调落库完成：轮询 DB（终态帧发送失败但落库必须先发生）
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            rows = db.agent_list_messages("sess-1").await.unwrap();
+            if rows.iter().any(|r| r.kind == "tool_result") {
+                break;
+            }
+        }
+        assert!(
+            rows.iter().any(|r| r.kind == "tool_calls"),
+            "tool_call should persist without ws consumer: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.kind == "tool_result"));
+        assert!(
+            rows.iter().any(|r| r.kind == "message" && r.name.is_none()),
+            "assistant text should persist without ws consumer"
+        );
     }
 }

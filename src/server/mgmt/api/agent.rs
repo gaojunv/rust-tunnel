@@ -668,6 +668,16 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         .await;
                     continue;
                 }
+                // 持久化 user 消息（与 runner 路径同款）：落的是注入后的 content，
+                // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。
+                let msg_id = format!("{:032x}", rand::random::<u128>());
+                if let Err(e) = agent
+                    .db
+                    .agent_add_message(&msg_id, &session_id, "user", &content, None)
+                    .await
+                {
+                    tracing::warn!(session_id = %session_id, "persist acp user message failed: {e}");
+                }
                 if let Err(e) = bridge.prompt(&session_id, &content).await {
                     let _ = event_tx
                         .send(serde_json::json!({"type": "error", "message": e}))
