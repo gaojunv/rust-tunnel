@@ -2,6 +2,7 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
 import MessageBubble from './MessageBubble';
+import type { ChatItem } from './types';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string, opts?: { count?: number }) => (opts?.count ? `${k}:${opts.count}` : k) }),
@@ -134,5 +135,46 @@ describe('MessageBubble tool card collapsing', () => {
     // 展开后显示 toolRunning 文案
     fireEvent.click(header);
     expect(screen.getByText('agent.toolRunning')).toBeTruthy();
+  });
+});
+
+describe('MessageBubble tool card status badges, plan and thought bubbles', () => {
+  afterEach(cleanup);
+
+  const base: ChatItem = { kind: 'tool', content: '', toolName: 'Edit src/a.ts' };
+
+  it('shows status badge: failed', () => {
+    render(<MessageBubble item={{ ...base, toolStatus: 'failed', toolResult: 'boom' }} />);
+    expect(screen.getByText('✗')).toBeTruthy();
+  });
+
+  it('shows completed badge when result present and no explicit status', () => {
+    render(<MessageBubble item={{ ...base, toolResult: 'ok' }} />);
+    expect(screen.getByText('✓')).toBeTruthy();
+  });
+
+  it('renders plan bubble with status markers', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'plan',
+          content: '',
+          planEntries: [
+            { content: '第一步', status: 'completed' },
+            { content: '第二步', status: 'in_progress' },
+            { content: '第三步', status: 'pending' },
+          ],
+        }}
+      />,
+    );
+    expect(screen.getByText('第一步')).toBeTruthy();
+    expect(screen.getByText('第三步')).toBeTruthy();
+    expect(screen.getByText('✓')).toBeTruthy();
+    expect(screen.getByText('▶')).toBeTruthy();
+  });
+
+  it('renders thought bubble collapsed by default', () => {
+    render(<MessageBubble item={{ kind: 'thought', content: '内部推理' }} />);
+    expect(screen.queryByText('内部推理')).not.toBeTruthy();
   });
 });

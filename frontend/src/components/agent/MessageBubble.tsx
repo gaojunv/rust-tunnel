@@ -1,8 +1,21 @@
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronUp, Loader2, Wrench } from 'lucide-react';
-import type { ChatItem } from './types';
+import {
+  Brain,
+  ChevronDown,
+  ChevronUp,
+  FileText,
+  Globe,
+  ListChecks,
+  Loader2,
+  Pencil,
+  Search,
+  TerminalSquare,
+  Wrench,
+} from 'lucide-react';
+import type { ChatItem, ToolKind, PlanEntryItem } from './types';
 import Markdown from './Markdown';
+import ToolDiffView from './ToolDiffView';
 
 /** 折叠阈值：tool 参数/结果超过该行数时只显示前 3 行，可手动展开。 */
 const COLLAPSE_LINE_THRESHOLD = 6;
@@ -75,11 +88,36 @@ function toolSummary(name: string | undefined, args: string | undefined): string
   }
 }
 
-/** 工具调用卡片：默认收起为一行头部（工具名 + 摘要），点击展开 args/result。 */
+/** toolKind → 图标（视觉分类；未知/缺省一律 Wrench）。 */
+const KIND_ICON: Record<ToolKind, typeof Wrench> = {
+  read: FileText,
+  edit: Pencil,
+  delete: Pencil,
+  move: Pencil,
+  search: Search,
+  execute: TerminalSquare,
+  think: Brain,
+  fetch: Globe,
+  switch_mode: Wrench,
+  other: Wrench,
+};
+
+/** 工具执行状态徽章：显式 toolStatus 优先；缺省（旧数据）按 result 有无推断。 */
+function StatusBadge({ item }: { item: ChatItem }) {
+  const status = item.toolStatus ?? (item.toolResult != null ? 'completed' : 'in_progress');
+  if (status === 'failed') return <span className="shrink-0 text-xs text-destructive">✗</span>;
+  if (status === 'completed') return <span className="shrink-0 text-xs text-green-600">✓</span>;
+  return <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />;
+}
+
+/** 工具调用卡片：默认收起为一行头部（图标 + 名称 + 摘要 + 状态），点击展开详情。
+ *  详情优先级：diffs → args/result 文本（折叠）。 */
 function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const summary = toolSummary(item.toolName, item.toolArgs);
+  const Icon = KIND_ICON[item.toolKind ?? 'other'];
+  const isError = (item.toolStatus ?? (item.toolResult != null ? 'completed' : 'in_progress')) === 'failed';
 
   return (
     <div>
@@ -89,13 +127,13 @@ function ToolCard({ item }: { item: ChatItem }) {
         className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        <Wrench className="h-3.5 w-3.5 shrink-0 text-primary" />
+        <Icon className="h-3.5 w-3.5 shrink-0 text-primary" />
         <span className="font-medium text-foreground/90">{item.toolName}</span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-muted-foreground">{summary}</span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
-          {!item.toolResult && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+          <StatusBadge item={item} />
           {open ? (
             <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
           ) : (
@@ -104,15 +142,19 @@ function ToolCard({ item }: { item: ChatItem }) {
         </span>
       </button>
       {open && (
-        <div className="mt-2 border-t border-border/60 pt-2">
+        <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
+          {item.toolDiffs && item.toolDiffs.length > 0 && <ToolDiffView diffs={item.toolDiffs} />}
           {item.toolArgs && <CollapsiblePre text={item.toolArgs} />}
           {item.toolResult ? (
-            <CollapsiblePre text={item.toolResult} className={item.toolArgs ? 'mt-2 border-t border-border/60 pt-2' : undefined} />
+            <CollapsiblePre text={item.toolResult} className={item.toolArgs || item.toolDiffs ? 'border-t border-border/60 pt-2' : undefined} />
           ) : (
             <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               {t('agent.toolRunning')}
             </div>
+          )}
+          {isError && item.toolResult && (
+            <div className="text-xs text-destructive">{t('agent.toolFailed')}</div>
           )}
         </div>
       )}
@@ -133,7 +175,11 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
       ? 'ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-primary/10 px-3.5 py-2 text-sm leading-relaxed'
       : item.kind === 'assistant'
         ? 'w-full py-0.5'
-        : 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
+        : item.kind === 'thought'
+          ? 'w-full rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs'
+          : item.kind === 'plan'
+            ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
+            : 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
 
   return (
     <div className={cls}>
@@ -141,9 +187,68 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
         <ToolCard item={item} />
       ) : item.kind === 'assistant' ? (
         <Markdown content={item.content} />
+      ) : item.kind === 'thought' ? (
+        <ThoughtBubble content={item.content} />
+      ) : item.kind === 'plan' ? (
+        <PlanBubble entries={item.planEntries ?? []} />
       ) : (
         <div className="whitespace-pre-wrap">{item.content}</div>
       )}
     </div>
   );
 });
+
+/** 思考过程气泡：默认折叠（思考是低信噪过程信息），浅灰斜体小字。 */
+function ThoughtBubble({ content }: { content: string }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 text-xs italic text-muted-foreground"
+        aria-expanded={open}
+      >
+        <Brain className="h-3 w-3 shrink-0" />
+        {t('agent.thought')}
+        {open ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+      </button>
+      {open && (
+        <div className="mt-1 whitespace-pre-wrap italic text-muted-foreground">{content}</div>
+      )}
+    </div>
+  );
+}
+
+const PLAN_MARK: Record<string, { mark: string; cls: string }> = {
+  completed: { mark: '✓', cls: 'text-green-600' },
+  in_progress: { mark: '▶', cls: 'text-primary' },
+  pending: { mark: '○', cls: 'text-muted-foreground' },
+};
+
+/** 计划气泡：checklist 样式；新 plan 帧由 ChatStream 就地更新本气泡内容。 */
+function PlanBubble({ entries }: { entries: PlanEntryItem[] }) {
+  const { t } = useTranslation();
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        <ListChecks className="h-3.5 w-3.5" />
+        {t('agent.plan')}
+      </div>
+      <ul className="space-y-0.5">
+        {entries.map((e, i) => {
+          const mark = PLAN_MARK[e.status] ?? PLAN_MARK.pending;
+          return (
+            <li key={i} className="flex items-baseline gap-2 text-xs">
+              <span className={mark.cls}>{mark.mark}</span>
+              <span className={e.status === 'completed' ? 'text-muted-foreground line-through' : ''}>
+                {e.content}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
