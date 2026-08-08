@@ -1,3 +1,5 @@
+import type { PlanEntryItem, ToolDiff, ToolKind, ToolLocation } from '../components/agent/types';
+
 export interface LoginRequest {
   password: string;
 }
@@ -563,9 +565,29 @@ export interface AgentMessage {
 }
 
 export type AgentWsEvent =
-  | { type: 'assistant_chunk'; content?: string; final?: boolean }
-  | { type: 'tool_call'; id?: string; name?: string; args?: string }
-  | { type: 'tool_result'; id?: string; name?: string; result?: string }
+  | { type: 'assistant_chunk'; content?: string; final?: boolean; thought?: boolean }
+  | {
+      type: 'tool_call';
+      id?: string;
+      name?: string;
+      args?: string;
+      status?: 'pending' | 'in_progress' | 'completed' | 'failed';
+      tool_kind?: ToolKind;
+      diffs?: ToolDiff[];
+      locations?: ToolLocation[];
+    }
+  | {
+      type: 'tool_result';
+      id?: string;
+      name?: string;
+      result?: string;
+      status?: 'pending' | 'in_progress' | 'completed' | 'failed';
+      tool_kind?: ToolKind;
+      diffs?: ToolDiff[];
+      locations?: ToolLocation[];
+    }
+  | { type: 'plan'; entries?: PlanEntryItem[] }
+  | { type: 'usage'; used?: number; size?: number }
   | { type: 'status'; message?: string }
   | { type: 'done' }
   | { type: 'stopped' }
