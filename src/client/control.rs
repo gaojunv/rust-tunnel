@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +45,8 @@ pub struct ClientState {
     exec_cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     /// 长生命周期 agent 进程的 spawn 管理器（AgentSpawn* 消息）。
     spawn_manager: SpawnManager,
+    /// LLM 回环代理的 request_id → 响应接收端（AgentLlmProxy* 消息）。
+    llm_proxy_pending: crate::client::llm_proxy::PendingMap,
 }
 
 impl ClientState {
@@ -55,6 +57,7 @@ impl ClientState {
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             exec_cancels: Arc::new(Mutex::new(HashMap::new())),
             spawn_manager: SpawnManager::new(),
+            llm_proxy_pending: crate::client::llm_proxy::new_pending_map(),
         }
     }
 
@@ -337,7 +340,8 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                             let mgr = state.spawn_manager.clone();
                             let tx = state.control_sender.clone();
                             tokio::spawn(async move {
-                                mgr.handle_spawn(session_id, command, args, env, cwd, tx).await;
+                                mgr.handle_spawn(session_id, command, args, env, cwd, tx)
+                                    .await;
                             });
                         }
                     }
@@ -352,6 +356,26 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     }
                     ControlMessage::AgentSpawnData { stdin: false, .. } => {
                         warn!("client received unexpected server-stdout spawn data");
+                    }
+                    ControlMessage::AgentLlmProxyStart { session_id } => {
+                        let tx = state.control_sender.clone();
+                        let port = if state.config.enable_agent {
+                            crate::client::llm_proxy::serve(
+                                session_id.clone(),
+                                tx.clone(),
+                                state.llm_proxy_pending.clone(),
+                            )
+                            .await
+                            .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let _ = tx
+                            .send(ControlMessage::AgentLlmProxyReady { session_id, port })
+                            .await;
+                    }
+                    ControlMessage::AgentLlmProxyChunk { .. } => {
+                        crate::client::llm_proxy::route_chunk(&state.llm_proxy_pending, &msg).await;
                     }
                     ControlMessage::Disconnect { reason } => {
                         info!("Server requested disconnect: {}", reason);
@@ -878,6 +902,76 @@ mod tests {
                 }
             }
             other => panic!("expected AgentExecResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_llm_proxy_start_disabled() {
+        // enable_agent=false 时收到 AgentLlmProxyStart → 回 AgentLlmProxyReady { port: 0 }
+        let state = create_test_state();
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState {
+            control_sender: tx,
+            ..state
+        };
+
+        let mut buffer = Vec::new();
+        ControlMessage::AgentLlmProxyStart {
+            session_id: "s1".into(),
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        match msg {
+            ControlMessage::AgentLlmProxyReady { session_id, port } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(port, 0);
+            }
+            other => panic!("expected AgentLlmProxyReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_llm_proxy_start_enabled() {
+        // enable_agent=true 时启动回环代理并回真实端口（>0）
+        let config = ClientConfig {
+            enable_agent: true,
+            ..create_test_state().config
+        };
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState::new(config, tx);
+
+        let mut buffer = Vec::new();
+        ControlMessage::AgentLlmProxyStart {
+            session_id: "s2".into(),
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state).await;
+        assert!(result.is_ok());
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        match msg {
+            ControlMessage::AgentLlmProxyReady { session_id, port } => {
+                assert_eq!(session_id, "s2");
+                assert!(port > 0);
+            }
+            other => panic!("expected AgentLlmProxyReady, got {other:?}"),
         }
     }
 

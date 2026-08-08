@@ -35,13 +35,27 @@ pub struct MeshServiceDef {
 /// A command the AI agent asks a client to execute (server -> client)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AgentCommand {
-    Shell { cmd: String, cwd: Option<String> },
-    ReadFile { path: String },
-    WriteFile { path: String, content: String },
-    ListDir { path: String },
+    Shell {
+        cmd: String,
+        cwd: Option<String>,
+    },
+    ReadFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    ListDir {
+        path: String,
+    },
     GitStatus,
-    GitDiff { path: Option<String> },
-    GitCommit { message: String },
+    GitDiff {
+        path: Option<String>,
+    },
+    GitCommit {
+        message: String,
+    },
     GitPush,
     /// 在工作区内搜索文件内容（字面量子串匹配），返回 path:line:content 列表
     Search {
@@ -185,9 +199,7 @@ pub enum ControlMessage {
     },
     /// Server asks an agent-capable client to kill the running exec for a
     /// request (真取消：停止回合时杀掉内网侧正在执行的命令)。
-    AgentExecCancel {
-        request_id: String,
-    },
+    AgentExecCancel { request_id: String },
     /// Server asks client to spawn a long-lived agent/LLM-proxy process.
     /// stdio flows via AgentSpawnData; process exit reported via AgentSpawnExit.
     AgentSpawnRequest {
@@ -232,6 +244,11 @@ pub enum ControlMessage {
         done: bool,
         status: u16,
     },
+    /// Server asks client to start the embedded LLM loop proxy for a session.
+    /// Client reports the bound loopback port via AgentLlmProxyReady.
+    AgentLlmProxyStart { session_id: String },
+    /// Client reports the bound loopback port (0 = failure)
+    AgentLlmProxyReady { session_id: String, port: u16 },
 }
 
 impl ControlMessage {
@@ -876,7 +893,13 @@ mod tests {
         let encoded = bincode::serialize(&req).unwrap();
         let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            ControlMessage::AgentSpawnRequest { session_id, command, args, env, cwd } => {
+            ControlMessage::AgentSpawnRequest {
+                session_id,
+                command,
+                args,
+                env,
+                cwd,
+            } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(command, "gemini");
                 assert_eq!(args, vec!["--experimental-acp"]);
@@ -893,12 +916,21 @@ mod tests {
         };
         let encoded = bincode::serialize(&data).unwrap();
         let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
-        assert!(matches!(decoded, ControlMessage::AgentSpawnData { stdin: false, .. }));
+        assert!(matches!(
+            decoded,
+            ControlMessage::AgentSpawnData { stdin: false, .. }
+        ));
 
-        let exit = ControlMessage::AgentSpawnExit { session_id: "sess-1".into(), code: Some(0) };
+        let exit = ControlMessage::AgentSpawnExit {
+            session_id: "sess-1".into(),
+            code: Some(0),
+        };
         let encoded = bincode::serialize(&exit).unwrap();
         let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
-        assert!(matches!(decoded, ControlMessage::AgentSpawnExit { code: Some(0), .. }));
+        assert!(matches!(
+            decoded,
+            ControlMessage::AgentSpawnExit { code: Some(0), .. }
+        ));
     }
 
     #[test]
@@ -912,7 +944,9 @@ mod tests {
         let encoded = bincode::serialize(&req).unwrap();
         let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            ControlMessage::AgentLlmProxyRequest { request_id, path, .. } => {
+            ControlMessage::AgentLlmProxyRequest {
+                request_id, path, ..
+            } => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(path, "/v1/chat/completions");
             }
@@ -927,6 +961,34 @@ mod tests {
         };
         let encoded = bincode::serialize(&chunk).unwrap();
         let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
-        assert!(matches!(decoded, ControlMessage::AgentLlmProxyChunk { done: false, status: 200, .. }));
+        assert!(matches!(
+            decoded,
+            ControlMessage::AgentLlmProxyChunk {
+                done: false,
+                status: 200,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_agent_llm_proxy_start_roundtrip() {
+        let start = ControlMessage::AgentLlmProxyStart {
+            session_id: "s1".into(),
+        };
+        let encoded = bincode::serialize(&start).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        assert!(matches!(decoded, ControlMessage::AgentLlmProxyStart { .. }));
+
+        let ready = ControlMessage::AgentLlmProxyReady {
+            session_id: "s1".into(),
+            port: 45678,
+        };
+        let encoded = bincode::serialize(&ready).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            ControlMessage::AgentLlmProxyReady { port, .. } => assert_eq!(port, 45678),
+            other => panic!("expected AgentLlmProxyReady, got {other:?}"),
+        }
     }
 }
