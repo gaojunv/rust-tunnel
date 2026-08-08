@@ -305,7 +305,8 @@ impl AcpBridge {
                 .await?;
             // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线；
             // ws_tx 由连接任务的处理器每次事件从会话条目动态解析，无需传入）
-            self.acp_handshake(session_id).await
+            let root_path = workspace.root_path.clone();
+            self.acp_handshake(session_id, &root_path).await
         }
         .await;
         if outcome.is_err() {
@@ -328,7 +329,7 @@ impl AcpBridge {
     /// 注意：`agent_client_protocol::Client` 是角色标记（unit struct），并非
     /// 连接句柄；连接句柄是 `ConnectionTo<Agent>`。每 session 一条专用连接，
     /// 通知无需按 session id 过滤。
-    async fn acp_handshake(&self, session_id: &str) -> Result<(), String> {
+    async fn acp_handshake(&self, session_id: &str, cwd: &str) -> Result<(), String> {
         // 取走 duplex 的 ACP 端（占用即移除；后续 kill 不再持有）。
         let agent_io = {
             let mut sessions = self.sessions.lock().await;
@@ -341,6 +342,7 @@ impl AcpBridge {
         };
 
         let sid = session_id.to_string();
+        let cwd = cwd.to_string();
         let approval = self.approval.clone();
         let sessions = self.sessions.clone();
         let (setup_tx, setup_rx) = oneshot::channel();
@@ -502,7 +504,7 @@ impl AcpBridge {
                                 .block_task()
                                 .await?;
                             let new_session = cx
-                                .send_request(NewSessionRequest::new("."))
+                                .send_request(NewSessionRequest::new(&cwd))
                                 .block_task()
                                 .await?;
                             let acp_session_id = new_session.session_id.clone();
@@ -1041,7 +1043,7 @@ mod tests {
         tokio::spawn(mock_acp_agent(control_rx, stdout_tx));
 
         bridge
-            .acp_handshake("sess-1")
+            .acp_handshake("sess-1", "/mock")
             .await
             .expect("handshake should complete");
     }
