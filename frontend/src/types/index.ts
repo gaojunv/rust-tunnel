@@ -571,7 +571,7 @@ export type AgentWsEvent =
       id?: string;
       name?: string;
       args?: string;
-      status?: 'pending' | 'in_progress' | 'completed' | 'failed';
+      status?: 'pending' | 'in_progress' | 'running' | 'completed' | 'failed';
       tool_kind?: ToolKind;
       diffs?: ToolDiff[];
       locations?: ToolLocation[];
@@ -581,7 +581,7 @@ export type AgentWsEvent =
       id?: string;
       name?: string;
       result?: string;
-      status?: 'pending' | 'in_progress' | 'completed' | 'failed';
+      status?: 'pending' | 'in_progress' | 'running' | 'completed' | 'failed';
       tool_kind?: ToolKind;
       diffs?: ToolDiff[];
       locations?: ToolLocation[];

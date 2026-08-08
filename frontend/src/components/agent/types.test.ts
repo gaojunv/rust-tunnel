@@ -23,6 +23,10 @@ describe('parseAcpToolJson', () => {
     expect(parseAcpToolJson(JSON.stringify([{ tool_kind: 'teleport' }]))).toEqual({});
   });
 
+  it('tolerates null diffs/locations as backend persists them', () => {
+    expect(parseAcpToolJson(JSON.stringify([{ id: 'c1', name: 'Edit', diffs: null, locations: null }]))).toEqual({});
+  });
+
   it('returns empty object on malformed json / old runner format', () => {
     expect(parseAcpToolJson('not json')).toEqual({});
     // runner 旧格式：function.arguments 嵌套，无 tool_kind → 不报错

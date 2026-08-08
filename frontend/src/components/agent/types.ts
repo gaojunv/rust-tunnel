@@ -8,7 +8,7 @@ export interface ChatItem {
   /** ACP 工具分类（图标/详情渲染依据）；runner 旧数据无此字段 */
   toolKind?: ToolKind;
   /** 工具执行状态：缺省（旧帧/历史 runner 数据）按 result 有无推断 */
-  toolStatus?: 'pending' | 'in_progress' | 'completed' | 'failed';
+  toolStatus?: 'pending' | 'in_progress' | 'running' | 'completed' | 'failed';
   /** 文件修改 diff（edit/delete/move 类工具） */
   toolDiffs?: ToolDiff[];
   /** 涉及的文件位置 */
