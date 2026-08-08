@@ -134,13 +134,14 @@ embed-frontend = ["rust-embed"]
 # 12 个集成测试二进制的磁盘/链接/加载开销同步下降。
 [profile.test]
 debug = 1            # 保留行号（够 panic 回溯用），丢弃局部变量 debuginfo
+opt-level = 1
 incremental = false  # 测试一次性编译，增量缓存反而拖慢且占磁盘
 
 # qdrant-edge 单 crate 编译峰值 ~3GB（来自其内嵌 SIMD/量化代码生成），
 # 是 cargo test OOM(SIGKILL) 的主因。opt-level=1 保证基础内联避免运行时过慢；
 # 真正的并行限制在 .cargo/config.toml 的 jobs=2。
-[profile.dev.package.qdrant-edge]
-opt-level = 1
+[profile.dev]
+opt-level = 0
 debug = 1
 
 [dev-dependencies]
