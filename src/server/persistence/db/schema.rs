@@ -926,3 +926,62 @@ impl Database {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Task 7：v3 迁移把 ACP 三列落到 agent_workspaces 后，直接 INSERT 新列应成功
+    /// （证明列存在且约束正确：agent_type NOT NULL 默认空串、后两列可空）。
+    #[tokio::test]
+    async fn test_migrate_agent_workspaces_v3() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO agent_workspaces
+                (id, name, client_id, runtime_type, root_path, agent_type, agent_path, llm_model_id)
+             VALUES ('w1', 'test', 'c1', 'host', '/tmp', 'gemini', '/opt/acp-agent', 'm1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 幂等：再次跑迁移不报错（列已存在，跳过 ALTER）
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT agent_type, agent_path, llm_model_id FROM agent_workspaces WHERE id = 'w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "gemini");
+        assert_eq!(row.1.as_deref(), Some("/opt/acp-agent"));
+        assert_eq!(row.2.as_deref(), Some("m1"));
+    }
+
+    /// 未显式提供 agent_type 时走列默认空串，INSERT 仍应成功（NOT NULL 约束满足）。
+    #[tokio::test]
+    async fn test_agent_workspaces_default_agent_type() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path)
+             VALUES ('w2', 'test', 'c1', 'host', '/tmp')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let agent_type: String =
+            sqlx::query_scalar("SELECT agent_type FROM agent_workspaces WHERE id = 'w2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(agent_type, "");
+    }
+}

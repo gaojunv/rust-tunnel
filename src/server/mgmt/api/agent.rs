@@ -938,6 +938,10 @@ pub async fn create_workspace(
             &body.root_path,
             body.docker_image.as_deref(),
             body.docker_container_id.as_deref(),
+            // ACP 字段由 Task 8 的请求 DTO 接入，当前占位：空 agent_type、无 path/model
+            "",
+            None,
+            None,
         )
         .await
     {
@@ -995,6 +999,10 @@ pub async fn update_workspace(
             &body.root_path,
             system_prompt,
             body.approval_mode.as_deref(),
+            // ACP 字段由 Task 8 的请求 DTO 接入，当前占位 None（COALESCE 保持原值）
+            None,
+            None,
+            None,
         )
         .await
     {
@@ -1551,7 +1559,7 @@ mod tests {
         // 评审 Finding 3：session/workspace「不存在」是 Ok(None)（可回退 runner），
         // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1646,7 +1654,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
 
@@ -1677,7 +1685,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model_endpoint() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1729,7 +1737,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_session_model_applies_patched_model() {
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -1775,7 +1783,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_workspace_files_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
@@ -1831,7 +1839,7 @@ mod tests {
     #[tokio::test]
     async fn test_fs_endpoints_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         // 客户端离线：所有面板端点统一 503（前端据此显示「客户端离线」而非空态）。
@@ -1873,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn test_fs_file_requires_path() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         let resp = get_fs_file(
@@ -1889,7 +1897,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_safe_mode_needs_approval_409() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         // 默认 approval_mode = safe：WriteFile 需确认。未确认 → 409 needs_approval，
@@ -1930,10 +1938,10 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_full_auto_skips_approval() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
-        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"))
+        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"), None, None, None)
             .await
             .unwrap();
         // full_auto：未确认也直接放行 → 客户端离线 503（而非 409）。

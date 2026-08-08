@@ -451,12 +451,24 @@ async fn setup_approval_env(
         &root_str,
         None,
         None,
+        "",
+        None,
+        None,
     )
     .await
     .expect("create workspace");
-    db.agent_update_workspace("ws-approval-e2e", "approval-e2e", &root_str, None, Some("safe"))
-        .await
-        .expect("set approval_mode=safe");
+    db.agent_update_workspace(
+        "ws-approval-e2e",
+        "approval-e2e",
+        &root_str,
+        None,
+        Some("safe"),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("set approval_mode=safe");
     let session_id = "sess-approval-e2e";
     db.agent_create_session(session_id, "ws-approval-e2e", None, Some("approval-model"))
         .await
@@ -762,6 +774,9 @@ async fn setup_text_turn_env(
         client_name,
         "host",
         &root_str,
+        None,
+        None,
+        "",
         None,
         None,
     )

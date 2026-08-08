@@ -361,7 +361,7 @@ mod tests {
         // 重插 kept 行同秒靠 rowid（自增）保证先后。故 DB 顺序恒为 [旧 kept, summary,
         // 重插 kept]，load 从最后一个 summary 起重放即可命中保留段。
         let db = crate::server::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -409,7 +409,7 @@ mod tests {
         // 重放丢失整段（红）；修复后 DB 物理顺序 [..., summary, kept...]，重连/
         // 刷新后 kept 段完整重放。
         let db = crate::server::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("big-model"))

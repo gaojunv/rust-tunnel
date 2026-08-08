@@ -194,7 +194,7 @@ mod tests {
     /// 造 session → workspace(llm_model_id) → model → provider 全链路。
     /// provider api key 用明文（测试不配 cipher）。
     async fn seed_configured_session(db: &Database, session_id: &str, model_id: &str) {
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_set_workspace_llm_model_id("w1", model_id)
@@ -251,7 +251,7 @@ mod tests {
     async fn test_forward_workspace_without_model_id_returns_502_done() {
         // workspace 存在但 llm_model_id 为空 → 502 done
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None, "", None, None)
             .await
             .unwrap();
         db.agent_create_session("sess-1", "w1", None, None)
