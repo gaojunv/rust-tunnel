@@ -176,12 +176,20 @@ async fn handle_client_connection(
                         );
                     }
                 }
-                // spawn stdio / LLM 请求代理：Task 5 转交 AgentState，本 Task 先留占位
+                // spawn stdio / LLM 请求代理：转交 AgentState 的 AcpBridge 路由
+                // （AgentSpawnData → ACP stdio pump，AgentSpawnExit → 进程退出
+                // 标记，AgentLlmProxyRequest → 服务端 LLM 网关转发）。
                 m @ (ControlMessage::AgentSpawnData { .. }
                 | ControlMessage::AgentSpawnExit { .. }
                 | ControlMessage::AgentLlmProxyRequest { .. }) => {
+                    if let Some(agent) = &state.agent_state {
+                        if let Some(bridge) = &agent.acp_bridge {
+                            bridge.handle_client_msg(&entry.name, m).await;
+                            continue;
+                        }
+                    }
                     debug!(
-                        "spawn/llm-proxy msg from client '{}' (Task 5 wiring): {:?}",
+                        "spawn/llm-proxy msg from client '{}' but no acp bridge: {:?}",
                         entry.name, m
                     );
                 }

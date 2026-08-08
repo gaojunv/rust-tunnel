@@ -1,8 +1,11 @@
 //! AI agent workbench: server-side agent loop, tool execution over tunnel.
 
+pub mod acp_bridge;
+pub mod acp_events;
 pub mod approval;
 pub mod compact;
 pub mod executor;
+pub mod llm_bridge;
 pub mod runner;
 pub mod session;
 pub mod spawner;
@@ -16,6 +19,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::server::client_registry::ClientRegistry;
 use crate::server::db::Database;
+
+use self::acp_bridge::AcpBridge;
+use self::spawner::AgentSpawner;
 
 /// 挂起的审批请求表：`request_id` → (工具名, 唤醒 `sender`)。别名化避免
 /// `clippy::type_complexity` 在多层嵌套字段上触发。
@@ -74,10 +80,15 @@ pub struct AgentState {
     /// 进行中的 exec：workspace_id → request_id。WS cancel/断连时据此把取消
     /// 信号下发到客户端。锁短持有（仅索引），与 workspace_locks 分离。
     exec_inflight: Arc<Mutex<HashMap<String, String>>>,
+    /// ACP 远程 agent 会话桥（配置了 agent_type 的 workspace 走 ACP 路径）。
+    /// 惰性 spawn + 事件映射 + LLM 代理路由；控制循环的 AgentSpawnData/Exit、
+    /// AgentLlmProxyRequest 经它路由。
+    pub acp_bridge: Option<AcpBridge>,
 }
 
 impl AgentState {
     pub fn new(registry: ClientRegistry, db: Database) -> Self {
+        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone());
         Self {
             registry,
             db,
@@ -86,6 +97,7 @@ impl AgentState {
             approvals: Arc::new(Mutex::new(HashMap::new())),
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
+            acp_bridge: Some(bridge),
         }
     }
 

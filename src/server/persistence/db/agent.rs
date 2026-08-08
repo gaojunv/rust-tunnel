@@ -12,6 +12,19 @@ pub struct AgentWorkspaceRecord {
     pub docker_container_id: Option<String>,
     pub approval_mode: String,
     pub system_prompt: Option<String>,
+    // TODO(Task 7): ACP 远程 agent 字段。列已在 Task 5 的迁移
+    // `migrate_agent_workspaces_v3`（schema.rs）落地；本 Task 加结构字段，
+    // 创建/更新 SQL 的正式写入口（agent_create/update_workspace 支持新字段）
+    // 留给 Task 7。`#[sqlx(default)]` 保证旧库未跑 v3 迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub agent_type: String,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub llm_model_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -275,6 +288,27 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试专用：给 workspace 补写 llm_model_id（正式 CRUD 写入口随 Task 7
+    /// 提供）。llm_bridge 测试用它构造已配置链路。
+    #[cfg(test)]
+    impl Database {
+        pub(crate) async fn agent_set_workspace_llm_model_id(
+            &self,
+            id: &str,
+            model_id: &str,
+        ) -> Result<(), sqlx::Error> {
+            sqlx::query(
+                "UPDATE agent_workspaces SET llm_model_id = ?, updated_at = datetime('now') \
+                 WHERE id = ?",
+            )
+            .bind(model_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_workspace_crud() {

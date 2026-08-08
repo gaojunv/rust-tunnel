@@ -261,6 +261,17 @@ impl Database {
         .await
     }
 
+    /// 按 id 取单个模型记录（llm_bridge 解析 workspace 的 llm_model_id 用）。
+    pub async fn llm_get_model(
+        &self,
+        id: &str,
+    ) -> Result<Option<LlmModelRecord>, sqlx::Error> {
+        sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     pub async fn llm_find_model_by_name_or_alias(
         &self,
         name_or_alias: &str,

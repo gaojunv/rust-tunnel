@@ -35,6 +35,7 @@ pub fn agent_env(port: u16) -> Vec<(String, String)> {
     ]
 }
 
+#[derive(Clone)]
 pub struct AgentSpawner {
     registry: ClientRegistry,
 }
@@ -109,6 +110,18 @@ impl AgentSpawner {
             }
             other => Err(format!("unexpected response: {other:?}")),
         }
+    }
+
+    /// 取某客户端控制通道的 sender（AcpBridge 回发 AgentLlmProxyChunk 用）。
+    /// 客户端离线返回 None。
+    pub async fn client_control_sender(
+        &self,
+        client_id: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::common::ControlMessage>> {
+        self.registry
+            .get(client_id)
+            .await
+            .map(|entry| entry.control_sender.clone())
     }
 }
 

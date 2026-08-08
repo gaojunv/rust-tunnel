@@ -659,6 +659,7 @@ impl Database {
 
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
+        Self::migrate_agent_workspaces_v3(pool).await?;
 
         Ok(())
     }
@@ -700,6 +701,36 @@ impl Database {
             (
                 "system_prompt",
                 "ALTER TABLE agent_workspaces ADD COLUMN system_prompt TEXT",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_workspaces migration: column already exists");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_workspaces 补全 ACP 远程 agent 列（agent_type/agent_path/llm_model_id）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_workspaces_v3(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "agent_type",
+                "ALTER TABLE agent_workspaces ADD COLUMN agent_type TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "agent_path",
+                "ALTER TABLE agent_workspaces ADD COLUMN agent_path TEXT",
+            ),
+            (
+                "llm_model_id",
+                "ALTER TABLE agent_workspaces ADD COLUMN llm_model_id TEXT",
             ),
         ] {
             match sqlx::query(ddl).execute(pool).await {

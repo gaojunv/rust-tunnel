@@ -123,6 +123,9 @@ base64 = "0.22"
 urlencoding = "2.1"
 trust-dns-resolver = "0.23"
 
+# ACP (Agent Client Protocol) — agent-client-protocol crate
+agent-client-protocol = "2"
+
 [features]
 embed-frontend = ["rust-embed"]
 
