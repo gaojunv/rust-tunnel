@@ -530,6 +530,12 @@ export interface AgentWorkspace {
   docker_container_id?: string;
   approval_mode: 'safe' | 'auto_write' | 'full_auto';
   system_prompt: string | null;
+  /** ACP 远程 agent 引擎：空串（缺省）= 内置 runner；非空 = gemini/claude-code/opencode */
+  agent_type?: '' | 'gemini' | 'claude-code' | 'opencode';
+  /** ACP agent 可执行文件路径；缺省依赖 PATH 查找 */
+  agent_path?: string;
+  /** workspace 默认 LLM 模型 id（llm_models.id） */
+  llm_model_id?: string;
   created_at: string;
   updated_at: string;
 }

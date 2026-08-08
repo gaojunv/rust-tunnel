@@ -16,12 +16,13 @@ import {
   clientsApi,
   createAgentWorkspace,
   getApiErrorMessage,
+  listAllLlmModels,
   updateAgentWorkspace,
 } from '@/api/client';
-import type { AgentWorkspace, Client } from '@/types';
+import type { AgentWorkspace, Client, LlmModel } from '@/types';
 
 interface Props {
-  /** 传入则为编辑模式：仅可改 name/root_path/system_prompt/approval_mode，client/运行时不可变 */
+  /** 传入则为编辑模式：仅可改 name/root_path/system_prompt/approval_mode 及 ACP 字段（client/运行时不可变） */
   editing?: AgentWorkspace;
   onClose: () => void;
   onCreated: (w: AgentWorkspace) => void;
@@ -34,6 +35,11 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     queryKey: ['clients'],
     queryFn: clientsApi.list,
   });
+  // LLM 模型下拉数据源（workspace llm_model_id 存 llm_models.id，需用全量列表而非 alias）
+  const { data: models } = useQuery<LlmModel[]>({
+    queryKey: ['llm-models', 'all'],
+    queryFn: listAllLlmModels,
+  });
 
   const [name, setName] = useState(editing?.name ?? '');
   const [clientId, setClientId] = useState(editing?.client_id ?? '');
@@ -45,6 +51,12 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     editing?.approval_mode ?? 'safe',
   );
   const [systemPrompt, setSystemPrompt] = useState(editing?.system_prompt ?? '');
+  // ACP 远程 agent 引擎：空串 = 内置 runner；非空 = gemini/claude-code/opencode
+  const [agentType, setAgentType] = useState<AgentWorkspace['agent_type']>(
+    editing?.agent_type ?? '',
+  );
+  const [agentPath, setAgentPath] = useState(editing?.agent_path ?? '');
+  const [llmModelId, setLlmModelId] = useState(editing?.llm_model_id ?? '');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 新建流程 create 成功后、补写 PUT 失败时记录已创建的工作区：用户点「创建」重试
@@ -66,12 +78,17 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
       let w: AgentWorkspace;
       if (editing) {
         // 编辑：PUT 必须带上完整 name/root_path/system_prompt（空串即清除，缺省会被
-        // 后端当作「未设置」而不是「清空」，形成缺省即清除陷阱）。
+        // 后端当作「未设置」而不是「清空」，形成缺省即清除陷阱）。agent_type 总是发送
+        // （空串 = 内置 runner）；agent_path/llm_model_id 仅非空时发送（后端 None=保持
+        // 原值，本迭代不支持清空）。
         await updateAgentWorkspace(editing.id, {
           name: name.trim(),
           root_path: rootPath.trim(),
           system_prompt: systemPrompt.trim(),
           approval_mode: approvalMode,
+          agent_type: agentType,
+          ...(agentPath.trim() !== '' ? { agent_path: agentPath.trim() } : {}),
+          ...(llmModelId !== '' ? { llm_model_id: llmModelId } : {}),
         });
         w = {
           ...editing,
@@ -79,6 +96,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           root_path: rootPath.trim(),
           system_prompt: systemPrompt.trim() || null,
           approval_mode: approvalMode,
+          agent_type: agentType,
+          agent_path: agentPath.trim() !== '' ? agentPath.trim() : undefined,
+          llm_model_id: llmModelId !== '' ? llmModelId : undefined,
         };
       } else {
         w = createdRef.current ?? (await createAgentWorkspace({
@@ -88,6 +108,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           root_path: rootPath.trim(),
           docker_image: runtimeType === 'docker' ? dockerImage.trim() : undefined,
           docker_container_id: runtimeType === 'docker' ? dockerContainerId.trim() : undefined,
+          agent_type: agentType,
+          ...(agentPath.trim() !== '' ? { agent_path: agentPath.trim() } : {}),
+          ...(llmModelId !== '' ? { llm_model_id: llmModelId } : {}),
         }));
         createdRef.current = w;
         // 后端 create 不含 system_prompt/approval_mode 字段（仅在 PUT 支持），
@@ -138,6 +161,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                   value={clientId}
                   onChange={(e) => setClientId(e.target.value)}
                   disabled={isLoading}
+                  aria-label={t('agent.client')}
                   className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <option value="">
@@ -182,6 +206,53 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
               placeholder={runtimeType === 'host' ? t('agent.rootPathPlaceholderHost') : t('agent.rootPathPlaceholderDocker')}
             />
           </div>
+          <div className="space-y-2">
+            <Label>{t('agent.agentEngine')}</Label>
+            <select
+              value={agentType}
+              onChange={(e) => setAgentType(e.target.value as AgentWorkspace['agent_type'])}
+              aria-label={t('agent.agentEngine')}
+              className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            >
+              <option value="">{t('agent.agentEngineBuiltin')}</option>
+              <option value="gemini">Gemini</option>
+              <option value="claude-code">Claude Code</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+            {runtimeType === 'docker' && agentType !== '' && (
+              <p className="text-xs text-destructive">{t('agent.acpDockerUnsupportedHint')}</p>
+            )}
+          </div>
+          {agentType !== '' && (
+            <>
+              <div className="space-y-2">
+                <Label>{t('agent.agentPath')}</Label>
+                <Input
+                  value={agentPath}
+                  onChange={(e) => setAgentPath(e.target.value)}
+                  placeholder={t('agent.agentPathPlaceholder')}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('agent.workspaceLlmModel')}</Label>
+                <select
+                  value={llmModelId}
+                  onChange={(e) => setLlmModelId(e.target.value)}
+                  aria-label={t('agent.workspaceLlmModel')}
+                  className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                >
+                  <option value="">{t('agent.selectModel')}</option>
+                  {(models ?? [])
+                    .filter((m) => m.enabled)
+                    .map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.alias || m.model_name}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            </>
+          )}
           <div className="space-y-2">
             <Label>{t('agent.approvalMode')}</Label>
             <div className="space-y-1.5">

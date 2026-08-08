@@ -28,6 +28,16 @@ pub struct CreateWorkspaceRequest {
     /// Pre-started container to `docker exec` into. MVP: container lifecycle is
     /// out of scope — the user must start the container and supply its id here.
     pub docker_container_id: Option<String>,
+    /// ACP 远程 agent 引擎：空串（缺省，向后兼容）为内置 runner；非空取
+    /// `gemini` / `claude-code` / `opencode`（见 `spawner::agent_command`）。
+    #[serde(default)]
+    pub agent_type: String,
+    /// ACP agent 可执行文件路径；缺省 None 时依赖 PATH 查找。
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    /// workspace 默认 LLM 模型 id（`llm_models.id`，ACP 会话启动时必需）。
+    #[serde(default)]
+    pub llm_model_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +46,19 @@ pub struct UpdateWorkspaceRequest {
     pub root_path: String,
     pub system_prompt: Option<String>,
     pub approval_mode: Option<String>,
+    /// ACP 字段，COALESCE 语义：缺省 None 保持原值。`agent_type` 空串表示切回内置
+    /// runner；`agent_path`/`llm_model_id` 空串视为忽略（本迭代不支持清空）。
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    #[serde(default)]
+    pub llm_model_id: Option<String>,
+}
+
+/// 校验 agent_type：空串（内置 runner）或受支持的 ACP 引擎。
+fn validate_agent_type(agent_type: &str) -> bool {
+    matches!(agent_type, "" | "gemini" | "claude-code" | "opencode")
 }
 
 #[derive(Debug, Deserialize)]
@@ -924,9 +947,19 @@ pub async fn create_workspace(
         )
             .into_response();
     }
+    if !validate_agent_type(&body.agent_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "agent_type must be '' | gemini | claude-code | opencode",
+        )
+            .into_response();
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // 可选 ACP 字段的空串归一化为 None：存储保持 NULL 而非空串。
+    let agent_path = body.agent_path.as_deref().filter(|s| !s.is_empty());
+    let llm_model_id = body.llm_model_id.as_deref().filter(|s| !s.is_empty());
     let id = new_id();
     match agent
         .db
@@ -938,10 +971,9 @@ pub async fn create_workspace(
             &body.root_path,
             body.docker_image.as_deref(),
             body.docker_container_id.as_deref(),
-            // ACP 字段由 Task 8 的请求 DTO 接入，当前占位：空 agent_type、无 path/model
-            "",
-            None,
-            None,
+            &body.agent_type,
+            agent_path,
+            llm_model_id,
         )
         .await
     {
@@ -982,6 +1014,16 @@ pub async fn update_workspace(
                 .into_response();
         }
     }
+    // agent_type 校验：空串合法（切回内置 runner），非法引擎拒绝
+    if let Some(t) = body.agent_type.as_deref() {
+        if !validate_agent_type(t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "agent_type must be '' | gemini | claude-code | opencode",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -991,6 +1033,10 @@ pub async fn update_workspace(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // ACP 字段 COALESCE 语义：None 保持原值；agent_type 空串合法（回到内置 runner）；
+    // agent_path/llm_model_id 空串归一化为 None（本迭代不支持清空，见 Task 8 brief）。
+    let agent_path = body.agent_path.as_deref().filter(|s| !s.is_empty());
+    let llm_model_id = body.llm_model_id.as_deref().filter(|s| !s.is_empty());
     match agent
         .db
         .agent_update_workspace(
@@ -999,10 +1045,9 @@ pub async fn update_workspace(
             &body.root_path,
             system_prompt,
             body.approval_mode.as_deref(),
-            // ACP 字段由 Task 8 的请求 DTO 接入，当前占位 None（COALESCE 保持原值）
-            None,
-            None,
-            None,
+            body.agent_type.as_deref(),
+            agent_path,
+            llm_model_id,
         )
         .await
     {
@@ -1596,6 +1641,9 @@ mod tests {
                 root_path: "/home/u/proj".into(),
                 docker_image: None,
                 docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
             }),
         )
         .await
@@ -1618,6 +1666,9 @@ mod tests {
                 root_path: "/p".into(),
                 docker_image: None,
                 docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
             }),
         )
         .await
@@ -1637,6 +1688,9 @@ mod tests {
                 root_path: "/container/work".into(),
                 docker_image: Some("node:20".into()),
                 docker_container_id: Some("dev-ctr".into()),
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
             }),
         )
         .await
@@ -1649,6 +1703,159 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["runtime_type"], "docker");
         assert_eq!(json["docker_container_id"], "dev-ctr");
+    }
+
+    #[test]
+    fn test_create_workspace_request_missing_acp_fields_defaults() {
+        // 向后兼容：旧前端不发送 ACP 字段 → serde default 填充 agent_type=''、
+        // agent_path/llm_model_id=None（自研 runner 路径）。
+        let body: CreateWorkspaceRequest = serde_json::from_str(
+            r#"{"name":"p","client_id":"nas","runtime_type":"host","root_path":"/p"}"#,
+        )
+        .unwrap();
+        assert_eq!(body.agent_type, "");
+        assert_eq!(body.agent_path, None);
+        assert_eq!(body.llm_model_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_persists_acp_fields() {
+        let (state, _db) = test_state().await;
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "acp-proj".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: "gemini".into(),
+                agent_path: Some("/opt/gemini".into()),
+                llm_model_id: Some("model-1".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 响应体回读 ACP 字段
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["agent_type"], "gemini");
+        assert_eq!(json["agent_path"], "/opt/gemini");
+        assert_eq!(json["llm_model_id"], "model-1");
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_rejects_invalid_agent_type() {
+        let (state, _db) = test_state().await;
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "x".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: "cursor".into(),
+                agent_path: None,
+                llm_model_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_acp_fields() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+            .await
+            .unwrap();
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: Some("gemini".into()),
+                agent_path: Some("/opt/gemini".into()),
+                llm_model_id: Some("model-1".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_type, "gemini");
+        assert_eq!(ws.agent_path.as_deref(), Some("/opt/gemini"));
+        assert_eq!(ws.llm_model_id.as_deref(), Some("model-1"));
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_absent_acp_fields_keep_existing() {
+        // COALESCE 语义：缺省 ACP 字段（None）保持原值；agent_path/llm_model_id
+        // 空串归一化为 None → 同样保持原值（本迭代不支持清空，见 brief）。
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "gemini", Some("/opt/gemini"),
+            Some("model-1"),
+        )
+        .await
+        .unwrap();
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: Some("".into()),
+                llm_model_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_type, "gemini");
+        assert_eq!(ws.agent_path.as_deref(), Some("/opt/gemini"));
+        assert_eq!(ws.llm_model_id.as_deref(), Some("model-1"));
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_clears_agent_type_to_builtin() {
+        // agent_type 空串合法：从 ACP 引擎切回内置 runner（与 path/model 不同，可清空）。
+        let (state, db) = test_state().await;
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "gemini", None, None)
+            .await
+            .unwrap();
+        let resp = update_workspace(
+            State(state),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: Some("".into()),
+                agent_path: None,
+                llm_model_id: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_type, "");
     }
 
     #[tokio::test]

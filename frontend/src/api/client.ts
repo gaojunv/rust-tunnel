@@ -549,6 +549,9 @@ export async function createAgentWorkspace(body: {
   root_path: string;
   docker_image?: string;
   docker_container_id?: string;
+  agent_type?: string;
+  agent_path?: string;
+  llm_model_id?: string;
 }): Promise<AgentWorkspace> {
   const { data } = await api.post('/agent/workspaces', body);
   return data;
@@ -560,7 +563,15 @@ export async function deleteAgentWorkspace(id: string): Promise<void> {
 
 export const updateAgentWorkspace = (
   id: string,
-  body: { name: string; root_path: string; system_prompt?: string; approval_mode?: string },
+  body: {
+    name: string;
+    root_path: string;
+    system_prompt?: string;
+    approval_mode?: string;
+    agent_type?: string;
+    agent_path?: string;
+    llm_model_id?: string;
+  },
 ) => api.put(`/agent/workspaces/${id}`, body);
 
 export const listWorkspaceFiles = (workspaceId: string, q: string) =>
