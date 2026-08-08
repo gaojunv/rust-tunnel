@@ -5,35 +5,50 @@
 //! 纯函数、无 I/O：单独文件便于单测（用 `serde_json::from_value` 构造
 //! ACP crate 的 fixture，避免手写嵌套结构）。
 
-use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, ToolCallStatus};
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::schema::v1::{
+    ContentBlock, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolKind,
+};
 
 /// 把一个 ACP update 映射为现有 WS 帧；无需推送的更新返回 None。
 ///
-/// 帧形状对齐 `src/server/agent/runner.rs` 现有 WS 协议：
-/// - `assistant_chunk` → `{"type", "content"}`
-/// - `tool_call`       → `{"type", "id", "name", "status", "args"?}`
-/// - `tool_call_update`→ `{"type": "tool_result", "id", "status", "result"?}`
+/// 帧形状对齐 `src/server/agent/runner.rs` 现有 WS 协议（并扩展了卡片化字段）：
+/// - `assistant_chunk` → `{"type", "content", "thought"?}`
+/// - `tool_call`       → `{"type", "id", "name", "status", "args"?, "tool_kind", "diffs"?, "locations"?}`
+/// - `tool_call_update`→ `{"type": "tool_result", "id", "name"?, "status", "result"?, "tool_kind"?, "diffs"?, "locations"?}`
+/// - `plan`            → `{"type", "entries": [{content, status}]}`
+/// - `session_info_update` → `{"type": "session_title", "title"}`
+/// - `usage_update`    → `{"type": "usage", "used", "size"}`
 pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
     match update {
-        SessionUpdate::AgentMessageChunk(chunk) => {
-            let ContentBlock::Text(text) = &chunk.content else {
-                // 非文本块（image/audio/resource 等）无正文可推
-                return None;
-            };
-            if text.text.is_empty() {
-                return None;
-            }
-            Some(serde_json::json!({"type": "assistant_chunk", "content": text.text}))
-        }
+        SessionUpdate::AgentMessageChunk(chunk) => map_text_chunk(&chunk.content, false),
+        SessionUpdate::AgentThoughtChunk(chunk) => map_text_chunk(&chunk.content, true),
+        SessionUpdate::UserMessageChunk(_) => None, // 用户消息前端自渲染，避免重复
         SessionUpdate::ToolCall(tc) => {
             let mut frame = serde_json::json!({
                 "type": "tool_call",
                 "id": tc.tool_call_id.to_string(),
                 "name": tc.title,
                 "status": status_str(Some(tc.status)),
+                "tool_kind": kind_str(&tc.kind),
             });
             if let Some(args) = &tc.raw_input {
                 frame["args"] = serde_json::Value::String(encode_raw(args));
+            }
+            let mut diffs = extract_diffs(&tc.content);
+            // claude-code Edit 形态：diff 在 raw_input 的 old_string/new_string
+            if diffs.is_empty() {
+                if let Some(raw) = &tc.raw_input {
+                    diffs = extract_raw_edit_diff(raw);
+                }
+            }
+            if !diffs.is_empty() {
+                frame["diffs"] = serde_json::Value::Array(diffs);
+            }
+            let locations = extract_locations(&tc.locations);
+            if !locations.is_empty() {
+                frame["locations"] = serde_json::Value::Array(locations);
             }
             Some(frame)
         }
@@ -46,11 +61,41 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             if let Some(title) = &upd.fields.title {
                 frame["name"] = serde_json::Value::String(title.clone());
             }
+            if let Some(kind) = &upd.fields.kind {
+                frame["tool_kind"] = serde_json::Value::String(kind_str(kind).into());
+            }
             if let Some(output) = &upd.fields.raw_output {
                 frame["result"] = serde_json::Value::String(encode_raw(output));
             }
+            if let Some(content) = &upd.fields.content {
+                let diffs = extract_diffs(content);
+                if !diffs.is_empty() {
+                    frame["diffs"] = serde_json::Value::Array(diffs);
+                }
+            }
+            if let Some(locations) = &upd.fields.locations {
+                let locations = extract_locations(locations);
+                if !locations.is_empty() {
+                    frame["locations"] = serde_json::Value::Array(locations);
+                }
+            }
             Some(frame)
         }
+        SessionUpdate::Plan(plan) => Some(serde_json::json!({
+            "type": "plan",
+            "entries": plan_entries_json(plan),
+        })),
+        SessionUpdate::SessionInfoUpdate(info) => {
+            let MaybeUndefined::Value(title) = &info.title else {
+                return None; // Undefined（未携带）与 Null（清除）都不产生标题帧
+            };
+            Some(serde_json::json!({"type": "session_title", "title": title}))
+        }
+        SessionUpdate::UsageUpdate(usage) => Some(serde_json::json!({
+            "type": "usage",
+            "used": usage.used,
+            "size": usage.size,
+        })),
         _ => None,
     }
 }
@@ -65,6 +110,98 @@ fn encode_raw(value: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     }
+}
+
+/// 文本 chunk（assistant 正文 / thought）→ assistant_chunk 帧。
+fn map_text_chunk(content: &ContentBlock, thought: bool) -> Option<serde_json::Value> {
+    let ContentBlock::Text(text) = content else {
+        return None; // 非文本块（image/audio/resource 等）无正文可推
+    };
+    if text.text.is_empty() {
+        return None;
+    }
+    let mut frame = serde_json::json!({"type": "assistant_chunk", "content": text.text});
+    if thought {
+        frame["thought"] = serde_json::Value::Bool(true);
+    }
+    Some(frame)
+}
+
+/// ACP `ToolKind` → 帧字符串（前端按此选图标/详情渲染）。
+fn kind_str(kind: &ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "read",
+        ToolKind::Edit => "edit",
+        ToolKind::Delete => "delete",
+        ToolKind::Move => "move",
+        ToolKind::Search => "search",
+        ToolKind::Execute => "execute",
+        ToolKind::Think => "think",
+        ToolKind::Fetch => "fetch",
+        ToolKind::SwitchMode => "switch_mode",
+        _ => "other", // Other + non_exhaustive 未来变体
+    }
+}
+
+/// `content[].Diff` → 规范化 diff JSON：`{path, old_text, new_text}`。
+fn extract_diffs(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            ToolCallContent::Diff(d) => Some(serde_json::json!({
+                "path": d.path.display().to_string(),
+                "old_text": d.old_text,
+                "new_text": d.new_text,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `locations[]` → 规范化 JSON：`{path, line?}`。
+fn extract_locations(locations: &[ToolCallLocation]) -> Vec<serde_json::Value> {
+    locations
+        .iter()
+        .map(|l| {
+            serde_json::json!({"path": l.path.display().to_string(), "line": l.line})
+        })
+        .collect()
+}
+
+/// claude-code Edit 形态兜底：raw_input 含 `file_path`+`old_string`+`new_string`
+/// 时合成单条 diff（old/new 是补丁片段而非完整文件，前端按上下文片段渲染）。
+fn extract_raw_edit_diff(raw: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(obj) = raw.as_object() else {
+        return Vec::new();
+    };
+    let (Some(path), Some(old), Some(new)) = (
+        obj.get("file_path").and_then(|v| v.as_str()),
+        obj.get("old_string").and_then(|v| v.as_str()),
+        obj.get("new_string").and_then(|v| v.as_str()),
+    ) else {
+        return Vec::new();
+    };
+    vec![serde_json::json!({"path": path, "old_text": old, "new_text": new})]
+}
+
+/// ACP Plan → 前端条目 JSON（priority 不展示，丢弃）。
+///
+/// 状态字符串通过 serde 序列化取 snake_case 名（`InProgress` → `in_progress`），
+/// 与前端既有 plan 渲染保持一致。
+fn plan_entries_json(plan: &Plan) -> Vec<serde_json::Value> {
+    plan.entries
+        .iter()
+        .map(|e| {
+            let status = serde_json::to_value(&e.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            serde_json::json!({
+                "content": e.content,
+                "status": status,
+            })
+        })
+        .collect()
 }
 
 /// ACP `ToolCallStatus` → WS 帧里的字符串状态。
@@ -195,5 +332,149 @@ mod tests {
         assert_eq!(status_str(Some(ToolCallStatus::Pending)), "running");
         assert_eq!(status_str(Some(ToolCallStatus::InProgress)), "running");
         assert_eq!(status_str(None), "running");
+    }
+
+    #[test]
+    fn test_map_tool_call_with_kind_diffs_locations() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "Edit src/main.rs",
+            "kind": "edit",
+            "status": "in_progress",
+            "content": [
+                {"type": "diff", "path": "/w/src/main.rs",
+                 "oldText": "fn main() {}", "newText": "fn main() { run(); }"},
+                {"type": "content", "content": {"type": "text", "text": "忽略我"}}
+            ],
+            "locations": [{"path": "/w/src/main.rs", "line": 3}],
+            "rawInput": {"file_path": "src/main.rs"}
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(frame["tool_kind"], "edit");
+        assert_eq!(
+            frame["diffs"],
+            serde_json::json!([{"path": "/w/src/main.rs",
+                "old_text": "fn main() {}", "new_text": "fn main() { run(); }"}])
+        );
+        assert_eq!(
+            frame["locations"],
+            serde_json::json!([{"path": "/w/src/main.rs", "line": 3}])
+        );
+    }
+
+    #[test]
+    fn test_map_tool_call_diff_from_raw_input() {
+        // claude-code Edit 形态：无 content，diff 在 raw_input 的 old_string/new_string
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_2",
+            "title": "Edit",
+            "kind": "edit",
+            "rawInput": {"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(
+            frame["diffs"],
+            serde_json::json!([{"path": "src/lib.rs", "old_text": "a", "new_text": "b"}])
+        );
+    }
+
+    #[test]
+    fn test_map_tool_call_kind_defaults_other() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_3",
+            "title": "mystery"
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(frame["tool_kind"], "other");
+        assert!(frame.get("diffs").is_none());
+        assert!(frame.get("locations").is_none());
+    }
+
+    #[test]
+    fn test_map_tool_call_update_with_kind_and_content_diff() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_4",
+            "status": "completed",
+            "kind": "edit",
+            "content": [{"type": "diff", "path": "/w/a.rs", "newText": "new"}],
+            "rawOutput": "ok"
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["tool_kind"], "edit");
+        assert_eq!(
+            frame["diffs"],
+            serde_json::json!([{"path": "/w/a.rs", "old_text": null, "new_text": "new"}])
+        );
+    }
+
+    #[test]
+    fn test_map_thought_chunk() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "想想…"}
+        }));
+        let frame = map_update(&u).expect("thought chunk should map");
+        assert_eq!(frame["type"], "assistant_chunk");
+        assert_eq!(frame["content"], "想想…");
+        assert_eq!(frame["thought"], true);
+    }
+
+    #[test]
+    fn test_map_user_message_chunk_ignored() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "用户原文"}
+        }));
+        assert!(map_update(&u).is_none());
+    }
+
+    #[test]
+    fn test_map_plan() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "plan",
+            "entries": [
+                {"content": "读代码", "priority": "high", "status": "completed"},
+                {"content": "改实现", "priority": "medium", "status": "in_progress"},
+                {"content": "跑测试", "priority": "low", "status": "pending"}
+            ]
+        }));
+        let frame = map_update(&u).expect("plan should map");
+        assert_eq!(frame["type"], "plan");
+        assert_eq!(
+            frame["entries"],
+            serde_json::json!([
+                {"content": "读代码", "status": "completed"},
+                {"content": "改实现", "status": "in_progress"},
+                {"content": "跑测试", "status": "pending"}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_map_session_info_title() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "session_info_update",
+            "title": "修复登录 bug"
+        }));
+        let frame = map_update(&u).expect("session info should map");
+        assert_eq!(frame["type"], "session_title");
+        assert_eq!(frame["title"], "修复登录 bug");
+    }
+
+    #[test]
+    fn test_map_usage_update() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "usage_update",
+            "used": 1234,
+            "size": 200000
+        }));
+        let frame = map_update(&u).expect("usage should map");
+        assert_eq!(frame["type"], "usage");
+        assert_eq!(frame["used"], 1234);
+        assert_eq!(frame["size"], 200000);
     }
 }
