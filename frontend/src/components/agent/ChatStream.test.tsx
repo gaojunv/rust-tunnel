@@ -46,9 +46,6 @@ class FakeWs {
   }
 }
 
-// 当前测试的 QueryClient 实例：loadedRef 自愈测试需手动 invalidateQueries 触发 refetch
-let queryClient: QueryClient | null = null;
-
 const renderChat = () => {
   const qc = new QueryClient({
     defaultOptions: {
@@ -58,7 +55,6 @@ const renderChat = () => {
       queries: { retry: false, refetchOnMount: false },
     },
   });
-  queryClient = qc;
   return render(
     <QueryClientProvider client={qc}>
       <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
@@ -815,15 +811,28 @@ describe('ChatStream running state', () => {
   });
 
   it('reloads when cached history was empty but refetch returns rows', async () => {
-    // loadedRef 自愈：首轮装载空历史后，refetch 拿到非空历史必须重新装载
+    // loadedRef 自愈：首轮装载空历史后，refetch 拿到非空历史必须重新装载。
+    // 确定性覆盖自愈分支：渲染前 setQueryData 预置空缓存，保证首轮 history
+    // effect 必以空历史同步运行（loadedRef=true 且 items 空）。随后 invalidate
+    // 触发的 refetch 拿到非空历史 → 走自愈重装路径。旧写法先渲染再等首轮空
+    // fetch 落定，jsdom/vitest 时序下 refetch 可能先于首轮装载发生，走的是
+    // 「首次装载」路径——旧守卫 `if (loadedRef.current) return;` 下用例同样
+    // PASS，未确定性覆盖自愈分支。
     (listAgentMessages as Mock).mockResolvedValue([]);
-    renderChat();
-    await act(async () => {});
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnMount: false } },
+    });
+    qc.setQueryData(['agent-messages', 's1'], []);
+    render(
+      <QueryClientProvider client={qc}>
+        <ChatStream sessionId="s1" workspaceId="w1" model="" onModelChange={vi.fn()} />
+      </QueryClientProvider>
+    );
     (listAgentMessages as Mock).mockResolvedValue([
       { id: 'm1', session_id: 's1', role: 'user', content: '迟到的历史', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
     ]);
     await act(async () => {
-      await queryClient!.invalidateQueries({ queryKey: ['agent-messages', 's1'] });
+      await qc.invalidateQueries({ queryKey: ['agent-messages', 's1'] });
     });
     expect(await screen.findByText('迟到的历史')).toBeTruthy();
   });
