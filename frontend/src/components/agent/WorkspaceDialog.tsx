@@ -36,6 +36,35 @@ const normalizeLlmRef = (raw?: string): string => {
   return `model:${raw}`;
 };
 
+export interface OverrideRow {
+  key: string;
+  value: string;
+}
+
+/** 解析存储的 overrides JSON 为编辑行；非法/空 → []。 */
+export const parseOverrides = (raw?: string): OverrideRow[] => {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+    return Object.entries(parsed as Record<string, unknown>)
+      .filter(([, v]) => typeof v === 'string')
+      .map(([key, value]) => ({ key, value: value as string }));
+  } catch {
+    return [];
+  }
+};
+
+/** 过滤空 key 行序列化为 JSON；无有效行 → undefined（调用方决定省略还是 "{}" 清空）。 */
+export const serializeOverrides = (rows: OverrideRow[]): string | undefined => {
+  const obj: Record<string, string> = {};
+  for (const row of rows) {
+    const key = row.key.trim();
+    if (key !== '') obj[key] = row.value;
+  }
+  return Object.keys(obj).length > 0 ? JSON.stringify(obj) : undefined;
+};
+
 interface Props {
   /** 传入则为编辑模式：仅可改 name/root_path/system_prompt/approval_mode 及 ACP 字段（client/运行时不可变） */
   editing?: AgentWorkspace;
@@ -82,6 +111,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
   const [agentPath, setAgentPath] = useState(editing?.agent_path ?? '');
   // 历史库中 llm_model_id 可能是裸 uuid，编辑时归一化为 `model:<id>` 以匹配下拉选项
   const [llmModelId, setLlmModelId] = useState(normalizeLlmRef(editing?.llm_model_id));
+  const [overrideRows, setOverrideRows] = useState<OverrideRow[]>(
+    parseOverrides(editing?.agent_config_overrides),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // provider_id → 供应商名（模型下拉展示「模型名（供应商名）」）
@@ -96,6 +128,12 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
       clientId !== '' &&
       rootPath.trim() !== '' &&
       (runtimeType === 'host' || (dockerImage.trim() !== '' && dockerContainerId.trim() !== ''));
+
+  // 序列化 overrides：有有效行 → JSON；无有效行且原记录有值（编辑模式）→ "{}" 清空；
+  // 否则 undefined（不发送该字段，后端保持原值）。
+  const overridesPayload = (): string | undefined =>
+    serializeOverrides(overrideRows) ??
+    (editing?.agent_config_overrides ? '{}' : undefined);
 
   const submit = async () => {
     if (!canSubmit || submitting) return;
@@ -116,6 +154,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_type: agentType,
           ...(agentPath.trim() !== '' ? { agent_path: agentPath.trim() } : {}),
           ...(llmModelId !== '' ? { llm_model_id: llmModelId } : {}),
+          ...(overridesPayload() !== undefined
+            ? { agent_config_overrides: overridesPayload() }
+            : {}),
         });
         w = {
           ...editing,
@@ -126,6 +167,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_type: agentType,
           agent_path: agentPath.trim() !== '' ? agentPath.trim() : undefined,
           llm_model_id: llmModelId !== '' ? llmModelId : undefined,
+          agent_config_overrides: overridesPayload(),
         };
       } else {
         w = createdRef.current ?? (await createAgentWorkspace({
@@ -138,6 +180,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_type: agentType,
           ...(agentPath.trim() !== '' ? { agent_path: agentPath.trim() } : {}),
           ...(llmModelId !== '' ? { llm_model_id: llmModelId } : {}),
+          ...(overridesPayload() !== undefined
+            ? { agent_config_overrides: overridesPayload() }
+            : {}),
         }));
         createdRef.current = w;
         // 后端 create 不含 system_prompt/approval_mode 字段（仅在 PUT 支持），
@@ -298,6 +343,52 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                     </optgroup>
                   )}
                 </select>
+              </div>
+              <div className="space-y-2">
+                <Label>{t('agent.configOverrides')}</Label>
+                {overrideRows.map((row, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <Input
+                      value={row.key}
+                      onChange={(e) =>
+                        setOverrideRows((rows) =>
+                          rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)),
+                        )
+                      }
+                      placeholder={t('agent.configOverrideKeyPlaceholder')}
+                      aria-label={`${t('agent.configOverrides')} key ${i + 1}`}
+                      className="w-40"
+                    />
+                    <Input
+                      value={row.value}
+                      onChange={(e) =>
+                        setOverrideRows((rows) =>
+                          rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)),
+                        )
+                      }
+                      placeholder={t('agent.configOverrideValuePlaceholder')}
+                      aria-label={`${t('agent.configOverrides')} value ${i + 1}`}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      aria-label={`${t('agent.configOverrideRemove')} ${i + 1}`}
+                      onClick={() => setOverrideRows((rows) => rows.filter((_, j) => j !== i))}
+                    >
+                      ×
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setOverrideRows((rows) => [...rows, { key: '', value: '' }])}
+                >
+                  {t('agent.configOverrideAdd')}
+                </Button>
+                <p className="text-xs text-muted-foreground">{t('agent.configOverridesHint')}</p>
               </div>
             </>
           )}
