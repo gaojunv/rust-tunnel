@@ -671,9 +671,21 @@ pub(crate) fn convert_openai_stream_to_anthropic_for_test(openai_resp: Response)
 /// Convert OpenAI chat completion response to Anthropic Messages format.
 async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
     let status = openai_resp.status();
-    let body_bytes = axum::body::to_bytes(openai_resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap_or_default();
+    // 上限与 compat 非流式改写路径一致（16MB）。超限时 to_bytes 返回 Err，
+    // 必须返回 502 而非静默丢弃 body 后透传原始状态码——否则客户端会拿到
+    // "200 + 空内容"的假象，整段生成结果丢失。
+    let body_bytes = match axum::body::to_bytes(openai_resp.into_body(), 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from(format!(
+                    "failed to read upstream response (too large or read error): {e}"
+                )))
+                .unwrap();
+        }
+    };
 
     let openai: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
@@ -1048,6 +1060,28 @@ mod tests {
         assert_eq!(v["content"][0]["text"], "hi");
         assert_eq!(v["usage"]["input_tokens"], 3);
         assert_eq!(v["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_openai_to_anthropic_response_oversized_returns_502() {
+        // 上游响应超过转换上限（16MB）时，不能静默返回 200 空 body。
+        // 应返回 502 并带错误说明，避免客户端拿到"成功但无内容"的假象。
+        let oversized = "x".repeat(20 * 1024 * 1024); // 20MB，超过 16MB 上限
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(oversized))
+            .unwrap();
+
+        let converted = convert_openai_to_anthropic_response(resp).await;
+        assert_eq!(converted.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("failed to read upstream"),
+            "expected error message about upstream read failure, got: {text}"
+        );
     }
 
     #[tokio::test]
