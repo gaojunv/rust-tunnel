@@ -15,3 +15,6 @@ server.toml
 client.toml
 .superpowers/
 .worktrees/
+
+# Claude Code 会话 worktree（避免 gitlink 误提交）
+.claude/worktrees/
