@@ -17,6 +17,10 @@
 //! DefaultBodyLimit 以 413 拒绝；用例 4 用 20MB + 1KB 的文件精确命中 handler
 //! 的流式超限检查（400 "file too large"，即设计文档「超限 400」的语义）。
 
+// qdrant-edge 门控为可选 `rag` feature（默认关闭），默认 feature 下
+// /api/llm/kb* 路由不存在，本测试仅在 `rag` feature 下编译运行。
+#![cfg(feature = "rag")]
+
 #[path = "common/mod.rs"]
 mod common;
 
