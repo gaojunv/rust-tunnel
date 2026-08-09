@@ -585,7 +585,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           ),
         );
       } else if (msg.type === 'approval_request') {
-        // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）
+        // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）。
+        // 有 options 时卡片渲染 agent 给的选项（ACP 透传），无则保持 approve/deny 二元。
         flushChunks();
         breakStream();
         setItems((prev) => [...prev, {
@@ -594,6 +595,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           approvalId: msg.request_id,
           approvalTool: msg.tool,
           approvalSummary: msg.summary,
+          approvalOptions: msg.options,
           approvalStatus: 'pending',
         }]);
       } else if (msg.type === 'error') {
@@ -676,16 +678,22 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const hasPendingApproval = items.some((it) => it.kind === 'approval' && it.approvalStatus === 'pending');
 
   // 审批响应：approved=true 时 remember 决定「仅本次」还是「本会话记住」；
-  // 无论 WS 是否可用都先落本地状态（卡片从 pending 变 approved/denied）
-  const respondApproval = (id: string, approved: boolean, remember: boolean) => {
+  // ACP options 路径由 ApprovalCard 传入 optionId（原样回传 option_id，后端优先
+  // 解析），remember 对 allow_always 选项置 true。无论 WS 是否可用都先落本地
+  // 状态（卡片从 pending 变 approved/denied）
+  const respondApproval = (id: string, approved: boolean, remember: boolean, optionId?: string) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({
+      const payload: Record<string, unknown> = {
         type: 'approval_response',
         request_id: id,
         approved,
         remember: remember ? 'session' : 'none',
-      }));
+      };
+      if (optionId) {
+        payload.option_id = optionId;
+      }
+      ws.send(JSON.stringify(payload));
     }
     setItems((prev) => prev.map((it) =>
       it.kind === 'approval' && it.approvalId === id

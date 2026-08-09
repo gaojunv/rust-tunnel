@@ -382,10 +382,12 @@ enum WsFrame {
     /// 用户消息：content + 可选 @引用文件路径列表
     UserMessage { content: String, refs: Vec<String> },
     Cancel,
-    /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具
+    /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具；
+    /// `option_id` 为 ACP options 透传路径（用户选中具体选项）时可缺省。
     ApprovalResponse {
         request_id: String,
         approved: bool,
+        option_id: Option<String>,
         remember: bool,
     },
     /// ACP 会话配置切换（session/set_config_option 透传）
@@ -434,6 +436,11 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                     .get("approved")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                option_id: body
+                    .get("option_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
                 remember: matches!(
                     body.get("remember").and_then(|v| v.as_str()),
                     Some("session")
@@ -664,12 +671,19 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 WsFrame::ApprovalResponse {
                     request_id,
                     approved,
+                    option_id,
                     remember,
                 } => {
                     if acp_active {
                         if let Some(agent) = state.server_state.agent_state.as_ref() {
                             agent
-                                .resolve_approval(&session_id, &request_id, approved, remember)
+                                .resolve_approval(
+                                    &session_id,
+                                    &request_id,
+                                    approved,
+                                    option_id,
+                                    remember,
+                                )
                                 .await;
                         }
                     }
@@ -958,6 +972,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             WsFrame::ApprovalResponse {
                                 request_id,
                                 approved,
+                                option_id,
                                 remember,
                             } => {
                                 // 唤醒挂起的审批（跨 runner future 边界，靠 AgentState
@@ -967,6 +982,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                         &session_id,
                                         &request_id,
                                         approved,
+                                        option_id,
                                         remember,
                                     )
                                     .await;
@@ -1680,7 +1696,8 @@ mod tests {
             WsFrame::ApprovalResponse {
                 request_id,
                 approved: true,
-                remember: true
+                remember: true,
+                option_id: None
             } if request_id == "r1"
         ));
 
@@ -1692,6 +1709,33 @@ mod tests {
             WsFrame::ApprovalResponse {
                 approved: false,
                 remember: false,
+                ..
+            }
+        ));
+
+        // ACP options 透传：option_id 解析（优先于 approved）
+        let select = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r3","option_id":"allow_always"}"#.into(),
+        ));
+        assert!(matches!(
+            select,
+            WsFrame::ApprovalResponse {
+                request_id,
+                approved: false,
+                option_id: Some(id),
+                remember: false,
+                ..
+            } if request_id == "r3" && id == "allow_always"
+        ));
+
+        // option_id 空串视为缺省（避免脏数据构造 Selected("")）
+        let empty_opt = parse_ws_frame(Message::Text(
+            r#"{"type":"approval_response","request_id":"r4","option_id":""}"#.into(),
+        ));
+        assert!(matches!(
+            empty_opt,
+            WsFrame::ApprovalResponse {
+                option_id: None,
                 ..
             }
         ));

@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::server::client_registry::ClientRegistry;
 use crate::server::db::Database;
 
@@ -24,9 +26,35 @@ use self::acp_bridge::AcpBridge;
 use self::llm_bridge::LlmGatewayEndpoint;
 use self::spawner::AgentSpawner;
 
+/// 审批卡片上展示的选项（ACP `session/request_permission` 透传；runner 路径为空）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    pub id: String,
+    pub label: String,
+    /// 选项类别：allow_once / allow_always / reject_once / reject_always / 自定义。
+    /// 前端据此决定按钮样式；allow_always 点击时附带 remember 语义。
+    pub kind: String,
+}
+
+/// 审批结果：runner / 无选项路径用 `Approved` / `Denied`；ACP 有选项路径用户选中
+/// 具体选项时返回 `Selected(option_id)`，由调用方原样回传给 agent。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResult {
+    Approved,
+    Denied,
+    Selected(String),
+}
+
+impl ApprovalResult {
+    /// 是否放行（runner 判断用；runner 不传 options，只产生 Approved/Denied）。
+    pub fn approved(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+}
+
 /// 挂起的审批请求表：`request_id` → (工具名, 唤醒 `sender`)。别名化避免
 /// `clippy::type_complexity` 在多层嵌套字段上触发。
-type PendingApprovals = HashMap<String, (String, oneshot::Sender<bool>)>;
+type PendingApprovals = HashMap<String, (String, oneshot::Sender<ApprovalResult>)>;
 
 /// `request_approval` 的清理 guard：future 被 drop（cancel/断连）时移除 pending 条目，
 /// 防止泄漏。正常完成时通过 [`Self::disarm`] 避免重复移除（无害但省一次锁）。
@@ -105,11 +133,18 @@ impl AgentState {
         // 克隆只有 acp_bridge=None，request_approval 不依赖它）。
         let approval_agent = state.clone();
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db).with_approval(Arc::new(
-            move |session_id, tool, summary, args_preview, ws_tx| {
+            move |session_id, tool, summary, args_preview, options, ws_tx| {
                 let agent = approval_agent.clone();
                 Box::pin(async move {
                     agent
-                        .request_approval(&session_id, &tool, &summary, &args_preview, &ws_tx)
+                        .request_approval(
+                            &session_id,
+                            &tool,
+                            &summary,
+                            &args_preview,
+                            &options,
+                            &ws_tx,
+                        )
                         .await
                 })
             },
@@ -166,18 +201,23 @@ impl AgentState {
             .clone()
     }
 
-    /// 发审批请求帧并挂起等待用户响应。返回是否批准；发送失败（前端已断开）、
-    /// 5 分钟超时、连接取消（sender 被 drop）一律视为 deny。发送失败立即返回，
+    /// 发审批请求帧并挂起等待用户响应。返回审批结果；发送失败（前端已断开）、
+    /// 5 分钟超时、连接取消（sender 被 drop）一律视为 `Denied`。发送失败立即返回，
     /// 不等超时——否则调用方（ACP 连接任务的请求处理器）会被占用 5 分钟，
     /// 阻塞 agent 下一个工具调用。
+    ///
+    /// `options`：ACP `request_permission` 的选项透传（runner 路径传空切片）。
+    /// 有选项时前端渲染这些选项、用户点击回传 option_id → `Selected(id)`；
+    /// 无选项时保持原有 approve/deny 二元按钮 → `Approved` / `Denied`。
     pub async fn request_approval(
         &self,
         session_id: &str,
         tool: &str,
         summary: &str,
         args_preview: &str,
+        options: &[ApprovalOption],
         ws_tx: &mpsc::Sender<serde_json::Value>,
-    ) -> bool {
+    ) -> ApprovalResult {
         let request_id = format!("{:032x}", rand::random::<u128>());
         let (tx, rx) = oneshot::channel();
         self.approvals
@@ -197,6 +237,7 @@ impl AgentState {
                 "tool": tool,
                 "summary": summary,
                 "args_preview": args_preview,
+                "options": options,
             }))
             .await
             .is_ok();
@@ -205,33 +246,44 @@ impl AgentState {
             // 不等待 5 分钟超时。pending 条目在此显式清理（guard 同时 disarmed）。
             self.approvals.lock().await.remove(&request_id);
             guard.disarm();
-            return false;
+            return ApprovalResult::Denied;
         }
-        let approved = matches!(
-            tokio::time::timeout(std::time::Duration::from_mins(5), rx).await,
-            Ok(Ok(true))
-        );
+        let result = match tokio::time::timeout(std::time::Duration::from_mins(5), rx).await {
+            Ok(Ok(result)) => result,
+            _ => ApprovalResult::Denied, // 超时 / sender 被 drop（取消）
+        };
         self.approvals.lock().await.remove(&request_id);
         guard.disarm();
         let _ = session_id; // 预留：审计日志可按 session 记录
-        approved
+        result
     }
 
     /// `WS` 收到 `approval_response` 时唤醒对应挂起。未知 `id` 静默忽略（可能已超时清除）。
-    /// `remember=true` 且批准时，把工具名记入 `session_allowed`（本会话同工具免审批）。
+    /// 优先按 `option_id` 解析（ACP options 透传路径：用户选中具体选项 → `Selected`）；
+    /// 无 `option_id` 时按 `approved` 解析（runner / 无选项路径）。`remember=true` 且
+    /// 批准时，把工具名记入 `session_allowed`（本会话同工具免审批）。
     pub async fn resolve_approval(
         &self,
         session_id: &str,
         request_id: &str,
         approved: bool,
+        option_id: Option<String>,
         remember: bool,
     ) {
         let entry = self.approvals.lock().await.remove(request_id);
         if let Some((tool, tx)) = entry {
-            if approved && remember {
+            let result = match option_id {
+                Some(id) => ApprovalResult::Selected(id),
+                None if approved => ApprovalResult::Approved,
+                None => ApprovalResult::Denied,
+            };
+            // remember 语义只对"放行"有意义。前端仅在用户点击 allow_always 选项时
+            // 附带 remember='session'（此时结果为 Selected），无选项 runner 路径则
+            // 依赖 approved。两者命中其一即记住本会话同类工具免审批。
+            if remember && (approved || matches!(result, ApprovalResult::Selected(_))) {
                 self.remember_for_session(session_id, &tool).await;
             }
-            let _ = tx.send(approved);
+            let _ = tx.send(result);
         }
     }
 
