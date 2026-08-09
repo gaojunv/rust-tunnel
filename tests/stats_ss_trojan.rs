@@ -17,7 +17,7 @@
 mod common;
 
 use common::{spawn_echo, wait_until, HarnessOpts, TestHarness};
-use rust_tunnel::common::{
+use rust_tunnel_common::{
     create_insecure_client_config, create_server_config, load_or_generate_cert,
 };
 use rust_tunnel::server::listener;

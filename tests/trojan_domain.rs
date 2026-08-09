@@ -327,7 +327,7 @@ async fn trojan_roundtrip(
     data: &[u8],
 ) -> Option<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let config = rust_tunnel::common::create_insecure_client_config().ok()?;
+    let config = rust_tunnel_common::create_insecure_client_config().ok()?;
     let connector = tokio_rustls::TlsConnector::from(config);
     let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{server_port}"))
         .await

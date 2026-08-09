@@ -16,7 +16,7 @@
 mod common;
 
 use common::{HarnessOpts, TestHarness};
-use rust_tunnel::common::{AgentCommand, AgentResult};
+use rust_tunnel_common::{AgentCommand, AgentResult};
 use rust_tunnel::server::agent::session::SessionRuntime;
 use rust_tunnel::server::client_registry::ClientRegistry;
 use std::io::ErrorKind;
