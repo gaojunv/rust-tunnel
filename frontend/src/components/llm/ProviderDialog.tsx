@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
@@ -47,11 +47,22 @@ export default function ProviderDialog({ open, onClose, providerId }: Props) {
 
   const existing = providerId ? providers?.find((p) => p.id === providerId) : null;
 
+  // Initialize the form exactly once per open cycle. `existing` is an object
+  // reference inside the live `llm-providers` query array, so it changes on every
+  // refetch (window focus, staleTime expiry); re-running the init on those changes
+  // would clobber in-progress edits. Mirrors KbDialog's initRef guard.
+  const initRef = useRef(false);
+
   useEffect(() => {
-    if (open) {
-      if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); setAnthropicBaseUrl(existing.anthropic_base_url || ''); setCompatToolHistory(parseCompat(existing.extra_config)); }
-      else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); setAnthropicBaseUrl(''); setCompatToolHistory(false); }
+    if (!open) {
+      initRef.current = false;
+      return;
     }
+    if (initRef.current) return;
+    initRef.current = true;
+
+    if (existing) { setName(existing.name); setProviderType(existing.provider_type); setBaseUrl(existing.base_url); setApiKey(''); setAnthropicBaseUrl(existing.anthropic_base_url || ''); setCompatToolHistory(parseCompat(existing.extra_config)); }
+    else { setName(''); setProviderType('deepseek'); setBaseUrl('https://api.deepseek.com'); setApiKey(''); setAnthropicBaseUrl(''); setCompatToolHistory(false); }
   }, [open, existing]);
 
   return (
