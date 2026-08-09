@@ -136,6 +136,58 @@ describe('MessageBubble tool card collapsing', () => {
     fireEvent.click(header);
     expect(screen.getByText('agent.toolRunning')).toBeTruthy();
   });
+
+  it('ACP execute 工具摘要显示 command（title 风格工具名 + command 字段）', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Bash', toolArgs: '{"command":"ls -la","description":"列表"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('ls -la');
+  });
+
+  it('ACP edit 工具摘要显示 file_path（title 风格工具名 + file_path 字段）', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Edit src/a.ts', toolArgs: '{"file_path":"src/a.ts","old_string":"x"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('src/a.ts');
+  });
+
+  it('ACP write 工具摘要显示 file_path（带 toolKind=edit）', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Write a.ts', toolKind: 'edit', toolArgs: '{"file_path":"a.ts"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('a.ts');
+  });
+
+  it('ACP 命令摘要显示 command，不显示原始 {} 对象', () => {
+    render(
+      <MessageBubble item={{ kind: 'tool', content: '', toolName: 'Bash', toolArgs: '{"command":"ls"}' }} />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    // 摘要应至少包含命令，而不是空/原始 {}
+    expect(header.textContent).not.toContain('{}');
+    expect(header.textContent).toContain('ls');
+  });
+
+  it('空参数 {} 不产生摘要也不显示原始 {}', () => {
+    render(
+      <MessageBubble item={{ kind: 'tool', content: '', toolName: 'Bash', toolArgs: '{}' }} />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).not.toContain('{}');
+    // 展开后详情区也不显示无意义的空对象
+    fireEvent.click(header);
+    expect(screen.queryByText('{}')).toBeNull();
+    expect(screen.queryByText('agent.toolRunning')).toBeTruthy();
+  });
 });
 
 describe('MessageBubble tool card status badges, plan and thought bubbles', () => {
@@ -151,6 +203,26 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
   it('shows completed badge when result present and no explicit status', () => {
     render(<MessageBubble item={{ ...base, toolResult: 'ok' }} />);
     expect(screen.getByText('✓')).toBeTruthy();
+  });
+
+  it('shows completed badge when result present even if toolStatus mis-mapped to running', () => {
+    // 回归（Bug 3）：ACP 的 ToolCallUpdate 常省略 status，上游可能误映射为
+    // running；result 已产出即视为完成，不能显示转圈。
+    render(<MessageBubble item={{ ...base, toolStatus: 'running', toolResult: 'ok' }} />);
+    expect(screen.getByText('✓')).toBeTruthy();
+    expect(screen.queryByText('✗')).toBeNull();
+  });
+
+  it('shows running spinner when no result yet (in_progress/running)', () => {
+    render(<MessageBubble item={{ ...base, toolStatus: 'running' }} />);
+    expect(screen.queryByText('✓')).toBeNull();
+    expect(screen.queryByText('✗')).toBeNull();
+  });
+
+  it('shows failed badge when status failed despite result', () => {
+    render(<MessageBubble item={{ ...base, toolStatus: 'failed', toolResult: 'boom' }} />);
+    expect(screen.getByText('✗')).toBeTruthy();
+    expect(screen.queryByText('✓')).toBeNull();
   });
 
   it('renders plan bubble with status markers', () => {

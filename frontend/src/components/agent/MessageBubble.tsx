@@ -61,31 +61,54 @@ function CollapsiblePre({ text, className }: { text: string; className?: string 
   );
 }
 
-/** 从 toolArgs JSON 提取一行摘要：shell→cmd；文件类→path；search→path + pattern。 */
-function toolSummary(name: string | undefined, args: string | undefined): string | null {
-  if (!args) return null;
+/** args 是否为「无信息的空 JSON」（`{}` / `null` / 空字符串）——展开时不应显示。 */
+function isNoopArgs(args: string): boolean {
+  const t = args.trim();
+  if (!t) return true;
+  if (t === '{}' || t === 'null' || t === '[]') return true;
+  return false;
+}
+
+/** 从 toolArgs JSON 提取一行摘要。
+ *
+ * 兼容两套数据：runner 旧格式（toolName 是规范工具名 shell/read_file…，字段
+ * cmd/path）与 ACP 新格式（toolName 是 title 如 "Bash"/"Edit src/a.ts"，字段
+ * command/file_path）。`kind`（ACP tool_kind）优先于 name 判断类别：命令类
+ * 认 cmd/command，文件类认 path/file_path，search 认 path+pattern。提取不到
+ * 时返回 null（无摘要；标题区已显示 toolName，避免重复）。
+ */
+function toolSummary(
+  name: string | undefined,
+  kind: ToolKind | undefined,
+  args: string | undefined,
+): string | null {
+  if (!args || isNoopArgs(args)) return null;
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(args) as Record<string, unknown>;
-    const str = (k: string) => (typeof parsed[k] === 'string' ? (parsed[k] as string) : null);
-    switch (name) {
-      case 'shell':
-        return str('cmd');
-      case 'search': {
-        const path = str('path') ?? '.';
-        const pattern = str('pattern');
-        return pattern ? `${path} ⌕ ${pattern}` : path;
-      }
-      case 'read_file':
-      case 'write_file':
-      case 'patch_file':
-      case 'list_dir':
-        return str('path');
-      default:
-        return null;
-    }
+    parsed = JSON.parse(args) as Record<string, unknown>;
   } catch {
     return null;
   }
+  const str = (...keys: string[]) => {
+    for (const k of keys) {
+      const v = parsed[k];
+      if (typeof v === 'string' && v) return v;
+    }
+    return null;
+  };
+  const nm = (name ?? '').toLowerCase();
+  const isExec = kind === 'execute' || ['shell', 'bash', 'execute', 'run', 'sh', 'cmd'].includes(nm);
+  if (isExec) return str('cmd', 'command');
+  const isFile =
+    kind === 'read' || kind === 'edit' || kind === 'delete' || kind === 'move' ||
+    ['read_file', 'write_file', 'patch_file', 'list_dir', 'read', 'write', 'edit', 'delete', 'move', 'glob'].includes(nm);
+  if (isFile) return str('path', 'file_path');
+  if (kind === 'search' || ['search', 'grep', 'find'].includes(nm)) {
+    const path = str('path', 'file_path') ?? '.';
+    const pattern = str('pattern', 'query');
+    return pattern ? `${path} ⌕ ${pattern}` : null;
+  }
+  return null;
 }
 
 /** toolKind → 图标（视觉分类；未知/缺省一律 Wrench）。 */
@@ -102,9 +125,17 @@ const KIND_ICON: Record<ToolKind, typeof Wrench> = {
   other: Wrench,
 };
 
+/** 工具状态：failed 优先；result 已产出 → completed（ACP 的 ToolCallUpdate 常省略
+ * status，上游若误映射为 running，result 到达后仍应显示完成）；缺省按 result 有无推断。 */
+function resolveToolStatus(item: ChatItem): 'pending' | 'in_progress' | 'running' | 'completed' | 'failed' {
+  if (item.toolStatus === 'failed') return 'failed';
+  if (item.toolResult != null) return 'completed';
+  return item.toolStatus ?? 'in_progress';
+}
+
 /** 工具执行状态徽章：显式 toolStatus 优先；缺省（旧数据）按 result 有无推断。 */
 function StatusBadge({ item }: { item: ChatItem }) {
-  const status = item.toolStatus ?? (item.toolResult != null ? 'completed' : 'in_progress');
+  const status = resolveToolStatus(item);
   if (status === 'failed') return <span className="shrink-0 text-xs text-destructive">✗</span>;
   if (status === 'completed') return <span className="shrink-0 text-xs text-green-600">✓</span>;
   return <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />;
@@ -115,9 +146,9 @@ function StatusBadge({ item }: { item: ChatItem }) {
 function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const summary = toolSummary(item.toolName, item.toolArgs);
-  const Icon = KIND_ICON[item.toolKind ?? 'other'];
-  const isError = (item.toolStatus ?? (item.toolResult != null ? 'completed' : 'in_progress')) === 'failed';
+  const summary = toolSummary(item.toolName, item.toolKind, item.toolArgs);
+  const Icon = KIND_ICON[item.toolKind ?? 'other'] ?? Wrench;
+  const isError = resolveToolStatus(item) === 'failed';
 
   return (
     <div>
@@ -144,7 +175,7 @@ function ToolCard({ item }: { item: ChatItem }) {
       {open && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {item.toolDiffs && item.toolDiffs.length > 0 && <ToolDiffView diffs={item.toolDiffs} />}
-          {item.toolArgs && <CollapsiblePre text={item.toolArgs} />}
+          {item.toolArgs && !isNoopArgs(item.toolArgs) && <CollapsiblePre text={item.toolArgs} />}
           {item.toolResult ? (
             <CollapsiblePre text={item.toolResult} className={item.toolArgs || item.toolDiffs ? 'border-t border-border/60 pt-2' : undefined} />
           ) : (

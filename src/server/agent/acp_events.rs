@@ -55,10 +55,27 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             Some(frame)
         }
         SessionUpdate::ToolCallUpdate(upd) => {
+            // ACP 的 ToolCallUpdate 常精简（claude-code 常省略 status，只带
+            // raw_output）。status 缺失但结果已产出（raw_output/content 携带
+            // 信息）→ completed，不能沿用 ToolCall 的 status_str（None→running），
+            // 否则已完成工具的前端卡片永远转圈（Bug 3）。真·中间状态更新
+            // （无结果、只改 title/content 为空）仍按 running 处理。
+            let status = match upd.fields.status {
+                Some(st) => status_str(Some(st)),
+                None => {
+                    let has_result = upd.fields.raw_output.is_some()
+                        || upd
+                            .fields
+                            .content
+                            .as_ref()
+                            .is_some_and(|c| !c.is_empty());
+                    if has_result { "completed" } else { "running" }
+                }
+            };
             let mut frame = serde_json::json!({
                 "type": "tool_result",
                 "id": upd.tool_call_id.to_string(),
-                "status": status_str(upd.fields.status),
+                "status": status,
             });
             if let Some(title) = &upd.fields.title {
                 frame["name"] = serde_json::Value::String(title.clone());
@@ -284,6 +301,22 @@ mod tests {
         }));
         let frame = map_update(&u).expect("tool_call should map");
         assert_eq!(frame["args"], "ls -la");
+    }
+
+    #[test]
+    fn test_map_tool_call_update_without_status_is_completed() {
+        // ACP 的 ToolCallUpdate 常精简（claude-code 常省略 status 字段，只带
+        // raw_output）。status 缺失但结果已产出的工具应视为 completed，
+        // 不能默认映射为 running——否则前端卡片永远转圈（Bug 3）。
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_1",
+            "rawOutput": "a.rs"
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["type"], "tool_result");
+        assert_eq!(frame["status"], "completed");
+        assert_eq!(frame["result"], "a.rs");
     }
 
     #[test]
