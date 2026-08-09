@@ -80,6 +80,10 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
 
 [features]
+# rag 默认开启：集成测试 tests/rag_multiformat.rs 用根 crate 的
+# #![cfg(feature = "rag")]，仅声明不设 default 时该 cfg 为 false、测试被整体
+# cfg 掉（dev-dep 的 rag 不传导为根包自身 feature）。根包无 lib/bin，
+# default 仅影响测试编译与 dev-deps，无副作用。
 default = ["rag"]
 rag = ["rust-tunnel-server/rag"]
 
