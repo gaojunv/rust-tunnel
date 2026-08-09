@@ -33,6 +33,13 @@ interface Props {
 
 export default function ChatStream({ sessionId, workspaceId, model, onModelChange }: Props) {
   const { t } = useTranslation();
+  // t 的身份随语言切换变化，把它放进 WS effect 的依赖会导致切语言时拆断
+  // 进行中的回合（onclose 追加"连接中断"气泡、过期所有 pending 审批、
+  // 触发全量历史重载）。用 ref 存最新 t，effect 从 ref 读，保持引用稳定。
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
   const queryClient = useQueryClient();
   const [items, setItems] = useState<ChatItem[]>([]);
   const [input, setInput] = useState('');
@@ -114,7 +121,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         setRunning(true);
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
         timeoutRef.current = globalThis.setTimeout(() => {
-          setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+          setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${tRef.current('agent.responseTimeout')}` }]);
           runningRef.current = false;
           setRunning(false);
           timeoutRef.current = null;
@@ -356,11 +363,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     clearRunningTimeout();
     // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
     timeoutRef.current = globalThis.setTimeout(() => {
-      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${tRef.current('agent.responseTimeout')}` }]);
       expirePendingApprovals();
       stopRunning();
     }, RUNNING_TIMEOUT_MS);
-  }, [clearRunningTimeout, stopRunning, expirePendingApprovals, t]);
+  }, [clearRunningTimeout, stopRunning, expirePendingApprovals]);
 
   // 切换会话：清空上一会话的配置快照（新会话的 session_state 帧到达前不残留
   // 旧会话的 mode/effort 快捷按钮）
@@ -615,7 +622,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         if (runningRef.current) {
           setItems((prev) => [
             ...prev,
-            { kind: 'assistant', content: `⚠️ ${t('agent.connectionInterrupted')}` },
+            { kind: 'assistant', content: `⚠️ ${tRef.current('agent.connectionInterrupted')}` },
           ]);
         }
         stopRunning();
@@ -655,7 +662,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       chunkBufRef.current = '';
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream, t]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream]);
 
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
