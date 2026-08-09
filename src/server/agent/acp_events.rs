@@ -20,6 +20,8 @@ use agent_client_protocol::schema::v1::{
 /// - `plan`            → `{"type", "entries": [{content, status}]}`
 /// - `session_info_update` → `{"type": "session_title", "title"}`
 /// - `usage_update`    → `{"type": "usage", "used", "size"}`
+/// - `current_mode_update` → `{"type": "current_mode_update", "mode_id"}`
+/// - `config_option_update` → `{"type": "config_option_update", "options"}`
 pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => map_text_chunk(&chunk.content, false),
@@ -95,6 +97,14 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             "type": "usage",
             "used": usage.used,
             "size": usage.size,
+        })),
+        SessionUpdate::CurrentModeUpdate(mode) => Some(serde_json::json!({
+            "type": "current_mode_update",
+            "mode_id": mode.current_mode_id.to_string(),
+        })),
+        SessionUpdate::ConfigOptionUpdate(upd) => Some(serde_json::json!({
+            "type": "config_option_update",
+            "options": upd.config_options,
         })),
         _ => None,
     }
@@ -317,10 +327,45 @@ mod tests {
     }
 
     #[test]
-    fn test_map_irrelevant_update_returns_none() {
+    fn test_map_current_mode_update() {
         let u = update(serde_json::json!({
             "sessionUpdate": "current_mode_update",
-            "currentModeId": "default"
+            "currentModeId": "plan"
+        }));
+        let frame = map_update(&u).expect("current_mode_update should map");
+        assert_eq!(frame["type"], "current_mode_update");
+        assert_eq!(frame["mode_id"], "plan");
+    }
+
+    #[test]
+    fn test_map_config_option_update() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{
+                "id": "mode",
+                "name": "Mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "plan",
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "plan", "name": "Plan"}
+                ]
+            }]
+        }));
+        let frame = map_update(&u).expect("config_option_update should map");
+        assert_eq!(frame["type"], "config_option_update");
+        assert_eq!(frame["options"][0]["id"], "mode");
+        assert_eq!(frame["options"][0]["currentValue"], "plan");
+        assert_eq!(frame["options"][0]["options"][1]["value"], "plan");
+    }
+
+    #[test]
+    fn test_map_irrelevant_update_returns_none() {
+        // user_message_chunk 仍属无需推送的更新（前端自渲染用户消息）
+        let u = update(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {"type": "text", "text": "hi"}
         }));
         assert!(map_update(&u).is_none());
     }
