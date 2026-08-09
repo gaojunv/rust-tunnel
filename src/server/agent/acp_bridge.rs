@@ -30,7 +30,9 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionNotification, TextContent,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigValueId, SessionNotification,
+    SetSessionConfigOptionRequest, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client, ConnectionTo};
@@ -90,6 +92,9 @@ struct SpawnedAgent {
     text_buf: String,
     /// 回合内 thought 文本缓冲（终态落 `name='thought'` 行）。
     thought_buf: String,
+    /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
+    /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
+    config_options: Vec<SessionConfigOption>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -266,6 +271,7 @@ impl AcpBridge {
                     exited: false,
                     text_buf: String::new(),
                     thought_buf: String::new(),
+                    config_options: Vec::new(),
                 },
             );
             Some((pump_io, stdout_rx))
@@ -395,6 +401,41 @@ impl AcpBridge {
                             // 返回 false，本帧放弃（不落库、不推送）。
                             if !touch_activity(&sessions, &sid).await {
                                 return Ok(());
+                            }
+                            // 状态快照维护：config_option_update 全量替换；
+                            // current_mode_update 只改写 mode 项的 current_value
+                            // （claude-code-acp 改 mode 时两种通知都会发，顺序不定，
+                            // 两处幂等保证最终一致）。只维护内存快照——帧推送已由
+                            // map_update 完成（Task 2），这里不重复推。
+                            match &notification.update {
+                                agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+                                    upd,
+                                ) => {
+                                    if let Some(a) = sessions.lock().await.get_mut(&sid) {
+                                        a.config_options = upd.config_options.clone();
+                                    }
+                                }
+                                agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+                                    mode,
+                                ) => {
+                                    if let Some(a) = sessions.lock().await.get_mut(&sid) {
+                                        for o in &mut a.config_options {
+                                            if matches!(
+                                                &o.category,
+                                                Some(SessionConfigOptionCategory::Mode)
+                                            ) {
+                                                if let SessionConfigKind::Select(sel) =
+                                                    &mut o.kind
+                                                {
+                                                    sel.current_value = SessionConfigValueId::new(
+                                                        mode.current_mode_id.0.clone(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                             if let Some(mut frame) = map_update(&notification.update) {
                                 // ToolCallUpdate 缺 title 时从缓存补 name。
@@ -531,12 +572,16 @@ impl AcpBridge {
                                 .block_task()
                                 .await?;
                             let acp_session_id = new_session.session_id.clone();
-                            // 写回会话条目：连接句柄 + ACP session id 供 prompt/cancel。
+                            let config_options =
+                                new_session.config_options.clone().unwrap_or_default();
+                            // 写回会话条目：连接句柄 + ACP session id 供 prompt/cancel；
+                            // config_options 捕获后供 set_config_option / session_state 帧。
                             {
                                 let mut map = sessions.lock().await;
                                 if let Some(agent) = map.get_mut(&sid) {
                                     agent.connection = Some(cx.clone());
                                     agent.acp_session_id = Some(acp_session_id);
+                                    agent.config_options = config_options;
                                     agent.last_activity = std::time::Instant::now();
                                 }
                             }
@@ -561,7 +606,16 @@ impl AcpBridge {
         });
 
         match tokio::time::timeout(SPAWN_TIMEOUT, setup_rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(()))) => {
+                self.replay_config_state(session_id).await;
+                // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
+                if let Some(frame) = self.session_state_frame(session_id).await {
+                    if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
+                        let _ = ws_tx.try_send(frame);
+                    }
+                }
+                Ok(())
+            }
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err("acp connection task dropped".into()),
             Err(_) => Err("acp handshake timed out".into()),
@@ -721,6 +775,114 @@ impl AcpBridge {
         if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
             a.ws_tx = None;
         }
+    }
+
+    /// 构造全量 session_state 帧；无状态（未握手/agent 不上报）返回 None。
+    async fn session_state_frame(&self, session_id: &str) -> Option<serde_json::Value> {
+        let sessions = self.sessions.lock().await;
+        let agent = sessions.get(session_id)?;
+        if agent.acp_session_id.is_none() || agent.config_options.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "type": "session_state",
+            "options": agent.config_options,
+        }))
+    }
+
+    /// 握手成功后回放 DB 中持久化的配置（mode 优先：agent 侧 model 切换会
+    /// 重建 effort 列表，mode 先行保证其余项在最终列表上生效）。单条失败
+    /// （如新版 agent 移除某取值）跳过并 warn，不阻断其余。
+    async fn replay_config_state(&self, session_id: &str) {
+        let saved = match self.db.agent_get_session(session_id).await {
+            Ok(Some(record)) => record.config_state,
+            _ => None,
+        };
+        let Some(saved) = saved else { return };
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&saved)
+        else {
+            return;
+        };
+        let mut entries: Vec<(String, String)> = map
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect();
+        entries.sort_by_key(|(k, _)| if k == "mode" { 0 } else { 1 });
+        for (config_id, value) in entries {
+            if let Err(e) = self.set_config_option(session_id, &config_id, &value).await {
+                tracing::warn!(session_id, config_id, "replay config_state skipped: {e}");
+            }
+        }
+    }
+
+    /// 切换 ACP 会话配置项：校验 config_id 在当前 options 中 → 发
+    /// `session/set_config_option`。value 对 select 是 value-id 字符串，
+    /// 对 boolean 是 "true"/"false"。成功后的状态更新以 agent 回推的
+    /// config_option_update 为准（通知处理器全量替换快照）。
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let (connection, acp_session_id, is_boolean) = {
+            let mut sessions = self.sessions.lock().await;
+            let agent = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "session not spawned".to_string())?;
+            if agent.exited {
+                return Err("agent process has exited".into());
+            }
+            let option = agent
+                .config_options
+                .iter()
+                .find(|o| o.id.0.as_ref() == config_id)
+                .ok_or_else(|| format!("unknown config option: {config_id}"))?;
+            let is_boolean = matches!(&option.kind, SessionConfigKind::Boolean(_));
+            let connection = agent
+                .connection
+                .clone()
+                .ok_or_else(|| "ACP handshake not complete".to_string())?;
+            let acp_session_id = agent
+                .acp_session_id
+                .clone()
+                .ok_or_else(|| "ACP handshake not complete".to_string())?;
+            agent.last_activity = std::time::Instant::now();
+            (connection, acp_session_id, is_boolean)
+        };
+        let typed_value = if is_boolean {
+            SessionConfigOptionValue::boolean(value == "true")
+        } else {
+            // schema 的 id 新类型只派生了 From<&'static str>；非静态 &str 经
+            // SessionConfigValueId::new（内部 Into<Arc<str>> 走 std From<&str>）。
+            SessionConfigOptionValue::value_id(SessionConfigValueId::new(value))
+        };
+        connection
+            .send_request_to(
+                agent_client_protocol::Agent,
+                SetSessionConfigOptionRequest::new(
+                    acp_session_id,
+                    SessionConfigId::new(config_id),
+                    typed_value,
+                ),
+            )
+            .block_task()
+            .await
+            .map_err(|e| format!("set_config_option failed: {e}"))?;
+        Ok(())
+    }
+
+    /// 当前会话的配置快照（WS 连接建立后主动推送用）；未就绪返回 None。
+    pub async fn session_config_options(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<SessionConfigOption>> {
+        let sessions = self.sessions.lock().await;
+        let agent = sessions.get(session_id)?;
+        if agent.acp_session_id.is_none() || agent.config_options.is_empty() {
+            return None;
+        }
+        Some(agent.config_options.clone())
     }
 
     /// 路由客户端发来的 spawn/LLM 代理控制消息（server.rs 控制循环转交）。
@@ -1180,6 +1342,7 @@ mod tests {
             exited: false,
             text_buf: String::new(),
             thought_buf: String::new(),
+            config_options: Vec::new(),
         }
     }
 
