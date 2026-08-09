@@ -551,12 +551,31 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // 继续 drain event_rx——runner 内部仍是阻塞式 send().await，但只要接收端持续
     // 消费，64 槽 channel 就不会填满，runner 永不阻塞。所有发送方 drop 后
     // recv() 返回 None，任务自然结束；外层循环退出后仍由 push_task.abort() 兜底。
+    //
+    // ws_sink.send 必须加超时：慢客户端（TCP 零窗口、对端存活但不读）会让
+    // send 无限阻塞 → push_task 不再 drain event_rx（64 槽）→ 所有生产方
+    // send().await 阻塞 → runner 回合、ACP 通知/审批、stdio pump 一并冻结。
+    // 完全断线能自愈（send 返回 Err），但"慢而不死"的客户端会永久停摆该会话。
+    // 5 秒超时足够覆盖正常网络抖动；超时即视为 sink 死亡，后续事件只 drain 不发。
+    const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     let push_task = tokio::spawn(async move {
         let mut sink_alive = true;
         while let Some(ev) = event_rx.recv().await {
             let text = serde_json::to_string(&ev).unwrap_or_default();
-            if sink_alive && ws_sink.send(Message::Text(text)).await.is_err() {
-                sink_alive = false;
+            if !sink_alive {
+                continue;
+            }
+            let send_result = tokio::time::timeout(
+                WS_SEND_TIMEOUT,
+                ws_sink.send(Message::Text(text)),
+            )
+            .await;
+            match send_result {
+                Ok(Ok(())) => {} // 发送成功
+                Ok(Err(_)) | Err(_) => {
+                    // 发送失败或超时：标记 sink 死亡，后续事件继续 drain 但不再发
+                    sink_alive = false;
+                }
             }
         }
     });
