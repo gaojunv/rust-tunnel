@@ -98,10 +98,11 @@ struct SpawnedAgent {
     /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
     /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
     config_options: Vec<SessionConfigOption>,
-    /// 握手完成信号（false → true）。连接预 spawn（后台任务）仍在握手时，
-    /// 首条 user_message 的 `wait_ready` 经 `subscribe` + `wait_for` 等待它，
-    /// 避免 `prompt` 报 "ACP handshake not complete"。条目被移除（spawn 失败/
-    /// kill）时 Sender drop，wait_for 以 RecvError 返回。
+    /// 握手 + 配置注入完成信号（false → true）。连接预 spawn（后台任务）仍在
+    /// 握手/注入 overrides 时，首条 user_message 的 `wait_ready` 经 `subscribe`
+    /// 与 `wait_for` 等待它，避免 `prompt` 报 "ACP handshake not complete" 或在
+    /// config 注入完成前首回合开跑。条目被移除（spawn 失败/kill）时 Sender drop，
+    /// wait_for 以 RecvError 返回。
     spawn_ready: watch::Sender<bool>,
 }
 
@@ -347,6 +348,13 @@ impl AcpBridge {
         // 返回后才执行：该函数只收 session_id/root_path，此处持有 workspace 记录。
         self.apply_config_overrides(session_id, workspace).await;
         self.replay_config_state(session_id).await;
+        // 配置注入完成后才放行 wait_ready：连接预 spawn（后台任务）场景下，
+        // 用户路径的 wait_ready 经 watch 通道等待此信号——必须延后到 overrides/
+        // config_state 已生效，首条 prompt 才不与在途 set_config_option 竞态
+        // （恢复旧顺序：replay 先于 spawn_ready）。
+        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+            let _ = a.spawn_ready.send(true);
+        }
         // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
         if let Some(frame) = self.session_state_frame(session_id).await {
             if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
@@ -680,15 +688,13 @@ impl AcpBridge {
 
         match tokio::time::timeout(SPAWN_TIMEOUT, setup_rx).await {
             Ok(Ok(Ok(()))) => {
-                // 握手完成：通知 wait_ready 等待方（连接预 spawn 期间首条消息）。
-                // connection 在 setup 闭包里已先于 setup_rx Ok 写入，wait_ready
-                // 的「connection.is_some()」快路径与订阅的 watch 双保险，不会
-                // 错过就绪。workspace overrides 注入与 config_state 回放由
-                // ensure_session 在握手返回后统一执行（其持有 workspace 记录，
-                // acp_handshake 只收 session_id/root_path，不接触 workspace）。
-                if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
-                    let _ = a.spawn_ready.send(true);
-                }
+                // 握手成功即返回。wait_ready 的放行（spawn_ready.send(true)）由
+                // ensure_session 在 apply_config_overrides + replay_config_state
+                // 完成后统一执行——acp_handshake 只收 session_id/root_path，不持有
+                // workspace 记录；把放行延后到配置注入完成，首条 prompt 才不与
+                // 在途 set_config_option 竞态（恢复旧顺序：replay 先于 spawn_ready）。
+                // 失败分支（下文）不发送 spawn_ready，wait_ready 以超时/Sender drop
+                // 返回，语义与移动前一致。
                 Ok(())
             }
             Ok(Ok(Err(e))) => Err(e),
@@ -881,7 +887,17 @@ impl AcpBridge {
         };
         let mut entries: Vec<(String, String)> = map
             .into_iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .filter_map(|(k, v)| match v.as_str() {
+                Some(s) => Some((k, s.to_string())),
+                None => {
+                    tracing::warn!(
+                        session_id,
+                        config_id = %k,
+                        "agent_config_overrides value not a string, skipped"
+                    );
+                    None
+                }
+            })
             .collect();
         entries.sort_by_key(|(k, _)| (if k == "mode" { 0 } else { 1 }, k.clone()));
         for (config_id, value) in entries {
@@ -1005,8 +1021,8 @@ impl AcpBridge {
             .is_some_and(|a| !a.exited)
     }
 
-    /// 等待会话的 ACP 握手完成（连接预 spawn 可能在后台进行）。已就绪立即
-    /// 返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    /// 等待会话的 ACP 握手 + 配置注入完成（连接预 spawn 可能在后台进行）。
+    /// 已就绪立即返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
     pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
