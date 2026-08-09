@@ -1,3 +1,5 @@
+import type { ApprovalOption } from '../../types';
+
 /** 聊天区单条消息。 */
 export interface ChatItem {
   kind: 'user' | 'assistant' | 'tool' | 'approval' | 'thought' | 'plan';
@@ -19,6 +21,8 @@ export interface ChatItem {
   approvalId?: string;
   approvalTool?: string;
   approvalSummary?: string;
+  /** ACP 权限选项透传（有则渲染选项按钮，无则 approve/deny 二元按钮） */
+  approvalOptions?: ApprovalOption[];
   /** pending=等待用户响应；approved/denied=用户主动处理；expired=回合终态被动过期 */
   approvalStatus?: 'pending' | 'approved' | 'denied' | 'expired';
 }

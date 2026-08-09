@@ -336,16 +336,18 @@ async fn handle_tool_calls(
                 {
                     let summary = super::approval::approval_summary(&command);
                     let args_preview: String = call.args.chars().take(500).collect();
-                    let approved = agent
+                    // runner 路径无 ACP 选项：透传空切片，审批卡片保持 approve/deny 二元。
+                    let approval = agent
                         .request_approval(
                             &rt.session_id,
                             &call.name,
                             &summary,
                             &args_preview,
+                            &[],
                             ws_tx,
                         )
                         .await;
-                    if !approved {
+                    if !approval.approved() {
                         let text = "[denied by user]".to_string();
                         let _ = ws_tx
                             .send(serde_json::json!({

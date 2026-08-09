@@ -109,6 +109,7 @@ pub fn approval_summary(cmd: &AgentCommand) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::agent::{ApprovalOption, ApprovalResult};
 
     fn shell(cmd: &str) -> AgentCommand {
         AgentCommand::Shell {
@@ -319,17 +320,23 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let st = state.clone();
         let handle = tokio::spawn(async move {
-            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+            st.request_approval("s1", "shell", "npm install", "{}", &[], &tx)
                 .await
         });
         // 收到 approval_request 帧
         let frame = rx.recv().await.unwrap();
         assert_eq!(frame["type"], "approval_request");
         assert_eq!(frame["tool"], "shell");
+        // 无选项：帧带空 options 数组
+        assert_eq!(
+            frame["options"].as_array().map(Vec::len),
+            Some(0),
+            "no-option approval should carry empty options"
+        );
         let req_id = frame["request_id"].as_str().unwrap().to_string();
         // 模拟 WS 收到批准响应
-        state.resolve_approval("s1", &req_id, true, false).await;
-        assert!(handle.await.unwrap());
+        state.resolve_approval("s1", &req_id, true, None, false).await;
+        assert!(handle.await.unwrap().approved());
     }
 
     #[tokio::test]
@@ -338,13 +345,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let st = state.clone();
         let handle = tokio::spawn(async move {
-            st.request_approval("s1", "git_push", "git push", "{}", &tx)
+            st.request_approval("s1", "git_push", "git push", "{}", &[], &tx)
                 .await
         });
         let frame = rx.recv().await.unwrap();
         let req_id = frame["request_id"].as_str().unwrap().to_string();
-        state.resolve_approval("s1", &req_id, false, false).await;
-        assert!(!handle.await.unwrap());
+        state.resolve_approval("s1", &req_id, false, None, false).await;
+        assert!(!handle.await.unwrap().approved());
     }
 
     #[tokio::test]
@@ -355,13 +362,76 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let st = state.clone();
         let handle = tokio::spawn(async move {
-            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+            st.request_approval("s1", "shell", "npm install", "{}", &[], &tx)
                 .await
         });
         let frame = rx.recv().await.unwrap();
         let req_id = frame["request_id"].as_str().unwrap().to_string();
-        state.resolve_approval("s1", &req_id, true, true).await;
-        assert!(handle.await.unwrap());
+        state.resolve_approval("s1", &req_id, true, None, true).await;
+        assert!(handle.await.unwrap().approved());
+        assert!(state.is_allowed_for_session("s1", "shell").await);
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_options_flow() {
+        // ACP options 透传：帧携带选项；用户选中某 option_id 后 resolve 返回 Selected。
+        let state = test_state().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let st = state.clone();
+        let options = vec![
+            ApprovalOption { id: "opt_allow_once".into(), label: "允许一次".into(), kind: "allow_once".into() },
+            ApprovalOption { id: "opt_allow_always".into(), label: "总是允许".into(), kind: "allow_always".into() },
+            ApprovalOption { id: "opt_reject".into(), label: "拒绝".into(), kind: "reject_once".into() },
+        ];
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &options, &tx)
+                .await
+        });
+        let frame = rx.recv().await.unwrap();
+        assert_eq!(frame["type"], "approval_request");
+        let frame_options = frame["options"].as_array().expect("options array");
+        assert_eq!(frame_options.len(), 3);
+        assert_eq!(frame_options[0]["id"], "opt_allow_once");
+        assert_eq!(frame_options[0]["kind"], "allow_once");
+        let req_id = frame["request_id"].as_str().unwrap().to_string();
+        // 用户选中 allow_always 选项：回传 option_id
+        state
+            .resolve_approval(
+                "s1",
+                &req_id,
+                false, // option_id 优先，approved 被忽略
+                Some("opt_allow_always".into()),
+                false,
+            )
+            .await;
+        let result = handle.await.unwrap();
+        assert_eq!(
+            result,
+            ApprovalResult::Selected("opt_allow_always".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_approval_options_selected_remember_writes_session_allowed() {
+        // 前端在用户点击 allow_always 选项时附带 remember='session'：服务端据此
+        // 记住本会话同类工具免审批（option_id 非空即可触发 remember）。
+        let state = test_state().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let st = state.clone();
+        let options = vec![ApprovalOption { id: "allow_always".into(), label: "总是允许".into(), kind: "allow_always".into() }];
+        let handle = tokio::spawn(async move {
+            st.request_approval("s1", "shell", "npm install", "{}", &options, &tx)
+                .await
+        });
+        let frame = rx.recv().await.unwrap();
+        let req_id = frame["request_id"].as_str().unwrap().to_string();
+        state
+            .resolve_approval("s1", &req_id, false, Some("allow_always".into()), true)
+            .await;
+        assert_eq!(
+            handle.await.unwrap(),
+            ApprovalResult::Selected("allow_always".to_string())
+        );
         assert!(state.is_allowed_for_session("s1", "shell").await);
     }
 
@@ -370,7 +440,7 @@ mod tests {
         let state = test_state().await;
         // 未知 request_id：不 panic、不误唤醒
         state
-            .resolve_approval("s1", "nonexistent", true, false)
+            .resolve_approval("s1", "nonexistent", true, None, false)
             .await;
     }
 
@@ -394,7 +464,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let st = state.clone();
         let handle = tokio::spawn(async move {
-            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+            st.request_approval("s1", "shell", "npm install", "{}", &[], &tx)
                 .await
         });
         // 等条目真正插入并挂起在 oneshot 上（避免竞态：abort 前必须已 insert）
@@ -416,14 +486,14 @@ mod tests {
         drop(rx); // 模拟前端断开：接收端被 drop，send 立即 Err
         let st = state.clone();
         let handle = tokio::spawn(async move {
-            st.request_approval("s1", "shell", "npm install", "{}", &tx)
+            st.request_approval("s1", "shell", "npm install", "{}", &[], &tx)
                 .await
         });
-        let approved = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
             .await
             .expect("request_approval must return promptly when send fails")
             .expect("task panicked");
-        assert!(!approved, "send failure should be treated as deny");
+        assert_eq!(result, ApprovalResult::Denied, "send failure should be deny");
         // pending 条目已清理，无泄漏
         assert_eq!(state.pending_approvals_count().await, 0);
     }

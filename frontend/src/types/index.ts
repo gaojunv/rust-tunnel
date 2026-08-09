@@ -585,6 +585,14 @@ export interface SessionConfigOption {
   currentBool?: boolean;
 }
 
+/** ACP `session/request_permission` 的权限选项（透传到审批卡片） */
+export interface ApprovalOption {
+  id: string;
+  label: string;
+  /** allow_once / allow_always / reject_once / reject_always / 自定义 */
+  kind: string;
+}
+
 export type AgentWsEvent =
   | { type: 'assistant_chunk'; content?: string; final?: boolean; thought?: boolean }
   | {
@@ -616,7 +624,15 @@ export type AgentWsEvent =
   | { type: 'done' }
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }
-  | { type: 'approval_request'; request_id: string; tool: string; summary: string; args_preview: string }
+  | {
+      type: 'approval_request';
+      request_id: string;
+      tool: string;
+      summary: string;
+      args_preview: string;
+      /** ACP `request_permission` 选项透传（空 = 无选项，保持 approve/deny 二元按钮） */
+      options?: ApprovalOption[];
+    }
   | { type: 'error'; message?: string }
   // 上游流传输失败重试信号：前端应丢弃已缓冲的半截增量，等重试后的完整文本从新气泡开始
   | { type: 'stream_reset' }

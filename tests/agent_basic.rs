@@ -523,7 +523,7 @@ async fn run_turn_with_approval(
             if let Some(approved) = resolve {
                 let req_id = frame["request_id"].as_str().unwrap().to_string();
                 agent
-                    .resolve_approval(&env.session_id, &req_id, approved, false)
+                    .resolve_approval(&env.session_id, &req_id, approved, None, false)
                     .await;
             }
         }

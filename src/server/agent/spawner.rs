@@ -124,6 +124,31 @@ impl AgentSpawner {
             .map(|entry| entry.control_sender.clone())
     }
 
+    /// 经控制通道在客户端执行一条 agent 命令（ACP `fs/read_text_file` /
+    /// `fs/write_text_file` 转发用；runner 路径走 `executor::exec_on_client`）。
+    pub async fn agent_exec(
+        &self,
+        client_id: &str,
+        request_id: &str,
+        session_id: &str,
+        root_path: &str,
+        docker_container: Option<&str>,
+        command: crate::common::AgentCommand,
+        timeout: Duration,
+    ) -> std::io::Result<crate::common::AgentResult> {
+        self.registry
+            .agent_exec(
+                client_id,
+                request_id,
+                session_id,
+                root_path,
+                docker_container,
+                command,
+                timeout,
+            )
+            .await
+    }
+
     /// 向客户端下发 `AgentExecCancel`（ACP 路径取消/杀进程用）。
     ///
     /// ACP 会话能 spawn 成功即意味着客户端 ≥ 0.4.0（agent spawn 协议与

@@ -650,6 +650,46 @@ describe('ChatStream running state', () => {
     expect(screen.getByText(/agent.approved/)).toBeTruthy();
   });
 
+  it('renders ACP permission options and returns selected option_id', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // approval_request 携带 options：卡片渲染选项按钮（而非 approveOnce/deny 二元）
+    act(() => {
+      wsInstance!.emit({
+        type: 'approval_request',
+        request_id: 'req4',
+        tool: 'shell',
+        summary: 'run a script',
+        args_preview: '{}',
+        options: [
+          { id: 'allow_once', label: '允许一次', kind: 'allow_once' },
+          { id: 'allow_always', label: '总是允许', kind: 'allow_always' },
+          { id: 'reject', label: '拒绝', kind: 'reject_once' },
+        ],
+      });
+    });
+    expect(screen.getByRole('button', { name: /允许一次/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /总是允许/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /拒绝/ })).toBeTruthy();
+    // 有选项时不显示二元按钮
+    expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.deny' })).toBeNull();
+    // 点击 allow_always → 回传 option_id（原样）+ remember=session
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: /总是允许/ }));
+    expect(
+      ws.sent.some(
+        (s) =>
+          s.includes('"type":"approval_response"') &&
+          s.includes('"request_id":"req4"') &&
+          s.includes('"option_id":"allow_always"') &&
+          s.includes('"remember":"session"'),
+      ),
+    ).toBe(true);
+    // 卡片变为已允许
+    expect(screen.getByText(/agent.approved/)).toBeTruthy();
+  });
+
   it('expires pending approval cards on done frame and unlocks send', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();

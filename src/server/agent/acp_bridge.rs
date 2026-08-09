@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,11 +29,12 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionNotification, SetSessionConfigOptionRequest, TextContent,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client, ConnectionTo};
@@ -45,6 +47,7 @@ use crate::server::persistence::db::agent::AgentWorkspaceRecord;
 use super::acp_events::map_update;
 use super::llm_bridge::{self, LlmGatewayEndpoint};
 use super::spawner::AgentSpawner;
+use super::{ApprovalOption, ApprovalResult};
 
 /// spawn/协商超时：LLM 代理启动与 agent 进程拉起各限 30s。
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,17 +113,20 @@ struct SpawnedAgent {
 
 /// ACP `session/request_permission` → 审批回调。
 ///
-/// `(session_id, tool, summary, args_preview, ws_tx) → 是否批准`。`AcpBridge`
-/// 构造时 `AgentState` 尚在构建（循环依赖），由 `AgentState::new` 通过
-/// [`Self::with_approval`] 注入真实实现（走 `AgentState::request_approval`，
-/// 与 runner 路径共用审批弹层与 pending map）；未注入时默认拒绝。
+/// `(session_id, tool, summary, args_preview, options, ws_tx) → 审批结果`。`options`
+/// 是 agent 给出的权限选项透传（用户可选中具体 option_id）；无选项时回调返回
+/// `Approved`/`Denied`。`AcpBridge` 构造时 `AgentState` 尚在构建（循环依赖），
+/// 由 `AgentState::new` 通过 [`Self::with_approval`] 注入真实实现（走
+/// `AgentState::request_approval`，与 runner 路径共用审批弹层与 pending map）；
+/// 未注入时默认拒绝。
 type ApproveFn = dyn Fn(
         String,
         String,
         String,
         String,
+        Vec<ApprovalOption>,
         mpsc::Sender<serde_json::Value>,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send>>
+    ) -> Pin<Box<dyn Future<Output = ApprovalResult> + Send>>
     + Send
     + Sync;
 
@@ -145,7 +151,9 @@ impl AcpBridge {
             spawner,
             db,
             cipher: None,
-            approval: Arc::new(|_, _, _, _, _| Box::pin(async { false })),
+            approval: Arc::new(|_, _, _, _, _, _| {
+                Box::pin(async { ApprovalResult::Denied })
+            }),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
         };
@@ -397,6 +405,7 @@ impl AcpBridge {
         let approval = self.approval.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
+        let spawner = self.spawner.clone();
         let (setup_tx, setup_rx) = oneshot::channel();
 
         // 常驻连接任务：connect_with 的 main_fn 完成 handshake 后保持挂起，
@@ -589,16 +598,31 @@ impl AcpBridge {
                                 .as_ref()
                                 .map(acp_raw_to_string)
                                 .unwrap_or_else(|| tool_name.clone());
-                            let approved = approval(
+                            // 透传 agent 给出的权限选项：用户可从中选具体选项（如
+                            // AskUserQuestion / plan 审批），而非服务端硬编码挑选。
+                            // options 为空时审批卡片保持 approve/deny 二元按钮。
+                            let options: Vec<ApprovalOption> = request
+                                .options
+                                .iter()
+                                .map(permission_option_to_approval)
+                                .collect();
+                            let result = approval(
                                 sid.clone(),
                                 tool_name,
                                 "ACP 工具调用请求".to_string(),
                                 args_preview,
+                                options,
                                 ws_tx,
                             )
                             .await;
-                            let outcome = if approved {
-                                pick_option(
+                            let outcome = match result {
+                                // 用户选中了具体选项：原样回传 option_id。
+                                ApprovalResult::Selected(id) => Some(
+                                    PermissionOptionId::from(id),
+                                ),
+                                // 无选项路径的批准/拒绝：fallback 到服务端挑默认选项
+                                // （AllowAlways→AllowOnce / RejectAlways→RejectOnce）。
+                                ApprovalResult::Approved => pick_option(
                                     &request.options,
                                     PermissionOptionKind::AllowAlways,
                                 )
@@ -607,9 +631,8 @@ impl AcpBridge {
                                         &request.options,
                                         PermissionOptionKind::AllowOnce,
                                     )
-                                })
-                            } else {
-                                pick_option(
+                                }),
+                                ApprovalResult::Denied => pick_option(
                                     &request.options,
                                     PermissionOptionKind::RejectAlways,
                                 )
@@ -618,7 +641,7 @@ impl AcpBridge {
                                         &request.options,
                                         PermissionOptionKind::RejectOnce,
                                     )
-                                })
+                                }),
                             };
                             match outcome {
                                 Some(option_id) => {
@@ -639,6 +662,74 @@ impl AcpBridge {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
+                .on_receive_request(
+                    {
+                        // fs/read_text_file：绝对路径 → 工作区相对路径 → 经隧道到
+                        // 客户端沙箱读取，内容回包给 agent（claude-code 据此读项目文件）。
+                        let sid = sid.clone();
+                        let db = db.clone();
+                        let sessions = sessions.clone();
+                        let spawner = spawner.clone();
+                        async move |request: ReadTextFileRequest, responder, _cx| {
+                            let outcome = exec_fs_read(
+                                &db,
+                                &spawner,
+                                &sessions,
+                                &sid,
+                                &request.path.to_string_lossy(),
+                            )
+                            .await;
+                            match outcome {
+                                Ok(content) => {
+                                    let _ = responder.respond(ReadTextFileResponse::new(content));
+                                }
+                                Err(e) => {
+                                    let _ = responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(
+                                            format!("fs/read_text_file failed: {e}"),
+                                        ),
+                                    );
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        // fs/write_text_file：同 read，写文件到客户端沙箱。
+                        let sid = sid.clone();
+                        let db = db.clone();
+                        let sessions = sessions.clone();
+                        let spawner = spawner.clone();
+                        async move |request: WriteTextFileRequest, responder, _cx| {
+                            let outcome = exec_fs_write(
+                                &db,
+                                &spawner,
+                                &sessions,
+                                &sid,
+                                &request.path.to_string_lossy(),
+                                &request.content,
+                            )
+                            .await;
+                            match outcome {
+                                Ok(()) => {
+                                    let _ = responder.respond(WriteTextFileResponse::new());
+                                }
+                                Err(e) => {
+                                    let _ = responder.respond_with_error(
+                                        agent_client_protocol::util::internal_error(
+                                            format!("fs/write_text_file failed: {e}"),
+                                        ),
+                                    );
+                                }
+                            }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
                 .connect_with(
                     {
                         // DuplexStream 非 Clone：拆成读写半各包一层 futures 适配。
@@ -648,9 +739,16 @@ impl AcpBridge {
                     async move |cx| {
                         // 1) initialize；2) session/new。失败则 setup 报错并关连接。
                         let setup = async {
-                            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                                .block_task()
-                                .await?;
+                            // 声明客户端 fs 能力：agent 才会通过 fs/read_text_file 与
+                            // fs/write_text_file 请求读文件（服务端经隧道转发到客户端
+                            // 沙箱执行）。不声明则 agent 静默降级（如报「不支持」）。
+                            let capabilities = client_capabilities();
+                            cx.send_request(
+                                InitializeRequest::new(ProtocolVersion::V1)
+                                    .client_capabilities(capabilities),
+                            )
+                            .block_task()
+                            .await?;
                             let new_session = cx
                                 .send_request(NewSessionRequest::new(&cwd))
                                 .block_task()
@@ -1419,6 +1517,153 @@ fn pick_option(
         .map(|o| o.option_id.clone())
 }
 
+/// ACP `PermissionOption` → 审批卡片透传的轻量 `ApprovalOption`（kind 归一为
+/// snake_case 字符串，前端据此渲染按钮样式 / 决定 remember 语义）。
+fn permission_option_to_approval(o: &PermissionOption) -> ApprovalOption {
+    ApprovalOption {
+        id: o.option_id.to_string(),
+        label: o.name.clone(),
+        kind: match o.kind {
+            PermissionOptionKind::AllowOnce => "allow_once".to_string(),
+            PermissionOptionKind::AllowAlways => "allow_always".to_string(),
+            PermissionOptionKind::RejectOnce => "reject_once".to_string(),
+            PermissionOptionKind::RejectAlways => "reject_always".to_string(),
+            // non_exhaustive：未来新增 kind 按自定义选项渲染（中性样式）。
+            _ => "custom".to_string(),
+        },
+    }
+}
+
+/// 本服务端声明的 ACP 客户端能力：fs 读写经隧道转发到客户端沙箱执行。
+/// 不声明则 agent 静默降级（如报「不支持」）。
+fn client_capabilities() -> agent_client_protocol::schema::v1::ClientCapabilities {
+    agent_client_protocol::schema::v1::ClientCapabilities::new().fs(
+        agent_client_protocol::schema::v1::FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true),
+    )
+}
+
+/// 把 ACP 的绝对路径转成工作区相对路径。客户端 `resolve_sandboxed` 只接受相对
+/// 路径（拒绝绝对路径、拒绝逃逸工作区）；ACP `Read/WriteTextFileRequest.path`
+/// 约定为绝对路径，这里剥掉 root_path 前缀。路径在工作区外 → Err。
+fn to_workspace_relative(root_path: &str, abs_path: &str) -> Result<String, String> {
+    let root = Path::new(root_path);
+    let abs = Path::new(abs_path);
+    if !abs.is_absolute() {
+        return Err(format!("fs request path must be absolute: {abs_path}"));
+    }
+    let rel = abs
+        .strip_prefix(root)
+        .map_err(|_| format!("fs request path is outside workspace root: {abs_path}"))?;
+    if rel.as_os_str().is_empty() {
+        return Err("fs request path is the workspace root itself".into());
+    }
+    Ok(rel.to_string_lossy().to_string())
+}
+
+/// fs 请求的公共上下文：session → workspace（root_path / docker）→ 活跃进程 client_id。
+struct FsContext {
+    client_id: String,
+    root_path: String,
+    docker_container: Option<String>,
+}
+
+/// 解析 fs 请求上下文；任一环节缺失报 Err（session 未建 / 进程未 spawn / DB 无记录）。
+async fn fs_context(
+    db: &Database,
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) -> Result<FsContext, String> {
+    let session = db
+        .agent_get_session(sid)
+        .await
+        .map_err(|e| format!("session lookup failed: {e}"))?
+        .ok_or_else(|| "session not found".to_string())?;
+    let ws = db
+        .agent_get_workspace(&session.workspace_id)
+        .await
+        .map_err(|e| format!("workspace lookup failed: {e}"))?
+        .ok_or_else(|| "workspace not found".to_string())?;
+    let client_id = {
+        let sessions = sessions.lock().await;
+        sessions
+            .get(sid)
+            .map(|a| a.client_id.clone())
+            .ok_or_else(|| "session not spawned".to_string())?
+    };
+    Ok(FsContext {
+        client_id,
+        root_path: ws.root_path,
+        docker_container: ws.docker_container_id,
+    })
+}
+
+/// 执行 `fs/read_text_file`：绝对路径 → 工作区相对路径 → 经隧道转发到客户端
+/// 沙箱读取，返回文本内容。
+async fn exec_fs_read(
+    db: &Database,
+    spawner: &AgentSpawner,
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+    abs_path: &str,
+) -> Result<String, String> {
+    let ctx = fs_context(db, sessions, sid).await?;
+    let rel = to_workspace_relative(&ctx.root_path, abs_path)?;
+    let request_id = format!("{:032x}", rand::random::<u128>());
+    let result = spawner
+        .agent_exec(
+            &ctx.client_id,
+            &request_id,
+            sid,
+            &ctx.root_path,
+            ctx.docker_container.as_deref(),
+            crate::common::AgentCommand::ReadFile { path: rel },
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| format!("tunnel execution failed: {e}"))?;
+    match result {
+        crate::common::AgentResult::FileContent { content } => Ok(content),
+        crate::common::AgentResult::Error { message } => Err(message),
+        other => Err(format!("unexpected read result: {other:?}")),
+    }
+}
+
+/// 执行 `fs/write_text_file`：同 read，写文件到客户端沙箱。
+async fn exec_fs_write(
+    db: &Database,
+    spawner: &AgentSpawner,
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+    abs_path: &str,
+    content: &str,
+) -> Result<(), String> {
+    let ctx = fs_context(db, sessions, sid).await?;
+    let rel = to_workspace_relative(&ctx.root_path, abs_path)?;
+    let request_id = format!("{:032x}", rand::random::<u128>());
+    let result = spawner
+        .agent_exec(
+            &ctx.client_id,
+            &request_id,
+            sid,
+            &ctx.root_path,
+            ctx.docker_container.as_deref(),
+            crate::common::AgentCommand::WriteFile {
+                path: rel,
+                content: content.to_string(),
+            },
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| format!("tunnel execution failed: {e}"))?;
+    match result {
+        crate::common::AgentResult::Success => Ok(()),
+        crate::common::AgentResult::Error { message } => Err(message),
+        other => Err(format!("unexpected write result: {other:?}")),
+    }
+}
+
 /// 把 ACP 权限请求的 raw 输入编码成审批弹层的 args_preview 字符串。
 /// 字符串直传；对象序列化为 JSON 文本（与 acp_events 的 encode_raw 同语义）。
 fn acp_raw_to_string(value: &serde_json::Value) -> String {
@@ -1608,6 +1853,118 @@ mod tests {
             }
         });
         AcpBridge::new(AgentSpawner::new(registry), db)
+    }
+
+    #[test]
+    fn test_client_capabilities_declare_fs() {
+        // fs 能力必须声明：agent 才走 fs/read_text_file 而非静默报「不支持」。
+        let caps = client_capabilities();
+        assert!(caps.fs.read_text_file);
+        assert!(caps.fs.write_text_file);
+    }
+
+    #[test]
+    fn test_to_workspace_relative() {
+        assert_eq!(to_workspace_relative("/ws", "/ws/a/b.txt").unwrap(), "a/b.txt");
+        assert_eq!(to_workspace_relative("/ws", "/ws/a.txt").unwrap(), "a.txt");
+        // 工作区外 / 非绝对 / 根目录自身 → Err
+        assert!(to_workspace_relative("/ws", "/etc/passwd").is_err());
+        assert!(to_workspace_relative("/ws", "a/b.txt").is_err());
+        assert!(to_workspace_relative("/ws", "/ws").is_err());
+        // 前缀歧义：/wsx 不在 /ws 下
+        assert!(to_workspace_relative("/ws", "/wsx/a").is_err());
+    }
+
+    /// 装配 fs 测试环境：内存 DB（workspace `/ws` + session）、注册客户端（spawn loop
+    /// 应答 AgentExecRequest 返回固定结果）、活跃会话条目（client_id=nas）。
+    async fn fs_test_env(
+        exec_result: crate::common::AgentResult,
+    ) -> (Database, AgentSpawner, Arc<Mutex<HashMap<String, SpawnedAgent>>>) {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let ControlMessage::AgentExecRequest { request_id, .. } = req else {
+                    panic!("unexpected request: {req:?}");
+                };
+                registry2
+                    .deliver_agent_response("nas", &request_id, exec_result.clone())
+                    .await;
+            }
+        });
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let mut agent = spawned_agent();
+        agent.client_id = "nas".into();
+        sessions.lock().await.insert("sess-1".into(), agent);
+        (db, AgentSpawner::new(registry), sessions)
+    }
+
+    #[tokio::test]
+    async fn test_exec_fs_read_forwards_via_tunnel() {
+        // 绝对路径 → 相对路径 → 客户端返回 FileContent → 回包给 agent。
+        let (db, spawner, sessions) = fs_test_env(crate::common::AgentResult::FileContent {
+            content: "hello fs".into(),
+        })
+        .await;
+        let content = exec_fs_read(&db, &spawner, &sessions, "sess-1", "/ws/src/main.rs")
+            .await
+            .expect("read should succeed");
+        assert_eq!(content, "hello fs");
+    }
+
+    #[tokio::test]
+    async fn test_exec_fs_read_rejects_outside_workspace() {
+        let (db, spawner, sessions) = fs_test_env(crate::common::AgentResult::Success).await;
+        let err = exec_fs_read(&db, &spawner, &sessions, "sess-1", "/etc/passwd")
+            .await
+            .expect_err("outside workspace should be rejected");
+        assert!(err.contains("outside workspace"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_exec_fs_read_propagates_client_error() {
+        let (db, spawner, sessions) = fs_test_env(crate::common::AgentResult::Error {
+            message: "no such file".into(),
+        })
+        .await;
+        let err = exec_fs_read(&db, &spawner, &sessions, "sess-1", "/ws/missing.txt")
+            .await
+            .expect_err("client error should propagate");
+        assert_eq!(err, "no such file");
+    }
+
+    #[tokio::test]
+    async fn test_exec_fs_write_forwards_via_tunnel() {
+        let (db, spawner, sessions) = fs_test_env(crate::common::AgentResult::Success).await;
+        exec_fs_write(&db, &spawner, &sessions, "sess-1", "/ws/a.txt", "hi")
+            .await
+            .expect("write should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_exec_fs_session_not_spawned_errors() {
+        // 会话条目缺失（进程未 spawn）：在构造 AgentCommand 前即报错，不触发隧道请求。
+        let (db, spawner, _sessions) = fs_test_env(crate::common::AgentResult::Success).await;
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let err = exec_fs_read(&db, &spawner, &sessions, "sess-1", "/ws/a.txt")
+            .await
+            .expect_err("missing session entry should error");
+        assert_eq!(err, "session not spawned");
     }
 
     #[tokio::test]
