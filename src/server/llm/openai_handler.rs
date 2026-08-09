@@ -253,7 +253,9 @@ pub async fn handle_chat_completions(
     let db = state.llm.db.clone();
 
     // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
+    #[allow(unused_mut, reason = "assigned only inside the rag-gated inject block")]
     let mut rag_injected: i64 = 0;
+    #[cfg(feature = "rag")]
     if let Some(kb_id) = kb_id_for_rag {
         if let Some(ref db) = db {
             let outcome = super::rag::enhance(
@@ -693,6 +695,7 @@ mod tests {
     /// 构造带 RAG 的 LlmState：真实临时 DB + 真实 VectorStore（tempdir）+ KB + chunk + api key 绑 KB。
     /// `emb_base_url` 由调用点启动的 mock embedding server 提供（返回固定 8 维向量）。
     /// 返回 (state, 有效 API key, _tempdir 守卫)。
+    #[cfg(feature = "rag")]
     async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
@@ -785,6 +788,7 @@ mod tests {
 
     /// RAG 注入端到端：api key 绑 KB → 请求 chat completions → 上游收到的 messages[0]
     /// 是注入的 system 消息且含 `<knowledge_base>`；usage log 记录 rag_chunks_injected=1。
+    #[cfg(feature = "rag")]
     #[tokio::test]
     async fn rag_injects_knowledge_base_into_messages() {
         use axum::routing::post;
@@ -906,6 +910,7 @@ mod tests {
     /// 降级直通端到端：api key **绑定**了 KB，但 KB 的 emb_base_url 不可达 →
     /// 检索降级为空，请求原样透传上游（messages 无 knowledge_base 注入），
     /// usage log 记录成功且 rag_chunks_injected 为 None。验证「RAG 永不阻断会话」。
+    #[cfg(feature = "rag")]
     #[tokio::test]
     async fn rag_degrades_to_pass_through_when_embedding_unreachable() {
         use axum::routing::post;

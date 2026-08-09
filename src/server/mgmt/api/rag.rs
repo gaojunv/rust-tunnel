@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
     },
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use tokio::sync::broadcast;
 
@@ -36,6 +37,38 @@ use super::{dto::SseQuery, ApiState};
 /// 字面量与 FileType::max_bytes 的二进制值保持一致（const 上下文无法调用
 /// 非 const fn，故写字面量并注明对应关系）。
 pub(crate) const MULTIPART_BODY_LIMIT: usize = 20 * 1024 * 1024 + 64 * 1024;
+
+/// RAG 公开路由（SSE 事件流，`?token=` 认证）。仅 `rag` feature 启用时存在。
+/// 返回 `Router<ApiState>`（handler 均依赖 `ApiState`，与生产路由链类型一致）。
+pub fn public_router() -> Router<ApiState> {
+    axum::Router::new().route("/api/llm/kb/events", get(sse_kb_events))
+}
+
+/// RAG 受保护路由（需 JWT）。仅 `rag` feature 启用时存在。
+/// 返回 `Router<ApiState>`（handler 均依赖 `ApiState`，与生产路由链类型一致）。
+pub fn protected_router() -> Router<ApiState> {
+    axum::Router::new()
+        .route("/api/llm/kb", get(list_kbs).post(create_kb))
+        .route(
+            "/api/llm/kb/:id",
+            get(get_kb).put(update_kb).patch(patch_kb).delete(delete_kb),
+        )
+        .route(
+            "/api/llm/kb/:id/docs",
+            get(list_docs).post(upload_doc),
+        )
+        .layer(DefaultBodyLimit::max(MULTIPART_BODY_LIMIT))
+        .route(
+            "/api/llm/kb/:id/docs/:doc_id",
+            get(get_doc).delete(delete_doc),
+        )
+        .route(
+            "/api/llm/kb/:id/docs/:doc_id/reindex",
+            post(reindex_doc),
+        )
+        .route("/api/llm/kb/test-embedding", post(test_embedding))
+        .route("/api/llm/kb/:id/query", post(query_kb))
+}
 
 /// 文档原文落盘路径：`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`（保留真实扩展名，
 /// 二进制原文 reindex 时按 file_type 重新解析）。

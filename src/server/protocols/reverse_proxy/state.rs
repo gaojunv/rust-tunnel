@@ -85,6 +85,7 @@ impl ReverseProxyState {
         &self,
         db: Option<Database>,
         master_key: Option<[u8; 32]>,
+        #[cfg_attr(not(feature = "rag"), allow(unused_variables))]
         rag_data_dir: &Path,
         dynamic_config: Arc<tokio::sync::RwLock<crate::server::dynamic_config::DynamicConfig>>,
     ) {
@@ -94,7 +95,10 @@ impl ReverseProxyState {
         };
 
         let cipher = master_key.map(crate::server::llm::crypto::LlmCipher::from_master_key);
+        #[cfg(feature = "rag")]
         let mut llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
+        #[cfg(not(feature = "rag"))]
+        let mut llm = LlmState::new(db, cipher);
         llm.dynamic_config = dynamic_config;
 
         // Derive gateway config from the ProxyRule

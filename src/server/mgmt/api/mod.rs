@@ -1,6 +1,5 @@
 use axum::{
     body::Body,
-    extract::DefaultBodyLimit,
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -23,6 +22,7 @@ pub mod login;
 pub mod logs;
 pub mod mesh;
 pub mod preferences;
+#[cfg(feature = "rag")]
 pub mod rag;
 pub mod reverse_proxy;
 pub mod server_auth;
@@ -215,12 +215,12 @@ pub async fn run_api_server(
         .allow_headers(Any);
 
     // Public routes (no auth required) — SSE uses ?token= query param for auth
-    let public_routes = Router::new()
+    #[allow(unused_mut, reason = "reassigned only by the rag-gated merge block below")]
+    let mut public_routes = Router::new()
         .route("/api/login", post(login::login))
         .route("/api/health", get(login::health))
         .route("/api/stats/stream", get(stats::sse_stats_stream))
         .route("/api/logs/stream", get(logs::sse_log_stream))
-        .route("/api/llm/kb/events", get(rag::sse_kb_events))
         .route("/api/agent/ws", get(agent::agent_ws))
         .route("/api/agent/terminal/ws", get(agent::terminal_ws))
         .route("/api/preferences", get(preferences::get_preferences));
@@ -363,30 +363,6 @@ pub async fn run_api_server(
             "/api/llm/model-groups/:id/reset-breaker",
             post(llm::reset_group_breaker),
         )
-        // RAG knowledge base management (SSE events endpoint is in public_routes — uses ?token= query param)
-        .route("/api/llm/kb", get(rag::list_kbs).post(rag::create_kb))
-        .route(
-            "/api/llm/kb/:id",
-            get(rag::get_kb)
-                .put(rag::update_kb)
-                .patch(rag::patch_kb)
-                .delete(rag::delete_kb),
-        )
-        .route(
-            "/api/llm/kb/:id/docs",
-            get(rag::list_docs).post(rag::upload_doc),
-        )
-        .layer(DefaultBodyLimit::max(rag::MULTIPART_BODY_LIMIT))
-        .route(
-            "/api/llm/kb/:id/docs/:doc_id",
-            get(rag::get_doc).delete(rag::delete_doc),
-        )
-        .route(
-            "/api/llm/kb/:id/docs/:doc_id/reindex",
-            post(rag::reindex_doc),
-        )
-        .route("/api/llm/kb/test-embedding", post(rag::test_embedding))
-        .route("/api/llm/kb/:id/query", post(rag::query_kb))
         // Agent workbench endpoints (WebSocket is in public_routes — uses ?token= query param)
         .route(
             "/api/agent/workspaces",
@@ -455,6 +431,15 @@ pub async fn run_api_server(
             "/api/settings/dns",
             get(dns::get_dns_config).put(dns::update_dns_config),
         );
+
+    // RAG 知识库路由（仅 rag feature 启用时挂载）。必须在 auth middleware 应用
+    // 之前 merge 进 protected_routes——axum 的 `.layer()` 只包裹调用时已存在的
+    // 路由，之后 merge 进来的路由不会被包裹（否则 /api/llm/kb* 会失去 JWT 保护）。
+    #[cfg(feature = "rag")]
+    {
+        public_routes = public_routes.merge(rag::public_router());
+        protected_routes = protected_routes.merge(rag::protected_router());
+    }
 
     // Only apply auth middleware if password is set
     if auth_config.is_enabled() {

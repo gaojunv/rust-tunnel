@@ -71,7 +71,7 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 
 # Database
-qdrant-edge = "=0.7.2"
+qdrant-edge = { version = "=0.7.2", optional = true }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 
 # Get hostname
@@ -128,6 +128,7 @@ agent-client-protocol = "2"
 
 [features]
 embed-frontend = ["rust-embed"]
+rag = ["dep:qdrant-edge"]
 
 # ---- 测试构建优化：降低内存占用、缩短链接/加载时间 ----
 # test profile 继承 dev；压缩 debuginfo 后单个测试二进制从 ~1.2G 降到 ~200M，

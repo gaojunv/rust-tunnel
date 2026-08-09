@@ -6,11 +6,13 @@ pub mod crypto;
 pub mod format;
 pub mod openai_handler;
 pub mod provider;
+#[cfg(feature = "rag")]
 pub mod rag;
 pub mod router;
 pub mod upstream;
 pub mod usage;
 
+#[cfg(feature = "rag")]
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -296,8 +298,10 @@ pub struct LlmState {
     /// 字段加密器（提供商 API Key 等敏感字段的落库加密）；None 表示未配置主密钥。
     pub cipher: Option<crate::server::llm::crypto::LlmCipher>,
     /// RAG 向量存储（知识库检索）。
+    #[cfg(feature = "rag")]
     pub rag_store: rag::store::VectorStore,
     /// RAG 摄入状态事件通道（SSE 推送给前端）。
+    #[cfg(feature = "rag")]
     pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
     /// 动态配置引用（LLM 请求日志开关等）。默认开启，生产路径由 init_llm_state 注入真实实例。
     pub dynamic_config: Arc<RwLock<crate::server::dynamic_config::DynamicConfig>>,
@@ -307,15 +311,28 @@ pub struct LlmState {
 
 impl LlmState {
     /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
-    /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录。
+    /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录（仅 `rag` feature 启用时可用）。
     pub fn new(
         db: Option<Database>,
         cipher: Option<crate::server::llm::crypto::LlmCipher>,
     ) -> Self {
-        Self::new_with_rag(db, cipher, Path::new(&std::env::temp_dir()))
+        Self {
+            db,
+            gateway_config: Arc::new(RwLock::new(None)),
+            cipher,
+            #[cfg(feature = "rag")]
+            rag_store: rag::store::VectorStore::new(Path::new(&std::env::temp_dir())),
+            #[cfg(feature = "rag")]
+            rag_tx: tokio::sync::broadcast::channel(256).0,
+            dynamic_config: Arc::new(RwLock::new(
+                crate::server::dynamic_config::DynamicConfig::default_for_llm(),
+            )),
+            breakers: breaker::ModelBreakers::new(),
+        }
     }
 
     /// 指定 RAG 数据目录构造（知识库向量 shard 位于 `<rag_data_dir>/rag/<kb_id>/`）。
+    #[cfg(feature = "rag")]
     pub fn new_with_rag(
         db: Option<Database>,
         cipher: Option<crate::server::llm::crypto::LlmCipher>,

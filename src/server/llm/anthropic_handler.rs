@@ -378,6 +378,8 @@ pub async fn handle_messages(
         .unwrap_or(false);
 
     // 用量采集上下文
+    // 仅 rag feature 启用时使用；feature 关闭时保留绑定并允许未使用。
+    #[cfg_attr(not(feature = "rag"), allow(unused_variables))]
     let api_key_id_for_rag = api_key_id.clone();
     let mut ctx = super::usage::UsageContext {
         api_key_id: Some(api_key_id),
@@ -486,7 +488,9 @@ pub async fn handle_messages(
 
     // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
     // 直通路径（anthropic_base_url 分支）不注入 —— 规格边界。
+    #[allow(unused_mut, reason = "assigned only inside the rag-gated inject block")]
     let mut rag_injected: i64 = 0;
+    #[cfg(feature = "rag")]
     if let Some(ref db) = db {
         if let Ok(Some(kb_id)) = db.rag_get_kb_id_for_api_key(&api_key_id_for_rag).await {
             let outcome = super::rag::enhance(
@@ -1521,6 +1525,7 @@ mod tests {
     /// 构造带 RAG 的 LlmState（与 openai_handler 测试等价的 helper）：真实临时
     /// DB + VectorStore（tempdir）+ KB + chunk + api key 绑 KB。`emb_base_url`
     /// 由调用点启动的 mock embedding server 提供（返回固定 8 维向量）。
+    #[cfg(feature = "rag")]
     async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = crate::server::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
@@ -1610,6 +1615,7 @@ mod tests {
     /// 回退路径注入端到端：api key 绑 KB → Anthropic 请求 → 回退路径转 OpenAI 格式
     /// → RAG 注入 messages[0]（含 `<knowledge_base>`）→ 上游（OpenAI 格式）收到；
     /// usage log 记录 rag_chunks_injected=1。复刻 openai_handler 的 rag 注入测试。
+    #[cfg(feature = "rag")]
     #[tokio::test]
     async fn anthropic_fallback_injects_knowledge_base() {
         use axum::routing::post;
