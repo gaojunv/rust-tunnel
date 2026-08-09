@@ -388,6 +388,8 @@ enum WsFrame {
         approved: bool,
         remember: bool,
     },
+    /// ACP 会话配置切换（session/set_config_option 透传）
+    SetConfigOption { config_id: String, value: String },
     Other,
 }
 
@@ -437,6 +439,22 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                     Some("session")
                 ),
             }
+        }
+        Some("set_config_option") => {
+            let config_id = body
+                .get("config_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = body
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if config_id.is_empty() || value.is_empty() {
+                return WsFrame::Other;
+            }
+            WsFrame::SetConfigOption { config_id, value }
         }
         _ => WsFrame::Other,
     }
@@ -558,6 +576,18 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // 异步执行，两轮之间的 cancel/approval_response 帧也要在此处理。
     let mut acp_active = false;
 
+    // ACP 会话已就绪（重连/多标签页场景）：立即推送配置快照，前端设置菜单
+    // 无需等下一次 config_option_update。session 尚未 spawn 时返回 None 跳过。
+    if let Some(agent) = state.server_state.agent_state.as_ref() {
+        if let Some(bridge) = agent.acp_bridge.as_ref() {
+            if let Some(options) = bridge.session_config_options(&session_id).await {
+                let _ = event_tx
+                    .send(serde_json::json!({"type": "session_state", "options": options}))
+                    .await;
+            }
+        }
+    }
+
     loop {
         // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
         let (content, refs) = if let Some(p) = pending.take() {
@@ -595,6 +625,42 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             agent
                                 .resolve_approval(&session_id, &request_id, approved, remember)
                                 .await;
+                        }
+                    }
+                    continue;
+                }
+                WsFrame::SetConfigOption { config_id, value } => {
+                    if acp_active {
+                        if let Some(agent) = state.server_state.agent_state.as_ref() {
+                            if let Some(bridge) = agent.acp_bridge.as_ref() {
+                                match bridge
+                                    .set_config_option(&session_id, &config_id, &value)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        // 持久化（best-effort）：重连/重开时握手回放。
+                                        if let Err(e) = agent
+                                            .db
+                                            .agent_update_session_config_state(
+                                                &session_id,
+                                                &config_id,
+                                                Some(&value),
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(session_id = %session_id, "persist config_state failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx
+                                            .send(serde_json::json!({
+                                                "type": "error",
+                                                "message": format!("设置失败: {e}")
+                                            }))
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                     }
                     continue;
@@ -838,6 +904,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                     )
                                     .await;
                             }
+                            // 配置切换是 ACP 会话概念：本内层循环只跑自研 runner
+                            // 路径（ACP 回合在外层循环处理），无会话配置可切换，忽略。
+                            WsFrame::SetConfigOption { .. } => {}
                             WsFrame::Other => {}
                         },
                     },
@@ -1565,6 +1634,28 @@ mod tests {
             r#"{"type":"approval_response","approved":true}"#.into(),
         ));
         assert!(matches!(bad, WsFrame::Other));
+    }
+
+    #[test]
+    fn test_parse_set_config_option() {
+        let frame = parse_ws_frame(Message::Text(
+            r#"{"type":"set_config_option","config_id":"mode","value":"plan"}"#.into(),
+        ));
+        match frame {
+            WsFrame::SetConfigOption { config_id, value } => {
+                assert_eq!(config_id, "mode");
+                assert_eq!(value, "plan");
+            }
+            _ => panic!("expected SetConfigOption"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_config_option_missing_fields() {
+        let frame = parse_ws_frame(Message::Text(
+            r#"{"type":"set_config_option","config_id":""}"#.into(),
+        ));
+        assert!(matches!(frame, WsFrame::Other));
     }
 
     async fn test_state() -> (ApiState, Database) {
