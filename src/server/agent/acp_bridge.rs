@@ -81,12 +81,14 @@ struct SpawnedAgent {
     /// prompt（ACP 单连接不支持并发回合；WS session_lock 只串行化分派，
     /// 不跨异步回合）。
     busy: bool,
-    /// 回合被取消标记：`cancel` 置位。杀进程后 `on_receiving_result` 会以 Err
-    /// 到达（stopped 帧已由 WS handler 回发），终态回调据此抑制 done/error 帧，
-    /// 避免取消后再补一条误导性的 error 帧。终态回调处理时读取并复位（只对
-    /// 本回合生效）。不用 exited 判定——进程自行崩溃（非用户取消）时 exited
-    /// 也会置位，此时仍须把错误上报前端。
-    cancelled: bool,
+    /// 已被取消的回合代数集合：`cancel` 时记录当前回合代数。终态回调只对
+    /// 与自身代数匹配的取消做抑制（避免跨回合误吞 done/误发 error）。
+    /// 不用 exited 判定——进程自行崩溃（非用户取消）时 exited 也会置位，
+    /// 此时仍须把错误上报前端。
+    cancelled_turns: std::collections::HashSet<u64>,
+    /// 回合代数计数器：每次 prompt 递增，与 cancelled_turns 配合区分
+    /// "哪个回合被取消"。
+    turn_generation: u64,
     /// 最近活动时间（prompt / cancel / stdio / ACP 通知都会刷新；idle reaper 依据）。
     last_activity: std::time::Instant,
     /// AgentSpawnExit 已到达（进程结束）。
@@ -274,7 +276,8 @@ impl AcpBridge {
                     client_id: workspace.client_id.clone(),
                     ws_tx: Some(ws_tx.clone()),
                     busy: false,
-                    cancelled: false,
+                    cancelled_turns: std::collections::HashSet::new(),
+                    turn_generation: 0,
                     last_activity: std::time::Instant::now(),
                     exited: false,
                     text_buf: String::new(),
@@ -698,7 +701,7 @@ impl AcpBridge {
     /// 不支持并发回合）。取消/杀进程后的终态帧被抑制（stopped 帧已由 WS handler
     /// 回发，再补 error/done 会造成误导）。
     pub async fn prompt(&self, session_id: &str, content: &str) -> Result<(), String> {
-        let (connection, acp_session_id) = {
+        let (connection, acp_session_id, turn_gen) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
                 .get_mut(session_id)
@@ -720,7 +723,12 @@ impl AcpBridge {
                 .ok_or_else(|| "ACP handshake not complete".to_string())?;
             agent.busy = true;
             agent.last_activity = std::time::Instant::now();
-            (connection, acp_session_id)
+            // 为本回合分配递增代数：cancel 时记录，终态回调据此判断是否抑制。
+            // 解决单布尔跨回合共享导致 cancel 后立即重发 prompt 时误吞 done/
+            // 误发 error 的竞态（cancelled 布尔无法区分"哪个回合被取消"）。
+            agent.turn_generation += 1;
+            let turn_gen = agent.turn_generation;
+            (connection, acp_session_id, turn_gen)
         };
 
         let sessions = self.sessions.clone();
@@ -737,19 +745,18 @@ impl AcpBridge {
                 // 否则前端 done 后 invalidate 的历史 refetch 可能读不到本回合并本。
                 flush_acp_turn_buffers(&db, &sessions, &sid).await;
                 // 回合终态：清 busy + 取当前 WS 通道（重连后 done/error 推给最新
-                // 连接，与通知处理器同语义）。若回合被取消/会话已被杀（条目移除），
-                // 抑制终态帧——取消路径的 stopped 帧已由 WS handler 回发，再补
-                // error/done 会造成误导（评审 Finding 4）。注意抑制条件只用 cancelled
-                // 而非 exited：进程自行崩溃（非用户取消）时 exited 也会置位，此时
-                // 必须把错误上报前端，不能吞。
+                // 连接，与通知处理器同语义）。若本回合被取消（cancelled_turns 含
+                // 本代数）或会话已被杀（条目移除），抑制终态帧——取消路径的
+                // stopped 帧已由 WS handler 回发，再补 error/done 会造成误导。
+                // 注意抑制条件按代数匹配而非全局布尔：cancel 后立即重发 prompt
+                // 时，新回合的终态回调不会被旧回合的取消标记误吞（评审 Finding）。
                 let ws_tx = {
                     let mut map = sessions.lock().await;
                     match map.get_mut(&sid) {
                         Some(a) => {
                             a.busy = false;
-                            if a.cancelled {
-                                a.cancelled = false; // 取消标记只对本回合终态生效
-                                return Ok(());
+                            if a.cancelled_turns.remove(&turn_gen) {
+                                return Ok(()); // 本回合被取消：抑制终态帧
                             }
                             a.ws_tx.clone()
                         }
@@ -799,9 +806,11 @@ impl AcpBridge {
                 Some(agent) => {
                     agent.last_activity = std::time::Instant::now();
                     agent.busy = false;
-                    // 标记本回合已取消：杀进程后 on_receiving_result 会以 Err 到达，
-                    // 终态回调据此抑制 error 帧（stopped 帧已由 WS handler 回发）。
-                    agent.cancelled = true;
+                    // 记录当前回合代数为已取消：杀进程后 on_receiving_result 会
+                    // 以 Err 到达，终态回调据此抑制 error 帧（stopped 帧已由 WS
+                    // handler 回发）。用代数而非布尔：cancel 后立即重发 prompt
+                    // 时，新回合分配新代数，不会被本条取消标记误伤。
+                    agent.cancelled_turns.insert(agent.turn_generation);
                     (
                         agent.client_id.clone(),
                         agent.connection.clone(),
@@ -1453,7 +1462,8 @@ mod tests {
             client_id: "nas".into(),
             ws_tx: None,
             busy: false,
-            cancelled: false,
+            cancelled_turns: std::collections::HashSet::new(),
+            turn_generation: 0,
             last_activity: std::time::Instant::now(),
             exited: false,
             text_buf: String::new(),
@@ -2192,14 +2202,17 @@ mod tests {
         let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
         setup_handshake(&bridge, ws_tx.clone()).await;
 
-        // 模拟 cancel 已执行（标记条目；cancel 同时会清 busy，这里直接置位）。
+        // 模拟 cancel 已执行：prompt 会分配 turn_generation=1，cancel 把该
+        // 代数记入 cancelled_turns（真实路径由 cancel() 在 busy 时插入当前代数）。
+        // 这里直接预置，等价于 cancel 发生在 prompt 之后但终态回调之前。
         bridge
             .sessions
             .lock()
             .await
             .get_mut("sess-1")
             .unwrap()
-            .cancelled = true;
+            .cancelled_turns
+            .insert(1);
 
         bridge
             .prompt("sess-1", "hello")
@@ -2231,7 +2244,68 @@ mod tests {
         {
             let s = bridge.sessions.lock().await;
             assert!(!s.get("sess-1").unwrap().busy);
-            assert!(!s.get("sess-1").unwrap().cancelled);
+            assert!(s.get("sess-1").unwrap().cancelled_turns.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
+        // 回归（P0-5）：cancel 后立即重发 prompt，新回合的终态回调不得被旧回合
+        // 的取消标记误吞（单布尔时代会错误抑制新回合的 done 帧）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake(&bridge, ws_tx.clone()).await;
+
+        // 模拟旧回合（turn_generation=1）已跑完且被取消：预置计数器到 1，
+        // 并把代数 1 记入 cancelled_turns。接下来的 prompt 会分配代数 2，
+        // 其终态回调不应被代数 1 的取消标记抑制。
+        {
+            let mut sessions = bridge.sessions.lock().await;
+            let agent = sessions.get_mut("sess-1").unwrap();
+            agent.turn_generation = 1;
+            agent.cancelled_turns.insert(1);
+        }
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+
+        // 新回合应正常收到 done 帧（不被旧回合的取消标记抑制）
+        let mut got_done = false;
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv()).await {
+                Ok(Some(ev)) if ev["type"] == "done" => {
+                    got_done = true;
+                    break;
+                }
+                Ok(Some(ev)) => {
+                    events.push(ev);
+                    continue;
+                } // 流式事件，继续等终态
+                Ok(None) => panic!("ws channel closed unexpectedly, events so far: {events:?}"),
+                Err(_) => panic!("timed out waiting for done frame, events so far: {events:?}"),
+            }
+        }
+        assert!(
+            got_done,
+            "new turn must emit done frame, not suppressed by old cancel. events: {events:?}"
+        );
+        // busy 已复位，旧取消标记仍残留（未被本回合消费）
+        {
+            let s = bridge.sessions.lock().await;
+            assert!(!s.get("sess-1").unwrap().busy);
+            assert!(s.get("sess-1").unwrap().cancelled_turns.contains(&1));
         }
     }
 
