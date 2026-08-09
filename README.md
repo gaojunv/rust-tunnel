@@ -224,11 +224,11 @@ cargo check
 # 运行测试
 cargo test
 
-# 调试模式运行服务器
-cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
+# 调试模式运行服务器（含 RAG 的完整构建）
+cargo run -p rust-tunnel-server --features rag -- --bind 0.0.0.0:8080
 
 # 调试模式运行客户端
-cargo run --bin rust-tunnel-client -- --server localhost:8080 --forward 8080:localhost:80
+cargo run -p rust-tunnel-client -- --server localhost:8080 --password <token> --name home-nas
 ```
 
 ### 前端开发

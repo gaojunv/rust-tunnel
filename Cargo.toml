@@ -9,7 +9,7 @@ license = "MIT"
 members = ["crates/common", "crates/client", "crates/server"]
 
 [workspace.dependencies]
-# ⬇ 逐字复制原根 Cargo.toml 的全部 [dependencies] + [dev-dependencies] + [target] 条目
+# Async runtime
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -31,6 +31,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", 
 hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "rustls-native-certs"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# 嵌入前端资源（服务端 `embed-frontend` feature）
 rust-embed = { version = "8.0", features = ["axum"] }
 mime_guess = "2.0"
 jsonwebtoken = "9.0"
@@ -40,6 +41,7 @@ uuid = { version = "1.0", features = ["v4"] }
 qdrant-edge = { version = "=0.7.2" }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 gethostname = "0.4"
+# PTY for the agent terminal loopback service (wezterm-maintained, Unix/ConPTY)
 portable-pty = "0.9"
 toml = "0.8"
 figment = { version = "0.10", features = ["env", "toml"] }
@@ -53,8 +55,11 @@ rustls-native-certs = "0.7"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
 md-5 = "0.10"
+# PDF 文本层提取（纯 Rust，无系统动态库依赖；nom_parser 提供 load/extract_text）
 lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] }
+# OOXML（docx/xlsx/pptx）解包：仅 deflate（miniz_oxide 纯 Rust），不开 bzip2/zstd/aes
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# OOXML XML 部件解析；escape-html 提供文本实体的 unescape
 quick-xml = { version = "0.31", features = ["escape-html"] }
 sha1 = "0.10"
 sha2 = "0.10"
