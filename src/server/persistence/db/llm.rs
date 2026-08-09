@@ -603,8 +603,11 @@ impl Database {
         Ok(row.0)
     }
 
-    /// 删除早于 `before`（ISO 8601 字符串）的用量日志，返回删除行数。
-    pub async fn cleanup_old_llm_usage_logs(&self, before: &str) -> Result<u64, sqlx::Error> {
+    /// 删除早于 `before` 的用量日志，返回删除行数。
+    /// 存储格式是 SQLite datetime（"YYYY-MM-DD HH:MM:SS"），必须转成同一格式
+    /// 再做字符串比较，否则边界日当天（' ' < 'T'）的记录会被误删。
+    pub async fn cleanup_old_llm_usage_logs(&self, before: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+        let before = before.format("%Y-%m-%d %H:%M:%S").to_string();
         let result = sqlx::query("DELETE FROM llm_usage_logs WHERE timestamp < ?")
             .bind(before)
             .execute(&self.pool)
@@ -1169,7 +1172,7 @@ mod tests {
         let (db, _tmp) = fresh_db().await;
         // 手工插入一条 timestamp 很旧的记录
         sqlx::query(
-            "INSERT INTO llm_usage_logs (id, timestamp, protocol) VALUES ('old', '2000-01-01T00:00:00Z', 'openai')",
+            "INSERT INTO llm_usage_logs (id, timestamp, protocol) VALUES ('old', '2000-01-01 00:00:00', 'openai')",
         )
         .execute(&db.pool)
         .await
@@ -1178,10 +1181,8 @@ mod tests {
             .await
             .unwrap();
 
-        let deleted = db
-            .cleanup_old_llm_usage_logs("2020-01-01T00:00:00Z")
-            .await
-            .unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let deleted = db.cleanup_old_llm_usage_logs(cutoff).await.unwrap();
         assert_eq!(deleted, 1);
 
         let remaining = db
@@ -1189,6 +1190,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_usage_cleanup_keeps_same_day_records() {
+        let (db, _tmp) = fresh_db().await;
+        // 截止时刻之后、同一天内的记录：存储格式 "YYYY-MM-DD HH:MM:SS"。
+        // 若清理边界格式化为 RFC3339（含 'T'/'Z'），字符串比较中 ' ' < 'T'，
+        // 这条记录会被误删；格式化为 SQLite datetime 则保留。
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        let same_day_after_cutoff = (cutoff + chrono::Duration::hours(12))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query(
+            "INSERT INTO llm_usage_logs (id, timestamp, protocol) VALUES ('same-day', ?, 'openai')",
+        )
+        .bind(&same_day_after_cutoff)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let deleted = db.cleanup_old_llm_usage_logs(cutoff).await.unwrap();
+        assert_eq!(deleted, 0, "同一天内晚于截止时刻的记录不应被删除");
+
+        let remaining = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "same-day");
     }
 
     #[tokio::test]

@@ -640,9 +640,9 @@ async fn main() -> TunnelResult<()> {
                 tracing::warn!("Failed to cleanup old stats snapshots: {}", e);
             }
             // LLM 用量日志保留 30 天
-            let thirty_days_ago = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+            let thirty_days_ago = chrono::Utc::now() - chrono::Duration::days(30);
             if let Err(e) = db_for_stats_cleanup
-                .cleanup_old_llm_usage_logs(&thirty_days_ago)
+                .cleanup_old_llm_usage_logs(thirty_days_ago)
                 .await
             {
                 tracing::warn!("Failed to cleanup old LLM usage logs: {}", e);
