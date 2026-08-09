@@ -552,6 +552,7 @@ export async function createAgentWorkspace(body: {
   agent_type?: string;
   agent_path?: string;
   llm_model_id?: string;
+  agent_config_overrides?: string;
 }): Promise<AgentWorkspace> {
   const { data } = await api.post('/agent/workspaces', body);
   return data;
@@ -571,6 +572,7 @@ export const updateAgentWorkspace = (
     agent_type?: string;
     agent_path?: string;
     llm_model_id?: string;
+    agent_config_overrides?: string;
   },
 ) => api.put(`/agent/workspaces/${id}`, body);
 

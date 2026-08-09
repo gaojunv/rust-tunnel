@@ -100,10 +100,11 @@ struct SpawnedAgent {
     /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
     /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
     config_options: Vec<SessionConfigOption>,
-    /// 握手完成信号（false → true）。连接预 spawn（后台任务）仍在握手时，
-    /// 首条 user_message 的 `wait_ready` 经 `subscribe` + `wait_for` 等待它，
-    /// 避免 `prompt` 报 "ACP handshake not complete"。条目被移除（spawn 失败/
-    /// kill）时 Sender drop，wait_for 以 RecvError 返回。
+    /// 握手 + 配置注入完成信号（false → true）。连接预 spawn（后台任务）仍在
+    /// 握手/注入 overrides 时，首条 user_message 的 `wait_ready` 经 `subscribe`
+    /// 与 `wait_for` 等待它，避免 `prompt` 报 "ACP handshake not complete" 或在
+    /// config 注入完成前首回合开跑。条目被移除（spawn 失败/kill）时 Sender drop，
+    /// wait_for 以 RecvError 返回。
     spawn_ready: watch::Sender<bool>,
 }
 
@@ -343,6 +344,25 @@ impl AcpBridge {
         if outcome.is_err() {
             // spawn 失败：移除占位，允许后续重试。
             self.sessions.lock().await.remove(session_id);
+            return outcome;
+        }
+        // 握手成功：workspace 级 overrides 注入先于 session 级 config_state 回放
+        // ——用户显式选择（config_state）覆盖 workspace 默认值。在 acp_handshake
+        // 返回后才执行：该函数只收 session_id/root_path，此处持有 workspace 记录。
+        self.apply_config_overrides(session_id, workspace).await;
+        self.replay_config_state(session_id).await;
+        // 配置注入完成后才放行 wait_ready：连接预 spawn（后台任务）场景下，
+        // 用户路径的 wait_ready 经 watch 通道等待此信号——必须延后到 overrides/
+        // config_state 已生效，首条 prompt 才不与在途 set_config_option 竞态
+        // （恢复旧顺序：replay 先于 spawn_ready）。
+        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+            let _ = a.spawn_ready.send(true);
+        }
+        // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
+        if let Some(frame) = self.session_state_frame(session_id).await {
+            if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
+                let _ = ws_tx.try_send(frame);
+            }
         }
         outcome
     }
@@ -671,20 +691,13 @@ impl AcpBridge {
 
         match tokio::time::timeout(SPAWN_TIMEOUT, setup_rx).await {
             Ok(Ok(Ok(()))) => {
-                self.replay_config_state(session_id).await;
-                // 握手完成：通知 wait_ready 等待方（连接预 spawn 期间首条消息）。
-                // 置于 session_state 推送前——connection 在 setup 闭包里已先于
-                // setup_rx Ok 写入，wait_ready 的「connection.is_some()」快路径
-                // 与订阅的 watch 双保险，不会错过就绪。
-                if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
-                    let _ = a.spawn_ready.send(true);
-                }
-                // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
-                if let Some(frame) = self.session_state_frame(session_id).await {
-                    if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
-                        let _ = ws_tx.try_send(frame);
-                    }
-                }
+                // 握手成功即返回。wait_ready 的放行（spawn_ready.send(true)）由
+                // ensure_session 在 apply_config_overrides + replay_config_state
+                // 完成后统一执行——acp_handshake 只收 session_id/root_path，不持有
+                // workspace 记录；把放行延后到配置注入完成，首条 prompt 才不与
+                // 在途 set_config_option 竞态（恢复旧顺序：replay 先于 spawn_ready）。
+                // 失败分支（下文）不发送 spawn_ready，wait_ready 以超时/Sender drop
+                // 返回，语义与移动前一致。
                 Ok(())
             }
             Ok(Ok(Err(e))) => Err(e),
@@ -867,6 +880,42 @@ impl AcpBridge {
         }))
     }
 
+    /// 握手成功后注入 workspace 级 ACP 引擎选项覆盖（`agent_config_overrides`，
+    /// JSON map：config_id → value）。先于 [`Self::replay_config_state`] 执行——
+    /// session 级 config_state（用户显式选择）回放覆盖 workspace 默认。
+    /// config_id 按字典序（`mode` 提前，与回放一致）逐项 set；agent 未暴露的
+    /// config_id 或单条失败仅 warn 跳过，不阻断会话建立与其余项注入。
+    async fn apply_config_overrides(&self, session_id: &str, workspace: &AgentWorkspaceRecord) {
+        let Some(raw) = workspace.agent_config_overrides.as_deref() else {
+            return;
+        };
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw)
+        else {
+            tracing::warn!(session_id, "agent_config_overrides not a JSON object, skipped");
+            return;
+        };
+        let mut entries: Vec<(String, String)> = map
+            .into_iter()
+            .filter_map(|(k, v)| match v.as_str() {
+                Some(s) => Some((k, s.to_string())),
+                None => {
+                    tracing::warn!(
+                        session_id,
+                        config_id = %k,
+                        "agent_config_overrides value not a string, skipped"
+                    );
+                    None
+                }
+            })
+            .collect();
+        entries.sort_by_key(|(k, _)| (if k == "mode" { 0 } else { 1 }, k.clone()));
+        for (config_id, value) in entries {
+            if let Err(e) = self.set_config_option(session_id, &config_id, &value).await {
+                tracing::warn!(session_id, config_id, "apply config override skipped: {e}");
+            }
+        }
+    }
+
     /// 握手成功后回放 DB 中持久化的配置（mode 优先：agent 侧 model 切换会
     /// 重建 effort 列表，mode 先行保证其余项在最终列表上生效）。单条失败
     /// （如新版 agent 移除某取值）跳过并 warn，不阻断其余。
@@ -981,22 +1030,25 @@ impl AcpBridge {
             .is_some_and(|a| !a.exited)
     }
 
-    /// 等待会话的 ACP 握手完成（连接预 spawn 可能在后台进行）。已就绪立即
-    /// 返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    /// 等待会话的 ACP 握手 + 配置注入完成（连接预 spawn 可能在后台进行）。
+    /// 已就绪立即返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    ///
+    /// 统一以 `spawn_ready` watch 为准，不放行于 connection 已写入的瞬时状态：
+    /// `connection` 在握手完成时即写回会话条目，而 `spawn_ready` 在
+    /// `apply_config_overrides` + `replay_config_state` 全部完成后才置 true。
+    /// 若以 connection 存在与否做快路径放行，首条 prompt 会与在途的
+    /// `set_config_option` 竞态（workspace overrides/用户 config_state 尚未注入）。
+    /// watch 为 true 即「握手 + 配置注入」均已完成的最终状态。
     pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
             let agent = sessions
                 .get(session_id)
                 .ok_or_else(|| "session not spawned".to_string())?;
-            // connection 已写入 = 握手完成，快路径直接返回
-            if agent.connection.is_some() {
-                return Ok(());
-            }
             agent.spawn_ready.subscribe()
         };
-        // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等。
-        // spawn_ready 只在 connection 写入后变 true，此分支实际不可达，作双保险。
+        // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等
+        // （重连/多标签页下条目已就绪，subscribe 即取到当前 true 值）。
         if *rx.borrow() {
             return Ok(());
         }
@@ -1441,6 +1493,7 @@ mod tests {
             agent_type: "gemini".into(),
             agent_path: None,
             llm_model_id: Some("model-1".into()),
+            agent_config_overrides: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -1480,6 +1533,24 @@ mod tests {
         bridge: &AcpBridge,
         ws_tx: mpsc::Sender<serde_json::Value>,
     ) {
+        setup_handshake_with(
+            bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+    }
+
+    /// `setup_handshake` 的参数化版本：`config_options` 注入 `session/new` 响应
+    /// 的 `configOptions`（空数组 = 无配置项），`applied` 记录收到的
+    /// `session/set_config_option` 调用（config_id, value）。
+    async fn setup_handshake_with(
+        bridge: &AcpBridge,
+        ws_tx: mpsc::Sender<serde_json::Value>,
+        config_options: serde_json::Value,
+        applied: Arc<Mutex<Vec<(String, String)>>>,
+    ) {
         let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
@@ -1500,7 +1571,7 @@ mod tests {
             control_tx,
             "sess-1".into(),
         ));
-        tokio::spawn(mock_acp_agent(control_rx, stdout_tx));
+        tokio::spawn(mock_acp_agent(control_rx, stdout_tx, config_options, applied));
 
         bridge
             .acp_handshake("sess-1", "/mock")
@@ -1593,6 +1664,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
@@ -1972,10 +2044,15 @@ mod tests {
 
     /// 模拟 ACP agent：newline-delimited JSON-RPC。从 `stdin_rx`（pump 的
     /// AgentSpawnData{stdin:true} 转来）读请求行，把响应/通知写到 `stdout_tx`
-    /// （→ pump → ACP crate）。
+    /// （→ pump → ACP crate）。`config_options` 注入 `session/new` 响应的
+    /// `configOptions`；`applied` 记录收到的 `session/set_config_option`
+    /// 调用（config_id, value）——value 形态以 ACP 实际序列化为准（select 为
+    /// 裸字符串，boolean 为 bool + 顶层 type）。
     async fn mock_acp_agent(
         mut stdin_rx: mpsc::Receiver<ControlMessage>,
         stdout_tx: mpsc::Sender<Vec<u8>>,
+        config_options: serde_json::Value,
+        applied: Arc<Mutex<Vec<(String, String)>>>,
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
@@ -2006,7 +2083,29 @@ mod tests {
                     "session/new" => {
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
-                            "result": { "sessionId": "acp-1" }
+                            "result": { "sessionId": "acp-1", "configOptions": config_options }
+                        }));
+                    }
+                    "session/set_config_option" => {
+                        let params = json.get("params").cloned().unwrap_or_default();
+                        let config_id = params
+                            .get("configId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        // ACP 实际序列化：select 的 value 是裸字符串（"sonnet"）；
+                        // boolean 是 bool（{"type":"boolean","value":true} 平铺到
+                        // params 顶层）。响应必须带 configOptions 字段（schema 的
+                        // SetSessionConfigOptionResponse 必填，缺则反序列化报错）。
+                        let value = params.get("value").cloned().unwrap_or_default();
+                        let value_str = value
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| value.to_string());
+                        applied.lock().await.push((config_id, value_str));
+                        out_lines.push(serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "configOptions": config_options }
                         }));
                     }
                     "session/prompt" => {
@@ -2315,6 +2414,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
@@ -2391,6 +2491,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
@@ -2432,5 +2533,102 @@ mod tests {
             rows.iter().any(|r| r.kind == "message" && r.name.is_none()),
             "assistant text should persist without ws consumer"
         );
+    }
+
+    // ── workspace 级 config overrides 注入 ──────────────────────
+
+    /// 握手后按 workspace.agent_config_overrides 注入；config_state 回放其后
+    /// （用户显式选择覆盖 workspace 默认）。快照中不存在的 config_id 跳过不报错。
+    #[tokio::test]
+    async fn test_apply_config_overrides_on_handshake() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/workspace", None, None, "claude-code",
+            None, Some("model-1"),
+            Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None).await.unwrap();
+        // session 级 config_state：用户显式把 model 改为 opus —— 必须覆盖 workspace 注入
+        db.agent_update_session_config_state("sess-1", "model", Some("opus"))
+            .await
+            .unwrap();
+
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry.register("nas", None, None, "secret", tx).await.unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let options = serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select",
+             "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "opus", "name": "Opus"}]},
+            {"id": "fast", "name": "Fast model", "type": "select",
+             "currentValue": "haiku",
+             "options": [{"value": "haiku", "name": "Haiku"}]}
+        ]);
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(&bridge, ws_tx, options, applied.clone()).await;
+
+        // workspace 注入：fast → haiku；model 先被 workspace 设为 sonnet，随后
+        // config_state 回放覆盖为 opus；nonexistent 不在快照中 → 跳过
+        bridge
+            .apply_config_overrides("sess-1", &db.agent_get_workspace("w1").await.unwrap().unwrap())
+            .await;
+        bridge.replay_config_state("sess-1").await;
+
+        let calls = applied.lock().await.clone();
+        // 顺序：workspace 按 config_id 字典序（fast 先于 model）注入，回放其后
+        assert_eq!(
+            calls,
+            vec![
+                ("fast".to_string(), "haiku".to_string()),
+                ("model".to_string(), "sonnet".to_string()),
+                ("model".to_string(), "opus".to_string()),
+            ]
+        );
+    }
+
+    /// workspace 未配置 overrides（None / 非法 JSON / 空对象）→ 不发任何
+    /// set_config_option，不报错。
+    #[tokio::test]
+    async fn test_apply_config_overrides_noop_when_unset() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::server::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let options = serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select",
+             "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}]}
+        ]);
+
+        for (label, overrides) in [
+            ("none", None),
+            ("not-json", Some("not-json")),
+            ("empty-object", Some("{}")),
+        ] {
+            let ws = AgentWorkspaceRecord {
+                agent_config_overrides: overrides.map(str::to_string),
+                ..acp_workspace()
+            };
+            let applied = Arc::new(Mutex::new(Vec::new()));
+            let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+            setup_handshake_with(&bridge, ws_tx, options.clone(), applied.clone()).await;
+            bridge.apply_config_overrides("sess-1", &ws).await;
+            assert!(
+                applied.lock().await.is_empty(),
+                "{label}: apply_config_overrides should be a no-op"
+            );
+        }
     }
 }

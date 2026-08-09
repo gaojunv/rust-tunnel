@@ -508,7 +508,7 @@ mod tests {
     // ── resolve_effective_model 优先级 ──────────────────────────
 
     async fn seed_ws(db: &Database, ws_id: &str, llm_model_id: Option<&str>) {
-        db.agent_create_workspace(ws_id, "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace(ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         if let Some(mid) = llm_model_id {
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_rebuilds_history() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -679,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_skips_tool_rows() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -704,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_model_fallback() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -731,6 +731,7 @@ mod tests {
             "",
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -743,7 +744,7 @@ mod tests {
         assert_eq!(rt.root_path, "/container/work");
 
         // docker 运行时但容器未启动（container_id 为空）
-        db.agent_create_workspace("w2", "p", "nas", "docker", "/x", Some("node:20"), None, "", None, None)
+        db.agent_create_workspace("w2", "p", "nas", "docker", "/x", Some("node:20"), None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s2", "w2", None, None)
@@ -763,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_replays_new_format_tool_structure() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -815,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_resumes_from_last_summary() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -861,7 +862,7 @@ mod tests {
         // 清洗后应为第 2 个补齐占位结果，序列合法（无 400）。
         // 取消链路（AgentExecCancel 停止回合）依赖 sanitize_tool_pairs 占位补齐。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -913,7 +914,7 @@ mod tests {
         // 压缩切割点落在 assistant tool_calls 行正后方：tool 结果保留但配对行被压掉。
         // 清洗后孤儿 tool 结果应被丢弃。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -961,7 +962,7 @@ mod tests {
         // 迁移前遗留行：SQLite DEFAULT 把 kind 补成 'message'，role='tool' 的旧合并行
         // 必须被跳过（不能落入普通文本消息分支产生非法 OpenAI 序列）。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)

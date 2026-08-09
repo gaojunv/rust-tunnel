@@ -660,6 +660,7 @@ impl Database {
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
+        Self::migrate_agent_workspaces_v4(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
 
         Ok(())
@@ -760,6 +761,26 @@ impl Database {
                     }
                     tracing::debug!(column, "agent_workspaces migration: column already exists");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_workspaces 补全 ACP 引擎选项覆盖列（JSON map：config_id → value，
+    /// 会话建立后经 set_config_option 注入 agent）。幂等：列已存在时跳过。
+    async fn migrate_agent_workspaces_v4(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query(
+            "ALTER TABLE agent_workspaces ADD COLUMN agent_config_overrides TEXT",
+        )
+        .execute(pool)
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_workspaces migration: column already exists");
             }
         }
         Ok(())

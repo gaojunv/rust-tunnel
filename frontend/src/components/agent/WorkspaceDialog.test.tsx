@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import WorkspaceDialog from './WorkspaceDialog';
+import WorkspaceDialog, { parseOverrides, serializeOverrides } from './WorkspaceDialog';
 import type { AgentWorkspace } from '../../types';
 
 vi.mock('react-i18next', () => ({
@@ -214,5 +214,114 @@ describe('WorkspaceDialog ACP config', () => {
         agent_type: '',
       });
     });
+  });
+});
+
+describe('parseOverrides / serializeOverrides', () => {
+  it('parses stored JSON to rows; invalid/empty → []', () => {
+    expect(parseOverrides('{"model":"sonnet","fast":"haiku"}')).toEqual([
+      { key: 'model', value: 'sonnet' },
+      { key: 'fast', value: 'haiku' },
+    ]);
+    expect(parseOverrides(undefined)).toEqual([]);
+    expect(parseOverrides('')).toEqual([]);
+    expect(parseOverrides('not-json')).toEqual([]);
+    expect(parseOverrides('{}')).toEqual([]);
+  });
+
+  it('serializes rows to JSON, skipping empty keys', () => {
+    expect(
+      serializeOverrides([
+        { key: 'model', value: 'sonnet' },
+        { key: '', value: 'ignored' },
+        { key: '  ', value: 'ignored' },
+      ]),
+    ).toBe('{"model":"sonnet"}');
+  });
+
+  it('returns undefined when no valid rows (caller decides {} vs omit)', () => {
+    expect(serializeOverrides([])).toBeUndefined();
+    expect(serializeOverrides([{ key: '', value: 'x' }])).toBeUndefined();
+  });
+});
+
+describe('WorkspaceDialog config overrides UI', () => {
+  it('编辑模式回填已有 overrides 行', () => {
+    renderDialog({ ...editingWs, agent_config_overrides: '{"model":"sonnet"}' });
+    expect((screen.getByLabelText('agent.configOverrides key 1') as HTMLInputElement).value).toBe(
+      'model',
+    );
+    expect(
+      (screen.getByLabelText('agent.configOverrides value 1') as HTMLInputElement).value,
+    ).toBe('sonnet');
+  });
+
+  it('编辑模式：原有 overrides 被删空后提交发送 "{}" 清空', async () => {
+    renderDialog({ ...editingWs, agent_config_overrides: '{"model":"sonnet"}' });
+    // 删除唯一一行
+    fireEvent.click(screen.getByLabelText('agent.configOverrideRemove 1'));
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(api.updateAgentWorkspace).toHaveBeenCalledWith(
+        'w1',
+        expect.objectContaining({ agent_config_overrides: '{}' }),
+      );
+    });
+  });
+
+  it('新建模式：填写行后提交发送 JSON', async () => {
+    api.createAgentWorkspace.mockResolvedValue({ ...editingWs, id: 'w-new' });
+    renderDialog();
+    // 等待 clients 加载完成（client 下拉 enabled）后再交互
+    await screen.findByRole('option', { name: 'nas' });
+    fireEvent.change(screen.getByPlaceholderText('agent.namePlaceholder'), {
+      target: { value: 'acp-proj' },
+    });
+    fireEvent.change(screen.getByLabelText('agent.client'), { target: { value: 'nas' } });
+    fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
+      target: { value: '/workspace' },
+    });
+    selectEngine('claude-code');
+    fireEvent.click(screen.getByText('agent.configOverrideAdd'));
+    fireEvent.change(screen.getByLabelText('agent.configOverrides key 1'), {
+      target: { value: 'model' },
+    });
+    fireEvent.change(screen.getByLabelText('agent.configOverrides value 1'), {
+      target: { value: 'sonnet' },
+    });
+    fireEvent.click(screen.getByText('agent.create'));
+    await waitFor(() => {
+      expect(api.createAgentWorkspace).toHaveBeenCalledWith({
+        name: 'acp-proj',
+        client_id: 'nas',
+        runtime_type: 'host',
+        root_path: '/workspace',
+        docker_image: undefined,
+        docker_container_id: undefined,
+        agent_type: 'claude-code',
+        agent_config_overrides: '{"model":"sonnet"}',
+      });
+    });
+  });
+
+  it('新建模式：未填写 overrides 不发送该字段', async () => {
+    api.createAgentWorkspace.mockResolvedValue({ ...editingWs, id: 'w-new' });
+    renderDialog();
+    // 等待 clients 加载完成（client 下拉 enabled）后再交互
+    await screen.findByRole('option', { name: 'nas' });
+    fireEvent.change(screen.getByPlaceholderText('agent.namePlaceholder'), {
+      target: { value: 'plain' },
+    });
+    fireEvent.change(screen.getByLabelText('agent.client'), { target: { value: 'nas' } });
+    fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
+      target: { value: '/p' },
+    });
+    selectEngine('claude-code');
+    fireEvent.click(screen.getByText('agent.create'));
+    await waitFor(() => {
+      expect(api.createAgentWorkspace).toHaveBeenCalled();
+    });
+    const body = api.createAgentWorkspace.mock.calls[0][0];
+    expect(body).not.toHaveProperty('agent_config_overrides');
   });
 });

@@ -454,6 +454,7 @@ async fn setup_approval_env(
         "",
         None,
         None,
+        None,
     )
     .await
     .expect("create workspace");
@@ -463,6 +464,7 @@ async fn setup_approval_env(
         &root_str,
         None,
         Some("safe"),
+        None,
         None,
         None,
         None,
@@ -777,6 +779,7 @@ async fn setup_text_turn_env(
         None,
         None,
         "",
+        None,
         None,
         None,
     )

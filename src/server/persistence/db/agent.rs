@@ -24,6 +24,11 @@ pub struct AgentWorkspaceRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub llm_model_id: Option<String>,
+    /// ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时经
+    /// `set_config_option` 注入。列由 `migrate_agent_workspaces_v4` 落地。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub agent_config_overrides: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -58,7 +63,9 @@ impl Database {
     // ── Workspace CRUD ──────────────────────────────────────────
 
     /// 创建 agent workspace。`agent_type` 为 ACP 远程 agent 类型（非空列，默认空串），
-    /// `agent_path`/`llm_model_id` 可空。调用方暂未接入请求 DTO 时传 `""` / `None` 占位。
+    /// `agent_path`/`llm_model_id`/`agent_config_overrides` 可空（后者为 ACP 引擎
+    /// 选项覆盖，JSON map：config_id → value，None 表示未配置）。调用方暂未接入请求
+    /// DTO 时传 `""` / `None` 占位。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_create_workspace(
         &self,
@@ -72,13 +79,14 @@ impl Database {
         agent_type: &str,
         agent_path: Option<&str>,
         llm_model_id: Option<&str>,
+        agent_config_overrides: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO agent_workspaces
                 (id, name, client_id, runtime_type, root_path, docker_image, docker_container_id,
-                 agent_type, agent_path, llm_model_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 agent_type, agent_path, llm_model_id, agent_config_overrides)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
@@ -91,6 +99,7 @@ impl Database {
         .bind(agent_type)
         .bind(agent_path)
         .bind(llm_model_id)
+        .bind(agent_config_overrides)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -114,8 +123,10 @@ impl Database {
         .await
     }
 
-    /// 更新 agent workspace 的可变字段。ACP 三个新字段（agent_type/agent_path/llm_model_id）
-    /// 采用 COALESCE 语义：`None` 保持原值，`Some` 写入新值，与 `approval_mode` 一致。
+    /// 更新 agent workspace 的可变字段。ACP 字段（agent_type/agent_path/llm_model_id/
+    /// agent_config_overrides）采用 COALESCE 语义：`None` 保持原值，`Some` 写入新值，
+    /// 与 `approval_mode` 一致。`agent_config_overrides` 为 ACP 引擎选项覆盖（JSON
+    /// map：config_id → value）；`Some("{}")` 显式清空，`None` 保持原值。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_update_workspace(
         &self,
@@ -127,6 +138,7 @@ impl Database {
         agent_type: Option<&str>,
         agent_path: Option<&str>,
         llm_model_id: Option<&str>,
+        agent_config_overrides: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
@@ -134,6 +146,7 @@ impl Database {
              agent_type = COALESCE(?, agent_type), \
              agent_path = COALESCE(?, agent_path), \
              llm_model_id = COALESCE(?, llm_model_id), \
+             agent_config_overrides = COALESCE(?, agent_config_overrides), \
              updated_at = datetime('now') WHERE id = ?",
         )
         .bind(name)
@@ -143,6 +156,7 @@ impl Database {
         .bind(agent_type)
         .bind(agent_path)
         .bind(llm_model_id)
+        .bind(agent_config_overrides)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -427,6 +441,7 @@ mod tests {
             "",
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -439,6 +454,7 @@ mod tests {
             Some("node:20"),
             Some("dev-ctr"),
             "",
+            None,
             None,
             None,
         )
@@ -461,7 +477,7 @@ mod tests {
 
         assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 2);
 
-        db.agent_update_workspace("w1", "renamed", "/new/path", None, None, None, None, None)
+        db.agent_update_workspace("w1", "renamed", "/new/path", None, None, None, None, None, None)
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -496,6 +512,7 @@ mod tests {
             "gemini",
             Some("/opt/acp-agent"),
             Some("m1"),
+            None,
         )
         .await
         .unwrap();
@@ -516,6 +533,7 @@ mod tests {
             Some("claude"),
             Some("/opt/acp-claude"),
             Some("m2"),
+            None,
         )
         .await
         .unwrap();
@@ -525,7 +543,7 @@ mod tests {
         assert_eq!(ws.llm_model_id.as_deref(), Some("m2"));
 
         // COALESCE：None 保持原值
-        db.agent_update_workspace("w1", "acp-proj", "/workspace", None, None, None, None, None)
+        db.agent_update_workspace("w1", "acp-proj", "/workspace", None, None, None, None, None, None)
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -543,6 +561,7 @@ mod tests {
             None,
             None,
             Some("m3"),
+            None,
         )
         .await
         .unwrap();
@@ -555,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_crud_and_archive() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", Some("fix bug"), Some("gpt-4o"))
@@ -590,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -613,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_append_and_list() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -663,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_list_orders_by_rowid_not_created_at() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -701,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_tool_call_args() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -744,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_workspace_cascades() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -762,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn test_message_v2_columns_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -816,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn test_config_state_upsert_and_clear() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None)
+        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -859,5 +878,58 @@ mod tests {
             .unwrap();
         let s = db.agent_get_session("s1").await.unwrap().unwrap();
         assert!(s.config_state.is_none());
+    }
+
+    /// agent_config_overrides（v4 列）的创建→读取→更新→清空完整往返。
+    /// update 语义：None 保持原值；Some("{}") 显式清空（与 llm_model_id 的
+    /// 「不支持清空」不同，见 spec 决策表）。
+    #[tokio::test]
+    async fn test_workspace_config_overrides_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "acp-proj", "nas", "host", "/workspace", None, None,
+            "claude-code", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        // 创建时未配置 → None
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert!(ws.agent_config_overrides.is_none());
+
+        // 写入配置
+        db.agent_update_workspace(
+            "w1", "acp-proj", "/workspace", None, None, None, None, None,
+            Some(r#"{"model":"sonnet","fast":"haiku"}"#),
+        )
+        .await
+        .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"model":"sonnet","fast":"haiku"}"#)
+        );
+
+        // COALESCE：None 保持原值
+        db.agent_update_workspace(
+            "w1", "acp-proj", "/workspace", None, None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"model":"sonnet","fast":"haiku"}"#)
+        );
+
+        // 显式 Some("") 写入空串由 API 层拦截（归一化 None）；DB 层原样写入 "{}"
+        // 表示清空——这里验证 DB 层忠实存储传入值
+        db.agent_update_workspace(
+            "w1", "acp-proj", "/workspace", None, None, None, None, None, Some("{}"),
+        )
+        .await
+        .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
     }
 }

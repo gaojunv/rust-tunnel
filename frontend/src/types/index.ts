@@ -538,6 +538,8 @@ export interface AgentWorkspace {
   agent_path?: string;
   /** workspace 默认 LLM 模型 id（llm_models.id） */
   llm_model_id?: string;
+  /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent */
+  agent_config_overrides?: string;
   created_at: string;
   updated_at: string;
 }
