@@ -17,13 +17,33 @@ interface Props {
   label: string;
   onChange: (configId: string, value: string) => void;
   disabled?: boolean;
+  /** agent 已上报过 config options 但本项缺失（如当前模型不支持 Effort）：
+   *  渲染禁用占位而非隐藏，hover 提示原因 */
+  placeholder?: boolean;
 }
 
 /** 发送按钮左侧的 config option 快捷按钮（VS Code Claude Code 插件样式）：
  *  幽灵小按钮显示当前取值名，点击向上弹出取值列表（当前项打勾）。 */
-export default function ConfigOptionButton({ option, label, onChange, disabled }: Props) {
+export default function ConfigOptionButton({ option, label, onChange, disabled, placeholder }: Props) {
   const { t } = useTranslation();
-  if (!option || option.type !== 'select') return null;
+  if (!option || option.type !== 'select') {
+    // 占位：agent 已上报过 config options 但缺本项（模型不支持）→ 禁用按钮。
+    // 非 ACP 会话/未就绪时 placeholder 缺省 false，保持隐藏既有语义。
+    if (placeholder) {
+      return (
+        <Button
+          variant="ghost"
+          disabled
+          aria-label={t(label, { defaultValue: label })}
+          title={t('agent.configOptionUnsupported')}
+          className="h-7 w-auto cursor-not-allowed gap-1 px-2 text-xs text-muted-foreground opacity-60"
+        >
+          {t(label, { defaultValue: label })}
+        </Button>
+      );
+    }
+    return null;
+  }
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild disabled={disabled}>

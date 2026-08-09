@@ -885,12 +885,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 label="agent.configMode"
                 onChange={sendConfigOption}
                 disabled={running}
+                placeholder={configOptions.length > 0 && !modeOption}
               />
               <ConfigOptionButton
                 option={effortOption}
                 label="agent.configEffort"
                 onChange={sendConfigOption}
                 disabled={running}
+                placeholder={configOptions.length > 0 && !effortOption}
               />
               {running ? (
                 <Button

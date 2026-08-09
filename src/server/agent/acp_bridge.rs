@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOption,
@@ -98,6 +98,11 @@ struct SpawnedAgent {
     /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
     /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
     config_options: Vec<SessionConfigOption>,
+    /// 握手完成信号（false → true）。连接预 spawn（后台任务）仍在握手时，
+    /// 首条 user_message 的 `wait_ready` 经 `subscribe` + `wait_for` 等待它，
+    /// 避免 `prompt` 报 "ACP handshake not complete"。条目被移除（spawn 失败/
+    /// kill）时 Sender drop，wait_for 以 RecvError 返回。
+    spawn_ready: watch::Sender<bool>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -275,6 +280,7 @@ impl AcpBridge {
                     text_buf: String::new(),
                     thought_buf: String::new(),
                     config_options: Vec::new(),
+                    spawn_ready: watch::channel(false).0,
                 },
             );
             Some((pump_io, stdout_rx))
@@ -611,6 +617,13 @@ impl AcpBridge {
         match tokio::time::timeout(SPAWN_TIMEOUT, setup_rx).await {
             Ok(Ok(Ok(()))) => {
                 self.replay_config_state(session_id).await;
+                // 握手完成：通知 wait_ready 等待方（连接预 spawn 期间首条消息）。
+                // 置于 session_state 推送前——connection 在 setup 闭包里已先于
+                // setup_rx Ok 写入，wait_ready 的「connection.is_some()」快路径
+                // 与订阅的 watch 双保险，不会错过就绪。
+                if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+                    let _ = a.spawn_ready.send(true);
+                }
                 // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
                 if let Some(frame) = self.session_state_frame(session_id).await {
                     if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
@@ -894,6 +907,46 @@ impl AcpBridge {
             return None;
         }
         Some(agent.config_options.clone())
+    }
+
+    /// 会话是否已在 ACP 桥登记且进程存活（预 spawn 成功后、首条消息前，
+    /// `set_config_option` 等帧也要能分派）。exited 的陈旧条目视同未就绪，
+    /// 让调用方走错误路径而非静默丢弃。
+    pub async fn session_spawned(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|a| !a.exited)
+    }
+
+    /// 等待会话的 ACP 握手完成（连接预 spawn 可能在后台进行）。已就绪立即
+    /// 返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
+        let mut rx = {
+            let sessions = self.sessions.lock().await;
+            let agent = sessions
+                .get(session_id)
+                .ok_or_else(|| "session not spawned".to_string())?;
+            // connection 已写入 = 握手完成，快路径直接返回
+            if agent.connection.is_some() {
+                return Ok(());
+            }
+            agent.spawn_ready.subscribe()
+        };
+        // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等。
+        // spawn_ready 只在 connection 写入后变 true，此分支实际不可达，作双保险。
+        if *rx.borrow() {
+            return Ok(());
+        }
+        // wait_for 的返回值借用 rx（Ref<bool>）：先绑局部变量强制在 rx drop 前
+        // 释放该借用，避免尾表达式临时值拖到块结束才 drop（E0597）。
+        let ready = tokio::time::timeout(SPAWN_TIMEOUT, rx.wait_for(|r| *r)).await;
+        match ready {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) => Err("session not spawned".to_string()),
+            Err(_) => Err("wait for ACP handshake timed out".to_string()),
+        }
     }
 
     /// 路由客户端发来的 spawn/LLM 代理控制消息（server.rs 控制循环转交）。
@@ -1354,6 +1407,7 @@ mod tests {
             text_buf: String::new(),
             thought_buf: String::new(),
             config_options: Vec::new(),
+            spawn_ready: watch::channel(false).0,
         }
     }
 
@@ -1446,6 +1500,27 @@ mod tests {
             .await
             .expect_err("no model config should be rejected");
         assert!(err.contains("未配置"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_session_spawned_reflects_registry() {
+        // 未登记 → false；登记存活条目 → true；exited 陈旧条目 → false
+        let bridge = mock_bridge(|_| unreachable!("no requests expected")).await;
+        assert!(!bridge.session_spawned("sess-1").await);
+        bridge
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), spawned_agent());
+        assert!(bridge.session_spawned("sess-1").await);
+        let mut exited = spawned_agent();
+        exited.exited = true;
+        bridge
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), exited);
+        assert!(!bridge.session_spawned("sess-1").await);
     }
 
     #[tokio::test]

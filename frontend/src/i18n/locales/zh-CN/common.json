@@ -835,6 +835,7 @@
     "sessionSettings": "会话设置",
     "configMode": "模式",
     "configEffort": "Effort",
+    "configOptionUnsupported": "当前模型不支持此选项",
     "configOn": "开",
     "configOff": "关",
     "agentModelHint": "Agent 内部模型；实际 LLM 调用由上方网关模型决定"

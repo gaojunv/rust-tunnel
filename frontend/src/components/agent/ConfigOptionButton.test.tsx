@@ -30,4 +30,19 @@ describe('ConfigOptionButton', () => {
     );
     expect(container.firstChild).toBeNull();
   });
+
+  it('renders disabled placeholder when placeholder prop set and option is undefined', () => {
+    render(
+      <ConfigOptionButton
+        option={undefined}
+        label="agent.configEffort"
+        onChange={vi.fn()}
+        placeholder
+      />,
+    );
+    const btn = screen.getByRole('button', { name: 'agent.configEffort' });
+    expect(btn).toBeTruthy();
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
+    expect(btn.getAttribute('title')).toBe('agent.configOptionUnsupported');
+  });
 });

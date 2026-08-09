@@ -592,6 +592,29 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         }
     }
 
+    // 预 spawn（后台、不阻塞连接循环）：WS 一建立即拉起 ACP agent，mode/effort
+    // 快捷按钮无需等首条 user_message。session 已 spawn（重连/多标签页）时
+    // ensure_session 幂等只刷新 ws_tx；失败静默——离线客户端/无模型配置等报错
+    // 交给首次 user_message 路径（再次 ensure_session 会重试）。成功后
+    // ensure_session 内部已在 handshake 后推送 session_state（acp_bridge），
+    // 前端对话前即收到 config options。
+    if let Some(agent) = state.server_state.agent_state.clone() {
+        if let Some(bridge) = agent.acp_bridge.clone() {
+            let sid = session_id.clone();
+            let ws_tx = event_tx.clone();
+            tokio::spawn(async move {
+                let Ok(Some(workspace)) = load_workspace_for_session(&agent.db, &sid).await else {
+                    return;
+                };
+                if use_acp_path(&workspace) {
+                    if let Err(e) = bridge.ensure_session(&sid, &workspace, ws_tx).await {
+                        tracing::debug!(session_id = %sid, "pre-spawn acp agent failed: {e}");
+                    }
+                }
+            });
+        }
+    }
+
     loop {
         // 优先消费缓冲的 pending 消息；否则从 socket 读取下一条。
         let (content, refs) = if let Some(p) = pending.take() {
@@ -634,7 +657,20 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     continue;
                 }
                 WsFrame::SetConfigOption { config_id, value } => {
-                    if acp_active {
+                    // 门控：acp_active（已走 ACP 路径）或会话已被预 spawn（对话前
+                    // 按钮已出现、config_options 已就绪）。预 spawn 成功后 acp_active
+                    // 仍是 false（只在 user_message 分派时置位），不加 session_spawned
+                    // 会导致按钮出现但 set_config_option 帧被静默丢弃（点击无响应）。
+                    let spawned = match state
+                        .server_state
+                        .agent_state
+                        .as_ref()
+                        .and_then(|a| a.acp_bridge.as_ref())
+                    {
+                        Some(bridge) => bridge.session_spawned(&session_id).await,
+                        None => false,
+                    };
+                    if acp_active || spawned {
                         if let Some(agent) = state.server_state.agent_state.as_ref() {
                             if let Some(bridge) = agent.acp_bridge.as_ref() {
                                 match bridge
@@ -733,6 +769,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     .ensure_session(&session_id, &acp_workspace, event_tx.clone())
                     .await
                 {
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "error", "message": e}))
+                        .await;
+                    continue;
+                }
+                // 预 spawn（连接打开时后台触发）可能仍在握手：等待就绪再 prompt，
+                // 否则 connection 未建立会报 "ACP handshake not complete"。
+                if let Err(e) = bridge.wait_ready(&session_id).await {
                     let _ = event_tx
                         .send(serde_json::json!({"type": "error", "message": e}))
                         .await;

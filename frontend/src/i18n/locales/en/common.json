@@ -835,6 +835,7 @@
     "sessionSettings": "Session settings",
     "configMode": "Mode",
     "configEffort": "Effort",
+    "configOptionUnsupported": "Current agent model does not support this option",
     "configOn": "On",
     "configOff": "Off",
     "agentModelHint": "Agent-internal model; actual LLM calls use the gateway model above"

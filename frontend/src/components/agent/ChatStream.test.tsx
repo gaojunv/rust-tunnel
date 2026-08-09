@@ -956,4 +956,32 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('button', { name: 'agent.configMode' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'agent.configEffort' })).toBeNull();
   });
+
+  it('shows disabled Effort placeholder when agent reported options without effort', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state：只有 mode 项（无 thought_level）→ 当前模型不支持 Effort
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'mode',
+            name: 'Mode',
+            category: 'mode',
+            type: 'select',
+            currentValue: 'plan',
+            options: [{ value: 'plan', name: 'Plan' }],
+          },
+        ],
+      });
+    });
+    // Mode 快捷按钮正常显示当前值
+    expect(screen.getByRole('button', { name: 'agent.configMode' }).textContent).toContain('Plan');
+    // Effort 占位按钮存在且禁用（title 提示原因）
+    const effortBtn = screen.getByRole('button', { name: 'agent.configEffort' });
+    expect(effortBtn).toBeTruthy();
+    expect((effortBtn as HTMLButtonElement).disabled).toBe(true);
+    expect(effortBtn.getAttribute('title')).toBe('agent.configOptionUnsupported');
+  });
 });
