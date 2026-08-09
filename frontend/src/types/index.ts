@@ -564,6 +564,25 @@ export interface AgentMessage {
   created_at: string;
 }
 
+export interface SessionConfigSelectOption {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+export interface SessionConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  category?: 'mode' | 'model' | 'model_config' | 'thought_level' | string;
+  type: 'select' | 'boolean';
+  /** select 时为当前 value-id；boolean 时归一化为 "true"/"false"，真值见 currentBool */
+  currentValue?: string | boolean;
+  /** select 的可选项（ungrouped 平铺；grouped 形态拍平后填入） */
+  options?: SessionConfigSelectOption[];
+  currentBool?: boolean;
+}
+
 export type AgentWsEvent =
   | { type: 'assistant_chunk'; content?: string; final?: boolean; thought?: boolean }
   | {
@@ -595,7 +614,10 @@ export type AgentWsEvent =
   | { type: 'approval_request'; request_id: string; tool: string; summary: string; args_preview: string }
   | { type: 'error'; message?: string }
   // 上游流传输失败重试信号：前端应丢弃已缓冲的半截增量，等重试后的完整文本从新气泡开始
-  | { type: 'stream_reset' };
+  | { type: 'stream_reset' }
+  | { type: 'session_state'; options?: SessionConfigOption[] }
+  | { type: 'config_option_update'; options?: SessionConfigOption[] }
+  | { type: 'current_mode_update'; mode_id?: string };
 
 export interface FsEntry {
   name: string;

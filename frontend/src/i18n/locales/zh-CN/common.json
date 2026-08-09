@@ -831,7 +831,13 @@
     "confirmSaveTitle": "确认保存",
     "confirmSaveDesc": "该工作区需要审批确认后才能写入文件",
     "saveFailed": "保存失败",
-    "noFileSelected": "选择文件以预览"
+    "noFileSelected": "选择文件以预览",
+    "sessionSettings": "会话设置",
+    "configMode": "模式",
+    "configEffort": "Effort",
+    "configOn": "开",
+    "configOff": "关",
+    "agentModelHint": "Agent 内部模型；实际 LLM 调用由上方网关模型决定"
   },
   "logs": {
     "title": "日志",
