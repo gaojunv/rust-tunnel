@@ -9,9 +9,9 @@ mod common;
 use common::api_client::ApiClient;
 use common::wait_until;
 use reqwest::StatusCode;
-use rust_tunnel::server::auth::AuthConfig;
-use rust_tunnel::server::dynamic_config::{DynamicConfig, TrojanDynamicConfig};
-use rust_tunnel::server::{api, control, Database, ServerConfig};
+use rust_tunnel_server::auth::AuthConfig;
+use rust_tunnel_server::dynamic_config::{DynamicConfig, TrojanDynamicConfig};
+use rust_tunnel_server::{api, control, Database, ServerConfig};
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -231,13 +231,13 @@ async fn trojan_password_optional_keeps_existing() {
 // 共享模式 e2e 与自签名回退：直接驱动底层函数（run_server 不启动 Trojan）
 // ---------------------------------------------------------------------------
 
-use rust_tunnel::server::acme::{CertEntry, CertSource, CertificateManager};
-use rust_tunnel::server::reverse_proxy::{
+use rust_tunnel_server::acme::{CertEntry, CertSource, CertificateManager};
+use rust_tunnel_server::reverse_proxy::{
     Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig,
     Route, RuleType,
 };
-use rust_tunnel::server::trojan::sha224_hex;
-use rust_tunnel::server::trojan_runtime;
+use rust_tunnel_server::trojan::sha224_hex;
+use rust_tunnel_server::trojan_runtime;
 use std::sync::Arc;
 
 /// 造一张自签名证书加入 cert_manager。

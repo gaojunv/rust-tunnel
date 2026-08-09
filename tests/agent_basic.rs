@@ -17,8 +17,8 @@ mod common;
 
 use common::{HarnessOpts, TestHarness};
 use rust_tunnel_common::{AgentCommand, AgentResult};
-use rust_tunnel::server::agent::session::SessionRuntime;
-use rust_tunnel::server::client_registry::ClientRegistry;
+use rust_tunnel_server::agent::session::SessionRuntime;
+use rust_tunnel_server::client_registry::ClientRegistry;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -507,7 +507,7 @@ async fn run_turn_with_approval(
 
     let agent_turn = agent.clone();
     let turn = tokio::spawn(async move {
-        rust_tunnel::server::agent::runner::run_agent_turn(agent_turn, llm, &mut rt, ws_tx).await
+        rust_tunnel_server::agent::runner::run_agent_turn(agent_turn, llm, &mut rt, ws_tx).await
     });
 
     let mut frames = Vec::new();
@@ -817,7 +817,7 @@ async fn run_turn_collect(
     let (ws_tx, mut ws_rx) = mpsc::channel(64);
 
     let turn = tokio::spawn(async move {
-        rust_tunnel::server::agent::runner::run_agent_turn(agent, llm, &mut rt, ws_tx).await
+        rust_tunnel_server::agent::runner::run_agent_turn(agent, llm, &mut rt, ws_tx).await
     });
 
     let mut frames = Vec::new();
