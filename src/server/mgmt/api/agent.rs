@@ -578,9 +578,13 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
 
     // ACP 会话已就绪（重连/多标签页场景）：立即推送配置快照，前端设置菜单
     // 无需等下一次 config_option_update。session 尚未 spawn 时返回 None 跳过。
+    // 能返回 Some 说明该 session 已有活跃 ACP 进程（workspace 必然配置了
+    // agent_type）——同时置 acp_active，让后续 set_config_option/cancel/
+    // approval_response 帧正常分派（否则刷新/新标签页连接上这些帧被静默丢弃）。
     if let Some(agent) = state.server_state.agent_state.as_ref() {
         if let Some(bridge) = agent.acp_bridge.as_ref() {
             if let Some(options) = bridge.session_config_options(&session_id).await {
+                acp_active = true;
                 let _ = event_tx
                     .send(serde_json::json!({"type": "session_state", "options": options}))
                     .await;

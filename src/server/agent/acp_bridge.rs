@@ -48,6 +48,9 @@ use super::spawner::AgentSpawner;
 
 /// spawn/协商超时：LLM 代理启动与 agent 进程拉起各限 30s。
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// config option 切换超时：agent 无响应时让 WS 连接及时拿到 error 帧回滚，
+/// 而非无限阻塞（回放挂起同样受此约束）。
+const CONFIG_OPTION_TIMEOUT: Duration = Duration::from_secs(15);
 /// 空闲 30 分钟杀进程（重挂 ACP 连接由客户端 spawn manager 处理）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// reaper 检查间隔。
@@ -857,19 +860,27 @@ impl AcpBridge {
             // SessionConfigValueId::new（内部 Into<Arc<str>> 走 std From<&str>）。
             SessionConfigOptionValue::value_id(SessionConfigValueId::new(value))
         };
-        connection
-            .send_request_to(
-                agent_client_protocol::Agent,
-                SetSessionConfigOptionRequest::new(
-                    acp_session_id,
-                    SessionConfigId::new(config_id),
-                    typed_value,
-                ),
-            )
-            .block_task()
-            .await
-            .map_err(|e| format!("set_config_option failed: {e}"))?;
-        Ok(())
+        match tokio::time::timeout(
+            CONFIG_OPTION_TIMEOUT,
+            connection
+                .send_request_to(
+                    agent_client_protocol::Agent,
+                    SetSessionConfigOptionRequest::new(
+                        acp_session_id,
+                        SessionConfigId::new(config_id),
+                        typed_value,
+                    ),
+                )
+                .block_task(),
+        )
+        .await
+        {
+            Err(_) => Err(format!("set_config_option timed out: {config_id}")),
+            Ok(inner) => {
+                inner.map_err(|e| format!("set_config_option failed: {e}"))?;
+                Ok(())
+            }
+        }
     }
 
     /// 当前会话的配置快照（WS 连接建立后主动推送用）；未就绪返回 None。
