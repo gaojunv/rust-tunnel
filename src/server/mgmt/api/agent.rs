@@ -1102,6 +1102,7 @@ pub async fn create_workspace(
             &body.agent_type,
             agent_path,
             llm_model_id,
+            None, // agent_config_overrides：Task 2 接入 API 请求字段
         )
         .await
     {
@@ -1176,6 +1177,7 @@ pub async fn update_workspace(
             body.agent_type.as_deref(),
             agent_path,
             llm_model_id,
+            None, // agent_config_overrides：Task 2 接入 API 请求字段
         )
         .await
     {
@@ -1733,6 +1735,7 @@ mod tests {
             agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
+            agent_config_overrides: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -1754,7 +1757,7 @@ mod tests {
         // 评审 Finding 3：session/workspace「不存在」是 Ok(None)（可回退 runner），
         // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1923,7 +1926,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_acp_fields() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         let resp = update_workspace(
@@ -1955,7 +1958,7 @@ mod tests {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
             "w1", "p", "nas", "host", "/p", None, None, "gemini", Some("/opt/gemini"),
-            Some("model-1"),
+            Some("model-1"), None,
         )
         .await
         .unwrap();
@@ -1985,7 +1988,7 @@ mod tests {
     async fn test_update_workspace_clears_agent_type_to_builtin() {
         // agent_type 空串合法：从 ACP 引擎切回内置 runner（与 path/model 不同，可清空）。
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "gemini", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None)
             .await
             .unwrap();
         let resp = update_workspace(
@@ -2011,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
 
@@ -2042,7 +2045,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model_endpoint() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -2094,7 +2097,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_session_model_applies_patched_model() {
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -2140,7 +2143,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_workspace_files_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
@@ -2196,7 +2199,7 @@ mod tests {
     #[tokio::test]
     async fn test_fs_endpoints_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         // 客户端离线：所有面板端点统一 503（前端据此显示「客户端离线」而非空态）。
@@ -2238,7 +2241,7 @@ mod tests {
     #[tokio::test]
     async fn test_fs_file_requires_path() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         let resp = get_fs_file(
@@ -2254,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_safe_mode_needs_approval_409() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
         // 默认 approval_mode = safe：WriteFile 需确认。未确认 → 409 needs_approval，
@@ -2295,10 +2298,10 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_full_auto_skips_approval() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None)
+        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
             .await
             .unwrap();
-        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"), None, None, None)
+        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"), None, None, None, None)
             .await
             .unwrap();
         // full_auto：未确认也直接放行 → 客户端离线 503（而非 409）。

@@ -1432,6 +1432,7 @@ mod tests {
             agent_type: "gemini".into(),
             agent_path: None,
             llm_model_id: Some("model-1".into()),
+            agent_config_overrides: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -1583,6 +1584,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
@@ -2241,6 +2243,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
@@ -2317,6 +2320,7 @@ mod tests {
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
             "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            None,
         )
         .await
         .unwrap();
