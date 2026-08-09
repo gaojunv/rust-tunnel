@@ -711,13 +711,21 @@ pub async fn reindex_doc(
     }
 
     // 并发防护：pending/processing 表示原始摄入或上一次 reindex 仍在途，
-    // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。拒绝并让前端重试。
-    if doc.status == "pending" || doc.status == "processing" {
-        return (
-            StatusCode::CONFLICT,
-            "document is being processed, retry later".to_string(),
-        )
-            .into_response();
+    // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。
+    // 用原子 CAS 抢占（check-then-act 会让两个并发请求双双通过守卫），
+    // 只有一个请求能把状态从 ready/failed 置回 pending，另一个收到 409。
+    match rt.db.rag_mark_document_pending_if_idle(&doc_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                "document is being processed, retry later".to_string(),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+        }
     }
 
     // 定位原文（摄入时已按 file_type 落盘，二进制原文也按同类型重新解析）。
@@ -725,8 +733,16 @@ pub async fn reindex_doc(
     let file_type = FileType::from_extension(&doc.file_type).unwrap_or(FileType::Markdown);
     let source_path = doc_source_path(&rt.store, &kb_id, &doc_id, file_type.as_str());
     // 存在性检查（读字节太贵，先 metadata 探测）：缺失 → 无法无损重建，提示删除重传。
+    // CAS 已把状态置为 pending，此处失败需回滚，否则文档永远卡在 pending。
     if tokio::fs::metadata(&source_path).await.is_err() {
         tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, path = %source_path.display(), "rag reindex: source file missing");
+        if let Err(e) = rt
+            .db
+            .rag_update_document_status(&doc_id, "failed", 0, Some("original document missing; delete and re-upload it"))
+            .await
+        {
+            tracing::warn!(doc_id = %doc_id, error = %e, "rag reindex: rollback status failed");
+        }
         return (
             StatusCode::CONFLICT,
             "original document missing; delete and re-upload it",
@@ -746,15 +762,8 @@ pub async fn reindex_doc(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
-    // 标记 pending（旧 chunk_count 不再有效），随后 spawn_ingest 走完整摄入
+    // 状态已是 pending（CAS 时置位），直接 spawn_ingest 走完整摄入
     // （与 upload 同路径：processing → ready/failed + SSE 事件）。
-    if let Err(e) = rt
-        .db
-        .rag_update_document_status(&doc_id, "pending", 0, None)
-        .await
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
-    }
     spawn_ingest(
         rt.db.clone(),
         rt.store.clone(),

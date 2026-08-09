@@ -255,6 +255,23 @@ impl Database {
         Ok(())
     }
 
+    /// 原子 CAS：仅当文档处于 ready/failed（空闲态）时置回 pending 并清零 chunk_count。
+    /// 返回 true = 抢占成功；false = 正在 pending/processing（在途），调用方应拒绝重索引。
+    /// 解决 reindex 端点 check-then-act 竞态：两个并发请求只有一个能抢到。
+    pub async fn rag_mark_document_pending_if_idle(&self, doc_id: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE rag_documents
+            SET status = 'pending', chunk_count = 0, error = NULL, updated_at = datetime('now')
+            WHERE id = ? AND status NOT IN ('pending', 'processing')
+            "#,
+        )
+        .bind(doc_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn rag_delete_document(&self, id: &str) -> Result<(), sqlx::Error> {
         // 分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_documents WHERE id = ?")
@@ -607,6 +624,50 @@ mod tests {
             .unwrap();
         let doc = db.rag_get_document("d1").await.unwrap().unwrap();
         assert_eq!(doc.file_type, "pdf");
+    }
+
+    #[tokio::test]
+    async fn mark_pending_if_idle_cas() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.rag_create_kb(
+            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
+        )
+        .await
+        .unwrap();
+        db.rag_create_document("d1", "kb1", "a.md", "sha256:x", "md")
+            .await
+            .unwrap();
+
+        // ready → pending 成功（返回 true）
+        db.rag_update_document_status("d1", "ready", 5, None)
+            .await
+            .unwrap();
+        assert!(db.rag_mark_document_pending_if_idle("d1").await.unwrap());
+        let doc = db.rag_get_document("d1").await.unwrap().unwrap();
+        assert_eq!(doc.status, "pending");
+        assert_eq!(doc.chunk_count, 0);
+
+        // 再次 CAS（已是 pending）→ 失败（返回 false），状态不变
+        assert!(!db.rag_mark_document_pending_if_idle("d1").await.unwrap());
+        let doc = db.rag_get_document("d1").await.unwrap().unwrap();
+        assert_eq!(doc.status, "pending");
+
+        // processing → 失败
+        db.rag_update_document_status("d1", "processing", 0, None)
+            .await
+            .unwrap();
+        assert!(!db.rag_mark_document_pending_if_idle("d1").await.unwrap());
+        let doc = db.rag_get_document("d1").await.unwrap().unwrap();
+        assert_eq!(doc.status, "processing");
+
+        // failed → 成功
+        db.rag_update_document_status("d1", "failed", 0, Some("boom"))
+            .await
+            .unwrap();
+        assert!(db.rag_mark_document_pending_if_idle("d1").await.unwrap());
+        let doc = db.rag_get_document("d1").await.unwrap().unwrap();
+        assert_eq!(doc.status, "pending");
+        assert!(doc.error.is_none());
     }
 
     #[tokio::test]
