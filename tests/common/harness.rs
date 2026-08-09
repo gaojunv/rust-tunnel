@@ -1,8 +1,8 @@
 //! In-process server+client harness. Each `TestHarness::spawn` yields a fully
 //! isolated server (fresh tempdir, random ports) that lives until drop.
 
-use rust_tunnel::client::config::ClientConfig;
-use rust_tunnel::client::control::run_client;
+use rust_tunnel_client::config::ClientConfig;
+use rust_tunnel_client::control::run_client;
 use rust_tunnel::server::auth::AuthConfig;
 use rust_tunnel::server::reverse_proxy::{
     tcp_proxy::TcpProxy, Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
@@ -253,7 +253,7 @@ impl TestHarness {
             tls_server_name: Some("localhost".to_string()),
             tls_insecure: true,
             enable_agent,
-            agent_pty_port: rust_tunnel::client::pty::DEFAULT_PTY_PORT,
+            agent_pty_port: rust_tunnel_client::pty::DEFAULT_PTY_PORT,
             log: "warn".to_string(),
         };
 

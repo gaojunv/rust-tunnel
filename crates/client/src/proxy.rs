@@ -2,7 +2,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-pub use crate::client::control::ClientState;
+pub use crate::control::ClientState;
 use rust_tunnel_common::{ControlMessage, TunnelError, TunnelResult};
 
 /// Handle an OpenTunnel request from server.

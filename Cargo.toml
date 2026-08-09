@@ -9,10 +9,6 @@ license = "MIT"
 name = "rust-tunnel-server"
 path = "src/bin/server.rs"
 
-[[bin]]
-name = "rust-tunnel-client"
-path = "src/bin/client.rs"
-
 [workspace]
 members = ["crates/common", "crates/client", "crates/server"]
 
@@ -84,6 +80,7 @@ tempfile = "3.0"
 
 [dependencies]
 rust-tunnel-common = { path = "crates/common" }
+rust-tunnel-client = { path = "crates/client" }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

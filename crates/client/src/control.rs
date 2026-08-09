@@ -7,8 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::client::logs::{spawn_log_forwarder, ClientLogLayer};
-use crate::client::{proxy, spawn::SpawnManager, ClientConfig};
+use crate::logs::{spawn_log_forwarder, ClientLogLayer};
+use crate::{proxy, spawn::SpawnManager, ClientConfig};
 use rust_tunnel_common::{
     connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, MeshServiceDef,
     TunnelError, TunnelResult,
@@ -46,7 +46,7 @@ pub struct ClientState {
     /// 长生命周期 agent 进程的 spawn 管理器（AgentSpawn* 消息）。
     spawn_manager: SpawnManager,
     /// LLM 回环代理的 request_id → 响应接收端（AgentLlmProxy* 消息）。
-    llm_proxy_pending: crate::client::llm_proxy::PendingMap,
+    llm_proxy_pending: crate::llm_proxy::PendingMap,
 }
 
 impl ClientState {
@@ -57,7 +57,7 @@ impl ClientState {
             active_connections: Arc::new(Mutex::new(HashMap::new())),
             exec_cancels: Arc::new(Mutex::new(HashMap::new())),
             spawn_manager: SpawnManager::new(),
-            llm_proxy_pending: crate::client::llm_proxy::new_pending_map(),
+            llm_proxy_pending: crate::llm_proxy::new_pending_map(),
         }
     }
 
@@ -291,7 +291,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         let (cancel_tx, mut cancel_rx) = oneshot::channel();
                         state.register_exec_cancel(&request_id, cancel_tx).await;
                         tokio::spawn(async move {
-                            let result = crate::client::agent::handle_exec_request(
+                            let result = crate::agent::handle_exec_request(
                                 &command,
                                 &root,
                                 std::time::Duration::from_secs(120),
@@ -360,7 +360,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     ControlMessage::AgentLlmProxyStart { session_id } => {
                         let tx = state.control_sender.clone();
                         let port = if state.config.enable_agent {
-                            crate::client::llm_proxy::serve(
+                            crate::llm_proxy::serve(
                                 session_id.clone(),
                                 tx.clone(),
                                 state.llm_proxy_pending.clone(),
@@ -375,7 +375,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                             .await;
                     }
                     ControlMessage::AgentLlmProxyChunk { .. } => {
-                        crate::client::llm_proxy::route_chunk(&state.llm_proxy_pending, &msg).await;
+                        crate::llm_proxy::route_chunk(&state.llm_proxy_pending, &msg).await;
                     }
                     ControlMessage::Disconnect { reason } => {
                         info!("Server requested disconnect: {}", reason);
@@ -609,7 +609,7 @@ mod tests {
             mesh_name: None,
             mesh_services: vec![],
             enable_agent: false,
-            agent_pty_port: crate::client::pty::DEFAULT_PTY_PORT,
+            agent_pty_port: crate::pty::DEFAULT_PTY_PORT,
             log: "info".to_string(),
         };
         let (sender, _) = mpsc::channel(32);

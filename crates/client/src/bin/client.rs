@@ -1,8 +1,8 @@
 use std::io::IsTerminal;
 use std::time::Duration;
 
-use rust_tunnel::client::control;
-use rust_tunnel::client::ClientConfig;
+use rust_tunnel_client::control;
+use rust_tunnel_client::ClientConfig;
 use rust_tunnel_common::{init_logging_with_level, TunnelError, TunnelResult};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
@@ -41,7 +41,7 @@ async fn run() -> TunnelResult<()> {
     if config.enable_agent {
         let port = config.agent_pty_port;
         tokio::spawn(async move {
-            if let Err(e) = rust_tunnel::client::pty::serve(port).await {
+            if let Err(e) = rust_tunnel_client::pty::serve(port).await {
                 tracing::warn!("agent PTY service disabled: {e}");
             }
         });

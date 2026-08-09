@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 
-use crate::client::control::ControlSender;
+use crate::control::ControlSender;
 use rust_tunnel_common::protocol::ClientLogEntry;
 use rust_tunnel_common::ControlMessage;
 
