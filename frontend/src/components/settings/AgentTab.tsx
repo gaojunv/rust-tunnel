@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Loader2, Sparkles } from 'lucide-react';
 import { getAgentDefaultModel, putAgentDefaultModel, getApiErrorMessage } from '@/api/client';
-import ModelSelect from '@/components/agent/ModelSelect';
+import { listAgentSelectableModels } from '@/api/agentModels';
 
 type Feedback = { type: 'success' | 'error'; text: string } | null;
 
@@ -16,6 +16,11 @@ export default function AgentTab() {
   const { data: defaultModel } = useQuery({
     queryKey: ['agent-default-model'],
     queryFn: getAgentDefaultModel,
+    staleTime: 60_000,
+  });
+  const { data: selectable } = useQuery({
+    queryKey: ['agent-selectable-models'],
+    queryFn: listAgentSelectableModels,
     staleTime: 60_000,
   });
 
@@ -54,11 +59,31 @@ export default function AgentTab() {
             <label className="text-sm font-medium">{t('agent.defaultModel')}</label>
             <p className="text-xs text-muted-foreground">{t('settings.agent.defaultModelDesc')}</p>
             <div className="flex items-center gap-2">
-              <ModelSelect
+              <select
+                aria-label={t('agent.selectModel')}
+                className="h-9 rounded-md border bg-background px-2 text-sm"
                 value={defaultModel ?? ''}
-                onChange={(id) => void save(id)}
+                onChange={(e) => void save(e.target.value)}
                 disabled={saving}
-              />
+              >
+                <option value="">{t('agent.selectModel')}</option>
+                <optgroup label={t('agent.model')}>
+                  {selectable?.models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </optgroup>
+                {!!selectable?.groups.length && (
+                  <optgroup label={t('agent.modelGroups')}>
+                    {selectable.groups.map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+              </select>
               {defaultModel && (
                 <Button
                   variant="ghost"
