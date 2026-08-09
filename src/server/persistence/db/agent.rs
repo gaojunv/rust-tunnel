@@ -332,12 +332,55 @@ impl Database {
         Ok(())
     }
 
+    /// 回填 tool_calls 行里指定调用的 arguments（claude-code-acp 的 ToolCall 首帧
+    /// rawInput 常是 {}，真正的参数经后续 ToolCallUpdate.rawInput 才到达；若不回填，
+    /// 重载后历史卡片无操作内容）。只重写 `tool_calls` JSON 数组中 id 匹配项的
+    /// `arguments` 字段，其余字段（name/tool_kind/diffs/locations）保持原样。
+    pub async fn agent_update_tool_call_args(
+        &self,
+        tool_call_id: &str,
+        args: &str,
+    ) -> Result<(), sqlx::Error> {
+        let rows = sqlx::query_as::<_, (i64, String)>(
+            "SELECT rowid, tool_calls FROM agent_messages \
+             WHERE kind = 'tool_calls' AND tool_call_id = ?",
+        )
+        .bind(tool_call_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (rowid, json) in rows {
+            let Ok(mut calls) = serde_json::from_str::<Vec<serde_json::Value>>(&json) else {
+                continue; // 畸形 JSON 跳过（best-effort，不影响实时路径）
+            };
+            let mut touched = false;
+            for c in &mut calls {
+                if c.get("id").and_then(|v| v.as_str()) == Some(tool_call_id) {
+                    c["arguments"] = serde_json::Value::String(args.to_string());
+                    touched = true;
+                }
+            }
+            if touched {
+                sqlx::query("UPDATE agent_messages SET tool_calls = ? WHERE rowid = ?")
+                    .bind(serde_json::to_string(&calls).unwrap_or_default())
+                    .bind(rowid)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn agent_list_messages(
         &self,
         session_id: &str,
     ) -> Result<Vec<AgentMessageRecord>, sqlx::Error> {
+        // 按 rowid（插入顺序）而非 created_at 排序：created_at 是秒级精度
+        // （datetime('now')），同一秒内多条消息（工具帧密集到达时很常见）之间的
+        // 相对顺序由 rowid 兜底，但 created_at 不同秒但插入乱序的场景（ACP 落库
+        // 走并发任务，wall-clock 与插入顺序可能错开）下按 created_at 排会把后插入
+        // 的行提前。rowid 自增且与插入顺序严格一致，是唯一的正确排序键。
         sqlx::query_as::<_, AgentMessageRecord>(
-            "SELECT * FROM agent_messages WHERE session_id = ? ORDER BY created_at, rowid",
+            "SELECT * FROM agent_messages WHERE session_id = ? ORDER BY rowid",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -603,6 +646,99 @@ mod tests {
         // 删除会话级联删除消息
         db.agent_delete_session("s1").await.unwrap();
         assert!(db.agent_list_messages("s1").await.unwrap().is_empty());
+    }
+
+    /// 插入顺序 ≠ created_at 顺序时，列表必须按插入顺序（rowid）返回。
+    ///
+    /// ACP 路径的落库走并发任务（tool_call/tool_result 直接落，文本/thought 缓冲
+    /// 到回合终态才落），wall-clock（created_at，秒级精度）与插入顺序可能错开：
+    /// 快速连续的工具帧在同一秒内多条插入时 created_at 相同靠 rowid 兜底没问题，
+    /// 但「回合中段的 tool_result 在 N 秒落库、回合末的文本合并在 N+1 秒落库」
+    /// 这种正常时序下按 created_at 排序本就对——真正出错的是旧排序键
+    /// `ORDER BY created_at, rowid` 在「晚到的帧带着晚 created_at 却应该先显示」
+    /// 时仍按 created_at 优先排，会把后插入的行甩到列表尾部、语义上提前。
+    ///
+    /// 这个测试直接用 SQL 显式篡改 created_at 制造「rowid 升序但 created_at 降序」
+    /// 的数据（与 ACP 并发落库的真实效果一致），断言按 rowid 而非 created_at 返回。
+    #[tokio::test]
+    async fn test_message_list_orders_by_rowid_not_created_at() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        db.agent_add_message("m1", "s1", "user", "第一", None)
+            .await
+            .unwrap();
+        db.agent_add_message("m2", "s1", "assistant", "第二", None)
+            .await
+            .unwrap();
+        db.agent_add_message("m3", "s1", "user", "第三", None)
+            .await
+            .unwrap();
+
+        // 把 m2 的 created_at 改成未来，m3 保持现在：若按 created_at 排序，
+        // m2（未来）会排到 m3（现在）之后；按 rowid 排序则 m2 仍在 m3 之前。
+        sqlx::query("UPDATE agent_messages SET created_at = '2999-01-01 00:00:00' WHERE id = 'm2'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let msgs = db.agent_list_messages("s1").await.unwrap();
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["m1", "m2", "m3"],
+            "list must follow insertion order (rowid), not created_at"
+        );
+    }
+
+    /// 回填 tool_calls 行 arguments（claude-code-acp rawInput 晚到场景）：只重写
+    /// id 匹配项的 arguments，其余字段与无关调用不受影响。
+    #[tokio::test]
+    async fn test_update_tool_call_args() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        let calls = serde_json::json!([
+            {"id": "c1", "name": "Terminal", "arguments": "{}", "tool_kind": "execute"},
+            {"id": "c2", "name": "Read", "arguments": "{\"path\":\"a.rs\"}", "tool_kind": "read"},
+        ]);
+        db.agent_add_message_v2(
+            "m1", "s1", "assistant", "", Some(&calls.to_string()), Some("c1"), Some("Terminal"), "tool_calls",
+        )
+        .await
+        .unwrap();
+
+        db.agent_update_tool_call_args("c1", "{\"command\":\"echo hi\"}")
+            .await
+            .unwrap();
+
+        let msgs = db.agent_list_messages("s1").await.unwrap();
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(msgs[0].tool_calls.as_deref().unwrap()).unwrap();
+        // c1 的 arguments 已回填为真实命令
+        assert_eq!(parsed[0]["arguments"], "{\"command\":\"echo hi\"}");
+        // c1 其余字段不受影响
+        assert_eq!(parsed[0]["name"], "Terminal");
+        assert_eq!(parsed[0]["tool_kind"], "execute");
+        // 无关调用 c2 不受影响
+        assert_eq!(parsed[1]["arguments"], "{\"path\":\"a.rs\"}");
+
+        // 不存在的 tool_call_id：无错误、无变更
+        db.agent_update_tool_call_args("nope", "x").await.unwrap();
+        let msgs = db.agent_list_messages("s1").await.unwrap();
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(msgs[0].tool_calls.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed[0]["arguments"], "{\"command\":\"echo hi\"}");
     }
 
     #[tokio::test]

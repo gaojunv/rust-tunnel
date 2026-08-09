@@ -102,6 +102,25 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // 自愈：已装载但聊天区为空而历史转非空（陈旧空缓存被 refetch 纠正）→ 允许重装
     if (loadedRef.current && !(itemsRef.current.length === 0 && history.length > 0)) return;
     loadedRef.current = true;
+    // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
+    // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true），此时
+    // 发送会撞 "ACP 回合进行中" busy 守卫、用户消息被静默吞掉。把 running 置 true
+    // 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧或 10 分钟超时解除。
+    // 误置（进程其实已退）的代价只是发送被禁用一段时间，优于消息被吞。
+    if (history.length > 0) {
+      const last = history[history.length - 1];
+      if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current) {
+        runningRef.current = true;
+        setRunning(true);
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        timeoutRef.current = globalThis.setTimeout(() => {
+          setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.responseTimeout')}` }]);
+          runningRef.current = false;
+          setRunning(false);
+          timeoutRef.current = null;
+        }, RUNNING_TIMEOUT_MS);
+      }
+    }
     const loaded: ChatItem[] = [];
     // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args；
     // 同时保留 ACP 新格式的 tool_kind/diffs/locations 供 tool_result 行合并
@@ -134,6 +153,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           /* ignore malformed tool_calls */
         }
       }
+    }
+    // 有配对 tool_result 的 tool_call_id 集合：tool_calls 行只为「无配对」的
+    // 孤儿行渲染兜底卡片（正常完成的工具由 tool_result 卡片展示，不重复）。
+    const pairedResultIds = new Set<string>();
+    for (const m of history) {
+      if (m.kind === 'tool_result' && m.tool_call_id) pairedResultIds.add(m.tool_call_id);
     }
     // 压缩重插去重：kept 段在 summary 前保留原始行（801c9a6），DB 物理顺序为
     // [..., 原kept, summary, 重插kept, 压缩后新消息...]，前端全量渲染会重复。
@@ -206,6 +231,29 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         } catch {
           /* ignore malformed tool_calls */
         }
+      } else if (m.kind === 'tool_calls') {
+        // kind='tool_calls' 的孤儿行（回合中断在工具执行中：ToolCall 已落库，
+        // 对应 ToolCallUpdate/tool_result 永不到达）。history effect 的注释说
+        // 「kind='tool_calls' 行本身不渲染」——但那只在有配对 tool_result 时成立：
+        // 正常路径下 tool_result 卡片已携带 args，无需重复渲染。孤儿行若没有
+        // 任何卡片兜底，重载后该工具就从聊天区彻底消失（现象：卡片无标题无内容、
+        // 或凭空少一段）。渲染为 failed 占位卡片，让用户看到中断痕迹。
+        if (m.tool_call_id && !m.content && !pairedResultIds.has(m.tool_call_id)) {
+          const call = callArgs.get(m.tool_call_id);
+          if (call) {
+            loaded.push({
+              kind: 'tool',
+              content: '',
+              toolName: call.name,
+              toolArgs: call.args,
+              toolResult: undefined,
+              toolStatus: 'failed',
+              toolKind: call.toolKind,
+              toolDiffs: call.toolDiffs,
+              toolLocations: call.toolLocations,
+            });
+          }
+        }
       } else if (m.kind === 'message' && m.name === 'thought' && m.content) {
         loaded.push({ kind: 'thought', content: m.content });
       } else if (m.kind === 'message' && m.name === 'plan') {
@@ -225,7 +273,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       ? loaded.filter((it, i) => it.kind !== 'plan' || i === lastPlanIdx)
       : loaded;
     setItems(finalLoaded);
-  }, [history]);
+    // t 用于 running 超时提示文案；语言切换后重跑 effect 只影响尚未触发的
+    // 超时回调文案，代价可忽略。
+  }, [history, t]);
 
   const clearRunningTimeout = useCallback(() => {
     if (timeoutRef.current) {
@@ -411,11 +461,22 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         setItems((prev) => {
           const next = [...prev];
           const patch = (i: number) => {
+            // args 覆盖（不用 ??）：claude-code-acp 的 ToolCall 首帧 rawInput 常是 {}
+            // 占位，真正的命令/路径经 ToolCallUpdate.rawInput 由本帧携带——必须覆盖
+            // 掉首帧的空 args，否则卡片头部摘要/展开详情永远停在空占位。
+            // 防回归：本帧不带 args 时保留旧值（nullish 保留）。
+            const isNoop = (a: string | undefined) => {
+              const t = (a ?? '').trim();
+              return t === '' || t === '{}';
+            };
             next[i] = {
               ...next[i],
               toolResult: msg.result,
               toolStatus: msg.status ?? 'completed',
               toolName: next[i].toolName ?? msg.name,
+              toolArgs: isNoop(next[i].toolArgs) && !isNoop(msg.args)
+                ? msg.args
+                : next[i].toolArgs ?? msg.args,
               toolKind: next[i].toolKind ?? msg.tool_kind,
               toolDiffs: next[i].toolDiffs ?? msg.diffs,
               toolLocations: next[i].toolLocations ?? msg.locations,

@@ -600,6 +600,9 @@ export type AgentWsEvent =
       id?: string;
       name?: string;
       result?: string;
+      // claude-code-acp 的 ToolCall 首帧 rawInput 常是 {}，真正的参数经
+      // ToolCallUpdate.rawInput 到达后由本帧携带——前端需合并进卡片 args
+      args?: string;
       status?: 'pending' | 'in_progress' | 'running' | 'completed' | 'failed';
       tool_kind?: ToolKind;
       diffs?: ToolDiff[];

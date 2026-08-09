@@ -215,6 +215,39 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('a.rs')).toBeTruthy();
   });
 
+  it('renders orphan tool_calls row as failed card (turn interrupted mid-tool)', async () => {
+    // 回合在工具执行中被刷新/断线打断：tool_call 已落库，tool_result 永不到达。
+    // 重载后该行若无卡片兜底，工具从聊天区彻底消失（现象：无标题无内容的卡片，
+    // 或少一段）。渲染为 failed 占位卡片（保留工具名，状态 ✗）。
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    // 孤儿 tool_calls 行渲染为 failed 卡片：工具名可见、状态徽章 ✗
+    expect(await screen.findByText('list_dir')).toBeTruthy();
+    // StatusBadge 对 failed 渲染 ✗（折叠卡片头部可见，无需展开）
+    expect(screen.getByText('✗')).toBeTruthy();
+    // 重载时末尾是 tool_calls 行 → running 兜底置 true（回合可能仍在服务端跑）
+    expect(screen.getByText('agent.running')).toBeTruthy();
+  });
+
+  it('does not render orphan card for tool_calls with paired tool_result', async () => {
+    // 正常完成的工具：tool_calls 行不渲染（args 由 tool_result 卡片展示），
+    // 只出现一张卡片，不重复。
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
+      { id: 'm3', session_id: 's1', role: 'tool', content: 'src/ tests/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    expect(await screen.findByText('list_dir')).toBeTruthy();
+    // 只有一张卡片（tool_result 渲染的），孤儿兜底不触发
+    expect(screen.getAllByText('list_dir')).toHaveLength(1);
+    // 卡片状态 ✓（completed）
+    expect(screen.getByText('✓')).toBeTruthy();
+  });
+
   it('merges streamed assistant_chunk deltas into one bubble', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
@@ -762,6 +795,53 @@ describe('ChatStream running state', () => {
     fireEvent.click(screen.getByText('Read y'));
     // c2 卡片仍在执行中（r1 没有误挂到 c2）
     expect(screen.getAllByText('agent.toolRunning').length).toBeGreaterThan(0);
+  });
+
+  it('tool_result args backfills placeholder {} args from tool_call (claude-code late rawInput)', async () => {
+    // 实测 claude-code-acp 0.66.0 帧序列：ToolCall 首帧 rawInput={}（占位），
+    // 真正的参数经 ToolCallUpdate.rawInput 由 tool_result 帧携带。卡片头部摘要
+    // 必须从空占位实时补出真实命令，否则「无操作内容」。
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'c1', name: 'Terminal', tool_kind: 'execute',
+        args: '{}', status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'tool_result', id: 'c1', name: 'echo hello',
+        args: '{"command":"echo hello","description":"Print hello"}', status: 'running',
+      });
+      wsInstance!.emit({
+        type: 'tool_result', id: 'c1', status: 'completed', result: 'hello',
+      });
+      wsInstance!.emit({ type: 'done' });
+    });
+    // 摘要必须显示真实命令（args 已从 {} 覆盖为真实参数）——execute 卡片从
+    // args 提取 command 作为头部摘要
+    expect(screen.getByText('echo hello')).toBeTruthy();
+    // 已完成
+    expect(screen.getByText('✓')).toBeTruthy();
+    // 展开卡片应看到完整 args（含 description 字段，证明不是 {} 占位）
+    fireEvent.click(screen.getByText('Terminal'));
+    expect(screen.getByText(/"command":"echo hello"/)).toBeTruthy();
+  });
+
+  it('tool_result without args preserves existing card args', async () => {
+    // tool_call 首帧已带真实 args（无占位），tool_result 不带 args（只带结果）：
+    // 不能清空已有 args。
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'c1', name: 'shell', tool_kind: 'execute',
+        args: '{"cmd":"ls"}', status: 'in_progress',
+      });
+      wsInstance!.emit({ type: 'tool_result', id: 'c1', status: 'completed', result: 'ok' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    fireEvent.click(screen.getByText('shell'));
+    expect(screen.getByText(/"cmd":"ls"/)).toBeTruthy();
   });
 
   it('plan frame updates the last plan bubble in place', async () => {

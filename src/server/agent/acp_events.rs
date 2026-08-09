@@ -83,14 +83,29 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             if let Some(kind) = &upd.fields.kind {
                 frame["tool_kind"] = serde_json::Value::String(kind_str(kind).into());
             }
+            // claude-code 的 ToolCall 首帧 rawInput 常是 {}（参数尚未到达），真正的
+            // 命令/路径经后续 ToolCallUpdate.rawInput 才到达——映射为 args 让前端卡片
+            // 实时补出操作内容（首帧 args 是 {} 占位时也要被本帧覆盖）。
+            if let Some(input) = &upd.fields.raw_input {
+                frame["args"] = serde_json::Value::String(encode_raw(input));
+            }
             if let Some(output) = &upd.fields.raw_output {
                 frame["result"] = serde_json::Value::String(encode_raw(output));
             }
-            if let Some(content) = &upd.fields.content {
-                let diffs = extract_diffs(content);
-                if !diffs.is_empty() {
-                    frame["diffs"] = serde_json::Value::Array(diffs);
+            let mut diffs = upd
+                .fields
+                .content
+                .as_deref()
+                .map(extract_diffs)
+                .unwrap_or_default();
+            // Edit 兜底：diff 在 raw_input 的 old_string/new_string（同 ToolCall 路径）
+            if diffs.is_empty() {
+                if let Some(raw) = &upd.fields.raw_input {
+                    diffs = extract_raw_edit_diff(raw);
                 }
+            }
+            if !diffs.is_empty() {
+                frame["diffs"] = serde_json::Value::Array(diffs);
             }
             if let Some(locations) = &upd.fields.locations {
                 let locations = extract_locations(locations);
@@ -486,6 +501,44 @@ mod tests {
         assert_eq!(
             frame["diffs"],
             serde_json::json!([{"path": "/w/a.rs", "old_text": null, "new_text": "new"}])
+        );
+    }
+
+    #[test]
+    fn test_map_tool_call_update_carries_raw_input_as_args() {
+        // 实测 claude-code-acp 形态（0.66.0）：ToolCall 首帧 rawInput={}、title 是
+        // 占位词（"Terminal"），真正的参数经 ToolCallUpdate.rawInput 才到达。
+        // update 帧必须携带 args，前端卡片才能实时补出操作内容。
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_5",
+            "rawInput": {"command": "echo hello", "description": "Print hello"},
+            "title": "echo hello",
+            "kind": "execute"
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["type"], "tool_result");
+        assert_eq!(
+            frame["args"],
+            "{\"command\":\"echo hello\",\"description\":\"Print hello\"}"
+        );
+        assert_eq!(frame["name"], "echo hello");
+        // 无 status/raw_output/非空 content → 仍是 running（中间状态，不误判 completed）
+        assert_eq!(frame["status"], "running");
+    }
+
+    #[test]
+    fn test_map_tool_call_update_diff_from_raw_input() {
+        // claude-code Edit 形态：update 无 content，diff 在 rawInput 的 old_string/new_string
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call_6",
+            "rawInput": {"file_path": "src/lib.rs", "old_string": "a", "new_string": "b"}
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(
+            frame["diffs"],
+            serde_json::json!([{"path": "src/lib.rs", "old_text": "a", "new_text": "b"}])
         );
     }
 

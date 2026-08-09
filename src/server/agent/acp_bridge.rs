@@ -391,6 +391,13 @@ impl AcpBridge {
                         // title，而前端 ChatStream 按 tool_result.name === tool_call.name
                         // 匹配卡片——从前序 ToolCall 事件的 title 补名，保证结果能挂上。
                         let mut tool_names: HashMap<String, String> = HashMap::new();
+                        // tool_call_id → 已落库 args 缓存：claude-code 的 ToolCall 首帧
+                        // rawInput 常是 {}（参数尚未到达），真正的命令/路径经后续
+                        // ToolCallUpdate.rawInput 到达。若仅推送 WS 而不回填 DB，
+                        // 重载后 tool_result 卡片从 tool_calls 行取到的仍是空 args
+                        // （历史卡片无操作内容）。缓存已落值，后续含新 rawInput 的帧
+                        // UPDATE 原 tool_calls 行补齐。
+                        let mut tool_args: HashMap<String, String> = HashMap::new();
                         async move |notification: SessionNotification, _cx| {
                             // 专用连接：所有通知都属于本 session。tool_call 名缓存
                             // 先填（会话 detached 期间也可累积，重连后 tool_result
@@ -447,16 +454,27 @@ impl AcpBridge {
                                 _ => {}
                             }
                             if let Some(mut frame) = map_update(&notification.update) {
-                                // ToolCallUpdate 缺 title 时从缓存补 name。
-                                if frame["type"] == "tool_result"
-                                    && frame.get("name").is_none()
-                                {
-                                    if let Some(id) =
-                                        frame.get("id").and_then(|v| v.as_str())
-                                    {
-                                        if let Some(name) = tool_names.get(id) {
-                                            frame["name"] =
-                                                serde_json::Value::String(name.clone());
+                                // owned 拷贝：后面要对 frame 赋值，不能持 &str 借用
+                                let frame_id = frame
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string);
+                                // ToolCallUpdate 缺 title 时从缓存补 name；缺 args 时
+                                // 从已落库值补（最终 rawOutput 帧常只带结果不带参数，
+                                // 卡片展开详情需要 args）。
+                                if frame["type"] == "tool_result" {
+                                    if let Some(id) = &frame_id {
+                                        if frame.get("name").is_none() {
+                                            if let Some(name) = tool_names.get(id) {
+                                                frame["name"] =
+                                                    serde_json::Value::String(name.clone());
+                                            }
+                                        }
+                                        if frame.get("args").is_none() {
+                                            if let Some(args) = tool_args.get(id) {
+                                                frame["args"] =
+                                                    serde_json::Value::String(args.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -464,6 +482,40 @@ impl AcpBridge {
                                 // 落；文本/thought 缓冲到终态合并落一行。断线期间
                                 // 到达的帧同样落库——落库在推送之前、与推送解耦。
                                 persist_acp_frame(&db, &sessions, &sid, &frame).await;
+                                // args 回填：tool_call 帧登记已落库 args；tool_result 帧
+                                // 携带了新 rawInput（与已落库值不同）时 UPDATE 原
+                                // tool_calls 行补齐——重载后历史卡片才能看到操作内容。
+                                match (frame["type"].as_str().unwrap_or(""), frame_id) {
+                                    ("tool_call", Some(id)) => {
+                                        if let Some(a) =
+                                            frame.get("args").and_then(|v| v.as_str())
+                                        {
+                                            tool_args.insert(id.to_string(), a.to_string());
+                                        }
+                                    }
+                                    ("tool_result", Some(id)) => {
+                                        if let Some(a) =
+                                            frame.get("args").and_then(|v| v.as_str())
+                                        {
+                                            // 空对象占位（"{}"）不算新信息：ToolCall 首帧
+                                            // 的 rawInput={} 不能覆盖此前已回填的真参数。
+                                            let meaningful = a.trim() != "{}";
+                                            let persisted =
+                                                tool_args.get(&id).map(String::as_str);
+                                            if meaningful && persisted != Some(a) {
+                                                if let Err(e) = db
+                                                    .agent_update_tool_call_args(&id, a)
+                                                    .await
+                                                {
+                                                    tracing::warn!(session_id = %sid,
+                                                        "backfill tool_call args failed: {e}");
+                                                }
+                                                tool_args.insert(id.clone(), a.to_string());
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 // 推送：每次事件动态解析当前 WS 通道（评审 Finding 1）——
                                 // handshake 时捕获的 ws_tx 在重连后会过时，ensure_session
                                 // 的 dedup 刷新与 detach_ws_tx 清空只改条目里的 ws_tx，
