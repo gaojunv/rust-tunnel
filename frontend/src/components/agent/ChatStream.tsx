@@ -48,6 +48,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
   // ACP 会话配置快照（session_state/config_option_update 全量帧；空数组 = 非 ACP 或未就绪）
   const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
+  // config option 乐观更新的回滚快照：发送后保留，等服务端权威确认帧
+  // （session_state/config_option_update，确认生效则清空）或「设置失败」error 帧
+  // （回滚到快照）。断线/重连时快照作废——它属于上一连接生命周期。
+  const configRollbackRef = useRef<SessionConfigOption[] | null>(null);
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -492,6 +496,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       } else if (msg.type === 'session_state' || msg.type === 'config_option_update') {
         // 全量配置快照（session_state=初始，config_option_update=变更后）：归一化覆盖
         setConfigOptions(normalizeConfigOptions(msg.options));
+        // 服务端权威状态到达 = 乐观更新确认生效：放弃回滚快照
+        configRollbackRef.current = null;
       } else if (msg.type === 'current_mode_update') {
         // agent 侧自行切 mode（如 shift+tab）：同步 mode 项当前值
         setConfigOptions((prev) =>
@@ -514,6 +520,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           approvalStatus: 'pending',
         }]);
       } else if (msg.type === 'error') {
+        // 「设置失败」error 帧（服务端 set_config_option 失败，格式 `设置失败: {e}`）：
+        // 乐观更新从未生效，回滚到发送前快照，按钮不再显示假性值。
+        if (configRollbackRef.current && msg.message?.startsWith('设置失败')) {
+          setConfigOptions(configRollbackRef.current);
+          configRollbackRef.current = null;
+        }
         flushChunks();
         breakStream();
         setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
@@ -525,6 +537,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
       ws.onclose = () => {
         wsRef.current = null;
+        // 回滚快照属于上一连接生命周期：断线即作废，重连后以 session_state 重新对齐
+        configRollbackRef.current = null;
         if (closedByCleanup) return;
         // 断线：本地回合状态作废（服务端可能还在跑，也可能已丢），重连后按
         // DB 历史对齐。用户消息已发出去但服务端未必收到——提示而非静默重发。
@@ -706,10 +720,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       });
   };
 
-  // ACP config option 切换：乐观更新 + WS 发送；发送失败回滚。
-  // 生效确认以服务端回推的 config_option_update 全量帧为准。
+  // ACP config option 切换：乐观更新 + WS 发送；发送失败或服务端「设置失败」
+  // error 帧回滚（configRollbackRef 快照），生效确认以服务端回推的
+  // config_option_update / session_state 全量帧为准。
   const sendConfigOption = (configId: string, value: string) => {
     const prev = configOptions;
+    // 保留回滚快照；不在此清空——发送成功与否要等服务端权威确认帧
+    configRollbackRef.current = prev;
     setConfigOptions((cur) =>
       cur.map((o) => {
         if (o.id !== configId) return o;
@@ -722,12 +739,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     );
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // 帧未发出：本地回滚即操作终结，快照一并作废
+      configRollbackRef.current = null;
       setConfigOptions(prev);
       return;
     }
     try {
       ws.send(JSON.stringify({ type: 'set_config_option', config_id: configId, value }));
     } catch {
+      // send 同步抛错：帧未到达服务端，回滚并作废快照
+      configRollbackRef.current = null;
       setConfigOptions(prev);
       setItems((prevItems) => [
         ...prevItems,

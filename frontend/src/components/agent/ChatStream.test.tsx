@@ -912,6 +912,43 @@ describe('ChatStream running state', () => {
     expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
   });
 
+  it('rolls back optimistic config option on 设置失败 error frame', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state：effort 项 currentValue=medium
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'effort',
+            name: 'Effort',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: 'medium',
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'medium', name: 'Medium' },
+              { value: 'high', name: 'High' },
+            ],
+          },
+        ],
+      });
+    });
+    // 展开 Effort 快捷菜单 → 点击 High：乐观更新使按钮文本立即变 High
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'agent.configEffort' }));
+    fireEvent.click(screen.getByText('High'));
+    expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
+    // 服务端回「设置失败」error 帧（config_id 失效/agent 退出等）：
+    // 乐观值从未生效，应回滚到发送前快照 Medium，而非停留在假性 High
+    act(() => {
+      wsInstance!.emit({ type: 'error', message: '设置失败: unknown config option: effort' });
+    });
+    expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('Medium');
+    // 错误气泡照常追加（用户可见失败原因）
+    expect(screen.getByText(/设置失败/)).toBeTruthy();
+  });
+
   it('hides Mode/Effort buttons for non-ACP sessions (no session_state)', () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
