@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-use crate::common::{AgentCommand, AgentResult};
+use rust_tunnel_common::{AgentCommand, AgentResult};
 
 /// 单条命令输出上限（协议 1MB 消息上限内留足余量）
 const MAX_OUTPUT: usize = 100 * 1024;

@@ -3,8 +3,8 @@ use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 
 use crate::client::control::ControlSender;
-use crate::common::protocol::ClientLogEntry;
-use crate::common::ControlMessage;
+use rust_tunnel_common::protocol::ClientLogEntry;
+use rust_tunnel_common::ControlMessage;
 
 /// A tracing [`Layer`] that captures log events on the client and forwards them
 /// through an mpsc channel so they can be batched and sent to the server.

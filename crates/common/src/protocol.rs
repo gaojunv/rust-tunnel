@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::common::{TunnelError, TunnelResult};
+use crate::{TunnelError, TunnelResult};
 
 /// A log entry from a connected client
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -287,7 +287,7 @@ impl ControlMessage {
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
 
-        let msg = bincode::deserialize(&buf)?;
+        let msg: Self = bincode::deserialize(&buf)?;
         Ok(Some(msg))
     }
 

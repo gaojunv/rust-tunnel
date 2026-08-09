@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rust_tunnel::client::control;
 use rust_tunnel::client::ClientConfig;
-use rust_tunnel::common::{init_logging_with_level, TunnelError, TunnelResult};
+use rust_tunnel_common::{init_logging_with_level, TunnelError, TunnelResult};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 30;

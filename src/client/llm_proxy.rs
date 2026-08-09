@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 
 /// request_id -> 等待响应 chunk 的 HTTP 连接发送端
 pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>;

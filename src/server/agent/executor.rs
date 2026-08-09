@@ -1,6 +1,6 @@
 //! Glue between the agent loop and the tunnel: workspace lock + registry.agent_exec.
 use super::AgentState;
-use crate::common::{AgentCommand, AgentResult};
+use rust_tunnel_common::{AgentCommand, AgentResult};
 
 /// Execute a command on the workspace's client, serialized per workspace.
 /// Never errors at the Rust level: transport failures become AgentResult::Error.

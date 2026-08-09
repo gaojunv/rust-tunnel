@@ -22,7 +22,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 use crate::server::stats::{EntityType, StatsCollector};
 
 /// Max payload of a single `Data` message. Chosen well under the 1 MiB
@@ -238,7 +238,7 @@ impl Drop for ClientTunnelStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ControlMessage;
+    use rust_tunnel_common::ControlMessage;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 

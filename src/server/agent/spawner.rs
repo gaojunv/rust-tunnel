@@ -57,7 +57,7 @@ impl AgentSpawner {
             .spawn_negotiate(
                 client_id,
                 session_id,
-                crate::common::ControlMessage::AgentLlmProxyStart {
+                rust_tunnel_common::ControlMessage::AgentLlmProxyStart {
                     session_id: session_id.to_string(),
                 },
                 timeout,
@@ -65,8 +65,8 @@ impl AgentSpawner {
             .await
             .map_err(|e| format!("llm proxy start failed: {e}"))?;
         match msg {
-            crate::common::ControlMessage::AgentLlmProxyReady { port, .. } if port > 0 => Ok(port),
-            crate::common::ControlMessage::AgentLlmProxyReady { .. } => {
+            rust_tunnel_common::ControlMessage::AgentLlmProxyReady { port, .. } if port > 0 => Ok(port),
+            rust_tunnel_common::ControlMessage::AgentLlmProxyReady { .. } => {
                 Err("llm proxy failed to bind".into())
             }
             other => Err(format!("unexpected response: {other:?}")),
@@ -92,7 +92,7 @@ impl AgentSpawner {
             .spawn_negotiate(
                 client_id,
                 session_id,
-                crate::common::ControlMessage::AgentSpawnRequest {
+                rust_tunnel_common::ControlMessage::AgentSpawnRequest {
                     session_id: session_id.to_string(),
                     command,
                     args,
@@ -104,8 +104,8 @@ impl AgentSpawner {
             .await
             .map_err(|e| format!("agent spawn failed: {e}"))?;
         match msg {
-            crate::common::ControlMessage::AgentSpawnResponse { success: true, .. } => Ok(()),
-            crate::common::ControlMessage::AgentSpawnResponse { error, .. } => {
+            rust_tunnel_common::ControlMessage::AgentSpawnResponse { success: true, .. } => Ok(()),
+            rust_tunnel_common::ControlMessage::AgentSpawnResponse { error, .. } => {
                 Err(error.unwrap_or_else(|| "unknown spawn error".into()))
             }
             other => Err(format!("unexpected response: {other:?}")),
@@ -117,7 +117,7 @@ impl AgentSpawner {
     pub async fn client_control_sender(
         &self,
         client_id: &str,
-    ) -> Option<tokio::sync::mpsc::Sender<crate::common::ControlMessage>> {
+    ) -> Option<tokio::sync::mpsc::Sender<rust_tunnel_common::ControlMessage>> {
         self.registry
             .get(client_id)
             .await
@@ -138,7 +138,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    use crate::common::ControlMessage;
+    use rust_tunnel_common::ControlMessage;
     use crate::server::db::Database;
 
     #[test]

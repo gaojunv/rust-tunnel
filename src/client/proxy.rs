@@ -3,7 +3,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 pub use crate::client::control::ClientState;
-use crate::common::{ControlMessage, TunnelError, TunnelResult};
+use rust_tunnel_common::{ControlMessage, TunnelError, TunnelResult};
 
 /// Handle an OpenTunnel request from server.
 /// Dials `target_addr`, sends TunnelOpenResult, then shuttles data.

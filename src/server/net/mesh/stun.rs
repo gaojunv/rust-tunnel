@@ -1,4 +1,4 @@
-use crate::common::{ATTR_XOR_MAPPED_ADDRESS, STUN_MAGIC_COOKIE};
+use rust_tunnel_common::{ATTR_XOR_MAPPED_ADDRESS, STUN_MAGIC_COOKIE};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
@@ -82,7 +82,7 @@ impl StunServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::build_binding_request;
+    use rust_tunnel_common::build_binding_request;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]

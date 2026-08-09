@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use crate::common::{ControlMessage, MeshMember, MeshRoute, MeshService};
+use rust_tunnel_common::{ControlMessage, MeshMember, MeshRoute, MeshService};
 
 use self::relay::MeshRelay;
 use self::router::MeshRouter;

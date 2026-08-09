@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::logs::{spawn_log_forwarder, ClientLogLayer};
 use crate::client::{proxy, spawn::SpawnManager, ClientConfig};
-use crate::common::{
+use rust_tunnel_common::{
     connect_tls_insecure, init_logging_with_layer, ClientLogEntry, ControlMessage, MeshServiceDef,
     TunnelError, TunnelResult,
 };
@@ -275,7 +275,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                     .send(ControlMessage::AgentExecResponse {
                                         session_id,
                                         request_id,
-                                        result: crate::common::AgentResult::Error {
+                                        result: rust_tunnel_common::AgentResult::Error {
                                             message: "agent not enabled on this client".into(),
                                         },
                                     })
@@ -595,7 +595,7 @@ pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ControlMessage;
+    use rust_tunnel_common::ControlMessage;
 
     fn create_test_state() -> ClientState {
         let config = ClientConfig {
@@ -820,7 +820,7 @@ mod tests {
             request_id: "r1".into(),
             root_path: ".".into(),
             docker_container: None,
-            command: crate::common::AgentCommand::Shell {
+            command: rust_tunnel_common::AgentCommand::Shell {
                 cmd: "echo hi".into(),
                 cwd: None,
             },
@@ -843,7 +843,7 @@ mod tests {
             } => {
                 assert_eq!(request_id, "r1");
                 match result {
-                    crate::common::AgentResult::Error { message } => {
+                    rust_tunnel_common::AgentResult::Error { message } => {
                         assert!(message.contains("not enabled"));
                     }
                     other => panic!("expected Error, got {other:?}"),
@@ -869,7 +869,7 @@ mod tests {
             request_id: "r2".into(),
             root_path: ".".into(),
             docker_container: None,
-            command: crate::common::AgentCommand::Shell {
+            command: rust_tunnel_common::AgentCommand::Shell {
                 cmd: "echo hello-agent".into(),
                 cwd: None,
             },
@@ -892,7 +892,7 @@ mod tests {
             } => {
                 assert_eq!(request_id, "r2");
                 match result {
-                    crate::common::AgentResult::Shell {
+                    rust_tunnel_common::AgentResult::Shell {
                         stdout, exit_code, ..
                     } => {
                         assert_eq!(exit_code, 0);

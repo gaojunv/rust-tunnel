@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
-use crate::common::error::TunnelResult;
-use crate::common::tls::{create_server_config, load_or_generate_cert};
+use rust_tunnel_common::error::TunnelResult;
+use rust_tunnel_common::tls::{create_server_config, load_or_generate_cert};
 use crate::server::acme::manager::{CertEvent, CertificateManager};
 use crate::server::acme::provider::CertCoverage;
 use crate::server::control::{ServerState, TrojanRuntimeStatus};

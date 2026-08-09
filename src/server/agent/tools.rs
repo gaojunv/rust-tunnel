@@ -1,5 +1,5 @@
 //! Tool definitions (JSON schema) and tool-call → AgentCommand conversion.
-use crate::common::AgentCommand;
+use rust_tunnel_common::AgentCommand;
 
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
 pub fn agent_tools_schema() -> Vec<serde_json::Value> {

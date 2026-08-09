@@ -6,7 +6,7 @@ use axum::{
 };
 
 use super::ApiState;
-use crate::common::DnsRecord;
+use rust_tunnel_common::DnsRecord;
 
 // ── DNS Management Endpoints ───────────────────────────────────────
 

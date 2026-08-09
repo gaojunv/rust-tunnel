@@ -37,7 +37,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client, ConnectionTo};
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 use crate::server::db::Database;
 use crate::server::llm::crypto::LlmCipher;
 use crate::server::persistence::db::agent::AgentWorkspaceRecord;

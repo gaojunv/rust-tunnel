@@ -1,5 +1,5 @@
-use crate::common::ControlMessage;
-use crate::common::TunnelError;
+use rust_tunnel_common::ControlMessage;
+use rust_tunnel_common::TunnelError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;

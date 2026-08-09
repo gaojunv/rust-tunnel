@@ -864,7 +864,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use crate::common::ControlMessage;
+        use rust_tunnel_common::ControlMessage;
         use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
         use crate::server::db::Database;
         use crate::server::reverse_proxy::connector::ClientConnector;

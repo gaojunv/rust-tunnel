@@ -19,7 +19,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info};
 
-use crate::common::{TunnelError, TunnelResult};
+use crate::{TunnelError, TunnelResult};
 
 /// Certificate and private key pair for TLS
 pub struct TlsCertPair {

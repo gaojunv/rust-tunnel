@@ -1,4 +1,4 @@
-use rust_tunnel::common::{
+use rust_tunnel_common::{
     create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert,
     TunnelResult,
 };

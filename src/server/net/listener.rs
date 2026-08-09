@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::common::{TunnelError, TunnelResult};
+use rust_tunnel_common::{TunnelError, TunnelResult};
 use crate::server::control::{PortInfo, ServerState};
 use crate::server::protocols::shadowsocks::proxy_ss_connection;
 use crate::server::protocols::trojan::proxy_trojan_connection;

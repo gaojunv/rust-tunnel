@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 /// PTY 服务固定回环端口。用固定端口而非随机端口，是为了让服务端在不新增协议
 /// 消息的前提下，仅凭 `open_tunnel(client_name, "127.0.0.1:45631")` 就能直连；
 /// 端口被占用时 listen 失败，调用方只 warn 不退出（服务端会按版本门控降级）。
-pub const DEFAULT_PTY_PORT: u16 = 45631;
+pub use rust_tunnel_common::pty::DEFAULT_PTY_PORT;
 
 /// 协商帧首行最大长度：4KB 足够容纳 rows/cols/shell，超限直接断开防畸形请求
 const MAX_NEGOTIATION_BYTES: usize = 4 * 1024;

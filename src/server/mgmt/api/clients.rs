@@ -243,7 +243,7 @@ mod tests {
         delete_client_impl(&reg, "home-nas").await.unwrap();
 
         // Should receive Disconnect
-        use crate::common::ControlMessage;
+        use rust_tunnel_common::ControlMessage;
         let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .unwrap()

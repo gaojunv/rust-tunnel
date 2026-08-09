@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, warn};
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 use crate::server::db::Database;
 
 pub type ControlSender = mpsc::Sender<ControlMessage>;
@@ -69,7 +69,7 @@ pub struct ClientEntry {
     pub active_connections: Mutex<HashMap<u64, ActiveTunnelConnection>>,
     /// Pending agent exec requests, keyed by request_id; resolved by
     /// `deliver_agent_response` when the client's AgentExecResponse arrives.
-    pub agent_pending: Mutex<HashMap<String, oneshot::Sender<crate::common::AgentResult>>>,
+    pub agent_pending: Mutex<HashMap<String, oneshot::Sender<rust_tunnel_common::AgentResult>>>,
 }
 
 /// Global registry of online clients, keyed by name. Cloneable: internal state
@@ -318,9 +318,9 @@ impl ClientRegistry {
         session_id: &str,
         root_path: &str,
         docker_container: Option<&str>,
-        command: crate::common::AgentCommand,
+        command: rust_tunnel_common::AgentCommand,
         timeout: std::time::Duration,
-    ) -> std::io::Result<crate::common::AgentResult> {
+    ) -> std::io::Result<rust_tunnel_common::AgentResult> {
         use std::io::{Error, ErrorKind};
 
         let entry = self.get(client_name).await.ok_or_else(|| {
@@ -371,7 +371,7 @@ impl ClientRegistry {
         &self,
         client_name: &str,
         request_id: &str,
-        result: crate::common::AgentResult,
+        result: rust_tunnel_common::AgentResult,
     ) {
         if let Some(entry) = self.get(client_name).await {
             let tx = entry.agent_pending.lock().await.remove(request_id);
@@ -457,7 +457,7 @@ impl ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::ControlMessage;
+    use rust_tunnel_common::ControlMessage;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -586,7 +586,7 @@ mod tests {
                 "sess",
                 "/workspace",
                 None,
-                crate::common::AgentCommand::GitStatus,
+                rust_tunnel_common::AgentCommand::GitStatus,
                 std::time::Duration::from_secs(1),
             )
             .await;
@@ -626,7 +626,7 @@ mod tests {
                         .deliver_agent_response(
                             "nas",
                             &request_id,
-                            crate::common::AgentResult::Success,
+                            rust_tunnel_common::AgentResult::Success,
                         )
                         .await;
                     let _ = session_id;
@@ -642,12 +642,12 @@ mod tests {
                 "sess",
                 "/workspace",
                 Some("dev-ctr"),
-                crate::common::AgentCommand::GitPush,
+                rust_tunnel_common::AgentCommand::GitPush,
                 std::time::Duration::from_secs(2),
             )
             .await
             .unwrap();
-        assert!(matches!(result, crate::common::AgentResult::Success));
+        assert!(matches!(result, rust_tunnel_common::AgentResult::Success));
     }
 
     #[tokio::test]
@@ -669,7 +669,7 @@ mod tests {
                 "sess",
                 "/workspace",
                 None,
-                crate::common::AgentCommand::GitPush,
+                rust_tunnel_common::AgentCommand::GitPush,
                 std::time::Duration::from_millis(100),
             )
             .await;

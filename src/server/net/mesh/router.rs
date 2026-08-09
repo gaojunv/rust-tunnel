@@ -1,4 +1,4 @@
-use crate::common::MeshRoute;
+use rust_tunnel_common::MeshRoute;
 use std::collections::HashMap;
 
 /// Mesh routing table tracking all mesh networks and their members.
@@ -71,7 +71,7 @@ impl MeshRouter {
         &mut self,
         mesh_id: &str,
         client_name: &str,
-        services: Vec<crate::common::MeshService>,
+        services: Vec<rust_tunnel_common::MeshService>,
     ) {
         if let Some(members) = self.networks.get_mut(mesh_id) {
             if let Some(route) = members.get_mut(client_name) {
@@ -184,7 +184,7 @@ mod tests {
         router.register_services(
             "mesh1",
             "client-a",
-            vec![crate::common::MeshService {
+            vec![rust_tunnel_common::MeshService {
                 name: "db".into(),
                 protocol: "mysql".into(),
                 local_addr: "localhost:3306".into(),

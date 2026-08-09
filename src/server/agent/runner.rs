@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
-use crate::common::{AgentCommand, AgentResult};
+use rust_tunnel_common::{AgentCommand, AgentResult};
 use crate::server::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
 /// @引用限制：个数、单文件字节、总字节。

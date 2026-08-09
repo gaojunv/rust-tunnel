@@ -268,7 +268,7 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
 
     // 5. 建立到客户端回环 PTY 服务的隧道。MVP：客户端 `--agent-pty-port` 可覆盖
     //    监听端口，但服务端无从得知覆盖值，只能硬编码默认端口常量。
-    let target = format!("127.0.0.1:{}", crate::client::pty::DEFAULT_PTY_PORT);
+    let target = format!("127.0.0.1:{}", rust_tunnel_common::pty::DEFAULT_PTY_PORT);
     let mut tunnel = match agent.registry.open_tunnel(&ws.client_id, &target).await {
         Ok(t) => t,
         Err(e) => {
@@ -529,11 +529,11 @@ async fn inject_refs(
             client_id,
             root_path,
             docker_container,
-            crate::common::AgentCommand::ReadFile { path: path.clone() },
+            rust_tunnel_common::AgentCommand::ReadFile { path: path.clone() },
         )
         .await;
         match result {
-            crate::common::AgentResult::FileContent { content: c } => {
+            rust_tunnel_common::AgentResult::FileContent { content: c } => {
                 total += c.len();
                 ref_files.push((path.clone(), Ok(c)));
             }
@@ -1228,8 +1228,8 @@ pub struct WorkspaceFilesQuery {
 async fn workspace_exec(
     state: &ApiState,
     workspace_id: &str,
-    command: crate::common::AgentCommand,
-) -> Result<crate::common::AgentResult, axum::response::Response> {
+    command: rust_tunnel_common::AgentCommand,
+) -> Result<rust_tunnel_common::AgentResult, axum::response::Response> {
     let Some(agent) = &state.server_state.agent_state else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
@@ -1251,7 +1251,7 @@ async fn workspace_exec(
     )
     .await;
     match result {
-        crate::common::AgentResult::Error { .. } => {
+        rust_tunnel_common::AgentResult::Error { .. } => {
             Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
         }
         ok => Ok(ok),
@@ -1272,13 +1272,13 @@ pub async fn get_fs_tree(
     Query(params): Query<FsPathQuery>,
 ) -> impl IntoResponse {
     let path = params.path.unwrap_or_else(|| ".".to_string());
-    let result = match workspace_exec(&state, &id, crate::common::AgentCommand::ListDir { path })
+    let result = match workspace_exec(&state, &id, rust_tunnel_common::AgentCommand::ListDir { path })
         .await
     {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let crate::common::AgentResult::FileContent { content } = result else {
+    let rust_tunnel_common::AgentResult::FileContent { content } = result else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let entries: Vec<serde_json::Value> = content
@@ -1303,13 +1303,13 @@ pub async fn get_fs_file(
     let Some(path) = params.path.filter(|p| !p.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "path is required").into_response();
     };
-    let result = match workspace_exec(&state, &id, crate::common::AgentCommand::ReadFile { path })
+    let result = match workspace_exec(&state, &id, rust_tunnel_common::AgentCommand::ReadFile { path })
         .await
     {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let crate::common::AgentResult::FileContent { content } = result else {
+    let rust_tunnel_common::AgentResult::FileContent { content } = result else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let truncated = content.contains("[truncated]");
@@ -1345,7 +1345,7 @@ pub async fn put_fs_file(
         },
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let command = crate::common::AgentCommand::WriteFile {
+    let command = rust_tunnel_common::AgentCommand::WriteFile {
         path: body.path,
         content: body.content,
     };
@@ -1373,7 +1373,7 @@ pub async fn get_git_status(
     let result = match workspace_exec(
         &state,
         &id,
-        crate::common::AgentCommand::Shell {
+        rust_tunnel_common::AgentCommand::Shell {
             cmd: "git status --porcelain=v1 -b".to_string(),
             cwd: None,
         },
@@ -1383,7 +1383,7 @@ pub async fn get_git_status(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let crate::common::AgentResult::Shell { stdout, stderr, .. } = result else {
+    let rust_tunnel_common::AgentResult::Shell { stdout, stderr, .. } = result else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     Json(serde_json::json!({ "status": stdout, "stderr": stderr })).into_response()
@@ -1399,7 +1399,7 @@ pub async fn get_git_diff(
     let result = match workspace_exec(
         &state,
         &id,
-        crate::common::AgentCommand::GitDiff {
+        rust_tunnel_common::AgentCommand::GitDiff {
             path: params.path.filter(|p| !p.is_empty()),
         },
     )
@@ -1408,7 +1408,7 @@ pub async fn get_git_diff(
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    let crate::common::AgentResult::FileContent { content } = result else {
+    let rust_tunnel_common::AgentResult::FileContent { content } = result else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     Json(serde_json::json!({ "diff": content })).into_response()
@@ -1458,12 +1458,12 @@ pub async fn list_workspace_files(
         &ws.client_id,
         &ws.root_path,
         ws.docker_container_id.as_deref(),
-        crate::common::AgentCommand::Shell { cmd, cwd: None },
+        rust_tunnel_common::AgentCommand::Shell { cmd, cwd: None },
     )
     .await;
     let files: Vec<String> = match result {
         // grep 无命中 / Windows 无 grep 报错（走 stderr，stdout 为空）→ 空列表 200，降级语义保留
-        crate::common::AgentResult::Shell { stdout, .. } => stdout
+        rust_tunnel_common::AgentResult::Shell { stdout, .. } => stdout
             .lines()
             .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
             .filter(|l| !l.is_empty())

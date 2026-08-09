@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 
 /// 单次 stdout 转发上限（协议 1MB 消息内留余量）
 const MAX_CHUNK: usize = 512 * 1024;

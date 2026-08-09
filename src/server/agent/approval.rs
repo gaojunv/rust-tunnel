@@ -1,5 +1,5 @@
 //! 危险操作审批规则：按 workspace approval_mode 判定工具调用是否需用户确认。
-use crate::common::AgentCommand;
+use rust_tunnel_common::AgentCommand;
 
 /// shell 危险模式（大小写不敏感子串匹配）。仅 auto_write 档用于判定 shell；
 /// safe 档下所有写操作都需确认，不经此表。

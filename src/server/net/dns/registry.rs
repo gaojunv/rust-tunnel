@@ -1,4 +1,4 @@
-use crate::common::DnsRecord;
+use rust_tunnel_common::DnsRecord;
 use crate::server::dns::zone::DnsZone;
 use std::sync::Arc;
 use tokio::sync::Mutex;

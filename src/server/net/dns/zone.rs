@@ -1,4 +1,4 @@
-use crate::common::DnsRecord;
+use rust_tunnel_common::DnsRecord;
 use std::collections::HashMap;
 
 /// In-memory DNS zone for tunnel.local and mesh.local domains.

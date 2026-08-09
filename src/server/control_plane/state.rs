@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::common::ControlMessage;
+use rust_tunnel_common::ControlMessage;
 use crate::server::client_registry::ClientRegistry;
 use crate::server::db::Database;
 use crate::server::dns::registry::DnsRegistry;

@@ -5,7 +5,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, warn};
 
-use crate::common::{TunnelError, TunnelResult};
+use rust_tunnel_common::{TunnelError, TunnelResult};
 use crate::server::control::ServerState;
 use crate::server::stats::EntityType;
 
@@ -1678,7 +1678,7 @@ mod legacy_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::client::TlsStream;
 
-    use crate::common::{
+    use rust_tunnel_common::{
         create_insecure_client_config, create_server_config, load_or_generate_cert,
     };
     use crate::server::control::ServerState;

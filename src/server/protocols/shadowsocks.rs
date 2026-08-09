@@ -1,4 +1,4 @@
-use crate::common::{TunnelError, TunnelResult};
+use rust_tunnel_common::{TunnelError, TunnelResult};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpStream;

@@ -138,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_connector_full_path() {
-        use crate::common::ControlMessage;
+        use rust_tunnel_common::ControlMessage;
         use crate::server::client_registry::{ClientRegistry, TunnelOpenOutcome};
         use crate::server::db::Database;
 
