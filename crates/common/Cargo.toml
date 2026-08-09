@@ -1,0 +1,6 @@
+[package]
+name = "rust-tunnel-common"
+version = "0.4.0"
+edition = "2021"
+description = "Shared protocol and infrastructure for rust-tunnel"
+license = "MIT"

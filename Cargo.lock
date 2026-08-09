@@ -4744,6 +4744,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-client"
+version = "0.4.0"
+
+[[package]]
+name = "rust-tunnel-common"
+version = "0.4.0"
+
+[[package]]
+name = "rust-tunnel-server"
+version = "0.4.0"
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

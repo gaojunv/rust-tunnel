@@ -13,78 +13,44 @@ path = "src/bin/server.rs"
 name = "rust-tunnel-client"
 path = "src/bin/client.rs"
 
-[dependencies]
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
+[workspace]
+members = ["crates/common", "crates/client", "crates/server"]
 
-# Error handling
+[workspace.dependencies]
+# ⬇ 逐字复制原根 Cargo.toml 的全部 [dependencies] + [dev-dependencies] + [target] 条目
+tokio = { version = "1.0", features = ["full"] }
 thiserror = "1.0"
 anyhow = "1.0"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Serialization for control messages
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
-
-# Command line argument parsing
 clap = { version = "4.0", features = ["derive"] }
-
-# Byte handling
 bytes = "1.0"
-
-# Timeout utilities
 tokio-util = { version = "0.7", features = ["time"] }
-
-# Random generation for connection IDs
 rand = "0.8"
-
-# Get network interface addresses for workaround
 get_if_addrs = "0.5.3"
-
-# Web framework
 axum = { version = "0.7", features = ["json", "multipart", "ws"] }
-# serde_html_form 版 Query 提取器，支持重复的查询参数（如 entity_type=a&entity_type=b）
 axum-extra = { version = "0.9", features = ["query"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 async-stream = "0.3"
-
-# HTTP client and utilities for reverse proxy
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2", "server", "server-auto"] }
 hyper-rustls = { version = "0.26", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "rustls-native-certs"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-
-# Embed frontend assets
-rust-embed = { version = "8.0", features = ["axum"], optional = true }
+rust-embed = { version = "8.0", features = ["axum"] }
 mime_guess = "2.0"
-
-# Authentication
 jsonwebtoken = "9.0"
-
-# Time and serialization
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
-
-# Database
-qdrant-edge = { version = "=0.7.2", optional = true }
+qdrant-edge = { version = "=0.7.2" }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
-
-# Get hostname
 gethostname = "0.4"
-
-# PTY for the agent terminal loopback service (wezterm-maintained, Unix/ConPTY)
 portable-pty = "0.9"
-
-# Configuration file support
 toml = "0.8"
 figment = { version = "0.10", features = ["env", "toml"] }
-
-# TLS support
 arc-swap = "1.7"
 rustls = "0.22"
 rustls-pemfile = "2.0"
@@ -95,64 +61,108 @@ rustls-native-certs = "0.7"
 time = "0.3"
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
 md-5 = "0.10"
-# PDF 文本层提取（纯 Rust，无系统动态库依赖；nom_parser 提供 load/extract_text）
 lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] }
-# OOXML（docx/xlsx/pptx）解包：仅 deflate（miniz_oxide 纯 Rust），不开 bzip2/zstd/aes
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-# OOXML XML 部件解析；escape-html 提供文本实体的 unescape
 quick-xml = { version = "0.31", features = ["escape-html"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 aes-gcm = "0.10"
-
-# DNS protocol types
 hickory-proto = "0.24"
-
-# Async trait support
 async-trait = "0.1"
 futures-util = "0.3"
-
-# ACME protocol support
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring"] }
 x509-parser = "0.16"
-
-# DNS-01 challenge support
 base64 = "0.22"
 urlencoding = "2.1"
 trust-dns-resolver = "0.23"
-
-# ACP (Agent Client Protocol) — agent-client-protocol crate
 agent-client-protocol = "2"
+libc = "0.2"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3.0"
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+bincode.workspace = true
+clap.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+rand.workspace = true
+get_if_addrs.workspace = true
+axum.workspace = true
+axum-extra.workspace = true
+tower-http.workspace = true
+async-stream.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+http-body-util.workspace = true
+reqwest.workspace = true
+rust-embed = { workspace = true, optional = true }
+mime_guess.workspace = true
+jsonwebtoken.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+qdrant-edge = { workspace = true, optional = true }
+sqlx.workspace = true
+gethostname.workspace = true
+portable-pty.workspace = true
+toml.workspace = true
+figment.workspace = true
+arc-swap.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+webpki-roots.workspace = true
+rustls-native-certs.workspace = true
+time.workspace = true
+shadowsocks.workspace = true
+md-5.workspace = true
+lopdf.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+aes-gcm.workspace = true
+hickory-proto.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+instant-acme.workspace = true
+x509-parser.workspace = true
+base64.workspace = true
+urlencoding.workspace = true
+trust-dns-resolver.workspace = true
+agent-client-protocol.workspace = true
 
 [features]
-embed-frontend = ["rust-embed"]
+embed-frontend = ["dep:rust-embed"]
 rag = ["dep:qdrant-edge"]
 
-# ---- 测试构建优化：降低内存占用、缩短链接/加载时间 ----
-# test profile 继承 dev；压缩 debuginfo 后单个测试二进制从 ~1.2G 降到 ~200M，
-# 12 个集成测试二进制的磁盘/链接/加载开销同步下降。
-[profile.test]
-debug = 1            # 保留行号（够 panic 回溯用），丢弃局部变量 debuginfo
-opt-level = 1
-incremental = false  # 测试一次性编译，增量缓存反而拖慢且占磁盘
+[dev-dependencies]
+tower.workspace = true
+tempfile.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+shadowsocks.workspace = true
 
-# qdrant-edge 单 crate 编译峰值 ~3GB（来自其内嵌 SIMD/量化代码生成），
-# 是 cargo test OOM(SIGKILL) 的主因。opt-level=1 保证基础内联避免运行时过慢；
-# 真正的并行限制在 .cargo/config.toml 的 jobs=2。
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[profile.test]
+debug = 1
+opt-level = 1
+incremental = false
+
 [profile.dev]
 opt-level = 0
 debug = 1
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
-tempfile = "3.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-futures-util = "0.3"
-# 集成测试用纯 Rust SS 客户端（ProxyClientStream），版本与主依赖保持一致
-shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-extra"] }
-
-# 进程组 kill（run_host 取消/超时时 SIGKILL 整个进程组，避免孙进程成孤儿）
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
