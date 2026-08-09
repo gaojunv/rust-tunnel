@@ -1023,20 +1023,23 @@ impl AcpBridge {
 
     /// 等待会话的 ACP 握手 + 配置注入完成（连接预 spawn 可能在后台进行）。
     /// 已就绪立即返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    ///
+    /// 统一以 `spawn_ready` watch 为准，不放行于 connection 已写入的瞬时状态：
+    /// `connection` 在握手完成时即写回会话条目，而 `spawn_ready` 在
+    /// `apply_config_overrides` + `replay_config_state` 全部完成后才置 true。
+    /// 若以 connection 存在与否做快路径放行，首条 prompt 会与在途的
+    /// `set_config_option` 竞态（workspace overrides/用户 config_state 尚未注入）。
+    /// watch 为 true 即「握手 + 配置注入」均已完成的最终状态。
     pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
             let agent = sessions
                 .get(session_id)
                 .ok_or_else(|| "session not spawned".to_string())?;
-            // connection 已写入 = 握手完成，快路径直接返回
-            if agent.connection.is_some() {
-                return Ok(());
-            }
             agent.spawn_ready.subscribe()
         };
-        // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等。
-        // spawn_ready 只在 connection 写入后变 true，此分支实际不可达，作双保险。
+        // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等
+        // （重连/多标签页下条目已就绪，subscribe 即取到当前 true 值）。
         if *rx.borrow() {
             return Ok(());
         }
