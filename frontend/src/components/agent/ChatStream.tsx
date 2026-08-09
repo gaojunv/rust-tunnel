@@ -309,10 +309,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     });
   }, []);
 
-  // 断开当前流式气泡（新事件类型到达/终态）：同步 ref，配合 setItems 队列语义
+  // 断开当前流式气泡（新事件类型到达/终态）：把 ref 置 null 折进 setItems updater
+  // 排队执行。flushChunks 的 updater 惰性读 streamingIdxRef，若在此处同步置 null，
+  // 会在 flush 的 updater 执行前把它清掉 → 工具/终态边界的尾文本恒新建碎片气泡
+  // （M1）。改为在 updater 里置 null，保证先于其入队的 flush updater 读到的仍是
+  // 当前气泡下标；updater 返回原引用，React bail out 不额外重渲染。
   const breakStream = useCallback(() => {
-    streamingIdxRef.current = null;
-    streamingKindRef.current = null;
+    setItems((prev) => {
+      streamingIdxRef.current = null;
+      streamingKindRef.current = null;
+      return prev;
+    });
   }, []);
 
   const scheduleChunkFlush = useCallback(() => {
@@ -397,11 +404,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       }
       if (msg.type === 'assistant_chunk') {
         if (msg.content) {
-          // thought 与正文分气泡：kind 切换先 flush 并断开当前流式气泡
+          // thought 与正文分气泡：kind 切换先 flush 当前缓冲，但不断流——下方
+          // streamingKindRef 更新为新 kind，下个 flush 的 `prev[idx].kind !==
+          // bubbleKind` 检查天然新建气泡；此处若 breakStream 排队置 null 反而会
+          // 在 updater 执行时把刚设的 streamingKindRef 清掉（M1）。
           const nextKind = msg.thought ? 'thought' : 'assistant';
           if (streamingKindRef.current !== null && streamingKindRef.current !== nextKind) {
             flushChunks();
-            breakStream();
           }
           streamingKindRef.current = nextKind;
           chunkBufRef.current += msg.content;
@@ -757,6 +766,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         /* 发送失败也走本地停止 */
       }
     }
+    // 先 flush 流式缓冲：停止时可能正有流式尾文本攒批未落屏，若不 flush，停止提示
+    // 会先于尾文本出现（顺序颠倒）。breakStream 的 ref 置 null 走 setItems 队列，
+    // 保证在 flush 的 updater 之后执行（M11/M1）。
+    flushChunks();
+    breakStream();
     stopRunning();
     // 本地停止路径同样作废未响应的审批卡片（cancel 帧可能因断线永远不回来）
     expirePendingApprovals();

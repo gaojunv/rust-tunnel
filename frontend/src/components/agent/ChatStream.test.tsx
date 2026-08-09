@@ -336,6 +336,47 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('半截内容')).toBeNull();
   });
 
+  it('does not fragment the trailing text of a streamed turn (M1)', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    // M1 回归：`flushChunks(); breakStream();` 若同步置空 streamingIdxRef，会在
+    // flushChunks 的 setItems updater 执行前读到 null → 工具边界处缓冲尾文本
+    // 新建碎片气泡（「前文」与「续文」分裂）。捕获 STREAM_FLUSH_MS 定时器先把
+    // 「前文」实体化为气泡，再缓冲「续文」后触发 tool_call 边界——「续文」必须
+    // 并入「前文」气泡（工具卡片之前），不得与「后文」合并成独立气泡。
+    let flushCb: (() => void) | undefined;
+    const origSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        if (ms === STREAM_FLUSH_MS) {
+          flushCb = cb;
+          return {} as unknown as ReturnType<typeof setTimeout>;
+        }
+        return origSetTimeout(cb, ms ?? 0) as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+    );
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '前文', final: false });
+    });
+    // 定时 flush 实体化「前文」气泡（streamingIdxRef 指向它）
+    act(() => {
+      flushCb?.();
+    });
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '续文', final: false });
+    });
+    // 工具边界：缓冲的「续文」必须 flush 进「前文」气泡，而非新建碎片
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '后文', final: true });
+    });
+    // 「续文」并入「前文」→ 「前文续文」整体存在；碎片化时「续文后文」合并出现
+    expect(screen.getByText('前文续文')).toBeTruthy();
+    expect(screen.queryByText('续文后文')).toBeNull();
+  });
+
   it('status closes the current streaming bubble before appending the hint', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
@@ -464,6 +505,26 @@ describe('ChatStream running state', () => {
     expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
     // running 指示消失 + 停止提示气泡出现
     expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.getByText(/agent.stopped/)).toBeTruthy();
+  });
+
+  it('flushes buffered text before appending stopped bubble on cancel (M11)', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '正在执行…', final: false });
+    });
+    // 在 50ms flush 定时器触发前点击停止：缓冲尾文本必须先实体化，再落停止提示。
+    // 若不 flush，停止提示会先于尾文本出现（尾文本 50ms 后才落屏，顺序颠倒）。
+    const stopBtn = screen.getByRole('button', { name: 'agent.stop' });
+    act(() => {
+      stopBtn.click();
+    });
+    // 流式文本已同步 flush（停止提示之前可见）
+    expect(screen.getByText('正在执行…')).toBeTruthy();
     expect(screen.getByText(/agent.stopped/)).toBeTruthy();
   });
 
