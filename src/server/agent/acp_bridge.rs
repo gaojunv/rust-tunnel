@@ -1883,7 +1883,7 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None,
+            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None,
         )
         .await
         .unwrap();
