@@ -123,9 +123,13 @@ describe('ChatStream running state', () => {
       return origSetTimeout(cb, ms !== undefined && ms >= 1000 && ms <= 15000 ? 1 : ms) as ReturnType<typeof setTimeout>;
     }) as typeof setTimeout);
     renderChat();
-    expect(wsInstances).toHaveLength(1);
+    // SessionSettingsMenu 的 models 查询在渲染期间 resolve → 触发一次重渲染 →
+    // WS effect 随之重建（i18n mock 的 t 每次渲染返回新引用），实例数不再恒为 1。
+    // wsInstance 总指向最后一次 connect 创建的活跃连接，以它触发断线。
+    const active = wsInstance!;
+    expect(active).toBeTruthy();
     act(() => {
-      wsInstances[0].onclose?.();
+      active.onclose?.();
     });
     // 断线横幅出现
     expect(screen.getByText('agent.reconnecting')).toBeTruthy();
@@ -133,9 +137,11 @@ describe('ChatStream running state', () => {
     await act(async () => {
       await new Promise((r) => origSetTimeout(r, 20));
     });
-    expect(wsInstances.length).toBeGreaterThan(1);
+    // 重连创建了新的活跃实例（而非复用旧连接）
+    const reconnected = wsInstance!;
+    expect(reconnected).not.toBe(active);
     act(() => {
-      wsInstances[wsInstances.length - 1].onopen?.();
+      reconnected.onopen?.();
     });
     expect(screen.queryByText('agent.reconnecting')).toBeNull();
   });
@@ -190,7 +196,9 @@ describe('ChatStream running state', () => {
     renderChat();
     // 工具名、参数、结果都渲染出来（工具卡片默认收起，先点头部展开再断言 args/result）
     expect(await screen.findByText('read_file')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    // 工具卡片头（含工具名的按钮，aria-expanded）点击展开；SessionSettingsMenu
+    // 触发器同样带 aria-expanded=false，故不再用 getByRole({expanded:false})
+    fireEvent.click(screen.getByText('read_file').closest('button')!);
     expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
     expect(screen.getByText('文件里是 main 函数')).toBeTruthy();
   });
@@ -202,8 +210,8 @@ describe('ChatStream running state', () => {
     ]);
     renderChat();
     expect(await screen.findByText('shell')).toBeTruthy();
-    // 工具卡片默认收起，先展开再断言结果
-    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    // 工具卡片默认收起，先展开（含工具名的卡片头按钮）再断言结果
+    fireEvent.click(screen.getByText('shell').closest('button')!);
     expect(screen.getByText('a.rs')).toBeTruthy();
   });
 
@@ -359,7 +367,7 @@ describe('ChatStream running state', () => {
     expect(screen.getAllByText('保留问题')).toHaveLength(1);
     // 工具卡片同样只渲染一份（read_file 工具名 + 结果；默认收起，先展开再断言结果）
     expect(screen.getAllByText('read_file')).toHaveLength(1);
-    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    fireEvent.click(screen.getByText('read_file').closest('button')!);
     expect(screen.getAllByText(/fn main\(\)/)).toHaveLength(1);
   });
 
@@ -835,5 +843,117 @@ describe('ChatStream running state', () => {
       await qc.invalidateQueries({ queryKey: ['agent-messages', 's1'] });
     });
     expect(await screen.findByText('迟到的历史')).toBeTruthy();
+  });
+
+  it('applies session_state frame to config options state', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state 帧：mode 项 currentValue=plan（options 含 {value:plan,name:Plan}）
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'mode',
+            name: 'Mode',
+            category: 'mode',
+            type: 'select',
+            currentValue: 'plan',
+            options: [{ value: 'plan', name: 'Plan' }],
+          },
+        ],
+      });
+    });
+    // 发送按钮左侧的 Mode 快捷按钮显示当前值 "Plan"
+    const modeBtn = screen.getByRole('button', { name: 'agent.configMode' });
+    expect(modeBtn).toBeTruthy();
+    expect(modeBtn.textContent).toContain('Plan');
+    // mode 项被过滤，不进左侧统一菜单：展开菜单后菜单内容里无 "Mode" 项
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'agent.sessionSettings' }));
+    expect(screen.getByText('agent.model')).toBeTruthy(); // 菜单已打开（模型子菜单标签）
+    expect(screen.queryByText('Mode')).toBeNull();
+  });
+
+  it('sendConfigOption sends set_config_option frame with optimistic update', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state：effort 项 currentValue=medium（options 含 high）
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'effort',
+            name: 'Effort',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: 'medium',
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'medium', name: 'Medium' },
+              { value: 'high', name: 'High' },
+            ],
+          },
+        ],
+      });
+    });
+    const effortBtn = screen.getByRole('button', { name: 'agent.configEffort' });
+    expect(effortBtn.textContent).toContain('Medium');
+    // 展开 Effort 快捷菜单 → 点击 "High"（点击前捕获当前活跃连接：乐观更新后
+    // ChatStream 重渲染会轮换 WS 实例，帧发在点击时刻的活跃连接上）
+    fireEvent.pointerDown(effortBtn);
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByText('High'));
+    // 发送 set_config_option 帧（最后一条）
+    expect(ws.sent[ws.sent.length - 1]).toBe(
+      '{"type":"set_config_option","config_id":"effort","value":"high"}',
+    );
+    // 乐观更新：按钮文本立即变为 "High"（生效确认以服务端回推帧为准）
+    expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
+  });
+
+  it('rolls back optimistic config option on 设置失败 error frame', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state：effort 项 currentValue=medium
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'effort',
+            name: 'Effort',
+            category: 'thought_level',
+            type: 'select',
+            currentValue: 'medium',
+            options: [
+              { value: 'low', name: 'Low' },
+              { value: 'medium', name: 'Medium' },
+              { value: 'high', name: 'High' },
+            ],
+          },
+        ],
+      });
+    });
+    // 展开 Effort 快捷菜单 → 点击 High：乐观更新使按钮文本立即变 High
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'agent.configEffort' }));
+    fireEvent.click(screen.getByText('High'));
+    expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
+    // 服务端回「设置失败」error 帧（config_id 失效/agent 退出等）：
+    // 乐观值从未生效，应回滚到发送前快照 Medium，而非停留在假性 High
+    act(() => {
+      wsInstance!.emit({ type: 'error', message: '设置失败: unknown config option: effort' });
+    });
+    expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('Medium');
+    // 错误气泡照常追加（用户可见失败原因）
+    expect(screen.getByText(/设置失败/)).toBeTruthy();
+  });
+
+  it('hides Mode/Effort buttons for non-ACP sessions (no session_state)', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 不注入 session_state：configOptions 为空 → 快捷按钮不渲染
+    expect(screen.queryByRole('button', { name: 'agent.configMode' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'agent.configEffort' })).toBeNull();
   });
 });

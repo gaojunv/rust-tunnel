@@ -35,6 +35,8 @@ pub struct AgentSessionRecord {
     pub title: Option<String>,
     pub status: String,
     pub model: Option<String>,
+    /// ACP 会话配置状态（JSON map：config_id → value；仅用户显式切换过的项）
+    pub config_state: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -222,6 +224,43 @@ impl Database {
             "UPDATE agent_sessions SET model = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// upsert/删除 session 的 ACP 配置项：value=Some 写入该 key，None 删除；
+    /// map 为空时列置 NULL。config_state 非 JSON（历史脏数据）时视为空 map 重建。
+    pub async fn agent_update_session_config_state(
+        &self,
+        id: &str,
+        config_id: &str,
+        value: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let row = self.agent_get_session(id).await?;
+        let mut map: serde_json::Map<String, serde_json::Value> = row
+            .and_then(|r| r.config_state)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        match value {
+            Some(v) => {
+                map.insert(config_id.to_string(), serde_json::Value::String(v.to_string()));
+            }
+            None => {
+                map.remove(config_id);
+            }
+        }
+        let serialized = if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map).to_string())
+        };
+        sqlx::query(
+            "UPDATE agent_sessions SET config_state = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(serialized)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -636,5 +675,53 @@ mod tests {
         assert_eq!(msgs[1].name.as_deref(), Some("shell"));
         assert_eq!(msgs[2].kind, "message");
         assert_eq!(msgs[3].kind, "tool"); // 旧格式保持 role=tool 的推导
+    }
+
+    #[tokio::test]
+    async fn test_config_state_upsert_and_clear() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 初始为空
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert!(s.config_state.is_none());
+
+        // upsert 两个 key
+        db.agent_update_session_config_state("s1", "mode", Some("plan"))
+            .await
+            .unwrap();
+        db.agent_update_session_config_state("s1", "effort", Some("high"))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        let map: serde_json::Value =
+            serde_json::from_str(s.config_state.as_deref().unwrap()).unwrap();
+        assert_eq!(map["mode"], "plan");
+        assert_eq!(map["effort"], "high");
+
+        // 覆盖已有 key
+        db.agent_update_session_config_state("s1", "mode", Some("default"))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        let map: serde_json::Value =
+            serde_json::from_str(s.config_state.as_deref().unwrap()).unwrap();
+        assert_eq!(map["mode"], "default");
+        assert_eq!(map["effort"], "high");
+
+        // 清空一个 key；清空全部后列回到 NULL
+        db.agent_update_session_config_state("s1", "mode", None)
+            .await
+            .unwrap();
+        db.agent_update_session_config_state("s1", "effort", None)
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert!(s.config_state.is_none());
     }
 }

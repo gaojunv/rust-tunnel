@@ -660,6 +660,7 @@ impl Database {
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
+        Self::migrate_agent_sessions_v2(pool).await?;
 
         Ok(())
     }
@@ -711,6 +712,24 @@ impl Database {
                     }
                     tracing::debug!(column, "agent_workspaces migration: column already exists");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_sessions 补全 ACP 会话配置状态列（JSON map：config_id → value）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_sessions_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN config_state TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_sessions migration: column already exists");
             }
         }
         Ok(())

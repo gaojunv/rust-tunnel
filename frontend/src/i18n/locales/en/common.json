@@ -831,7 +831,13 @@
     "confirmSaveTitle": "Confirm save",
     "confirmSaveDesc": "This workspace requires approval before writing files",
     "saveFailed": "Save failed",
-    "noFileSelected": "Select a file to preview"
+    "noFileSelected": "Select a file to preview",
+    "sessionSettings": "Session settings",
+    "configMode": "Mode",
+    "configEffort": "Effort",
+    "configOn": "On",
+    "configOff": "Off",
+    "agentModelHint": "Agent-internal model; actual LLM calls use the gateway model above"
   },
   "logs": {
     "title": "Logs",

@@ -15,7 +15,10 @@ import type { ChatItem, ToolDiff, ToolKind, ToolLocation } from './types';
 import ApprovalCard from './ApprovalCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
-import ModelSelect from './ModelSelect';
+import SessionSettingsMenu from './SessionSettingsMenu';
+import ConfigOptionButton from './ConfigOptionButton';
+import { normalizeConfigOptions } from './sessionConfig';
+import type { SessionConfigOption } from '../../types';
 
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
 /** 流式 chunk 合并 flush 间隔：token 级 WS 帧攒批后一次性写 state，避免每 token 全列表重渲染。 */
@@ -43,6 +46,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 通过 onFilesChange 上报可选中列表、列表变化时经 onActiveIdxChange 回卷首项
   const [mentionFiles, setMentionFiles] = useState<string[]>([]);
   const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
+  // ACP 会话配置快照（session_state/config_option_update 全量帧；空数组 = 非 ACP 或未就绪）
+  const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
+  // config option 乐观更新的回滚快照：发送后保留，等服务端权威确认帧
+  // （session_state/config_option_update，确认生效则清空）或「设置失败」error 帧
+  // （回滚到快照）。断线/重连时快照作废——它属于上一连接生命周期。
+  const configRollbackRef = useRef<SessionConfigOption[] | null>(null);
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -296,6 +305,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }, RUNNING_TIMEOUT_MS);
   }, [clearRunningTimeout, stopRunning, expirePendingApprovals, t]);
 
+  // 切换会话：清空上一会话的配置快照（新会话的 session_state 帧到达前不残留
+  // 旧会话的 mode/effort 快捷按钮）
+  useEffect(() => {
+    setConfigOptions([]);
+  }, [sessionId]);
+
   // WebSocket：断线自动重连（指数退避 1s→15s）。后端支持重连（新连接从 DB 重载
   // 会话，见 agent.rs handle_agent_socket），断线不应废掉整个会话的流式功能。
   useEffect(() => {
@@ -478,6 +493,20 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 服务端标题已写库（生成晚于 done 帧，故此处单独广播）：刷新会话列表
         // 让 SessionBar 及时回显新标题
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
+      } else if (msg.type === 'session_state' || msg.type === 'config_option_update') {
+        // 全量配置快照（session_state=初始，config_option_update=变更后）：归一化覆盖
+        setConfigOptions(normalizeConfigOptions(msg.options));
+        // 服务端权威状态到达 = 乐观更新确认生效：放弃回滚快照
+        configRollbackRef.current = null;
+      } else if (msg.type === 'current_mode_update') {
+        // agent 侧自行切 mode（如 shift+tab）：同步 mode 项当前值
+        setConfigOptions((prev) =>
+          prev.map((o) =>
+            o.category === 'mode' && msg.mode_id
+              ? { ...o, currentValue: msg.mode_id }
+              : o,
+          ),
+        );
       } else if (msg.type === 'approval_request') {
         // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）
         flushChunks();
@@ -491,6 +520,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           approvalStatus: 'pending',
         }]);
       } else if (msg.type === 'error') {
+        // 「设置失败」error 帧（服务端 set_config_option 失败，格式 `设置失败: {e}`）：
+        // 乐观更新从未生效，回滚到发送前快照，按钮不再显示假性值。
+        if (configRollbackRef.current && msg.message?.startsWith('设置失败')) {
+          setConfigOptions(configRollbackRef.current);
+          configRollbackRef.current = null;
+        }
         flushChunks();
         breakStream();
         setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
@@ -502,6 +537,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
       ws.onclose = () => {
         wsRef.current = null;
+        // 回滚快照属于上一连接生命周期：断线即作废，重连后以 session_state 重新对齐
+        configRollbackRef.current = null;
         if (closedByCleanup) return;
         // 断线：本地回合状态作废（服务端可能还在跑，也可能已丢），重连后按
         // DB 历史对齐。用户消息已发出去但服务端未必收到——提示而非静默重发。
@@ -683,6 +720,50 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       });
   };
 
+  // ACP config option 切换：乐观更新 + WS 发送；发送失败或服务端「设置失败」
+  // error 帧回滚（configRollbackRef 快照），生效确认以服务端回推的
+  // config_option_update / session_state 全量帧为准。
+  const sendConfigOption = (configId: string, value: string) => {
+    const prev = configOptions;
+    // 保留回滚快照；不在此清空——发送成功与否要等服务端权威确认帧
+    configRollbackRef.current = prev;
+    setConfigOptions((cur) =>
+      cur.map((o) => {
+        if (o.id !== configId) return o;
+        if (o.type === 'boolean') {
+          const b = value === 'true';
+          return { ...o, currentBool: b, currentValue: b ? 'true' : 'false' };
+        }
+        return { ...o, currentValue: value };
+      }),
+    );
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // 帧未发出：本地回滚即操作终结，快照一并作废
+      configRollbackRef.current = null;
+      setConfigOptions(prev);
+      return;
+    }
+    try {
+      ws.send(JSON.stringify({ type: 'set_config_option', config_id: configId, value }));
+    } catch {
+      // send 同步抛错：帧未到达服务端，回滚并作废快照
+      configRollbackRef.current = null;
+      setConfigOptions(prev);
+      setItems((prevItems) => [
+        ...prevItems,
+        { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` },
+      ]);
+    }
+  };
+
+  // mode/effort 走右侧快捷按钮（发送按钮左边）；其余 options 进左侧统一菜单
+  const modeOption = configOptions.find((o) => o.category === 'mode');
+  const effortOption = configOptions.find((o) => o.category === 'thought_level');
+  const menuOptions = configOptions.filter(
+    (o) => o.category !== 'mode' && o.category !== 'thought_level',
+  );
+
   return (
     <div className="flex h-full flex-col">
       <div
@@ -791,29 +872,49 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             rows={2}
           />
           <div className="flex items-center justify-between px-2 pb-1.5">
-            <ModelSelect value={model} onChange={handleModelChange} disabled={running} />
-            {running ? (
-              <Button
-                onClick={stop}
-                size="sm"
-                variant="ghost"
-                aria-label={t('agent.stop')}
-                className="h-8 w-8 rounded-full p-0 text-destructive hover:text-destructive"
-              >
-                <Square className="h-4 w-4 fill-current" />
-              </Button>
-            ) : (
-              <Button
-                onClick={send}
-                disabled={!input.trim() || hasPendingApproval}
-                size="sm"
-                variant="ghost"
-                aria-label={t('agent.send')}
-                className="h-8 w-8 rounded-full p-0"
-              >
-                <SendHorizontal className="h-4 w-4" />
-              </Button>
-            )}
+            <SessionSettingsMenu
+              model={model}
+              onModelChange={handleModelChange}
+              configOptions={menuOptions}
+              onConfigChange={sendConfigOption}
+              disabled={running}
+            />
+            <div className="flex items-center gap-0.5">
+              <ConfigOptionButton
+                option={modeOption}
+                label="agent.configMode"
+                onChange={sendConfigOption}
+                disabled={running}
+              />
+              <ConfigOptionButton
+                option={effortOption}
+                label="agent.configEffort"
+                onChange={sendConfigOption}
+                disabled={running}
+              />
+              {running ? (
+                <Button
+                  onClick={stop}
+                  size="sm"
+                  variant="ghost"
+                  aria-label={t('agent.stop')}
+                  className="h-8 w-8 rounded-full p-0 text-destructive hover:text-destructive"
+                >
+                  <Square className="h-4 w-4 fill-current" />
+                </Button>
+              ) : (
+                <Button
+                  onClick={send}
+                  disabled={!input.trim() || hasPendingApproval}
+                  size="sm"
+                  variant="ghost"
+                  aria-label={t('agent.send')}
+                  className="h-8 w-8 rounded-full p-0"
+                >
+                  <SendHorizontal className="h-4 w-4" />
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       </div>
