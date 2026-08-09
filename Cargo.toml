@@ -74,12 +74,16 @@ libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"
 
+[features]
+default = ["rag"]
+rag = ["rust-tunnel-server/rag"]
+
 [dependencies]
-rust-tunnel-common = { path = "crates/common" }
-rust-tunnel-client = { path = "crates/client" }
-rust-tunnel-server = { path = "crates/server" }
 
 [dev-dependencies]
+rust-tunnel-common = { path = "crates/common" }
+rust-tunnel-client = { path = "crates/client" }
+rust-tunnel-server = { path = "crates/server", features = ["rag"] }
 tokio.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -91,6 +95,9 @@ tempfile.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
 shadowsocks.workspace = true
+axum.workspace = true
+uuid.workspace = true
+zip.workspace = true
 
 [profile.test]
 debug = 1
