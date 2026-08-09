@@ -38,6 +38,9 @@ pub struct CreateWorkspaceRequest {
     /// workspace 默认 LLM 模型 id（`llm_models.id`，ACP 会话启动时必需）。
     #[serde(default)]
     pub llm_model_id: Option<String>,
+    /// ACP 引擎选项覆盖（JSON map：config_id → value）；空串归一化为 None。
+    #[serde(default)]
+    pub agent_config_overrides: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,18 +50,34 @@ pub struct UpdateWorkspaceRequest {
     pub system_prompt: Option<String>,
     pub approval_mode: Option<String>,
     /// ACP 字段，COALESCE 语义：缺省 None 保持原值。`agent_type` 空串表示切回内置
-    /// runner；`agent_path`/`llm_model_id` 空串视为忽略（本迭代不支持清空）。
+    /// runner；`agent_path`/`llm_model_id` 空串视为忽略（本迭代不支持清空）；
+    /// `agent_config_overrides` 显式 `"{}"` 清空、空串视为忽略。
     #[serde(default)]
     pub agent_type: Option<String>,
     #[serde(default)]
     pub agent_path: Option<String>,
     #[serde(default)]
     pub llm_model_id: Option<String>,
+    /// ACP 引擎选项覆盖（JSON map：config_id → value）；None 保持原值，`"{}"` 清空。
+    #[serde(default)]
+    pub agent_config_overrides: Option<String>,
 }
 
 /// 校验 agent_type：空串（内置 runner）或受支持的 ACP 引擎。
 fn validate_agent_type(agent_type: &str) -> bool {
     matches!(agent_type, "" | "gemini" | "claude-code" | "opencode")
+}
+
+/// 校验 agent_config_overrides：空串合法（调用方归一化 None）；非空必须是
+/// JSON object 且所有 value 为 string（set_config_option 的 value 形态）。
+fn validate_config_overrides(raw: &str) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map.values().all(serde_json::Value::is_string),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1082,12 +1101,25 @@ pub async fn create_workspace(
         )
             .into_response();
     }
+    if let Some(raw) = body.agent_config_overrides.as_deref() {
+        if !validate_config_overrides(raw) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "agent_config_overrides must be a JSON object with string values",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     // 可选 ACP 字段的空串归一化为 None：存储保持 NULL 而非空串。
     let agent_path = body.agent_path.as_deref().filter(|s| !s.is_empty());
     let llm_model_id = body.llm_model_id.as_deref().filter(|s| !s.is_empty());
+    let agent_config_overrides = body
+        .agent_config_overrides
+        .as_deref()
+        .filter(|s| !s.is_empty());
     let id = new_id();
     match agent
         .db
@@ -1102,7 +1134,7 @@ pub async fn create_workspace(
             &body.agent_type,
             agent_path,
             llm_model_id,
-            None, // agent_config_overrides：Task 2 接入 API 请求字段
+            agent_config_overrides,
         )
         .await
     {
@@ -1153,6 +1185,15 @@ pub async fn update_workspace(
                 .into_response();
         }
     }
+    if let Some(raw) = body.agent_config_overrides.as_deref() {
+        if !validate_config_overrides(raw) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "agent_config_overrides must be a JSON object with string values",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1163,9 +1204,14 @@ pub async fn update_workspace(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     // ACP 字段 COALESCE 语义：None 保持原值；agent_type 空串合法（回到内置 runner）；
-    // agent_path/llm_model_id 空串归一化为 None（本迭代不支持清空，见 Task 8 brief）。
+    // agent_path/llm_model_id 空串归一化为 None（本迭代不支持清空，见 Task 8 brief）；
+    // agent_config_overrides 空串归一化 None（保持），`"{}"` 非空原样传入 db → 清空。
     let agent_path = body.agent_path.as_deref().filter(|s| !s.is_empty());
     let llm_model_id = body.llm_model_id.as_deref().filter(|s| !s.is_empty());
+    let agent_config_overrides = body
+        .agent_config_overrides
+        .as_deref()
+        .filter(|s| !s.is_empty());
     match agent
         .db
         .agent_update_workspace(
@@ -1177,7 +1223,7 @@ pub async fn update_workspace(
             body.agent_type.as_deref(),
             agent_path,
             llm_model_id,
-            None, // agent_config_overrides：Task 2 接入 API 请求字段
+            agent_config_overrides,
         )
         .await
     {
@@ -1797,6 +1843,7 @@ mod tests {
                 agent_type: String::new(),
                 agent_path: None,
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1822,6 +1869,7 @@ mod tests {
                 agent_type: String::new(),
                 agent_path: None,
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1844,6 +1892,7 @@ mod tests {
                 agent_type: String::new(),
                 agent_path: None,
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1886,6 +1935,7 @@ mod tests {
                 agent_type: "gemini".into(),
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1916,6 +1966,7 @@ mod tests {
                 agent_type: "cursor".into(),
                 agent_path: None,
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1940,6 +1991,7 @@ mod tests {
                 agent_type: Some("gemini".into()),
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -1973,6 +2025,7 @@ mod tests {
                 agent_type: None,
                 agent_path: Some("".into()),
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -2002,6 +2055,7 @@ mod tests {
                 agent_type: Some("".into()),
                 agent_path: None,
                 llm_model_id: None,
+                agent_config_overrides: None,
             }),
         )
         .await
@@ -2009,6 +2063,154 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_type, "");
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_rejects_bad_config_overrides() {
+        let (state, _db) = test_state().await;
+        // 非法 JSON → 400
+        let resp = create_workspace(
+            State(state.clone()),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some("not-json".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // JSON 数组（非 object）→ 400
+        let resp = create_workspace(
+            State(state.clone()),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some(r#"["model"]"#.into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // object 但 value 非 string → 400
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some(r#"{"model": 1}"#.into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_config_overrides_clear_semantics() {
+        // create 带 overrides 的 workspace → update 不传字段保持原值 → 传 "{}" 清空
+        // → 传非法 JSON 400（断言经读库验证）。
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None,
+            Some(r#"{"mode":"plan"}"#),
+        )
+        .await
+        .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"mode":"plan"}"#)
+        );
+
+        // 1) 不传字段（None）→ COALESCE 保持原值
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"mode":"plan"}"#)
+        );
+
+        // 2) 传 "{}" → 覆盖为空对象（清空语义）
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some("{}".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
+
+        // 3) 传非法 JSON → 400，且原值保持不变
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some("not-json".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
     }
 
     #[tokio::test]
