@@ -206,6 +206,12 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// DeepSeek 思考模式的历史 `reasoning_content`：思考链开启后，上游（如
+    /// Console Go 渠道）要求多轮对话里历史 assistant 消息必须原样携带该字段，
+    /// 否则 400「The reasoning_content in the thinking mode must be passed back」。
+    /// 由 Anthropic 历史 `thinking` 块映射而来（thinking → reasoning_content）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +226,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

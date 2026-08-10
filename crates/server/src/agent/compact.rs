@@ -233,6 +233,7 @@ mod tests {
         vec![
             ChatMessage {
                 role: "assistant".into(),
+                reasoning_content: None,
                 content: None,
                 tool_calls: Some(vec![
                     serde_json::json!({"id": id, "type": "function", "function": {"name": "shell", "arguments": "{}"}}),
@@ -242,6 +243,7 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".into(),
+                reasoning_content: None,
                 content: Some("ok".into()),
                 tool_calls: None,
                 tool_call_id: Some(id.into()),
@@ -257,6 +259,7 @@ mod tests {
             msg("user", "12345678"),
             ChatMessage {
                 role: "assistant".into(),
+                reasoning_content: None,
                 content: None,
                 tool_calls: Some(vec![serde_json::json!({"id": "c1"})]),
                 tool_call_id: None,

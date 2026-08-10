@@ -517,6 +517,7 @@ mod tests {
     fn assistant_tool_calls_become_text() {
         let mut msgs = vec![ChatMessage {
             role: "assistant".into(),
+            reasoning_content: None,
             content: None,
             tool_calls: Some(vec![json!({
                 "id": "call_1",
@@ -540,6 +541,7 @@ mod tests {
         let mut msgs = vec![
             ChatMessage {
                 role: "assistant".into(),
+                reasoning_content: None,
                 content: None,
                 tool_calls: Some(vec![json!({
                     "id": "call_1",
@@ -551,6 +553,7 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".into(),
+                reasoning_content: None,
                 content: Some("晴 25度".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
@@ -582,6 +585,7 @@ mod tests {
         // assistant 同时有正文和 tool_calls 时，两者都保留
         let mut msgs = vec![ChatMessage {
             role: "assistant".into(),
+            reasoning_content: None,
             content: Some("我先查一下".into()),
             tool_calls: Some(vec![json!({
                 "id": "c1",
@@ -603,6 +607,7 @@ mod tests {
         let mut msgs = vec![
             ChatMessage {
                 role: "assistant".into(),
+                reasoning_content: None,
                 content: None,
                 tool_calls: Some(vec![json!({
                     "id": "c1", "type": "function",
@@ -613,6 +618,7 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".into(),
+                reasoning_content: None,
                 content: Some("out".into()),
                 tool_calls: None,
                 tool_call_id: Some("c1".into()),
@@ -632,6 +638,7 @@ mod tests {
     fn rewrite_v2_assistant_tool_calls_become_tags() {
         let mut msgs = vec![ChatMessage {
             role: "assistant".into(),
+            reasoning_content: None,
             content: None,
             tool_calls: Some(vec![json!({
                 "id": "call_1", "type": "function",
@@ -655,6 +662,7 @@ mod tests {
         let mut msgs = vec![
             ChatMessage {
                 role: "assistant".into(),
+                reasoning_content: None,
                 content: None,
                 tool_calls: Some(vec![json!({
                     "id": "call_1", "type": "function",
@@ -665,6 +673,7 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".into(),
+                reasoning_content: None,
                 content: Some("file content".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
@@ -687,6 +696,7 @@ mod tests {
     fn rewrite_v2_content_before_tool_call_preserved() {
         let mut msgs = vec![ChatMessage {
             role: "assistant".into(),
+            reasoning_content: None,
             content: Some("我先看下".into()),
             tool_calls: Some(vec![json!({
                 "id": "c1", "type": "function",
@@ -926,6 +936,7 @@ mod tests {
     fn v2_roundtrip_rewrite_then_scan() {
         let mut msgs = vec![ChatMessage {
             role: "assistant".into(),
+            reasoning_content: None,
             content: Some("执行".into()),
             tool_calls: Some(vec![json!({
                 "id": "x", "type": "function",

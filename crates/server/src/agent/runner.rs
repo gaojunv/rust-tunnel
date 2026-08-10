@@ -300,6 +300,7 @@ async fn handle_tool_calls(
     rt.messages.push(ChatMessage {
         role: "assistant".into(),
         content: None,
+        reasoning_content: None,
         tool_calls: Some(raw_calls.clone()),
         tool_call_id: None,
         name: None,
@@ -865,6 +866,7 @@ async fn record_tool_result(
     rt.messages.push(ChatMessage {
         role: "tool".into(),
         content: Some(content),
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),
         name: Some(call_name.to_string()),

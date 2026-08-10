@@ -207,6 +207,7 @@ impl SessionRuntime {
                 "tool_calls" => messages.push(ChatMessage {
                     role: "assistant".into(),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: r
                         .tool_calls
                         .as_deref()
@@ -218,6 +219,7 @@ impl SessionRuntime {
                 "tool_result" => messages.push(ChatMessage {
                     role: "tool".into(),
                     content: Some(r.content.clone()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: r.tool_call_id.clone(),
                     name: r.name.clone(),
@@ -371,6 +373,7 @@ fn sanitize_tool_pairs(messages: &mut Vec<ChatMessage>) {
                 .map(|(id, name)| ChatMessage {
                     role: "tool".into(),
                     content: Some("[interrupted: tool execution did not complete]".to_string()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: Some(id),
                     name: Some(name),

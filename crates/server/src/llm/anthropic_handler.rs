@@ -12,10 +12,13 @@ use super::{ChatCompletionRequest, ChatMessage};
 /// 拆解 Anthropic 消息 content 字段的结果。
 ///
 /// Anthropic content 允许是纯字符串或 content block 数组，块类型包含
-/// `text` / `tool_use` / `tool_result`（本次只识别这三种）。
+/// `text` / `thinking` / `tool_use` / `tool_result`（本次只识别这四种）。
 struct ParsedContent {
     /// 所有 `text` 块拼接后的文本；空字符串表示没有文本内容。
     text: String,
+    /// assistant 历史消息里的 `thinking` 块拼接文本 → OpenAI `reasoning_content`。
+    /// DeepSeek 思考模式要求历史 assistant 消息必须携带该字段回传上游。
+    thinking: String,
     /// assistant 消息里的 `tool_use` 块 → OpenAI `tool_calls` 元素。
     tool_uses: Vec<Value>,
     /// user 消息里的 `tool_result` 块 → 每个都要展开成一条 `role="tool"` 消息。
@@ -32,6 +35,7 @@ struct ToolResult {
 /// 把 Anthropic content 字段（字符串 或 block 数组）解析为文本 + 工具信息。
 fn parse_anthropic_content(content: &Value) -> ParsedContent {
     let mut text_parts: Vec<String> = Vec::new();
+    let mut thinking_parts: Vec<String> = Vec::new();
     let mut tool_uses: Vec<Value> = Vec::new();
     let mut tool_results: Vec<ToolResult> = Vec::new();
 
@@ -43,6 +47,17 @@ fn parse_anthropic_content(content: &Value) -> ParsedContent {
                     Some("text") => {
                         if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                             text_parts.push(t.to_string());
+                        }
+                    }
+                    // Claude Code 走 Anthropic 协议且开思考链时，历史 assistant 消息
+                    // 会携带 thinking 块；映射为 DeepSeek 的 reasoning_content 字段，
+                    // 否则上游 400「reasoning_content must be passed back」。
+                    // redacted_thinking（加密签名）对 DeepSeek 不可验证，忽略。
+                    Some("thinking") => {
+                        if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                thinking_parts.push(t.to_string());
+                            }
                         }
                     }
                     Some("tool_use") => {
@@ -98,6 +113,7 @@ fn parse_anthropic_content(content: &Value) -> ParsedContent {
 
     ParsedContent {
         text: text_parts.join("\n"),
+        thinking: thinking_parts.join("\n"),
         tool_uses,
         tool_results,
     }
@@ -177,6 +193,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
             .map(parse_anthropic_content)
             .unwrap_or(ParsedContent {
                 text: String::new(),
+                thinking: String::new(),
                 tool_uses: Vec::new(),
                 tool_results: Vec::new(),
             });
@@ -189,16 +206,22 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                 } else {
                     Some(parsed.text)
                 };
+                let reasoning_content = if parsed.thinking.is_empty() {
+                    None
+                } else {
+                    Some(parsed.thinking)
+                };
                 let tool_calls = if parsed.tool_uses.is_empty() {
                     None
                 } else {
                     Some(parsed.tool_uses)
                 };
                 // 只有当至少一个字段有值时才推入（防止全空消息）。
-                if content.is_some() || tool_calls.is_some() {
+                if content.is_some() || reasoning_content.is_some() || tool_calls.is_some() {
                     all_messages.push(ChatMessage {
                         role,
                         content,
+                        reasoning_content,
                         tool_calls,
                         tool_call_id: None,
                         name: None,
@@ -218,6 +241,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                     all_messages.push(ChatMessage {
                         role: "tool".to_string(),
                         content: Some(tr.content),
+                        reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: Some(tr.tool_call_id),
                         name: None,
@@ -1010,6 +1034,85 @@ mod tests {
         // 第 5 条：user 剩余文本排在 tool 消息之后
         assert_eq!(r.messages[4].role, "user");
         assert_eq!(r.messages[4].content.as_deref(), Some("thanks"));
+    }
+
+    #[test]
+    fn assistant_thinking_block_maps_to_reasoning_content() {
+        // 回归：Claude Code 开思考链时，历史 assistant 消息携带 thinking 块；
+        // 必须映射为 DeepSeek 的 reasoning_content 字段，否则上游 400
+        // 「The reasoning_content in the thinking mode must be passed back」。
+        let input = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "让我想想……", "signature": "sig"},
+                        {"type": "text", "text": "答案"},
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "/a"}}
+                    ]
+                }
+            ],
+        });
+        let r = anthropic_to_openai(&input).unwrap();
+        assert_eq!(r.messages.len(), 2);
+        let asst = &r.messages[1];
+        assert_eq!(
+            asst.reasoning_content.as_deref(),
+            Some("让我想想……"),
+            "thinking 块必须映射为 reasoning_content"
+        );
+        assert_eq!(asst.content.as_deref(), Some("答案"));
+        assert_eq!(asst.tool_calls.as_ref().unwrap().len(), 1);
+
+        // 序列化进上游请求体时必须带 reasoning_content 字段
+        let out = crate::llm::upstream::build_upstream_body(&r);
+        assert_eq!(
+            out["messages"][1]["reasoning_content"].as_str(),
+            Some("让我想想……"),
+            "上行 body 必须携带 reasoning_content: {out}"
+        );
+    }
+
+    #[test]
+    fn assistant_without_thinking_has_no_reasoning_content() {
+        // 普通 assistant 消息不得输出 reasoning_content 字段（避免 null 敏感上游）。
+        let input = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "plain answer"}
+            ],
+        });
+        let r = anthropic_to_openai(&input).unwrap();
+        let out = crate::llm::upstream::build_upstream_body(&r);
+        assert!(
+            out["messages"][1].get("reasoning_content").is_none(),
+            "无 thinking 时不得输出 reasoning_content: {out}"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_block_is_ignored() {
+        // redacted_thinking 只有加密签名、无可回传文本，忽略后消息其余部分照常转换。
+        let input = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque-blob"},
+                        {"type": "text", "text": "答案"}
+                    ]
+                }
+            ],
+        });
+        let r = anthropic_to_openai(&input).unwrap();
+        assert_eq!(r.messages.len(), 2);
+        assert_eq!(r.messages[1].reasoning_content, None);
+        assert_eq!(r.messages[1].content.as_deref(), Some("答案"));
     }
 
     #[test]

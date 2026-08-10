@@ -61,6 +61,15 @@ fn openai_usage_to_anthropic(usage: &Value) -> Value {
 pub fn openai_response_to_anthropic(openai: &Value) -> Value {
     let mut content: Vec<Value> = Vec::new();
 
+    // DeepSeek 思考模式的 reasoning_content → Anthropic thinking 块。
+    // 透传后客户端（Claude Code）会把 thinking 块放进下一轮历史消息，
+    // 网关再映射回 reasoning_content，构成完整回路（上游要求历史消息携带）。
+    if let Some(reasoning) = openai["choices"][0]["message"]["reasoning_content"].as_str() {
+        if !reasoning.is_empty() {
+            content.push(json!({ "type": "thinking", "thinking": reasoning }));
+        }
+    }
+
     // text 块（如果有）
     if let Some(text) = openai["choices"][0]["message"]["content"].as_str() {
         if !text.is_empty() {
@@ -107,8 +116,11 @@ pub fn openai_response_to_anthropic(openai: &Value) -> Value {
 /// 内部缓冲跨 chunk 边界的不完整行。
 ///
 /// **多 content block 处理**：
-/// - 文本内容（`delta.content`）始终占 Anthropic block index 0（若出现）；
-/// - 每个 tool_call 按上游 `delta.tool_calls[i].index` 首次出现顺序分配 index 1、2、...；
+/// - 思考内容（`delta.reasoning_content`，DeepSeek 思考模式）映射为 Anthropic
+///   `thinking` 块，出现即占 block index 0；
+/// - 文本内容（`delta.content`）映射为 `text` 块，index 紧随 thinking（无 thinking 时为 0）；
+/// - 每个 tool_call 按上游 `delta.tool_calls[i].index` 首次出现顺序继续分配 index；
+/// - block 切换（thinking → text）时先关闭前一个 block；
 /// - 所有已开启的 block 会在 message_stop 前逐个发送 `content_block_stop`。
 pub struct AnthropicSseTranslator {
     /// 尚未遇到换行符的不完整数据（原始字节）。
@@ -122,11 +134,15 @@ pub struct AnthropicSseTranslator {
     started: bool,
     /// message_stop 是否已发送
     closed: bool,
-    /// 文本 block 是否已发送 content_block_start（占据 anthropic index 0）
-    text_block_open: bool,
+    /// 当前已开启的 content block 类型（用于 thinking → text 切换时先关闭）
+    open_block: Option<BlockKind>,
+    /// thinking block 的 anthropic index（出现即 0）
+    thinking_index: Option<u32>,
+    /// text block 的 anthropic index（有 thinking 则 1，否则 0）
+    text_index: Option<u32>,
     /// 上游 tool_call index → 分配的 anthropic block index
     tool_blocks: std::collections::HashMap<u64, u32>,
-    /// 下一个可分配的 anthropic block index（text 用 0；tool 从 1 起，除非无 text）
+    /// 下一个可分配的 anthropic block index（thinking/text 依次占 0/1，tool 从其后起）
     next_block_index: u32,
     /// close() 时使用的 stop_reason；部分上游（compat 伪工具重写）会在 finish 之后
     /// 才补发携带 usage 的 chunk，需要用同一 stop_reason 补发一条 message_delta。
@@ -141,18 +157,24 @@ impl Default for AnthropicSseTranslator {
     }
 }
 
+/// 当前开启的 content block 类型。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Thinking,
+    Text,
+}
+
 impl AnthropicSseTranslator {
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
             started: false,
             closed: false,
-            text_block_open: false,
+            open_block: None,
+            thinking_index: None,
+            text_index: None,
             tool_blocks: std::collections::HashMap::new(),
-            // text block（若出现）用 0；tool block 用 1、2、... —— 若最终无 text，
-            // Anthropic 允许 tool_use block 从任何 index 开始，因此从 0 起也可以。
-            // 这里选择：text 出现即占 0，tool 从 next_block_index 起（初始 1）。
-            next_block_index: 1,
+            next_block_index: 0,
             close_stop_reason: None,
             late_usage_emitted: false,
         }
@@ -228,21 +250,61 @@ impl AnthropicSseTranslator {
             push_event(out, "message_start", &msg);
         }
 
+        // 思考增量（DeepSeek reasoning_content → Anthropic thinking 块）
+        if let Some(reasoning) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
+            if !reasoning.is_empty() {
+                let idx = match self.thinking_index {
+                    Some(idx) => idx,
+                    None => {
+                        let idx = self.next_block_index;
+                        self.next_block_index += 1;
+                        self.thinking_index = Some(idx);
+                        let block_start = json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        });
+                        push_event(out, "content_block_start", &block_start);
+                        self.open_block = Some(BlockKind::Thinking);
+                        idx
+                    }
+                };
+                let delta = json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                });
+                push_event(out, "content_block_delta", &delta);
+            }
+        }
+
         // 文本增量
         if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
             if !text.is_empty() {
-                if !self.text_block_open {
-                    self.text_block_open = true;
+                if self.text_index.is_none() {
+                    // thinking → text 切换：先关闭 thinking block，保持索引与顺序一致
+                    if self.open_block == Some(BlockKind::Thinking) {
+                        let block_stop = json!({
+                            "type": "content_block_stop",
+                            "index": self.thinking_index.unwrap(),
+                        });
+                        push_event(out, "content_block_stop", &block_stop);
+                        self.open_block = None;
+                    }
+                    let idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.text_index = Some(idx);
                     let block_start = json!({
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": idx,
                         "content_block": {"type": "text", "text": ""},
                     });
                     push_event(out, "content_block_start", &block_start);
+                    self.open_block = Some(BlockKind::Text);
                 }
                 let delta = json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": self.text_index.unwrap(),
                     "delta": {"type": "text_delta", "text": text},
                 });
                 push_event(out, "content_block_delta", &delta);
@@ -318,15 +380,29 @@ impl AnthropicSseTranslator {
         self.closed = true;
         self.close_stop_reason = Some(stop_reason.to_string());
 
-        // 关闭 text block（若开启过）
-        if self.text_block_open {
-            self.text_block_open = false;
+        // 关闭仍开启的 thinking / text block。
+        // 注意按 open_block 追踪实际开启状态：thinking → text 切换时已单独
+        // 关闭过 thinking，此处不能按「曾分配过 index」再发一次 stop（会重复）。
+        let mut open_indices: Vec<u32> = Vec::new();
+        if self.open_block == Some(BlockKind::Thinking) {
+            if let Some(i) = self.thinking_index {
+                open_indices.push(i);
+            }
+        }
+        if self.open_block == Some(BlockKind::Text) {
+            if let Some(i) = self.text_index {
+                open_indices.push(i);
+            }
+        }
+        open_indices.sort_unstable();
+        for idx in open_indices {
             let block_stop = json!({
                 "type": "content_block_stop",
-                "index": 0,
+                "index": idx,
             });
             push_event(out, "content_block_stop", &block_stop);
         }
+        self.open_block = None;
 
         // 关闭所有 tool blocks，按 anthropic index 顺序发送
         let mut indices: Vec<u32> = self.tool_blocks.values().copied().collect();
@@ -605,6 +681,88 @@ mod tests {
         assert_eq!(u.completion_tokens, 16);
     }
 
+    // ── 思考链（reasoning_content ↔ thinking）─────────────────
+
+    #[test]
+    fn non_stream_reasoning_content_becomes_thinking_block() {
+        // DeepSeek 思考模式响应携带 reasoning_content，必须转成 Anthropic
+        // thinking 块，Claude Code 才能在下轮历史中原样带回（上游强制要求）。
+        let openai = json!({
+            "id": "chatcmpl-r1",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "先分析……",
+                    "content": "最终答案"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+        });
+        let a = openai_response_to_anthropic(&openai);
+        let content = a["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "先分析……");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "最终答案");
+    }
+
+    #[test]
+    fn stream_reasoning_content_emits_thinking_block_before_text() {
+        // 流式：reasoning_content 增量 → thinking block（index 0），
+        // text 开始后 thinking 先关闭，text 占 index 1。
+        let reasoning_chunk = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"思考中\"},\"finish_reason\":null}]}\n\n";
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        all.extend(t.push(reasoning_chunk.as_bytes()));
+        all.extend(t.push(openai_chunk("答案", None).as_bytes()));
+        all.extend(t.push(openai_chunk("", Some("stop")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+
+        let events = parse_sse_events(&text);
+        let starts: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "expected thinking + text blocks:\n{text}");
+        assert_eq!(starts[0]["index"], 0);
+        assert_eq!(starts[0]["content_block"]["type"], "thinking");
+        assert_eq!(starts[1]["index"], 1);
+        assert_eq!(starts[1]["content_block"]["type"], "text");
+
+        // thinking_delta 正确透传
+        assert!(
+            text.contains("\"type\":\"thinking_delta\""),
+            "missing thinking_delta:\n{text}"
+        );
+        assert!(text.contains("思考中"), "{text}");
+
+        // 两个 block 都关闭，且 thinking(0) 先于 text(1)
+        let stops: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_stop")
+            .map(|s| s["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(stops, vec![0, 1], "stops must be ascending: {stops:?}");
+    }
+
+    #[test]
+    fn stream_reasoning_only_closes_cleanly() {
+        // 只有 reasoning_content、无 text 的流也要正常收尾（不残留未关闭 block）。
+        let reasoning_chunk = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"嗯\"},\"finish_reason\":null}]}\n\n";
+        let mut t = AnthropicSseTranslator::new();
+        let mut all = Vec::new();
+        all.extend(t.push(reasoning_chunk.as_bytes()));
+        all.extend(t.push(openai_chunk("", Some("stop")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+        assert!(text.contains("\"type\":\"thinking\""), "{text}");
+        assert!(text.contains("event: content_block_stop"), "{text}");
+        assert!(text.contains("event: message_stop"), "{text}");
+    }
+
     // ── 工具调用：非流式 ──────────────────────────────────────
 
     #[test]
@@ -716,7 +874,7 @@ mod tests {
         all.extend(t.push(openai_tool_chunk(0, None, None, None, Some("tool_calls")).as_bytes()));
         let text = String::from_utf8(all).unwrap();
 
-        // 首个 tool_use content_block_start，index=1（因为无 text，从 next_block_index=1 开始）
+        // 首个 tool_use content_block_start，index=0（无 thinking/text，从 0 起分配）
         assert!(text.contains("event: content_block_start"));
         assert!(text.contains("\"type\":\"tool_use\""));
         assert!(text.contains("\"id\":\"call_a\""));
@@ -787,9 +945,9 @@ mod tests {
             .filter(|e| e["type"] == "content_block_start")
             .collect();
         assert_eq!(starts.len(), 2, "expected 2 tool block_start:\n{text}");
-        assert_eq!(starts[0]["index"], 1);
+        assert_eq!(starts[0]["index"], 0);
         assert_eq!(starts[0]["content_block"]["id"], "a");
-        assert_eq!(starts[1]["index"], 2);
+        assert_eq!(starts[1]["index"], 1);
         assert_eq!(starts[1]["content_block"]["id"], "b");
 
         // block_stop 顺序按 index 升序
@@ -798,7 +956,7 @@ mod tests {
             .filter(|e| e["type"] == "content_block_stop")
             .map(|s| s["index"].as_u64().unwrap())
             .collect();
-        assert_eq!(stops, vec![1, 2], "block_stop must be ascending: {stops:?}");
+        assert_eq!(stops, vec![0, 1], "block_stop must be ascending: {stops:?}");
     }
 
     /// 解析 SSE 文本为事件 JSON 列表（丢弃 event: 前缀行）。
