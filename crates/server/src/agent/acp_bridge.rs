@@ -51,6 +51,12 @@ use super::{ApprovalOption, ApprovalResult};
 
 /// spawn/协商超时：LLM 代理启动与 agent 进程拉起各限 30s。
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// `wait_ready` 等待预 spawn 就绪的预算：必须覆盖 spawn 流水线最坏耗时
+/// （LLM 代理协商 + spawn 协商 + ACP handshake 各 `SPAWN_TIMEOUT`，另加
+/// 配置注入若干 `CONFIG_OPTION_TIMEOUT`）。若与 `SPAWN_TIMEOUT` 相同，
+/// agent 冷启动慢/隧道 RTT 大时，首条消息会在后台 spawn 成功前误报
+/// "wait for ACP handshake timed out"（重试即可成功，误导用户）。
+const READY_TIMEOUT: Duration = Duration::from_secs(150);
 /// config option 切换超时：agent 无响应时让 WS 连接及时拿到 error 帧回滚，
 /// 而非无限阻塞（回放挂起同样受此约束）。
 const CONFIG_OPTION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -141,6 +147,12 @@ pub struct AcpBridge {
     approval: Arc<ApproveFn>,
     /// 本服务端进程的活跃 ACP 会话表：session_id → SpawnedAgent。
     sessions: Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    /// 最近一次 spawn 失败的真实原因（session_id → 错误）。预 spawn 失败会
+    /// 移除占位条目，无此缓存时已在等待的 `wait_ready` 只能报误导性的
+    /// "session not spawned"，真实原因（binary not found / handshake failed
+    /// 等）被吞。新一轮 spawn 尝试（占位插入）时清除，只在会话不在场且无
+    /// 在途尝试时被消费（见 [`Self::spawn_failure`]）。
+    spawn_errors: Arc<Mutex<HashMap<String, String>>>,
     /// LLM 网关入口（内部 HTTP 回环调用）；未注入时 LLM 代理请求全部 502。
     gateway: Option<LlmGatewayEndpoint>,
 }
@@ -153,6 +165,7 @@ impl AcpBridge {
             cipher: None,
             approval: Arc::new(|_, _, _, _, _, _| Box::pin(async { ApprovalResult::Denied })),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            spawn_errors: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
         };
         bridge.start_idle_reaper();
@@ -295,6 +308,11 @@ impl AcpBridge {
             );
             Some((pump_io, stdout_rx))
         };
+        if pump_setup.is_some() {
+            // 新一轮 spawn 尝试：清除上一次的失败缓存，避免 wait_ready 在新
+            // 尝试在途时消费到陈旧错误（见 spawn_failure 的消费条件）。
+            self.spawn_errors.lock().await.remove(session_id);
+        }
 
         // 拿锁期不 spawn（避免长时间持锁阻塞 prompt/cancel）。先解析客户端
         // 控制通道并启动 pump（ACP→进程 stdin 方向；进程 stdout 方向已在占位
@@ -347,9 +365,15 @@ impl AcpBridge {
             self.acp_handshake(session_id, &root_path).await
         }
         .await;
-        if outcome.is_err() {
-            // spawn 失败：移除占位，允许后续重试。
+        if let Err(e) = &outcome {
+            // spawn 失败：移除占位，允许后续重试；同时缓存真实原因——已在
+            // wait_ready 等待的并发调用（预 spawn 在途时发了首条消息）在
+            // Sender drop 后能拿到它，而非误导性的 "session not spawned"。
             self.sessions.lock().await.remove(session_id);
+            self.spawn_errors
+                .lock()
+                .await
+                .insert(session_id.to_string(), e.clone());
             return outcome;
         }
         // 握手成功：workspace 级 overrides 注入先于 session 级 config_state 回放
@@ -1130,7 +1154,8 @@ impl AcpBridge {
     }
 
     /// 等待会话的 ACP 握手 + 配置注入完成（连接预 spawn 可能在后台进行）。
-    /// 已就绪立即返回；超时或会话被移除（spawn 失败/Sender drop）返回 Err。
+    /// 已就绪立即返回；超时、会话被移除（spawn 失败/Sender drop）返回 Err
+    /// （spawn 失败时透出缓存的真实原因）。
     ///
     /// 统一以 `spawn_ready` watch 为准，不放行于 connection 已写入的瞬时状态：
     /// `connection` 在握手完成时即写回会话条目，而 `spawn_ready` 在
@@ -1138,26 +1163,48 @@ impl AcpBridge {
     /// 若以 connection 存在与否做快路径放行，首条 prompt 会与在途的
     /// `set_config_option` 竞态（workspace overrides/用户 config_state 尚未注入）。
     /// watch 为 true 即「握手 + 配置注入」均已完成的最终状态。
+    ///
+    /// 超时预算用 `READY_TIMEOUT` 而非 `SPAWN_TIMEOUT`：预 spawn 流水线
+    /// （LLM 代理协商 → spawn 协商 → handshake → 配置注入）最坏耗时远超
+    /// 30s，等待方必须覆盖整个在途尝试，否则冷启动慢时误报超时。
     pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
         let mut rx = {
             let sessions = self.sessions.lock().await;
-            let agent = sessions
-                .get(session_id)
-                .ok_or_else(|| "session not spawned".to_string())?;
-            agent.spawn_ready.subscribe()
+            match sessions.get(session_id) {
+                Some(agent) => agent.spawn_ready.subscribe(),
+                None => return Err(self.spawn_failure(session_id).await),
+            }
         };
         // 订阅后才检查当前值：避免「subscribe 前已 send(true)」的窗口漏等
         // （重连/多标签页下条目已就绪，subscribe 即取到当前 true 值）。
         if *rx.borrow() {
             return Ok(());
         }
-        // wait_for 的返回值借用 rx（Ref<bool>）：先绑局部变量强制在 rx drop 前
-        // 释放该借用，避免尾表达式临时值拖到块结束才 drop（E0597）。
-        let ready = tokio::time::timeout(SPAWN_TIMEOUT, rx.wait_for(|r| *r)).await;
-        match ready {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(_)) => Err("session not spawned".to_string()),
-            Err(_) => Err("wait for ACP handshake timed out".to_string()),
+        // wait_for 的返回值借用 rx（Ref<bool>，非 Send）：直接 match 临时值
+        // 并在语句结束即 drop，不持借用跨下方 await（否则 WS handler 的
+        // future 非 Send）；也不能落局部变量——通配模式不 move，会活到块尾。
+        let sender_dropped = match tokio::time::timeout(READY_TIMEOUT, rx.wait_for(|r| *r)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(_)) => true,
+            Err(_) => false,
+        };
+        if sender_dropped {
+            Err(self.spawn_failure(session_id).await)
+        } else {
+            Err(
+                "等待 ACP agent 就绪超时：spawn 仍在进行（agent 冷启动或网络较慢），请稍后重试"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// 会话不在 spawn 表时的错误描述：优先取最近一次 spawn 失败的真实原因
+    /// （预 spawn 失败会移除占位条目并缓存原因；新一轮尝试开始前已清除旧值，
+    /// 故此处读到的必属于最近一次已结束的尝试）。
+    async fn spawn_failure(&self, session_id: &str) -> String {
+        match self.spawn_errors.lock().await.get(session_id) {
+            Some(e) => format!("agent spawn failed: {e}"),
+            None => "session not spawned".to_string(),
         }
     }
 
@@ -2139,6 +2186,71 @@ mod tests {
             .await
             .expect_err("unsupported agent type should fail locally");
         assert!(err.contains("unsupported agent type"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_reports_cached_spawn_failure() {
+        // 预 spawn 失败会移除占位条目：后到/在等的 wait_ready 必须拿到缓存的
+        // 真实原因，而非误导性的 "session not spawned"。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let mut ws = acp_workspace();
+        ws.client_id = "ghost".into();
+        let (ws_tx, _rx) = mpsc::channel(16);
+        let _ = bridge.ensure_session("sess-1", &ws, ws_tx).await;
+
+        let err = bridge
+            .wait_ready("sess-1")
+            .await
+            .expect_err("failed spawn should surface via wait_ready");
+        assert!(
+            err.contains("llm proxy start failed"),
+            "real spawn error should propagate, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_unknown_session_reports_not_spawned() {
+        // 从未尝试过 spawn 的会话：无失败缓存，保持 "session not spawned"。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let err = bridge
+            .wait_ready("sess-x")
+            .await
+            .expect_err("unknown session should error");
+        assert_eq!(err, "session not spawned");
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_retry_clears_stale_failure() {
+        // 失败缓存不得污染新一轮尝试：重试（新占位插入）清旧值后，新一轮
+        // 在途期间条目缺失的极端窗口不应再报旧错误。这里验证重试失败后
+        // 缓存被新错误覆盖（而非残留首次错误）。
+        let bridge = mock_bridge(|req| match req {
+            ControlMessage::AgentLlmProxyStart { session_id } => {
+                ControlMessage::AgentLlmProxyReady {
+                    session_id,
+                    port: 0, // 绑定失败：每次 spawn 都以相同原因失败
+                }
+            }
+            other => panic!("unexpected request: {other:?}"),
+        })
+        .await;
+        let ws = acp_workspace();
+        for _ in 0..2 {
+            let (ws_tx, _rx) = mpsc::channel(16);
+            let _ = bridge.ensure_session("sess-1", &ws, ws_tx).await;
+        }
+        let err = bridge
+            .wait_ready("sess-1")
+            .await
+            .expect_err("failed spawn should surface via wait_ready");
+        assert!(
+            err.contains("failed to bind"),
+            "latest failure should be cached, got: {err}"
+        );
     }
 
     #[tokio::test]

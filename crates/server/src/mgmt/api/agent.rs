@@ -655,7 +655,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 };
                 if use_acp_path(&workspace) {
                     if let Err(e) = bridge.ensure_session(&sid, &workspace, ws_tx).await {
-                        tracing::debug!(session_id = %sid, "pre-spawn acp agent failed: {e}");
+                        // info 级：预 spawn 失败此前只在 debug 可见，用户首条
+                        // 消息只能拿到 wait_ready 的泛化错误，排查困难。
+                        tracing::info!(session_id = %sid, "pre-spawn acp agent failed: {e}");
                     }
                 }
             });
