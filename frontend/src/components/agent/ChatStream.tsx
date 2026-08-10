@@ -858,7 +858,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   return (
     <div className="flex h-full flex-col">
       <div
-        className="flex-1 space-y-4 overflow-y-auto px-5 py-4"
+        className="flex-1 space-y-3 overflow-y-auto px-3 py-3 md:space-y-4 md:px-5 md:py-4"
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
@@ -885,9 +885,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       </div>
 
       {/* 一体化输入框：模型选择(左下) + 发送图标(右下) 内嵌 */}
-      <div className="border-t p-2">
+      <div className="border-t p-2 pb-[env(safe-area-inset-bottom,16px)]">
         {disconnected && (
-          <div className="mb-1.5 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">
+          <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
             <Loader2 className="h-3 w-3 animate-spin" />
             {t('agent.reconnecting')}
           </div>
@@ -964,7 +964,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             className="w-full resize-none rounded-t-xl border-0 bg-transparent px-3 pt-2 text-sm focus:outline-none"
             rows={2}
           />
-          <div className="flex items-center justify-between px-2 pb-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-1 px-1.5 pb-1.5 md:px-2">
             <SessionSettingsMenu
               model={model}
               onModelChange={handleModelChange}

@@ -95,13 +95,13 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" aria-label={t('agent.selectSessionAria')}>
             <MessageSquare className="mr-1 h-4 w-4" />
-            <span className="max-w-[160px] truncate">
+            <span className="max-w-[80px] truncate md:max-w-[160px]">
               {current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
             </span>
             <ChevronDown className="ml-1 h-3.5 w-3.5 opacity-50" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" className="w-72 p-0">
+        <DropdownMenuContent align="start" className="w-[calc(100vw-2rem)] max-w-80 p-0 md:w-72">
           {/* sticky 新建会话：列表长时滚动仍保持可见；onSelect 触发后 Radix 自动收起菜单 */}
           <div className="sticky top-0 z-10 border-b border-border/60 bg-popover">
             <DropdownMenuItem className="cursor-pointer" onSelect={() => onNew()}>

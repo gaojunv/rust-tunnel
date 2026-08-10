@@ -72,7 +72,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
         onValueChange={(v) => onSelect(v === NONE_VALUE ? '' : v)}
       >
         <SelectTrigger
-          className="h-9 w-[220px]"
+          className="h-9 w-[130px] md:w-[220px]"
           aria-label={t('agent.selectWorkspaceAria')}
         >
           <SelectValue placeholder={t('agent.selectWorkspace')} />
@@ -95,6 +95,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
         size="sm"
         onClick={onEdit}
         disabled={!workspaceId}
+        className="hidden md:inline-flex"
         aria-label={t('agent.editWorkspace')}
       >
         <Settings className="h-4 w-4" />
@@ -110,6 +111,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
             setError(null);
             setConfirming(true);
           }}
+          className="hidden md:inline-flex"
           aria-label={t('agent.deleteWorkspace')}
         >
           <Trash2 className="h-4 w-4 text-destructive" />

@@ -15,10 +15,13 @@ import WorkspaceBar from '../components/agent/WorkspaceBar';
 import SessionBar from '../components/agent/SessionBar';
 import ActivityBar from '../components/agent/ActivityBar';
 import WorkspaceDialog from '../components/agent/WorkspaceDialog';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 
 export default function AgentPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // 桌面/移动端分支：ActivityBar 在 <768px 下切到底部图标栏 + Sheet 面板
+  const isDesktop = useMediaQuery('(min-width: 768px)');
   const [workspaceId, setWorkspaceId] = useState(
     () => localStorage.getItem('agent.lastWorkspaceId') ?? '',
   );
@@ -134,9 +137,9 @@ export default function AgentPage() {
   };
 
   return (
-    <div className="flex h-[calc(100dvh-7.5rem)] min-h-[480px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card">
+    <div className="flex h-[calc(100dvh-7.5rem)] min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
       {/* 顶栏：logo + WorkspaceBar + SessionBar */}
-      <div className="flex items-center gap-2 border-b border-border/60 p-2">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 p-1.5 md:flex-nowrap md:p-2">
         <Sparkles className="h-4 w-4 shrink-0 text-primary" />
         <WorkspaceBar
           workspaceId={workspaceId}
@@ -157,7 +160,13 @@ export default function AgentPage() {
 
       <div className="flex min-h-0 flex-1">
         {/* VS Code 式 Activity Bar（选中会话后可用） */}
-        {sessionId && <ActivityBar sessionId={sessionId} workspaceId={workspaceId} />}
+        {sessionId && (
+          <ActivityBar
+            sessionId={sessionId}
+            workspaceId={workspaceId}
+            variant={isDesktop ? 'sidebar' : 'mobile'}
+          />
+        )}
 
         {/* 对话区 */}
         <div className="min-w-0 flex-1">

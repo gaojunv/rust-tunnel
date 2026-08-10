@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Folder, TerminalSquare, GitBranch } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import FilesPanel from './panels/FilesPanel';
 import TerminalPanel from './panels/TerminalPanel';
 import GitPanel from './panels/GitPanel';
@@ -35,9 +36,14 @@ const MAX_WIDTH_RATIO = 0.8;
 interface ActivityBarProps {
   sessionId: string;
   workspaceId: string;
+  /**
+   * 'sidebar'：桌面端 VS Code 式侧栏（默认，向后兼容）；
+   * 'mobile'：底部固定图标栏 + 底部 Sheet 面板（<768px）。
+   */
+  variant?: 'sidebar' | 'mobile';
 }
 
-export default function ActivityBar({ sessionId, workspaceId }: ActivityBarProps) {
+export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar' }: ActivityBarProps) {
   const { t } = useTranslation();
   const [active, setActive] = useState<PanelKind | null>(null);
   // 每种面板各自记住拖动后的宽度（px）
@@ -103,6 +109,57 @@ export default function ActivityBar({ sessionId, workspaceId }: ActivityBarProps
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
+
+  // 移动端（<768px）：VS Code 侧栏在 393px 宽度上不可用——改为底部固定图标栏，
+  // 面板经底部 Sheet（side="bottom"）弹出。面板内容仅在对应 Sheet open 时挂载
+  // （Radix Dialog 关闭即卸载），避免在页面常驻重量级文件/终端面板。
+  if (variant === 'mobile') {
+    return (
+      <>
+        {/* spacer 占位：防止底部固定栏遮挡聊天区/输入框（仅在移动端占流） */}
+        <div className="h-12 md:hidden" />
+        {/* 底部固定图标栏：外层承担安全区下内边距，内层 h-12 保持触控高度不被挤压 */}
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[env(safe-area-inset-bottom,0px)] md:hidden">
+          <div className="flex h-12 items-center justify-around">
+            {ICONS.map(({ kind, Icon, labelKey }) => (
+              <button
+                key={kind}
+                type="button"
+                aria-label={t(labelKey)}
+                aria-pressed={active === kind}
+                onClick={() => toggle(kind)}
+                className={cn(
+                  'flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                  active === kind && 'bg-accent text-primary'
+                )}
+              >
+                <Icon className="h-5 w-5" />
+              </button>
+            ))}
+          </div>
+        </div>
+        {/* 底部 Sheet 面板：每个图标一个受控 Sheet，open 时挂载对应面板 */}
+        {ICONS.map(({ kind, labelKey }) => (
+          <Sheet
+            key={kind}
+            open={active === kind}
+            onOpenChange={(open) => setActive(open ? kind : null)}
+          >
+            <SheetContent side="bottom" className="flex h-[60vh] flex-col gap-0 p-0">
+              <div className="flex items-center justify-between border-b border-border/60 py-3 pl-4 pr-10">
+                <SheetTitle className="text-sm font-medium">{t(labelKey)}</SheetTitle>
+              </div>
+              <div className="min-h-0 flex-1 overflow-hidden">
+                {kind === 'files' && <FilesPanel workspaceId={workspaceId} />}
+                {kind === 'terminal' && <TerminalPanel workspaceId={workspaceId} />}
+                {kind === 'git' && <GitPanel sessionId={sessionId} workspaceId={workspaceId} />}
+              </div>
+            </SheetContent>
+          </Sheet>
+        ))}
+      </>
+    );
+  }
 
   return (
     <div ref={rootRef} className="flex h-full shrink-0">
