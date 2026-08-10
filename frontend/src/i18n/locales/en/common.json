@@ -791,6 +791,8 @@
     "model": "Models",
     "modelGroups": "Model Groups",
     "selectModel": "Select model…",
+    "searchModels": "Search models…",
+    "noModelsFound": "No models found",
     "defaultModel": "Default model",
     "responseTimeout": "Response timed out, please retry",
     "modelUpdateFailed": "Failed to update model, reverted to previous selection",

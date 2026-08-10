@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import SessionSettingsMenu from './SessionSettingsMenu';
 
@@ -32,6 +32,13 @@ const renderMenu = (props: Partial<Parameters<typeof SessionSettingsMenu>[0]> = 
   );
 };
 
+const openMenu = async () => {
+  const trigger = screen.getByRole('button', { name: 'agent.sessionSettings' });
+  fireEvent.pointerDown(trigger);
+  fireEvent.click(trigger);
+  await screen.findByPlaceholderText('agent.searchModels');
+};
+
 describe('SessionSettingsMenu', () => {
   it('shows current model label on the trigger', async () => {
     renderMenu();
@@ -46,5 +53,25 @@ describe('SessionSettingsMenu', () => {
     });
     // trigger 冒烟：菜单项内容依赖 Radix portal，jsdom 下只断言 trigger 存在
     expect(await screen.findByText('deepseek-chat')).toBeTruthy();
+  });
+
+  it('opens a flat searchable model list at the top of the menu (no nested submenu)', async () => {
+    renderMenu();
+    await openMenu();
+    // 模型项直接是 menuitem（一层），不再是需展开的子菜单
+    const item = await screen.findByRole('menuitem', { name: 'deepseek-chat' });
+    expect(item).toBeTruthy();
+    // 模型区 label 在同一层出现
+    expect(screen.getByText('agent.model')).toBeTruthy();
+  });
+
+  it('shows no-results message when model search matches nothing', async () => {
+    renderMenu();
+    await openMenu();
+    fireEvent.change(screen.getByPlaceholderText('agent.searchModels'), {
+      target: { value: 'no-such-model' },
+    });
+    expect(await screen.findByText('agent.noModelsFound')).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: 'deepseek-chat' })).toBeNull();
   });
 });

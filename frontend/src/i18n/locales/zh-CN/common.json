@@ -791,6 +791,8 @@
     "model": "模型",
     "modelGroups": "模型组",
     "selectModel": "选择模型…",
+    "searchModels": "搜索模型…",
+    "noModelsFound": "未找到模型",
     "defaultModel": "默认模型",
     "responseTimeout": "响应超时，请重试",
     "modelUpdateFailed": "模型更新失败，已回滚到之前的模型",
