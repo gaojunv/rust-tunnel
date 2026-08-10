@@ -1,0 +1,25 @@
+[package]
+name = "rust-tunnel-common"
+version = "0.4.0"
+edition = "2021"
+description = "Shared protocol and infrastructure for rust-tunnel"
+license = "MIT"
+
+[dependencies]
+bincode.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

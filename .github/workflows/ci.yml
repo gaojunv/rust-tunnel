@@ -41,7 +41,7 @@ jobs:
         # Suppress 18 pre-existing src/ warnings (deferred to cleanup PR).
         # Scope: -A flags for known categories; --tests compiles lib as dependency.
         run: >-
-          cargo clippy --tests -- -D warnings
+          cargo clippy --workspace --tests -- -D warnings
           -A clippy::collapsible_match
           -A clippy::map_flatten
           -A clippy::new_without_default
@@ -52,9 +52,9 @@ jobs:
           -A clippy::zombie_processes
 
       - name: Build
-        run: cargo build --tests
+        run: cargo build --workspace --tests
 
       - name: Test
-        run: cargo test --tests -- --test-threads=4
+        run: cargo test --workspace --tests -- --test-threads=4
         env:
           RUST_BACKTRACE: "1"

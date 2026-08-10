@@ -17,11 +17,11 @@
 mod common;
 
 use common::{spawn_echo, wait_until, HarnessOpts, TestHarness};
-use rust_tunnel::common::{
+use rust_tunnel_common::{
     create_insecure_client_config, create_server_config, load_or_generate_cert,
 };
-use rust_tunnel::server::listener;
-use rust_tunnel::server::trojan::sha224_hex;
+use rust_tunnel_server::listener;
+use rust_tunnel_server::trojan::sha224_hex;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

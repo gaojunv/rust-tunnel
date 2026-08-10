@@ -16,8 +16,8 @@ mod common;
 
 use common::echo::spawn_http_echo;
 use common::{spawn_echo, wait_until, HarnessOpts, TestHarness};
-use rust_tunnel::server::reverse_proxy::tcp_proxy::{TcpProxy, UdpProxy};
-use rust_tunnel::server::reverse_proxy::{
+use rust_tunnel_server::reverse_proxy::tcp_proxy::{TcpProxy, UdpProxy};
+use rust_tunnel_server::reverse_proxy::{
     Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route, RuleType,
 };
 use std::time::Duration;

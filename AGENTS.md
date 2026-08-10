@@ -22,8 +22,9 @@ rust-tunnel 是一个基于 Rust 的**内网穿透工具**，采用客户端-服
 
 ## 技术栈
 
-**后端（Rust，单 crate，无 workspace）**
+**后端（Rust，Cargo workspace：根元包 + 三库 crate）**
 
+- 根元包 `rust-tunnel` 仅托管 e2e 集成测试（`tests/`）；`crates/common`（`rust-tunnel-common`）、`crates/client`（`rust-tunnel-client`）、`crates/server`（`rust-tunnel-server`）三独立 crate，依赖单向 `common ← client` / `common ← server`。
 - 异步运行时 Tokio（full features）；错误处理：二进制用 `anyhow`，库用 `thiserror`（`TunnelError`）。
 - 控制消息：`bincode` 序列化 + 4 字节大端长度前缀帧（最大 1MB）。
 - API：`serde_json` + Axum 0.7 + `tower-http`（CORS、fs），SSE 日志/统计流。
@@ -48,25 +49,29 @@ rust-tunnel 是一个基于 Rust 的**内网穿透工具**，采用客户端-服
 ### 后端
 
 ```bash
-cargo build                    # 调试构建
-cargo build --release          # 发布构建
-cargo check                    # 快速编译检查
-cargo test                     # 全部测试（单元 + 集成）
-cargo test --tests             # 仅集成测试
+cargo build                      # 调试构建（默认 feature，不编译 qdrant-edge）
+cargo build -p rust-tunnel-server --features rag   # 含 RAG 的完整构建
+cargo check                      # 快速编译检查
+cargo test                       # 根目录：e2e 集成测试（dev-dep 带 rag feature）
+cargo test -p rust-tunnel-server --lib --features rag   # 含 RAG 的服务端单测
+cargo test --tests               # 仅集成测试
 cargo clippy --tests -- -D warnings   # 与 CI 一致的 Lint（另有若干 -A 豁免，见 .github/workflows/ci.yml）
-cargo fmt --all                # 格式化（CI 检查 --check）
+cargo fmt --all                  # 格式化（CI 检查 --check）
 
 # 运行服务器（示例）
-cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000
+cargo run -p rust-tunnel-server --features rag -- --bind 0.0.0.0:8080 --api-bind 0.0.0.0:3000
 
 # 运行客户端（示例）
-cargo run --bin rust-tunnel-client -- --server localhost:8080 --password <token> --name my-client
+cargo run -p rust-tunnel-client -- --server localhost:8080 --password <token> --name my-client
 
 # SQLite 诊断
-cargo run --bin checkdb
+cargo run -p rust-tunnel-server --bin checkdb
 ```
 
-Cargo feature：`embed-frontend` — 通过 `rust-embed` 将 `frontend-dist/` 嵌入服务器二进制。不带该 feature 构建时静态页面路由不生效（见 `src/server/mgmt/api/mod.rs` 中的 `#[cfg(feature = "embed-frontend")]`）。
+Cargo feature（`rust-tunnel-server`）：
+- `rag`（非默认）— 门控 qdrant-edge 与 `/api/llm/kb*` RAG 知识库路由，完整服务需 `--features rag`。
+- `embed-frontend` — 通过 `rust-embed` 将 `frontend-dist/` 嵌入服务器二进制。不带该 feature 构建时静态页面路由不生效（见 `crates/server/src/mgmt/api/mod.rs` 中的 `#[cfg(feature = "embed-frontend")]`）。
+- CI 发布构建使用 `--features rag,embed-frontend`。
 
 ### 前端
 
@@ -89,15 +94,15 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ## 仓库结构与模块划分
 
-### 二进制（`src/bin/`，Cargo 自动发现，共 3 个）
+### 二进制（workspace 三 crate，共 3 个）
 
-- `rust-tunnel-server`（`src/bin/server.rs`）— 服务器端入口。
-- `rust-tunnel-client`（`src/bin/client.rs`）— 客户端入口，支持断线指数退避重连。
-- `checkdb`（`src/bin/checkdb.rs`）— 独立的 SQLite `stats_snapshots` 诊断工具。
+- `rust-tunnel-server`（`crates/server/src/bin/server.rs`）— 服务器端入口（`rust-tunnel-server` crate）。
+- `rust-tunnel-client`（`crates/client/src/bin/client.rs`）— 客户端入口（`rust-tunnel-client` crate），支持断线指数退避重连。
+- `checkdb`（`crates/server/src/bin/checkdb.rs`）— 独立的 SQLite `stats_snapshots` 诊断工具（`rust-tunnel-server` crate）。
 
-库入口 `src/lib.rs` 仅导出三个模块：`client`、`common`、`server`。集成测试直接调用库层的 `run_server`（`src/server/control_plane/server.rs`）和 `run_client`（`src/client/control.rs`）在同进程内起服务。
+集成测试（根元包 `tests/`）直接调用库层的 `run_server`（`crates/server/src/control_plane/server.rs`）和 `run_client`（`crates/client/src/control.rs`）在同进程内起服务。
 
-### `src/common/` — 共享协议与基础设施
+### `crates/common/src/` — 共享协议与基础设施
 
 - `protocol.rs` — `ControlMessage` 枚举，v2 协议，bincode + 长度前缀。
 - `error.rs` — `TunnelError` / `TunnelResult`。
@@ -106,7 +111,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `mesh_types.rs` — `MeshRoute`、`MeshService`、`DnsRecord` 等共享类型。
 - `logging.rs` — tracing 初始化。
 
-### `src/server/` — 服务器实现
+### `crates/server/src/` — 服务器实现
 
 顶层 `mod.rs` 重新导出：`api`（即 `mgmt::api`）、`control`（即 `control_plane`）、`db`（即 `persistence::db`）、`dns`（即 `net::dns`）、`listener`（即 `net::listener`）、`mesh`（即 `net::mesh`）、`acme`（即 `pki::acme`）、`reverse_proxy`（即 `protocols::reverse_proxy`）、`shadowsocks`（即 `protocols::shadowsocks`）、`trojan`（即 `protocols::trojan`）、`trojan_runtime`（即 `protocols::trojan_runtime`）。
 
@@ -154,7 +159,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
   - `merge.rs` — 配置合并与校验。
   - `mod.rs` — `ServerConfig` 结构体与默认值。
 
-### `src/client/` — 客户端实现
+### `crates/client/src/` — 客户端实现
 
 - `control.rs` — 控制连接、TLS、认证注册、心跳 RTT 测量、消息分发；`run_client` 入口。
 - `proxy.rs` — 处理 `OpenTunnel`，连接本地目标并转发数据。
@@ -193,7 +198,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `ss_*` / `trojan_*` — Shadowsocks / Trojan 配置。
 - `dns_*` — 嵌入式 DNS。
 - `reverse_proxy_*` — 反向代理全局配置。
-- `acme_*` — ACME 配置（DB 为运行时真相来源，见 `src/server/control_plane/acme_config.rs`）。
+- `acme_*` — ACME 配置（DB 为运行时真相来源，见 `crates/server/src/control_plane/acme_config.rs`）。
 
 ### 客户端关键配置项
 
@@ -208,7 +213,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### 单元测试
 
-位于 `src/` 各文件内（`#[cfg(test)] mod tests`）。例如 `src/common/protocol.rs`、`src/server/control_plane/state.rs`、`src/server/mgmt/stats.rs`、`src/server/persistence/db/mod.rs` 等。
+位于各 crate 的 `src/` 文件内（`#[cfg(test)] mod tests`）。例如 `crates/common/src/protocol.rs`、`crates/server/src/control_plane/state.rs`、`crates/server/src/mgmt/stats.rs`、`crates/server/src/persistence/db/mod.rs` 等。
 
 ### 集成测试（`tests/`，规范详见 `tests/README.md`）
 
@@ -235,7 +240,7 @@ cargo test --test tunnel_basic        # 指定文件
 
 ## API 概览
 
-完整路由定义见 `src/server/mgmt/api/mod.rs`（Router 构建在 `run_api_server` 中）。
+完整路由定义见 `crates/server/src/mgmt/api/mod.rs`（Router 构建在 `run_api_server` 中）。
 
 - 公开（无认证）：`POST /api/login`、`GET /api/health`、`GET /api/stats/stream`（SSE）、`GET /api/logs/stream`（SSE，通过 `?token=` 认证）。
 - 受保护（`admin_password` 设置时需 JWT Bearer）：
@@ -278,7 +283,7 @@ cargo test --test tunnel_basic        # 指定文件
 GitHub Actions（`.github/workflows/`）：
 
 - `ci.yml` — 每次 push / PR：`cargo fmt --check` → `cargo clippy --tests -D warnings`（含豁免）→ `cargo build --tests` → `cargo test --tests -- --test-threads=4`。
-- `release-server.yml` — 打 `v*` tag 或手动触发：Node 20 构建前端 → 下载产物到 `frontend-dist/` → `x86_64-unknown-linux-musl` 静态编译服务器（带 `embed-frontend`）→ strip → SCP 二进制 + systemd 单元 + 配置到远程服务器 → SSH 重启。
+- `release-server.yml` — 打 `v*` tag 或手动触发：Node 20 构建前端 → 下载产物到 `frontend-dist/` → `x86_64-unknown-linux-musl` 静态编译服务器（`-p rust-tunnel-server`，`--features rag,embed-frontend`）→ strip → SCP 二进制 + systemd 单元 + 配置到远程服务器 → SSH 重启。
 - `release-client.yml` — 打 tag 时交叉编译客户端：Linux musl、macOS x86_64/aarch64、Windows MSVC，上传为 Release 构件。
 
 部署使用 systemd，单元文件 `contrib/rust-tunnel-server.service`（工作目录 `/opt/rust-tunnel`，配置 `/etc/rust-tunnel/config.toml`，模板见 `contrib/config.toml.template`）。

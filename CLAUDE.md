@@ -8,19 +8,21 @@ rust-tunnel 是一个基于 Rust 的客户端-服务器内网穿透工具，配�
 
 ## 常用开发命令
 
-### 后端
+### 后端（workspace：crates/common、crates/client、crates/server）
 ```bash
-cargo build                    # 调试构建
-cargo build --release          # 发布构建
-cargo check                    # 快速编译检查
-cargo test                     # 运行所有测试（注意内存限制：环境内存小，用 cargo test -- -j 2 避免 OOM）
-cargo test test_name           # 运行单个测试
-cargo test -- --nocapture      # 运行测试并显示输出
-cargo test -p rust-tunnel --test '*' module::test_name  # 按模块筛选
-cargo clippy                   # Lint（项目配置为 clippy::pedantic）
-cargo run --bin rust-tunnel-server -- --bind 0.0.0.0:8080
-cargo run --bin rust-tunnel-client -- --server localhost:8080 --password <token> --name home-nas
-cargo run --bin checkdb        # SQLite 数据库诊断工具
+cargo build                      # 调试构建（默认 feature，不编译 qdrant-edge）
+cargo build -p rust-tunnel-server --features rag   # 含 RAG 的完整构建
+cargo check                      # 快速编译检查
+cargo test -p rust-tunnel-common --lib
+cargo test -p rust-tunnel-client --lib
+cargo test -p rust-tunnel-server --lib        # 服务器单测（无 RAG，快速）
+cargo test -p rust-tunnel-server --lib --features rag   # 含 RAG 单测
+cargo test                       # 根目录：e2e 集成测试（dev-dep 带 rag feature）
+cargo test -j 2                  # 内存限制：-j 是 cargo 构建并行度（e2e 编译含 qdrant-edge 时尤其需要）
+cargo clippy -p rust-tunnel-server
+cargo run -p rust-tunnel-server --features rag -- --bind 0.0.0.0:8080
+cargo run -p rust-tunnel-client -- --server localhost:8080 --password <token> --name home-nas
+cargo run -p rust-tunnel-server --bin checkdb  # SQLite 数据库诊断工具
 ```
 
 ### 前端
@@ -39,15 +41,23 @@ npm test                       # Vitest 单元/组件测试（jsdom 环境）
 cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../frontend-dist
 ```
 
+### 构建缓存治理
+```bash
+du -sh target                       # 查看缓存体积（分解 debug/incremental）
+cargo clean -p rust-tunnel-server   # 定点清理单个 crate 的产物/增量缓存
+cargo clean                         # 全量清空（磁盘告警时；重建约需数分钟）
+# 可选后续：sccache 对象级缓存（跨目标/CI 复用，清仓重建也快）
+```
+
 ## 架构
 
-### 单 Crate 三二进制
-项目是单个 Cargo crate（无 workspace），三个二进制目标：
-- `rust-tunnel-server`（`src/bin/server.rs`）
-- `rust-tunnel-client`（`src/bin/client.rs`）
-- `checkdb`（`src/bin/checkdb.rs`）— 独立的 SQLite 质量历史诊断工具
-
-库入口 `src/lib.rs` 导出三个模块：`client`、`common`、`server`。
+### Cargo workspace：三库 crate + 根元包
+- 根元包 `rust-tunnel` 仅托管 e2e 测试（`tests/`），无实现代码
+- `crates/common`（`rust-tunnel-common`）— 协议/TLS/错误/日志/mesh + `DEFAULT_PTY_PORT`
+- `crates/client`（`rust-tunnel-client`）— 客户端 lib + bin
+- `crates/server`（`rust-tunnel-server`）— 服务端 lib + bins（server、checkdb）
+- 依赖单向：`common ← client`、`common ← server`
+- **`rag` 为非默认 feature**（门控 qdrant-edge 与 `/api/llm/kb*`）；完整服务需 `--features rag`，CI 构建用 `--features rag,embed-frontend`
 
 ### 核心数据流
 1. 客户端通过控制通道（加密 TLS）向服务端注册，提供名称和密码
@@ -57,13 +67,13 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### 模块职责
 
-**`src/common/`** — 共享协议和基础设施工具
+**`crates/common/src/`** — 共享协议和基础设施工具
 - `protocol.rs` — `ControlMessage` 枚举，长度前缀 bincode 序列化（最大 1MB）
 - `error.rs` — `TunnelError`（10 个变体）和 `TunnelResult`
 - `tls.rs` — 自签名证书生成（Ed25519）、TOFU/安全模式客户端配置
 - `logging.rs` — 日志初始化
 
-**`src/server/`** — 服务器实现
+**`crates/server/src/`** — 服务器实现
 - `control_plane/` — 控制通道、`ServerState`、`ClientRegistry` 管理、消息分发、心跳质量监控、SS/Trojan 端口追踪
 - `protocols/` — 代理协议实现：
   - `shadowsocks.rs` — 内置 SS 代理：`shadowsocks-rust` crate，AES-256-GCM / ChaCha20-Poly1305，EVP_BytesToKey 密钥派生
@@ -83,7 +93,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - `agent/` — AI agent 工作台：`runner`（自研 agent 循环/回合，保留但不再作为运行时路径）、`tools`（工具 schema：shell/read_file/write_file/patch_file/list_dir/search/git_*，工具经隧道在内网客户端执行）、`executor`（命令执行）、`approval`（审批矩阵：危险工具挂起等待用户批准，支持"本会话记住"）、`session`/`title`/`compact`（会话管理、自动标题、上下文压缩）、`sse`（WebSocket 事件流）、`spawner`（ACP 路径：经控制通道 negotiate AgentSpawnRequest/AgentLlmProxyStart，在客户端 spawn agent 进程）、`acp_bridge`（ACP 路径：管理 ACP session 生命周期、stdio pump、idle reaper、断线恢复）、`acp_events`（ACP `SessionUpdate` → 现有 WS 帧映射）、`llm_bridge`（AgentLlmProxyRequest → 服务端 LLM 网关转发，服务端注入认证）。`AgentState` 挂在 `ServerState` 上，含 per-workspace 执行锁（git 状态安全）和 per-session 回合锁（多标签页/重连防并发写库）
 - `config/` — 服务器配置（Clap + figment（TOML）+ 环境变量，三级优先级）
 
-**`src/client/`** — 客户端实现（零配置范式的端侧）
+**`crates/client/src/`** — 客户端实现（零配置范式的端侧）
 - `control.rs` — 建立控制连接、TLS、密码认证、`Register{protocol_version:2, name, password, version}`、`ClientState`（pending→active 连接管理）、分发 `OpenTunnel`/`Data`/`Close`/`Disconnect`
 - `proxy.rs` — `handle_open_tunnel`：收到 OpenTunnel 后 `TcpStream::connect(target_addr)`，TunnelOpenResult 反馈，双向 shuttle 转发
 - `config.rs` — 同上三级配置优先级，但只保留 `server/password/name/tls*` 和 `mesh*`，删除 `forwards`
@@ -102,7 +112,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ### 数据库 (SQLite)
 - 位置：`--db-path` 配置（默认 `./data/rust-tunnel.db`），WAL 模式
-- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`）、`agent_workspaces` / `agent_sessions` / `agent_messages`（agent 工作台）
+- 表：`port_traffic`（聚合流量）、`traffic_buckets`（分钟级，保留 24h）、`client_sessions`（连接历史）、`connection_quality_history`（质量数据）、`shadowsocks_config`、`trojan_config`、`log_entries`、`clients`（客户端名录）、`server_auth`（客户端接入 token）、`rag_knowledge_bases` / `rag_documents` / `rag_chunks`（RAG 知识库、文档与分块，向量本体存于 `<db_parent>/rag/<kb_id>/`，文档原文存于 `<db_parent>/rag_docs/<kb_id>/`；**向量本体仅随 `rag` feature 编译**）、`agent_workspaces` / `agent_sessions` / `agent_messages`（agent 工作台）
 
 ### API 端点
 - 公开：`POST /api/login`、`GET /api/health`、`GET /api/llm/kb/events`（SSE，`?token=` 认证）
@@ -110,7 +120,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - LLM 网关（既有）：`/api/llm/gateway`、`/api/llm/providers`、`/api/llm/providers/:id`、`/api/llm/providers/:provider_id/models`、`/api/llm/models`、`/api/llm/models/:id`、`/api/llm/api-keys`、`/api/llm/api-keys/:id`、`/api/llm/usage/*`
 - RAG 知识库（新）：`/api/llm/kb`（CRUD）、`/api/llm/kb/:id`、`/api/llm/kb/:id/docs`、`/api/llm/kb/:id/docs/:doc_id`（含 `/reindex`）、`/api/llm/kb/test-embedding`、`/api/llm/kb/:id/query`
 - AI agent（新）：`GET /api/agent/ws`（WebSocket 回合/事件流）、`/api/agent/workspaces`（CRUD，含 `/files`、`/sessions`）、`/api/agent/sessions/:id`（含 `/model`、`/archive`、`/messages`）、`/api/agent/default-model`
-- 完整列表见 `src/server/mgmt/api/mod.rs`
+- 完整列表见 `crates/server/src/mgmt/api/mod.rs`
 
 ## 代码模式
 
@@ -121,7 +131,7 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 - 状态共享：`Arc<Mutex<T>>`、`tokio::sync::Mutex`
 - 数据库：sqlx + SQLite（WAL 模式）
 - TLS：rustls + tokio-rustls + rcgen（自签名证书）
-- 配置：Clap（CLI）+ figment（TOML + 环境变量），三级优先级：CLI > 环境变量 > 配置文件 > 默认值（`src/server/config/`）
+- 配置：Clap（CLI）+ figment（TOML + 环境变量），三级优先级：CLI > 环境变量 > 配置文件 > 默认值（`crates/server/src/config/`）
 - 质量监控：基于心跳的 RTT 测量，通过序列号追踪丢包
 - Lint：项目配置为 `clippy::pedantic`
 
@@ -140,8 +150,8 @@ cd frontend && npm run build && rm -rf ../frontend-dist && cp -r dist ../fronten
 
 ## 测试
 
-- **单元测试**：位于 `src/` 内，源文件末尾 `#[cfg(test)] mod tests`（协议专属测试如 shadowsocks/trojan/http2/aliyun 均已合并回各自实现文件）。
-- **集成测试**：位于顶层 `tests/`，以黑盒 API/协议流程为主（`tunnel_basic.rs`、`api_auth.rs`、`stats_*.rs` 等）。
+- **单元测试**：位于各 crate 的 `src/` 内（`crates/{common,client,server}/src/`），源文件末尾 `#[cfg(test)] mod tests`（协议专属测试如 shadowsocks/trojan/http2/aliyun 均已合并回各自实现文件）。
+- **集成测试**：位于根元包 `tests/`，以黑盒 API/协议流程为主（`tunnel_basic.rs`、`api_auth.rs`、`stats_*.rs` 等）。
 
 ## CI/CD
 
