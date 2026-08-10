@@ -312,10 +312,7 @@ pub struct LlmState {
 impl LlmState {
     /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
     /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录（仅 `rag` feature 启用时可用）。
-    pub fn new(
-        db: Option<Database>,
-        cipher: Option<crate::llm::crypto::LlmCipher>,
-    ) -> Self {
+    pub fn new(db: Option<Database>, cipher: Option<crate::llm::crypto::LlmCipher>) -> Self {
         Self {
             db,
             gateway_config: Arc::new(RwLock::new(None)),

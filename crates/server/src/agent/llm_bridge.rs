@@ -194,9 +194,15 @@ mod tests {
     /// 构造带 DB 的 endpoint：API key 写入 DB（authenticate 走 hash 查询）。
     async fn test_gateway(db: &Database) -> LlmGatewayEndpoint {
         let (raw_key, key_hash, key_prefix) = generate_api_key();
-        db.llm_save_api_key("__acp_internal__", &key_hash, &key_prefix, "ACP Internal", None)
-            .await
-            .unwrap();
+        db.llm_save_api_key(
+            "__acp_internal__",
+            &key_hash,
+            &key_prefix,
+            "ACP Internal",
+            None,
+        )
+        .await
+        .unwrap();
         LlmGatewayEndpoint {
             llm_state: Arc::new(LlmState::new(Some(db.clone()), None)),
             api_key: raw_key,
@@ -205,9 +211,21 @@ mod tests {
 
     /// 造 session → workspace(llm_model_id) → model → provider 全链路。
     async fn seed_configured_session(db: &Database, session_id: &str, model_id: &str) {
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         db.agent_set_workspace_llm_model_id("w1", model_id)
             .await
             .unwrap();
@@ -229,9 +247,11 @@ mod tests {
         )
         .await
         .unwrap();
-        db.llm_save_model(model_id, "prov-1", "gpt-test", "gpt-test", "", enabled, None)
-            .await
-            .unwrap();
+        db.llm_save_model(
+            model_id, "prov-1", "gpt-test", "gpt-test", "", enabled, None,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -261,9 +281,21 @@ mod tests {
     #[tokio::test]
     async fn test_forward_workspace_without_model_id_returns_502_done() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/workspace", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("sess-1", "w1", None, None)
             .await
             .unwrap();
@@ -373,7 +405,11 @@ mod tests {
         let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
         let last = chunks.last().expect("at least one chunk");
         assert!(last.done, "must end with done=true");
-        assert!(last.status >= 400, "upstream failure → error status, got {}", last.status);
+        assert!(
+            last.status >= 400,
+            "upstream failure → error status, got {}",
+            last.status
+        );
     }
 
     #[tokio::test]

@@ -262,10 +262,7 @@ impl Database {
     }
 
     /// 按 id 取单个模型记录（llm_bridge 解析 workspace 的 llm_model_id 用）。
-    pub async fn llm_get_model(
-        &self,
-        id: &str,
-    ) -> Result<Option<LlmModelRecord>, sqlx::Error> {
+    pub async fn llm_get_model(&self, id: &str) -> Result<Option<LlmModelRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -606,7 +603,10 @@ impl Database {
     /// 删除早于 `before` 的用量日志，返回删除行数。
     /// 存储格式是 SQLite datetime（"YYYY-MM-DD HH:MM:SS"），必须转成同一格式
     /// 再做字符串比较，否则边界日当天（' ' < 'T'）的记录会被误删。
-    pub async fn cleanup_old_llm_usage_logs(&self, before: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    pub async fn cleanup_old_llm_usage_logs(
+        &self,
+        before: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
         let before = before.format("%Y-%m-%d %H:%M:%S").to_string();
         let result = sqlx::query("DELETE FROM llm_usage_logs WHERE timestamp < ?")
             .bind(before)

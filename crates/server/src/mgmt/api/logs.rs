@@ -464,8 +464,7 @@ mod tests {
 
         // 模拟重启：与 bin/server.rs 启动流程一致 —— load_or_seed 从 DB 回读
         let config = crate::config::ServerConfig::default();
-        let reloaded =
-            crate::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
+        let reloaded = crate::dynamic_config::DynamicConfig::load_or_seed(&db, &config).await;
         assert!(
             !reloaded.llm_request_logging,
             "restart must read back false from DB"

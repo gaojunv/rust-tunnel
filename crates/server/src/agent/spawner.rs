@@ -65,7 +65,9 @@ impl AgentSpawner {
             .await
             .map_err(|e| format!("llm proxy start failed: {e}"))?;
         match msg {
-            rust_tunnel_common::ControlMessage::AgentLlmProxyReady { port, .. } if port > 0 => Ok(port),
+            rust_tunnel_common::ControlMessage::AgentLlmProxyReady { port, .. } if port > 0 => {
+                Ok(port)
+            }
             rust_tunnel_common::ControlMessage::AgentLlmProxyReady { .. } => {
                 Err("llm proxy failed to bind".into())
             }
@@ -163,8 +165,8 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    use rust_tunnel_common::ControlMessage;
     use crate::db::Database;
+    use rust_tunnel_common::ControlMessage;
 
     #[test]
     fn test_agent_command_gemini() {
@@ -306,7 +308,15 @@ mod tests {
         .await;
         let spawner = AgentSpawner::new(registry);
         spawner
-            .spawn_agent("nas", "sess-1", "gemini", None, 45678, "/workspace", Duration::from_secs(2))
+            .spawn_agent(
+                "nas",
+                "sess-1",
+                "gemini",
+                None,
+                45678,
+                "/workspace",
+                Duration::from_secs(2),
+            )
             .await
             .expect("spawn should succeed");
     }
@@ -321,7 +331,15 @@ mod tests {
         .await;
         let spawner = AgentSpawner::new(registry);
         let err = spawner
-            .spawn_agent("nas", "sess-1", "gemini", None, 45678, "/workspace", Duration::from_secs(2))
+            .spawn_agent(
+                "nas",
+                "sess-1",
+                "gemini",
+                None,
+                45678,
+                "/workspace",
+                Duration::from_secs(2),
+            )
             .await
             .expect_err("client error should propagate");
         assert_eq!(err, "binary not found");
@@ -333,7 +351,15 @@ mod tests {
         let registry = ClientRegistry::new(db);
         let spawner = AgentSpawner::new(registry);
         let err = spawner
-            .spawn_agent("nas", "sess-1", "cursor", None, 45678, "/workspace", Duration::from_secs(1))
+            .spawn_agent(
+                "nas",
+                "sess-1",
+                "cursor",
+                None,
+                45678,
+                "/workspace",
+                Duration::from_secs(1),
+            )
             .await
             .expect_err("unsupported agent type should error locally");
         assert!(err.contains("unsupported agent type"), "err: {err}");

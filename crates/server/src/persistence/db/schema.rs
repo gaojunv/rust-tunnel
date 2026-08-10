@@ -769,11 +769,9 @@ impl Database {
     /// agent_workspaces 补全 ACP 引擎选项覆盖列（JSON map：config_id → value，
     /// 会话建立后经 set_config_option 注入 agent）。幂等：列已存在时跳过。
     async fn migrate_agent_workspaces_v4(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-        match sqlx::query(
-            "ALTER TABLE agent_workspaces ADD COLUMN agent_config_overrides TEXT",
-        )
-        .execute(pool)
-        .await
+        match sqlx::query("ALTER TABLE agent_workspaces ADD COLUMN agent_config_overrides TEXT")
+            .execute(pool)
+            .await
         {
             Ok(_) => {}
             Err(e) => {
@@ -973,9 +971,7 @@ mod tests {
     /// （证明列存在且约束正确：agent_type NOT NULL 默认空串、后两列可空）。
     #[tokio::test]
     async fn test_migrate_agent_workspaces_v3() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         super::Database::initialize_schema(&pool).await.unwrap();
 
         sqlx::query(
@@ -1004,9 +1000,7 @@ mod tests {
     /// 未显式提供 agent_type 时走列默认空串，INSERT 仍应成功（NOT NULL 约束满足）。
     #[tokio::test]
     async fn test_agent_workspaces_default_agent_type() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
-            .await
-            .unwrap();
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         super::Database::initialize_schema(&pool).await.unwrap();
 
         sqlx::query(

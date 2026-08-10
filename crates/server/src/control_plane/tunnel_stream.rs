@@ -22,8 +22,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use rust_tunnel_common::ControlMessage;
 use crate::stats::{EntityType, StatsCollector};
+use rust_tunnel_common::ControlMessage;
 
 /// Max payload of a single `Data` message. Chosen well under the 1 MiB
 /// serialize cap in `common::protocol` so header/framing overhead fits

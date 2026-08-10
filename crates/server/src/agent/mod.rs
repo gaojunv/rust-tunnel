@@ -160,10 +160,7 @@ impl AgentState {
     /// 配置后（默认生产路径）provider API Key 落库加密，agent LLM 代理请求必须
     /// 在服务端解密后才能调上游——缺注会全部 502。
     #[must_use]
-    pub fn with_acp_cipher(
-        mut self,
-        cipher: Option<crate::llm::crypto::LlmCipher>,
-    ) -> Self {
+    pub fn with_acp_cipher(mut self, cipher: Option<crate::llm::crypto::LlmCipher>) -> Self {
         if let Some(bridge) = self.acp_bridge.take() {
             self.acp_bridge = Some(bridge.with_cipher(cipher));
         }

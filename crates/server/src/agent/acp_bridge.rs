@@ -17,13 +17,13 @@
 //! duplex 本身就是缓冲区：handshake 期间进程早产 stdout 会缓冲在 duplex/通道
 //! 里（不会丢），ACP 连接建立后随即消费。
 
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
@@ -39,10 +39,10 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client, ConnectionTo};
 
-use rust_tunnel_common::ControlMessage;
 use crate::db::Database;
 use crate::llm::crypto::LlmCipher;
 use crate::persistence::db::agent::AgentWorkspaceRecord;
+use rust_tunnel_common::ControlMessage;
 
 use super::acp_events::map_update;
 use super::llm_bridge::{self, LlmGatewayEndpoint};
@@ -151,9 +151,7 @@ impl AcpBridge {
             spawner,
             db,
             cipher: None,
-            approval: Arc::new(|_, _, _, _, _, _| {
-                Box::pin(async { ApprovalResult::Denied })
-            }),
+            approval: Arc::new(|_, _, _, _, _, _| Box::pin(async { ApprovalResult::Denied })),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
         };
@@ -989,7 +987,10 @@ impl AcpBridge {
         };
         let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw)
         else {
-            tracing::warn!(session_id, "agent_config_overrides not a JSON object, skipped");
+            tracing::warn!(
+                session_id,
+                "agent_config_overrides not a JSON object, skipped"
+            );
             return;
         };
         let mut entries: Vec<(String, String)> = map
@@ -1198,7 +1199,11 @@ impl AcpBridge {
     /// prompt/cancel/reaper 对会话表的访问。
     async fn handle_spawn_data(&self, session_id: &str, data: Vec<u8>, stdin: bool) {
         if stdin {
-            tracing::trace!(session_id, len = data.len(), "acp spawn data stdin=true ignored");
+            tracing::trace!(
+                session_id,
+                len = data.len(),
+                "acp spawn data stdin=true ignored"
+            );
             return;
         }
         let stdout_tx = {
@@ -1214,7 +1219,11 @@ impl AcpBridge {
         };
         match stdout_tx {
             Some(tx) => {
-                tracing::trace!(session_id, len = data.len(), "acp spawn data routed to pump");
+                tracing::trace!(
+                    session_id,
+                    len = data.len(),
+                    "acp spawn data routed to pump"
+                );
                 if tx.send(data).await.is_err() {
                     tracing::debug!(session_id, "spawn data: pump closed, dropped");
                 }
@@ -1281,7 +1290,8 @@ impl AcpBridge {
         };
         let db = self.db.clone();
         tokio::spawn(async move {
-            let stream = llm_bridge::forward(db, session_id, request_id.clone(), gateway, path, body);
+            let stream =
+                llm_bridge::forward(db, session_id, request_id.clone(), gateway, path, body);
             futures_util::pin_mut!(stream);
             while let Some(chunk) = stream.next().await {
                 let msg = ControlMessage::AgentLlmProxyChunk {
@@ -1320,10 +1330,7 @@ async fn current_ws_tx(
 /// false 放弃本帧（落库与推送都依赖会话条目，回收后两者都无意义）。
 /// 断线期间不依赖 WS 通道存活即落库，是「断线期间后台跑完的回合同样可
 /// 追溯」的前提（评审修复：persist 移出 ws_tx guard 之前）。
-async fn touch_activity(
-    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
-    sid: &str,
-) -> bool {
+async fn touch_activity(sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>, sid: &str) -> bool {
     let mut map = sessions.lock().await;
     match map.get_mut(sid) {
         Some(a) => {
@@ -1407,7 +1414,14 @@ async fn persist_acp_frame(
             let entries = frame["entries"].to_string();
             if let Err(e) = db
                 .agent_add_message_v2(
-                    &msg_id, sid, "assistant", &entries, None, None, Some("plan"), "message",
+                    &msg_id,
+                    sid,
+                    "assistant",
+                    &entries,
+                    None,
+                    None,
+                    Some("plan"),
+                    "message",
                 )
                 .await
             {
@@ -1437,7 +1451,10 @@ async fn flush_acp_turn_buffers(
         let Some(a) = map.get_mut(sid) else {
             return;
         };
-        (std::mem::take(&mut a.text_buf), std::mem::take(&mut a.thought_buf))
+        (
+            std::mem::take(&mut a.text_buf),
+            std::mem::take(&mut a.thought_buf),
+        )
     };
     for (name, content) in [(None, text), (Some("thought"), thought)] {
         if content.is_empty() {
@@ -1446,7 +1463,14 @@ async fn flush_acp_turn_buffers(
         let msg_id = format!("{:032x}", rand::random::<u128>());
         if let Err(e) = db
             .agent_add_message_v2(
-                &msg_id, sid, "assistant", &content, None, None, name, "message",
+                &msg_id,
+                sid,
+                "assistant",
+                &content,
+                None,
+                None,
+                name,
+                "message",
             )
             .await
         {
@@ -1774,10 +1798,7 @@ mod tests {
     /// 装配 mock agent（duplex → pump → mock_acp_agent）并完成 ACP handshake。
     /// `ws_tx` 注册为会话条目的初始事件通道；连接任务的通知处理器此后每次事件
     /// 从条目动态解析通道（见 `current_ws_tx`）。
-    async fn setup_handshake(
-        bridge: &AcpBridge,
-        ws_tx: mpsc::Sender<serde_json::Value>,
-    ) {
+    async fn setup_handshake(bridge: &AcpBridge, ws_tx: mpsc::Sender<serde_json::Value>) {
         setup_handshake_with(
             bridge,
             ws_tx,
@@ -1804,11 +1825,7 @@ mod tests {
         agent.agent_io = Some(agent_io);
         agent.stdout_tx = Some(stdout_tx.clone());
         agent.ws_tx = Some(ws_tx.clone());
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), agent);
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
 
         tokio::spawn(run_stdio_pump(
             pump_io,
@@ -1816,7 +1833,12 @@ mod tests {
             control_tx,
             "sess-1".into(),
         ));
-        tokio::spawn(mock_acp_agent(control_rx, stdout_tx, config_options, applied));
+        tokio::spawn(mock_acp_agent(
+            control_rx,
+            stdout_tx,
+            config_options,
+            applied,
+        ));
 
         bridge
             .acp_handshake("sess-1", "/mock")
@@ -1865,7 +1887,10 @@ mod tests {
 
     #[test]
     fn test_to_workspace_relative() {
-        assert_eq!(to_workspace_relative("/ws", "/ws/a/b.txt").unwrap(), "a/b.txt");
+        assert_eq!(
+            to_workspace_relative("/ws", "/ws/a/b.txt").unwrap(),
+            "a/b.txt"
+        );
         assert_eq!(to_workspace_relative("/ws", "/ws/a.txt").unwrap(), "a.txt");
         // 工作区外 / 非绝对 / 根目录自身 → Err
         assert!(to_workspace_relative("/ws", "/etc/passwd").is_err());
@@ -1879,7 +1904,11 @@ mod tests {
     /// 应答 AgentExecRequest 返回固定结果）、活跃会话条目（client_id=nas）。
     async fn fs_test_env(
         exec_result: rust_tunnel_common::AgentResult,
-    ) -> (Database, AgentSpawner, Arc<Mutex<HashMap<String, SpawnedAgent>>>) {
+    ) -> (
+        Database,
+        AgentSpawner,
+        Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    ) {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
@@ -2005,11 +2034,7 @@ mod tests {
         assert!(bridge.session_spawned("sess-1").await);
         let mut exited = spawned_agent();
         exited.exited = true;
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), exited);
+        bridge.sessions.lock().await.insert("sess-1".into(), exited);
         assert!(!bridge.session_spawned("sess-1").await);
     }
 
@@ -2020,7 +2045,16 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
             None,
         )
         .await
@@ -2132,11 +2166,7 @@ mod tests {
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
         let mut exited = spawned_agent();
         exited.exited = true;
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), exited);
+        bridge.sessions.lock().await.insert("sess-1".into(), exited);
         let mut ws = acp_workspace();
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
@@ -2171,11 +2201,7 @@ mod tests {
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
         let mut exited = spawned_agent();
         exited.exited = true;
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), exited);
+        bridge.sessions.lock().await.insert("sess-1".into(), exited);
         let err = bridge
             .prompt("sess-1", "hi")
             .await
@@ -2273,7 +2299,12 @@ mod tests {
         let (mut agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, _control_rx) = mpsc::channel::<ControlMessage>(16);
-        tokio::spawn(run_stdio_pump(pump_io, stdout_rx, control_tx, "sess-1".into()));
+        tokio::spawn(run_stdio_pump(
+            pump_io,
+            stdout_rx,
+            control_tx,
+            "sess-1".into(),
+        ));
 
         stdout_tx.send(b"hello".to_vec()).await.unwrap();
         let mut buf = [0u8; 16];
@@ -2290,7 +2321,12 @@ mod tests {
         let (mut agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (_stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, mut control_rx) = mpsc::channel::<ControlMessage>(16);
-        tokio::spawn(run_stdio_pump(pump_io, stdout_rx, control_tx, "sess-1".into()));
+        tokio::spawn(run_stdio_pump(
+            pump_io,
+            stdout_rx,
+            control_tx,
+            "sess-1".into(),
+        ));
 
         agent_io.write_all(b"world").await.unwrap();
         let msg = tokio::time::timeout(std::time::Duration::from_secs(2), control_rx.recv())
@@ -2316,7 +2352,12 @@ mod tests {
         let (mut agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(16);
         let (control_tx, _control_rx) = mpsc::channel::<ControlMessage>(16);
-        let task = tokio::spawn(run_stdio_pump(pump_io, stdout_rx, control_tx, "sess-1".into()));
+        let task = tokio::spawn(run_stdio_pump(
+            pump_io,
+            stdout_rx,
+            control_tx,
+            "sess-1".into(),
+        ));
         // 先投递一条残余字节再 drop 发送端：pump 应转发后再退出（不丢数据）
         stdout_tx.send(b"tail".to_vec()).await.unwrap();
         drop(stdout_tx);
@@ -2342,11 +2383,7 @@ mod tests {
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
         let mut agent = spawned_agent();
         agent.busy = true;
-        bridge
-            .sessions
-            .lock()
-            .await
-            .insert("sess-1".into(), agent);
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
         let err = bridge
             .prompt("sess-1", "hi")
             .await
@@ -2413,7 +2450,10 @@ mod tests {
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
-            let ControlMessage::AgentSpawnData { data, stdin: true, .. } = msg else {
+            let ControlMessage::AgentSpawnData {
+                data, stdin: true, ..
+            } = msg
+            else {
                 continue;
             };
             buf.push_str(&String::from_utf8_lossy(&data));
@@ -2542,10 +2582,7 @@ mod tests {
             let s = bridge.sessions.lock().await;
             let agent = s.get("sess-1").unwrap();
             assert!(agent.connection.is_some(), "connection should be stored");
-            assert_eq!(
-                agent.acp_session_id.as_ref().unwrap().0.as_ref(),
-                "acp-1"
-            );
+            assert_eq!(agent.acp_session_id.as_ref().unwrap().0.as_ref(), "acp-1");
         }
 
         // prompt：异步回合，事件流经 ws_tx
@@ -2569,7 +2606,10 @@ mod tests {
         assert_eq!(events[1]["type"], "tool_call");
         assert_eq!(events[1]["name"], "shell");
         assert_eq!(events[2]["type"], "tool_result");
-        assert_eq!(events[2]["name"], "shell", "name should be cached from ToolCall");
+        assert_eq!(
+            events[2]["name"], "shell",
+            "name should be cached from ToolCall"
+        );
         assert_eq!(events[2]["result"], "a.rs");
         assert_eq!(events[3]["type"], "assistant_chunk");
         assert_eq!(events[3]["thought"], true);
@@ -2632,8 +2672,8 @@ mod tests {
         // 旧连接 A 不应收到任何帧（handshake 后捕获的旧 sender 已不再被使用）。
         // 注意：swap 后 A 通道所有 sender 都已 drop，recv 会以 Ok(None)（通道关闭）
         // 或 Err（超时）返回——两者都表示"没有帧"，只有 Ok(Some(..)) 才是泄漏。
-        let stale = tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv())
-            .await;
+        let stale =
+            tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv()).await;
         assert!(
             !matches!(stale, Ok(Some(_))),
             "old channel should receive nothing after reconnect: {stale:?}"
@@ -2690,8 +2730,8 @@ mod tests {
                 .expect("ws channel closed");
             assert_eq!(ev["type"], expected, "event: {ev}");
         }
-        let terminal = tokio::time::timeout(std::time::Duration::from_millis(300), ws_rx.recv())
-            .await;
+        let terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(300), ws_rx.recv()).await;
         assert!(
             terminal.is_err(),
             "cancelled turn must not emit a terminal frame"
@@ -2770,7 +2810,16 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
             None,
         )
         .await
@@ -2847,7 +2896,16 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini", None, None,
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
             None,
         )
         .await
@@ -2901,13 +2959,23 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/workspace", None, None, "claude-code",
-            None, Some("model-1"),
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "claude-code",
+            None,
+            Some("model-1"),
             Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
         )
         .await
         .unwrap();
-        db.agent_create_session("sess-1", "w1", None, None).await.unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
         // session 级 config_state：用户显式把 model 改为 opus —— 必须覆盖 workspace 注入
         db.agent_update_session_config_state("sess-1", "model", Some("opus"))
             .await
@@ -2915,7 +2983,10 @@ mod tests {
 
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
         let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-        registry.register("nas", None, None, "secret", tx).await.unwrap();
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
 
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -2933,7 +3004,10 @@ mod tests {
         // workspace 注入：fast → haiku；model 先被 workspace 设为 sonnet，随后
         // config_state 回放覆盖为 opus；nonexistent 不在快照中 → 跳过
         bridge
-            .apply_config_overrides("sess-1", &db.agent_get_workspace("w1").await.unwrap().unwrap())
+            .apply_config_overrides(
+                "sess-1",
+                &db.agent_get_workspace("w1").await.unwrap().unwrap(),
+            )
             .await;
         bridge.replay_config_state("sess-1").await;
 

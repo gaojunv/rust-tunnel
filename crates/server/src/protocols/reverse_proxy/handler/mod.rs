@@ -864,7 +864,6 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use rust_tunnel_common::ControlMessage;
         use crate::client_registry::{ClientRegistry, TunnelOpenOutcome};
         use crate::db::Database;
         use crate::reverse_proxy::connector::ClientConnector;
@@ -874,6 +873,7 @@ mod tests {
             Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
             RuleType,
         };
+        use rust_tunnel_common::ControlMessage;
 
         const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 

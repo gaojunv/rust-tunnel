@@ -258,7 +258,10 @@ impl Database {
     /// 原子 CAS：仅当文档处于 ready/failed（空闲态）时置回 pending 并清零 chunk_count。
     /// 返回 true = 抢占成功；false = 正在 pending/processing（在途），调用方应拒绝重索引。
     /// 解决 reindex 端点 check-then-act 竞态：两个并发请求只有一个能抢到。
-    pub async fn rag_mark_document_pending_if_idle(&self, doc_id: &str) -> Result<bool, sqlx::Error> {
+    pub async fn rag_mark_document_pending_if_idle(
+        &self,
+        doc_id: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE rag_documents

@@ -281,10 +281,7 @@ async fn llm_aware_proxy_dispatch(
 async fn match_llm_gateway(
     proxy_state: &Arc<ReverseProxyState>,
     host: &str,
-) -> Option<(
-    Arc<crate::llm::LlmState>,
-    crate::llm::LlmProtocol,
-)> {
+) -> Option<(Arc<crate::llm::LlmState>, crate::llm::LlmProtocol)> {
     let llm_guard = proxy_state.llm_state.read().await;
     let llm = llm_guard.as_ref()?;
     let cfg = llm.gateway_config.read().await;

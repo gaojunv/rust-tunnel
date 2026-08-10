@@ -260,7 +260,10 @@ impl Database {
             .unwrap_or_default();
         match value {
             Some(v) => {
-                map.insert(config_id.to_string(), serde_json::Value::String(v.to_string()));
+                map.insert(
+                    config_id.to_string(),
+                    serde_json::Value::String(v.to_string()),
+                );
             }
             None => {
                 map.remove(config_id);
@@ -477,9 +480,19 @@ mod tests {
 
         assert_eq!(db.agent_list_workspaces().await.unwrap().len(), 2);
 
-        db.agent_update_workspace("w1", "renamed", "/new/path", None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.agent_update_workspace(
+            "w1",
+            "renamed",
+            "/new/path",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.name, "renamed");
         assert_eq!(ws.root_path, "/new/path");
@@ -543,9 +556,19 @@ mod tests {
         assert_eq!(ws.llm_model_id.as_deref(), Some("m2"));
 
         // COALESCE：None 保持原值
-        db.agent_update_workspace("w1", "acp-proj", "/workspace", None, None, None, None, None, None)
-            .await
-            .unwrap();
+        db.agent_update_workspace(
+            "w1",
+            "acp-proj",
+            "/workspace",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_type, "claude");
         assert_eq!(ws.agent_path.as_deref(), Some("/opt/acp-claude"));
@@ -574,9 +597,11 @@ mod tests {
     #[tokio::test]
     async fn test_session_crud_and_archive() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", Some("fix bug"), Some("gpt-4o"))
             .await
             .unwrap();
@@ -609,9 +634,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
             .await
             .unwrap();
@@ -632,9 +659,11 @@ mod tests {
     #[tokio::test]
     async fn test_message_append_and_list() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -682,9 +711,11 @@ mod tests {
     #[tokio::test]
     async fn test_message_list_orders_by_rowid_not_created_at() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -720,9 +751,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_tool_call_args() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -732,7 +765,14 @@ mod tests {
             {"id": "c2", "name": "Read", "arguments": "{\"path\":\"a.rs\"}", "tool_kind": "read"},
         ]);
         db.agent_add_message_v2(
-            "m1", "s1", "assistant", "", Some(&calls.to_string()), Some("c1"), Some("Terminal"), "tool_calls",
+            "m1",
+            "s1",
+            "assistant",
+            "",
+            Some(&calls.to_string()),
+            Some("c1"),
+            Some("Terminal"),
+            "tool_calls",
         )
         .await
         .unwrap();
@@ -763,9 +803,11 @@ mod tests {
     #[tokio::test]
     async fn test_delete_workspace_cascades() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -781,9 +823,11 @@ mod tests {
     #[tokio::test]
     async fn test_message_v2_columns_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -835,9 +879,11 @@ mod tests {
     #[tokio::test]
     async fn test_config_state_upsert_and_clear() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -887,8 +933,17 @@ mod tests {
     async fn test_workspace_config_overrides_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "acp-proj", "nas", "host", "/workspace", None, None,
-            "claude-code", None, None, None,
+            "w1",
+            "acp-proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "claude-code",
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -899,7 +954,14 @@ mod tests {
 
         // 写入配置
         db.agent_update_workspace(
-            "w1", "acp-proj", "/workspace", None, None, None, None, None,
+            "w1",
+            "acp-proj",
+            "/workspace",
+            None,
+            None,
+            None,
+            None,
+            None,
             Some(r#"{"model":"sonnet","fast":"haiku"}"#),
         )
         .await
@@ -912,7 +974,15 @@ mod tests {
 
         // COALESCE：None 保持原值
         db.agent_update_workspace(
-            "w1", "acp-proj", "/workspace", None, None, None, None, None, None,
+            "w1",
+            "acp-proj",
+            "/workspace",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -925,7 +995,15 @@ mod tests {
         // 显式 Some("") 写入空串由 API 层拦截（归一化 None）；DB 层原样写入 "{}"
         // 表示清空——这里验证 DB 层忠实存储传入值
         db.agent_update_workspace(
-            "w1", "acp-proj", "/workspace", None, None, None, None, None, Some("{}"),
+            "w1",
+            "acp-proj",
+            "/workspace",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("{}"),
         )
         .await
         .unwrap();

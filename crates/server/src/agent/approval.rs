@@ -26,7 +26,8 @@ fn is_force_push(cmd_lower: &str) -> bool {
     // 合并短选项（-uf/-fu 等以 "-" 开头、非 "--"、长度>2 且含 'f'）一律视为 force。
     // 保守方向可接受：普通 -u 长度为 2 被排除，git pushup -f 仍被上方 git+push 门槛挡下。
     let force_flag = |t: &str| {
-        matches!(t, "--force" | "-f") || t.starts_with("--force-with-lease")
+        matches!(t, "--force" | "-f")
+            || t.starts_with("--force-with-lease")
             || (t.starts_with('-') && !t.starts_with("--") && t.len() > 2 && t.contains('f'))
     };
     has_git && has_push && tokens.iter().any(|&t| force_flag(t))
@@ -210,7 +211,10 @@ mod tests {
         // 核心回归：shell 形态 git push（非 force）同样需确认——与 GitPush 工具同等对待，
         // 否则模型可用 shell 绕过审批矩阵
         assert!(needs_approval("auto_write", &shell("git push origin main")));
-        assert!(needs_approval("auto_write", &shell("git push -u origin main")));
+        assert!(needs_approval(
+            "auto_write",
+            &shell("git push -u origin main")
+        ));
         // 非 push 形态不误伤
         assert!(!needs_approval("auto_write", &shell("git pushup origin")));
         assert!(!needs_approval("auto_write", &shell("git-push origin")));
@@ -234,7 +238,7 @@ mod tests {
         // shell 形态 push 视为危险（与 GitPush 工具同等对待）
         assert!(is_dangerous_shell("git push origin main"));
         assert!(!is_dangerous_shell("npm run rebuild")); // 含 "rebuild" 不含 "reboot"
-        // 非 push 不误伤
+                                                         // 非 push 不误伤
         assert!(!is_dangerous_shell("git pushup origin"));
         assert!(!is_dangerous_shell("git-push origin"));
     }
@@ -335,7 +339,9 @@ mod tests {
         );
         let req_id = frame["request_id"].as_str().unwrap().to_string();
         // 模拟 WS 收到批准响应
-        state.resolve_approval("s1", &req_id, true, None, false).await;
+        state
+            .resolve_approval("s1", &req_id, true, None, false)
+            .await;
         assert!(handle.await.unwrap().approved());
     }
 
@@ -350,7 +356,9 @@ mod tests {
         });
         let frame = rx.recv().await.unwrap();
         let req_id = frame["request_id"].as_str().unwrap().to_string();
-        state.resolve_approval("s1", &req_id, false, None, false).await;
+        state
+            .resolve_approval("s1", &req_id, false, None, false)
+            .await;
         assert!(!handle.await.unwrap().approved());
     }
 
@@ -367,7 +375,9 @@ mod tests {
         });
         let frame = rx.recv().await.unwrap();
         let req_id = frame["request_id"].as_str().unwrap().to_string();
-        state.resolve_approval("s1", &req_id, true, None, true).await;
+        state
+            .resolve_approval("s1", &req_id, true, None, true)
+            .await;
         assert!(handle.await.unwrap().approved());
         assert!(state.is_allowed_for_session("s1", "shell").await);
     }
@@ -379,9 +389,21 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let st = state.clone();
         let options = vec![
-            ApprovalOption { id: "opt_allow_once".into(), label: "允许一次".into(), kind: "allow_once".into() },
-            ApprovalOption { id: "opt_allow_always".into(), label: "总是允许".into(), kind: "allow_always".into() },
-            ApprovalOption { id: "opt_reject".into(), label: "拒绝".into(), kind: "reject_once".into() },
+            ApprovalOption {
+                id: "opt_allow_once".into(),
+                label: "允许一次".into(),
+                kind: "allow_once".into(),
+            },
+            ApprovalOption {
+                id: "opt_allow_always".into(),
+                label: "总是允许".into(),
+                kind: "allow_always".into(),
+            },
+            ApprovalOption {
+                id: "opt_reject".into(),
+                label: "拒绝".into(),
+                kind: "reject_once".into(),
+            },
         ];
         let handle = tokio::spawn(async move {
             st.request_approval("s1", "shell", "npm install", "{}", &options, &tx)
@@ -418,7 +440,11 @@ mod tests {
         let state = test_state().await;
         let (tx, mut rx) = mpsc::channel(8);
         let st = state.clone();
-        let options = vec![ApprovalOption { id: "allow_always".into(), label: "总是允许".into(), kind: "allow_always".into() }];
+        let options = vec![ApprovalOption {
+            id: "allow_always".into(),
+            label: "总是允许".into(),
+            kind: "allow_always".into(),
+        }];
         let handle = tokio::spawn(async move {
             st.request_approval("s1", "shell", "npm install", "{}", &options, &tx)
                 .await
@@ -493,7 +519,11 @@ mod tests {
             .await
             .expect("request_approval must return promptly when send fails")
             .expect("task panicked");
-        assert_eq!(result, ApprovalResult::Denied, "send failure should be deny");
+        assert_eq!(
+            result,
+            ApprovalResult::Denied,
+            "send failure should be deny"
+        );
         // pending 条目已清理，无泄漏
         assert_eq!(state.pending_approvals_count().await, 0);
     }

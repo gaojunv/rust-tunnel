@@ -11,8 +11,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, warn};
 
-use rust_tunnel_common::ControlMessage;
 use crate::db::Database;
+use rust_tunnel_common::ControlMessage;
 
 pub type ControlSender = mpsc::Sender<ControlMessage>;
 
@@ -357,7 +357,10 @@ impl ClientRegistry {
             Ok(Err(_)) => {
                 // rx 被 drop（调用方取消/断连）：清理 pending 防泄漏，结果不可达。
                 entry.agent_pending.lock().await.remove(&request_id);
-                Err(Error::new(ErrorKind::BrokenPipe, "response channel dropped"))
+                Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "response channel dropped",
+                ))
             }
             Err(_) => {
                 entry.agent_pending.lock().await.remove(&request_id);
@@ -713,7 +716,9 @@ mod tests {
             let msg = rx.recv().await.unwrap();
             match msg {
                 ControlMessage::AgentSpawnRequest {
-                    session_id, command, ..
+                    session_id,
+                    command,
+                    ..
                 } => {
                     assert_eq!(session_id, "sess-1");
                     assert_eq!(command, "gemini");
@@ -750,10 +755,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             resp,
-            ControlMessage::AgentSpawnResponse {
-                success: true,
-                ..
-            }
+            ControlMessage::AgentSpawnResponse { success: true, .. }
         ));
     }
 

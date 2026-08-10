@@ -432,7 +432,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", true).await;
         assert_eq!(
-            resolve_workspace_model_ref(&db, Some("model:m1")).await.unwrap(),
+            resolve_workspace_model_ref(&db, Some("model:m1"))
+                .await
+                .unwrap(),
             Some("deepseek-chat".to_string())
         );
     }
@@ -441,12 +443,16 @@ mod tests {
     async fn test_workspace_ref_group_prefix() {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "model-a", true).await;
-        db.llm_create_model_group("g1", "router", true).await.unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
         db.llm_replace_group_members("g1", &[("m1".into(), 1)])
             .await
             .unwrap();
         assert_eq!(
-            resolve_workspace_model_ref(&db, Some("group:g1")).await.unwrap(),
+            resolve_workspace_model_ref(&db, Some("group:g1"))
+                .await
+                .unwrap(),
             Some("router".to_string())
         );
     }
@@ -457,7 +463,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "model-1", "gpt-legacy", true).await;
         assert_eq!(
-            resolve_workspace_model_ref(&db, Some("model-1")).await.unwrap(),
+            resolve_workspace_model_ref(&db, Some("model-1"))
+                .await
+                .unwrap(),
             Some("gpt-legacy".to_string())
         );
     }
@@ -467,7 +475,9 @@ mod tests {
         // 历史裸值未命中 llm_models.id（可能是 alias/model_name/组名）→ 原样直通
         let db = Database::new(":memory:").await.unwrap();
         assert_eq!(
-            resolve_workspace_model_ref(&db, Some("deepseek-chat")).await.unwrap(),
+            resolve_workspace_model_ref(&db, Some("deepseek-chat"))
+                .await
+                .unwrap(),
             Some("deepseek-chat".to_string())
         );
     }
@@ -486,7 +496,9 @@ mod tests {
     async fn test_workspace_ref_group_disabled_errors() {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "model-a", true).await;
-        db.llm_create_model_group("g1", "router", false).await.unwrap();
+        db.llm_create_model_group("g1", "router", false)
+            .await
+            .unwrap();
         db.llm_replace_group_members("g1", &[("m1".into(), 1)])
             .await
             .unwrap();
@@ -508,11 +520,15 @@ mod tests {
     // ── resolve_effective_model 优先级 ──────────────────────────
 
     async fn seed_ws(db: &Database, ws_id: &str, llm_model_id: Option<&str>) {
-        db.agent_create_workspace(ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         if let Some(mid) = llm_model_id {
-            db.agent_set_workspace_llm_model_id(ws_id, mid).await.unwrap();
+            db.agent_set_workspace_llm_model_id(ws_id, mid)
+                .await
+                .unwrap();
         }
     }
 
@@ -521,7 +537,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "ws-model", true).await;
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
 
         let name = resolve_effective_model(&db, None, "s1").await.unwrap();
         assert_eq!(name, "gpt-4o", "session 模型应优先于 workspace");
@@ -532,7 +550,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", true).await;
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         let name = resolve_effective_model(&db, None, "s1").await.unwrap();
         assert_eq!(name, "deepseek-chat");
@@ -542,8 +562,12 @@ mod tests {
     async fn test_effective_model_global_default_fallback() {
         let db = Database::new(":memory:").await.unwrap();
         seed_ws(&db, "w1", None).await;
-        db.save_server_setting(DEFAULT_MODEL_KEY, "claude-opus-5").await.unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.save_server_setting(DEFAULT_MODEL_KEY, "claude-opus-5")
+            .await
+            .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         let name = resolve_effective_model(&db, None, "s1").await.unwrap();
         assert_eq!(name, "claude-opus-5");
@@ -554,10 +578,14 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", true).await;
         seed_ws(&db, "w1", None).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         let state = crate::llm::LlmState::new(Some(db.clone()), None);
-        let name = resolve_effective_model(&db, Some(&state), "s1").await.unwrap();
+        let name = resolve_effective_model(&db, Some(&state), "s1")
+            .await
+            .unwrap();
         assert_eq!(name, "deepseek-chat", "无显式配置 → 第一个可用模型");
     }
 
@@ -565,7 +593,9 @@ mod tests {
     async fn test_effective_model_none_configured_errors() {
         let db = Database::new(":memory:").await.unwrap();
         seed_ws(&db, "w1", None).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         let err = resolve_effective_model(&db, None, "s1").await.unwrap_err();
         assert!(err.contains("no LLM model configured"), "err: {err}");
@@ -574,7 +604,9 @@ mod tests {
     #[tokio::test]
     async fn test_effective_model_session_not_found() {
         let db = Database::new(":memory:").await.unwrap();
-        let err = resolve_effective_model(&db, None, "ghost").await.unwrap_err();
+        let err = resolve_effective_model(&db, None, "ghost")
+            .await
+            .unwrap_err();
         assert!(err.contains("session not found"), "err: {err}");
     }
 
@@ -584,7 +616,9 @@ mod tests {
     async fn test_has_model_config_session_model() {
         let db = Database::new(":memory:").await.unwrap();
         seed_ws(&db, "w1", None).await;
-        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
         assert!(has_any_model_config(&db, "s1", None).await.unwrap());
     }
 
@@ -592,15 +626,21 @@ mod tests {
     async fn test_has_model_config_workspace_ref() {
         let db = Database::new(":memory:").await.unwrap();
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
-        assert!(has_any_model_config(&db, "s1", Some("model:m1")).await.unwrap());
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        assert!(has_any_model_config(&db, "s1", Some("model:m1"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn test_has_model_config_none() {
         let db = Database::new(":memory:").await.unwrap();
         seed_ws(&db, "w1", None).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         assert!(!has_any_model_config(&db, "s1", None).await.unwrap());
     }
 
@@ -611,9 +651,13 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", true).await;
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
-        let rt = SessionRuntime::load(&db, "s1", "default-model").await.unwrap();
+        let rt = SessionRuntime::load(&db, "s1", "default-model")
+            .await
+            .unwrap();
         assert_eq!(rt.model, "deepseek-chat");
     }
 
@@ -622,9 +666,13 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", true).await;
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, Some("gpt-4o")).await.unwrap();
+        db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
 
-        let rt = SessionRuntime::load(&db, "s1", "default-model").await.unwrap();
+        let rt = SessionRuntime::load(&db, "s1", "default-model")
+            .await
+            .unwrap();
         assert_eq!(rt.model, "gpt-4o");
     }
 
@@ -633,7 +681,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         save_named_model(&db, "m1", "deepseek-chat", false).await;
         seed_ws(&db, "w1", Some("model:m1")).await;
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         let err = match SessionRuntime::load(&db, "s1", "default-model").await {
             Err(e) => e,
@@ -645,9 +695,11 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_rebuilds_history() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
             .await
             .unwrap();
@@ -679,9 +731,11 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_skips_tool_rows() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -704,9 +758,11 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_model_fallback() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -744,9 +800,21 @@ mod tests {
         assert_eq!(rt.root_path, "/container/work");
 
         // docker 运行时但容器未启动（container_id 为空）
-        db.agent_create_workspace("w2", "p", "nas", "docker", "/x", Some("node:20"), None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w2",
+            "p",
+            "nas",
+            "docker",
+            "/x",
+            Some("node:20"),
+            None,
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s2", "w2", None, None)
             .await
             .unwrap();
@@ -764,9 +832,11 @@ mod tests {
     #[tokio::test]
     async fn test_load_replays_new_format_tool_structure() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -816,9 +886,11 @@ mod tests {
     #[tokio::test]
     async fn test_load_resumes_from_last_summary() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -862,9 +934,11 @@ mod tests {
         // 清洗后应为第 2 个补齐占位结果，序列合法（无 400）。
         // 取消链路（AgentExecCancel 停止回合）依赖 sanitize_tool_pairs 占位补齐。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -914,9 +988,11 @@ mod tests {
         // 压缩切割点落在 assistant tool_calls 行正后方：tool 结果保留但配对行被压掉。
         // 清洗后孤儿 tool 结果应被丢弃。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -962,9 +1038,11 @@ mod tests {
         // 迁移前遗留行：SQLite DEFAULT 把 kind 补成 'message'，role='tool' 的旧合并行
         // 必须被跳过（不能落入普通文本消息分支产生非法 OpenAI 序列）。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();

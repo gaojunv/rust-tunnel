@@ -138,9 +138,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_connector_full_path() {
-        use rust_tunnel_common::ControlMessage;
         use crate::client_registry::{ClientRegistry, TunnelOpenOutcome};
         use crate::db::Database;
+        use rust_tunnel_common::ControlMessage;
 
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("pw").await.unwrap();

@@ -53,19 +53,13 @@ pub fn protected_router() -> Router<ApiState> {
             "/api/llm/kb/:id",
             get(get_kb).put(update_kb).patch(patch_kb).delete(delete_kb),
         )
-        .route(
-            "/api/llm/kb/:id/docs",
-            get(list_docs).post(upload_doc),
-        )
+        .route("/api/llm/kb/:id/docs", get(list_docs).post(upload_doc))
         .layer(DefaultBodyLimit::max(MULTIPART_BODY_LIMIT))
         .route(
             "/api/llm/kb/:id/docs/:doc_id",
             get(get_doc).delete(delete_doc),
         )
-        .route(
-            "/api/llm/kb/:id/docs/:doc_id/reindex",
-            post(reindex_doc),
-        )
+        .route("/api/llm/kb/:id/docs/:doc_id/reindex", post(reindex_doc))
         .route("/api/llm/kb/test-embedding", post(test_embedding))
         .route("/api/llm/kb/:id/query", post(query_kb))
 }
@@ -771,7 +765,12 @@ pub async fn reindex_doc(
         tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, path = %source_path.display(), "rag reindex: source file missing");
         if let Err(e) = rt
             .db
-            .rag_update_document_status(&doc_id, "failed", 0, Some("original document missing; delete and re-upload it"))
+            .rag_update_document_status(
+                &doc_id,
+                "failed",
+                0,
+                Some("original document missing; delete and re-upload it"),
+            )
             .await
         {
             tracing::warn!(doc_id = %doc_id, error = %e, "rag reindex: rollback status failed");

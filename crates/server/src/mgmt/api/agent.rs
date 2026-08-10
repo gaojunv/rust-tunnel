@@ -380,11 +380,7 @@ async fn bridge_terminal(
 /// 且与运行时当前模型不同则覆盖。`session.model` 为 `None` 表示回退默认——保持
 /// `SessionRuntime::load` 的加载路径语义（此时 `rt.model` 已在 load/首轮解析为
 /// 默认或第一个可用模型），不据此覆盖，避免把已解析的模型改写为空串。
-async fn refresh_session_model(
-    db: &crate::db::Database,
-    session_id: &str,
-    rt_model: &mut String,
-) {
+async fn refresh_session_model(db: &crate::db::Database, session_id: &str, rt_model: &mut String) {
     let Ok(Some(session)) = db.agent_get_session(session_id).await else {
         return;
     };
@@ -399,7 +395,10 @@ async fn refresh_session_model(
 /// `WS` 客户端帧分类：`user_message` / `cancel` / `approval_response` / 其他（忽略）。
 enum WsFrame {
     /// 用户消息：content + 可选 @引用文件路径列表
-    UserMessage { content: String, refs: Vec<String> },
+    UserMessage {
+        content: String,
+        refs: Vec<String>,
+    },
     Cancel,
     /// 审批响应：`request_id`、是否批准、是否本会话记住该类工具；
     /// `option_id` 为 ACP options 透传路径（用户选中具体选项）时可缺省。
@@ -410,7 +409,10 @@ enum WsFrame {
         remember: bool,
     },
     /// ACP 会话配置切换（session/set_config_option 透传）
-    SetConfigOption { config_id: String, value: String },
+    SetConfigOption {
+        config_id: String,
+        value: String,
+    },
     Other,
 }
 
@@ -423,7 +425,10 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
     };
     match body.get("type").and_then(|t| t.as_str()) {
         Some("user_message") => {
-            let content = body.get("content").and_then(|c| c.as_str()).map(str::to_string);
+            let content = body
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
             let refs = body
                 .get("refs")
                 .and_then(|r| r.as_array())
@@ -591,11 +596,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             if !sink_alive {
                 continue;
             }
-            let send_result = tokio::time::timeout(
-                WS_SEND_TIMEOUT,
-                ws_sink.send(Message::Text(text)),
-            )
-            .await;
+            let send_result =
+                tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(text))).await;
             match send_result {
                 Ok(Ok(())) => {} // 发送成功
                 Ok(Err(_)) | Err(_) => {
@@ -679,9 +681,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         if let Some(agent) = state.server_state.agent_state.as_ref() {
                             if let Some(bridge) = agent.acp_bridge.as_ref() {
                                 bridge.cancel(&session_id).await;
-                                let _ = event_tx
-                                    .send(serde_json::json!({"type": "stopped"}))
-                                    .await;
+                                let _ = event_tx.send(serde_json::json!({"type": "stopped"})).await;
                             }
                         }
                     }
@@ -894,9 +894,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     };
                 // 模型为空 → 取 LLM 网关第一个可用模型
                 if loaded.model.is_empty() {
-                    if let Ok(models) =
-                        crate::llm::router::list_available_models(&llm).await
-                    {
+                    if let Ok(models) = crate::llm::router::list_available_models(&llm).await {
                         if let Some(first) = models.first() {
                             if let Some(name) = first.get("id").and_then(|v| v.as_str()) {
                                 loaded.model = name.to_string();
@@ -949,12 +947,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 此处先 clone workspace/client 标识备用（仅两个 String，代价可忽略）。
         let cancel_workspace_id = rt.workspace_id.clone();
         let cancel_client_id = rt.client_id.clone();
-        let turn = crate::agent::runner::run_agent_turn(
-            agent.clone(),
-            llm.clone(),
-            rt,
-            event_tx.clone(),
-        );
+        let turn =
+            crate::agent::runner::run_agent_turn(agent.clone(), llm.clone(), rt, event_tx.clone());
         // turn future 独占 rt 的可变借用：把 select 循环放进独立块，块结束时
         // turn 被 drop、借用随之结束——取消分支需置空 rt_cache，必须在块外赋值。
         let outcome = {
@@ -1096,7 +1090,11 @@ async fn send_cancel_to_client(
         tracing::debug!("client {} does not support cancel, skipping", client_id);
         return;
     }
-    if !agent.registry.send_agent_cancel(client_id, &request_id).await {
+    if !agent
+        .registry
+        .send_agent_cancel(client_id, &request_id)
+        .await
+    {
         tracing::debug!("send_agent_cancel failed for client {}", client_id);
     }
 }
@@ -1336,8 +1334,12 @@ pub async fn get_fs_tree(
     Query(params): Query<FsPathQuery>,
 ) -> impl IntoResponse {
     let path = params.path.unwrap_or_else(|| ".".to_string());
-    let result = match workspace_exec(&state, &id, rust_tunnel_common::AgentCommand::ListDir { path })
-        .await
+    let result = match workspace_exec(
+        &state,
+        &id,
+        rust_tunnel_common::AgentCommand::ListDir { path },
+    )
+    .await
     {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -1367,8 +1369,12 @@ pub async fn get_fs_file(
     let Some(path) = params.path.filter(|p| !p.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "path is required").into_response();
     };
-    let result = match workspace_exec(&state, &id, rust_tunnel_common::AgentCommand::ReadFile { path })
-        .await
+    let result = match workspace_exec(
+        &state,
+        &id,
+        rust_tunnel_common::AgentCommand::ReadFile { path },
+    )
+    .await
     {
         Ok(r) => r,
         Err(resp) => return resp,
@@ -1866,9 +1872,11 @@ mod tests {
         // 评审 Finding 3：session/workspace「不存在」是 Ok(None)（可回退 runner），
         // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -1879,7 +1887,10 @@ mod tests {
             .expect("workspace exists");
         assert_eq!(ws.id, "w1");
         // session 不存在 → Ok(None)，不 panic
-        assert!(load_workspace_for_session(&db, "ghost").await.unwrap().is_none());
+        assert!(load_workspace_for_session(&db, "ghost")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2040,9 +2051,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_acp_fields() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         let resp = update_workspace(
             State(state.clone()),
             Path("w1".to_string()),
@@ -2072,8 +2085,17 @@ mod tests {
         // 空串归一化为 None → 同样保持原值（本迭代不支持清空，见 brief）。
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "gemini", Some("/opt/gemini"),
-            Some("model-1"), None,
+            "w1",
+            "p",
+            "nas",
+            "host",
+            "/p",
+            None,
+            None,
+            "gemini",
+            Some("/opt/gemini"),
+            Some("model-1"),
+            None,
         )
         .await
         .unwrap();
@@ -2104,9 +2126,11 @@ mod tests {
     async fn test_update_workspace_clears_agent_type_to_builtin() {
         // agent_type 空串合法：从 ACP 引擎切回内置 runner（与 path/model 不同，可清空）。
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None,
+        )
+        .await
+        .unwrap();
         let resp = update_workspace(
             State(state),
             Path("w1".to_string()),
@@ -2198,7 +2222,16 @@ mod tests {
         // → 传非法 JSON 400（断言经读库验证）。
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None,
+            "w1",
+            "p",
+            "nas",
+            "host",
+            "/p",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
             Some(r#"{"mode":"plan"}"#),
         )
         .await
@@ -2279,9 +2312,11 @@ mod tests {
     #[tokio::test]
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
 
         let resp = create_session(
             State(state.clone()),
@@ -2310,9 +2345,11 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model_endpoint() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -2362,9 +2399,11 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_session_model_applies_patched_model() {
         let (_state, db) = test_state().await;
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
             .await
             .unwrap();
@@ -2398,7 +2437,10 @@ mod tests {
         let resp = list_workspace_files(
             State(state),
             Path("ghost".to_string()),
-            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+            Query(WorkspaceFilesQuery {
+                q: "main".into(),
+                limit: None,
+            }),
         )
         .await
         .into_response();
@@ -2408,15 +2450,20 @@ mod tests {
     #[tokio::test]
     async fn test_list_workspace_files_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
         // 立即返回 AgentResult::Error，handler 应回 503 供前端区分「离线」与「无匹配」。
         let resp = list_workspace_files(
             State(state),
             Path("w1".to_string()),
-            Query(WorkspaceFilesQuery { q: "main".into(), limit: None }),
+            Query(WorkspaceFilesQuery {
+                q: "main".into(),
+                limit: None,
+            }),
         )
         .await
         .into_response();
@@ -2464,9 +2511,11 @@ mod tests {
     #[tokio::test]
     async fn test_fs_endpoints_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         // 客户端离线：所有面板端点统一 503（前端据此显示「客户端离线」而非空态）。
         let resp = get_fs_tree(
             State(state.clone()),
@@ -2506,9 +2555,11 @@ mod tests {
     #[tokio::test]
     async fn test_fs_file_requires_path() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         let resp = get_fs_file(
             State(state),
             Path("w1".to_string()),
@@ -2522,9 +2573,11 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_safe_mode_needs_approval_409() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         // 默认 approval_mode = safe：WriteFile 需确认。未确认 → 409 needs_approval，
         // 且不会触碰隧道（客户端离线也不会 503）。
         let resp = put_fs_file(
@@ -2563,12 +2616,24 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_full_auto_skips_approval() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace("w1", "proj", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
-        db.agent_update_workspace("w1", "proj", "/p", None, Some("full_auto"), None, None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_update_workspace(
+            "w1",
+            "proj",
+            "/p",
+            None,
+            Some("full_auto"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         // full_auto：未确认也直接放行 → 客户端离线 503（而非 409）。
         let resp = put_fs_file(
             State(state),
@@ -2688,10 +2753,7 @@ mod tests {
         // auth 未启用 → 一律放行（与受保护路由中间件的语义一致）
         let disabled = AuthConfig::new(None, None);
         assert_eq!(terminal_ws_auth_status(&disabled, None), None);
-        assert_eq!(
-            terminal_ws_auth_status(&disabled, Some("anything")),
-            None
-        );
+        assert_eq!(terminal_ws_auth_status(&disabled, Some("anything")), None);
     }
 
     #[test]

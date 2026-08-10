@@ -495,10 +495,7 @@ mod tests {
 
         // 未指定时回落到默认端口
         let default_cfg = ClientConfig::default();
-        assert_eq!(
-            default_cfg.agent_pty_port,
-            crate::pty::DEFAULT_PTY_PORT
-        );
+        assert_eq!(default_cfg.agent_pty_port, crate::pty::DEFAULT_PTY_PORT);
     }
 
     #[test]

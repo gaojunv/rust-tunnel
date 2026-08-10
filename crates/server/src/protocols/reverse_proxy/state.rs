@@ -85,8 +85,7 @@ impl ReverseProxyState {
         &self,
         db: Option<Database>,
         master_key: Option<[u8; 32]>,
-        #[cfg_attr(not(feature = "rag"), allow(unused_variables))]
-        rag_data_dir: &Path,
+        #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &Path,
         dynamic_config: Arc<tokio::sync::RwLock<crate::dynamic_config::DynamicConfig>>,
     ) {
         let gateway_rule = {

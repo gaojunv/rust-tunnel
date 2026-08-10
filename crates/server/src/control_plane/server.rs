@@ -6,11 +6,11 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use crate::client_registry::TunnelOpenOutcome;
+use crate::ServerConfig;
 use rust_tunnel_common::{
     create_server_config, load_or_generate_cert, ControlMessage, TunnelError, TunnelResult,
 };
-use crate::client_registry::TunnelOpenOutcome;
-use crate::ServerConfig;
 
 use super::ServerState;
 

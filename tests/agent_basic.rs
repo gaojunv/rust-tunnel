@@ -319,9 +319,7 @@ impl ApprovalMockLlm {
                             Ok(0) | Err(_) => return,
                             Ok(n) => {
                                 buf.extend_from_slice(&chunk[..n]);
-                                if let Some(pos) =
-                                    buf.windows(4).position(|w| w == b"\r\n\r\n")
-                                {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                     break pos + 4;
                                 }
                             }
@@ -533,7 +531,9 @@ async fn run_turn_with_approval(
             break;
         }
     }
-    turn.await.expect("turn task panicked").expect("turn failed");
+    turn.await
+        .expect("turn task panicked")
+        .expect("turn failed");
     frames
 }
 
@@ -560,7 +560,10 @@ async fn agent_safe_mode_shell_requires_approval() {
             .find(|f| f["type"] == "tool_result")
             .expect("tool_result frame after approval");
         assert!(
-            tool_result["result"].as_str().unwrap().contains("approve-e2e-ok"),
+            tool_result["result"]
+                .as_str()
+                .unwrap()
+                .contains("approve-e2e-ok"),
             "shell should execute after approval, got: {tool_result}"
         );
 
@@ -586,8 +589,7 @@ async fn agent_denied_tool_result_recorded() {
             .find(|f| f["type"] == "tool_result")
             .expect("tool_result frame after denial");
         assert_eq!(
-            tool_result["result"],
-            "[denied by user]",
+            tool_result["result"], "[denied by user]",
             "denied tool must record the marker, got: {tool_result}"
         );
 
@@ -607,7 +609,10 @@ async fn agent_denied_tool_result_recorded() {
             .find(|m| m.kind == "tool_result" && m.content == "[denied by user]")
             .expect("denied tool_result row in DB");
         assert_eq!(denied.name.as_deref(), Some("shell"));
-        assert!(denied.tool_call_id.is_some(), "denied row keeps tool_call_id");
+        assert!(
+            denied.tool_call_id.is_some(),
+            "denied row keeps tool_call_id"
+        );
 
         // 拒绝后回合继续（第二轮文本收尾），未在客户端执行 shell。
         assert!(mock.hit_count() >= 2, "expected a second LLM round");
@@ -660,8 +665,7 @@ impl RetryMockLlm {
                             Ok(0) | Err(_) => return,
                             Ok(n) => {
                                 buf.extend_from_slice(&chunk[..n]);
-                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-                                {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                                     break pos + 4;
                                 }
                             }
@@ -695,7 +699,8 @@ impl RetryMockLlm {
                         // 连接才断——这样 agg 重置的正确性也被覆盖（半截残留会污染
                         // 最终落库文本，成功路径断言即失败）。
                         let payload_with_eol = format!("{payload}\n\n");
-                        let frame = format!("{:x}\r\n{}\r\n", payload_with_eol.len(), payload_with_eol);
+                        let frame =
+                            format!("{:x}\r\n{}\r\n", payload_with_eol.len(), payload_with_eol);
                         let _ = stream.write_all(frame.as_bytes()).await;
                         let _ = stream.flush().await;
                         return; // drop 连接，不写终止 chunk
@@ -847,8 +852,8 @@ async fn agent_stream_retry_succeeds_with_full_text() {
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         let mut harness = TestHarness::spawn(HarnessOpts::default()).await;
         let mock = RetryMockLlm::start_with_text(1, "半截", "完整文本").await;
-        let env = setup_text_turn_env(&mut harness, "agent-retry-ok", &mock.url(), "retry-model")
-            .await;
+        let env =
+            setup_text_turn_env(&mut harness, "agent-retry-ok", &mock.url(), "retry-model").await;
 
         let (turn_result, frames) = run_turn_collect(&harness, &env.session_id).await;
         turn_result.expect("turn should complete after a successful retry");
@@ -934,8 +939,14 @@ async fn agent_stream_retry_exhausted_sends_error() {
             .iter()
             .filter(|f| f["type"] == "stream_reset")
             .count();
-        assert_eq!(resets, 2, "two retries → two stream_reset frames, got: {frames:?}");
-        for expected in ["上游连接中断，正在重试 (1/2)", "上游连接中断，正在重试 (2/2)"] {
+        assert_eq!(
+            resets, 2,
+            "two retries → two stream_reset frames, got: {frames:?}"
+        );
+        for expected in [
+            "上游连接中断，正在重试 (1/2)",
+            "上游连接中断，正在重试 (2/2)",
+        ] {
             assert!(
                 frames.iter().any(|f| {
                     f["type"] == "status"

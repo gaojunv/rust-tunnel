@@ -386,8 +386,15 @@ async fn main() -> TunnelResult<()> {
             if let Some(db) = state.db() {
                 // 先删旧 key 再插入（简化幂等）
                 let _ = db.llm_delete_api_key("__acp_internal__").await;
-                if let Err(e) =
-                    db.llm_save_api_key("__acp_internal__", &key_hash, &key_prefix, "ACP Internal", None).await
+                if let Err(e) = db
+                    .llm_save_api_key(
+                        "__acp_internal__",
+                        &key_hash,
+                        &key_prefix,
+                        "ACP Internal",
+                        None,
+                    )
+                    .await
                 {
                     tracing::warn!("Failed to save ACP internal API key: {e}");
                 }

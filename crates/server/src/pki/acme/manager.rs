@@ -433,7 +433,9 @@ impl CertificateManager {
     /// Build a resolver for use with `rustls::ServerConfig::with_cert_resolver`.
     #[must_use]
     pub fn sni_resolver(self: Arc<Self>) -> Arc<dyn ResolvesServerCert> {
-        Arc::new(crate::reverse_proxy::sni_resolver::SniCertResolver::new(self))
+        Arc::new(crate::reverse_proxy::sni_resolver::SniCertResolver::new(
+            self,
+        ))
     }
 }
 

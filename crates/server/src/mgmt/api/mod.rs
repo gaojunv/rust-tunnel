@@ -215,7 +215,10 @@ pub async fn run_api_server(
         .allow_headers(Any);
 
     // Public routes (no auth required) — SSE uses ?token= query param for auth
-    #[allow(unused_mut, reason = "reassigned only by the rag-gated merge block below")]
+    #[allow(
+        unused_mut,
+        reason = "reassigned only by the rag-gated merge block below"
+    )]
     let mut public_routes = Router::new()
         .route("/api/login", post(login::login))
         .route("/api/health", get(login::health))
@@ -378,10 +381,7 @@ pub async fn run_api_server(
             "/api/agent/workspaces/:id/files",
             get(agent::list_workspace_files),
         )
-        .route(
-            "/api/agent/workspaces/:id/fs/tree",
-            get(agent::get_fs_tree),
-        )
+        .route("/api/agent/workspaces/:id/fs/tree", get(agent::get_fs_tree))
         .route(
             "/api/agent/workspaces/:id/fs/file",
             get(agent::get_fs_file).put(agent::put_fs_file),

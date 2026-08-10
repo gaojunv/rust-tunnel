@@ -5,13 +5,13 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use rust_tunnel_common::ControlMessage;
 use crate::client_registry::ClientRegistry;
 use crate::db::Database;
 use crate::dns::registry::DnsRegistry;
 use crate::dynamic_config::DynamicConfig;
 use crate::mesh::MeshManager;
 use crate::reverse_proxy::ReverseProxyState;
+use rust_tunnel_common::ControlMessage;
 
 use super::acme_config::{AcmeConfigInfo, AcmeFullConfig};
 use super::port_info::{ClientInfo, PortInfo, TrojanRuntimeStatus};
@@ -186,9 +186,9 @@ impl ServerState {
     /// has started. Called from `bin/server.rs` after `with_db()`.
     pub async fn wire_up_client_connector(&self) {
         if let Some(registry) = &self.client_registry {
-            let cc = std::sync::Arc::new(
-                crate::reverse_proxy::connector::ClientConnector::new(registry.clone()),
-            );
+            let cc = std::sync::Arc::new(crate::reverse_proxy::connector::ClientConnector::new(
+                registry.clone(),
+            ));
             self.proxy_state.set_client_connector(cc).await;
             info!("ClientConnector registered into ReverseProxyState");
         }

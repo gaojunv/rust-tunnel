@@ -169,9 +169,7 @@ pub async fn create_proxy_rule(
         .into_response()
 }
 
-fn conflicts_from_error(
-    e: &crate::reverse_proxy::error::ReconcileError,
-) -> Vec<serde_json::Value> {
+fn conflicts_from_error(e: &crate::reverse_proxy::error::ReconcileError) -> Vec<serde_json::Value> {
     use crate::reverse_proxy::error::ReconcileError as E;
     match e {
         E::DomainConflict {
@@ -312,9 +310,7 @@ pub async fn update_proxy_rule(
                 .into_response();
         }
     }
-    if previous.rule_type == crate::reverse_proxy::RuleType::Http
-        && old_listen != new_listen
-    {
+    if previous.rule_type == crate::reverse_proxy::RuleType::Http && old_listen != new_listen {
         if let Err(e) = state
             .server_state
             .proxy_state

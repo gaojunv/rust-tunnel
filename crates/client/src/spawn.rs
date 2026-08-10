@@ -41,14 +41,25 @@ impl SpawnManager {
         control_tx: mpsc::Sender<ControlMessage>,
     ) {
         let result = self
-            .spawn_inner(&session_id, &command, &args, &env, cwd.as_deref(), control_tx.clone())
+            .spawn_inner(
+                &session_id,
+                &command,
+                &args,
+                &env,
+                cwd.as_deref(),
+                control_tx.clone(),
+            )
             .await;
         let (success, error) = match result {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e)),
         };
         let _ = control_tx
-            .send(ControlMessage::AgentSpawnResponse { session_id, success, error })
+            .send(ControlMessage::AgentSpawnResponse {
+                session_id,
+                success,
+                error,
+            })
             .await;
     }
 
@@ -73,7 +84,9 @@ impl SpawnManager {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
-        let mut child: Child = cmd.spawn().map_err(|e| format!("spawn '{command}' failed: {e}"))?;
+        let mut child: Child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn '{command}' failed: {e}"))?;
 
         let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let mut stdout = child.stdout.take().ok_or("no stdout pipe")?;
@@ -118,13 +131,18 @@ impl SpawnManager {
                 }
             }
             let code = child.wait().await.ok().and_then(|s| s.code());
-            let _ = tx.send(ControlMessage::AgentSpawnExit { session_id: sid, code }).await;
+            let _ = tx
+                .send(ControlMessage::AgentSpawnExit {
+                    session_id: sid,
+                    code,
+                })
+                .await;
         });
 
-        self.processes.lock().await.insert(
-            session_id.to_string(),
-            SpawnedProcess { stdin_tx, kill_tx },
-        );
+        self.processes
+            .lock()
+            .await
+            .insert(session_id.to_string(), SpawnedProcess { stdin_tx, kill_tx });
         Ok(())
     }
 
@@ -135,7 +153,10 @@ impl SpawnManager {
             procs.get(session_id).map(|p| p.stdin_tx.clone())
         };
         match tx {
-            Some(tx) => tx.send(data).await.map_err(|_| "stdin channel closed".to_string()),
+            Some(tx) => tx
+                .send(data)
+                .await
+                .map_err(|_| "stdin channel closed".to_string()),
             None => Err(format!("no spawned process for session {session_id}")),
         }
     }
@@ -162,20 +183,26 @@ mod tests {
     async fn test_spawn_echo_roundtrip() {
         let mgr = SpawnManager::new();
         let (tx, mut rx) = mpsc::channel(32);
-        mgr.handle_spawn(
-            "s1".into(), "cat".into(), vec![], vec![], None, tx,
-        )
-        .await;
+        mgr.handle_spawn("s1".into(), "cat".into(), vec![], vec![], None, tx)
+            .await;
         // 第一条应是 AgentSpawnResponse success
-        let resp = timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
-        assert!(matches!(resp, ControlMessage::AgentSpawnResponse { success: true, .. }));
+        let resp = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            resp,
+            ControlMessage::AgentSpawnResponse { success: true, .. }
+        ));
 
         mgr.write_stdin("s1", b"hello\n".to_vec()).await.unwrap();
         // 读 stdout 回显
         let mut got = Vec::new();
         while got.len() < 6 {
             match timeout(Duration::from_secs(5), rx.recv()).await.unwrap() {
-                Some(ControlMessage::AgentSpawnData { data, stdin: false, .. }) => got.extend(data),
+                Some(ControlMessage::AgentSpawnData {
+                    data, stdin: false, ..
+                }) => got.extend(data),
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -189,7 +216,8 @@ mod tests {
                     break;
                 }
             }
-        }).await;
+        })
+        .await;
         assert!(exit.is_ok());
     }
 
@@ -198,10 +226,18 @@ mod tests {
         let mgr = SpawnManager::new();
         let (tx, mut rx) = mpsc::channel(32);
         mgr.handle_spawn(
-            "s2".into(), "/nonexistent/binary".into(), vec![], vec![], None, tx,
+            "s2".into(),
+            "/nonexistent/binary".into(),
+            vec![],
+            vec![],
+            None,
+            tx,
         )
         .await;
-        let resp = timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        let resp = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match resp {
             ControlMessage::AgentSpawnResponse { success, error, .. } => {
                 assert!(!success);

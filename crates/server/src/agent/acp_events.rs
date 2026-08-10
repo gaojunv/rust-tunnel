@@ -5,11 +5,10 @@
 //! 纯函数、无 I/O：单独文件便于单测（用 `serde_json::from_value` 构造
 //! ACP crate 的 fixture，避免手写嵌套结构）。
 
-use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolKind,
+    ContentBlock, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
 };
+use agent_client_protocol::schema::MaybeUndefined;
 
 /// 把一个 ACP update 映射为现有 WS 帧；无需推送的更新返回 None。
 ///
@@ -64,12 +63,12 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                 Some(st) => status_str(Some(st)),
                 None => {
                     let has_result = upd.fields.raw_output.is_some()
-                        || upd
-                            .fields
-                            .content
-                            .as_ref()
-                            .is_some_and(|c| !c.is_empty());
-                    if has_result { "completed" } else { "running" }
+                        || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
+                    if has_result {
+                        "completed"
+                    } else {
+                        "running"
+                    }
                 }
             };
             let mut frame = serde_json::json!({
@@ -204,9 +203,7 @@ fn extract_diffs(content: &[ToolCallContent]) -> Vec<serde_json::Value> {
 fn extract_locations(locations: &[ToolCallLocation]) -> Vec<serde_json::Value> {
     locations
         .iter()
-        .map(|l| {
-            serde_json::json!({"path": l.path.display().to_string(), "line": l.line})
-        })
+        .map(|l| serde_json::json!({"path": l.path.display().to_string(), "line": l.line}))
         .collect()
 }
 

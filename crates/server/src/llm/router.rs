@@ -332,9 +332,7 @@ mod tests {
 
         let state = LlmState::new(
             Some(db),
-            Some(crate::llm::crypto::LlmCipher::from_master_key(
-                [9u8; 32],
-            )),
+            Some(crate::llm::crypto::LlmCipher::from_master_key([9u8; 32])),
         );
         let (provider, _, _) = resolve_model(&state, "deepseek-chat").await.unwrap();
         assert_eq!(provider.api_key, "sk-plain");

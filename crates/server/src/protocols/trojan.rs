@@ -5,9 +5,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, warn};
 
-use rust_tunnel_common::{TunnelError, TunnelResult};
 use crate::control::ServerState;
 use crate::stats::EntityType;
+use rust_tunnel_common::{TunnelError, TunnelResult};
 
 /// Trojan command types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1678,12 +1678,12 @@ mod legacy_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::client::TlsStream;
 
-    use rust_tunnel_common::{
-        create_insecure_client_config, create_server_config, load_or_generate_cert,
-    };
     use crate::control::ServerState;
     use crate::listener;
     use crate::trojan::sha224_hex;
+    use rust_tunnel_common::{
+        create_insecure_client_config, create_server_config, load_or_generate_cert,
+    };
 
     // ---------------------------------------------------------------------------
     // helper types

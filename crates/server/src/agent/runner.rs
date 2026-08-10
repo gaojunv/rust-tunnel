@@ -3,8 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
-use rust_tunnel_common::{AgentCommand, AgentResult};
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
+use rust_tunnel_common::{AgentCommand, AgentResult};
 
 /// @引用限制：个数、单文件字节、总字节。
 pub const MAX_REFS: usize = 10;
@@ -32,7 +32,9 @@ pub fn compose_user_message(
                 } else {
                     text.clone()
                 };
-                out.push_str(&format!("\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```"));
+                out.push_str(&format!(
+                    "\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```"
+                ));
             }
             Err(_) => out.push_str(&format!("\n\n[无法读取: {path}]")),
         }
@@ -548,13 +550,9 @@ pub async fn run_agent_turn(
             raw_body: None,
         };
         let req_body = crate::llm::upstream::build_upstream_body(&request);
-        let outcome = crate::llm::upstream::execute_with_failover(
-            &llm.breakers,
-            &chain,
-            &req_body,
-            true,
-        )
-        .await;
+        let outcome =
+            crate::llm::upstream::execute_with_failover(&llm.breakers, &chain, &req_body, true)
+                .await;
 
         let mut resp = match outcome {
             crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
@@ -611,12 +609,19 @@ pub async fn run_agent_turn(
                                 }))
                                 .await;
                             let retry = crate::llm::upstream::execute_with_failover(
-                                &llm.breakers, &chain, &req_body, true,
-                            ).await;
+                                &llm.breakers,
+                                &chain,
+                                &req_body,
+                                true,
+                            )
+                            .await;
                             match retry {
-                                crate::llm::upstream::FailoverOutcome::Success { resp: r2, .. } => {
+                                crate::llm::upstream::FailoverOutcome::Success {
+                                    resp: r2, ..
+                                } => {
                                     resp = r2;
-                                    let content_type2 = resp.headers()
+                                    let content_type2 = resp
+                                        .headers()
                                         .get(axum::http::header::CONTENT_TYPE)
                                         .and_then(|v| v.to_str().ok())
                                         .unwrap_or("")
@@ -624,10 +629,15 @@ pub async fn run_agent_turn(
                                     if !is_sse_response(&content_type2) {
                                         // 重试返回非 SSE（上游降级普通 JSON）→ 转非 SSE 回退
                                         let body_bytes = axum::body::to_bytes(
-                                            resp.into_body(), sse::MAX_STREAM_BYTES,
-                                        ).await.map_err(|e| format!("failed to read LLM response: {e}"))?;
-                                        let body: serde_json::Value = serde_json::from_slice(&body_bytes)
-                                            .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
+                                            resp.into_body(),
+                                            sse::MAX_STREAM_BYTES,
+                                        )
+                                        .await
+                                        .map_err(|e| format!("failed to read LLM response: {e}"))?;
+                                        let body: serde_json::Value =
+                                            serde_json::from_slice(&body_bytes).map_err(|e| {
+                                                format!("invalid LLM response JSON: {e}")
+                                            })?;
                                         if handle_llm_turn_json(&agent, rt, &ws_tx, &body).await? {
                                             return Ok(());
                                         }
@@ -642,7 +652,10 @@ pub async fn run_agent_turn(
                                     byte_stream = resp.into_body().into_data_stream();
                                     continue 'sse;
                                 }
-                                crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
+                                crate::llm::upstream::FailoverOutcome::Exhausted {
+                                    message,
+                                    ..
+                                } => {
                                     let _ = ws_tx.send(serde_json::json!({"type": "error", "message": format!("LLM unavailable: {message}")})).await;
                                     return Err(format!("LLM unavailable: {message}"));
                                 }
@@ -1065,9 +1078,11 @@ mod tests {
     #[tokio::test]
     async fn test_persist_message_v2_writes_all_columns() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace("w1", "p", "nas", "host", "/p", None, None, "", None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
@@ -1134,9 +1149,10 @@ mod tests {
 
     #[test]
     fn test_compose_user_message_with_refs() {
-        let msg = compose_user_message("帮我重构", &[
-            ("src/main.rs".to_string(), Ok("fn main() {}".to_string())),
-        ]);
+        let msg = compose_user_message(
+            "帮我重构",
+            &[("src/main.rs".to_string(), Ok("fn main() {}".to_string()))],
+        );
         assert!(msg.starts_with("帮我重构"));
         assert!(msg.contains("--- 引用文件: src/main.rs ---"));
         assert!(msg.contains("fn main() {}"));
@@ -1144,9 +1160,10 @@ mod tests {
 
     #[test]
     fn test_compose_user_message_ref_failure_annotated() {
-        let msg = compose_user_message("看下这个", &[
-            ("missing.rs".to_string(), Err("not found".to_string())),
-        ]);
+        let msg = compose_user_message(
+            "看下这个",
+            &[("missing.rs".to_string(), Err("not found".to_string()))],
+        );
         assert!(msg.contains("[无法读取: missing.rs]"));
     }
 

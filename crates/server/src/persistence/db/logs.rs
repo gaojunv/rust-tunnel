@@ -3,10 +3,7 @@ use super::Database;
 
 impl Database {
     /// Insert a log entry into the database
-    pub async fn insert_log(
-        &self,
-        entry: &crate::logs::LogEntry,
-    ) -> Result<i64, sqlx::Error> {
+    pub async fn insert_log(&self, entry: &crate::logs::LogEntry) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO server_logs (timestamp, level, source, target, message)

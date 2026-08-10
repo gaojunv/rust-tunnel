@@ -131,8 +131,7 @@ pub async fn update_trojan_config(
     }
 
     // Handle listener lifecycle（证书解析 + 共享/独立模式判定统一在 trojan_runtime）
-    if let Err(e) =
-        crate::trojan_runtime::apply_trojan_config(&state.server_state, &new_cfg).await
+    if let Err(e) = crate::trojan_runtime::apply_trojan_config(&state.server_state, &new_cfg).await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

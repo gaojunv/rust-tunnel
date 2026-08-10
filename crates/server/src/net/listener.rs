@@ -5,12 +5,12 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use rust_tunnel_common::{TunnelError, TunnelResult};
 use crate::control::{PortInfo, ServerState};
 use crate::protocols::shadowsocks::proxy_ss_connection;
 use crate::protocols::trojan::proxy_trojan_connection;
 use crate::shadowsocks::handle_ss_handshake;
 use crate::trojan::{handle_trojan_fallback, handle_trojan_handshake};
+use rust_tunnel_common::{TunnelError, TunnelResult};
 
 /// Generate a unique connection ID
 fn generate_connection_id() -> u64 {

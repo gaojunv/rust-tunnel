@@ -75,7 +75,9 @@ const SEARCH_MAX_LINE: usize = 500;
 fn grep_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
     match shell_result {
         AgentResult::Shell {
-            stdout, stderr, exit_code,
+            stdout,
+            stderr,
+            exit_code,
         } => {
             let stderr = stderr.trim();
             if !stderr.is_empty() {
@@ -377,8 +379,15 @@ pub async fn handle_exec_request(
 ) -> AgentResult {
     match command {
         AgentCommand::Shell { cmd, cwd } => {
-            shell_exec(cmd, cwd.as_deref(), root_path, docker_container, timeout, cancel_rx)
-                .await
+            shell_exec(
+                cmd,
+                cwd.as_deref(),
+                root_path,
+                docker_container,
+                timeout,
+                cancel_rx,
+            )
+            .await
         }
         AgentCommand::ReadFile { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
@@ -923,8 +932,14 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         // 起一个会生成子进程的 sleep，验证进程组整体被杀
         let handle = tokio::spawn(async move {
-            run_host("sleep 30 & wait", None, None, Duration::from_secs(60), Some(&mut rx))
-                .await
+            run_host(
+                "sleep 30 & wait",
+                None,
+                None,
+                Duration::from_secs(60),
+                Some(&mut rx),
+            )
+            .await
         });
         // 给 spawn + 进程组建立留时间
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1297,7 +1312,10 @@ mod tests {
         let root = temp_workspace(&[("a.rs", "fn old() {}\nrest\n")]);
         let result = patch_file_host(&root.join("a.rs"), "fn old()", "fn new()").await;
         assert!(matches!(result, AgentResult::Success));
-        assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap(), "fn new() {}\nrest\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.rs")).unwrap(),
+            "fn new() {}\nrest\n"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1305,11 +1323,15 @@ mod tests {
     async fn test_patch_not_found_and_ambiguous() {
         let root = temp_workspace(&[("a.rs", "dup\ndup\n")]);
         let r1 = patch_file_host(&root.join("a.rs"), "missing", "x").await;
-        let AgentResult::Error { message } = r1 else { panic!() };
+        let AgentResult::Error { message } = r1 else {
+            panic!()
+        };
         assert!(message.contains("not found"));
 
         let r2 = patch_file_host(&root.join("a.rs"), "dup", "x").await;
-        let AgentResult::Error { message } = r2 else { panic!() };
+        let AgentResult::Error { message } = r2 else {
+            panic!()
+        };
         assert!(message.contains("2 times"));
 
         let r3 = patch_file_host(&root.join("a.rs"), "", "x").await;

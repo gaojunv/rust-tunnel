@@ -10,10 +10,7 @@ const USER_MSG_MAX_CHARS: usize = 500;
 
 /// 清洗 LLM 输出为合法标题：trim、去首尾引号、按字符截断；空结果返回 None。
 fn clean_title(raw: &str) -> Option<String> {
-    let trimmed = raw
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'')
-        .trim();
+    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -74,7 +71,11 @@ async fn generate_title_inner(
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "session not found".to_string())?;
-    if session.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+    if session
+        .title
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
         return Ok(None);
     }
 
@@ -88,7 +89,11 @@ async fn generate_title_inner(
         .iter()
         .find(|m| m.role == "user" && m.kind == "message")
         .ok_or_else(|| "no user message yet".to_string())?;
-    let excerpt: String = first_user.content.chars().take(USER_MSG_MAX_CHARS).collect();
+    let excerpt: String = first_user
+        .content
+        .chars()
+        .take(USER_MSG_MAX_CHARS)
+        .collect();
 
     let request = ChatCompletionRequest {
         model: model.to_string(),
@@ -111,13 +116,8 @@ async fn generate_title_inner(
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
     let body = crate::llm::upstream::build_upstream_body(&request);
-    let outcome = crate::llm::upstream::execute_with_failover(
-        &llm.breakers,
-        &chain,
-        &body,
-        false,
-    )
-    .await;
+    let outcome =
+        crate::llm::upstream::execute_with_failover(&llm.breakers, &chain, &body, false).await;
     let crate::llm::upstream::FailoverOutcome::Success { resp, .. } = outcome else {
         return Err("LLM unavailable for title generation".to_string());
     };
@@ -163,8 +163,14 @@ mod tests {
 
     #[test]
     fn test_clean_title() {
-        assert_eq!(clean_title("  修复登录 bug  "), Some("修复登录 bug".to_string()));
-        assert_eq!(clean_title("\"quoted title\""), Some("quoted title".to_string()));
+        assert_eq!(
+            clean_title("  修复登录 bug  "),
+            Some("修复登录 bug".to_string())
+        );
+        assert_eq!(
+            clean_title("\"quoted title\""),
+            Some("quoted title".to_string())
+        );
         assert_eq!(clean_title("   "), None);
         assert_eq!(clean_title(""), None);
         let long = "标".repeat(50);
@@ -176,11 +182,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
         notify_title(&tx, "sess-123", "修复登录 bug").await;
         let frame = rx.recv().await.expect("frame should be sent");
-        assert_eq!(frame, json!({
-            "type": "session_title",
-            "title": "修复登录 bug",
-            "session_id": "sess-123",
-        }));
+        assert_eq!(
+            frame,
+            json!({
+                "type": "session_title",
+                "title": "修复登录 bug",
+                "session_id": "sess-123",
+            })
+        );
     }
 
     #[tokio::test]
