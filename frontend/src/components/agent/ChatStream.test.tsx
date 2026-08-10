@@ -1051,7 +1051,8 @@ describe('ChatStream running state', () => {
     expect(modeBtn.textContent).toContain('Plan');
     // mode 项被过滤，不进左侧统一菜单：展开菜单后菜单内容里无 "Mode" 项
     fireEvent.pointerDown(screen.getByRole('button', { name: 'agent.sessionSettings' }));
-    expect(screen.getByText('agent.model')).toBeTruthy(); // 菜单已打开（模型子菜单标签）
+    // 菜单已打开（ModelPicker 重构后模型区不再渲染 agent.model 标签，改用 role=menu 判定）
+    expect(screen.getByRole('menu')).toBeTruthy();
     expect(screen.queryByText('Mode')).toBeNull();
   });
 

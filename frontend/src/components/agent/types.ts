@@ -2,8 +2,10 @@ import type { ApprovalOption } from '../../types';
 
 /** 聊天区单条消息。 */
 export interface ChatItem {
-  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'thought' | 'plan';
+  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'thought' | 'plan' | 'system';
   content: string;
+  /** kind='system'：提示行语气（状态/警告/错误/停止），缺省按 info 渲染 */
+  systemTone?: 'info' | 'warning' | 'error' | 'stopped';
   toolName?: string;
   toolArgs?: string;
   toolResult?: string;
