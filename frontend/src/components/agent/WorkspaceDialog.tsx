@@ -11,6 +11,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Loader2 } from 'lucide-react';
 import {
   clientsApi,
@@ -220,222 +221,250 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
         <DialogHeader>
           <DialogTitle>{editing ? t('agent.editWorkspace') : t('agent.newWorkspace')}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label>{t('agent.name')}</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t('agent.namePlaceholder')} />
-          </div>
-          {!editing && (
-            <>
-              <div className="space-y-2">
-                <Label>{t('agent.client')}</Label>
-                <select
-                  value={clientId}
-                  onChange={(e) => setClientId(e.target.value)}
-                  disabled={isLoading}
-                  aria-label={t('agent.client')}
-                  className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <option value="">
-                    {isLoading ? t('common.loading') : t('agent.selectClient')}
-                  </option>
-                  {(clients ?? []).map((c) => (
-                    <option key={c.name} value={c.name}>
-                      {c.name}
-                      {c.online ? '' : `（${t('common.status.offline')}）`}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-2">
-                <Label>{t('agent.runtimeType')}</Label>
-                <div className="flex gap-4">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      checked={runtimeType === 'host'}
-                      onChange={() => setRuntimeType('host')}
-                    />
-                    {t('agent.runtimeHost')}
-                  </label>
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="radio"
-                      checked={runtimeType === 'docker'}
-                      onChange={() => setRuntimeType('docker')}
-                    />
-                    {t('agent.runtimeDocker')}
-                  </label>
-                </div>
-              </div>
-            </>
-          )}
-          <div className="space-y-2">
-            <Label>{t('agent.rootPath')}</Label>
-            <Input
-              value={rootPath}
-              onChange={(e) => setRootPath(e.target.value)}
-              placeholder={runtimeType === 'host' ? t('agent.rootPathPlaceholderHost') : t('agent.rootPathPlaceholderDocker')}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label>{t('agent.agentEngine')}</Label>
-            <select
-              value={agentType}
-              onChange={(e) => setAgentType(e.target.value as AgentWorkspace['agent_type'])}
-              aria-label={t('agent.agentEngine')}
-              className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            >
-              <option value="">{t('agent.agentEngineBuiltin')}</option>
-              <option value="gemini">Gemini</option>
-              <option value="claude-code">Claude Code</option>
-              <option value="opencode">OpenCode</option>
-            </select>
-            {runtimeType === 'docker' && agentType !== '' && (
-              <p className="text-xs text-destructive">{t('agent.acpDockerUnsupportedHint')}</p>
-            )}
-          </div>
-          {agentType !== '' && (
-            <>
-              <div className="space-y-2">
-                <Label>{t('agent.agentPath')}</Label>
-                <Input
-                  value={agentPath}
-                  onChange={(e) => setAgentPath(e.target.value)}
-                  placeholder={t('agent.agentPathPlaceholder')}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>{t('agent.workspaceLlmModel')}</Label>
-                <select
-                  value={llmModelId}
-                  onChange={(e) => setLlmModelId(e.target.value)}
-                  aria-label={t('agent.workspaceLlmModel')}
-                  className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                >
-                  <option value="">{t('agent.selectModel')}</option>
-                  <optgroup label={t('agent.model')}>
-                    {(models ?? [])
-                      .filter((m) => m.enabled)
-                      .map((m) => {
-                        const pname = m.provider_id
-                          ? providerName.get(m.provider_id)
-                          : undefined;
-                        const label = pname
-                          ? `${m.model_name}（${pname}）`
-                          : m.model_name;
-                        return (
-                          <option key={m.id} value={`model:${m.id}`}>
-                            {label}
-                          </option>
-                        );
-                      })}
-                  </optgroup>
-                  {(groups ?? []).some((g) => g.enabled) && (
-                    <optgroup label={t('agent.modelGroups')}>
-                      {(groups ?? [])
-                        .filter((g) => g.enabled)
-                        .map((g) => (
-                          <option key={g.id} value={`group:${g.id}`}>
-                            {g.name}
-                          </option>
-                        ))}
-                    </optgroup>
-                  )}
-                </select>
-              </div>
-              <div className="space-y-2">
-                <Label>{t('agent.configOverrides')}</Label>
-                {overrideRows.map((row, i) => (
-                  <div key={i} className="flex items-center gap-2">
-                    <Input
-                      value={row.key}
-                      onChange={(e) =>
-                        setOverrideRows((rows) =>
-                          rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)),
-                        )
-                      }
-                      placeholder={t('agent.configOverrideKeyPlaceholder')}
-                      aria-label={`${t('agent.configOverrides')} key ${i + 1}`}
-                      className="w-40"
-                    />
-                    <Input
-                      value={row.value}
-                      onChange={(e) =>
-                        setOverrideRows((rows) =>
-                          rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)),
-                        )
-                      }
-                      placeholder={t('agent.configOverrideValuePlaceholder')}
-                      aria-label={`${t('agent.configOverrides')} value ${i + 1}`}
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      aria-label={`${t('agent.configOverrideRemove')} ${i + 1}`}
-                      onClick={() => setOverrideRows((rows) => rows.filter((_, j) => j !== i))}
-                    >
-                      ×
-                    </Button>
-                  </div>
-                ))}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setOverrideRows((rows) => [...rows, { key: '', value: '' }])}
-                >
-                  {t('agent.configOverrideAdd')}
-                </Button>
-                <p className="text-xs text-muted-foreground">{t('agent.configOverridesHint')}</p>
-              </div>
-            </>
-          )}
-          <div className="space-y-2">
-            <Label>{t('agent.approvalMode')}</Label>
-            <div className="space-y-1.5">
-              {(['safe', 'auto_write', 'full_auto'] as const).map((m) => (
-                <label key={m} className="flex items-start gap-2 text-sm">
-                  <input type="radio" checked={approvalMode === m} onChange={() => setApprovalMode(m)} className="mt-1" />
-                  <span>
-                    <span className="font-medium">{t(`agent.approvalMode_${m}`)}</span>
-                    <span className="ml-1.5 text-xs text-muted-foreground">{t(`agent.approvalModeHint_${m}`)}</span>
-                  </span>
-                </label>
-              ))}
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label>{t('agent.systemPrompt')}</Label>
-            <textarea
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              placeholder={t('agent.systemPromptPlaceholder')}
-              rows={3}
-              className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
-            />
-          </div>
-          {!editing && runtimeType === 'docker' && (
+        {/* 分 Tab 布局（对标成熟 coding agent 的设置弹窗）：基础=身份与运行时，
+            引擎=ACP agent 及其模型/覆盖，高级=审批与系统提示。控件仍在 inactive
+            TabsContent 中挂载（Radix 保留 DOM），提交状态不受切换影响。 */}
+        {/* Tabs 触发器本身带 aria-label（可访问名），与内容 Label 的文本区分，
+            避免与 Label>控件 组合后 testing-library 精确匹配出现歧义。 */}
+        <Tabs defaultValue="basic" className="w-full">
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="basic" aria-label={t('agent.tabBasic')}>
+              {t('agent.tabBasic')}
+            </TabsTrigger>
+            <TabsTrigger value="engine" aria-label={t('agent.tabEngine')}>
+              {t('agent.tabEngine')}
+            </TabsTrigger>
+            <TabsTrigger value="advanced" aria-label={t('agent.tabAdvanced')}>
+              {t('agent.tabAdvanced')}
+            </TabsTrigger>
+          </TabsList>
+
+          {/* 基础：名称 / 客户端 / 运行时 / 根路径 / Docker 参数 */}
+          <TabsContent value="basic" className="mt-4 space-y-4">
             <div className="space-y-2">
-              <Label>{t('agent.dockerImage')}</Label>
-              <Input
-                value={dockerImage}
-                onChange={(e) => setDockerImage(e.target.value)}
-                placeholder={t('agent.dockerImagePlaceholder')}
-              />
-              <Label>{t('agent.dockerContainerId')}</Label>
-              <Input
-                value={dockerContainerId}
-                onChange={(e) => setDockerContainerId(e.target.value)}
-                placeholder={t('agent.dockerContainerIdPlaceholder')}
-              />
-              <p className="text-xs text-muted-foreground">
-                {t('agent.dockerContainerIdHint')}
-              </p>
+              <Label>{t('agent.name')}</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={t('agent.namePlaceholder')} />
             </div>
-          )}
-        </div>
+            {!editing && (
+              <>
+                <div className="space-y-2">
+                  <Label>{t('agent.client')}</Label>
+                  <select
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                    disabled={isLoading}
+                    aria-label={t('agent.client')}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="">
+                      {isLoading ? t('common.loading') : t('agent.selectClient')}
+                    </option>
+                    {(clients ?? []).map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.name}
+                        {c.online ? '' : `（${t('common.status.offline')}）`}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('agent.runtimeType')}</Label>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        checked={runtimeType === 'host'}
+                        onChange={() => setRuntimeType('host')}
+                      />
+                      {t('agent.runtimeHost')}
+                    </label>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        checked={runtimeType === 'docker'}
+                        onChange={() => setRuntimeType('docker')}
+                      />
+                      {t('agent.runtimeDocker')}
+                    </label>
+                  </div>
+                </div>
+              </>
+            )}
+            <div className="space-y-2">
+              <Label>{t('agent.rootPath')}</Label>
+              <Input
+                value={rootPath}
+                onChange={(e) => setRootPath(e.target.value)}
+                placeholder={runtimeType === 'host' ? t('agent.rootPathPlaceholderHost') : t('agent.rootPathPlaceholderDocker')}
+              />
+            </div>
+            {!editing && runtimeType === 'docker' && (
+              <div className="space-y-2">
+                <Label>{t('agent.dockerImage')}</Label>
+                <Input
+                  value={dockerImage}
+                  onChange={(e) => setDockerImage(e.target.value)}
+                  placeholder={t('agent.dockerImagePlaceholder')}
+                />
+                <Label>{t('agent.dockerContainerId')}</Label>
+                <Input
+                  value={dockerContainerId}
+                  onChange={(e) => setDockerContainerId(e.target.value)}
+                  placeholder={t('agent.dockerContainerIdPlaceholder')}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('agent.dockerContainerIdHint')}
+                </p>
+              </div>
+            )}
+          </TabsContent>
+
+          {/* 引擎：ACP agent 类型 / 可执行路径 / LLM 模型 / 配置覆盖（仅 ACP 引擎时显示后三项） */}
+          <TabsContent value="engine" className="mt-4 space-y-4">
+            <div className="space-y-2">
+              <Label>{t('agent.agentEngine')}</Label>
+              <select
+                value={agentType}
+                onChange={(e) => setAgentType(e.target.value as AgentWorkspace['agent_type'])}
+                aria-label={t('agent.agentEngine')}
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              >
+                <option value="">{t('agent.agentEngineBuiltin')}</option>
+                <option value="gemini">Gemini</option>
+                <option value="claude-code">Claude Code</option>
+                <option value="opencode">OpenCode</option>
+              </select>
+              {runtimeType === 'docker' && agentType !== '' && (
+                <p className="text-xs text-destructive">{t('agent.acpDockerUnsupportedHint')}</p>
+              )}
+            </div>
+            {agentType !== '' && (
+              <>
+                <div className="space-y-2">
+                  <Label>{t('agent.agentPath')}</Label>
+                  <Input
+                    value={agentPath}
+                    onChange={(e) => setAgentPath(e.target.value)}
+                    placeholder={t('agent.agentPathPlaceholder')}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('agent.workspaceLlmModel')}</Label>
+                  <select
+                    value={llmModelId}
+                    onChange={(e) => setLlmModelId(e.target.value)}
+                    aria-label={t('agent.workspaceLlmModel')}
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  >
+                    <option value="">{t('agent.selectModel')}</option>
+                    <optgroup label={t('agent.model')}>
+                      {(models ?? [])
+                        .filter((m) => m.enabled)
+                        .map((m) => {
+                          const pname = m.provider_id
+                            ? providerName.get(m.provider_id)
+                            : undefined;
+                          const label = pname
+                            ? `${m.model_name}（${pname}）`
+                            : m.model_name;
+                          return (
+                            <option key={m.id} value={`model:${m.id}`}>
+                              {label}
+                            </option>
+                          );
+                        })}
+                    </optgroup>
+                    {(groups ?? []).some((g) => g.enabled) && (
+                      <optgroup label={t('agent.modelGroups')}>
+                        {(groups ?? [])
+                          .filter((g) => g.enabled)
+                          .map((g) => (
+                            <option key={g.id} value={`group:${g.id}`}>
+                              {g.name}
+                            </option>
+                          ))}
+                      </optgroup>
+                    )}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('agent.configOverrides')}</Label>
+                  {overrideRows.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={row.key}
+                        onChange={(e) =>
+                          setOverrideRows((rows) =>
+                            rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)),
+                          )
+                        }
+                        placeholder={t('agent.configOverrideKeyPlaceholder')}
+                        aria-label={`${t('agent.configOverrides')} key ${i + 1}`}
+                        className="w-40"
+                      />
+                      <Input
+                        value={row.value}
+                        onChange={(e) =>
+                          setOverrideRows((rows) =>
+                            rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)),
+                          )
+                        }
+                        placeholder={t('agent.configOverrideValuePlaceholder')}
+                        aria-label={`${t('agent.configOverrides')} value ${i + 1}`}
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`${t('agent.configOverrideRemove')} ${i + 1}`}
+                        onClick={() => setOverrideRows((rows) => rows.filter((_, j) => j !== i))}
+                      >
+                        ×
+                      </Button>
+                    </div>
+                  ))}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setOverrideRows((rows) => [...rows, { key: '', value: '' }])}
+                  >
+                    {t('agent.configOverrideAdd')}
+                  </Button>
+                  <p className="text-xs text-muted-foreground">{t('agent.configOverridesHint')}</p>
+                </div>
+              </>
+            )}
+          </TabsContent>
+
+          {/* 高级：审批模式 / 系统提示 */}
+          <TabsContent value="advanced" className="mt-4 space-y-4">
+            <div className="space-y-2">
+              <Label>{t('agent.approvalMode')}</Label>
+              <div className="space-y-1.5">
+                {(['safe', 'auto_write', 'full_auto'] as const).map((m) => (
+                  <label key={m} className="flex items-start gap-2 text-sm">
+                    <input type="radio" checked={approvalMode === m} onChange={() => setApprovalMode(m)} className="mt-1" />
+                    <span>
+                      <span className="font-medium">{t(`agent.approvalMode_${m}`)}</span>
+                      <span className="ml-1.5 text-xs text-muted-foreground">{t(`agent.approvalModeHint_${m}`)}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>{t('agent.systemPrompt')}</Label>
+              <textarea
+                value={systemPrompt}
+                onChange={(e) => setSystemPrompt(e.target.value)}
+                placeholder={t('agent.systemPromptPlaceholder')}
+                rows={3}
+                className="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm"
+              />
+            </div>
+          </TabsContent>
+        </Tabs>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={submitting}>

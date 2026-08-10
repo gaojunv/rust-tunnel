@@ -17,6 +17,7 @@ import {
 import type { SessionConfigOption } from '../../types';
 import { currentOptionLabel } from './sessionConfig';
 import { listAgentSelectableModels } from '../../api/agentModels';
+import ModelPicker from './ModelPicker';
 
 interface Props {
   model: string;
@@ -99,41 +100,13 @@ export default function SessionSettingsMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-56">
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger className="flex justify-between gap-4 text-xs">
-            <span>{t('agent.model')}</span>
-            <span className="max-w-28 truncate text-muted-foreground">{modelLabel}</span>
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            <DropdownMenuLabel className="text-xs">{t('agent.model')}</DropdownMenuLabel>
-            {data?.models.map((m) => (
-              <DropdownMenuItem
-                key={m.id}
-                onSelect={() => onModelChange(m.id)}
-                className="flex justify-between gap-4 text-xs"
-              >
-                <span>{m.label}</span>
-                {m.id === model && <Check className="h-3 w-3" />}
-              </DropdownMenuItem>
-            ))}
-            {!!data?.groups.length && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuLabel className="text-xs">{t('agent.modelGroups')}</DropdownMenuLabel>
-                {data.groups.map((g) => (
-                  <DropdownMenuItem
-                    key={g.id}
-                    onSelect={() => onModelChange(g.id)}
-                    className="flex justify-between gap-4 text-xs"
-                  >
-                    <span>{g.label}</span>
-                    {g.id === model && <Check className="h-3 w-3" />}
-                  </DropdownMenuItem>
-                ))}
-              </>
-            )}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
+        <ModelPicker
+          models={data?.models ?? []}
+          groups={data?.groups ?? []}
+          currentModel={model}
+          onSelect={onModelChange}
+          disabled={disabled}
+        />
         {configOptions.length > 0 && <DropdownMenuSeparator />}
         {configOptions.map((o) =>
           renderOptionSub(o, o.category === 'model' ? t('agent.agentModelHint') : undefined),

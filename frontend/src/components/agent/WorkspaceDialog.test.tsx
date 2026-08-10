@@ -79,7 +79,22 @@ const renderDialog = (editing?: AgentWorkspace) => {
   );
 };
 
-const selectEngine = (value: string) => {
+// Radix Tabs 默认卸载 inactive Tab 的内容（未加 forceMount），交互前需先切到对应 Tab。
+// Tabs 触发器带 aria-label，其可访问名即 i18n key 本身（mock 为 t: (k) => k）。
+// RovingFocus 在 mousedown 上处理聚焦+激活（automatic 模式），jsdom 的 fireEvent.click
+// 不带 focus 副作用不会触发切换，故先发 mouseDown 再 click，切换后内容挂载是异步的。
+const clickTab = async (name: string) => {
+  fireEvent.mouseDown(screen.getByRole('tab', { name }));
+  fireEvent.click(screen.getByRole('tab', { name }));
+  // 项目未引入 jest-dom，用原生属性断言 Tab 激活态
+  await waitFor(() => {
+    expect(screen.getByRole('tab', { name }).getAttribute('data-state')).toBe('active');
+  });
+};
+
+const selectEngine = async (value: string) => {
+  // 引擎下拉位于「引擎」Tab，先切换再交互
+  await clickTab('agent.tabEngine');
   fireEvent.change(screen.getByLabelText('agent.agentEngine'), { target: { value } });
 };
 
@@ -90,7 +105,7 @@ describe('WorkspaceDialog ACP config', () => {
     expect(screen.queryByLabelText('agent.workspaceLlmModel')).toBeNull();
     expect(screen.queryByPlaceholderText('agent.agentPathPlaceholder')).toBeNull();
 
-    selectEngine('gemini');
+    await selectEngine('gemini');
     // path 输入框 + LLM 模型下拉出现；仅启用的模型/组可选（带类型前缀）
     expect(screen.getByPlaceholderText('agent.agentPathPlaceholder')).toBeTruthy();
     const modelSelect = screen.getByLabelText('agent.workspaceLlmModel') as HTMLSelectElement;
@@ -111,15 +126,17 @@ describe('WorkspaceDialog ACP config', () => {
   it('shows docker-unsupported hint when engine chosen in docker runtime', async () => {
     renderDialog();
     fireEvent.click(screen.getByText('agent.runtimeDocker'));
-    selectEngine('claude-code');
+    await selectEngine('claude-code');
     expect(screen.getByText('agent.acpDockerUnsupportedHint')).toBeTruthy();
     // 切回内置引擎 → 提示消失
-    selectEngine('');
+    await selectEngine('');
     expect(screen.queryByText('agent.acpDockerUnsupportedHint')).toBeNull();
   });
 
   it('edit mode prefills ACP fields and submits them via PUT', async () => {
     renderDialog(editingWs);
+    // 引擎字段位于「引擎」Tab，先切换（Radix 默认卸载 inactive 内容）
+    await clickTab('agent.tabEngine');
     // 预填：引擎、路径、模型
     expect((screen.getByLabelText('agent.agentEngine') as HTMLSelectElement).value).toBe('gemini');
     expect(
@@ -161,7 +178,7 @@ describe('WorkspaceDialog ACP config', () => {
     fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
       target: { value: '/workspace' },
     });
-    selectEngine('gemini');
+    await selectEngine('gemini');
     fireEvent.change(screen.getByPlaceholderText('agent.agentPathPlaceholder'), {
       target: { value: '/opt/gemini' },
     });
@@ -246,8 +263,10 @@ describe('parseOverrides / serializeOverrides', () => {
 });
 
 describe('WorkspaceDialog config overrides UI', () => {
-  it('编辑模式回填已有 overrides 行', () => {
+  it('编辑模式回填已有 overrides 行', async () => {
     renderDialog({ ...editingWs, agent_config_overrides: '{"model":"sonnet"}' });
+    // overrides 行位于「引擎」Tab，先切换
+    await clickTab('agent.tabEngine');
     expect((screen.getByLabelText('agent.configOverrides key 1') as HTMLInputElement).value).toBe(
       'model',
     );
@@ -258,6 +277,8 @@ describe('WorkspaceDialog config overrides UI', () => {
 
   it('编辑模式：原有 overrides 被删空后提交发送 "{}" 清空', async () => {
     renderDialog({ ...editingWs, agent_config_overrides: '{"model":"sonnet"}' });
+    // overrides 行位于「引擎」Tab，先切换
+    await clickTab('agent.tabEngine');
     // 删除唯一一行
     fireEvent.click(screen.getByLabelText('agent.configOverrideRemove 1'));
     fireEvent.click(screen.getByText('common.save'));
@@ -281,7 +302,7 @@ describe('WorkspaceDialog config overrides UI', () => {
     fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
       target: { value: '/workspace' },
     });
-    selectEngine('claude-code');
+    await selectEngine('claude-code');
     fireEvent.click(screen.getByText('agent.configOverrideAdd'));
     fireEvent.change(screen.getByLabelText('agent.configOverrides key 1'), {
       target: { value: 'model' },
@@ -316,7 +337,7 @@ describe('WorkspaceDialog config overrides UI', () => {
     fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
       target: { value: '/p' },
     });
-    selectEngine('claude-code');
+    await selectEngine('claude-code');
     fireEvent.click(screen.getByText('agent.create'));
     await waitFor(() => {
       expect(api.createAgentWorkspace).toHaveBeenCalled();

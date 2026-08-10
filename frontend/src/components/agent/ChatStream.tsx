@@ -16,6 +16,7 @@ import ApprovalCard from './ApprovalCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import SessionSettingsMenu from './SessionSettingsMenu';
+import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions } from './sessionConfig';
 import type { SessionConfigOption } from '../../types';
@@ -121,7 +122,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         setRunning(true);
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
         timeoutRef.current = globalThis.setTimeout(() => {
-          setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${tRef.current('agent.responseTimeout')}` }]);
+          setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
           runningRef.current = false;
           setRunning(false);
           timeoutRef.current = null;
@@ -363,7 +364,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     clearRunningTimeout();
     // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
     timeoutRef.current = globalThis.setTimeout(() => {
-      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${tRef.current('agent.responseTimeout')}` }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
       expirePendingApprovals();
       stopRunning();
     }, RUNNING_TIMEOUT_MS);
@@ -543,7 +544,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 不进气泡流 → 冲掉缓冲后断开流式气泡再追加独立行
         flushChunks();
         breakStream();
-        setItems((prev) => [...prev, { kind: 'assistant', content: `ℹ️ ${msg.message ?? ''}` }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: msg.message ?? '' }]);
       } else if (msg.type === 'stopped') {
         // 服务端确认取消（本连接或另一标签页发起的 cancel 都会广播到本连接的处理逻辑）
         flushChunks();
@@ -607,7 +608,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         }
         flushChunks();
         breakStream();
-        setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${msg.message}` }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: msg.message ?? '' }]);
         stopRunning();
         // 回合以错误终态结束，未响应的审批卡片一并过期
         expirePendingApprovals();
@@ -624,7 +625,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         if (runningRef.current) {
           setItems((prev) => [
             ...prev,
-            { kind: 'assistant', content: `⚠️ ${tRef.current('agent.connectionInterrupted')}` },
+            { kind: 'system', systemTone: 'warning', content: tRef.current('agent.connectionInterrupted') },
           ]);
         }
         stopRunning();
@@ -757,13 +758,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
       return;
     }
     try {
       ws.send(JSON.stringify({ type: 'user_message', content: text, refs }));
     } catch {
-      setItems((prev) => [...prev, { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
       return;
     }
     setItems((prev) => [...prev, { kind: 'user', content: text }]);
@@ -789,7 +790,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     stopRunning();
     // 本地停止路径同样作废未响应的审批卡片（cancel 帧可能因断线永远不回来）
     expirePendingApprovals();
-    setItems((prev) => [...prev, { kind: 'assistant', content: `⏹️ ${t('agent.stopped')}` }]);
+    setItems((prev) => [...prev, { kind: 'system', systemTone: 'stopped', content: t('agent.stopped') }]);
   };
 
   const handleModelChange = (id: string) => {
@@ -805,7 +806,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         onModelChange(prev);
         setItems((prevItems) => [
           ...prevItems,
-          { kind: 'assistant', content: `⚠️ ${t('agent.modelUpdateFailed')}: ${getApiErrorMessage(err)}` },
+          { kind: 'system', systemTone: 'error', content: `${t('agent.modelUpdateFailed')}: ${getApiErrorMessage(err)}` },
         ]);
       });
   };
@@ -842,7 +843,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       setConfigOptions(prev);
       setItems((prevItems) => [
         ...prevItems,
-        { kind: 'assistant', content: `⚠️ ${t('agent.connectionLost')}` },
+        { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') },
       ]);
     }
   };
@@ -868,9 +869,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
         {items.map((it, i) => (
-          it.kind === 'approval'
-            ? <ApprovalCard key={i} item={it} onRespond={respondApproval} />
-            : <MessageBubble key={i} item={it} />
+          it.kind === 'system'
+            ? <SystemMessage key={i} tone={it.systemTone} content={it.content} />
+            : it.kind === 'approval'
+              ? <ApprovalCard key={i} item={it} onRespond={respondApproval} />
+              : <MessageBubble key={i} item={it} />
         ))}
         {running && (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

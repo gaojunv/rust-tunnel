@@ -10,8 +10,33 @@ interface Props {
 
 export default function ApprovalCard({ item, onRespond }: Props) {
   const { t } = useTranslation();
-  const pending = item.approvalStatus === 'pending';
+  const status = item.approvalStatus ?? 'pending';
+  const pending = status === 'pending';
   const options = item.approvalOptions;
+  // 三态视觉区分：pending 保持琥珀高亮；approved 走 emerald；denied 走
+  // destructive；expired 被动过期 → 灰色 + 虚线边框（区别于用户主动拒绝）
+  const CARD_CLS: Record<string, string> = {
+    pending: 'border-amber-500/50 bg-amber-500/10',
+    approved: 'border-emerald-500/50 bg-emerald-500/10',
+    denied: 'border-destructive/50 bg-destructive/10',
+    expired: 'border-dashed border-border bg-muted/30 opacity-70',
+  };
+  const ICON_CLS: Record<string, string> = {
+    pending: 'text-amber-500',
+    approved: 'text-emerald-600',
+    denied: 'text-destructive',
+    expired: 'text-muted-foreground',
+  };
+  // 终态徽章（替换原先底部状态文案）：复用既有 i18n key，不硬编码
+  const BADGE_CLS: Record<string, string> = {
+    approved: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600',
+    denied: 'border-destructive/40 bg-destructive/10 text-destructive',
+    expired: 'border-border bg-muted text-muted-foreground',
+  };
+  const badgeText =
+    status === 'approved' ? `✓ ${t('agent.approved')}`
+    : status === 'denied' ? `✗ ${t('agent.denied')}`
+    : t('agent.approvalExpired');
   // ACP 权限选项语义映射：allow_* → 放行（allow_always 附带本会话记住），
   // reject_* → 拒绝；自定义 kind 走中性样式。allow 类点选后卡片显 ✓。
   const isAllow = (kind: string | undefined) => kind?.startsWith('allow') ?? false;
@@ -30,15 +55,20 @@ export default function ApprovalCard({ item, onRespond }: Props) {
   };
 
   return (
-    <div className={`rounded-lg border p-3 text-sm ${pending ? 'border-amber-500/50 bg-amber-500/10' : 'border-border bg-muted/30 opacity-70'}`}>
+    <div className={`rounded-lg border p-3 text-sm ${CARD_CLS[status]}`}>
       <div className="mb-1.5 flex items-center gap-1.5 font-medium">
-        <ShieldAlert className="h-4 w-4 text-amber-500" />
+        <ShieldAlert className={`h-4 w-4 ${ICON_CLS[status]}`} />
         {t('agent.approvalRequired')}: <code>{item.approvalTool}</code>
+        {!pending && (
+          <span className={`ml-auto inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${BADGE_CLS[status]}`}>
+            {badgeText}
+          </span>
+        )}
       </div>
       <pre className="mb-2 overflow-x-auto whitespace-pre-wrap break-all rounded bg-background/60 px-2 py-1.5 text-xs">
         {item.approvalSummary}
       </pre>
-      {pending ? (
+      {pending && (
         options && options.length > 0 ? (
           // ACP 选项透传：每个选项一个按钮，用户点选回传 option_id
           <div className="flex flex-wrap gap-2">
@@ -67,12 +97,6 @@ export default function ApprovalCard({ item, onRespond }: Props) {
             </Button>
           </div>
         )
-      ) : (
-        <p className="text-xs text-muted-foreground">
-          {item.approvalStatus === 'approved' && `✓ ${t('agent.approved')}`}
-          {item.approvalStatus === 'denied' && `✗ ${t('agent.denied')}`}
-          {item.approvalStatus === 'expired' && t('agent.approvalExpired')}
-        </p>
       )}
     </div>
   );

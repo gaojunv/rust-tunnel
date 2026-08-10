@@ -148,7 +148,11 @@ function ToolCard({ item }: { item: ChatItem }) {
   const [open, setOpen] = useState(false);
   const summary = toolSummary(item.toolName, item.toolKind, item.toolArgs);
   const Icon = KIND_ICON[item.toolKind ?? 'other'] ?? Wrench;
-  const isError = resolveToolStatus(item) === 'failed';
+  const status = resolveToolStatus(item);
+  const isError = status === 'failed';
+  // 不确定进度条：工具仍在执行（pending/in_progress/running，result 未产出）时
+  // 在卡片头部下方显示一条呼吸动画进度条，替代静态转圈的区域性弱提示
+  const isRunning = status !== 'completed' && status !== 'failed';
 
   return (
     <div>
@@ -172,6 +176,11 @@ function ToolCard({ item }: { item: ChatItem }) {
           )}
         </span>
       </button>
+      {isRunning && (
+        <div className="mt-1.5 h-0.5 w-full overflow-hidden rounded bg-muted">
+          <div className="h-full w-1/3 animate-pulse rounded bg-primary/60" />
+        </div>
+      )}
       {open && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {item.toolDiffs && item.toolDiffs.length > 0 && <ToolDiffView diffs={item.toolDiffs} />}

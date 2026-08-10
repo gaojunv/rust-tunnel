@@ -138,6 +138,9 @@ describe('AgentPage', () => {
     const deleteButtons = screen.getAllByLabelText('agent.deleteSession');
     fireEvent.click(deleteButtons[0]);
 
+    // 删除改为确认 Dialog（SessionBar 不再用 window.confirm）：点「删除」确认后才调用 API
+    fireEvent.click(await screen.findByText('common.delete'));
+
     await waitFor(() => expect(api.deleteAgentSession).toHaveBeenCalledWith('s1'));
 
     // 回引导态：不自动重选任何会话（即使 refetch 后列表只剩 s2）
