@@ -86,6 +86,10 @@ struct SpawnedAgent {
     /// 连接任务的通知/请求处理器**每次事件**都经 [`current_ws_tx`] 动态读此
     /// 字段，重连（dedup 刷新）后流式帧自动切到新连接。
     ws_tx: Option<mpsc::Sender<serde_json::Value>>,
+    /// 当前注册 WS 通道所属的连接唯一标识：`detach_ws_tx` 按它判断「这个
+    /// teardown 是不是注册方本人」。刷新竞态下旧连接 teardown 晚于新连接注册，
+    /// 若无条件清空会误清新连接通道（tool_result/done 全丢）。
+    ws_conn_id: u64,
     /// 回合进行中标记：prompt 置位、PromptResponse 到达/cancel 清位。防并发
     /// prompt（ACP 单连接不支持并发回合；WS session_lock 只串行化分派，
     /// 不跨异步回合）。
@@ -251,6 +255,7 @@ impl AcpBridge {
         session_id: &str,
         workspace: &AgentWorkspaceRecord,
         ws_tx: mpsc::Sender<serde_json::Value>,
+        conn_id: u64,
     ) -> Result<(), String> {
         // 幂等守卫 + 占位登记 + pump 基础设施一次锁内完成：并发 ensure_session
         // （同一 session 的多个 WS 连接/多条消息）看到占位条目直接短路，杜绝
@@ -266,9 +271,11 @@ impl AcpBridge {
             match sessions.get(session_id) {
                 Some(agent) if !agent.exited => {
                     // 已有活跃进程：仅刷新事件通道（多标签页/重连共用同一进程；
-                    // 事件推给最新连接，避免断线后的旧 sender 占位）。
+                    // 事件推给最新连接，避免断线后的旧 sender 占位）。同时记录
+                    // 本连接的 conn_id，供 detach 按身份清空。
                     if let Some(a) = sessions.get_mut(session_id) {
                         a.ws_tx = Some(ws_tx.clone());
+                        a.ws_conn_id = conn_id;
                     }
                     return Ok(());
                 }
@@ -295,6 +302,7 @@ impl AcpBridge {
                     stdout_tx: Some(stdout_tx),
                     client_id: workspace.client_id.clone(),
                     ws_tx: Some(ws_tx.clone()),
+                    ws_conn_id: conn_id,
                     busy: false,
                     cancelled_turns: std::collections::HashSet::new(),
                     turn_generation: 0,
@@ -1017,9 +1025,16 @@ impl AcpBridge {
     /// 断开/连接关闭时清空条目里的 WS 事件通道：ACP 回合在连接关闭后仍可能
     /// 存活，保留旧 sender 会让通知处理器 try_send 持续成功而事件无人消费
     /// （更严重的是 reaper 据此刷新活动，误以为会话仍然活跃）。
-    pub async fn detach_ws_tx(&self, session_id: &str) {
+    ///
+    /// 只清本连接自己注册的通道（按 `conn_id` 匹配）：刷新/重连时旧连接的
+    /// close 检测可能晚于新连接注册（`ensure_session` 已把 `ws_tx` 换成新连接
+    /// 的通道），旧连接 teardown 若无条件置 None 会把新连接的通道一起清掉
+    /// → 后续 tool_result/done 帧全部丢弃、前端 running 卡死。
+    pub async fn detach_ws_tx(&self, session_id: &str, my_conn_id: u64) {
         if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
-            a.ws_tx = None;
+            if a.ws_conn_id == my_conn_id {
+                a.ws_tx = None;
+            }
         }
     }
 
@@ -1449,6 +1464,11 @@ async fn persist_acp_frame(
             }
         }
         "tool_call" => {
+            // 工具边界 flush：把此前缓冲的 assistant 文本/thought 先落库，再落
+            // tool_call 行——DB rowid 顺序 = 对话顺序（文本出现在其调用的工具
+            // 之前）。否则中途刷新时 DB 里缺当前工具之前的文本段，前端历史里
+            // 这段文本消失（顺序乱）。终态 flush 只冲最后一段，行为不变。
+            flush_acp_turn_buffers(db, sessions, sid).await;
             let call = serde_json::json!([{
                 "id": frame["id"],
                 "name": frame["name"],
@@ -1493,6 +1513,9 @@ async fn persist_acp_frame(
             }
         }
         "plan" => {
+            // 同 tool_call：plan 前若有已缓冲文本（ACP 常先出 plan 再出正文，
+            // 但顺序不定），先落库保证边界前文本不丢。
+            flush_acp_turn_buffers(db, sessions, sid).await;
             let msg_id = format!("{:032x}", rand::random::<u128>());
             let entries = frame["entries"].to_string();
             if let Err(e) = db
@@ -1830,6 +1853,10 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    /// 测试固定连接 id：setup_handshake 注册的 ws_tx 属此连接，detach 用例
+    /// 用同一 id 验证「自己 detach 才清空」。
+    const TEST_CONN_ID: u64 = 42;
+
     /// 构造 workspace 记录（agent_type 已配置 + host 运行时）。
     fn acp_workspace() -> AgentWorkspaceRecord {
         AgentWorkspaceRecord {
@@ -1866,6 +1893,7 @@ mod tests {
             stdout_tx: None,
             client_id: "nas".into(),
             ws_tx: None,
+            ws_conn_id: 0,
             busy: false,
             cancelled_turns: std::collections::HashSet::new(),
             turn_generation: 0,
@@ -1908,6 +1936,7 @@ mod tests {
         agent.agent_io = Some(agent_io);
         agent.stdout_tx = Some(stdout_tx.clone());
         agent.ws_tx = Some(ws_tx.clone());
+        agent.ws_conn_id = TEST_CONN_ID;
         bridge.sessions.lock().await.insert("sess-1".into(), agent);
 
         tokio::spawn(run_stdio_pump(
@@ -2086,7 +2115,7 @@ mod tests {
         let bridge = mock_bridge(|_| unreachable!("docker rejection should not spawn")).await;
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &docker_workspace(), ws_tx)
+            .ensure_session("sess-1", &docker_workspace(), ws_tx, TEST_CONN_ID)
             .await
             .expect_err("docker workspace should be rejected");
         assert!(err.contains("docker"), "err: {err}");
@@ -2100,7 +2129,7 @@ mod tests {
         ws.llm_model_id = None;
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &ws, ws_tx)
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
             .await
             .expect_err("no model config should be rejected");
         assert!(err.contains("未配置"), "err: {err}");
@@ -2180,7 +2209,7 @@ mod tests {
         ws.llm_model_id = None;
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &ws, ws_tx)
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
             .await
             .expect_err("spawn should be attempted past the model gate");
         assert!(
@@ -2199,7 +2228,7 @@ mod tests {
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &ws, ws_tx)
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
             .await
             .expect_err("offline client should fail");
         assert!(err.contains("llm proxy start failed"), "err: {err}");
@@ -2222,7 +2251,7 @@ mod tests {
         ws.agent_type = "cursor".into();
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &ws, ws_tx)
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
             .await
             .expect_err("unsupported agent type should fail locally");
         assert!(err.contains("unsupported agent type"), "err: {err}");
@@ -2238,7 +2267,7 @@ mod tests {
         let mut ws = acp_workspace();
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
-        let _ = bridge.ensure_session("sess-1", &ws, ws_tx).await;
+        let _ = bridge.ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID).await;
 
         let err = bridge
             .wait_ready("sess-1")
@@ -2281,7 +2310,7 @@ mod tests {
         let ws = acp_workspace();
         for _ in 0..2 {
             let (ws_tx, _rx) = mpsc::channel(16);
-            let _ = bridge.ensure_session("sess-1", &ws, ws_tx).await;
+            let _ = bridge.ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID).await;
         }
         let err = bridge
             .wait_ready("sess-1")
@@ -2325,7 +2354,7 @@ mod tests {
             .insert("sess-1".into(), spawned_agent());
         let (ws_tx, _rx) = mpsc::channel(16);
         bridge
-            .ensure_session("sess-1", &acp_workspace(), ws_tx)
+            .ensure_session("sess-1", &acp_workspace(), ws_tx, TEST_CONN_ID)
             .await
             .expect("dedup should return Ok");
     }
@@ -2344,7 +2373,7 @@ mod tests {
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
         let err = bridge
-            .ensure_session("sess-1", &ws, ws_tx)
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
             .await
             .expect_err("exited entry must attempt respawn, not short-circuit Ok");
         assert!(err.contains("llm proxy start failed"), "err: {err}");
@@ -2815,9 +2844,10 @@ mod tests {
         setup_handshake(&bridge, ws_tx_a).await;
 
         // 新连接 B：重连 → ensure_session dedup 把条目里的 ws_tx 刷新到 B。
+        // B 用独立 conn_id（旧连接 A 是 TEST_CONN_ID），验证事件按通道切到 B。
         let (ws_tx_b, mut ws_rx_b) = mpsc::channel::<serde_json::Value>(16);
         bridge
-            .ensure_session("sess-1", &acp_workspace(), ws_tx_b)
+            .ensure_session("sess-1", &acp_workspace(), ws_tx_b, TEST_CONN_ID + 1)
             .await
             .expect("reconnect dedup should refresh ws_tx");
 
@@ -3023,13 +3053,24 @@ mod tests {
         }
 
         let rows = db.agent_list_messages("sess-1").await.unwrap();
-        // assistant 文本（缓冲到终态落一行）
+        // assistant 文本：在 plan/tool 边界 flush 成一行（不再攒到终态），
+        // 保证 DB rowid 顺序 = 对话顺序——文本行必须排在 tool_calls 行之前，
+        // 刷新后历史里正文才出现在其调用的工具之前。
         let texts: Vec<_> = rows
             .iter()
             .filter(|r| r.kind == "message" && r.name.is_none())
             .collect();
         assert_eq!(texts.len(), 1);
         assert_eq!(texts[0].content, "hello from mock");
+        let first_text = rows
+            .iter()
+            .position(|r| r.kind == "message" && r.name.is_none())
+            .unwrap();
+        let first_call = rows.iter().position(|r| r.kind == "tool_calls").unwrap();
+        assert!(
+            first_text < first_call,
+            "text row should precede tool_calls row (boundary flush): {rows:?}"
+        );
         // thought 行
         let thoughts: Vec<_> = rows
             .iter()
@@ -3095,8 +3136,9 @@ mod tests {
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
 
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-        setup_handshake(&bridge, ws_tx).await;
-        bridge.detach_ws_tx("sess-1").await; // 真实断线：清空条目 WS 通道
+        setup_handshake(&bridge, ws_tx.clone()).await;
+        // 真实断线：清空条目 WS 通道（本连接自己的通道，sender 通道身份匹配）
+        bridge.detach_ws_tx("sess-1", TEST_CONN_ID).await;
         bridge.prompt("sess-1", "hello").await.expect("prompt");
         // 等终态回调落库完成：轮询 DB（断线下无终态帧，只能轮询落库结果）。
         // break 条件要求 tool_result 与终态 flush 的文本行（kind='message' 且
@@ -3121,6 +3163,44 @@ mod tests {
             rows.iter().any(|r| r.kind == "message" && r.name.is_none()),
             "assistant text should persist without ws consumer"
         );
+    }
+
+    #[tokio::test]
+    async fn test_detach_ws_tx_only_clears_own_connection() {
+        // 刷新/重连竞态：旧连接 close 检测晚于新连接注册（ensure_session 已把
+        // ws_tx 换成新连接的 sender）。旧连接 teardown 必须只清自己的通道，否则
+        // 新连接后续 tool_result/done 全部丢弃（前端 running 卡死）。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let (tx, _rx) = mpsc::channel::<serde_json::Value>(16);
+        const OLD: u64 = 1;
+        const NEW: u64 = 2;
+
+        // 旧连接独占通道（ws_conn_id=OLD）：其 teardown 应清空
+        let mut a = spawned_agent();
+        a.ws_tx = Some(tx.clone());
+        a.ws_conn_id = OLD;
+        bridge.sessions.lock().await.insert("sess-1".into(), a);
+        bridge.detach_ws_tx("sess-1", OLD).await;
+        assert!(
+            bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_none(),
+            "own detach should clear ws_tx"
+        );
+
+        // 新连接已注册（ws_conn_id=NEW）：旧连接晚到的 teardown 不得清掉它
+        let mut a = spawned_agent();
+        a.ws_tx = Some(tx.clone());
+        a.ws_conn_id = NEW;
+        bridge.sessions.lock().await.insert("sess-1".into(), a);
+        bridge.detach_ws_tx("sess-1", OLD).await;
+        assert!(
+            bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_some(),
+            "old connection teardown must not clear newer connection's ws_tx"
+        );
+        // 新连接自己的 teardown 仍能清空
+        bridge.detach_ws_tx("sess-1", NEW).await;
+        assert!(bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_none());
     }
 
     // ── workspace 级 config overrides 注入 ──────────────────────

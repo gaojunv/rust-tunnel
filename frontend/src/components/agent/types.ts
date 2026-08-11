@@ -7,6 +7,9 @@ export interface ChatItem {
   /** kind='system'：提示行语气（状态/警告/错误/停止），缺省按 info 渲染 */
   systemTone?: 'info' | 'warning' | 'error' | 'stopped';
   toolName?: string;
+  /** 工具调用稳定身份（tool_call_id）：history 装载与 live WS 帧按它去重/匹配，
+   *  防止刷新后同一工具被渲染成两张卡（一张历史孤儿、一张 live 追加）。 */
+  toolId?: string;
   toolArgs?: string;
   toolResult?: string;
   /** ACP 工具分类（图标/详情渲染依据）；runner 旧数据无此字段 */

@@ -251,6 +251,76 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('✓')).toBeTruthy();
   });
 
+  it('renders runner orphan tool_calls (column tool_call_id null) as failed card', async () => {
+    // runner 旧格式：tool_calls 行整行 tool_call_id 列为 null，但 JSON 内每个
+    // 调用带 id。回合在工具执行中被取消（tool_result 永不到达）时，若只认列
+    // 上的 tool_call_id，这些工具刷新后会从聊天区消失。按 JSON 内 id 与
+    // tool_result 配对，未配对的渲染 failed 占位卡。
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: null, name: null, kind: 'tool_calls', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    expect(await screen.findByText('Read')).toBeTruthy();
+    expect(screen.getByText('✗')).toBeTruthy();
+  });
+
+  it('dedups live tool_call against history orphan card (no duplicate)', async () => {
+    // 刷新后 live tool_call 与 history 已渲染的孤儿卡片是同一工具（tool_call
+    // 已落库、tool_result 未到）。按 toolId 就地升级状态，不追加第二张卡——
+    // 否则 tool_result 只 patch 一张，另一张永远 running（Bug 复现）。
+    (listAgentMessages as Mock).mockResolvedValue([
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
+    ]);
+    renderChat();
+    // 半截装载：孤儿卡（failed ✗）已渲染
+    expect(await screen.findByText('Read')).toBeTruthy();
+    expect(screen.getByText('✗')).toBeTruthy();
+    // live tool_call 同 id 到达：就地升级为运行中，不新增卡片
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', tool_kind: 'read', status: 'in_progress' });
+    });
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+    expect(screen.queryByText('✗')).toBeNull();
+    // 结果到达：按 toolId 精确匹配 → 完成
+    act(() => {
+      wsInstance!.emit({ type: 'tool_result', id: 'c1', name: 'list_dir', status: 'completed', result: 'src/' });
+    });
+    expect(screen.getByText('✓')).toBeTruthy();
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+  });
+
+  it('reconciles complete history on done after a mid-turn partial load', async () => {
+    // 半截装载（刷新时回合仍在跑）：DB 当时缺终态 flush 的文本/结果。done
+    // 到达后服务端已完整落库——重置 loadedRef 让 refetch 重渲染完整历史：
+    // 孤儿卡变 completed、终态文本补全、running 兜底不复发（对账重载跳过 heuristic）。
+    const orphanCalls = JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]);
+    const partial = [
+      { id: 'm1', session_id: 's1', role: 'user', content: '看下目录', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: orphanCalls, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-08' },
+    ];
+    const complete = [
+      ...partial,
+      { id: 'm3', session_id: 's1', role: 'tool', content: 'src/ tests/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-08' },
+      { id: 'm4', session_id: 's1', role: 'assistant', content: '完成', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
+    ];
+    (listAgentMessages as Mock).mockResolvedValueOnce(partial).mockResolvedValue(complete);
+    renderChat();
+    // 半截装载：孤儿卡 failed + running 兜底
+    expect(await screen.findByText('Read')).toBeTruthy();
+    expect(screen.getByText('✗')).toBeTruthy();
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // done → invalidate → refetch 返回完整历史 → 对账重载
+    await act(async () => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(await screen.findByText('完成')).toBeTruthy();
+    expect(screen.getByText('✓')).toBeTruthy();
+    // running 兜底不复发（对账重载跳过 running heuristic）
+    expect(screen.queryByText('agent.running')).toBeNull();
+  });
+
   it('merges streamed assistant_chunk deltas into one bubble', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();

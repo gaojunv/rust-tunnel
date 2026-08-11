@@ -95,6 +95,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 会话内最新 history 的 ref 镜像：done/重连后按状态决定是否需要重新装载
   // （React Query 后台 refetch 也会更新 history，不能仅凭引用变化就覆盖聊天区）
   const historyRef = useRef<typeof history>(undefined);
+  // 本次装载是否为「半截装载」：history 末尾是 tool_calls/tool_result 行（回合在
+  // 工具执行中被刷新/断线打断）。此时 DB 可能仍缺终态 flush 的文本/结果——done
+  // 到达后允许 history refetch 重渲染完整历史（见 done 处理器），否则 loadedRef
+  // 守卫会永远挡住对账。
+  const partialLoadRef = useRef(false);
+  // done 后对账重载的标记：history effect 读到它时跳过 running 兜底 heuristic
+  // （对账重载的末行可能是 tool_result，按现状会误置 running=true——回合其实已终态）。
+  const reconcileRef = useRef(false);
 
   // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）。
   // 关键：staleTime 0 + refetchOnMount 'always'。staleTime Infinity 会留下陈旧
@@ -113,14 +121,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // 自愈：已装载但聊天区为空而历史转非空（陈旧空缓存被 refetch 纠正）→ 允许重装
     if (loadedRef.current && !(itemsRef.current.length === 0 && history.length > 0)) return;
     loadedRef.current = true;
-    // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
-    // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true），此时
-    // 发送会撞 "ACP 回合进行中" busy 守卫、用户消息被静默吞掉。把 running 置 true
-    // 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧或 10 分钟超时解除。
-    // 误置（进程其实已退）的代价只是发送被禁用一段时间，优于消息被吞。
-    if (history.length > 0) {
+    // done 后的对账重载（见 done 处理器）：只重建 items、跳过 running 兜底——
+    // 该重载的末行可能是 tool_result（回合在工具执行中结束），按现状会误置
+    // running=true 并锁死发送按钮 10 分钟，而回合其实已终态。
+    const isReconcileReload = reconcileRef.current;
+    reconcileRef.current = false;
+    if (!isReconcileReload && history.length > 0) {
+      // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
+      // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true），此时
+      // 发送会撞 "ACP 回合进行中" busy 守卫、用户消息被静默吞掉。把 running 置 true
+      // 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧或 10 分钟超时解除。
+      // 误置（进程其实已退）的代价只是发送被禁用一段时间，优于消息被吞。
       const last = history[history.length - 1];
       if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current) {
+        // 半截装载标记：done 到达时允许 refetch 重渲染完整历史（对账）
+        partialLoadRef.current = true;
         runningRef.current = true;
         setRunning(true);
         if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -226,6 +241,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           kind: 'tool',
           content: '',
           toolName: call.name,
+          toolId: m.tool_call_id ?? undefined,
           toolArgs: call.args,
           toolResult: m.content,
           toolStatus: 'completed',
@@ -256,6 +272,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               kind: 'tool',
               content: '',
               toolName: call.name,
+              toolId: m.tool_call_id,
               toolArgs: call.args,
               toolResult: undefined,
               toolStatus: 'failed',
@@ -263,6 +280,32 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               toolDiffs: call.toolDiffs,
               toolLocations: call.toolLocations,
             });
+          }
+        } else if (!m.tool_call_id && m.tool_calls) {
+          // runner 旧格式：整行 tool_call_id 列为空，但 JSON 内每个调用带 id。
+          // 按 id 与 tool_result 行配对——未配对的（回合在工具执行中被取消）也
+          // 渲染 failed 占位卡，否则这些工具刷新后从聊天区消失。
+          try {
+            for (const c of JSON.parse(m.tool_calls) as { id?: string }[]) {
+              if (!c.id || pairedResultIds.has(c.id)) continue;
+              const call = callArgs.get(c.id);
+              if (call) {
+                loaded.push({
+                  kind: 'tool',
+                  content: '',
+                  toolName: call.name,
+                  toolId: c.id,
+                  toolArgs: call.args,
+                  toolResult: undefined,
+                  toolStatus: 'failed',
+                  toolKind: call.toolKind,
+                  toolDiffs: call.toolDiffs,
+                  toolLocations: call.toolLocations,
+                });
+              }
+            }
+          } catch {
+            /* ignore malformed tool_calls */
           }
         }
       } else if (m.kind === 'message' && m.name === 'thought' && m.content) {
@@ -460,19 +503,52 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 再断开流式气泡追加工具卡片
         flushChunks();
         breakStream();
-        setItems((prev) => [
-          ...prev,
-          {
-            kind: 'tool',
-            content: '',
-            toolName: msg.name,
-            toolArgs: msg.args,
-            toolKind: msg.tool_kind,
-            toolStatus: msg.status ?? 'in_progress',
-            toolDiffs: msg.diffs,
-            toolLocations: msg.locations,
-          },
-        ]);
+        setItems((prev) => {
+          // 去重：刷新/重连时 live tool_call 可能与 history 已渲染的孤儿卡片
+          // 是同一工具（tool_call 已落库、tool_result 未到）。按 toolId 就地
+          // 更新（覆盖历史误判的 failed 状态为真实运行态），而不是再追加一张
+          // 重复卡——否则 tool_result 只 patch 一张，另一张永远 running。
+          if (msg.id) {
+            const idx = prev.findIndex((it) => it.kind === 'tool' && it.toolId === msg.id);
+            if (idx >= 0) {
+              const cur = prev[idx];
+              // 卡片已有结果（历史里 tool_call+tool_result 均已落库，乱序帧又
+              // 重发了 tool_call）：不降级已完成卡片，忽略本帧即可。
+              if (cur.toolResult != null) return prev;
+              const next = [...prev];
+              // args 用有意义值合并（claude-code 首帧 rawInput 常是 {} 占位，
+              // 不能覆盖历史里已回填的真实参数）
+              const isNoop = (a?: string) => {
+                const t = (a ?? '').trim();
+                return t === '' || t === '{}';
+              };
+              next[idx] = {
+                ...cur,
+                toolName: msg.name ?? cur.toolName,
+                toolArgs: !isNoop(msg.args) ? msg.args : cur.toolArgs,
+                toolKind: msg.tool_kind ?? cur.toolKind,
+                toolStatus: msg.status ?? 'in_progress',
+                toolDiffs: msg.diffs ?? cur.toolDiffs,
+                toolLocations: msg.locations ?? cur.toolLocations,
+              };
+              return next;
+            }
+          }
+          return [
+            ...prev,
+            {
+              kind: 'tool',
+              content: '',
+              toolId: msg.id,
+              toolName: msg.name,
+              toolArgs: msg.args,
+              toolKind: msg.tool_kind,
+              toolStatus: msg.status ?? 'in_progress',
+              toolDiffs: msg.diffs,
+              toolLocations: msg.locations,
+            },
+          ];
+        });
       } else if (msg.type === 'tool_result') {
         if (msg.id) {
           pendingTools.delete(msg.id);
@@ -502,7 +578,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               toolLocations: next[i].toolLocations ?? msg.locations,
             };
           };
-          // 优先按 name 匹配（runner/旧帧语义）
+          // 权威匹配：按 toolId 精确命中（history 装载/live 追加的卡都带 id）。
+          // 刷新后同名工具可能出现多次（或 tool_result 缺 name），id 是唯一可靠
+          // 身份——比 name 扫描/「最早未完成」回退准确得多。
+          if (msg.id) {
+            const byId = next.findIndex((it) => it.kind === 'tool' && it.toolId === msg.id);
+            if (byId >= 0) {
+              patch(byId);
+              return next;
+            }
+          }
+          // 无 id 或 id 未命中：按 name 匹配（runner/旧帧语义）
           if (msg.name) {
             for (let i = next.length - 1; i >= 0; i--) {
               if (next[i].kind === 'tool' && next[i].toolName === msg.name && next[i].toolResult == null) {
@@ -564,6 +650,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 回合成功结束：服务端 5 分钟审批超时按 deny 继续回合，仍 pending 的
         // 卡片必须过期，否则 hasPendingApproval 恒 true 锁死发送按钮
         expirePendingApprovals();
+        // 半截装载对账：本次会话是「刷新/断线时回合仍在跑」加载的，DB 当时缺
+        // 终态 flush 的文本/结果（ACP 文本缓冲到终态落库）。done 到达时服务端
+        // 已 flush 完整落库——重置 loadedRef 让紧随的 refetch 重渲染完整历史
+        // （文本补全 + DB rowid 顺序），并置 reconcileRef 防 running heuristic 复发。
+        if (partialLoadRef.current) {
+          partialLoadRef.current = false;
+          reconcileRef.current = true;
+          loadedRef.current = false;
+        }
         // 刷新共享的历史缓存，让 ActivityBar 的 Git 面板拿到最新 tool 结果；
         // 不影响聊天区（history effect 有 loadedRef 守卫，不会重复装载）
         void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
@@ -903,8 +998,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           it.kind === 'system'
             ? <SystemMessage key={i} tone={it.systemTone} content={it.content} />
             : it.kind === 'approval'
-              ? <ApprovalCard key={i} item={it} onRespond={respondApproval} />
-              : <MessageBubble key={i} item={it} />
+              ? <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />
+              : <MessageBubble key={it.kind === 'tool' && it.toolId ? it.toolId : i} item={it} />
         ))}
         {running && (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">

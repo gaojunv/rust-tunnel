@@ -577,6 +577,10 @@ async fn inject_refs(
 async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: String) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+    // 本连接唯一标识：ensure_session 注册/刷新 ws_tx 时记录，teardown 时
+    // detach_ws_tx 按它判断「是否仍是我注册的通道」。刷新竞态下旧连接 close
+    // 晚于新连接注册，若无身份判断会误清新连接的通道（tool_result/done 全丢）。
+    let conn_id = rand::random::<u64>();
 
     // 推送任务：event_rx → WebSocket。对端断开导致 send 失败时不再 break，而是
     // 继续 drain event_rx——runner 内部仍是阻塞式 send().await，但只要接收端持续
@@ -654,7 +658,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     return;
                 };
                 if use_acp_path(&workspace) {
-                    if let Err(e) = bridge.ensure_session(&sid, &workspace, ws_tx).await {
+                    if let Err(e) = bridge.ensure_session(&sid, &workspace, ws_tx, conn_id).await {
                         // info 级：预 spawn 失败此前只在 debug 可见，用户首条
                         // 消息只能拿到 wait_ready 的泛化错误，排查困难。
                         tracing::info!(session_id = %sid, "pre-spawn acp agent failed: {e}");
@@ -820,7 +824,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     continue;
                 };
                 if let Err(e) = bridge
-                    .ensure_session(&session_id, &acp_workspace, event_tx.clone())
+                    .ensure_session(&session_id, &acp_workspace, event_tx.clone(), conn_id)
                     .await
                 {
                     let _ = event_tx
@@ -1062,7 +1066,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     if acp_active {
         if let Some(agent) = state.server_state.agent_state.as_ref() {
             if let Some(bridge) = agent.acp_bridge.as_ref() {
-                bridge.detach_ws_tx(&session_id).await;
+                // 只清本连接自己的通道：刷新时旧连接 teardown 晚于新连接注册，
+                // 无条件清空会误清新连接的 ws_tx（tool_result/done 全部丢失）。
+                bridge.detach_ws_tx(&session_id, conn_id).await;
             }
         }
     }
