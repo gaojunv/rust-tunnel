@@ -244,6 +244,55 @@ describe('MessageBubble tool card collapsing', () => {
     expect(header.textContent?.match(/src\/a\.ts/g)).toHaveLength(1);
   });
 
+  it('Edit args 与 title 均无路径时回退到 diffs 路径', () => {
+    // 回归（用户反馈 Bug）：ACP Edit 的 raw_input 为空占位（args='{}'）、title
+    // 只是别名（无内嵌路径），路径只经 content Diff 到达——头部摘要必须显示
+    // diffs 的目标文件，否则卡片只剩「Edit」。
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Edit',
+          toolKind: 'edit',
+          toolArgs: '{}',
+          toolDiffs: [{ path: 'src/a.ts', old_text: 'x', new_text: 'y' }],
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Edit');
+    expect(header.textContent).toContain('src/a.ts');
+  });
+
+  it('Edit args 与 title 均无路径时回退到 locations 路径', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Edit',
+          toolKind: 'edit',
+          toolArgs: '{}',
+          toolLocations: [{ path: 'src/b.ts', line: 3 }],
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Edit');
+    expect(header.textContent).toContain('src/b.ts');
+  });
+
+  it('args/title/diffs/locations 均无路径时头部仅显示工具名，不崩溃', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Edit', toolKind: 'edit', toolArgs: '{}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent?.trim()).toBe('Edit');
+  });
+
   it('进度条容器在完成后仍占位（不卸载），仅淡出', () => {
     const { container, rerender } = render(
       <MessageBubble

@@ -197,8 +197,15 @@ function ToolCard({ item }: { item: ChatItem }) {
   const { label, extra } = splitToolTitle(item.toolName, item.toolKind);
   // 摘要只显示一份：args 提取的结构化摘要优先（通常是绝对路径/命令），
   // 缺失时才用 title 内嵌目标（通常是相对路径）——两者同源，同显即用户反馈的
-  // 「标题双重路径」问题
-  const summary = toolSummary(item.toolName, item.toolKind, item.toolArgs) ?? extra;
+  // 「标题双重路径」问题；两者都无路径（如 ACP Edit 的 raw_input 为空占位、
+  // 路径只经 content Diff/locations 到达）时，退回 diffs/locations 的首个路径，
+  // 保证文件操作卡片头部始终能看到目标文件。
+  const summary =
+    toolSummary(item.toolName, item.toolKind, item.toolArgs) ??
+    extra ??
+    item.toolDiffs?.[0]?.path ??
+    item.toolLocations?.[0]?.path ??
+    null;
   const Icon = KIND_ICON[item.toolKind ?? 'other'] ?? Wrench;
   const status = resolveToolStatus(item);
   const isError = status === 'failed';
