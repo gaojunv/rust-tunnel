@@ -124,7 +124,7 @@ export function ProxyRuleDialog({ open, onOpenChange, editingRule }: ProxyRuleDi
         </DialogHeader>
         <form onSubmit={handleSubmit} className="space-y-5">
           {/* Name + Type */}
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div className="space-y-2">
               <label className="text-sm font-medium">{t('reverseProxy.dialog.name')}</label>
               <Input

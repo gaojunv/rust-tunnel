@@ -92,7 +92,7 @@ export function ChallengeStatusCard({ domain }: ChallengeStatusCardProps) {
         {getStatusBadge(status.status)}
       </CardHeader>
       <CardContent>
-        <div className="grid gap-4 md:grid-cols-3 text-sm">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3 text-sm">
           <div>
             <div className="text-muted-foreground">{t('acme.challenge.domain')}</div>
             <div className="font-mono">{status.domain}</div>

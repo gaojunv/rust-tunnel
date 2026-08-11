@@ -43,7 +43,7 @@ export default function ClientsPage() {
       <section className="card-aurora rounded-lg border bg-card p-4">
         <h2 className="mb-3 text-sm font-medium">{t('clients.clientToken')}</h2>
         <div className="flex flex-wrap items-center gap-4">
-          <code className="rounded bg-muted px-3 py-1.5 font-mono text-sm">
+          <code className="min-w-0 max-w-full break-all rounded bg-muted px-3 py-1.5 font-mono text-sm">
             {auth?.client_token ?? '...'}
           </code>
           {!confirmRotate ? (

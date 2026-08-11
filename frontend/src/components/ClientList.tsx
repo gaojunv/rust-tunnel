@@ -43,10 +43,11 @@ const ClientCard = ({ client, onSelectClient }: {
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs text-gray-500 dark:text-slate-400 mb-3">
-        <span>{t('clients.list.hostnameLabel')}: {client.hostname ?? t('clients.list.nA')}</span>
-        <span>{t('clients.list.versionLabel')}: {client.client_version ?? t('clients.list.nA')}</span>
-        <span>{t('clients.list.referencedLabel')}: {client.referenced_by_rules}</span>
-        <span>{t('clients.list.lastSeenLabel')}: {new Date(client.last_seen_at).toLocaleString()}</span>
+        {/* min-w-0 + break-words：长 hostname / lastSeen 不可断时也能在单元格内折行，避免撑破卡片 */}
+        <span className="min-w-0 break-words">{t('clients.list.hostnameLabel')}: {client.hostname ?? t('clients.list.nA')}</span>
+        <span className="min-w-0 break-words">{t('clients.list.versionLabel')}: {client.client_version ?? t('clients.list.nA')}</span>
+        <span className="min-w-0 break-words">{t('clients.list.referencedLabel')}: {client.referenced_by_rules}</span>
+        <span className="min-w-0 break-words">{t('clients.list.lastSeenLabel')}: {new Date(client.last_seen_at).toLocaleString()}</span>
       </div>
       <div className="flex justify-end">
         <button

@@ -37,7 +37,7 @@ function CollapsiblePre({ text, className }: { text: string; className?: string 
 
   return (
     <div className={className}>
-      <pre className="whitespace-pre-wrap text-xs text-muted-foreground">{shown}</pre>
+      <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{shown}</pre>
       {collapsible && (
         <button
           type="button"
@@ -299,7 +299,7 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
       ) : item.kind === 'plan' ? (
         <PlanBubble entries={item.planEntries ?? []} />
       ) : (
-        <div className="whitespace-pre-wrap">{item.content}</div>
+        <div className="whitespace-pre-wrap break-words">{item.content}</div>
       )}
     </div>
   );

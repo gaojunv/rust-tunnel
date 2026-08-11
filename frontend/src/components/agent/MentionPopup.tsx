@@ -58,7 +58,7 @@ export default function MentionPopup({
   }, [files, onFilesChange, onActiveIdxChange]);
 
   return (
-    <div className="absolute bottom-full left-0 mb-1 max-h-56 w-80 overflow-y-auto rounded-lg border bg-popover shadow-lg">
+    <div className="absolute bottom-full left-0 mb-1 max-h-56 w-80 max-w-full overflow-y-auto rounded-lg border bg-popover shadow-lg">
       {files.length === 0 && (
         <p className="px-3 py-2 text-xs text-muted-foreground">{t('agent.noMatchingFiles')}</p>
       )}

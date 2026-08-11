@@ -240,7 +240,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
               {t('kb.advanced')}
             </CollapsibleTrigger>
             <CollapsibleContent className="mt-3 space-y-4">
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
                   <Label>{t('kb.topK')}</Label>
                   <Input type="number" min={1} value={topK} onChange={(e) => setTopK(Number(e.target.value))} />

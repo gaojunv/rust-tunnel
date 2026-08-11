@@ -57,7 +57,7 @@ function StatsOverview() {
   ];
 
   return (
-    <div className="grid gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
       {cards.map((card) => (
         <StatCard
           key={card.title}
@@ -114,7 +114,7 @@ export default function DashboardPage() {
       <StatsOverview />
 
       {/* Stats Grid */}
-      <div className="grid gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-4">
         <StatCard
           title={t('dashboard.connectedClients')}
           value={connectedClients}

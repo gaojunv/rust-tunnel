@@ -299,7 +299,7 @@ export default function LogsPage() {
 
       {/* Log Entries */}
       <Card className="flex min-h-0 flex-1 overflow-hidden">
-        <CardContent className="flex-1 p-0">
+        <CardContent className="min-w-0 flex-1 p-0">
           {isInitialLoading ? (
             <div className="flex items-center justify-center py-16 text-muted-foreground">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />

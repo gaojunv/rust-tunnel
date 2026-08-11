@@ -131,6 +131,23 @@ html body[data-scroll-locked] {
   padding-right: 0 !important;
 }
 
+/* 移动端横向溢出防护（根因修复）。
+   Radix ScrollArea 的 viewport 内部包裹层是 `display: table; min-width: 100%`
+   （内联样式）。在 table 布局下，内容块（AppLayout 的 <main>）会被当作匿名
+   table-cell，其宽度 = 内容固有宽度 → 任意一个过宽的子元素（长 token / 表格 /
+   recharts SVG）都会把整页撑宽，即使 viewport 本身 overflow-x: hidden 也会导致
+   内容被裁掉。这里把包裹层改回普通 block（保持 min-width: 100% 让内容填满
+   viewport 宽度），切断「内容最小宽度 → 整页宽度」的放大链：过宽子元素只会
+   被 viewport 裁切（表格自身的 overflow-x-auto 等局部滚动容器不受影响），
+   页面始终等于视口宽度。
+   必须写在 @layer 外 + !important：Radix 的内联 style 是普通声明，任意
+   !important 都能压过它（与下面 Radix 滚动锁补偿同理）。 */
+[data-radix-scroll-area-viewport] > div {
+  display: block !important;
+  min-width: 100% !important;
+  width: 100% !important;
+}
+
 @layer utilities {
   /* 玻璃拟态卡片表面（配合 Card 的 border-border 使用，明暗主题均安全） */
   .glass-card {

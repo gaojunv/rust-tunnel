@@ -50,7 +50,7 @@ export default function TrojanPage() {
       />
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
         <StatCard
           title={t('trojan.stats.status')}
           value={config?.enabled ? t('common.status.active') : t('common.status.inactive')}

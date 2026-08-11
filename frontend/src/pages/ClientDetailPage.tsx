@@ -65,7 +65,7 @@ export default function ClientDetailPage() {
       </PageHeader>
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">{t('clientDetail.status')}</CardTitle>
@@ -112,7 +112,7 @@ export default function ClientDetailPage() {
           <CardTitle>{t('clientDetail.details')}</CardTitle>
         </CardHeader>
         <CardContent>
-          <dl className="grid gap-4 sm:grid-cols-2">
+          <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <dt className="text-sm font-medium text-muted-foreground">{t('clientDetail.name')}</dt>
               <dd className="mt-1">{client.name}</dd>

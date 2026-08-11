@@ -14,7 +14,10 @@ const TabsList = React.forwardRef<
   <TabsPrimitive.List
     ref={ref}
     className={cn(
-      "inline-flex h-10 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground",
+      // 移动端标签多时允许横向滚动而不是撑破容器：max-w-full 把宽度钳到父容器，
+      // overflow-x-auto 让超宽部分可横向滚动；justify-start 保证滚动时从左侧起始项
+      // 开始（justify-center + 滚动会把首项裁到可视区外）。桌面端恢复居中。
+      "inline-flex h-10 max-w-full items-center justify-start overflow-x-auto rounded-md bg-muted p-1 text-muted-foreground md:justify-center",
       className
     )}
     {...props}

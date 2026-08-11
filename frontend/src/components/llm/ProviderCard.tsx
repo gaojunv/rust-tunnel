@@ -38,7 +38,7 @@ function ModelRow({ model }: { model: LlmModel }) {
   if (editing) {
     return (
       <div className="flex items-center gap-2 text-sm py-1 border-b">
-        <span className="font-mono">{model.model_name}</span>
+        <span className="min-w-0 truncate font-mono">{model.model_name}</span>
         <Input placeholder={t('llm.providerCard.aliasPlaceholder')} value={alias} onChange={(e) => setAlias(e.target.value)} className="h-7 w-32" />
         <Input placeholder={t('llm.providerCard.tagsPlaceholder')} value={tags} onChange={(e) => setTags(e.target.value)} className="h-7 flex-1" />
         <Input
@@ -59,9 +59,9 @@ function ModelRow({ model }: { model: LlmModel }) {
   }
 
   return (
-    <div className="flex items-center justify-between text-sm py-1 border-b">
-      <div>
-        <span className="font-mono">{model.model_name}</span>
+    <div className="flex items-center justify-between gap-2 text-sm py-1 border-b">
+      <div className="min-w-0">
+        <span className="truncate font-mono">{model.model_name}</span>
         {model.alias && <span className="text-muted-foreground ml-2">({model.alias})</span>}
         {model.tags?.map((t) => <Badge key={t} variant="outline" className="ml-1 text-xs">{t}</Badge>)}
       </div>

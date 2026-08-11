@@ -59,8 +59,8 @@ export function AcmeConfigCard() {
     <>
       <Collapsible defaultOpen>
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle className="flex items-center gap-2">
+          <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+            <CardTitle className="flex min-w-0 items-center gap-2">
               {t('acme.config.title')}
               <Badge
                 variant="outline"
@@ -96,7 +96,7 @@ export function AcmeConfigCard() {
           </CardHeader>
           <CollapsibleContent>
             <CardContent>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4 text-sm">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4 text-sm">
                 <div>
                   <div className="text-muted-foreground">{t('acme.config.fields.serverUrl')}</div>
                   <div className="font-mono truncate">{config.server_url}</div>

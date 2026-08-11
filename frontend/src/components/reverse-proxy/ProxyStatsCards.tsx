@@ -14,7 +14,7 @@ export function ProxyStatsCards() {
   const activeRules = proxyRules.filter((r) => r.enabled).length;
 
   return (
-    <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
       <StatCard
         title={t('reverseProxy.stats.totalRules')}
         value={isLoading ? '—' : proxyRules.length}

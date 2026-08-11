@@ -46,7 +46,7 @@ export function CertConsumerBinding({ consumers }: CertConsumerBindingProps) {
             {t('acme.consumers.empty')}
           </p>
         ) : (
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             {CONSUMERS.map((item) => {
               const active = consumers[item.key];
               return (

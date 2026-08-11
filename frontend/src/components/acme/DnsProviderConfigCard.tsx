@@ -71,8 +71,8 @@ export function DnsProviderConfigCard() {
   return (
     <>
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between">
-          <CardTitle className="flex items-center gap-2">
+        <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+          <CardTitle className="flex min-w-0 items-center gap-2">
             <Globe className="h-5 w-5 text-primary" />
             {t('acme.dnsProvider.title')}
             <Badge
@@ -106,7 +106,7 @@ export function DnsProviderConfigCard() {
         </CardHeader>
         <CardContent>
           {data?.config ? (
-            <div className="grid gap-4 md:grid-cols-3 text-sm">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3 text-sm">
               <div>
                 <div className="text-muted-foreground">{t('acme.dnsProvider.provider')}</div>
                 <div>{providerLabel}</div>
