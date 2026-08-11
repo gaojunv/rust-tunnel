@@ -7,6 +7,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import {
@@ -28,12 +29,14 @@ interface Props {
   onEdit: () => void;
 }
 
-/** 顶栏工作区选择：VS Code 式图标下拉（选项含 client_id 小字）+ 编辑/新建 +
- *  Dialog 确认删除（替代原 inline 两段确认——确认态文本+双按钮挤在顶栏一行，
- *  会撑破布局；对话框也避免误触）。 */
+/** 顶栏工作区选择：VS Code 式图标下拉。操作项全部收进下拉——sticky 新建工作区、
+ *  工作区列表（含 client_id 小字）、编辑/删除操作项（分隔线以下）+ Dialog 确认删除
+ *  （替代原 inline 两段确认——确认态文本+双按钮挤在顶栏一行，会撑破布局；对话框也
+ *  避免误触）。顶栏仅保留 Sparkles logo + 触发器图标。 */
 export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const [menuOpen, setMenuOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +46,13 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
   });
 
   const current = workspaces?.find((w) => w.id === workspaceId);
+
+  const openDeleteConfirm = () => {
+    // 先关下拉再弹 Dialog：Dialog 覆盖在打开的菜单上会造成焦点/层级混乱
+    setMenuOpen(false);
+    setError(null);
+    setConfirming(true);
+  };
 
   const handleDelete = async () => {
     if (!workspaceId || deleting) return;
@@ -62,7 +72,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
 
   return (
     <div className="flex items-center gap-2">
-      <DropdownMenu>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
           <Button
             variant="ghost"
@@ -108,35 +118,30 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
               <p className="px-2 py-2 text-xs text-muted-foreground">{t('agent.selectWorkspace')}</p>
             )}
           </div>
+          <DropdownMenuSeparator />
+          {/* 操作区：编辑/删除收进下拉；未选中工作区时禁用 */}
+          <div className="p-1">
+            <DropdownMenuItem
+              className="cursor-pointer"
+              disabled={!workspaceId}
+              onSelect={() => onEdit()}
+              aria-label={t('agent.editWorkspace')}
+            >
+              <Settings className="h-4 w-4" />
+              {t('agent.editWorkspace')}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="cursor-pointer"
+              disabled={!workspaceId}
+              onSelect={openDeleteConfirm}
+              aria-label={t('agent.deleteWorkspace')}
+            >
+              <Trash2 className="h-4 w-4 text-destructive" />
+              {t('agent.deleteWorkspace')}
+            </DropdownMenuItem>
+          </div>
         </DropdownMenuContent>
       </DropdownMenu>
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={onEdit}
-        disabled={!workspaceId}
-        className="hidden md:inline-flex"
-        aria-label={t('agent.editWorkspace')}
-      >
-        <Settings className="h-4 w-4" />
-      </Button>
-      <Button variant="outline" size="sm" onClick={onNew} aria-label={t('agent.newWorkspace')}>
-        <Plus className="h-4 w-4" />
-      </Button>
-      {workspaceId && (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => {
-            setError(null);
-            setConfirming(true);
-          }}
-          className="hidden md:inline-flex"
-          aria-label={t('agent.deleteWorkspace')}
-        >
-          <Trash2 className="h-4 w-4 text-destructive" />
-        </Button>
-      )}
 
       <Dialog open={confirming} onOpenChange={setConfirming}>
         <DialogContent className="max-w-md">

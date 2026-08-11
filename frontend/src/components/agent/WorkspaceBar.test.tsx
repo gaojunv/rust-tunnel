@@ -62,6 +62,15 @@ const renderBar = (workspaceId = 'w1', onSelect = vi.fn()) => {
   return { onSelect, ...utils };
 };
 
+/** 打开下拉（Radix 菜单在 pointerdown 时打开；portal 渲染到 body）。
+ *  操作项已收进下拉，所有用例先开菜单再断言菜单项。 */
+const openMenu = async () => {
+  const trigger = await screen.findByLabelText('agent.selectWorkspaceAria');
+  fireEvent.pointerDown(trigger);
+  fireEvent.click(trigger);
+  await screen.findByText('agent.newWorkspace');
+};
+
 describe('WorkspaceBar', () => {
   it('shows current workspace name on trigger', async () => {
     renderBar('w1');
@@ -75,7 +84,8 @@ describe('WorkspaceBar', () => {
     const { onSelect } = renderBar('w1');
     api.deleteAgentWorkspace.mockResolvedValue(undefined);
 
-    // 顶栏不直接删除：先开确认 Dialog
+    // 删除项收进下拉：先开下拉再点删除项，随后弹确认 Dialog（不直接删除）
+    await openMenu();
     fireEvent.click(screen.getByLabelText('agent.deleteWorkspace'));
     const dialog = await screen.findByRole('dialog');
     expect(dialog.textContent).toContain('agent.confirmDeleteWorkspace');
@@ -97,6 +107,7 @@ describe('WorkspaceBar', () => {
 
   it('cancel closes the dialog without deleting', async () => {
     renderBar('w1');
+    await openMenu();
     fireEvent.click(screen.getByLabelText('agent.deleteWorkspace'));
     await screen.findByRole('dialog');
 
@@ -111,6 +122,7 @@ describe('WorkspaceBar', () => {
     renderBar('w1');
     api.deleteAgentWorkspace.mockRejectedValue(new Error('boom'));
 
+    await openMenu();
     fireEvent.click(screen.getByLabelText('agent.deleteWorkspace'));
     await screen.findByRole('dialog');
     fireEvent.click(screen.getByText('agent.confirm'));
@@ -120,12 +132,13 @@ describe('WorkspaceBar', () => {
     expect(screen.getByRole('dialog')).toBeTruthy();
   });
 
-  it('edit button is disabled when no workspace selected', () => {
+  it('edit/delete items are disabled when no workspace selected', async () => {
     renderBar('');
-    expect((screen.getByLabelText('agent.editWorkspace') as HTMLButtonElement).disabled).toBe(
-      true,
+    await openMenu();
+    // DropdownMenuItem 渲染为 div（role=menuitem），disabled 以 aria-disabled 标记
+    expect(screen.getByLabelText('agent.editWorkspace').getAttribute('aria-disabled')).toBe('true');
+    expect(screen.getByLabelText('agent.deleteWorkspace').getAttribute('aria-disabled')).toBe(
+      'true',
     );
-    // 未选中时无删除入口
-    expect(screen.queryByLabelText('agent.deleteWorkspace')).toBeNull();
   });
 });

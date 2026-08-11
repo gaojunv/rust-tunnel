@@ -96,7 +96,7 @@ describe('SessionBar', () => {
     expect(await screen.findByText('agent.timeMinutesAgo · sonnet')).toBeTruthy();
     // 无模型会话：第二行仅相对时间（2 小时 → 小时级 bucket）
     expect(screen.getByText('agent.timeHoursAgo')).toBeTruthy();
-    // sticky 新建会话项与顶栏按钮并存
+    // 新建收进下拉：仅 sticky 新建会话项（顶栏不再有独立按钮）
     expect(screen.getByText('agent.newSession')).toBeTruthy();
   });
 

@@ -35,7 +35,7 @@ interface Props {
   onNew: () => void;
 }
 
-/** 顶栏会话选择：下拉（项内改名/删除 + 信息增强）+ 新建。 */
+/** 顶栏会话选择：图标下拉（sticky 新建会话 + 列表项内改名/删除 + 信息增强）。 */
 export default function SessionBar({ workspaceId, sessionId, onSelect, onDeletedCurrent, onNew }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -207,9 +207,6 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
           </div>
         </DropdownMenuContent>
       </DropdownMenu>
-      <Button variant="outline" size="sm" onClick={onNew} aria-label={t('agent.newSession')}>
-        <Plus className="h-4 w-4" />
-      </Button>
 
       {/* 删除确认：替代 window.confirm，复用项目 Dialog 组件（错误走上方 error 状态） */}
       <Dialog open={!!deletingSession} onOpenChange={(open) => {
