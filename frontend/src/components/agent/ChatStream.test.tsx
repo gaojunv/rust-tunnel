@@ -194,11 +194,12 @@ describe('ChatStream running state', () => {
       { id: 'm4', session_id: 's1', role: 'assistant', content: '文件里是 main 函数', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 工具名、参数、结果都渲染出来（工具卡片默认收起，先点头部展开再断言 args/result）
-    expect(await screen.findByText('read_file')).toBeTruthy();
+    // 工具名、参数、结果都渲染出来（工具卡片默认收起，先点头部展开再断言 args/result）；
+    // read_file 归一化为规范名 Read
+    expect(await screen.findByText('Read')).toBeTruthy();
     // 工具卡片头（含工具名的按钮，aria-expanded）点击展开；SessionSettingsMenu
     // 触发器同样带 aria-expanded=false，故不再用 getByRole({expanded:false})
-    fireEvent.click(screen.getByText('read_file').closest('button')!);
+    fireEvent.click(screen.getByText('Read').closest('button')!);
     expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
     expect(screen.getByText('文件里是 main 函数')).toBeTruthy();
   });
@@ -209,9 +210,10 @@ describe('ChatStream running state', () => {
       { id: 'm1', session_id: 's1', role: 'tool', content: '', tool_calls: JSON.stringify([{ name: 'shell', args: '{"cmd":"ls"}', result: 'a.rs' }]), tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
     ]);
     renderChat();
-    expect(await screen.findByText('shell')).toBeTruthy();
+    // shell 归一化为规范名 Terminal
+    expect(await screen.findByText('Terminal')).toBeTruthy();
     // 工具卡片默认收起，先展开（含工具名的卡片头按钮）再断言结果
-    fireEvent.click(screen.getByText('shell').closest('button')!);
+    fireEvent.click(screen.getByText('Terminal').closest('button')!);
     expect(screen.getByText('a.rs')).toBeTruthy();
   });
 
@@ -224,8 +226,8 @@ describe('ChatStream running state', () => {
       { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 孤儿 tool_calls 行渲染为 failed 卡片：工具名可见、状态徽章 ✗
-    expect(await screen.findByText('list_dir')).toBeTruthy();
+    // 孤儿 tool_calls 行渲染为 failed 卡片：工具名可见（list_dir 归一化为 Read）、状态徽章 ✗
+    expect(await screen.findByText('Read')).toBeTruthy();
     // StatusBadge 对 failed 渲染 ✗（折叠卡片头部可见，无需展开）
     expect(screen.getByText('✗')).toBeTruthy();
     // 重载时末尾是 tool_calls 行 → running 兜底置 true（回合可能仍在服务端跑）
@@ -241,9 +243,10 @@ describe('ChatStream running state', () => {
       { id: 'm3', session_id: 's1', role: 'tool', content: 'src/ tests/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
     ]);
     renderChat();
-    expect(await screen.findByText('list_dir')).toBeTruthy();
+    // 工具名归一化为 Read（list_dir 为 read 类别别名）
+    expect(await screen.findByText('Read')).toBeTruthy();
     // 只有一张卡片（tool_result 渲染的），孤儿兜底不触发
-    expect(screen.getAllByText('list_dir')).toHaveLength(1);
+    expect(screen.getAllByText('Read')).toHaveLength(1);
     // 卡片状态 ✓（completed）
     expect(screen.getByText('✓')).toBeTruthy();
   });
@@ -439,9 +442,9 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('[上下文摘要] 之前讨论了 A')).toBeTruthy();
     // 重插的 kept 段只渲染一次（原始 kept 行被跳过，无连续重复段）
     expect(screen.getAllByText('保留问题')).toHaveLength(1);
-    // 工具卡片同样只渲染一份（read_file 工具名 + 结果；默认收起，先展开再断言结果）
-    expect(screen.getAllByText('read_file')).toHaveLength(1);
-    fireEvent.click(screen.getByText('read_file').closest('button')!);
+    // 工具卡片同样只渲染一份（read_file 归一化为 Read + 结果；默认收起，先展开再断言结果）
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+    fireEvent.click(screen.getByText('Read').closest('button')!);
     expect(screen.getAllByText(/fn main\(\)/)).toHaveLength(1);
   });
 
@@ -855,14 +858,15 @@ describe('ChatStream running state', () => {
     renderChat();
     act(() => {
       wsInstance!.emit({ type: 'assistant_chunk', content: '正文' });
-      wsInstance!.emit({ type: 'assistant_chunk', content: '推理', thought: true });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '推理第一行\n隐藏的推理细节', thought: true });
       wsInstance!.emit({ type: 'assistant_chunk', content: '续正文' });
       wsInstance!.emit({ type: 'done' });
     });
-    // thought 与正文是分开的气泡：正文两段各自成气泡，thought 默认折叠不可见
+    // thought 与正文是分开的气泡：正文两段各自成气泡；thought 默认折叠只显示首行预览
     expect(screen.getByText('正文')).toBeTruthy();
     expect(screen.getByText('续正文')).toBeTruthy();
-    expect(screen.queryByText('推理')).not.toBeTruthy();
+    expect(screen.getByText('推理第一行')).toBeTruthy();
+    expect(screen.queryByText('隐藏的推理细节')).not.toBeTruthy();
   });
 
   it('tool_call frame carries kind/diffs into card', async () => {
@@ -877,9 +881,9 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'done' });
     });
     expect(screen.getByText('✓')).toBeTruthy();
-    // 展开卡片应看到 diff（点击头部）
-    fireEvent.click(screen.getByText('Edit a.ts'));
-    expect(screen.getByText('a.ts')).toBeTruthy();
+    // 展开卡片应看到 diff（点击头部——标题归一化为 Edit，内嵌目标 a.ts 为摘要）
+    fireEvent.click(screen.getByText('Edit').closest('button')!);
+    expect(screen.getByText('+ y')).toBeTruthy();
   });
 
   it('tool_result without name falls back to id matching', async () => {
@@ -892,8 +896,9 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_result', id: 'c1', status: 'completed', result: 'r1' });
       wsInstance!.emit({ type: 'done' });
     });
-    // c1 完成、不占用 c2 的卡片（按 id 回退：r1 落在 c1 的卡片）
-    fireEvent.click(screen.getByText('Read y'));
+    // c1 完成、不占用 c2 的卡片（按 id 回退：r1 落在 c1 的卡片）。
+    // 两张卡片标题归一化为 Read，用内嵌目标（y）定位 c2 卡片头部
+    fireEvent.click(screen.getByText('y').closest('button')!);
     // c2 卡片仍在执行中（r1 没有误挂到 c2）
     expect(screen.getAllByText('agent.toolRunning').length).toBeGreaterThan(0);
   });
@@ -941,7 +946,8 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_result', id: 'c1', status: 'completed', result: 'ok' });
       wsInstance!.emit({ type: 'done' });
     });
-    fireEvent.click(screen.getByText('shell'));
+    // shell 归一化为 Terminal，点击头部展开
+    fireEvent.click(screen.getByText('Terminal'));
     expect(screen.getByText(/"cmd":"ls"/)).toBeTruthy();
   });
 
@@ -976,7 +982,7 @@ describe('ChatStream running state', () => {
     }]);
     (listAgentMessages as Mock).mockResolvedValue([
       { id: 'm1', session_id: 's1', role: 'user', content: '改一下', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-08' },
-      { id: 'm2', session_id: 's1', role: 'assistant', content: '想一下', tool_calls: null, tool_call_id: null, name: 'thought', kind: 'message', created_at: '2026-08-08' },
+      { id: 'm2', session_id: 's1', role: 'assistant', content: '想一下\n隐藏的推理', tool_calls: null, tool_call_id: null, name: 'thought', kind: 'message', created_at: '2026-08-08' },
       { id: 'm3', session_id: 's1', role: 'assistant', content: '', tool_calls: acpCall, tool_call_id: 'c1', name: 'Edit a.ts', kind: 'tool_calls', created_at: '2026-08-08' },
       { id: 'm4', session_id: 's1', role: 'assistant', content: 'done ok', tool_calls: null, tool_call_id: 'c1', name: 'Edit a.ts', kind: 'tool_result', created_at: '2026-08-08' },
       { id: 'm5', session_id: 's1', role: 'assistant', content: JSON.stringify([{ content: '旧计划', status: 'pending' }]), tool_calls: null, tool_call_id: null, name: 'plan', kind: 'message', created_at: '2026-08-08' },
@@ -989,14 +995,15 @@ describe('ChatStream running state', () => {
     // 只渲染最后一条 plan
     expect(screen.queryByText('旧计划')).not.toBeTruthy();
     expect(await screen.findByText('新计划')).toBeTruthy();
-    // tool 卡片带完成态；展开见 diff
-    expect(await screen.findByText('Edit a.ts')).toBeTruthy();
+    // tool 卡片带完成态；标题归一化为 Edit，展开见 diff
+    expect(await screen.findByText('Edit')).toBeTruthy();
     await act(async () => {
-      screen.getByText('Edit a.ts').click();
+      screen.getByText('Edit').closest('button')!.click();
     });
     expect(screen.getByText('+ y')).toBeTruthy();
-    // thought 折叠
-    expect(screen.queryByText('想一下')).not.toBeTruthy();
+    // thought 折叠：只显示首行预览，完整内容（后续行）不可见
+    expect(screen.getByText('想一下')).toBeTruthy();
+    expect(screen.queryByText('隐藏的推理')).not.toBeTruthy();
   });
 
   it('reloads when cached history was empty but refetch returns rows', async () => {

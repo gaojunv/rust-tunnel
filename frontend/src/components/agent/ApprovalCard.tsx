@@ -65,7 +65,11 @@ export default function ApprovalCard({ item, onRespond }: Props) {
           </span>
         )}
       </div>
-      <pre className="mb-2 overflow-x-auto whitespace-pre-wrap break-all rounded bg-background/60 px-2 py-1.5 text-xs">
+      {/* 命令摘要单行截断：长命令不换行撑开卡片；悬停 title 查看全文 */}
+      <pre
+        className="mb-2 truncate rounded bg-background/60 px-2 py-1.5 text-xs"
+        title={item.approvalSummary}
+      >
         {item.approvalSummary}
       </pre>
       {pending && (

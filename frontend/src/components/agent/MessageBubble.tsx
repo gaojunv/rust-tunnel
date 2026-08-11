@@ -228,9 +228,11 @@ function ToolCard({ item }: { item: ChatItem }) {
           )}
         </span>
       </button>
-      {/* 进度条容器常驻占位：完成时淡出背景而不卸载，避免高度突变导致卡片晃动 */}
+      {/* 进度条绝对定位在卡片底部边缘：运行中显示呼吸动画，完成后透明淡出。
+          不占用文档流高度（卡片高度由头部内容决定，内容垂直居中）；容器常驻
+          避免进度条出现/消失时 DOM 抖动。 */}
       <div
-        className={`mt-1.5 h-0.5 w-full overflow-hidden rounded transition-colors duration-300 ${
+        className={`absolute inset-x-0 bottom-0 h-0.5 overflow-hidden rounded transition-colors duration-300 ${
           isRunning ? 'bg-muted' : 'bg-transparent'
         }`}
         aria-hidden={!isRunning}
@@ -275,7 +277,9 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
           ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
           : item.kind === 'plan'
             ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
-            : 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
+            // tool 卡片：relative 供底部边缘进度条定位；overflow-hidden 让进度条
+            // 在圆角内被裁剪，不超出卡片边框
+            : 'relative w-full overflow-hidden rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
 
   return (
     <div className={cls}>
