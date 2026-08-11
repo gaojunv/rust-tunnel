@@ -137,7 +137,7 @@ export default function AgentPage() {
   };
 
   return (
-    <div className="flex h-[calc(100dvh-7.5rem)] min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
+    <div className="flex h-[calc(100dvh-6rem)] min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:h-[calc(100dvh-6.5rem)] md:min-h-[480px]">
       {/* 顶栏：logo + WorkspaceBar + SessionBar */}
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 p-1.5 md:flex-nowrap md:p-2">
         <Sparkles className="h-4 w-4 shrink-0 text-primary" />

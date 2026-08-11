@@ -925,15 +925,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       />
 
       {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌 */}
-      <div className="absolute inset-x-0 bottom-0 px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)] md:px-4 md:pb-4">
-        <div ref={inputCardRef}>
+      <div className="absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-6 md:pb-5">
+        <div ref={inputCardRef} className="mx-auto w-full max-w-3xl">
         {disconnected && (
           <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
             <Loader2 className="h-3 w-3 animate-spin" />
             {t('agent.reconnecting')}
           </div>
         )}
-        <div className="relative rounded-xl border border-input bg-background shadow-lg focus-within:ring-1 focus-within:ring-ring">
+        <div className="relative rounded-2xl border border-input bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring">
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (
@@ -1004,7 +1004,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
-            className="w-full min-h-[3.5rem] resize-none rounded-t-xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
+            className="w-full min-h-[3.5rem] resize-none rounded-t-2xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
             rows={1}
           />
           <div className="flex flex-wrap items-center justify-between gap-1 px-1.5 pb-1.5 md:px-2">
