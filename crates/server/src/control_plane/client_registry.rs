@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, warn};
 
+use crate::agent::runner::client_supports_cancel;
 use crate::db::Database;
 use rust_tunnel_common::ControlMessage;
 
@@ -364,6 +365,13 @@ impl ClientRegistry {
             }
             Err(_) => {
                 entry.agent_pending.lock().await.remove(&request_id);
+                // 尽力取消：客户端仍在跑的命令经 AgentExecCancel 真杀（shell/search），
+                // 防超时后内网侧遗留孤儿进程。仅对支持 cancel 的客户端（≥0.4.0）
+                // 下发——老客户端收到未知 bincode 变体会反序列化失败断开控制连接
+                // （见 runner::client_supports_cancel）。客户端离线时返回 false 无害。
+                if client_supports_cancel(entry.client_version.as_deref()) {
+                    self.send_agent_cancel(client_name, &request_id).await;
+                }
                 Err(Error::new(ErrorKind::TimedOut, "agent exec timed out"))
             }
         }
@@ -389,16 +397,22 @@ impl ClientRegistry {
     /// 向客户端下发 `AgentExecCancel`。**调用方必须先用 `client_supports_cancel`
     /// 判定版本**；本方法只负责发送，客户端离线时静默返回 false。
     pub async fn send_agent_cancel(&self, client_name: &str, request_id: &str) -> bool {
+        self.send_control(
+            client_name,
+            ControlMessage::AgentExecCancel {
+                request_id: request_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// 向客户端下发任意控制消息（best-effort）。客户端离线返回 false，
+    /// send 失败（控制通道关闭）返回 false。
+    pub async fn send_control(&self, client_name: &str, msg: ControlMessage) -> bool {
         let Some(entry) = self.get(client_name).await else {
             return false;
         };
-        entry
-            .control_sender
-            .send(ControlMessage::AgentExecCancel {
-                request_id: request_id.to_string(),
-            })
-            .await
-            .is_ok()
+        entry.control_sender.send(msg).await.is_ok()
     }
 
     /// 发送控制消息并等待以 session_id 匹配的响应（AgentSpawnResponse/AgentLlmProxyReady）。
@@ -689,6 +703,123 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_timeout_sends_cancel() {
+        // 超时后必须下发 AgentExecCancel（尽力取消，防内网孤儿进程）：
+        // 模拟在线但永不回 AgentExecResponse 的客户端。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, Some("0.4.0".into()), "secret", tx)
+            .await
+            .unwrap();
+
+        // 客户端侧消费线程：收到 AgentExecRequest 后不回响应，直到收到 cancel。
+        let client = tokio::spawn(async move {
+            let mut seen_request = None;
+            let mut seen_cancel = None;
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ControlMessage::AgentExecRequest { request_id, .. } => {
+                        seen_request = Some(request_id);
+                    }
+                    ControlMessage::AgentExecCancel { request_id } => {
+                        seen_cancel = Some(request_id);
+                        break;
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+            (seen_request, seen_cancel)
+        });
+
+        let result = registry
+            .agent_exec(
+                "nas",
+                "req-cancel-x",
+                "sess",
+                "/workspace",
+                None,
+                rust_tunnel_common::AgentCommand::GitPush,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        let (seen_request, seen_cancel) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client)
+                .await
+                .expect("client task timed out")
+                .expect("client task panicked");
+        assert_eq!(seen_request.as_deref(), Some("req-cancel-x"));
+        assert_eq!(seen_cancel.as_deref(), Some("req-cancel-x"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_exec_timeout_skips_cancel_for_old_client() {
+        // 老客户端（<0.4.0）不支持 AgentExecCancel：超时只返回 TimedOut，
+        // 不下发 cancel（避免老客户端收到未知 bincode 变体断开控制连接）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = ClientRegistry::new(db);
+
+        let (tx, mut rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, Some("0.3.9".into()), "secret", tx)
+            .await
+            .unwrap();
+
+        // 客户端侧消费线程：收到 AgentExecRequest 后不回响应，收集 200ms 内的
+        // 全部消息（应只有 request，无 cancel）。
+        let client = tokio::spawn(async move {
+            let mut seen_request = None;
+            let mut got_cancel = false;
+            tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        ControlMessage::AgentExecRequest { request_id, .. } => {
+                            seen_request = Some(request_id);
+                        }
+                        ControlMessage::AgentExecCancel { .. } => {
+                            got_cancel = true;
+                            break;
+                        }
+                        other => panic!("unexpected message: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .ok(); // 无更多消息即超时返回，属预期
+            (seen_request, got_cancel)
+        });
+
+        let result = registry
+            .agent_exec(
+                "nas",
+                "req-old",
+                "sess",
+                "/workspace",
+                None,
+                rust_tunnel_common::AgentCommand::GitPush,
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+
+        let (seen_request, got_cancel) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client)
+                .await
+                .expect("client task timed out")
+                .expect("client task panicked");
+        assert_eq!(seen_request.as_deref(), Some("req-old"));
+        assert!(!got_cancel, "old client must not receive AgentExecCancel");
     }
 
     #[tokio::test]

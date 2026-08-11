@@ -390,6 +390,9 @@ impl AcpBridge {
             // wait_ready 等待的并发调用（预 spawn 在途时发了首条消息）在
             // Sender drop 后能拿到它，而非误导性的 "session not spawned"。
             self.sessions.lock().await.remove(session_id);
+            // start_llm_proxy 成功但 spawn_agent/handshake 失败时，代理端口仍
+            // 在客户端监听：下发 AgentLlmProxyStop 释放（best-effort）。
+            self.spawner.stop_llm_proxy(&client_id, session_id).await;
             self.spawn_errors
                 .lock()
                 .await
@@ -1005,6 +1008,8 @@ impl AcpBridge {
             return;
         };
         self.spawner.send_agent_cancel(&client_id, session_id).await;
+        // 终结会话：一并释放 LLM 回环代理监听端口（防泄漏）。
+        self.spawner.stop_llm_proxy(&client_id, session_id).await;
         self.sessions.lock().await.remove(session_id);
         tracing::info!(session_id, "killed ACP session");
     }
@@ -1947,6 +1952,8 @@ mod tests {
                 let sid = match &req {
                     ControlMessage::AgentSpawnRequest { session_id, .. } => session_id.clone(),
                     ControlMessage::AgentLlmProxyStart { session_id } => session_id.clone(),
+                    // AgentLlmProxyStop 是单向清理消息（无响应、无等待者），跳过不协商。
+                    ControlMessage::AgentLlmProxyStop { .. } => continue,
                     other => panic!("unexpected request: {other:?}"),
                 };
                 registry2.resolve_spawn_pending(&sid, respond(req)).await;
@@ -2152,6 +2159,8 @@ mod tests {
                 let sid = match &req {
                     ControlMessage::AgentSpawnRequest { session_id, .. } => session_id.clone(),
                     ControlMessage::AgentLlmProxyStart { session_id } => session_id.clone(),
+                    // AgentLlmProxyStop 是单向清理消息（无响应、无等待者），跳过不协商。
+                    ControlMessage::AgentLlmProxyStop { .. } => continue,
                     other => panic!("unexpected request: {other:?}"),
                 };
                 let resp = match &req {
