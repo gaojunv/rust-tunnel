@@ -128,6 +128,7 @@ impl AgentSpawner {
 
     /// 经控制通道在客户端执行一条 agent 命令（ACP `fs/read_text_file` /
     /// `fs/write_text_file` 转发用；runner 路径走 `executor::exec_on_client`）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn agent_exec(
         &self,
         client_id: &str,
