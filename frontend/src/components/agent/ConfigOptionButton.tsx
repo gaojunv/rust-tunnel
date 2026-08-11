@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { Check, ChevronDown } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -36,7 +36,7 @@ export default function ConfigOptionButton({ option, label, onChange, disabled, 
           disabled
           aria-label={t(label, { defaultValue: label })}
           title={t('agent.configOptionUnsupported')}
-          className="h-7 w-auto cursor-not-allowed gap-1 px-2 text-xs text-muted-foreground opacity-60"
+          className="h-7 w-auto cursor-not-allowed rounded-full px-2.5 text-xs font-medium text-muted-foreground opacity-60"
         >
           {t(label, { defaultValue: label })}
         </Button>
@@ -50,10 +50,9 @@ export default function ConfigOptionButton({ option, label, onChange, disabled, 
         <Button
           variant="ghost"
           aria-label={t(label, { defaultValue: label })}
-          className="h-7 w-auto gap-1 px-2 text-xs text-muted-foreground hover:bg-accent"
+          className="h-7 w-auto rounded-full px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           {currentOptionLabel(option)}
-          <ChevronDown className="h-3 w-3" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" side="top">

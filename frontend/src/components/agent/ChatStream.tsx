@@ -65,6 +65,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 悬浮输入框高度：消息区底部留出同高占位，保证末尾消息可滚动到输入框之上
+  const [inputFloatH, setInputFloatH] = useState(0);
+  const inputCardRef = useRef<HTMLDivElement>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
@@ -675,6 +678,34 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }
   }, [items]);
 
+  // 输入框自适应高度：内容驱动向上长高（输入框锚定底部悬浮），超 10 行才出滚动条
+  const autoresizeInput = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    // jsdom 等无布局环境 scrollHeight 恒 0：保持 CSS 默认高度，不写内联样式
+    if (el.scrollHeight === 0) return;
+    const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 20;
+    const max = lineHeight * 10 + 16; // 10 行 + 上下 padding
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
+    el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+  }, []);
+
+  // 打字、发送后清空、@ 选中改写文本都汇聚到 input state，统一在此重算高度
+  useEffect(() => {
+    autoresizeInput();
+  }, [input, autoresizeInput]);
+
+  // 悬浮输入框高度测量（含长高/重连提示条出现）：消息区底部占位与渐隐随之伸缩
+  useEffect(() => {
+    const el = inputCardRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setInputFloatH(el.offsetHeight));
+    ro.observe(el);
+    setInputFloatH(el.offsetHeight);
+    return () => ro.disconnect();
+  }, []);
+
   // 存在未响应的审批卡片时禁止继续发送（服务端在该审批响应前挂起回合）
   const hasPendingApproval = items.some((it) => it.kind === 'approval' && it.approvalStatus === 'pending');
 
@@ -856,7 +887,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   );
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
       <div
         className="flex-1 space-y-3 overflow-y-auto px-3 py-3 md:space-y-4 md:px-5 md:py-4"
         onScroll={(e) => {
@@ -881,18 +912,28 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             {t('agent.running')}
           </div>
         )}
+        {/* 悬浮输入框占位：保证最后一条消息能滚动到输入框之上 */}
+        <div aria-hidden style={{ height: inputFloatH + 8 }} />
         <div ref={bottomRef} />
       </div>
 
-      {/* 一体化输入框：模型选择(左下) + 发送图标(右下) 内嵌 */}
-      <div className="px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)] pt-1.5 md:px-4 md:pb-4 md:pt-2">
+      {/* 底部渐隐：消息滑入悬浮输入框下方时柔和淡出 */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-card via-card/85 to-transparent"
+        style={{ height: inputFloatH + 28 }}
+      />
+
+      {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌 */}
+      <div className="absolute inset-x-0 bottom-0 px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)] md:px-4 md:pb-4">
+        <div ref={inputCardRef}>
         {disconnected && (
           <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
             <Loader2 className="h-3 w-3 animate-spin" />
             {t('agent.reconnecting')}
           </div>
         )}
-        <div className="relative rounded-xl border border-input bg-background shadow-sm focus-within:ring-1 focus-within:ring-ring">
+        <div className="relative rounded-xl border border-input bg-background shadow-lg focus-within:ring-1 focus-within:ring-ring">
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (
@@ -918,6 +959,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             value={input}
             onChange={handleInputChange}
             onKeyDown={(e) => {
+              // IME 组词中（拼音候选窗）的按键不触发任何快捷键：回车是确认候选而非发送
+              if (e.nativeEvent.isComposing) return;
               if (e.key === 'Escape') {
                 closeMention();
                 return;
@@ -961,8 +1004,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
-            className="w-full resize-none rounded-t-xl border-0 bg-transparent px-3 pt-2 text-sm focus:outline-none"
-            rows={2}
+            className="w-full min-h-[3.5rem] resize-none rounded-t-xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
+            rows={1}
           />
           <div className="flex flex-wrap items-center justify-between gap-1 px-1.5 pb-1.5 md:px-2">
             <SessionSettingsMenu
@@ -1011,6 +1054,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               )}
             </div>
           </div>
+        </div>
         </div>
       </div>
     </div>

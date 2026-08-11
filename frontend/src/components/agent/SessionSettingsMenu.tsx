@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Check, ChevronDown } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -93,10 +93,9 @@ export default function SessionSettingsMenu({
         <Button
           variant="ghost"
           aria-label={t('agent.sessionSettings')}
-          className="h-7 w-auto gap-1 px-2 text-xs text-muted-foreground hover:bg-accent"
+          className="h-7 w-auto rounded-full px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           {modelLabel}
-          <ChevronDown className="h-3 w-3" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-56">
