@@ -125,6 +125,54 @@ const KIND_ICON: Record<ToolKind, typeof Wrench> = {
   other: Wrench,
 };
 
+/** toolKind → 规范显示名 + title 别名表。ACP 各 agent 上报的 title 形态不一
+ *  （"Read File"/"Read"/"Edit src/a.ts"/命令本体），统一按 kind 归一为规范名，
+ *  title 中内嵌的目标（相对路径/命令）拆出为 extra，避免与 args 摘要重复显示。
+ *  `stripPrefix: false`（execute）时仅在 title 恰等于别名时归一——命令本体可能
+ *  以 "run"/"bash" 等词开头，前缀剥离会截断真实命令。 */
+const KIND_META: Record<ToolKind, { label: string; aliases: string[]; stripPrefix: boolean }> = {
+  read: { label: 'Read', aliases: ['read file', 'read_file', 'read', 'list_dir', 'list directory'], stripPrefix: true },
+  edit: { label: 'Edit', aliases: ['edit file', 'edit', 'write file', 'write_file', 'write', 'patch file', 'patch_file', 'patch'], stripPrefix: true },
+  delete: { label: 'Delete', aliases: ['delete file', 'delete', 'remove file', 'remove'], stripPrefix: true },
+  move: { label: 'Move', aliases: ['move file', 'move', 'rename'], stripPrefix: true },
+  search: { label: 'Search', aliases: ['search', 'grep', 'glob', 'find'], stripPrefix: true },
+  execute: { label: 'Terminal', aliases: ['terminal', 'bash', 'shell', 'sh', 'cmd', 'execute'], stripPrefix: false },
+  think: { label: 'Think', aliases: ['think', 'thinking'], stripPrefix: true },
+  fetch: { label: 'Fetch', aliases: ['fetch', 'web fetch', 'webfetch', 'browse'], stripPrefix: true },
+  switch_mode: { label: 'Mode', aliases: ['switch mode', 'switch_mode', 'mode'], stripPrefix: true },
+  other: { label: '', aliases: [], stripPrefix: true },
+};
+
+/** 归一化工具标题：返回规范显示名 label 与 title 内嵌目标 extra（可能为 null）。
+ *  显式 toolKind（非 other）优先匹配；kind 缺省/other（runner 旧数据）时按别名
+ *  全表反查推断类别；均不命中且 kind 有效时，title 整体视为 extra（如命令本体）。 */
+function splitToolTitle(
+  name: string | undefined,
+  kind: ToolKind | undefined,
+): { label: string; extra: string | null } {
+  const raw = (name ?? '').trim();
+  const lower = raw.toLowerCase();
+  const candidates: ToolKind[] =
+    kind && kind !== 'other'
+      ? [kind]
+      : (Object.keys(KIND_META) as ToolKind[]).filter((k) => k !== 'other');
+  for (const k of candidates) {
+    const meta = KIND_META[k];
+    // 长别名优先（"read file" 先于 "read"）
+    for (const alias of [...meta.aliases].sort((a, b) => b.length - a.length)) {
+      if (lower === alias) return { label: meta.label, extra: null };
+      if (meta.stripPrefix && lower.startsWith(`${alias} `)) {
+        const extra = raw.slice(alias.length + 1).trim();
+        return { label: meta.label, extra: extra || null };
+      }
+    }
+  }
+  if (kind && kind !== 'other') {
+    return { label: KIND_META[kind].label, extra: raw || null };
+  }
+  return { label: raw || 'Tool', extra: null };
+}
+
 /** 工具状态：failed 优先；result 已产出 → completed（ACP 的 ToolCallUpdate 常省略
  * status，上游若误映射为 running，result 到达后仍应显示完成）；缺省按 result 有无推断。 */
 function resolveToolStatus(item: ChatItem): 'pending' | 'in_progress' | 'running' | 'completed' | 'failed' {
@@ -146,7 +194,11 @@ function StatusBadge({ item }: { item: ChatItem }) {
 function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const summary = toolSummary(item.toolName, item.toolKind, item.toolArgs);
+  const { label, extra } = splitToolTitle(item.toolName, item.toolKind);
+  // 摘要只显示一份：args 提取的结构化摘要优先（通常是绝对路径/命令），
+  // 缺失时才用 title 内嵌目标（通常是相对路径）——两者同源，同显即用户反馈的
+  // 「标题双重路径」问题
+  const summary = toolSummary(item.toolName, item.toolKind, item.toolArgs) ?? extra;
   const Icon = KIND_ICON[item.toolKind ?? 'other'] ?? Wrench;
   const status = resolveToolStatus(item);
   const isError = status === 'failed';
@@ -163,7 +215,7 @@ function ToolCard({ item }: { item: ChatItem }) {
         aria-expanded={open}
       >
         <Icon className="h-3.5 w-3.5 shrink-0 text-primary" />
-        <span className="font-medium text-foreground/90">{item.toolName}</span>
+        <span className="font-medium text-foreground/90">{label}</span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-muted-foreground">{summary}</span>
         )}
@@ -176,11 +228,15 @@ function ToolCard({ item }: { item: ChatItem }) {
           )}
         </span>
       </button>
-      {isRunning && (
-        <div className="mt-1.5 h-0.5 w-full overflow-hidden rounded bg-muted">
-          <div className="h-full w-1/3 animate-pulse rounded bg-primary/60" />
-        </div>
-      )}
+      {/* 进度条容器常驻占位：完成时淡出背景而不卸载，避免高度突变导致卡片晃动 */}
+      <div
+        className={`mt-1.5 h-0.5 w-full overflow-hidden rounded transition-colors duration-300 ${
+          isRunning ? 'bg-muted' : 'bg-transparent'
+        }`}
+        aria-hidden={!isRunning}
+      >
+        {isRunning && <div className="h-full w-1/3 animate-pulse rounded bg-primary/60" />}
+      </div>
       {open && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {item.toolDiffs && item.toolDiffs.length > 0 && <ToolDiffView diffs={item.toolDiffs} />}

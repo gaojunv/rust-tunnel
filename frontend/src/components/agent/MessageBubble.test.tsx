@@ -78,7 +78,8 @@ describe('MessageBubble tool card collapsing', () => {
       />,
     );
     const header = screen.getByRole('button', { expanded: false });
-    expect(header.textContent).toContain('read_file');
+    // runner 旧格式工具名 read_file 归一化为规范名 Read
+    expect(header.textContent).toContain('Read');
     expect(header.textContent).toContain('src/main.rs');
     // 未展开：args 与 result 均不可见
     expect(screen.queryByText('{"path":"src/main.rs"}')).toBeNull();
@@ -187,6 +188,88 @@ describe('MessageBubble tool card collapsing', () => {
     fireEvent.click(header);
     expect(screen.queryByText('{}')).toBeNull();
     expect(screen.queryByText('agent.toolRunning')).toBeTruthy();
+  });
+
+  it('标题归一化：Read File / Read 均显示为规范名 Read', () => {
+    const { unmount } = render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Read File', toolKind: 'read', toolArgs: '{}' }}
+      />,
+    );
+    expect(screen.getByRole('button', { expanded: false }).textContent).toBe('Read');
+    unmount();
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Read', toolKind: 'read', toolArgs: '{}' }}
+      />,
+    );
+    expect(screen.getByRole('button', { expanded: false }).textContent).toBe('Read');
+  });
+
+  it('标题归一化：execute 的 title 为命令本体时显示 Terminal + 命令摘要', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'npm test', toolKind: 'execute', toolArgs: '{}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Terminal');
+    expect(header.textContent).toContain('npm test');
+  });
+
+  it('标题归一化：execute 命令以 run 开头时不被误剥离', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'run npm test', toolKind: 'execute', toolArgs: '{}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('run npm test');
+  });
+
+  it('title 内嵌相对路径与 args 绝对路径去重，只显示一份', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Edit src/a.ts',
+          toolKind: 'edit',
+          toolArgs: '{"file_path":"/home/u/proj/src/a.ts"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Edit');
+    expect(header.textContent?.match(/src\/a\.ts/g)).toHaveLength(1);
+  });
+
+  it('进度条容器在完成后仍占位（不卸载），仅淡出', () => {
+    const { container, rerender } = render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute', toolArgs: '{}' }}
+      />,
+    );
+    const barBefore = container.querySelector('.h-0\\.5');
+    expect(barBefore).toBeTruthy();
+    expect(barBefore?.className).toContain('bg-muted');
+    rerender(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Bash',
+          toolKind: 'execute',
+          toolArgs: '{}',
+          toolResult: 'done',
+        }}
+      />,
+    );
+    const barAfter = container.querySelector('.h-0\\.5');
+    // 容器常驻（避免高度跳变），背景淡出为透明，动画条移除
+    expect(barAfter).toBeTruthy();
+    expect(barAfter?.className).toContain('bg-transparent');
+    expect(container.querySelector('.animate-pulse')).toBeNull();
   });
 });
 
