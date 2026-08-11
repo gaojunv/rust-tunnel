@@ -249,6 +249,9 @@ pub enum ControlMessage {
     AgentLlmProxyStart { session_id: String },
     /// Client reports the bound loopback port (0 = failure)
     AgentLlmProxyReady { session_id: String, port: u16 },
+    /// Server asks client to stop the embedded LLM loop proxy for a session
+    /// (frees the loopback listener; no response expected).
+    AgentLlmProxyStop { session_id: String },
 }
 
 impl ControlMessage {
@@ -560,6 +563,9 @@ mod tests {
                     protocol: "mysql".into(),
                     local_addr: "localhost:3306".into(),
                 }],
+            },
+            ControlMessage::AgentLlmProxyStop {
+                session_id: "sess-1".into(),
             },
         ];
 
@@ -989,6 +995,16 @@ mod tests {
         match decoded {
             ControlMessage::AgentLlmProxyReady { port, .. } => assert_eq!(port, 45678),
             other => panic!("expected AgentLlmProxyReady, got {other:?}"),
+        }
+
+        let stop = ControlMessage::AgentLlmProxyStop {
+            session_id: "s1".into(),
+        };
+        let encoded = bincode::serialize(&stop).unwrap();
+        let decoded: ControlMessage = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            ControlMessage::AgentLlmProxyStop { session_id } => assert_eq!(session_id, "s1"),
+            other => panic!("expected AgentLlmProxyStop, got {other:?}"),
         }
     }
 }

@@ -33,27 +33,34 @@ pub async fn route_chunk(pending: &PendingMap, chunk: &ControlMessage) -> bool {
     }
 }
 
-/// 启动回环 HTTP 代理，返回绑定端口。
+/// 启动回环 HTTP 代理，返回绑定端口与 kill 信号发送端。
 /// 每个进入的请求经 control_tx 发 AgentLlmProxyRequest，响应从 pending 收集后写回。
+/// 调用方持有 kill_tx：发 `()` 即让 accept 循环退出（listener drop 释放端口）。
 pub async fn serve(
     session_id: String,
     control_tx: mpsc::Sender<ControlMessage>,
     pending: PendingMap,
-) -> std::io::Result<u16> {
+) -> std::io::Result<(u16, tokio::sync::oneshot::Sender<()>)> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
+    let (kill_tx, mut kill_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
-            };
-            let sid = session_id.clone();
-            let tx = control_tx.clone();
-            let pend = pending.clone();
-            tokio::spawn(handle_conn(stream, sid, tx, pend));
+            tokio::select! {
+                _ = &mut kill_rx => break, // kill 信号：结束监听，listener drop 释放端口
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else {
+                        break;
+                    };
+                    let sid = session_id.clone();
+                    let tx = control_tx.clone();
+                    let pend = pending.clone();
+                    tokio::spawn(handle_conn(stream, sid, tx, pend));
+                }
+            }
         }
     });
-    Ok(port)
+    Ok((port, kill_tx))
 }
 
 async fn handle_conn(
@@ -201,7 +208,9 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let port = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
         assert!(port > 0);
 
         // 模拟服务端：收到 request 后回两个 chunk + done
@@ -247,6 +256,21 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"));
         assert!(text.contains("data: one"));
         server.await.unwrap();
+
+        // kill 后监听任务退出：回环端口应释放（connect 失败），防泄漏验证。
+        kill_tx.send(()).unwrap();
+        let mut port_closed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                port_closed = true;
+                break;
+            }
+        }
+        assert!(port_closed, "listener should be released after kill");
     }
 
     #[test]

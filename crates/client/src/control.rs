@@ -47,6 +47,9 @@ pub struct ClientState {
     spawn_manager: SpawnManager,
     /// LLM 回环代理的 request_id → 响应接收端（AgentLlmProxy* 消息）。
     llm_proxy_pending: crate::llm_proxy::PendingMap,
+    /// LLM 回环代理的 session_id → kill 信号发送端（AgentLlmProxyStop 触发，
+    /// 释放回环监听端口）。重 spawn 时旧句柄先 send 再替换，自愈泄漏。
+    llm_proxy_kills: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl ClientState {
@@ -58,6 +61,7 @@ impl ClientState {
             exec_cancels: Arc::new(Mutex::new(HashMap::new())),
             spawn_manager: SpawnManager::new(),
             llm_proxy_pending: crate::llm_proxy::new_pending_map(),
+            llm_proxy_kills: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -359,20 +363,47 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     }
                     ControlMessage::AgentLlmProxyStart { session_id } => {
                         let tx = state.control_sender.clone();
-                        let port = if state.config.enable_agent {
-                            crate::llm_proxy::serve(
+                        let (port, kill_tx) = if state.config.enable_agent {
+                            match crate::llm_proxy::serve(
                                 session_id.clone(),
                                 tx.clone(),
                                 state.llm_proxy_pending.clone(),
                             )
                             .await
-                            .unwrap_or(0)
+                            {
+                                Ok((port, kill_tx)) => (port, Some(kill_tx)),
+                                Err(e) => {
+                                    warn!("LLM loop proxy bind failed: {}", e);
+                                    (0, None)
+                                }
+                            }
                         } else {
-                            0
+                            (0, None)
                         };
+                        if let Some(kill_tx) = kill_tx {
+                            // 重 spawn 自愈：同一 session 的旧监听（若仍存活）先关掉
+                            // 再存新句柄，避免每次 spawn 泄漏一个回环监听端口。
+                            let old = state
+                                .llm_proxy_kills
+                                .lock()
+                                .await
+                                .insert(session_id.clone(), kill_tx);
+                            if let Some(old) = old {
+                                let _ = old.send(());
+                            }
+                        }
                         let _ = tx
                             .send(ControlMessage::AgentLlmProxyReady { session_id, port })
                             .await;
+                    }
+                    ControlMessage::AgentLlmProxyStop { session_id } => {
+                        // 释放 LLM 回环代理监听端口（kill/失败清理用）；无此 session 静默忽略。
+                        let kill_tx = state.llm_proxy_kills.lock().await.remove(&session_id);
+                        if let Some(kill_tx) = kill_tx {
+                            let _ = kill_tx.send(());
+                        } else {
+                            debug!("AgentLlmProxyStop for unknown session {}", session_id);
+                        }
                     }
                     ControlMessage::AgentLlmProxyChunk { .. } => {
                         crate::llm_proxy::route_chunk(&state.llm_proxy_pending, &msg).await;
@@ -973,6 +1004,63 @@ mod tests {
             }
             other => panic!("expected AgentLlmProxyReady, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_control_messages_llm_proxy_stop_frees_listener() {
+        // Start 后 Stop：kill_tx 被触发，回环监听端口释放（防泄漏）。
+        let config = ClientConfig {
+            enable_agent: true,
+            ..create_test_state().config
+        };
+        let (tx, mut rx) = mpsc::channel(32);
+        let state = ClientState::new(config, tx);
+
+        let mut buffer = Vec::new();
+        ControlMessage::AgentLlmProxyStart {
+            session_id: "s2".into(),
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+        ControlMessage::AgentLlmProxyStop {
+            session_id: "s2".into(),
+        }
+        .write_to_stream(&mut buffer)
+        .await
+        .unwrap();
+
+        let mut reader = &buffer[..];
+        let result = process_control_messages(&mut reader, state.clone()).await;
+        assert!(result.is_ok());
+
+        // 先拿 Ready 里的端口，确认代理确实启动了
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        let port = match msg {
+            ControlMessage::AgentLlmProxyReady { session_id, port } => {
+                assert_eq!(session_id, "s2");
+                assert!(port > 0);
+                port
+            }
+            other => panic!("expected AgentLlmProxyReady, got {other:?}"),
+        };
+        // Stop 已处理：kill 句柄被移除，kill 信号已触发 → 端口释放
+        assert!(state.llm_proxy_kills.lock().await.is_empty());
+        let mut port_closed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                port_closed = true;
+                break;
+            }
+        }
+        assert!(port_closed, "listener should be released after stop");
     }
 
     #[tokio::test]

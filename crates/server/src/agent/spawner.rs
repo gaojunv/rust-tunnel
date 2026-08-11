@@ -159,6 +159,19 @@ impl AgentSpawner {
     pub async fn send_agent_cancel(&self, client_id: &str, request_id: &str) -> bool {
         self.registry.send_agent_cancel(client_id, request_id).await
     }
+
+    /// 请求客户端停止某 session 的内嵌 LLM 回环代理（释放回环监听端口）。
+    /// 客户端离线或发送失败返回 false（无害）。
+    pub async fn stop_llm_proxy(&self, client_id: &str, session_id: &str) -> bool {
+        self.registry
+            .send_control(
+                client_id,
+                rust_tunnel_common::ControlMessage::AgentLlmProxyStop {
+                    session_id: session_id.to_string(),
+                },
+            )
+            .await
+    }
 }
 
 #[cfg(test)]
