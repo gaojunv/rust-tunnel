@@ -328,7 +328,11 @@ impl AcpBridge {
         }
 
         let agent_type = &workspace.agent_type;
-        let outcome = async {
+        // 阶段耗时打点：wait_ready 超时只能看到「spawn 仍在进行」，各阶段
+        // （协商/握手/配置注入）的耗时分布是定位卡点（冷启动慢 vs 隧道 RTT
+        // vs agent 不响应 set_config_option）的关键证据。
+        let pipeline_start = std::time::Instant::now();
+        let outcome: Result<(), String> = async {
             // 0) 模型配置门禁：session.model / workspace.llm_model_id / 全局默认
             //    任一即可。实际 LLM 请求按 session 从 DB 解析（resolve_effective_model，
             //    含「第一个可用」兜底），此处只防 spawn 后才发现无模型。校验失败走
@@ -347,6 +351,11 @@ impl AcpBridge {
                 .spawner
                 .start_llm_proxy(&client_id, session_id, SPAWN_TIMEOUT)
                 .await?;
+            tracing::info!(
+                session_id,
+                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                "acp spawn stage: llm proxy ready (port {port})"
+            );
             // 2) spawn agent 进程（env 注入 LLM 代理地址）
             self.spawner
                 .spawn_agent(
@@ -359,10 +368,21 @@ impl AcpBridge {
                     SPAWN_TIMEOUT,
                 )
                 .await?;
+            tracing::info!(
+                session_id,
+                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                "acp spawn stage: agent process spawned"
+            );
             // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线；
             // ws_tx 由连接任务的处理器每次事件从会话条目动态解析，无需传入）
             let root_path = workspace.root_path.clone();
-            self.acp_handshake(session_id, &root_path).await
+            self.acp_handshake(session_id, &root_path).await?;
+            tracing::info!(
+                session_id,
+                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                "acp spawn stage: handshake complete"
+            );
+            Ok(())
         }
         .await;
         if let Err(e) = &outcome {
@@ -381,12 +401,23 @@ impl AcpBridge {
         // 返回后才执行：该函数只收 session_id/root_path，此处持有 workspace 记录。
         self.apply_config_overrides(session_id, workspace).await;
         self.replay_config_state(session_id).await;
+        tracing::info!(
+            session_id,
+            elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+            "acp spawn stage: config injection complete"
+        );
         // 配置注入完成后才放行 wait_ready：连接预 spawn（后台任务）场景下，
         // 用户路径的 wait_ready 经 watch 通道等待此信号——必须延后到 overrides/
         // config_state 已生效，首条 prompt 才不与在途 set_config_option 竞态
         // （恢复旧顺序：replay 先于 spawn_ready）。
+        // 必须用 send_modify 而非 send：spawn_ready 建通道时只存了 Sender
+        // （Receiver 当场 drop），预 spawn 在首条消息（首个 subscribe）之前
+        // 完成时 receiver_count==0，`send` 会静默失败且**不写入新值**——
+        // wait_ready 将永远看到 false，空等整个 READY_TIMEOUT 后误报
+        // 「spawn 仍在进行」。send_modify 无接收者也更新值，恰好匹配
+        // 「就绪状态置位」语义。
         if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
-            let _ = a.spawn_ready.send(true);
+            a.spawn_ready.send_modify(|ready| *ready = true);
         }
         // 回放完成后把最终快照推给当前 WS 连接（重连场景前端立即可见）。
         if let Some(frame) = self.session_state_frame(session_id).await {
@@ -2251,6 +2282,27 @@ mod tests {
             err.contains("failed to bind"),
             "latest failure should be cached, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_wait_ready_visible_when_ready_set_before_subscribe() {
+        // 回归：spawn 在首个 wait_ready（首个 subscribe）之前完成时，就绪置位
+        // 必须对后到订阅者可见。spawn_ready 建通道只存 Sender（Receiver 当场
+        // drop），watch::Sender::send 在无接收者时静默失败且**不写入新值**——
+        // 预 spawn 快于首条消息时 wait_ready 曾空等整个 READY_TIMEOUT，误报
+        // 「spawn 仍在进行」。ensure_session 成功路径必须用 send_modify 置位。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let agent = spawned_agent();
+        let sender = agent.spawn_ready.clone();
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+        // 无任何订阅者时置位（等价 ensure_session 成功路径的 send_modify）
+        sender.send_modify(|ready| *ready = true);
+        tokio::time::timeout(Duration::from_secs(2), bridge.wait_ready("sess-1"))
+            .await
+            .expect("wait_ready must not time out")
+            .expect("ready set before subscribe must be visible");
     }
 
     #[tokio::test]

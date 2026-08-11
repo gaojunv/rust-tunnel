@@ -427,9 +427,20 @@ impl ClientRegistry {
             .lock()
             .await
             .insert(session_id.to_string(), tx);
-        if entry.control_sender.send(request).await.is_err() {
-            self.spawn_pending.lock().await.remove(session_id);
-            return Err(Error::new(ErrorKind::BrokenPipe, "control channel closed"));
+        // send 同样受 timeout 约束：控制通道消费端（TLS 写出）卡住时 mpsc
+        // 会满，无超时的 send 会无限挂起，绕过协商护栏让 spawn 流水线停滞
+        // （wait_ready 侧只能看到泛化的「spawn 仍在进行」）。
+        let send_result = tokio::time::timeout(timeout, entry.control_sender.send(request)).await;
+        match send_result {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.spawn_pending.lock().await.remove(session_id);
+                return Err(Error::new(ErrorKind::BrokenPipe, "control channel closed"));
+            }
+            Err(_) => {
+                self.spawn_pending.lock().await.remove(session_id);
+                return Err(Error::new(ErrorKind::TimedOut, "control channel congested"));
+            }
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(msg)) => Ok(msg),

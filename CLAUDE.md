@@ -49,6 +49,9 @@ cargo clean                         # 全量清空（磁盘告警时；重建约
 # 可选后续：sccache 对象级缓存（跨目标/CI 复用，清仓重建也快）
 ```
 
+### AI开发模型
+进行开发时，使用worktree进行代码隔离，使用subagent模型进行代码开发
+
 ## 架构
 
 ### Cargo workspace：三库 crate + 根元包
