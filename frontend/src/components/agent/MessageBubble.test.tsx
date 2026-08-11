@@ -328,8 +328,25 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
     expect(screen.getByText('▶')).toBeTruthy();
   });
 
-  it('renders thought bubble collapsed by default', () => {
-    render(<MessageBubble item={{ kind: 'thought', content: '内部推理' }} />);
-    expect(screen.queryByText('内部推理')).not.toBeTruthy();
+  it('renders thought card collapsed by default with one-line preview', () => {
+    render(<MessageBubble item={{ kind: 'thought', content: '## 计划\n先分析再动手' }} />);
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('agent.thought');
+    // 折叠态头部显示首行预览（剥掉 md 标题标记），完整内容不渲染
+    expect(header.textContent).toContain('计划');
+    expect(screen.queryByText('先分析再动手')).toBeNull();
+  });
+
+  it('expanding thought card renders content as Markdown', () => {
+    render(<MessageBubble item={{ kind: 'thought', content: '这是 **加粗** 的思考' }} />);
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText('加粗').getAttribute('data-streamdown')).toBe('strong');
+  });
+
+  it('thought preview strips inline emphasis markers', () => {
+    render(<MessageBubble item={{ kind: 'thought', content: '用 **方案A** 实现 `foo` 函数' }} />);
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('用 方案A 实现 foo 函数');
+    expect(header.textContent).not.toContain('**');
   });
 });

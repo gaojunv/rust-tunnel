@@ -272,7 +272,7 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
       : item.kind === 'assistant'
         ? 'w-full py-0.5'
         : item.kind === 'thought'
-          ? 'w-full rounded-lg border border-border/50 bg-muted/20 px-3 py-2 text-xs'
+          ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
           : item.kind === 'plan'
             ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
             : 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
@@ -294,24 +294,51 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
   );
 });
 
-/** 思考过程气泡：默认折叠（思考是低信噪过程信息），浅灰斜体小字。 */
+/** 思考内容通常是 Markdown：取首个非空行（剥掉标题/列表/引用前缀与行内强调
+ *  符号）作折叠态预览——预览是纯文本，残留 `**` 等标记会显得 noisy。 */
+function thoughtPreview(content: string): string | null {
+  const line = content.split('\n').find((l) => l.trim());
+  if (!line) return null;
+  const text = line
+    .trim()
+    .replace(/^(#{1,6}\s+|[-*+]\s+|>\s*)/, '')
+    .replace(/[*_`~]/g, '')
+    .trim();
+  return text || null;
+}
+
+/** 思考过程卡片：与 ToolCard 同构（图标 + 标题 + 预览 + chevron 头部，
+ *  展开区 border-t 分隔），默认折叠（思考是低信噪过程信息）。
+ *  内容按 Markdown 渲染（agent 思考多为 md 格式），muted 弱化以区分正文。 */
 function ThoughtBubble({ content }: { content: string }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const preview = thoughtPreview(content);
   return (
     <div>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 text-xs italic text-muted-foreground"
+        className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        <Brain className="h-3 w-3 shrink-0" />
-        {t('agent.thought')}
-        {open ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+        <Brain className="h-3.5 w-3.5 shrink-0 text-primary" />
+        <span className="font-medium text-foreground/90">{t('agent.thought')}</span>
+        {!open && preview && (
+          <span className="min-w-0 truncate text-muted-foreground">{preview}</span>
+        )}
+        <span className="ml-auto flex shrink-0 items-center gap-1.5">
+          {open ? (
+            <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+          )}
+        </span>
       </button>
       {open && (
-        <div className="mt-1 whitespace-pre-wrap italic text-muted-foreground">{content}</div>
+        <div className="mt-2 border-t border-border/60 pt-2 text-muted-foreground [&_pre]:!my-2">
+          <Markdown content={content} />
+        </div>
       )}
     </div>
   );
