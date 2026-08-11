@@ -93,12 +93,18 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
       )}
       <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" aria-label={t('agent.selectSessionAria')}>
-            <MessageSquare className="mr-1 h-4 w-4" />
-            <span className="max-w-[80px] truncate md:max-w-[160px]">
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={t('agent.selectSessionAria')}
+            title={current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
+          >
+            <MessageSquare className="h-4 w-4" />
+            {/* sr-only：保留可访问性 + 供测试断言触发器文本 */}
+            <span className="sr-only">
               {current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
             </span>
-            <ChevronDown className="ml-1 h-3.5 w-3.5 opacity-50" />
+            <ChevronDown className="h-3.5 w-3.5 opacity-50" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-[calc(100vw-2rem)] max-w-80 p-0 md:w-72">

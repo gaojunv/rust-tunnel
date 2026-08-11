@@ -885,14 +885,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       </div>
 
       {/* 一体化输入框：模型选择(左下) + 发送图标(右下) 内嵌 */}
-      <div className="border-t p-2 pb-[env(safe-area-inset-bottom,16px)]">
+      <div className="px-2 pb-[max(env(safe-area-inset-bottom),0.5rem)] pt-1.5 md:px-4 md:pb-4 md:pt-2">
         {disconnected && (
           <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
             <Loader2 className="h-3 w-3 animate-spin" />
             {t('agent.reconnecting')}
           </div>
         )}
-        <div className="relative rounded-xl border border-input bg-background focus-within:ring-1 focus-within:ring-ring">
+        <div className="relative rounded-xl border border-input bg-background shadow-sm focus-within:ring-1 focus-within:ring-ring">
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (

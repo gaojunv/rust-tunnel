@@ -1,15 +1,14 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Plus, Settings, Trash2 } from 'lucide-react';
+import { Check, ChevronDown, FolderOpen, Loader2, Plus, Settings, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import {
   Dialog,
   DialogContent,
@@ -21,9 +20,6 @@ import {
 import { listAgentWorkspaces, deleteAgentWorkspace, getApiErrorMessage } from '../../api/client';
 import type { AgentWorkspace } from '../../types';
 
-/** shadcn Select 不允许空字符串 value：用哨兵值表示「未选择」，回调时映射回 ''。 */
-const NONE_VALUE = '__none__';
-
 interface Props {
   workspaceId: string;
   onSelect: (id: string) => void;
@@ -32,7 +28,7 @@ interface Props {
   onEdit: () => void;
 }
 
-/** 顶栏工作区选择：shadcn Select（选项含 client_id 小字）+ 编辑/新建 +
+/** 顶栏工作区选择：VS Code 式图标下拉（选项含 client_id 小字）+ 编辑/新建 +
  *  Dialog 确认删除（替代原 inline 两段确认——确认态文本+双按钮挤在顶栏一行，
  *  会撑破布局；对话框也避免误触）。 */
 export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: Props) {
@@ -66,30 +62,54 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
 
   return (
     <div className="flex items-center gap-2">
-      <Select
-        // 未选择态走哨兵值（radix 空串 = 清除选择，语义不同）
-        value={workspaceId || NONE_VALUE}
-        onValueChange={(v) => onSelect(v === NONE_VALUE ? '' : v)}
-      >
-        <SelectTrigger
-          className="h-9 w-[130px] md:w-[220px]"
-          aria-label={t('agent.selectWorkspaceAria')}
-        >
-          <SelectValue placeholder={t('agent.selectWorkspace')} />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value={NONE_VALUE}>{t('agent.selectWorkspace')}</SelectItem>
-          {workspaces?.map((w) => (
-            <SelectItem key={w.id} value={w.id}>
-              {/* 名称 + client_id 小字：多客户端部署时帮助区分同名工作区 */}
-              <span className="flex w-full items-baseline justify-between gap-3">
-                <span className="truncate">{w.name}</span>
-                <span className="shrink-0 text-xs text-muted-foreground">{w.client_id}</span>
-              </span>
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={t('agent.selectWorkspaceAria')}
+            title={current ? current.name : t('agent.selectWorkspace')}
+          >
+            <FolderOpen className="h-4 w-4" />
+            {/* sr-only：保留可访问性 + 供测试断言触发器文本 */}
+            <span className="sr-only">
+              {current ? current.name : t('agent.selectWorkspace')}
+            </span>
+            <ChevronDown className="h-3.5 w-3.5 opacity-50" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-[calc(100vw-2rem)] max-w-80 p-0 md:w-72">
+          {/* sticky 新建工作区：列表长时滚动仍保持可见；onSelect 触发后 Radix 自动收起菜单 */}
+          <div className="sticky top-0 z-10 border-b border-border/60 bg-popover">
+            <DropdownMenuItem className="cursor-pointer" onSelect={() => onNew()}>
+              <Plus className="h-4 w-4" />
+              {t('agent.newWorkspace')}
+            </DropdownMenuItem>
+          </div>
+          <div className="p-1">
+            {(workspaces ?? []).map((w) => (
+              <DropdownMenuItem
+                key={w.id}
+                className="cursor-pointer"
+                onSelect={() => onSelect(w.id)}
+              >
+                {/* 固定宽度 Check 列：非选中项仅占位透明，保证各行左对齐 */}
+                <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                  <Check className={w.id === workspaceId ? 'h-4 w-4' : 'h-4 w-4 opacity-0'} />
+                </span>
+                <div className="min-w-0 flex-1">
+                  {/* 名称 + client_id 小字：多客户端部署时帮助区分同名工作区 */}
+                  <div className="truncate text-sm">{w.name}</div>
+                  <div className="truncate text-xs text-muted-foreground">{w.client_id}</div>
+                </div>
+              </DropdownMenuItem>
+            ))}
+            {(workspaces ?? []).length === 0 && (
+              <p className="px-2 py-2 text-xs text-muted-foreground">{t('agent.selectWorkspace')}</p>
+            )}
+          </div>
+        </DropdownMenuContent>
+      </DropdownMenu>
       <Button
         variant="ghost"
         size="sm"
