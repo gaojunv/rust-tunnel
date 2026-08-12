@@ -160,6 +160,21 @@ fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
 /// becomes a model-facing error instead of tearing down the client.
 const MAX_TOOL_INPUT: usize = 900 * 1024;
 
+/// File path maximum length (POSIX PATH_MAX is usually 4096).
+const MAX_PATH_LEN: usize = 4096;
+
+/// Git commit message maximum length (prevents an oversized message from
+/// blowing past the control-channel cap).
+const MAX_COMMIT_MSG_LEN: usize = 64 * 1024;
+
+/// Validate a path-like argument against `MAX_PATH_LEN`.
+fn check_path_len(value: &str, arg: &str) -> Result<(), String> {
+    if value.len() > MAX_PATH_LEN {
+        return Err(format!("{arg} too long (>{MAX_PATH_LEN} bytes)"));
+    }
+    Ok(())
+}
+
 /// Convert an LLM function call into an AgentCommand. Errors are fed back to the model.
 pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, String> {
     let args: serde_json::Value =
@@ -170,16 +185,22 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
             if cmd.len() > MAX_TOOL_INPUT {
                 return Err("cmd too large (>900KB); split it into smaller commands".to_string());
             }
-            Ok(AgentCommand::Shell {
-                cmd: cmd.to_string(),
-                cwd: arg_opt_str(&args, "cwd"),
+            let cwd = arg_opt_str(&args, "cwd");
+            if let Some(cwd) = &cwd {
+                check_path_len(cwd, "cwd")?;
+            }
+            Ok(AgentCommand::Shell { cmd: cmd.to_string(), cwd })
+        }
+        "read_file" => {
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            Ok(AgentCommand::ReadFile {
+                path: path.to_string(),
             })
         }
-        "read_file" => Ok(AgentCommand::ReadFile {
-            path: arg_str(&args, "path", name)?.to_string(),
-        }),
         "write_file" => {
             let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
             let content = arg_str(&args, "content", name)?;
             if content.len() > MAX_TOOL_INPUT {
                 return Err(
@@ -191,30 +212,53 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                 content: content.to_string(),
             })
         }
-        "list_dir" => Ok(AgentCommand::ListDir {
-            path: arg_str(&args, "path", name)?.to_string(),
-        }),
+        "list_dir" => {
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            Ok(AgentCommand::ListDir {
+                path: path.to_string(),
+            })
+        }
         "git_status" => Ok(AgentCommand::GitStatus),
-        "git_diff" => Ok(AgentCommand::GitDiff {
-            path: arg_opt_str(&args, "path"),
-        }),
-        "git_commit" => Ok(AgentCommand::GitCommit {
-            message: arg_str(&args, "message", name)?.to_string(),
-        }),
+        "git_diff" => {
+            let path = arg_opt_str(&args, "path");
+            if let Some(path) = &path {
+                check_path_len(path, "path")?;
+            }
+            Ok(AgentCommand::GitDiff { path })
+        }
+        "git_commit" => {
+            let message = arg_str(&args, "message", name)?;
+            if message.len() > MAX_COMMIT_MSG_LEN {
+                return Err(format!(
+                    "message too long (>{MAX_COMMIT_MSG_LEN} bytes)"
+                ));
+            }
+            Ok(AgentCommand::GitCommit {
+                message: message.to_string(),
+            })
+        }
         "git_push" => Ok(AgentCommand::GitPush),
         "search" => {
             let pattern = arg_str(&args, "pattern", name)?;
             if pattern.len() > MAX_TOOL_INPUT {
                 return Err("pattern too large (>900KB)".to_string());
             }
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            let include = arg_opt_str(&args, "include");
+            if let Some(include) = &include {
+                check_path_len(include, "include")?;
+            }
             Ok(AgentCommand::Search {
                 pattern: pattern.to_string(),
-                path: arg_str(&args, "path", name)?.to_string(),
-                include: arg_opt_str(&args, "include"),
+                path: path.to_string(),
+                include,
             })
         }
         "patch_file" => {
             let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
             let old_string = arg_str(&args, "old_string", name)?;
             let new_string = arg_str(&args, "new_string", name)?;
             if old_string.len() + new_string.len() > MAX_TOOL_INPUT {
@@ -418,6 +462,96 @@ mod tests {
         match parse_tool_call("git_diff", r"{}").unwrap() {
             AgentCommand::GitDiff { path } => assert!(path.is_none()),
             other => panic!("expected GitDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_path() {
+        let big = "x".repeat(MAX_PATH_LEN + 1);
+        // read_file 必填 path
+        let args = serde_json::json!({"path": big}).to_string();
+        let err = parse_tool_call("read_file", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+        // write_file
+        let args =
+            serde_json::json!({"path": &big, "content": "x"}).to_string();
+        let err = parse_tool_call("write_file", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+        // list_dir
+        let args = serde_json::json!({"path": &big}).to_string();
+        let err = parse_tool_call("list_dir", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+        // git_diff（可选 path）
+        let args = serde_json::json!({"path": &big}).to_string();
+        let err = parse_tool_call("git_diff", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+        // search path
+        let args =
+            serde_json::json!({"pattern": "x", "path": &big}).to_string();
+        let err = parse_tool_call("search", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+        // patch_file path
+        let args = serde_json::json!({
+            "path": &big,
+            "old_string": "o",
+            "new_string": "n"
+        })
+        .to_string();
+        let err = parse_tool_call("patch_file", &args).unwrap_err();
+        assert!(err.contains("path too long"), "err: {err}");
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_cwd() {
+        let big = "x".repeat(MAX_PATH_LEN + 1);
+        let args = serde_json::json!({"cmd": "ls", "cwd": big}).to_string();
+        let err = parse_tool_call("shell", &args).unwrap_err();
+        assert!(err.contains("cwd too long"), "err: {err}");
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_commit_msg() {
+        let big = "x".repeat(MAX_COMMIT_MSG_LEN + 1);
+        let args = serde_json::json!({"message": big}).to_string();
+        let err = parse_tool_call("git_commit", &args).unwrap_err();
+        assert!(err.contains("message too long"), "err: {err}");
+    }
+
+    #[test]
+    fn test_parse_rejects_oversized_include() {
+        let big = "x".repeat(MAX_PATH_LEN + 1);
+        let args =
+            serde_json::json!({"pattern": "x", "path": ".", "include": big}).to_string();
+        let err = parse_tool_call("search", &args).unwrap_err();
+        assert!(err.contains("include too long"), "err: {err}");
+    }
+
+    #[test]
+    fn test_parse_accepts_max_boundary_path() {
+        let ok = "x".repeat(MAX_PATH_LEN);
+        let args = serde_json::json!({"path": ok}).to_string();
+        let cmd = parse_tool_call("read_file", &args).unwrap();
+        match cmd {
+            AgentCommand::ReadFile { path } => assert_eq!(path.len(), MAX_PATH_LEN),
+            other => panic!("expected ReadFile, got {other:?}"),
+        }
+        // cwd 边界
+        let cwd = "y".repeat(MAX_PATH_LEN);
+        let args = serde_json::json!({"cmd": "ls", "cwd": cwd}).to_string();
+        match parse_tool_call("shell", &args).unwrap() {
+            AgentCommand::Shell { cwd, .. } => {
+                assert_eq!(cwd.as_deref().map(str::len), Some(MAX_PATH_LEN));
+            }
+            other => panic!("expected Shell, got {other:?}"),
+        }
+        // commit message 边界（恰好 64KB）
+        let msg = "z".repeat(MAX_COMMIT_MSG_LEN);
+        let args = serde_json::json!({"message": msg}).to_string();
+        match parse_tool_call("git_commit", &args).unwrap() {
+            AgentCommand::GitCommit { message } => {
+                assert_eq!(message.len(), MAX_COMMIT_MSG_LEN);
+            }
+            other => panic!("expected GitCommit, got {other:?}"),
         }
     }
 }

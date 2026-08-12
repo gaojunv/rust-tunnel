@@ -245,6 +245,15 @@ async fn handle_client_connection(
     .await;
 
     // 3. Cleanup: remove from registry
+    // 客户端控制连接断开：先清理该客户端的 ACP 会话（flush 回合缓冲 + 移除条目）。
+    // 客户端 agent 进程随连接断开而终止，残留条目只会被 idle reaper 晚回收
+    // （30 分钟）；disconnect 只发断线通知、不 await 任何 agent 工作，此处即时
+    // 清理避免审批等待/缓冲长时间悬挂。
+    if let Some(agent) = &state.agent_state {
+        if let Some(bridge) = &agent.acp_bridge {
+            bridge.drop_client_sessions(&name_for_cleanup).await;
+        }
+    }
     cleanup_registry
         .disconnect(&name_for_cleanup, "connection closed")
         .await;

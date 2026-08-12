@@ -3,8 +3,11 @@ use rust_tunnel_common::AgentCommand;
 
 /// shell 危险模式（大小写不敏感子串匹配）。仅 auto_write 档用于判定 shell；
 /// safe 档下所有写操作都需确认，不经此表。
-/// 强制 push / dd 写盘 / 重定向进块设备无法用连续子串可靠表达，由
-/// [`is_force_push`] / [`is_dd_write`] / [`redirects_to_device`] 单独判定。
+/// 匹配前先对命令做空白归一化（任意连续空白折叠为单空格），故 `rm  -rf /`、
+/// `kill\t-9` 等空白变体同样命中。
+/// 强制 push / dd 写盘 / 重定向进块设备 / kill 危险信号 / 递归 rm 无法用连续子串
+/// 可靠表达，由 [`is_force_push`] / [`is_git_push`] / [`is_dd_write`] /
+/// [`is_kill_dangerous`] / [`is_recursive_rm`] / [`redirects_to_device`] 单独判定。
 const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
     "rm -rf",
     "rm -fr",
@@ -50,18 +53,89 @@ fn is_dd_write(cmd_lower: &str) -> bool {
     has_dd && cmd_lower.split_whitespace().any(|t| t.starts_with("if="))
 }
 
-/// 重定向进块设备："> /dev/xxx" 但排除良性的 /dev/null。
+/// kill 危险信号：独立 token `kill`（或以 `/kill` 结尾，排除 killall/killall5）
+/// 后跟以 `-` 开头的危险信号参数（-9 / -KILL / -SIGKILL / -SIGTERM / -STOP 等）。
+fn is_kill_dangerous(cmd_lower: &str) -> bool {
+    const DANGEROUS_SIGNALS: &[&str] = &[
+        "-9",
+        "-sighup",
+        "-sigint",
+        "-sigkill",
+        "-sigterm",
+        "-sigstop",
+        "-sigcont",
+        "-hup",
+        "-int",
+        "-kill",
+        "-term",
+        "-stop",
+        "-abrt",
+        "-segv",
+    ];
+    let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if *t == "kill" || t.ends_with("/kill") {
+            if let Some(&next) = tokens.get(i + 1) {
+                if DANGEROUS_SIGNALS.contains(&next) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// rm 递归删除：独立 token `rm`（或以 `/rm` 结尾）后带递归标志
+/// （-r/-R/--recursive，或合并短选项含 'r'）。任何递归 rm 都视为危险（即便无 -f），
+/// 因为 `rm -r` 即可静默删除整个目录树。
+fn is_recursive_rm(cmd_lower: &str) -> bool {
+    let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if *t != "rm" && !t.ends_with("/rm") {
+            continue;
+        }
+        for &flag in &tokens[i + 1..] {
+            let recursive = matches!(flag, "-r" | "-R")
+                || flag.starts_with("--recursive")
+                || (flag.starts_with('-')
+                    && !flag.starts_with("--")
+                    && flag.len() > 2
+                    && flag.contains('r'));
+            if recursive {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 重定向进块设备：`>` 后（跳过空白）直接是 `/dev/xxx` 但排除良性的 `/dev/null`。
+/// 不依赖 `>` 与 `/dev/` 之间是否有空格，故 `>/dev/sda`、`2>/dev/sda` 同样命中；
+/// `>>` 的第二个 `>` 也参与检测。
 fn redirects_to_device(cmd_lower: &str) -> bool {
-    cmd_lower.contains("> /dev/") && !cmd_lower.contains("> /dev/null")
+    for (i, &b) in cmd_lower.as_bytes().iter().enumerate() {
+        if b == b'>' {
+            let path_start = cmd_lower[i + 1..].trim_start();
+            if path_start.starts_with("/dev/") && !path_start.starts_with("/dev/null") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 该 shell 命令是否命中危险模式。
 pub fn is_dangerous_shell(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
+    // 空白归一化：任意连续空白（空格/tab/换行）折叠为单个空格，使 `rm  -rf /`、
+    // `kill\t-9` 等空白变体无法绕过子串匹配。归一化后同一字符序列的语义不变。
+    let normalized = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_lowercase();
     DANGEROUS_SHELL_PATTERNS.iter().any(|p| lower.contains(p))
         || is_force_push(&lower)
         || is_git_push(&lower) // 对 auto_write 而言所有 push 都是"危险"需确认；safe 档本来就全确认
         || is_dd_write(&lower)
+        || is_kill_dangerous(&lower)
+        || is_recursive_rm(&lower)
         || redirects_to_device(&lower)
 }
 
@@ -293,6 +367,53 @@ mod tests {
         // 真实块设备命中
         assert!(is_dangerous_shell("dd of=x > /dev/sda"));
         assert!(is_dangerous_shell("cat x > /dev/mmcblk0"));
+    }
+
+    #[test]
+    fn test_whitespace_variant_bypass() {
+        // 空格变体绕过：连续空白折叠为单空格后应命中
+        assert!(is_dangerous_shell("rm  -rf /"));
+        assert!(is_dangerous_shell("rm\t-rf\t/"));
+        assert!(is_dangerous_shell("git reset  --hard HEAD"));
+    }
+
+    #[test]
+    fn test_kill_signal_variants() {
+        // 多空格 / 信号名变体 / SIG 前缀变体
+        assert!(is_dangerous_shell("kill  -9  1234"));
+        assert!(is_dangerous_shell("kill -KILL 1234"));
+        assert!(is_dangerous_shell("kill -SIGKILL 1234"));
+        assert!(is_dangerous_shell("sudo kill -TERM 1234"));
+        // 独立 token 门槛：killall / killall5 不误杀
+        assert!(!is_dangerous_shell("killall firefox"));
+        assert!(!is_dangerous_shell("killall5"));
+        assert!(!is_dangerous_shell("kill 1234")); // 无信号参数不命中
+    }
+
+    #[test]
+    fn test_redirect_no_space() {
+        // 无空格重定向（直接 `>/dev/...`、fd 重定向、空命令重定向）
+        assert!(is_dangerous_shell("echo x >/dev/sda"));
+        assert!(is_dangerous_shell("echo x 2>/dev/sda"));
+        assert!(is_dangerous_shell(">/dev/sda"));
+        // 良性的 /dev/null 在无空格形态下也不误报
+        assert!(!is_dangerous_shell("echo x >/dev/null"));
+        assert!(!is_dangerous_shell("echo x >/dev/null 2>&1"));
+    }
+
+    #[test]
+    fn test_recursive_rm_detection() {
+        // 任何递归 rm 都危险：单独 -r/-R/--recursive、长选项组合、合并短选项
+        assert!(is_dangerous_shell("rm -r node_modules"));
+        assert!(is_dangerous_shell("rm -R node_modules"));
+        assert!(is_dangerous_shell("rm --recursive --force node_modules"));
+        assert!(is_dangerous_shell("rm -R -f node_modules"));
+        assert!(is_dangerous_shell("rm -r --force node_modules"));
+        assert!(is_dangerous_shell("rm -rfv node_modules")); // 合并短选项含 r
+        // 非递归 rm / 非独立 token 不误伤
+        assert!(!is_dangerous_shell("rm file.txt"));
+        assert!(!is_dangerous_shell("rm -f file.txt"));
+        assert!(!is_dangerous_shell("rmdir -r dir"));
     }
 
     #[test]

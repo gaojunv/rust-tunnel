@@ -121,6 +121,12 @@ struct SpawnedAgent {
     /// teardown 是不是注册方本人」。刷新竞态下旧连接 teardown 晚于新连接注册，
     /// 若无条件清空会误清新连接通道（tool_result/done 全丢）。
     ws_conn_id: u64,
+    /// WS 连接变化通知：`ensure_session` 每次注册/刷新写入新 conn_id（insert
+    /// 时以 conn_id 为初始值），[`AcpBridge::detach_ws_tx`] 匹配清空时写入 0。
+    /// 审批等待（`request_permission` → [`approve_or_disconnect`]）订阅此通道：
+    /// 连接断开/重连（值变为 ≠ 捕获的 conn_id）即立即拒绝，不再等满 5 分钟
+    /// 审批超时——断线后审批帧缓冲在无人消费的 channel 里、新重连也收不到。
+    ws_conn_watch: watch::Sender<u64>,
     /// 回合进行中标记：prompt 置位、PromptResponse 到达/cancel 清位。防并发
     /// prompt（ACP 单连接不支持并发回合；WS session_lock 只串行化分派，
     /// 不跨异步回合）。
@@ -327,6 +333,9 @@ impl AcpBridge {
                     if let Some(a) = sessions.get_mut(session_id) {
                         a.ws_tx = Some(ws_tx.clone());
                         a.ws_conn_id = conn_id;
+                        // 通知审批等待者连接已切换（重连/多标签页）：旧 conn_id
+                        // 的 request_permission 等待立即拒绝，新连接才能看到审批卡。
+                        a.ws_conn_watch.send_replace(conn_id);
                     }
                     return Ok(());
                 }
@@ -358,6 +367,7 @@ impl AcpBridge {
                     client_id: workspace.client_id.clone(),
                     ws_tx: Some(ws_tx.clone()),
                     ws_conn_id: conn_id,
+                    ws_conn_watch: watch::channel(conn_id).0,
                     busy: false,
                     cancelled_turns: std::collections::HashSet::new(),
                     turn_generation: 0,
@@ -714,19 +724,27 @@ impl AcpBridge {
                         let approval = approval.clone();
                         let sessions = sessions.clone();
                         async move |request: RequestPermissionRequest, responder, _cx| {
-                            // 动态解析当前 WS 通道（同 notification，评审 Finding 1）：
-                            // 审批弹层要推给最新连接，而非 handshake 时捕获的旧通道。
-                            let ws_tx = match current_ws_tx(&sessions, &sid).await {
-                                Some(tx) => tx,
-                                // 会话已回收 / WS 已断开：构造一个立即失效的通道传给
-                                // 审批回调，request_approval 发帧失败即按拒绝短路返回
-                                // （评审 Finding 2：避免 5 分钟超时占用连接任务，阻塞
-                                // agent 下一个工具调用）。
-                                None => {
-                                    let (tx, _rx) = mpsc::channel::<serde_json::Value>(1);
-                                    tx
-                                }
+                            // 动态解析当前 WS 通道 + 连接标识 + 连接变化 watch
+                            // （同 notification，评审 Finding 1）：审批弹层要推给
+                            // 最新连接，而非 handshake 时捕获的旧通道。
+                            let Some((ws_tx, conn_id, conn_rx)) =
+                                current_ws_channel(&sessions, &sid).await
+                            else {
+                                // 会话已回收（kill/reaper）：无审批通道可推，立即拒绝。
+                                let _ = responder.respond(RequestPermissionResponse::new(
+                                    RequestPermissionOutcome::Cancelled,
+                                ));
+                                return Ok(());
                             };
+                            // WS 已断开（detach 置 None）：构造一个立即失效的通道传给
+                            // 审批回调，request_approval 发帧失败即按拒绝短路返回
+                            // （评审 Finding 2：避免 5 分钟超时占用连接任务，阻塞
+                            // agent 下一个工具调用）。若断开早于订阅，conn_rx 当前值
+                            // 已 ≠ conn_id，approve_or_disconnect 直接短路拒绝。
+                            let ws_tx = ws_tx.unwrap_or_else(|| {
+                                let (tx, _rx) = mpsc::channel::<serde_json::Value>(1);
+                                tx
+                            });
                             let tool_name = request
                                 .tool_call
                                 .fields
@@ -748,13 +766,17 @@ impl AcpBridge {
                                 .iter()
                                 .map(permission_option_to_approval)
                                 .collect();
-                            let result = approval(
+                            // 审批在途时连接断开/重连 → 立即拒绝（不等满审批超时），
+                            // 避免审批帧缓冲在无人消费的旧 channel 里、新重连也看不到。
+                            let result = approve_or_disconnect(
+                                approval.clone(),
                                 sid.clone(),
                                 tool_name,
-                                "ACP 工具调用请求".to_string(),
                                 args_preview,
                                 options,
                                 ws_tx,
+                                conn_id,
+                                conn_rx,
                             )
                             .await;
                             let outcome = match result {
@@ -1347,7 +1369,34 @@ impl AcpBridge {
         if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
             if a.ws_conn_id == my_conn_id {
                 a.ws_tx = None;
+                // 通知审批等待者本连接已断开：值变化 → wait_for 唤醒 → 立即拒绝
+                // （若 detach 早于订阅，borrow 已看到 0，同样短路拒绝）。
+                a.ws_conn_watch.send_replace(0);
             }
+        }
+    }
+
+    /// 客户端控制连接断开时清理该客户端的所有 ACP 会话：先 flush 回合缓冲
+    /// （断线瞬间未到终态的内容也落库，刷新历史仍可追溯），再移除会话条目。
+    /// 客户端进程随控制连接断开而终止，残留条目只会被 idle reaper 晚回收
+    /// （30 分钟），此处在断开点即时清理，避免审批等待/缓冲长时间悬挂。
+    pub async fn drop_client_sessions(&self, client_id: &str) {
+        let sids: Vec<String> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, a)| a.client_id == client_id)
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        for sid in sids {
+            flush_acp_turn_buffers(&self.db, &self.sessions, &sid).await;
+            self.sessions.lock().await.remove(&sid);
+            tracing::info!(
+                session_id = %sid,
+                client_id,
+                "dropped ACP session on client disconnect"
+            );
         }
     }
 
@@ -1748,6 +1797,61 @@ async fn current_ws_tx(
     let agent = map.get_mut(sid)?;
     agent.last_activity = std::time::Instant::now();
     agent.ws_tx.clone()
+}
+
+/// 动态解析会话当前的 WS 事件通道 + 连接标识 + 连接变化 watch（`request_permission`
+/// 处理器专用）。与 [`current_ws_tx`] 同样的「每次事件读最新值」语义，额外返回
+/// `ws_conn_id` 与 watch Receiver——`approve_or_disconnect` 据此在连接断开/重连时
+/// 即时拒绝审批，不等满审批超时。会话不存在返回 None。
+async fn current_ws_channel(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) -> Option<(
+    Option<mpsc::Sender<serde_json::Value>>,
+    u64,
+    watch::Receiver<u64>,
+)> {
+    let mut map = sessions.lock().await;
+    let agent = map.get_mut(sid)?;
+    agent.last_activity = std::time::Instant::now();
+    Some((
+        agent.ws_tx.clone(),
+        agent.ws_conn_id,
+        agent.ws_conn_watch.subscribe(),
+    ))
+}
+
+/// 审批等待 + 断线/重连即时拒绝（select 逻辑独立成函数便于单元测试）。
+///
+/// 订阅后先检查当前值：若已 detach/重连（值 ≠ 捕获的 `captured_conn_id`，
+/// 例如 detach 早于订阅发生）立即返回 `Denied`，不进入审批。随后 select 等
+/// approval 完成，或 `conn_rx` 变为 ≠ 捕获值（连接断开/重连 → 审批帧缓冲在
+/// 无人消费的旧 channel 里、新重连也收不到）→ 返回 `Denied`，避免
+/// `request_approval` 等满 5 分钟超时阻塞 agent 的下一个工具调用。
+#[allow(clippy::too_many_arguments)]
+async fn approve_or_disconnect(
+    approval: Arc<ApproveFn>,
+    sid: String,
+    tool_name: String,
+    args_preview: String,
+    options: Vec<ApprovalOption>,
+    ws_tx: mpsc::Sender<serde_json::Value>,
+    captured_conn_id: u64,
+    mut conn_rx: watch::Receiver<u64>,
+) -> ApprovalResult {
+    // subscribe 之后立即检查：可能在 subscribe 之前已变化（detach/重连已发生）。
+    if *conn_rx.borrow() != captured_conn_id {
+        return ApprovalResult::Denied;
+    }
+    tokio::select! {
+        result = approval(sid, tool_name, "ACP 工具调用请求".to_string(), args_preview, options, ws_tx) => {
+            result
+        }
+        _ = conn_rx.wait_for(|v| *v != captured_conn_id) => {
+            // WS 断线/重连 → Deny（不等审批超时）。
+            ApprovalResult::Denied
+        }
+    }
 }
 
 /// 刷新会话活动时间并返回条目是否存在。与 [`current_ws_tx`] 的锁内刷新
@@ -2231,6 +2335,7 @@ mod tests {
             client_id: "nas".into(),
             ws_tx: None,
             ws_conn_id: 0,
+            ws_conn_watch: watch::channel(0).0,
             busy: false,
             cancelled_turns: std::collections::HashSet::new(),
             turn_generation: 0,
@@ -3761,6 +3866,184 @@ mod tests {
         // 新连接自己的 teardown 仍能清空
         bridge.detach_ws_tx("sess-1", NEW).await;
         assert!(bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_none());
+    }
+
+    // ── WS 连接变化 watch：审批断线/重连即时拒绝 ──────────────────
+
+    #[tokio::test]
+    async fn test_ws_conn_watch_denies_on_detach() {
+        // 断线即时拒绝：审批等待期间 detach_ws_tx 写入 0 → conn_watch 值变化
+        // → wait_for 唤醒 → Deny，不等满 5 分钟审批超时（旧实现审批帧缓冲在
+        // 无人消费的 channel 里，新重连也看不到审批卡）。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mut agent = spawned_agent();
+        agent.ws_tx = Some(ws_tx);
+        agent.ws_conn_id = TEST_CONN_ID;
+        agent.ws_conn_watch.send_replace(TEST_CONN_ID);
+        let conn_rx = agent.ws_conn_watch.subscribe();
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+
+        // approval 挂起（永不返回）：等待中途断线由 watch 唤醒短路拒绝。
+        let approval: Arc<ApproveFn> = Arc::new(|_, _, _, _, _, _| {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                ApprovalResult::Approved
+            })
+        });
+        let handle = tokio::spawn(approve_or_disconnect(
+            approval,
+            "sess-1".into(),
+            "shell".into(),
+            "ls".into(),
+            vec![],
+            mpsc::channel::<serde_json::Value>(1).0,
+            TEST_CONN_ID,
+            conn_rx,
+        ));
+
+        // 审批在途时连接断开 → 立即拒绝
+        bridge.detach_ws_tx("sess-1", TEST_CONN_ID).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("must deny promptly on disconnect")
+            .unwrap();
+        assert_eq!(result, ApprovalResult::Denied);
+    }
+
+    #[tokio::test]
+    async fn test_ws_conn_watch_approves_when_connected() {
+        // 连接保持时 conn_watch 值不变：审批正常完成（Approved），不被误拒。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mut agent = spawned_agent();
+        agent.ws_tx = Some(ws_tx);
+        agent.ws_conn_id = TEST_CONN_ID;
+        agent.ws_conn_watch.send_replace(TEST_CONN_ID);
+        let conn_rx = agent.ws_conn_watch.subscribe();
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+
+        let approval: Arc<ApproveFn> = Arc::new(|_, _, _, _, _, _| {
+            Box::pin(async { ApprovalResult::Approved })
+        });
+        let result = approve_or_disconnect(
+            approval,
+            "sess-1".into(),
+            "shell".into(),
+            "ls".into(),
+            vec![],
+            mpsc::channel::<serde_json::Value>(1).0,
+            TEST_CONN_ID,
+            conn_rx,
+        )
+        .await;
+        assert_eq!(result, ApprovalResult::Approved);
+    }
+
+    // ── drop_client_sessions：客户端控制连接断开清理 ──────────────
+
+    #[tokio::test]
+    async fn test_drop_client_sessions_cleans_sessions_for_client() {
+        // 两个 nas 会话 + 一个其他客户端会话：drop 后仅 nas 的两条被移除。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let mut nas1 = spawned_agent();
+        nas1.client_id = "nas".into();
+        let mut nas2 = spawned_agent();
+        nas2.client_id = "nas".into();
+        let mut other = spawned_agent();
+        other.client_id = "other".into();
+        {
+            let mut sessions = bridge.sessions.lock().await;
+            sessions.insert("sess-nas-1".into(), nas1);
+            sessions.insert("sess-nas-2".into(), nas2);
+            sessions.insert("sess-other".into(), other);
+        }
+        bridge.drop_client_sessions("nas").await;
+        let sessions = bridge.sessions.lock().await;
+        assert!(!sessions.contains_key("sess-nas-1"));
+        assert!(!sessions.contains_key("sess-nas-2"));
+        assert!(sessions.contains_key("sess-other"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_client_sessions_flushes_buffers() {
+        // 会话有缓冲 turn_segments（断线瞬间未到终态）：drop 时先 flush 落库，
+        // 刷新历史仍可追溯（思考先行、正文随后）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+
+        let mut agent = spawned_agent();
+        agent.client_id = "nas".into();
+        agent.turn_segments = vec![
+            TurnSegment {
+                thought: true,
+                content: "先思考".into(),
+            },
+            TurnSegment {
+                thought: false,
+                content: "再回复".into(),
+            },
+        ];
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+
+        bridge.drop_client_sessions("nas").await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let thoughts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.name.as_deref() == Some("thought"))
+            .collect();
+        let texts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "message" && r.name.is_none())
+            .collect();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts[0].content, "先思考");
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].content, "再回复");
+    }
+
+    #[tokio::test]
+    async fn test_drop_client_sessions_unknown_client_noop() {
+        // 不存在的 client：不 panic、不动其它会话条目。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        bridge
+            .sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), spawned_agent());
+        bridge.drop_client_sessions("no-such-client").await;
+        assert!(bridge.sessions.lock().await.contains_key("sess-1"));
     }
 
     // ── workspace 级 config overrides 注入 ──────────────────────
