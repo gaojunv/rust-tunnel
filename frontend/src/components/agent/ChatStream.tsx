@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Button } from '@/components/ui/button';
 import { Loader2, SendHorizontal, Square } from 'lucide-react';
 import {
@@ -65,6 +66,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // 消息区滚动容器 ref：虚拟化的 getScrollElement 目标。
+  const scrollRef = useRef<HTMLDivElement>(null);
   // 悬浮输入框高度：消息区底部留出同高占位，保证末尾消息可滚动到输入框之上
   const [inputFloatH, setInputFloatH] = useState(0);
   const inputCardRef = useRef<HTMLDivElement>(null);
@@ -103,6 +106,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // done 后对账重载的标记：history effect 读到它时跳过 running 兜底 heuristic
   // （对账重载的末行可能是 tool_result，按现状会误置 running=true——回合其实已终态）。
   const reconcileRef = useRef(false);
+
+  // 消息区虚拟化：长会话只渲染视口内气泡，DOM 数量与 items 总数解耦（流式每
+  // 50ms 更新时只 re-measure 视口内元素，避免长会话全量 DOM 布局卡顿）。
+  // jsdom 无 ResizeObserver（measureElement 依赖它）时退化全量渲染，保证
+  // 测试环境行为与既有实现一致。
+  const canVirtualize = typeof ResizeObserver !== 'undefined';
+  const virtualizer = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 80,
+    overscan: 8,
+  });
+  const virtualItems = canVirtualize ? virtualizer.getVirtualItems() : null;
 
   // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）。
   // 关键：staleTime 0 + refetchOnMount 'always'。staleTime Infinity 会留下陈旧
@@ -765,13 +781,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     };
   }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream]);
 
+  // 虚拟化下 getTotalSize() 随 measureElement 异步修正 item 高度而变：装载长会话时
+  // 初始 estimate 不准，totalSize 稳定后需重新对齐底部，否则滚动停在半路、最新消息
+  // 不可见。退化路径 totalSize 仅随 items 数量变化，行为与原先「items 变化即滚」一致。
+  const totalSize = virtualizer.getTotalSize();
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
     // 避免逐 token smooth 动画互相堆积。jsdom 未实现 scrollIntoView，?.() 保底。
     if (stickToBottomRef.current) {
       bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
-  }, [items]);
+  }, [items, totalSize]);
 
   // 输入框自适应高度：内容驱动向上长高（输入框锚定底部悬浮），超 10 行才出滚动条
   const autoresizeInput = useCallback(() => {
@@ -981,10 +1001,32 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     (o) => o.category !== 'mode' && o.category !== 'thought_level',
   );
 
+  // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
+  // （assistant/thought），MessageBubble 据此降级为纯文本渲染（避免 Shiki 每帧
+  // 全量重高亮，见 MessageBubble.tsx 的 PlainBody）。
+  const renderItem = (it: ChatItem, i: number) => {
+    const isStreaming =
+      streamingIdxRef.current === i && (it.kind === 'assistant' || it.kind === 'thought');
+    if (it.kind === 'system') {
+      return <SystemMessage key={i} tone={it.systemTone} content={it.content} />;
+    }
+    if (it.kind === 'approval') {
+      return <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />;
+    }
+    return (
+      <MessageBubble
+        key={it.kind === 'tool' && it.toolId ? it.toolId : i}
+        item={it}
+        streaming={isStreaming}
+      />
+    );
+  };
+
   return (
     <div className="relative flex h-full flex-col">
       <div
-        className="flex-1 space-y-3 overflow-y-auto px-3 py-3 md:space-y-4 md:px-5 md:py-4"
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4"
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
@@ -994,13 +1036,35 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         {items.length === 0 && !running && (
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
-        {items.map((it, i) => (
-          it.kind === 'system'
-            ? <SystemMessage key={i} tone={it.systemTone} content={it.content} />
-            : it.kind === 'approval'
-              ? <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />
-              : <MessageBubble key={it.kind === 'tool' && it.toolId ? it.toolId : i} item={it} />
-        ))}
+        {virtualItems ? (
+          // 虚拟化路径：只渲染视口附近的气泡。item div 用 absolute + translateY
+          // 定位（totalSize 撑起滚动高度），间距用 padding 而非 margin——measureElement
+          // 只测 border-box，margin 不计入会导致相邻项重叠。pb-3/md:pb-4 对齐原 space-y。
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+            {virtualItems.map((vi) => (
+              <div
+                key={vi.index}
+                ref={virtualizer.measureElement}
+                data-index={vi.index}
+                className="pb-3 md:pb-4"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  transform: `translateY(${vi.start}px)`,
+                }}
+              >
+                {renderItem(items[vi.index], vi.index)}
+              </div>
+            ))}
+          </div>
+        ) : (
+          // 退化路径（jsdom/无 ResizeObserver）：全量渲染，保持原 space-y 布局
+          <div className="space-y-3 md:space-y-4">
+            {items.map((it, i) => renderItem(it, i))}
+          </div>
+        )}
         {running && (
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />

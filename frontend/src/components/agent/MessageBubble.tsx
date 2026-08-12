@@ -267,14 +267,28 @@ function ToolCard({ item }: { item: ChatItem }) {
   );
 }
 
+/** 流式期间的降级渲染：跳过 Streamdown/Shiki 全量解析，直接渲染纯文本。
+ *
+ *  流式气泡每 STREAM_FLUSH_MS（50ms）追加一次内容。若每帧都对整段 markdown
+ *  重跑 unified 解析 + Shiki codeToTokens，长代码块呈 O(n²)（n 帧 × 每帧
+ *  O(n) tokenize 整块代码，且代码块越长常数越大）。流式期间降级为文本节点
+ *  （追加渲染 O(1)/帧量级），终态后切回 Markdown 一次性高亮 → 总代价 O(n)。
+ *  样式与 Markdown 正文对齐（text-sm leading-7），避免终态切换时跳变。
+ */
+function PlainBody({ content }: { content: string }) {
+  return <div className="whitespace-pre-wrap break-words text-sm leading-7">{content}</div>;
+}
+
 /** 单条消息气泡：user / assistant（Markdown）/ tool（默认收起的工具卡片）。
  *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。
+ *  `streaming`：当前正在流式写入的气泡。流式期间 assistant/thought 用 PlainBody
+ *  渲染（见上，避免 Shiki 每帧全量重高亮），终态后一次性完整 Markdown。
  *  布局策略（对标主流 AI 聊天 UI）：
  *  - user：右对齐小气泡（primary 淡底），用户消息一般短，气泡让双方身份一眼可辨
  *  - assistant：全宽无气泡正文。LLM 回复是长文（标题/列表/表格/代码块），
  *    套 max-w-[80%] 的圆角盒子会压缩排版空间、且圆角背景让长文显得拥挤
  *  - tool：全宽细线卡片，视觉上弱于正文（工具是过程，正文是结论） */
-export default memo(function MessageBubble({ item }: { item: ChatItem }) {
+export default memo(function MessageBubble({ item, streaming }: { item: ChatItem; streaming?: boolean }) {
   const cls =
     item.kind === 'user'
       ? 'ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-primary/10 px-3.5 py-2 text-sm leading-relaxed'
@@ -293,9 +307,9 @@ export default memo(function MessageBubble({ item }: { item: ChatItem }) {
       {item.kind === 'tool' ? (
         <ToolCard item={item} />
       ) : item.kind === 'assistant' ? (
-        <Markdown content={item.content} />
+        streaming ? <PlainBody content={item.content} /> : <Markdown content={item.content} />
       ) : item.kind === 'thought' ? (
-        <ThoughtBubble content={item.content} />
+        <ThoughtBubble content={item.content} streaming={streaming} />
       ) : item.kind === 'plan' ? (
         <PlanBubble entries={item.planEntries ?? []} />
       ) : (
@@ -320,8 +334,9 @@ function thoughtPreview(content: string): string | null {
 
 /** 思考过程卡片：与 ToolCard 同构（图标 + 标题 + 预览 + chevron 头部，
  *  展开区 border-t 分隔），默认折叠（思考是低信噪过程信息）。
- *  内容按 Markdown 渲染（agent 思考多为 md 格式），muted 弱化以区分正文。 */
-function ThoughtBubble({ content }: { content: string }) {
+ *  内容按 Markdown 渲染（agent 思考多为 md 格式），muted 弱化以区分正文。
+ *  `streaming` 期间展开区走 PlainBody 降级（同正文气泡，避免流式每帧 Shiki 重高亮）。 */
+function ThoughtBubble({ content, streaming }: { content: string; streaming?: boolean }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const preview = thoughtPreview(content);
@@ -348,7 +363,7 @@ function ThoughtBubble({ content }: { content: string }) {
       </button>
       {open && (
         <div className="mt-2 border-t border-border/60 pt-2 text-muted-foreground [&_pre]:!my-2">
-          <Markdown content={content} />
+          {streaming ? <PlainBody content={content} /> : <Markdown content={content} />}
         </div>
       )}
     </div>
