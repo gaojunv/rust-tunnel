@@ -627,6 +627,7 @@ impl Database {
                 title TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 model TEXT,
+                acp_session_id TEXT,
                 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
                 updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
@@ -662,6 +663,7 @@ impl Database {
         Self::migrate_agent_workspaces_v3(pool).await?;
         Self::migrate_agent_workspaces_v4(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
+        Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
 
         Ok(())
@@ -723,6 +725,24 @@ impl Database {
     /// 幂等：列已存在时 ALTER 报错即跳过。
     async fn migrate_agent_sessions_v2(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN config_state TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_sessions migration: column already exists");
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_sessions 补全 ACP 会话 id 列（agent 侧持久化会话的 session_id，
+    /// 供断线重拉时 session/resume 恢复上下文）。幂等：列已存在时跳过。
+    async fn migrate_agent_sessions_v3(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN acp_session_id TEXT")
             .execute(pool)
             .await
         {

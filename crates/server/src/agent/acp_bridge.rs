@@ -28,13 +28,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PermissionOption,
-    PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigValueId, SessionNotification, SetSessionConfigOptionRequest, TextContent,
-    WriteTextFileRequest, WriteTextFileResponse,
+    CancelNotification, ContentBlock, DeleteSessionRequest, InitializeRequest,
+    NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigValueId, SessionId,
+    SessionNotification, SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client, ConnectionTo};
@@ -437,9 +438,19 @@ impl AcpBridge {
                 "acp spawn stage: agent process spawned"
             );
             // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线；
-            // ws_tx 由连接任务的处理器每次事件从会话条目动态解析，无需传入）
+            // ws_tx 由连接任务的处理器每次事件从会话条目动态解析，无需传入）。
+            // 重拉（断连过久/reaper 杀进程后）时从 DB 取持久化的 ACP session id，
+            // 交 handshake 优先 session/resume 恢复上下文；读失败视为无（重拉走全新）。
+            let persisted_acp_session_id = self
+                .db
+                .agent_get_session(session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.acp_session_id);
             let root_path = workspace.root_path.clone();
-            self.acp_handshake(session_id, &root_path).await?;
+            self.acp_handshake(session_id, &root_path, persisted_acp_session_id)
+                .await?;
             tracing::info!(
                 session_id,
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
@@ -494,20 +505,32 @@ impl AcpBridge {
         outcome
     }
 
-    /// ACP handshake：initialize → session/new（或 session/load 恢复）。
+    /// ACP handshake：initialize → 会话建立（session/new，或带持久化 id 时优先
+    /// session/resume 恢复上下文）。
     ///
     /// 从占位条目取走 duplex 的 ACP 端，spawn 一个常驻连接任务（crate 的
     /// `Client` 角色 + `ByteStreams` transport），任务内完成
-    /// `initialize` + `session/new`，把 `ConnectionTo<Agent>` 与 ACP session id
-    /// 写回会话条目；随后 main_fn 挂起等待 incoming EOF（保持连接存活，
-    /// 直到进程退出/会话被杀）。通知（`session/update`）经
-    /// [`map_update`] 映射后推会话条目当前的 ws_tx——处理器每次事件动态解析，
-    /// 重连自动切到新连接；权限请求（`session/request_permission`）走审批回调。
+    /// `initialize` + 会话建立（`session/resume` 或 `session/new`），把
+    /// `ConnectionTo<Agent>` 与 ACP session id 写回会话条目；随后 main_fn 挂起
+    /// 等待 incoming EOF（保持连接存活，直到进程退出/会话被杀）。通知
+    /// （`session/update`）经 [`map_update`] 映射后推会话条目当前的 ws_tx——
+    /// 处理器每次事件动态解析，重连自动切到新连接；权限请求
+    /// （`session/request_permission`）走审批回调。
+    ///
+    /// `persisted_acp_session_id` 为上次会话建立落库的 ACP session id（断线过久
+    /// 重拉时从 DB 取）。agent 声明支持 `session/resume` 时优先 resume（凭 id 从
+    /// 客户端磁盘恢复 agent 侧对话上下文），失败/不支持回退 `session/new`。
+    /// 最终生效的 session id 落库（best-effort），供下次重拉继续 resume。
     ///
     /// 注意：`agent_client_protocol::Client` 是角色标记（unit struct），并非
     /// 连接句柄；连接句柄是 `ConnectionTo<Agent>`。每 session 一条专用连接，
     /// 通知无需按 session id 过滤。
-    async fn acp_handshake(&self, session_id: &str, cwd: &str) -> Result<(), String> {
+    async fn acp_handshake(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        persisted_acp_session_id: Option<String>,
+    ) -> Result<(), String> {
         // 取走 duplex 的 ACP 端（占用即移除；后续 kill 不再持有）。
         let agent_io = {
             let mut sessions = self.sessions.lock().await;
@@ -856,25 +879,94 @@ impl AcpBridge {
                         ByteStreams::new(FuturesIo(agent_wr), FuturesIo(agent_rd))
                     },
                     async move |cx| {
-                        // 1) initialize；2) session/new。失败则 setup 报错并关连接。
+                        // 1) initialize；2) 会话建立（session/resume 或 session/new）。
+                        // 失败则 setup 报错并关连接。
                         let setup = async {
                             // 声明客户端 fs 能力：agent 才会通过 fs/read_text_file 与
                             // fs/write_text_file 请求读文件（服务端经隧道转发到客户端
                             // 沙箱执行）。不声明则 agent 静默降级（如报「不支持」）。
                             let capabilities = client_capabilities();
-                            cx.send_request(
-                                InitializeRequest::new(ProtocolVersion::V1)
-                                    .client_capabilities(capabilities),
-                            )
-                            .block_task()
-                            .await?;
-                            let new_session = cx
-                                .send_request(NewSessionRequest::new(&cwd))
+                            let init_resp = cx
+                                .send_request(
+                                    InitializeRequest::new(ProtocolVersion::V1)
+                                        .client_capabilities(capabilities),
+                                )
                                 .block_task()
                                 .await?;
-                            let acp_session_id = new_session.session_id.clone();
-                            let config_options =
-                                new_session.config_options.clone().unwrap_or_default();
+                            // agent 声明 session/resume 能力 + 持有多余的持久化 id →
+                            // 优先 resume（凭 id 从客户端磁盘恢复 agent 侧对话上下文，
+                            // 解决断线过久/进程被杀后上下文丢失）。
+                            let resume_capable = init_resp
+                                .agent_capabilities
+                                .session_capabilities
+                                .resume
+                                .is_some();
+                            // 会话建立：resume 成功复用旧 id；失败/无 id/不支持 →
+                            // session/new（全新会话，原行为）。
+                            let (acp_session_id, config_options): (
+                                SessionId,
+                                Vec<SessionConfigOption>,
+                            ) = match persisted_acp_session_id.as_deref() {
+                                Some(persisted) if resume_capable => {
+                                    match cx
+                                        .send_request(ResumeSessionRequest::new(
+                                            SessionId::new(persisted),
+                                            &cwd,
+                                        ))
+                                        .block_task()
+                                        .await
+                                    {
+                                        Ok(resp) => {
+                                            tracing::info!(
+                                                session_id = %sid,
+                                                acp_session_id = %persisted,
+                                                "acp session resumed"
+                                            );
+                                            (
+                                                SessionId::new(persisted),
+                                                resp.config_options.clone().unwrap_or_default(),
+                                            )
+                                        }
+                                        Err(e) => {
+                                            // resume 失败（会话文件缺失/已清理等）
+                                            // → 回退全新会话，不阻断建立。
+                                            tracing::warn!(
+                                                session_id = %sid,
+                                                "acp resume failed, fall back to new session: {e}"
+                                            );
+                                            let new_session = cx
+                                                .send_request(NewSessionRequest::new(&cwd))
+                                                .block_task()
+                                                .await?;
+                                            (
+                                                new_session.session_id.clone(),
+                                                new_session
+                                                    .config_options
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                            )
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    let new_session = cx
+                                        .send_request(NewSessionRequest::new(&cwd))
+                                        .block_task()
+                                        .await?;
+                                    (
+                                        new_session.session_id.clone(),
+                                        new_session.config_options.clone().unwrap_or_default(),
+                                    )
+                                }
+                            };
+                            // 落库（best-effort）：断线重拉时凭它 session/resume
+                            // 恢复上下文。失败仅 warn，不阻断会话建立。
+                            if let Err(e) = db
+                                .agent_set_acp_session_id(&sid, Some(acp_session_id.0.as_ref()))
+                                .await
+                            {
+                                tracing::warn!(session_id = %sid, "persist acp_session_id failed: {e}");
+                            }
                             // 写回会话条目：连接句柄 + ACP session id 供 prompt/cancel；
                             // config_options 捕获后供 set_config_option / session_state 帧。
                             {
@@ -1196,6 +1288,9 @@ impl AcpBridge {
 
     /// 终结 ACP 会话：杀客户端进程 + 移除会话条目（idle reaper / 会话归档关闭
     /// 用）。与 `cancel` 的区别：不再保留会话，进程死后不重拉。
+    ///
+    /// **保留** agent 侧持久化会话数据：归档后重开会话可 `session/resume`
+    /// 恢复上下文。需要连客户端数据一起清理请用 [`Self::kill_and_delete`]。
     pub async fn kill(&self, session_id: &str) {
         let client_id = self
             .sessions
@@ -1211,6 +1306,33 @@ impl AcpBridge {
         self.spawner.stop_llm_proxy(&client_id, session_id).await;
         self.sessions.lock().await.remove(session_id);
         tracing::info!(session_id, "killed ACP session");
+    }
+
+    /// 终结 ACP 会话并清理客户端持久化会话数据（**会话删除**用）：先发 ACP
+    /// `session/delete` 让 agent 删除其持久化会话文件，再走 [`Self::kill`] 杀进程
+    /// 移除条目。
+    ///
+    /// `session/delete` 是 best-effort（5s 超时防卡死）：连接已断/进程已死时忽略，
+    /// 不影响终结。与 [`Self::kill`]（归档用，保留数据）和 idle reaper 的
+    /// `send_agent_cancel`（回收空闲进程，保留数据供 resume）区别——只有用户
+    /// 显式删除会话才清理 agent 侧数据。
+    pub async fn kill_and_delete(&self, session_id: &str) {
+        let (connection, acp_sid) = {
+            let guard = self.sessions.lock().await;
+            let Some(a) = guard.get(session_id) else {
+                return;
+            };
+            (a.connection.clone(), a.acp_session_id.clone())
+        };
+        // 先让 agent 删除其持久化会话文件（best-effort，5s 超时防卡死）。
+        if let (Some(cx), Some(sid)) = (connection, acp_sid) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                cx.send_request(DeleteSessionRequest::new(sid)).block_task(),
+            )
+            .await;
+        }
+        self.kill(session_id).await;
     }
 
     /// 断开/连接关闭时清空条目里的 WS 事件通道：ACP 回合在连接关闭后仍可能
@@ -2133,6 +2255,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             None,
             None,
+            None,
+            false,
         )
         .await;
     }
@@ -2145,6 +2269,10 @@ mod tests {
     /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试需要精确控制「回合
     /// 何时结束」。`recorded`（None 不记录）：收集 mock 收到的 method/通知名
     /// （如 `session/cancel`），供断言。
+    ///
+    /// `persisted_id`：传给 `acp_handshake` 的持久化 ACP session id（resume 测试
+    /// 用；None = 全新会话路径）。`resume_fails`：true 时 mock 的 `session/resume`
+    /// 回 error（测回退 session/new）。
     #[allow(clippy::too_many_arguments)]
     async fn setup_handshake_with(
         bridge: &AcpBridge,
@@ -2153,6 +2281,8 @@ mod tests {
         applied: Arc<Mutex<Vec<(String, String)>>>,
         prompt_permits: Option<mpsc::Receiver<()>>,
         recorded: Option<Arc<Mutex<Vec<String>>>>,
+        persisted_id: Option<&str>,
+        resume_fails: bool,
     ) {
         let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -2178,10 +2308,11 @@ mod tests {
             applied,
             prompt_permits,
             recorded,
+            resume_fails,
         ));
 
         bridge
-            .acp_handshake("sess-1", "/mock")
+            .acp_handshake("sess-1", "/mock", persisted_id.map(str::to_string))
             .await
             .expect("handshake should complete");
     }
@@ -2876,6 +3007,7 @@ mod tests {
     /// `prompt_permits`（None 立即响应）：mock 收到 `session/prompt` 后先回流式
     /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试用。
     /// `recorded`（None 不记录）：收集收到的 method/通知名（如 `session/cancel`）。
+    /// `resume_fails`：true 时 `session/resume` 回 JSON-RPC error（测回退 session/new）。
     #[allow(clippy::too_many_arguments)]
     async fn mock_acp_agent(
         mut stdin_rx: mpsc::Receiver<ControlMessage>,
@@ -2884,6 +3016,7 @@ mod tests {
         applied: Arc<Mutex<Vec<(String, String)>>>,
         mut prompt_permits: Option<mpsc::Receiver<()>>,
         recorded: Option<Arc<Mutex<Vec<String>>>>,
+        resume_fails: bool,
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
@@ -2912,15 +3045,49 @@ mod tests {
                 let mut out_lines: Vec<serde_json::Value> = Vec::new();
                 match method.as_str() {
                     "initialize" => {
+                        // 声明 loadSession + session/resume/delete 能力，与
+                        // claude-agent-acp 对齐（resume 测试依赖它）。
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
-                            "result": { "protocolVersion": 1 }
+                            "result": {
+                                "protocolVersion": 1,
+                                "agentCapabilities": {
+                                    "loadSession": true,
+                                    "sessionCapabilities": { "resume": {}, "delete": {} }
+                                }
+                            }
                         }));
                     }
                     "session/new" => {
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": { "sessionId": "acp-1", "configOptions": config_options }
+                        }));
+                    }
+                    "session/resume" => {
+                        // 成功回显请求的 sessionId；失败回 JSON-RPC error
+                        // （acp_handshake 据此回退 session/new）。
+                        if resume_fails {
+                            out_lines.push(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32601, "message": "session not found" }
+                            }));
+                        } else {
+                            let req_sid = json
+                                .pointer("/params/sessionId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            out_lines.push(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": { "sessionId": req_sid, "configOptions": config_options }
+                            }));
+                        }
+                    }
+                    "session/delete" => {
+                        out_lines.push(serde_json::json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {}
                         }));
                     }
                     "session/set_config_option" => {
@@ -3645,7 +3812,8 @@ mod tests {
              "options": [{"value": "haiku", "name": "Haiku"}]}
         ]);
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-        setup_handshake_with(&bridge, ws_tx, options, applied.clone(), None, None).await;
+        setup_handshake_with(&bridge, ws_tx, options, applied.clone(), None, None, None, false)
+            .await;
 
         // workspace 注入：fast → haiku；model 先被 workspace 设为 sonnet，随后
         // config_state 回放覆盖为 opus；nonexistent 不在快照中 → 跳过
@@ -3700,8 +3868,10 @@ mod tests {
             };
             let applied = Arc::new(Mutex::new(Vec::new()));
             let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-            setup_handshake_with(&bridge, ws_tx, options.clone(), applied.clone(), None, None)
-                .await;
+            setup_handshake_with(
+                &bridge, ws_tx, options.clone(), applied.clone(), None, None, None, false,
+            )
+            .await;
             bridge.apply_config_overrides("sess-1", &ws).await;
             assert!(
                 applied.lock().await.is_empty(),
@@ -3773,6 +3943,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Some(permit_rx),
             None,
+            None,
+            false,
         )
         .await;
 
@@ -3863,6 +4035,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Some(permit_rx),
             Some(recorded2),
+            None,
+            false,
         )
         .await;
 
@@ -3933,6 +4107,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Some(permit_rx),
             None,
+            None,
+            false,
         )
         .await;
 
@@ -3982,6 +4158,8 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             Some(permit_rx),
             None,
+            None,
+            false,
         )
         .await;
 
@@ -4052,5 +4230,217 @@ mod tests {
             "graceful cancel queue drain must not kill the process"
         );
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
+    }
+
+    // ── ACP 会话上下文持久化：session/resume + session/delete ──
+
+    /// 建 workspace w1 + session sess-1（`agent_set_acp_session_id` 落库需要
+    /// session 行；`agent_get_session` 断言同样依赖它）。
+    async fn seeded_bridge() -> (AcpBridge, Database) {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/ws",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+        (bridge, db)
+    }
+
+    /// 断线重拉：持有多余的持久化 ACP session id + agent 支持 session/resume →
+    /// 握手走 resume（sessionId 复用、DB 落库同 id），不建全新会话。
+    #[tokio::test]
+    async fn test_handshake_resumes_persisted_session() {
+        let (bridge, db) = seeded_bridge().await;
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some(recorded.clone()),
+            Some("acp-persisted-1"),
+            false,
+        )
+        .await;
+
+        // mock 收到 session/resume，未走 session/new
+        let methods = recorded.lock().await.clone();
+        assert!(
+            methods.iter().any(|m| m == "session/resume"),
+            "should send session/resume, got: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "session/new"),
+            "resume-capable path must not send session/new: {methods:?}"
+        );
+        // 会话条目的 acp_session_id 复用持久化 id
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .acp_session_id
+                .as_ref()
+                .unwrap()
+                .0
+                .as_ref(),
+            "acp-persisted-1"
+        );
+        // DB 落库同 id（下次重拉继续 resume）
+        assert_eq!(
+            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            Some("acp-persisted-1".into())
+        );
+    }
+
+    /// 无持久化 id（首次会话）→ 行为不变：session/new，新 id 落库。
+    #[tokio::test]
+    async fn test_handshake_new_when_no_persisted_id() {
+        let (bridge, db) = seeded_bridge().await;
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some(recorded.clone()),
+            None,
+            false,
+        )
+        .await;
+
+        let methods = recorded.lock().await.clone();
+        assert!(
+            methods.iter().any(|m| m == "session/new"),
+            "no persisted id should use session/new: {methods:?}"
+        );
+        assert!(!methods.iter().any(|m| m == "session/resume"));
+        // 新 id（mock 固定返回 acp-1）落库
+        assert_eq!(
+            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            Some("acp-1".into())
+        );
+    }
+
+    /// resume 失败（会话文件缺失/已清理）→ 回退 session/new，新 id 落库，
+    /// 会话建立不阻断。
+    #[tokio::test]
+    async fn test_handshake_resume_failure_falls_back_to_new() {
+        let (bridge, db) = seeded_bridge().await;
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some(recorded.clone()),
+            Some("acp-persisted-1"),
+            true,
+        )
+        .await;
+
+        let methods = recorded.lock().await.clone();
+        let resume_pos = methods.iter().position(|m| m == "session/resume");
+        let new_pos = methods.iter().position(|m| m == "session/new");
+        assert!(
+            resume_pos.is_some(),
+            "should attempt resume first: {methods:?}"
+        );
+        assert!(
+            new_pos.is_some(),
+            "resume failure should fall back to new: {methods:?}"
+        );
+        assert!(
+            resume_pos < new_pos,
+            "resume must be attempted before new: {methods:?}"
+        );
+        // 回退后使用新 id（mock 固定返回 acp-1）落库
+        assert_eq!(
+            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            Some("acp-1".into())
+        );
+    }
+
+    /// kill_and_delete（会话删除路径）先发 ACP session/delete（让 agent 清理其
+    /// 持久化会话文件），再移除会话条目。方法等待 session/delete 响应后才继续
+    /// → 断言时已记录。
+    #[tokio::test]
+    async fn test_kill_and_delete_sends_session_delete() {
+        let (bridge, _db) = seeded_bridge().await;
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some(recorded.clone()),
+            None,
+            false,
+        )
+        .await;
+
+        bridge.kill_and_delete("sess-1").await;
+        assert!(
+            recorded.lock().await.iter().any(|m| m == "session/delete"),
+            "kill_and_delete() should send session/delete to clean up client-side session data"
+        );
+        assert!(
+            !bridge.sessions.lock().await.contains_key("sess-1"),
+            "kill_and_delete() should remove the session entry"
+        );
+    }
+
+    /// kill()（归档路径）**不**发 session/delete：归档后重开会话仍可
+    /// session/resume 恢复上下文，客户端持久化会话数据必须保留。
+    #[tokio::test]
+    async fn test_kill_preserves_client_session_data() {
+        let (bridge, _db) = seeded_bridge().await;
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            Some(recorded.clone()),
+            None,
+            false,
+        )
+        .await;
+
+        bridge.kill("sess-1").await;
+        assert!(
+            !recorded.lock().await.iter().any(|m| m == "session/delete"),
+            "kill() (archive path) must preserve client-side session data: {:?}",
+            recorded.lock().await
+        );
+        assert!(!bridge.sessions.lock().await.contains_key("sess-1"));
     }
 }
