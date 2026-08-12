@@ -42,6 +42,12 @@ pub struct AgentSessionRecord {
     pub model: Option<String>,
     /// ACP 会话配置状态（JSON map：config_id → value；仅用户显式切换过的项）
     pub config_state: Option<String>,
+    /// agent 侧 ACP 会话 id（`session/new` 返回，断线重拉时 `session/resume`
+    /// 凭它恢复上下文）。列由 `migrate_agent_sessions_v3`（schema.rs）落地；
+    /// `#[sqlx(default)]` 保证旧库未跑迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -238,6 +244,23 @@ impl Database {
             "UPDATE agent_sessions SET model = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 写入/清除 session 的 ACP 会话 id（handshake 完成后落库，供断线重拉时
+    /// `session/resume` 恢复上下文）。None 清空（如重拉后 session/delete 删除）。
+    pub async fn agent_set_acp_session_id(
+        &self,
+        id: &str,
+        acp_session_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET acp_session_id = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(acp_session_id)
         .bind(id)
         .execute(&self.pool)
         .await?;

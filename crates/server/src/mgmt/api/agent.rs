@@ -1645,6 +1645,7 @@ pub async fn archive_session(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     // 归档即终结：杀掉该 session 的 ACP agent 进程（不存在则 no-op）。
+    // 用 kill（保留 agent 侧持久化会话数据）——归档后重开会话可 resume 恢复。
     if let Some(bridge) = agent.acp_bridge.as_ref() {
         bridge.kill(&id).await;
     }
@@ -1661,9 +1662,10 @@ pub async fn delete_session(
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    // 删除即终结：杀掉该 session 的 ACP agent 进程（不存在则 no-op）。
+    // 删除即终结：先发 ACP session/delete 让 agent 清理客户端持久化会话文件，
+    // 再杀掉进程（不存在则 no-op）。
     if let Some(bridge) = agent.acp_bridge.as_ref() {
-        bridge.kill(&id).await;
+        bridge.kill_and_delete(&id).await;
     }
     match agent.db.agent_delete_session(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
