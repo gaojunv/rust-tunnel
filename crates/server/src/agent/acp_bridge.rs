@@ -84,6 +84,17 @@ struct PendingPrompt {
     refs: Vec<String>,
 }
 
+/// 回合内一段已到达但尚未落库的 assistant 输出（正文或思考）。流式 chunk 按
+/// 到达顺序 push，正文/思考交错时各自独立成段——flush 时按此顺序落库，保证
+/// DB rowid 顺序 = 对话顺序（思考先于其后的正文）。旧实现用 `text_buf`/`thought_buf`
+/// 两个独立缓冲，flush 时硬编码先正文后思考，刷新后顺序反了（见 flush）。
+#[derive(Debug, Default)]
+struct TurnSegment {
+    /// true = 落 `name='thought'` 行（思考）；false = 普通 assistant 正文行。
+    thought: bool,
+    content: String,
+}
+
 /// 一个已 spawn 的 ACP agent 会话。
 struct SpawnedAgent {
     /// ACP 侧 session id（handshake 成功后填充）。LLM 模型配置不在此缓存——
@@ -125,10 +136,9 @@ struct SpawnedAgent {
     last_activity: std::time::Instant,
     /// AgentSpawnExit 已到达（进程结束）。
     exited: bool,
-    /// 回合内 assistant 文本缓冲（chunk 逐条到达，终态合并落一行库）。
-    text_buf: String,
-    /// 回合内 thought 文本缓冲（终态落 `name='thought'` 行）。
-    thought_buf: String,
+    /// 回合内 assistant 输出片段缓冲（chunk 按到达顺序 append，同类型相邻合并）。
+    /// flush 时按顺序逐段落库——正文/思考交错顺序与对话一致，刷新后历史不乱。
+    turn_segments: Vec<TurnSegment>,
     /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
     /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
     config_options: Vec<SessionConfigOption>,
@@ -352,8 +362,7 @@ impl AcpBridge {
                     turn_generation: 0,
                     last_activity: std::time::Instant::now(),
                     exited: false,
-                    text_buf: String::new(),
-                    thought_buf: String::new(),
+                    turn_segments: Vec::new(),
                     config_options: Vec::new(),
                     spawn_ready: watch::channel(false).0,
                     pending_prompts: migrated_prompts,
@@ -1653,10 +1662,21 @@ async fn persist_acp_frame(
             let mut map = sessions.lock().await;
             if let Some(a) = map.get_mut(sid) {
                 let content = frame["content"].as_str().unwrap_or("");
-                if frame["thought"].as_bool().unwrap_or(false) {
-                    a.thought_buf.push_str(content);
-                } else {
-                    a.text_buf.push_str(content);
+                let is_thought = frame["thought"].as_bool().unwrap_or(false);
+                // 同类型相邻 chunk 合并进当前段（流式分段到达）；正文↔思考切换时
+                // 开新段，保住交错顺序——flush 按此落库，刷新后顺序才与对话一致。
+                let appended = match a.turn_segments.last_mut() {
+                    Some(last) if last.thought == is_thought => {
+                        last.content.push_str(content);
+                        true
+                    }
+                    _ => false,
+                };
+                if !appended {
+                    a.turn_segments.push(TurnSegment {
+                        thought: is_thought,
+                        content: content.to_string(),
+                    });
                 }
             }
         }
@@ -1740,34 +1760,34 @@ async fn persist_acp_frame(
     }
 }
 
-/// 回合终态：把缓冲的 assistant 文本 / thought 各落一行并清空缓冲。
+/// 回合终态：把缓冲的 assistant 输出片段按到达顺序各落一行并清空缓冲。
 /// 取消/错误/断线终态同样落已有缓冲（用户能看到的那部分回合过程可追溯）。
+/// 注意：必须按 `turn_segments` 顺序落库（思考 → 其后正文），不可先正文后思考
+/// ——否则 DB rowid 顺序反了，刷新后历史里思考卡与回复顺序颠倒。
 async fn flush_acp_turn_buffers(
     db: &Database,
     sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
     sid: &str,
 ) {
-    let (text, thought) = {
+    let segments = {
         let mut map = sessions.lock().await;
         let Some(a) = map.get_mut(sid) else {
             return;
         };
-        (
-            std::mem::take(&mut a.text_buf),
-            std::mem::take(&mut a.thought_buf),
-        )
+        std::mem::take(&mut a.turn_segments)
     };
-    for (name, content) in [(None, text), (Some("thought"), thought)] {
-        if content.is_empty() {
+    for seg in segments {
+        if seg.content.is_empty() {
             continue;
         }
+        let name = seg.thought.then_some("thought");
         let msg_id = format!("{:032x}", rand::random::<u128>());
         if let Err(e) = db
             .agent_add_message_v2(
                 &msg_id,
                 sid,
                 "assistant",
-                &content,
+                &seg.content,
                 None,
                 None,
                 name,
@@ -2094,8 +2114,7 @@ mod tests {
             turn_generation: 0,
             last_activity: std::time::Instant::now(),
             exited: false,
-            text_buf: String::new(),
-            thought_buf: String::new(),
+            turn_segments: Vec::new(),
             config_options: Vec::new(),
             spawn_ready: watch::channel(false).0,
             pending_prompts: VecDeque::new(),
@@ -3337,6 +3356,141 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(results[0].content, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn test_flush_preserves_thought_before_text() {
+        // 回归：思考→回复 的回合（无工具边界，done 一次性 flush）落库顺序必须
+        // 保持 thought 在正文之前。旧实现 text_buf/thought_buf 独立缓冲 + flush
+        // 硬编码先正文后思考，DB rowid 反了 → 刷新后思考卡与回复顺序颠倒。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), spawned_agent());
+
+        // thought chunk 先到达、正文后到达（真实 ACP 回合顺序），done 时才 flush
+        for (content, thought) in [("先思考", true), ("再回复", false)] {
+            persist_acp_frame(
+                &db,
+                &sessions,
+                "sess-1",
+                &serde_json::json!({
+                    "type": "assistant_chunk",
+                    "content": content,
+                    "thought": thought,
+                }),
+            )
+            .await;
+        }
+        flush_acp_turn_buffers(&db, &sessions, "sess-1").await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let thoughts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.name.as_deref() == Some("thought"))
+            .collect();
+        let texts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "message" && r.name.is_none())
+            .collect();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts[0].content, "先思考");
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].content, "再回复");
+        // rowid 顺序 = 对话顺序：思考行必须先于正文行
+        let thought_pos = rows
+            .iter()
+            .position(|r| r.name.as_deref() == Some("thought"))
+            .unwrap();
+        let text_pos = rows
+            .iter()
+            .position(|r| r.kind == "message" && r.name.is_none())
+            .unwrap();
+        assert!(
+            thought_pos < text_pos,
+            "thought must precede text: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_preserves_interleaved_thought_text() {
+        // 交错变体：正文先出、再思考、再正文（无工具边界）。每段独立落行，
+        // 顺序严格按到达顺序保持，不能按类型归并重排。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-2", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("sess-2".into(), spawned_agent());
+
+        for (content, thought) in [("正文一", false), ("思考", true), ("正文二", false)] {
+            persist_acp_frame(
+                &db,
+                &sessions,
+                "sess-2",
+                &serde_json::json!({
+                    "type": "assistant_chunk",
+                    "content": content,
+                    "thought": thought,
+                }),
+            )
+            .await;
+        }
+        flush_acp_turn_buffers(&db, &sessions, "sess-2").await;
+
+        let rows = db.agent_list_messages("sess-2").await.unwrap();
+        let kinds: Vec<(bool, String)> = rows
+            .iter()
+            .filter(|r| r.kind == "message")
+            .map(|r| (r.name.as_deref() == Some("thought"), r.content.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (false, "正文一".to_string()),
+                (true, "思考".to_string()),
+                (false, "正文二".to_string()),
+            ],
+            "rows must keep arrival order: {rows:?}"
+        );
     }
 
     #[tokio::test]
