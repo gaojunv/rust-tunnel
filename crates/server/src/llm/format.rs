@@ -4,6 +4,10 @@
 //! 时，网关在响应侧把 OpenAI 格式转回 Anthropic 格式（非流式整体转换，
 //! 流式逐 chunk 转换，见 [`AnthropicSseTranslator`]）。
 
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 /// OpenAI `finish_reason` → Anthropic `stop_reason` 映射。
@@ -434,6 +438,80 @@ fn push_event(out: &mut String, event: &str, data: &Value) {
     out.push_str("\ndata: ");
     out.push_str(&data.to_string());
     out.push_str("\n\n");
+}
+
+/// 流式：把上游 OpenAI SSE 响应体逐 chunk 转换为 Anthropic SSE 事件流。
+///
+/// 从 `anthropic_handler` 下沉（双协议入口共享的「回退路径」在成功时调用）。
+pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
+    let byte_stream = openai_resp.into_body().into_data_stream();
+    let translator = std::sync::Arc::new(std::sync::Mutex::new(AnthropicSseTranslator::new()));
+    let out = byte_stream.filter_map(move |chunk| {
+        let translator = translator.clone();
+        async move {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = translator.lock().unwrap().push(&bytes);
+                    if converted.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(converted))
+                    }
+                }
+                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(out))
+        .unwrap()
+}
+
+/// 非流式：把 OpenAI chat completion 响应 JSON 转成 Anthropic Messages 响应。
+///
+/// 从 `anthropic_handler` 下沉（双协议入口共享的「回退路径」在成功时调用）。
+pub async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
+    let status = openai_resp.status();
+    // 上限与 compat 非流式改写路径一致（16MB）。超限时 to_bytes 返回 Err，
+    // 必须返回 502 而非静默丢弃 body 后透传原始状态码——否则客户端会拿到
+    // "200 + 空内容"的假象，整段生成结果丢失。
+    let body_bytes = match axum::body::to_bytes(openai_resp.into_body(), 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from(format!(
+                    "failed to read upstream response (too large or read error): {e}"
+                )))
+                .unwrap();
+        }
+    };
+
+    let openai: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_bytes))
+                .unwrap();
+        }
+    };
+
+    // Build Anthropic-format response
+    let anthropic_resp = openai_response_to_anthropic(&openai);
+
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_vec(&anthropic_resp).unwrap()))
+        .unwrap()
 }
 
 #[cfg(test)]

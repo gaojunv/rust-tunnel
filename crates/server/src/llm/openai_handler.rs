@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use super::router::{list_available_models, resolve_with_failover};
+use super::router::list_available_models;
 use super::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
 
 /// State for LLM request handlers.
@@ -68,65 +68,38 @@ pub async fn handle_chat_completions(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     // Validate API key
-    let auth = match super::auth::authenticate(&state.llm, &headers).await {
-        Some(a) => a,
-        None => {
-            // 记录认证失败
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    protocol: "openai".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
-            }
-            return state.error_for_protocol(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key".into(),
-                "authentication_error",
-            );
-        }
-    };
-    let (api_key_id, api_key_name) = auth;
+    let (api_key_id, api_key_name) =
+        match super::pipeline::authenticate_or_reject(&state, &headers, "openai").await {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
 
     // Extract model name
-    let model = match body.get("model").and_then(|v| v.as_str()) {
-        Some(m) => m.to_string(),
-        None => {
-            // 记录请求错误（缺少 model）
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    api_key_id: Some(api_key_id.clone()),
-                    api_key_name: api_key_name.clone(),
-                    protocol: "openai".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
-            }
-            return state.error_for_protocol(
-                StatusCode::BAD_REQUEST,
-                "model is required".into(),
-                "invalid_request_error",
-            );
-        }
+    let model = match super::pipeline::extract_model_or_reject(
+        &state,
+        &body,
+        &api_key_id,
+        &api_key_name,
+        "openai",
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
 
     // Resolve model → 候选链（模型组故障转移）
-    let chain = match resolve_with_failover(&state.llm, &model).await {
+    let chain = match super::pipeline::resolve_chain_or_reject(
+        &state,
+        &model,
+        &api_key_id,
+        &api_key_name,
+        "openai",
+    )
+    .await
+    {
         Ok(c) => c,
-        Err(e) => {
-            // 记录路由失败到用量日志
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    api_key_id: Some(api_key_id.clone()),
-                    api_key_name: api_key_name.clone(),
-                    requested_model: model.clone(),
-                    protocol: "openai".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 404, "model_resolution_error", std::time::Instant::now());
-            }
-            return super::router::resolve_error_response(&state.llm, e).await;
-        }
+        Err(resp) => return resp,
     };
     // 首选候选：provider 级配置（compat 开关）以首选为准——RAG/compat 改写在循环外只做一次
     let first_candidate = chain.candidates[0].clone();
@@ -252,45 +225,16 @@ pub async fn handle_chat_completions(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
-    // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
-    #[allow(unused_mut, reason = "assigned only inside the rag-gated inject block")]
-    let mut rag_injected: i64 = 0;
-    #[cfg(feature = "rag")]
-    if let Some(kb_id) = kb_id_for_rag {
-        if let Some(ref db) = db {
-            let outcome = super::rag::enhance(
-                db,
-                &state.llm.rag_store,
-                state.llm.cipher.as_ref(),
-                &kb_id,
-                &mut request,
-            )
-            .await;
-            rag_injected = outcome.injected as i64;
-        }
-    }
-    if rag_injected > 0 {
-        ctx.rag_chunks_injected = Some(rag_injected);
-        // 改写回写：透传基底 raw_body["messages"] 必须用改写后的内容。
-        if let Some(raw) = request.raw_body.as_mut() {
-            if let Ok(v) = serde_json::to_value(&request.messages) {
-                raw["messages"] = v;
-            }
-        }
-    }
-
-    // 兼容模式：provider 开启 compat_tool_history 时，把工具调用历史改写为标签文本，
-    // 并在末尾注入 system 引导（教模型输出伪工具调用格式）。
-    if compat_enabled {
-        super::compat::rewrite_tool_history(&mut request.messages);
-        super::compat::inject_tool_call_guidance(&mut request.messages);
-        // 改写回写：与 RAG 相同，保证上行的是改写后的 messages。
-        if let Some(raw) = request.raw_body.as_mut() {
-            if let Ok(v) = serde_json::to_value(&request.messages) {
-                raw["messages"] = v;
-            }
-        }
-    }
+    // RAG 注入 + compat 改写（共享流水线阶段；改写后的 messages 回写 raw_body）。
+    super::pipeline::inject_rag_and_compat(
+        &state.llm,
+        db.as_ref(),
+        kb_id_for_rag,
+        compat_enabled,
+        &mut request,
+        &mut ctx,
+    )
+    .await;
 
     // 日志统计：message_count 在未结构化时取原始数组长度，has_tools 取 tools 存在性。
     let message_count = if need_structured {
@@ -300,100 +244,24 @@ pub async fn handle_chat_completions(
     };
     let has_tools = request.tools.is_some();
 
-    // Call upstream：先构造完整请求体（RAG/compat 改写后的最终内容），
-    // 写入请求日志后发送，保证日志与实际发送内容一致。
-    let req_body = super::upstream::build_upstream_body(&request);
-    super::log_llm_request(
-        &state.llm,
-        "openai",
-        &request.model,
+    let prepared = super::pipeline::PreparedRequest {
+        request,
         message_count,
         has_tools,
-        request.stream,
-        None,
-        None,
-        0,
-        &req_body,
-    )
-    .await;
-    let outcome = super::upstream::execute_with_failover(
-        &state.llm.breakers,
+        compat_enabled,
+    };
+    super::pipeline::run_execution(
+        &state,
+        "openai",
+        prepared,
         &chain,
-        &req_body,
-        request.stream,
+        &first_candidate.model_name,
+        ctx,
+        db,
+        started,
+        super::pipeline::ResponsePostProcess::None,
     )
-    .await;
-    match outcome {
-        super::upstream::FailoverOutcome::Success {
-            resp,
-            candidate,
-            failed_over,
-        } => {
-            // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
-            if failed_over {
-                ctx.provider_id = Some(candidate.provider.id.clone());
-                ctx.provider_name = candidate.provider.name.clone();
-                ctx.model_id = Some(candidate.model_id.clone());
-                ctx.model_name = candidate.model_name.clone();
-                ctx.failover_from = Some(first_candidate.model_name.clone());
-            }
-            let elapsed_ms = started.elapsed().as_millis();
-            super::log_llm_request(
-                &state.llm,
-                "openai",
-                &ctx.model_name,
-                message_count,
-                has_tools,
-                request.stream,
-                Some(200),
-                None,
-                elapsed_ms,
-                &req_body,
-            )
-            .await;
-            let resp = if compat_enabled {
-                if request.stream {
-                    // 流式 + compat 模式：增量解析 content，伪工具调用即时识别为 tool_calls
-                    rewrite_pseudo_tool_calls_in_stream(resp).await
-                } else {
-                    // 非流式 + compat 模式：解析伪工具调用，还原为结构化 tool_calls
-                    rewrite_pseudo_tool_calls_in_response(resp).await
-                }
-            } else {
-                resp
-            };
-            super::usage::wrap_and_record(resp, ctx, db, started).await
-        }
-        super::upstream::FailoverOutcome::Exhausted {
-            status,
-            message: msg,
-            failed_over,
-        } => {
-            let elapsed_ms = started.elapsed().as_millis();
-            super::log_llm_request(
-                &state.llm,
-                "openai",
-                &request.model,
-                message_count,
-                has_tools,
-                request.stream,
-                Some(status.as_u16()),
-                Some(&msg),
-                elapsed_ms,
-                &req_body,
-            )
-            .await;
-            // 记录失败请求到用量日志，确保请求明细中可见
-            if let Some(ref db) = db {
-                // 全部候选失败但实际尝试过转移：failover_from 记首选（被跳过的）模型名
-                if failed_over {
-                    ctx.failover_from = Some(first_candidate.model_name.clone());
-                }
-                ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
-            }
-            state.error_for_protocol(status, msg, "upstream_error")
-        }
-    }
+    .await
 }
 
 /// 非流式响应：从 OpenAI chat.completion body 中解析伪工具调用文本，
