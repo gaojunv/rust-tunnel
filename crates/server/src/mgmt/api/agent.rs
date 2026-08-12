@@ -841,7 +841,8 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     continue;
                 }
                 // 持久化 user 消息（与 runner 路径同款）：落的是注入后的 content，
-                // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。
+                // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。排队消息同样
+                // 立即落库——在 submit_prompt 之前，无论本轮是直接跑还是排队。
                 let msg_id = format!("{:032x}", rand::random::<u128>());
                 if let Err(e) = agent
                     .db
@@ -850,7 +851,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 {
                     tracing::warn!(session_id = %session_id, "persist acp user message failed: {e}");
                 }
-                if let Err(e) = bridge.prompt(&session_id, &content).await {
+                // submit_prompt：空闲直接跑；进行中回合排队（回合连续，排空才发
+                // done）。返回 Err（会话不存在/已退出/排队满）时以 error 帧回发。
+                if let Err(e) = bridge.submit_prompt(&session_id, &content, refs).await {
                     let _ = event_tx
                         .send(serde_json::json!({"type": "error", "message": e}))
                         .await;

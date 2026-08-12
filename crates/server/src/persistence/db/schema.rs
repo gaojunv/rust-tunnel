@@ -662,6 +662,7 @@ impl Database {
         Self::migrate_agent_workspaces_v3(pool).await?;
         Self::migrate_agent_workspaces_v4(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
+        Self::migrate_agent_messages_v3(pool).await?;
 
         Ok(())
     }
@@ -763,6 +764,75 @@ impl Database {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// agent_messages 去重迁移 v3：历史版本对每个 ACP 事件纯 INSERT，同一
+    /// (session_id, tool_call_id, kind) 会产生多行（tool_call 每次事件、tool_result
+    /// 每个中间态各一行），前端刷新后重复卡片。按分组收敛为一行：
+    /// `tool_result` 保留「content 非空中 rowid 最大者」，全空则保留 rowid 最大者；
+    /// `tool_calls` 保留 length(tool_calls) 最大者（并列取 rowid 最大）。
+    /// 事务内执行，幂等（去重后分组 COUNT 均 ≤ 1，重复运行无变化）。不做唯一索引
+    /// 收敛：compact.rs 压缩时会带相同 (session_id, tool_call_id, kind) 重插 kept
+    /// 段，唯一索引会直接冲突报错。
+    async fn migrate_agent_messages_v3(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        let dup_groups: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT session_id, tool_call_id, kind FROM agent_messages \
+             WHERE kind IN ('tool_calls', 'tool_result') \
+               AND tool_call_id IS NOT NULL AND tool_call_id != '' \
+             GROUP BY session_id, tool_call_id, kind \
+             HAVING COUNT(*) > 1",
+        )
+        .fetch_all(pool)
+        .await?;
+        if dup_groups.is_empty() {
+            return Ok(());
+        }
+        let mut tx = pool.begin().await?;
+        for (session_id, tool_call_id, kind) in dup_groups {
+            // 组内所有行（rowid 升序 = 插入顺序）
+            let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+                "SELECT rowid, content, tool_calls FROM agent_messages \
+                 WHERE session_id = ? AND tool_call_id = ? AND kind = ? ORDER BY rowid",
+            )
+            .bind(&session_id)
+            .bind(&tool_call_id)
+            .bind(&kind)
+            .fetch_all(&mut *tx)
+            .await?;
+            let keep_rid = match kind.as_str() {
+                // 保留规则：非空 content 中 rowid 最大者；全空则 rowid 最大者。
+                "tool_result" => rows
+                    .iter()
+                    .filter(|(_, c, _)| !c.is_empty())
+                    .map(|(rid, _, _)| *rid)
+                    .max()
+                    .or_else(|| rows.iter().map(|(rid, _, _)| *rid).max()),
+                // 保留规则：length(tool_calls) 最大者，并列取 rowid 最大。
+                "tool_calls" => rows
+                    .iter()
+                    .max_by(|a, b| {
+                        a.2.as_deref()
+                            .map(str::len)
+                            .unwrap_or(0)
+                            .cmp(&b.2.as_deref().map(str::len).unwrap_or(0))
+                            .then(a.0.cmp(&b.0))
+                    })
+                    .map(|(rid, _, _)| *rid),
+                _ => None,
+            };
+            if let Some(keep) = keep_rid {
+                for (rid, _, _) in &rows {
+                    if *rid != keep {
+                        sqlx::query("DELETE FROM agent_messages WHERE rowid = ?")
+                            .bind(rid)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -995,6 +1065,106 @@ mod tests {
         assert_eq!(row.0, "gemini");
         assert_eq!(row.1.as_deref(), Some("/opt/acp-agent"));
         assert_eq!(row.2.as_deref(), Some("m1"));
+    }
+
+    /// v3 迁移：同一 (session_id, tool_call_id, kind) 多行收敛为一行，且幂等。
+    /// tool_result 保留非空中 rowid 最大者；tool_calls 保留 length(tool_calls)
+    /// 最大者；无关行（message / tool_call_id 为空）不参与去重。
+    #[tokio::test]
+    async fn test_migrate_agent_messages_v3_dedup() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path) \
+             VALUES ('w1', 'w', 'c1', 'host', '/p')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_sessions (id, workspace_id) VALUES ('s1', 'w1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // tool_result：两个中间态空 content + 一个终态非空
+        for (id, content) in [("m1", ""), ("m2", ""), ("m3", "final output")] {
+            sqlx::query(
+                "INSERT INTO agent_messages (id, session_id, role, content, tool_call_id, name, kind) \
+                 VALUES (?, 's1', 'assistant', ?, 'c1', 'shell', 'tool_result')",
+            )
+            .bind(id)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // tool_calls：短 JSON 先插、长 JSON 后插（保留长 JSON）
+        sqlx::query(
+            "INSERT INTO agent_messages (id, session_id, role, content, tool_calls, tool_call_id, name, kind) \
+             VALUES ('m4', 's1', 'assistant', '', 'short', 'c2', 'Terminal', 'tool_calls')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_messages (id, session_id, role, content, tool_calls, tool_call_id, name, kind) \
+             VALUES ('m5', 's1', 'assistant', '', 'a much longer tool_calls json with real arguments', 'c2', 'Terminal', 'tool_calls')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 无关行：kind='message'（tool_call_id 为空）不参与去重
+        sqlx::query(
+            "INSERT INTO agent_messages (id, session_id, role, content, name, kind) \
+             VALUES ('m6', 's1', 'user', 'hi', NULL, 'message')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        super::Database::migrate_agent_messages_v3(&pool)
+            .await
+            .unwrap();
+
+        let (count, content): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(content) FROM agent_messages \
+             WHERE kind = 'tool_result' AND tool_call_id = 'c1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "tool_result should converge to one row");
+        assert_eq!(content, "final output");
+
+        let (count, tc): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(tool_calls) FROM agent_messages \
+             WHERE kind = 'tool_calls' AND tool_call_id = 'c2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "tool_calls should converge to one row");
+        assert_eq!(
+            tc, "a much longer tool_calls json with real arguments",
+            "tool_calls should keep the longest json"
+        );
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3, "converged rows + unrelated row: {total}");
+
+        // 幂等：再跑一次结果一致
+        super::Database::migrate_agent_messages_v3(&pool)
+            .await
+            .unwrap();
+        let total2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total2, 3, "migration must be idempotent");
     }
 
     /// 未显式提供 agent_type 时走列默认空串，INSERT 仍应成功（NOT NULL 约束满足）。

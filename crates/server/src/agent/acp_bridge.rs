@@ -18,7 +18,7 @@
 //! 里（不会丢），ACP 连接建立后随即消费。
 
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -64,6 +64,25 @@ const CONFIG_OPTION_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// reaper 检查间隔。
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// 排队消息上限：进行中回合期间 submit_prompt 入队；超出上限报错（不静默丢弃，
+/// 用户能立刻知道消息未被接受）。
+const MAX_PENDING_PROMPTS: usize = 20;
+/// 取消宽限期默认值：`cancel()` 发出 session/cancel 后，agent 未在此时限内响应
+/// PromptResponse（终态回调未清 busy）则兜底杀客户端进程。
+const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// 排队等待发送的用户 prompt（进行中回合时经 [`AcpBridge::submit_prompt`] 暂存）。
+/// `content` 是注入 @引用后的完整消息（mgmt/api/agent.rs 分派前已 `inject_refs`，
+/// refs 内容已内联）；`refs` 原样留存备查。FIFO：终态回调逐个取出续跑，队列排空才
+/// 发 done。
+#[derive(Clone)]
+struct PendingPrompt {
+    content: String,
+    /// @引用路径列表，随消息原样留存备查（调用方在分派前已 inject_refs，
+    /// refs 内容已内联进 `content`，本字段仅作记录不参与运行）。
+    #[allow(dead_code)]
+    refs: Vec<String>,
+}
 
 /// 一个已 spawn 的 ACP agent 会话。
 struct SpawnedAgent {
@@ -119,6 +138,12 @@ struct SpawnedAgent {
     /// config 注入完成前首回合开跑。条目被移除（spawn 失败/kill）时 Sender drop，
     /// wait_for 以 RecvError 返回。
     spawn_ready: watch::Sender<bool>,
+    /// 进行中回合期间排队等待发送的 prompt（FIFO）。兜底杀进程后重拉新进程时
+    /// （ensure_session 移除 exited 条目）迁移到新条目，排队消息不丢。
+    pending_prompts: VecDeque<PendingPrompt>,
+    /// 回合终态唤醒信号：`prompt()` 终态回调清 busy 后 notify_waiters，取消的
+    /// 兜底任务（见 [`AcpBridge::cancel`]）据此走优雅路径提前退出，不再等宽限期。
+    cancel_notify: Arc<tokio::sync::Notify>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -159,6 +184,9 @@ pub struct AcpBridge {
     spawn_errors: Arc<Mutex<HashMap<String, String>>>,
     /// LLM 网关入口（内部 HTTP 回环调用）；未注入时 LLM 代理请求全部 502。
     gateway: Option<LlmGatewayEndpoint>,
+    /// 取消宽限期：`cancel()` 发出 session/cancel 后 agent 未在此时限内响应
+    /// PromptResponse 则兜底杀进程。
+    cancel_grace: Duration,
 }
 
 impl AcpBridge {
@@ -171,9 +199,18 @@ impl AcpBridge {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             spawn_errors: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
         };
         bridge.start_idle_reaper();
         bridge
+    }
+
+    /// 注入取消宽限期（仅测试：验证兜底杀进程路径；生产用默认 10s）。
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
+        self.cancel_grace = grace;
+        self
     }
 
     /// 注入 LLM 字段解密器（提供商 API Key 落库加密；bin/server.rs 在 LLM
@@ -268,6 +305,9 @@ impl AcpBridge {
         // 建立后消费——handshake 期间早产字节不会丢（Task 6 评审要求）。
         let pump_setup: Option<(tokio::io::DuplexStream, mpsc::Receiver<Vec<u8>>)> = {
             let mut sessions = self.sessions.lock().await;
+            // 兜底杀进程后重拉：旧（exited）条目里排队等待的 prompt 迁移到新条目，
+            // 避免 cancel 期间提交、进程死时尚未消费的等待消息在重拉后丢失。
+            let mut migrated_prompts = VecDeque::new();
             match sessions.get(session_id) {
                 Some(agent) if !agent.exited => {
                     // 已有活跃进程：仅刷新事件通道（多标签页/重连共用同一进程；
@@ -284,6 +324,10 @@ impl AcpBridge {
                 // prompt 一直报 "agent process has exited"。
                 Some(_) => {
                     tracing::info!(session_id, "re-spawning exited ACP session");
+                    migrated_prompts = sessions
+                        .get(session_id)
+                        .map(|a| a.pending_prompts.clone())
+                        .unwrap_or_default();
                     sessions.remove(session_id);
                 }
                 None => {}
@@ -312,6 +356,8 @@ impl AcpBridge {
                     thought_buf: String::new(),
                     config_options: Vec::new(),
                     spawn_ready: watch::channel(false).0,
+                    pending_prompts: migrated_prompts,
+                    cancel_notify: Arc::new(tokio::sync::Notify::new()),
                 },
             );
             Some((pump_io, stdout_rx))
@@ -871,10 +917,15 @@ impl AcpBridge {
     /// 向 ACP 会话发送一条 prompt（fire-and-forget）。
     ///
     /// 发送 `session/prompt` 后立即返回；回合内的 `session/update` 通知经
-    /// [`map_update`] 推送会话条目当前的 ws_tx，`PromptResponse` 到达时回调发
-    /// `{"type":"done"}` 帧。回合进行中重复 prompt 报错（`busy` 守卫；ACP 单连接
-    /// 不支持并发回合）。取消/杀进程后的终态帧被抑制（stopped 帧已由 WS handler
-    /// 回发，再补 error/done 会造成误导）。
+    /// [`map_update`] 推送会话条目当前的 ws_tx，`PromptResponse` 到达时终态回调
+    /// 处理。回合进行中重复 prompt 报错（`busy` 守卫；ACP 单连接不支持并发回合）
+    /// ——用户路径请用 [`Self::submit_prompt`]（进行中自动排队）。
+    ///
+    /// 终态回调同时承担队列 drain：清 busy、唤醒取消兜底任务后，若 `pending_prompts`
+    /// 非空则取队首异步续跑下一条（回合连续，不发 done），排空才发 done；本回合被
+    /// 取消（代数命中）时抑制生产者终态帧但仍 drain 队列（停止后排队消息自动发送）。
+    /// 兜底杀进程/进程崩溃（exited）后不 drain——排队消息在 ensure_session 重拉新
+    /// 进程时迁移，避免往死进程发请求丢失。
     pub async fn prompt(&self, session_id: &str, content: &str) -> Result<(), String> {
         let (connection, acp_session_id, turn_gen) = {
             let mut sessions = self.sessions.lock().await;
@@ -906,6 +957,7 @@ impl AcpBridge {
             (connection, acp_session_id, turn_gen)
         };
 
+        let bridge = self.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
         let sid = session_id.to_string();
@@ -919,25 +971,53 @@ impl AcpBridge {
                 // 终态落库先行：缓冲文本/thought 合并落库必须在 done 帧之前完成，
                 // 否则前端 done 后 invalidate 的历史 refetch 可能读不到本回合并本。
                 flush_acp_turn_buffers(&db, &sessions, &sid).await;
-                // 回合终态：清 busy + 取当前 WS 通道（重连后 done/error 推给最新
-                // 连接，与通知处理器同语义）。若本回合被取消（cancelled_turns 含
-                // 本代数）或会话已被杀（条目移除），抑制终态帧——取消路径的
-                // stopped 帧已由 WS handler 回发，再补 error/done 会造成误导。
-                // 注意抑制条件按代数匹配而非全局布尔：cancel 后立即重发 prompt
-                // 时，新回合的终态回调不会被旧回合的取消标记误吞（评审 Finding）。
-                let ws_tx = {
+                // 终态：清 busy + 唤醒取消兜底任务 + 取当前 WS 通道 + 排空队列
+                // （若会话存活）。取消/杀进程后的终态帧抑制按代数匹配而非全局
+                // 布尔：cancel 后立即重发 prompt 时，新回合的终态回调不会被旧回合
+                // 的取消标记误吞（评审 Finding）。
+                let (ws_tx, next, cancelled, alive) = {
                     let mut map = sessions.lock().await;
                     match map.get_mut(&sid) {
                         Some(a) => {
                             a.busy = false;
-                            if a.cancelled_turns.remove(&turn_gen) {
-                                return Ok(()); // 本回合被取消：抑制终态帧
-                            }
-                            a.ws_tx.clone()
+                            // 唤醒取消兜底任务走优雅路径。用 notify_waiters 而非
+                            // notify_one：notify_one 在无等待者时会暂存一个许可，
+                            // 某正常回合的终态若先于兜底任务开始等待时调用，后续的
+                            // 兜底任务会误消费陈旧许可而直接跳过杀进程（agent 真卡
+                            // 死时进程无人杀）。
+                            a.cancel_notify.notify_waiters();
+                            let cancelled = a.cancelled_turns.remove(&turn_gen);
+                            // 兜底杀进程/进程崩溃后不 drain：排队消息在
+                            // ensure_session 重拉新进程时迁移（见 ensure_session），
+                            // 避免往死进程发请求丢失。
+                            let alive = !a.exited;
+                            let next = if alive {
+                                a.pending_prompts.pop_front()
+                            } else {
+                                None
+                            };
+                            (a.ws_tx.clone(), next, cancelled, alive)
                         }
-                        None => return Ok(()), // 会话已 kill/回收：不再发终态帧
+                        // 会话已 kill/回收：条目移除，不再发终态帧。
+                        None => return Ok(()),
                     }
                 };
+                // 队列非空：不发 done（回合连续），异步发起下一条 prompt。不在
+                // 持锁状态 send_request（prompt 内部自己取锁）；spawn 避免同步
+                // 递归 async 的深度风险（20 条排队 = 至多 20 层同步调用栈）。
+                if let Some(next) = next {
+                    // 抽成独立 sync fn 发起下一条（不在 async 闭包里直接
+                    // tokio::spawn(bridge.prompt(...))——闭包捕获环境会让 prompt
+                    // future 被判定非 Send；独立函数里是普通 owned 数据，编译通过）。
+                    spawn_drain_next(bridge.clone(), sid.clone(), next);
+                    return Ok(());
+                }
+                // 队列排空：被取消或会话已死的回合不发生产者终态帧（stopped 帧
+                // 已由 WS handler 回发、cancel_fallback 由兜底任务回发，再补
+                // error/done 会造成误导）。
+                if cancelled || !alive {
+                    return Ok(());
+                }
                 let Some(ws_tx) = ws_tx else {
                     return Ok(()); // 前端已断开：无消费端，终态帧不发
                 };
@@ -968,39 +1048,141 @@ impl AcpBridge {
         Ok(())
     }
 
-    /// 取消进行中的回合：ACP session/cancel + 客户端 AgentExecCancel。
+    /// 提交一条用户消息到 ACP 会话：空闲直接跑（走 [`Self::prompt`]），进行中回合
+    /// 排队等待（推 `{"type":"queued"}` 帧通知前端）。回合连续：终态回调逐条续跑
+    /// 队列，排空才发 done。
     ///
-    /// `AgentExecCancel{request_id = session_id}` 的杀进程语义由客户端 spawn
-    /// manager 实现（Task 2）：终止内网侧 agent 进程。进程退出后 `exited`
-    /// 置位，下一次 prompt 前 ensure_session 自动重拉新进程。
+    /// `content` 为注入 @引用后的完整消息（调用方 mgmt/api/agent.rs 在分派前已
+    /// `inject_refs`）；`refs` 原样随 PendingPrompt 存储备查。排队消息同样已由调用
+    /// 方立即落库（user 落库在 submit_prompt 之前），刷新/重连后历史完整。
+    ///
+    /// 返回 Err 的场景：会话不存在 / 进程已退出 / 排队已达 `MAX_PENDING_PROMPTS`
+    /// 上限。调用方应把错误以 error 帧回发前端。
+    pub async fn submit_prompt(
+        &self,
+        session_id: &str,
+        content: &str,
+        refs: Vec<String>,
+    ) -> Result<(), String> {
+        // 锁内决策：busy 入队；空闲跑现有 prompt()。队列非空但空闲（兜底杀进程后
+        // 重拉迁移的旧消息）时，本条排到队尾、先跑队首——保持 FIFO 顺序。
+        let run_content = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(a) = sessions.get_mut(session_id) else {
+                return Err("session not spawned".to_string());
+            };
+            if a.exited {
+                return Err("agent process has exited".into());
+            }
+            if a.busy {
+                if a.pending_prompts.len() >= MAX_PENDING_PROMPTS {
+                    return Err(format!("排队消息已达上限（{MAX_PENDING_PROMPTS} 条）"));
+                }
+                a.pending_prompts.push_back(PendingPrompt {
+                    content: content.to_string(),
+                    refs,
+                });
+                // queued 帧：状态提示，try_send 丢帧可接受（与通知处理器同语义）。
+                if let Some(ws_tx) = a.ws_tx.clone() {
+                    let _ = ws_tx.try_send(serde_json::json!({"type": "queued"}));
+                }
+                return Ok(());
+            }
+            if a.pending_prompts.is_empty() {
+                Some(content.to_string())
+            } else {
+                // 空闲但队列非空：本条排到队尾（FIFO），先跑队首旧消息。
+                a.pending_prompts.push_back(PendingPrompt {
+                    content: content.to_string(),
+                    refs,
+                });
+                if let Some(ws_tx) = a.ws_tx.clone() {
+                    let _ = ws_tx.try_send(serde_json::json!({"type": "queued"}));
+                }
+                a.pending_prompts
+                    .pop_front()
+                    .map(|p| p.content)
+            }
+        };
+        match run_content {
+            Some(c) => self.prompt(session_id, &c).await,
+            None => Ok(()),
+        }
+    }
+
+    /// 优雅取消进行中的回合：发 ACP `session/cancel` 通知（**保留进程**），等待
+    /// agent 在 `cancel_grace` 内响应 PromptResponse（终态回调清 busy）；超时未
+    /// 响应则兜底杀客户端进程（`AgentExecCancel{request_id = session_id}`，客户端
+    /// spawn manager 终止内网侧 agent）并推 `{"type":"cancel_fallback"}` 帧。
+    ///
+    /// 与旧实现的区别：不再立即杀进程——直接杀会丢会话上下文（下次 prompt 走
+    /// NewSessionRequest 建空会话）。busy 保持到 PromptResponse 到达才复位，期间
+    /// 新消息经 [`Self::submit_prompt`] 排队；兜底杀进程后 `exited` 置位，下一次
+    /// ensure_session 自动重拉新进程并迁移排队消息。
     pub async fn cancel(&self, session_id: &str) {
         tracing::info!(session_id, "ACP cancel requested");
-        let (client_id, connection, acp_session_id) = {
+        // 仅取消进行中的回合：非 busy 短路返回，防止无在途回合时把代数记入
+        // cancelled_turns 后永不消费（泄漏）。
+        let (client_id, connection, acp_session_id, turn_gen, cancel_notify) = {
             let mut sessions = self.sessions.lock().await;
             match sessions.get_mut(session_id) {
-                Some(agent) => {
+                Some(agent) if agent.busy => {
                     agent.last_activity = std::time::Instant::now();
-                    agent.busy = false;
-                    // 记录当前回合代数为已取消：杀进程后 on_receiving_result 会
-                    // 以 Err 到达，终态回调据此抑制 error 帧（stopped 帧已由 WS
-                    // handler 回发）。用代数而非布尔：cancel 后立即重发 prompt
-                    // 时，新回合分配新代数，不会被本条取消标记误伤。
+                    // 记录当前回合代数为已取消：终态回调据此抑制生产者终态帧。
+                    // 用代数而非布尔：cancel 后立即重发 prompt 时，新回合分配新
+                    // 代数，不会被本条取消标记误伤。注意不清 busy——回合保持到
+                    // PromptResponse 到达（终态回调清位）或兜底杀进程。
                     agent.cancelled_turns.insert(agent.turn_generation);
+                    let turn_gen = agent.turn_generation;
                     (
                         agent.client_id.clone(),
                         agent.connection.clone(),
                         agent.acp_session_id.clone(),
+                        turn_gen,
+                        agent.cancel_notify.clone(),
                     )
                 }
-                None => return,
+                _ => return, // 无进行中回合（或会话不存在）：无事可取消
             }
         };
-        // ACP 协议层取消：让 agent 尽快停手（stop_reason = cancelled）。
+        // ACP 协议层取消：让 agent 尽快停手（stop_reason = cancelled），进程保留。
         if let (Some(cx), Some(sid)) = (connection, acp_session_id) {
             let _ = cx.send_notification(CancelNotification::new(sid));
         }
-        // 客户端进程层取消：真杀（AgentExecCancel request_id = session_id）。
-        self.spawner.send_agent_cancel(&client_id, session_id).await;
+        // 兜底任务：agent 未在 cancel_grace 内响应（终态回调未清 busy）则真杀。
+        // 捕获的均为克隆（session_id / 代数 / Notify），锁只在二次确认时短暂持有。
+        let sessions = self.sessions.clone();
+        let spawner = self.spawner.clone();
+        let sid = session_id.to_string();
+        let grace = self.cancel_grace;
+        tokio::spawn(async move {
+            tokio::select! {
+                // 优雅路径：终态回调清 busy 后 notify_waiters 唤醒，兜底不做任何事。
+                _ = cancel_notify.notified() => {}
+                // 超时：二次确认（仍 busy 且本代数仍被取消）才杀进程——避免误杀
+                // 已恢复的回合 / 终态回调已清 busy 的正常路径。
+                _ = tokio::time::sleep(grace) => {
+                    let (should_kill, ws_tx) = {
+                        let mut map = sessions.lock().await;
+                        match map.get_mut(&sid) {
+                            Some(a) if a.busy && a.cancelled_turns.contains(&turn_gen) => {
+                                a.busy = false;
+                                a.cancelled_turns.remove(&turn_gen);
+                                (true, a.ws_tx.clone())
+                            }
+                            _ => (false, None),
+                        }
+                    };
+                    if should_kill {
+                        tracing::warn!(session_id = %sid, "ACP agent did not respond to cancel within grace; killing process");
+                        spawner.send_agent_cancel(&client_id, &sid).await;
+                        if let Some(ws_tx) = ws_tx {
+                            let _ = ws_tx.try_send(serde_json::json!({"type": "cancel_fallback"}));
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// 终结 ACP 会话：杀客户端进程 + 移除会话条目（idle reaper / 会话归档关闭
@@ -1406,6 +1588,21 @@ impl AcpBridge {
     }
 }
 
+/// 从终态回调发起下一条排队 prompt（fire-and-forget，队列 drain）。
+///
+/// 抽成独立 sync fn：在 async 闭包（`on_receiving_result` 回调）里直接
+/// `tokio::spawn(bridge.prompt(...))` 会让 `prompt()` 的 opaque future 因闭包
+/// 捕获环境被判定非 Send（编译错误）；独立函数上下文里 `bridge`/`sid`/`next` 是
+/// 普通 owned 数据，`tokio::spawn` 正常编译。`prompt()` 本身 fire-and-forget
+/// （发完即返回），spawn 后本函数立即返回，不构成同步递归。
+fn spawn_drain_next(bridge: AcpBridge, sid: String, next: PendingPrompt) {
+    tokio::spawn(async move {
+        if let Err(e) = bridge.prompt(&sid, &next.content).await {
+            tracing::warn!(session_id = %sid, "drain queued prompt failed: {e}");
+        }
+    });
+}
+
 /// 动态解析会话当前的 WS 事件通道：重连/多标签页时 `ensure_session` 的 dedup
 /// 刷新、连接关闭时 [`AcpBridge::detach_ws_tx`] 清空，都会改动条目里的
 /// `ws_tx`。连接任务的通知/请求处理器**每次事件**都读最新值，避免流式帧/审批
@@ -1478,16 +1675,15 @@ async fn persist_acp_frame(
                 "locations": frame.get("locations").cloned().unwrap_or(serde_json::Value::Null),
             }]);
             let msg_id = format!("{:032x}", rand::random::<u128>());
+            // upsert：同一 (session_id, tool_call_id) 收敛为一行，避免每个事件
+            // 纯 INSERT 造成刷新后重复卡片。
             if let Err(e) = db
-                .agent_add_message_v2(
+                .agent_upsert_tool_call(
                     &msg_id,
                     sid,
-                    "assistant",
-                    "",
-                    Some(&call.to_string()),
-                    frame["id"].as_str(),
+                    frame["id"].as_str().unwrap_or_default(),
                     frame["name"].as_str(),
-                    "tool_calls",
+                    &call.to_string(),
                 )
                 .await
             {
@@ -1496,16 +1692,15 @@ async fn persist_acp_frame(
         }
         "tool_result" => {
             let msg_id = format!("{:032x}", rand::random::<u128>());
+            // upsert：ToolCallUpdate 中间态（空 result）与终态按同一
+            // (session_id, tool_call_id) 收敛，终态覆盖中间态空占位。
             if let Err(e) = db
-                .agent_add_message_v2(
+                .agent_upsert_tool_result(
                     &msg_id,
                     sid,
-                    "assistant",
-                    frame["result"].as_str().unwrap_or(""),
-                    None,
-                    frame["id"].as_str(),
+                    frame["id"].as_str().unwrap_or_default(),
                     frame["name"].as_str(),
-                    "tool_result",
+                    frame["result"].as_str().unwrap_or(""),
                 )
                 .await
             {
@@ -1903,6 +2098,8 @@ mod tests {
             thought_buf: String::new(),
             config_options: Vec::new(),
             spawn_ready: watch::channel(false).0,
+            pending_prompts: VecDeque::new(),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -1915,6 +2112,8 @@ mod tests {
             ws_tx,
             serde_json::json!([]),
             Arc::new(Mutex::new(Vec::new())),
+            None,
+            None,
         )
         .await;
     }
@@ -1922,11 +2121,19 @@ mod tests {
     /// `setup_handshake` 的参数化版本：`config_options` 注入 `session/new` 响应
     /// 的 `configOptions`（空数组 = 无配置项），`applied` 记录收到的
     /// `session/set_config_option` 调用（config_id, value）。
+    ///
+    /// `prompt_permits`（None 立即响应）：mock 收到 `session/prompt` 后先回流式
+    /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试需要精确控制「回合
+    /// 何时结束」。`recorded`（None 不记录）：收集 mock 收到的 method/通知名
+    /// （如 `session/cancel`），供断言。
+    #[allow(clippy::too_many_arguments)]
     async fn setup_handshake_with(
         bridge: &AcpBridge,
         ws_tx: mpsc::Sender<serde_json::Value>,
         config_options: serde_json::Value,
         applied: Arc<Mutex<Vec<(String, String)>>>,
+        prompt_permits: Option<mpsc::Receiver<()>>,
+        recorded: Option<Arc<Mutex<Vec<String>>>>,
     ) {
         let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -1950,6 +2157,8 @@ mod tests {
             stdout_tx,
             config_options,
             applied,
+            prompt_permits,
+            recorded,
         ));
 
         bridge
@@ -2644,11 +2853,18 @@ mod tests {
     /// `configOptions`；`applied` 记录收到的 `session/set_config_option`
     /// 调用（config_id, value）——value 形态以 ACP 实际序列化为准（select 为
     /// 裸字符串，boolean 为 bool + 顶层 type）。
+    ///
+    /// `prompt_permits`（None 立即响应）：mock 收到 `session/prompt` 后先回流式
+    /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试用。
+    /// `recorded`（None 不记录）：收集收到的 method/通知名（如 `session/cancel`）。
+    #[allow(clippy::too_many_arguments)]
     async fn mock_acp_agent(
         mut stdin_rx: mpsc::Receiver<ControlMessage>,
         stdout_tx: mpsc::Sender<Vec<u8>>,
         config_options: serde_json::Value,
         applied: Arc<Mutex<Vec<(String, String)>>>,
+        mut prompt_permits: Option<mpsc::Receiver<()>>,
+        recorded: Option<Arc<Mutex<Vec<String>>>>,
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
@@ -2669,6 +2885,9 @@ mod tests {
                     .and_then(|m| m.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Some(r) = &recorded {
+                    r.lock().await.push(method.clone());
+                }
                 let id = json.get("id").cloned().unwrap_or(serde_json::Value::Null);
                 // 单条请求可能产出多条输出行（prompt：通知 + 响应）。
                 let mut out_lines: Vec<serde_json::Value> = Vec::new();
@@ -2708,45 +2927,65 @@ mod tests {
                         }));
                     }
                     "session/prompt" => {
-                        out_lines.push(serde_json::json!({
-                            "jsonrpc": "2.0", "method": "session/update",
-                            "params": { "sessionId": "acp-1",
-                                "update": { "sessionUpdate": "agent_message_chunk",
-                                    "content": { "type": "text", "text": "hello from mock" } } }
-                        }));
-                        out_lines.push(serde_json::json!({
-                            "jsonrpc": "2.0", "method": "session/update",
-                            "params": { "sessionId": "acp-1",
-                                "update": { "sessionUpdate": "tool_call", "toolCallId": "call_1",
-                                    "title": "shell", "status": "completed",
-                                    "rawInput": { "cmd": "ls" } } }
-                        }));
-                        // ToolCallUpdate 不带 title：验证 name 从前序 ToolCall 缓存补
-                        out_lines.push(serde_json::json!({
-                            "jsonrpc": "2.0", "method": "session/update",
-                            "params": { "sessionId": "acp-1",
-                                "update": { "sessionUpdate": "tool_call_update",
-                                    "toolCallId": "call_1", "status": "completed",
-                                    "rawOutput": "a.rs" } }
-                        }));
-                        // plan + thought：验证新事件类型的落库
-                        out_lines.push(serde_json::json!({
-                            "jsonrpc": "2.0", "method": "session/update",
-                            "params": { "sessionId": "acp-1",
-                                "update": { "sessionUpdate": "agent_thought_chunk",
-                                    "content": { "type": "text", "text": "思考一下" } } }
-                        }));
-                        out_lines.push(serde_json::json!({
-                            "jsonrpc": "2.0", "method": "session/update",
-                            "params": { "sessionId": "acp-1",
-                                "update": { "sessionUpdate": "plan",
-                                    "entries": [ { "content": "步骤一", "priority": "high",
-                                        "status": "in_progress" } ] } }
-                        }));
-                        out_lines.push(serde_json::json!({
+                        // 流式通知：先发（回合立即进入 running 状态，前端可见）。
+                        let stream_lines = vec![
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "acp-1",
+                                    "update": { "sessionUpdate": "agent_message_chunk",
+                                        "content": { "type": "text", "text": "hello from mock" } } }
+                            }),
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "acp-1",
+                                    "update": { "sessionUpdate": "tool_call", "toolCallId": "call_1",
+                                        "title": "shell", "status": "completed",
+                                        "rawInput": { "cmd": "ls" } } }
+                            }),
+                            // ToolCallUpdate 不带 title：验证 name 从前序 ToolCall 缓存补
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "acp-1",
+                                    "update": { "sessionUpdate": "tool_call_update",
+                                        "toolCallId": "call_1", "status": "completed",
+                                        "rawOutput": "a.rs" } }
+                            }),
+                            // plan + thought：验证新事件类型的落库
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "acp-1",
+                                    "update": { "sessionUpdate": "agent_thought_chunk",
+                                        "content": { "type": "text", "text": "思考一下" } } }
+                            }),
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": "acp-1",
+                                    "update": { "sessionUpdate": "plan",
+                                        "entries": [ { "content": "步骤一", "priority": "high",
+                                            "status": "in_progress" } ] } }
+                            }),
+                        ];
+                        for line_value in &stream_lines {
+                            let mut bytes = serde_json::to_vec(line_value).unwrap();
+                            bytes.push(b'\n');
+                            if stdout_tx.send(bytes).await.is_err() {
+                                return;
+                            }
+                        }
+                        // 响应 gate：None 立即回；Some 等待一个许可（队列/取消测试
+                        // 需要精确控制「回合何时结束」）。等待期间回合保持 busy。
+                        if let Some(permits) = &mut prompt_permits {
+                            let _ = permits.recv().await;
+                        }
+                        let resp = serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": { "stopReason": "end_turn" }
-                        }));
+                        });
+                        let mut bytes = serde_json::to_vec(&resp).unwrap();
+                        bytes.push(b'\n');
+                        if stdout_tx.send(bytes).await.is_err() {
+                            return;
+                        }
                     }
                     other => {
                         tracing::debug!("mock agent: unknown method {other}");
@@ -3252,7 +3491,7 @@ mod tests {
              "options": [{"value": "haiku", "name": "Haiku"}]}
         ]);
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-        setup_handshake_with(&bridge, ws_tx, options, applied.clone()).await;
+        setup_handshake_with(&bridge, ws_tx, options, applied.clone(), None, None).await;
 
         // workspace 注入：fast → haiku；model 先被 workspace 设为 sonnet，随后
         // config_state 回放覆盖为 opus；nonexistent 不在快照中 → 跳过
@@ -3307,12 +3546,357 @@ mod tests {
             };
             let applied = Arc::new(Mutex::new(Vec::new()));
             let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-            setup_handshake_with(&bridge, ws_tx, options.clone(), applied.clone()).await;
+            setup_handshake_with(&bridge, ws_tx, options.clone(), applied.clone(), None, None)
+                .await;
             bridge.apply_config_overrides("sess-1", &ws).await;
             assert!(
                 applied.lock().await.is_empty(),
                 "{label}: apply_config_overrides should be a no-op"
             );
         }
+    }
+
+    // ── submit_prompt 排队 + 优雅取消/兜底杀进程 ────────────────
+
+    /// 注册客户端并观察 AgentExecCancel（优雅取消测试断言「未杀进程」，
+    /// 兜底测试断言「已杀进程」）。
+    async fn register_cancel_observer(
+        registry: &crate::client_registry::ClientRegistry,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let (client_tx, mut client_rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", client_tx)
+            .await
+            .unwrap();
+        let cancels = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observer = cancels.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = client_rx.recv().await {
+                if let ControlMessage::AgentExecCancel { request_id } = msg {
+                    observer.lock().await.push(request_id);
+                }
+            }
+        });
+        cancels
+    }
+
+    /// 轮询 `cond`（async 闭包）直到返回 true（超时 panic）。
+    async fn wait_until<F, Fut>(timeout: Duration, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        while !cond().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition not met within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// busy 时 submit_prompt 入队并推 queued 帧；当前回合终态后自动发下一条；
+    /// done 只在队列排空后发（回合连续）。
+    #[tokio::test]
+    async fn test_submit_prompt_queues_when_busy_and_drains() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);
+        let (permit_tx, permit_rx) = mpsc::channel::<()>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permit_rx),
+            None,
+        )
+        .await;
+
+        // 第一条：空闲 → 直接跑（busy）
+        bridge
+            .submit_prompt("sess-1", "first", vec![])
+            .await
+            .expect("first prompt accepted");
+        assert!(bridge.sessions.lock().await.get("sess-1").unwrap().busy);
+
+        // 第二条：busy → 排队 + queued 帧
+        bridge
+            .submit_prompt("sess-1", "second", vec![])
+            .await
+            .expect("second prompt queued");
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .pending_prompts
+                .len(),
+            1,
+            "busy prompt should be queued"
+        );
+
+        // 放行第一条 → 终态回调 drain → 自动发第二条
+        permit_tx.send(()).await.unwrap();
+
+        let mut events = Vec::new();
+        let mut text_chunks = 0;
+        let mut sent_second_permit = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for events")
+                .expect("ws channel closed");
+            // mock 每回合发 1 个正文 chunk（thought 也是 assistant_chunk 类型，
+            // 用 thought 字段区分，只数正文用于判定「下一回合已开跑」）
+            if ev["type"] == "assistant_chunk"
+                && !ev.get("thought").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            {
+                text_chunks += 1;
+                if text_chunks >= 2 && !sent_second_permit {
+                    // 第二条已开跑：放行其 PromptResponse
+                    sent_second_permit = true;
+                    permit_tx.send(()).await.unwrap();
+                }
+            }
+            let done = ev["type"] == "done";
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        assert!(sent_second_permit, "queued prompt should auto-send after first turn");
+        assert_eq!(text_chunks, 2, "both turns should stream");
+        let queued = events.iter().filter(|e| e["type"] == "queued").count();
+        assert_eq!(queued, 1, "busy queue should push a queued frame");
+        assert_eq!(
+            events.last().unwrap()["type"], "done",
+            "done only after the queue drains"
+        );
+        assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
+    }
+
+    /// 优雅取消：收到 session/cancel、无 AgentExecCancel、busy 保持到
+    /// PromptResponse 到达才复位，取消回合不发生产者终态帧。
+    #[tokio::test]
+    async fn test_cancel_graceful_keeps_process_and_busy() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let cancels = register_cancel_observer(&registry).await;
+        // 默认 cancel_grace（10s）：测试期间不会触发兜底杀进程
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);
+        let (permit_tx, permit_rx) = mpsc::channel::<()>(16);
+        let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded2 = recorded.clone();
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permit_rx),
+            Some(recorded2),
+        )
+        .await;
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+        // 消费 mock 的流式通知（assistant_chunk/tool_call/tool_result/thought/plan）
+        for _ in 0..5 {
+            tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for stream")
+                .expect("closed");
+        }
+
+        bridge.cancel("sess-1").await;
+        assert!(
+            bridge.sessions.lock().await.get("sess-1").unwrap().busy,
+            "graceful cancel keeps busy until PromptResponse arrives"
+        );
+        // 放行 PromptResponse → 终态回调清 busy。
+        // 注意：mock 逐行处理，session/cancel 通知排在 prompt 响应之后才被读取，
+        // 因此 session/cancel 的断言放在放行之后。
+        permit_tx.send(()).await.unwrap();
+        wait_until(Duration::from_secs(2), async || {
+            !bridge.sessions.lock().await.get("sess-1").unwrap().busy
+        })
+        .await;
+        // mock 已收到 session/cancel 通知
+        wait_until(Duration::from_secs(2), async || {
+            recorded.lock().await.iter().any(|m| m == "session/cancel")
+        })
+        .await;
+
+        // 无 AgentExecCancel（进程保留）
+        assert!(
+            cancels.lock().await.is_empty(),
+            "graceful cancel must not kill the process"
+        );
+        // 被取消的回合不发生产者终态帧（stopped 已由 WS handler 回发）
+        let stale = tokio::time::timeout(Duration::from_millis(300), ws_rx.recv()).await;
+        assert!(
+            matches!(stale, Err(_) | Ok(None)),
+            "cancelled turn must not emit a terminal frame: {stale:?}"
+        );
+    }
+
+    /// 兜底杀进程：cancel_grace 调极短，mock agent 不响应 cancel →
+    /// 超时后 send_agent_cancel + cancel_fallback 帧 + busy 复位。
+    #[tokio::test]
+    async fn test_cancel_fallback_kills_after_grace() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let cancels = register_cancel_observer(&registry).await;
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db)
+            .with_cancel_grace(Duration::from_millis(50));
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);
+        // `_permit_tx` 必须保持存活到测试结束：drop 会让 mock 的 recv 返回 None
+        // 而放行 PromptResponse（回合结束，兜底无从触发）；且永不 send → 回合
+        // 一直 busy，agent 不响应 cancel。
+        let (_permit_tx, permit_rx) = mpsc::channel::<()>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permit_rx),
+            None,
+        )
+        .await;
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+        bridge.cancel("sess-1").await;
+
+        // 等待兜底任务：cancel_fallback 帧
+        let frame = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), ws_rx.recv())
+                .await
+                .expect("timed out waiting for cancel_fallback")
+                .expect("closed");
+            if ev["type"] == "cancel_fallback" {
+                break ev;
+            }
+        };
+        assert_eq!(frame["type"], "cancel_fallback");
+        // 兜底杀进程已下发
+        assert_eq!(
+            cancels.lock().await.as_slice(),
+            &["sess-1".to_string()],
+            "fallback should send AgentExecCancel for the session"
+        );
+        // busy 已复位（回合不再被卡死）
+        assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
+    }
+
+    /// cancel 后队列自动 drain：被取消的回合结束后，排队的消息自动续跑，
+    /// 新回合的 done 不被 cancelled_turns 误吞。
+    #[tokio::test]
+    async fn test_cancel_queued_prompts_auto_send_after_graceful_stop() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let cancels = register_cancel_observer(&registry).await;
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);
+        let (permit_tx, permit_rx) = mpsc::channel::<()>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permit_rx),
+            None,
+        )
+        .await;
+
+        bridge
+            .submit_prompt("sess-1", "first", vec![])
+            .await
+            .expect("first accepted");
+        bridge
+            .submit_prompt("sess-1", "second", vec![])
+            .await
+            .expect("second queued");
+        bridge
+            .submit_prompt("sess-1", "third", vec![])
+            .await
+            .expect("third queued");
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .pending_prompts
+                .len(),
+            2
+        );
+
+        // 取消当前回合（优雅路径，进程保留）
+        bridge.cancel("sess-1").await;
+
+        // 放行被取消的第一回合 → 队列自动 drain（second → third → done）
+        permit_tx.send(()).await.unwrap();
+        let mut events = Vec::new();
+        let mut text_chunks = 0;
+        let mut permits_sent = 0;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for drain")
+                .expect("closed");
+            // 只数正文 chunk（thought 也是 assistant_chunk 类型）判定回合推进
+            if ev["type"] == "assistant_chunk"
+                && !ev.get("thought").and_then(serde_json::Value::as_bool).unwrap_or(false)
+            {
+                text_chunks += 1;
+                // 第 2、3 个正文 chunk 分别放行 second/third 的 PromptResponse
+                if text_chunks >= 2 && permits_sent < 2 {
+                    permits_sent += 1;
+                    permit_tx.send(()).await.unwrap();
+                }
+            }
+            let done = ev["type"] == "done";
+            events.push(ev);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            text_chunks, 3,
+            "queued prompts should auto-send after the cancelled turn"
+        );
+        // 新回合的 done 不被 cancelled_turns 误吞
+        assert_eq!(events.last().unwrap()["type"], "done");
+        let queued = events.iter().filter(|e| e["type"] == "queued").count();
+        assert_eq!(queued, 2, "second and third were queued");
+        assert!(
+            cancels.lock().await.is_empty(),
+            "graceful cancel queue drain must not kill the process"
+        );
+        assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
     }
 }

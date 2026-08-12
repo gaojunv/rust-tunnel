@@ -564,7 +564,7 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
     expect(screen.getByText('agent.running')).toBeTruthy();
-    // 停止按钮（aria-label = t('agent.stop')）替代发送按钮
+    // 停止按钮（aria-label = t('agent.stop')）：running 期间与发送按钮并存
     const stopBtn = screen.getByRole('button', { name: 'agent.stop' });
     expect(stopBtn).toBeTruthy();
     // 捕获当前活跃连接：i18n mock 的 t 每次渲染返回新引用 → armRunning（WS effect
@@ -579,6 +579,86 @@ describe('ChatStream running state', () => {
     // running 指示消失 + 停止提示气泡出现
     expect(screen.queryByText('agent.running')).toBeNull();
     expect(screen.getByText(/agent.stopped/)).toBeTruthy();
+  });
+
+  it('keeps send button usable while running (queues instead of dropping)', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 进入 running：回合进行中用户仍可提交消息（服务端 busy 时排队，回 queued 帧）
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 停止按钮与发送按钮并存
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    const sendBtn = screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement;
+    // 无输入时发送按钮仍禁用
+    expect(sendBtn.disabled).toBe(true);
+    // 输入后可用
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '排队消息' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+    // 点击发送：照常发 user_message 帧（服务端 busy 会排队而非丢弃）
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.send' }));
+    expect(ws.sent.some((s) => s.includes('"type":"user_message"') && s.includes('排队消息'))).toBe(true);
+    // running 状态保持（当前回合仍在服务端执行）
+    expect(screen.getByText('agent.running')).toBeTruthy();
+  });
+
+  it('shows queued hint on queued frame while running', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    // 服务端 busy 入队确认帧 → 轻量提示气泡
+    act(() => {
+      wsInstance!.emit({ type: 'queued' });
+    });
+    expect(screen.getByText('agent.messageQueued')).toBeTruthy();
+    // 不打断进行中的回合
+    expect(screen.getByText('agent.running')).toBeTruthy();
+  });
+
+  it('shows cancel_fallback warning and clears running', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    // 停止超时兜底：agent 未响应停止，服务端强制杀进程并重启
+    act(() => {
+      wsInstance!.emit({ type: 'cancel_fallback' });
+    });
+    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.getByText('agent.cancelFallback')).toBeTruthy();
+  });
+
+  it('keeps Mode/Effort config buttons enabled while running', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state（mode 项）→ Mode 快捷按钮出现
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'mode', name: 'Mode', category: 'mode', type: 'select',
+            currentValue: 'plan',
+            options: [{ value: 'plan', name: 'Plan' }],
+          },
+        ],
+      });
+    });
+    const modeBtn = screen.getByRole('button', { name: 'agent.configMode' });
+    expect((modeBtn as HTMLButtonElement).disabled).toBe(false);
+    // 进入 running 后 mode 快捷按钮仍可用（运行中允许改 mode/effort/模型）
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
+    });
+    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'agent.configMode' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('flushes buffered text before appending stopped bubble on cancel (M11)', () => {

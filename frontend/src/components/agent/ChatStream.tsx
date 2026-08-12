@@ -11,8 +11,7 @@ import {
   updateAgentSessionModel,
 } from '../../api/client';
 import type { AgentWsEvent } from '../../types';
-import { parseAcpToolJson, parsePlanEntries } from './types';
-import type { ChatItem, ToolDiff, ToolKind, ToolLocation } from './types';
+import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
@@ -20,6 +19,7 @@ import SessionSettingsMenu from './SessionSettingsMenu';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions } from './sessionConfig';
+import { historyToChatItems } from './history';
 import type { SessionConfigOption } from '../../types';
 
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
@@ -144,10 +144,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     reconcileRef.current = false;
     if (!isReconcileReload && history.length > 0) {
       // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
-      // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true），此时
-      // 发送会撞 "ACP 回合进行中" busy 守卫、用户消息被静默吞掉。把 running 置 true
-      // 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧或 10 分钟超时解除。
-      // 误置（进程其实已退）的代价只是发送被禁用一段时间，优于消息被吞。
+      // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true）。把
+      // running 置 true 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧
+      // 或 10 分钟超时解除。运行中发送已放开（服务端 busy 会排队），误置的代价只是
+      // 指示器多亮一阵、消息走排队路径，优于用户以为回合已结束而重复发送。
       const last = history[history.length - 1];
       if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current) {
         // 半截装载标记：done 到达时允许 refetch 重渲染完整历史（对账）
@@ -163,186 +163,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         }, RUNNING_TIMEOUT_MS);
       }
     }
-    const loaded: ChatItem[] = [];
-    // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args；
-    // 同时保留 ACP 新格式的 tool_kind/diffs/locations 供 tool_result 行合并
-    const callArgs = new Map<string, {
-      name: string;
-      args: string;
-      toolKind?: ToolKind;
-      toolDiffs?: ToolDiff[];
-      toolLocations?: ToolLocation[];
-    }>();
-    for (const m of history) {
-      if (m.kind === 'tool_calls' && m.tool_calls) {
-        try {
-          const parsed = JSON.parse(m.tool_calls) as {
-            id: string;
-            function?: { name?: string; arguments?: string };
-          }[];
-          const acp = parseAcpToolJson(m.tool_calls);
-          for (const c of parsed) {
-            callArgs.set(c.id, {
-              // ACP 新格式：name/arguments 平铺；runner 旧格式：function 嵌套
-              name:
-                (c as { name?: string }).name ?? c.function?.name ?? m.name ?? '',
-              args:
-                (c as { arguments?: string }).arguments ?? c.function?.arguments ?? '',
-              ...acp,
-            });
-          }
-        } catch {
-          /* ignore malformed tool_calls */
-        }
-      }
-    }
-    // 有配对 tool_result 的 tool_call_id 集合：tool_calls 行只为「无配对」的
-    // 孤儿行渲染兜底卡片（正常完成的工具由 tool_result 卡片展示，不重复）。
-    const pairedResultIds = new Set<string>();
-    for (const m of history) {
-      if (m.kind === 'tool_result' && m.tool_call_id) pairedResultIds.add(m.tool_call_id);
-    }
-    // 压缩重插去重：kept 段在 summary 前保留原始行（801c9a6），DB 物理顺序为
-    // [..., 原kept, summary, 重插kept, 压缩后新消息...]，前端全量渲染会重复。
-    // 不能用「summary 之后的行数」当作重插行数（压缩后新消息也排在 summary 后，
-    // 会把行数放大、多跳掉没有重复副本的合法旧行）。改为内容匹配：对每个
-    // summary，以「summary 后紧跟的重插段」为模板，从 summary 前紧邻行向前找
-    // 等长且逐行全等（kind/role/content/tool_calls/tool_call_id/name）的连续
-    // 段——重插段是 kept 段原样复制，故 summary 前必存在这样一段原件。
-    // 重插段长度未知：先取「summary 后到下一个 summary/末尾」的行数作为上界，
-    // 逐步缩短直到匹配上（首个全等的段长即 kept_count，余下的是压缩后新消息）。
-    // 对每个 summary（含多次压缩）都做，因为每个 summary 各对应一次重插。
-    const normNull = (v: unknown) => (v === undefined ? null : v);
-    const rowEquals = (a: (typeof history)[number], b: (typeof history)[number]) =>
-      a.kind === b.kind &&
-      a.role === b.role &&
-      a.content === b.content &&
-      normNull(a.tool_calls) === normNull(b.tool_calls) &&
-      normNull(a.tool_call_id) === normNull(b.tool_call_id) &&
-      normNull(a.name) === normNull(b.name);
-    const skipBeforeSummary = new Set<number>();
-    for (let s = 0; s < history.length; s++) {
-      if (history[s].kind !== 'summary') continue;
-      // summary 后、到下一个 summary（或数组末尾）之间的行数 = 重插段长上界
-      let upper = 0;
-      while (s + 1 + upper < history.length && history[s + 1 + upper].kind !== 'summary') upper++;
-      // 从长到短尝试：找到「summary 前紧邻 len 行」与「summary 后前 len 行」全等的最大 len
-      let matched = 0;
-      for (let len = Math.min(upper, s); len >= 1; len--) {
-        let all = true;
-        for (let m = 0; m < len; m++) {
-          if (!rowEquals(history[s - len + m], history[s + 1 + m])) {
-            all = false;
-            break;
-          }
-        }
-        if (all) {
-          matched = len;
-          break;
-        }
-      }
-      for (let m = 0; m < matched; m++) {
-        skipBeforeSummary.add(s - matched + m);
-      }
-    }
-    // 历史中多条 plan 行只保留最后一条（ACP plan 全量替换语义）：先记录索引
-    let lastPlanIdx = -1;
-    for (let i = 0; i < history.length; i++) {
-      const m = history[i];
-      if (skipBeforeSummary.has(i)) continue;
-      if (m.kind === 'tool_result') {
-        const call: { name: string; args: string; toolKind?: ToolKind; toolDiffs?: ToolDiff[]; toolLocations?: ToolLocation[] } =
-          (m.tool_call_id && callArgs.get(m.tool_call_id)) || { name: m.name ?? '', args: '' };
-        loaded.push({
-          kind: 'tool',
-          content: '',
-          toolName: call.name,
-          toolId: m.tool_call_id ?? undefined,
-          toolArgs: call.args,
-          toolResult: m.content,
-          toolStatus: 'completed',
-          toolKind: call.toolKind,
-          toolDiffs: call.toolDiffs,
-          toolLocations: call.toolLocations,
-        });
-      } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
-        // 旧格式：合并 tool_log JSON 行
-        try {
-          for (const t of JSON.parse(m.tool_calls)) {
-            loaded.push({ kind: 'tool', content: '', toolName: t.name, toolArgs: t.args, toolResult: t.result });
-          }
-        } catch {
-          /* ignore malformed tool_calls */
-        }
-      } else if (m.kind === 'tool_calls') {
-        // kind='tool_calls' 的孤儿行（回合中断在工具执行中：ToolCall 已落库，
-        // 对应 ToolCallUpdate/tool_result 永不到达）。history effect 的注释说
-        // 「kind='tool_calls' 行本身不渲染」——但那只在有配对 tool_result 时成立：
-        // 正常路径下 tool_result 卡片已携带 args，无需重复渲染。孤儿行若没有
-        // 任何卡片兜底，重载后该工具就从聊天区彻底消失（现象：卡片无标题无内容、
-        // 或凭空少一段）。渲染为 failed 占位卡片，让用户看到中断痕迹。
-        if (m.tool_call_id && !m.content && !pairedResultIds.has(m.tool_call_id)) {
-          const call = callArgs.get(m.tool_call_id);
-          if (call) {
-            loaded.push({
-              kind: 'tool',
-              content: '',
-              toolName: call.name,
-              toolId: m.tool_call_id,
-              toolArgs: call.args,
-              toolResult: undefined,
-              toolStatus: 'failed',
-              toolKind: call.toolKind,
-              toolDiffs: call.toolDiffs,
-              toolLocations: call.toolLocations,
-            });
-          }
-        } else if (!m.tool_call_id && m.tool_calls) {
-          // runner 旧格式：整行 tool_call_id 列为空，但 JSON 内每个调用带 id。
-          // 按 id 与 tool_result 行配对——未配对的（回合在工具执行中被取消）也
-          // 渲染 failed 占位卡，否则这些工具刷新后从聊天区消失。
-          try {
-            for (const c of JSON.parse(m.tool_calls) as { id?: string }[]) {
-              if (!c.id || pairedResultIds.has(c.id)) continue;
-              const call = callArgs.get(c.id);
-              if (call) {
-                loaded.push({
-                  kind: 'tool',
-                  content: '',
-                  toolName: call.name,
-                  toolId: c.id,
-                  toolArgs: call.args,
-                  toolResult: undefined,
-                  toolStatus: 'failed',
-                  toolKind: call.toolKind,
-                  toolDiffs: call.toolDiffs,
-                  toolLocations: call.toolLocations,
-                });
-              }
-            }
-          } catch {
-            /* ignore malformed tool_calls */
-          }
-        }
-      } else if (m.kind === 'message' && m.name === 'thought' && m.content) {
-        loaded.push({ kind: 'thought', content: m.content });
-      } else if (m.kind === 'message' && m.name === 'plan') {
-        // 只保留最后一条 plan（ACP plan 全量替换语义）：先记录索引，循环后处理
-        lastPlanIdx = loaded.length;
-        loaded.push({ kind: 'plan', content: '', planEntries: parsePlanEntries(m.content) });
-      } else if (m.kind === 'message' && m.content) {
-        loaded.push({ kind: m.role === 'user' ? 'user' : 'assistant', content: m.content });
-      } else if (m.kind === 'summary' && m.content) {
-        // summary 渲染为 assistant 气泡（muted 样式），避免与普通用户消息混淆
-        loaded.push({ kind: 'assistant', content: m.content });
-      }
-      // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
-    }
-    // 历史中多条 plan 行只渲染最后一条
-    const finalLoaded = lastPlanIdx >= 0
-      ? loaded.filter((it, i) => it.kind !== 'plan' || i === lastPlanIdx)
-      : loaded;
-    setItems(finalLoaded);
+    // 纯函数装载：历史行 → ChatItem（含同一 tool_call_id 多行去重、压缩重插
+    // 去重、plan 只留最后一条），见 history.ts。
+    setItems(historyToChatItems(history));
     // t 用于 running 超时提示文案；语言切换后重跑 effect 只影响尚未触发的
     // 超时回调文案，代价可忽略。
   }, [history, t]);
@@ -650,6 +473,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: msg.message ?? '' }]);
+      } else if (msg.type === 'queued') {
+        // 运行中提交消息 → 服务端 busy 入队确认：轻量提示（不打断当前流式气泡）。
+        // 队列在服务端（前端不做本地排队），本连接后续会收到该消息对应的流式帧。
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: tRef.current('agent.messageQueued') }]);
       } else if (msg.type === 'stopped') {
         // 服务端确认取消（本连接或另一标签页发起的 cancel 都会广播到本连接的处理逻辑）
         flushChunks();
@@ -657,6 +484,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         stopRunning();
         // 回合已终态，未响应的审批请求随回合作废 → 卡片过期
         expirePendingApprovals();
+      } else if (msg.type === 'cancel_fallback') {
+        // 停止超时兜底：agent 进程未在时限内退出，服务端强制杀掉并重启。
+        // 当前回合已死（上下文可能丢失）——按终态处理并提示用户。
+        flushChunks();
+        breakStream();
+        stopRunning();
+        expirePendingApprovals();
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.cancelFallback') }]);
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
@@ -899,7 +734,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
   const send = () => {
     const text = input.trim();
-    if (!text || running || hasPendingApproval) return;
+    // 运行中不再短路：服务端 busy 时会排队（回 queued 帧），消息不会丢。
+    // hasPendingApproval 仍需阻塞——服务端在该审批响应前挂起回合，发送必被吞。
+    if (!text || hasPendingApproval) return;
     const ws = wsRef.current;
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
@@ -1172,24 +1009,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               onModelChange={handleModelChange}
               configOptions={menuOptions}
               onConfigChange={sendConfigOption}
-              disabled={running}
             />
             <div className="flex items-center gap-0.5">
               <ConfigOptionButton
                 option={modeOption}
                 label="agent.configMode"
                 onChange={sendConfigOption}
-                disabled={running}
                 placeholder={configOptions.length > 0 && !modeOption}
               />
               <ConfigOptionButton
                 option={effortOption}
                 label="agent.configEffort"
                 onChange={sendConfigOption}
-                disabled={running}
                 placeholder={configOptions.length > 0 && !effortOption}
               />
-              {running ? (
+              {running && (
                 <Button
                   onClick={stop}
                   size="sm"
@@ -1199,18 +1033,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 >
                   <Square className="h-4 w-4 fill-current" />
                 </Button>
-              ) : (
-                <Button
-                  onClick={send}
-                  disabled={!input.trim() || hasPendingApproval}
-                  size="sm"
-                  variant="ghost"
-                  aria-label={t('agent.send')}
-                  className="h-8 w-8 rounded-full p-0"
-                >
-                  <SendHorizontal className="h-4 w-4" />
-                </Button>
               )}
+              <Button
+                onClick={send}
+                disabled={!input.trim() || hasPendingApproval}
+                size="sm"
+                variant="ghost"
+                aria-label={t('agent.send')}
+                className="h-8 w-8 rounded-full p-0"
+              >
+                <SendHorizontal className="h-4 w-4" />
+              </Button>
             </div>
           </div>
         </div>

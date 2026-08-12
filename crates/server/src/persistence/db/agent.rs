@@ -387,6 +387,143 @@ impl Database {
         Ok(())
     }
 
+    /// ACP 工具行 upsert：按 (session_id, tool_call_id, kind) 定位 agent_messages
+    /// 行。历史版本对每个 ACP 事件纯 INSERT，同一 tool_call_id 会产生多行
+    /// （tool_call 每次事件、tool_result 每个中间态各一行），前端刷新后重复卡片。
+    /// 此函数把同组多行收敛为一行（保留 rowid 最大者，删除其余）后做 UPDATE/INSERT。
+    ///
+    /// 不能加唯一索引收敛——compact.rs 压缩时会带相同 (session_id, tool_call_id,
+    /// kind) 重插 kept 段，唯一索引会直接冲突报错。
+    ///
+    /// tool_calls 覆盖规则：新 JSON 长度 >= 旧值时覆盖（新帧通常带更完整的
+    /// rawInput/diffs），否则保持旧值（如回放带来的短占位不覆盖已回填的真实参数）。
+    pub async fn agent_upsert_tool_call(
+        &self,
+        id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        name: Option<&str>,
+        tool_calls_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        let rows: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
+            "SELECT rowid, tool_calls FROM agent_messages \
+             WHERE session_id = ? AND tool_call_id = ? AND kind = 'tool_calls' \
+             ORDER BY rowid",
+        )
+        .bind(session_id)
+        .bind(tool_call_id)
+        .fetch_all(&self.pool)
+        .await?;
+        match rows.split_last() {
+            Some((max, rest)) => {
+                // 收敛：删除非 rowid 最大的其余行
+                for (rid, _) in rest {
+                    sqlx::query("DELETE FROM agent_messages WHERE rowid = ?")
+                        .bind(rid)
+                        .execute(&self.pool)
+                        .await?;
+                }
+                let (rowid, old_json) = max;
+                if tool_calls_json.len() >= old_json.len() {
+                    sqlx::query(
+                        "UPDATE agent_messages SET tool_calls = ?, name = COALESCE(?, name) \
+                         WHERE rowid = ?",
+                    )
+                    .bind(tool_calls_json)
+                    .bind(name)
+                    .bind(rowid)
+                    .execute(&self.pool)
+                    .await?;
+                } else if name.is_some() {
+                    // 旧 JSON 更完整：仅补名（不覆盖已回填的完整 tool_calls）
+                    sqlx::query("UPDATE agent_messages SET name = ? WHERE rowid = ?")
+                        .bind(name)
+                        .bind(rowid)
+                        .execute(&self.pool)
+                        .await?;
+                }
+                Ok(())
+            }
+            None => {
+                self.agent_add_message_v2(
+                    id,
+                    session_id,
+                    "assistant",
+                    "",
+                    Some(tool_calls_json),
+                    Some(tool_call_id),
+                    name,
+                    "tool_calls",
+                )
+                .await
+            }
+        }
+    }
+
+    /// tool_result upsert：同 [`Self::agent_upsert_tool_call`] 的收敛规则。content
+    /// 覆盖规则：新 content 非空时覆盖（终态覆盖中间态空占位）；新 content 为空且
+    /// 已有非空 content 则不动（空占位不抹掉真实结果）。
+    pub async fn agent_upsert_tool_result(
+        &self,
+        id: &str,
+        session_id: &str,
+        tool_call_id: &str,
+        name: Option<&str>,
+        content: &str,
+    ) -> Result<(), sqlx::Error> {
+        let rows: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
+            "SELECT rowid, content FROM agent_messages \
+             WHERE session_id = ? AND tool_call_id = ? AND kind = 'tool_result' \
+             ORDER BY rowid",
+        )
+        .bind(session_id)
+        .bind(tool_call_id)
+        .fetch_all(&self.pool)
+        .await?;
+        match rows.split_last() {
+            Some((max, rest)) => {
+                for (rid, _) in rest {
+                    sqlx::query("DELETE FROM agent_messages WHERE rowid = ?")
+                        .bind(rid)
+                        .execute(&self.pool)
+                        .await?;
+                }
+                let (rowid, old_content) = max;
+                if !content.is_empty() || old_content.is_empty() {
+                    sqlx::query(
+                        "UPDATE agent_messages SET content = ?, name = COALESCE(?, name) \
+                         WHERE rowid = ?",
+                    )
+                    .bind(content)
+                    .bind(name)
+                    .bind(rowid)
+                    .execute(&self.pool)
+                    .await?;
+                } else if name.is_some() {
+                    sqlx::query("UPDATE agent_messages SET name = ? WHERE rowid = ?")
+                        .bind(name)
+                        .bind(rowid)
+                        .execute(&self.pool)
+                        .await?;
+                }
+                Ok(())
+            }
+            None => {
+                self.agent_add_message_v2(
+                    id,
+                    session_id,
+                    "assistant",
+                    content,
+                    None,
+                    Some(tool_call_id),
+                    name,
+                    "tool_result",
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn agent_list_messages(
         &self,
         session_id: &str,
@@ -798,6 +935,102 @@ mod tests {
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(msgs[0].tool_calls.as_deref().unwrap()).unwrap();
         assert_eq!(parsed[0]["arguments"], "{\"command\":\"echo hi\"}");
+    }
+
+    /// tool_result upsert 去重：先写中间态空 content，再写终态非空 content →
+    /// 只剩 1 行且 content 为终态值。
+    #[tokio::test]
+    async fn test_upsert_tool_result_dedup_content() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 中间态：空 content（ToolCallUpdate 首帧常无 raw_output）
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "")
+            .await
+            .unwrap();
+        // 终态：非空 content
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "a.rs")
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1, "upsert should converge to one row: {rows:?}");
+        assert_eq!(rows[0].kind, "tool_result");
+        assert_eq!(rows[0].content, "a.rs");
+        assert_eq!(rows[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(rows[0].name.as_deref(), Some("shell"));
+    }
+
+    /// 反向顺序：先非空后空 → 空 content 不得覆盖已有非空结果。
+    #[tokio::test]
+    async fn test_upsert_tool_result_empty_does_not_clear() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "result")
+            .await
+            .unwrap();
+        // 迟到的空占位帧：不覆盖
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "")
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "result");
+    }
+
+    /// tool_calls upsert：保更长/更完整的 JSON（回放短占位不覆盖已回填参数）。
+    #[tokio::test]
+    async fn test_upsert_tool_call_keeps_longer_json() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 短 JSON（首帧 rawInput={} 占位）
+        let short = r#"[{"id":"c1","name":"shell","arguments":"{}"}]"#;
+        db.agent_upsert_tool_call("m1", "s1", "c1", Some("shell"), short)
+            .await
+            .unwrap();
+        // 长 JSON（参数/字段更完整）
+        let long = r#"[{"id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}","tool_kind":"execute"}]"#;
+        db.agent_upsert_tool_call("m2", "s1", "c1", Some("shell"), long)
+            .await
+            .unwrap();
+        // 更短的 JSON 再写：不得回退已保存的完整 JSON
+        db.agent_upsert_tool_call("m3", "s1", "c1", Some("shell"), r#"[{"id":"c1"}]"#)
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1, "upsert should converge to one row: {rows:?}");
+        assert_eq!(rows[0].kind, "tool_calls");
+        let json = rows[0].tool_calls.as_deref().unwrap();
+        assert!(
+            json.contains("tool_kind") && json.contains("ls"),
+            "longer json should be kept: {json}"
+        );
+        assert_eq!(rows[0].name.as_deref(), Some("shell"));
     }
 
     #[tokio::test]

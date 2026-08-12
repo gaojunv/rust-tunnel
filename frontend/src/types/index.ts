@@ -621,6 +621,10 @@ export type AgentWsEvent =
   | { type: 'plan'; entries?: PlanEntryItem[] }
   | { type: 'usage'; used?: number; size?: number }
   | { type: 'status'; message?: string }
+  // 运行中提交消息被服务端 busy 入队的确认帧（队列在服务端，前端不做本地排队）
+  | { type: 'queued' }
+  // 停止超时兜底：agent 未在时限内响应停止，服务端强制杀进程并重启
+  | { type: 'cancel_fallback' }
   | { type: 'done' }
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }

@@ -778,6 +778,8 @@
     "running": "Agent 运行中…",
     "stop": "停止",
     "stopped": "已停止当前回合",
+    "messageQueued": "已排队，将在当前回合后发送",
+    "cancelFallback": "agent 未响应停止，已强制重启，上下文可能丢失",
     "inputPlaceholder": "描述你的需求… (Enter 发送, Shift+Enter 换行)",
     "send": "发送",
     "connectionLost": "连接已断开，请刷新重试",
