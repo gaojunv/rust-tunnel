@@ -863,13 +863,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     <div className="relative flex h-full flex-col">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4"
+        className="flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4 dark:text-foreground/85"
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
           stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
+        {/* 限宽包裹层：与下方悬浮输入框的 max-w-3xl 对齐，控制长文阅读行长，
+            避免消息流全宽铺开与居中输入框的视觉错位。渐隐占位留在层外保持全宽。 */}
+        <div className="mx-auto w-full max-w-3xl">
         {items.length === 0 && !running && (
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}
@@ -908,6 +911,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             {t('agent.running')}
           </div>
         )}
+        <div ref={bottomRef} />
+        </div>
         {/* 悬浮输入框占位 + 底部渐隐（合并为一个 sticky 元素）：sticky 固定在可视
             底部，高度同时充当占位，保证最后一条消息能滚动到输入框之上。作为滚动
             容器的子元素，浏览器把滚动条绘制在所有后代之上——渐隐不再遮挡滚动条、
@@ -919,7 +924,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           className="pointer-events-none sticky bottom-0 bg-gradient-to-t from-card via-card/85 to-transparent"
           style={{ height: inputFloatH + 28 }}
         />
-        <div ref={bottomRef} />
       </div>
 
       {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌 */}
