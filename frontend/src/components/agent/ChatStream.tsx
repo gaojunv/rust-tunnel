@@ -908,17 +908,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             {t('agent.running')}
           </div>
         )}
-        {/* 悬浮输入框占位：保证最后一条消息能滚动到输入框之上 */}
-        <div aria-hidden style={{ height: inputFloatH + 8 }} />
+        {/* 悬浮输入框占位 + 底部渐隐（合并为一个 sticky 元素）：sticky 固定在可视
+            底部，高度同时充当占位，保证最后一条消息能滚动到输入框之上。作为滚动
+            容器的子元素，浏览器把滚动条绘制在所有后代之上——渐隐不再遮挡滚动条、
+            也不阻断其交互（此前 external absolute + inset-x-0 会盖住右侧细滚动条，
+            导致 thumb 被渐变挡住、滚动条拖不动）；宽度自动等于内容宽度（不含
+            滚动条），无需硬编码滚动条宽度。 */}
+        <div
+          aria-hidden
+          className="pointer-events-none sticky bottom-0 bg-gradient-to-t from-card via-card/85 to-transparent"
+          style={{ height: inputFloatH + 28 }}
+        />
         <div ref={bottomRef} />
       </div>
-
-      {/* 底部渐隐：消息滑入悬浮输入框下方时柔和淡出 */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-card via-card/85 to-transparent"
-        style={{ height: inputFloatH + 28 }}
-      />
 
       {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌 */}
       <div className="absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-6 md:pb-5">
