@@ -24,7 +24,7 @@ rand = "0.8"
 get_if_addrs = "0.5.3"
 axum = { version = "0.7", features = ["json", "multipart", "ws"] }
 axum-extra = { version = "0.9", features = ["query"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "compression-gzip", "compression-br"] }
 async-stream = "0.3"
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http1", "http2", "server", "server-auto"] }

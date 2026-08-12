@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
@@ -37,7 +38,8 @@ import {
   BookOpen,
   Sparkles,
 } from 'lucide-react';
-import DataFlowBackground from '@/components/dataflow/DataFlowBackground';
+// three.js 体积大（约 600KB），装饰性背景懒加载，不阻塞首屏
+const DataFlowBackground = lazy(() => import('@/components/dataflow/DataFlowBackground'));
 
 interface NavItem {
   labelKey: 'nav.dashboard' | 'nav.clients' | 'nav.mesh' | 'nav.dns' | 'nav.reverseProxy' | 'nav.shadowsocks' | 'nav.trojan' | 'nav.acmeCerts' | 'nav.llmGateway' | 'nav.knowledgeBase' | 'nav.agentWorkbench' | 'nav.logs' | 'nav.settings';
@@ -113,7 +115,11 @@ export function Header({ onLogout }: HeaderProps) {
           overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
           弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击。
           titleEffect === 'none' 时跳过数据流背景（WebGL），保留底线渐变。 */}
-      {prefs.titleEffect !== 'none' && <DataFlowBackground />}
+      {prefs.titleEffect !== 'none' && (
+        <Suspense fallback={null}>
+          <DataFlowBackground />
+        </Suspense>
+      )}
       <div
         aria-hidden
         className="header-light-flow pointer-events-none absolute inset-x-0 bottom-0 h-[2px] opacity-70"

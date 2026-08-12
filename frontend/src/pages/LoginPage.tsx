@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -6,8 +6,10 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { useLogin } from '@/api/hooks';
 import { Logo } from '@/components/shared/Logo';
-import AuroraBackground from '@/components/aurora/AuroraBackground';
 import { usePreferences } from '@/preferences/PreferencesProvider';
+
+// three.js 体积大（约 600KB），装饰性背景懒加载，不阻塞登录页首屏
+const AuroraBackground = lazy(() => import('@/components/aurora/AuroraBackground'));
 
 export default function LoginPage() {
   const { t } = useTranslation();
@@ -32,7 +34,11 @@ export default function LoginPage() {
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
-      {prefs.titleEffect !== 'none' && <AuroraBackground />}
+      {prefs.titleEffect !== 'none' && (
+        <Suspense fallback={null}>
+          <AuroraBackground />
+        </Suspense>
+      )}
 
       <Card className="relative w-full max-w-sm border-primary/20 shadow-glow">
         <CardHeader className="text-center">

@@ -1,3 +1,4 @@
+import { lazy } from 'react';
 import { createBrowserRouter, RouterProvider, Navigate, Outlet } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { I18nProvider } from './i18n/I18nProvider';
@@ -5,21 +6,23 @@ import { ThemeProvider } from './theme/ThemeProvider';
 import { PreferencesProvider } from './preferences/PreferencesProvider';
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
-import MeshPage from './pages/MeshPage';
-import DnsPage from './pages/DnsPage';
-import ShadowsocksPage from './pages/ShadowsocksPage';
-import TrojanPage from './pages/TrojanPage';
-import ReverseProxyPage from './pages/ReverseProxyPage';
-import AcmePage from './pages/AcmePage';
-import LogsPage from './pages/LogsPage';
-import ClientsPage from './pages/ClientsPage';
-import ClientDetailPage from './pages/ClientDetailPage';
-import SettingsPage from './pages/SettingsPage';
-import LLMPage from './pages/LLMPage';
-import KbPage from './pages/KbPage';
-import AgentPage from './pages/AgentPage';
 import AppLayout from './components/layout/AppLayout';
 import './index.css';
+
+// 路由级代码分割：非首页页面按需加载（three.js / xterm / streamdown 等重依赖随之拆出首屏）
+const MeshPage = lazy(() => import('./pages/MeshPage'));
+const DnsPage = lazy(() => import('./pages/DnsPage'));
+const ShadowsocksPage = lazy(() => import('./pages/ShadowsocksPage'));
+const TrojanPage = lazy(() => import('./pages/TrojanPage'));
+const ReverseProxyPage = lazy(() => import('./pages/ReverseProxyPage'));
+const AcmePage = lazy(() => import('./pages/AcmePage'));
+const LogsPage = lazy(() => import('./pages/LogsPage'));
+const ClientsPage = lazy(() => import('./pages/ClientsPage'));
+const ClientDetailPage = lazy(() => import('./pages/ClientDetailPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const LLMPage = lazy(() => import('./pages/LLMPage'));
+const KbPage = lazy(() => import('./pages/KbPage'));
+const AgentPage = lazy(() => import('./pages/AgentPage'));
 
 const queryClient = new QueryClient({
   defaultOptions: {

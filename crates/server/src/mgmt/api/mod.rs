@@ -458,7 +458,9 @@ pub async fn run_api_server(
             "/",
             get(|| async { static_files::serve_static(Path("".to_string())).await }),
         )
-        .route("/*path", get(static_files::serve_static));
+        .route("/*path", get(static_files::serve_static))
+        // 前端静态资源 gzip/brotli 压缩（JS/CSS 体积大，压缩收益显著）
+        .layer(tower_http::compression::CompressionLayer::new());
 
     let app = Router::new().merge(public_routes).merge(protected_routes);
 
