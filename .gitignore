@@ -1,4 +1,8 @@
 /target
+# 根级 node_modules：本地开发常在工作区根建 symlink 指向 frontend/node_modules
+#（worktree 隔离时复用依赖），必须忽略避免误提交（历史上 21c6d39 曾把
+# node_modules/.vite 的 vitest 缓存空文件提交进仓库）。
+/node_modules
 frontend/node_modules
 frontend/dist
 frontend-dist
