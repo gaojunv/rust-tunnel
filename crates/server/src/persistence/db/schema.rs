@@ -665,6 +665,7 @@ impl Database {
         Self::migrate_agent_sessions_v2(pool).await?;
         Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
+        Self::migrate_agent_messages_v4(pool).await?;
 
         Ok(())
     }
@@ -853,6 +854,25 @@ impl Database {
             }
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// agent_messages 补全子 agent 归属列（claude-code-acp `_meta.claudeCode
+    /// .parentToolUseId`：发起本消息的 Task 工具调用 id，主 agent 消息为 NULL）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_messages_v4(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_messages ADD COLUMN parent_tool_call_id TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_messages migration: column already exists");
+            }
+        }
         Ok(())
     }
 

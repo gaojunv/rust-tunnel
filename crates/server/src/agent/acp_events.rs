@@ -6,7 +6,8 @@
 //! ACP crate 的 fixture，避免手写嵌套结构）。
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolKind,
+    ContentBlock, Meta, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
+    ToolKind,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 
@@ -21,10 +22,20 @@ use agent_client_protocol::schema::MaybeUndefined;
 /// - `usage_update`    → `{"type": "usage", "used", "size"}`
 /// - `current_mode_update` → `{"type": "current_mode_update", "mode_id"}`
 /// - `config_option_update` → `{"type": "config_option_update", "options"}`
+///
+/// 子 agent 归属（opt-in 的 "nested subagent transcripts" 约定，见
+/// https://github.com/zed-industries/claude-code-acp ）：事件 `_meta.claudeCode`
+/// 携带 `parentToolUseId`/`subagent` 时，tool_call / tool_result / assistant_chunk
+/// 帧额外输出 `parent_tool_call_id`（有值才输出）与 `is_subagent`（仅 true 时
+/// 输出），前端据此按父子关系分组渲染。无 `_meta` 的事件字段缺省，完全无感降级。
 pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
     match update {
-        SessionUpdate::AgentMessageChunk(chunk) => map_text_chunk(&chunk.content, false),
-        SessionUpdate::AgentThoughtChunk(chunk) => map_text_chunk(&chunk.content, true),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            map_text_chunk(&chunk.content, &chunk.meta, false)
+        }
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            map_text_chunk(&chunk.content, &chunk.meta, true)
+        }
         SessionUpdate::UserMessageChunk(_) => None, // 用户消息前端自渲染，避免重复
         SessionUpdate::ToolCall(tc) => {
             let mut frame = serde_json::json!({
@@ -51,6 +62,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             if !locations.is_empty() {
                 frame["locations"] = serde_json::Value::Array(locations);
             }
+            apply_claude_code_meta(&mut frame, &tc.meta);
             Some(frame)
         }
         SessionUpdate::ToolCallUpdate(upd) => {
@@ -112,6 +124,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                     frame["locations"] = serde_json::Value::Array(locations);
                 }
             }
+            apply_claude_code_meta(&mut frame, &upd.meta);
             Some(frame)
         }
         SessionUpdate::Plan(plan) => Some(serde_json::json!({
@@ -154,7 +167,14 @@ fn encode_raw(value: &serde_json::Value) -> String {
 }
 
 /// 文本 chunk（assistant 正文 / thought）→ assistant_chunk 帧。
-fn map_text_chunk(content: &ContentBlock, thought: bool) -> Option<serde_json::Value> {
+///
+/// `chunk_meta` 是 chunk 级 `_meta`（`ContentChunk.meta`）；`TextContent` 内部还有
+/// content 级 `_meta`（`TextContent.meta`）。子 agent 文本归属两级都查，优先 chunk 级。
+fn map_text_chunk(
+    content: &ContentBlock,
+    chunk_meta: &Option<Meta>,
+    thought: bool,
+) -> Option<serde_json::Value> {
     let ContentBlock::Text(text) = content else {
         return None; // 非文本块（image/audio/resource 等）无正文可推
     };
@@ -165,7 +185,59 @@ fn map_text_chunk(content: &ContentBlock, thought: bool) -> Option<serde_json::V
     if thought {
         frame["thought"] = serde_json::Value::Bool(true);
     }
+    let (parent, is_subagent) = claude_code_meta_two(chunk_meta, &text.meta);
+    if let Some(parent) = parent {
+        frame["parent_tool_call_id"] = serde_json::Value::String(parent);
+    }
+    if is_subagent {
+        frame["is_subagent"] = serde_json::Value::Bool(true);
+    }
     Some(frame)
+}
+
+/// claude-code-acp 的 opt-in 子 agent 约定（https://github.com/zed-industries/claude-code-acp）：
+/// 事件 `_meta.claudeCode` 携带
+/// - `parentToolUseId`（字符串）：发起本事件的 Task/Agent 工具调用的 toolCallId
+/// - `subagent`（布尔）：本事件由子 agent 产生（Task 工具调用自身）
+///
+/// 返回 `(parent_tool_call_id, is_subagent)`；缺省时均为 `(None, false)`。
+fn claude_code_meta(meta: &Option<Meta>) -> (Option<String>, bool) {
+    let Some(meta) = meta else {
+        return (None, false);
+    };
+    let claude_code = meta.get("claudeCode");
+    let parent = claude_code
+        .and_then(|v| v.get("parentToolUseId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let is_subagent = claude_code
+        .and_then(|v| v.get("subagent"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    (parent, is_subagent)
+}
+
+/// 两级 `_meta` 的 claudeCode 字段：primary（chunk 级）有任一字段时采用，否则
+/// 回退 fallback（content 级）。真实事件里两级不会同时携带不同归属，先到先得即可。
+fn claude_code_meta_two(primary: &Option<Meta>, fallback: &Option<Meta>) -> (Option<String>, bool) {
+    let parsed = claude_code_meta(primary);
+    if parsed.0.is_some() || parsed.1 {
+        return parsed;
+    }
+    claude_code_meta(fallback)
+}
+
+/// 把 claude-code `_meta` 的父归属写入 WS 帧：`parent_tool_call_id` 有值才输出，
+/// `is_subagent` 仅 true 时输出——缺省帧字段不出现，对不支持 `_meta` 的引擎无感降级。
+fn apply_claude_code_meta(frame: &mut serde_json::Value, meta: &Option<Meta>) {
+    let (parent, is_subagent) = claude_code_meta(meta);
+    if let Some(parent) = parent {
+        frame["parent_tool_call_id"] = serde_json::Value::String(parent);
+    }
+    if is_subagent {
+        frame["is_subagent"] = serde_json::Value::Bool(true);
+    }
 }
 
 /// ACP `ToolKind` → 帧字符串（前端按此选图标/详情渲染）。
@@ -604,5 +676,128 @@ mod tests {
         assert_eq!(frame["type"], "usage");
         assert_eq!(frame["used"], 1234);
         assert_eq!(frame["size"], 200000);
+    }
+
+    // ── claude-code subagent-transcript `_meta` 透传 ──────────────
+
+    fn claude_code_meta(parent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "claudeCode": {
+                "parentToolUseId": parent,
+                "subagent": true,
+            }
+        })
+    }
+
+    #[test]
+    fn test_map_tool_call_carries_subagent_meta() {
+        // Task/Agent 工具调用自身：is_subagent=true，无 parentToolUseId
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "task_1",
+            "title": "Agent 子任务",
+            "status": "in_progress",
+            "rawInput": {"prompt": "查一下"},
+            "_meta": {"claudeCode": {"subagent": true}}
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(frame["type"], "tool_call");
+        assert_eq!(frame["is_subagent"], true);
+        assert!(
+            frame.get("parent_tool_call_id").is_none(),
+            "Task 调用自身无父归属"
+        );
+    }
+
+    #[test]
+    fn test_map_tool_call_carries_parent_meta() {
+        // 子 agent 内的工具调用：parentToolUseId = 发起它的 Task 的 toolCallId
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "sub_tool_1",
+            "title": "shell",
+            "status": "in_progress",
+            "rawInput": {"cmd": "ls"},
+            "_meta": claude_code_meta("task_1")
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert_eq!(frame["type"], "tool_call");
+        assert_eq!(frame["parent_tool_call_id"], "task_1");
+        assert_eq!(frame["is_subagent"], true);
+        // 原有字段不受影响
+        assert_eq!(frame["id"], "sub_tool_1");
+        assert_eq!(frame["name"], "shell");
+    }
+
+    #[test]
+    fn test_map_tool_call_without_meta_has_no_parent_fields() {
+        // 向后兼容：无 `_meta` 的事件帧不出现新增字段
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call_1",
+            "title": "shell",
+            "status": "completed"
+        }));
+        let frame = map_update(&u).expect("tool_call should map");
+        assert!(frame.get("parent_tool_call_id").is_none());
+        assert!(frame.get("is_subagent").is_none());
+    }
+
+    #[test]
+    fn test_map_tool_call_update_carries_parent_meta() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sub_tool_1",
+            "status": "completed",
+            "rawOutput": "a.rs",
+            "_meta": claude_code_meta("task_1")
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["type"], "tool_result");
+        assert_eq!(frame["parent_tool_call_id"], "task_1");
+        assert_eq!(frame["is_subagent"], true);
+        assert_eq!(frame["result"], "a.rs");
+    }
+
+    #[test]
+    fn test_map_text_chunk_carries_parent_meta_chunk_level() {
+        // chunk 级 `_meta`（ContentChunk.meta）：子 agent 文本归属
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "子 agent 的回复"},
+            "_meta": claude_code_meta("task_1")
+        }));
+        let frame = map_update(&u).expect("text chunk should map");
+        assert_eq!(frame["type"], "assistant_chunk");
+        assert_eq!(frame["content"], "子 agent 的回复");
+        assert_eq!(frame["parent_tool_call_id"], "task_1");
+    }
+
+    #[test]
+    fn test_map_text_chunk_carries_parent_meta_content_level() {
+        // content 级 `_meta`（TextContent.meta）兜底：chunk 级缺失时归属仍透传
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {
+                "type": "text",
+                "text": "子 agent 的思考",
+                "_meta": {"claudeCode": {"parentToolUseId": "task_1"}}
+            }
+        }));
+        let frame = map_update(&u).expect("thought chunk should map");
+        assert_eq!(frame["type"], "assistant_chunk");
+        assert_eq!(frame["thought"], true);
+        assert_eq!(frame["parent_tool_call_id"], "task_1");
+    }
+
+    #[test]
+    fn test_map_text_chunk_without_meta_has_no_parent_fields() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "主 agent 文本"}
+        }));
+        let frame = map_update(&u).expect("text chunk should map");
+        assert!(frame.get("parent_tool_call_id").is_none());
+        assert!(frame.get("is_subagent").is_none());
     }
 }

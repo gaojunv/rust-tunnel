@@ -1323,4 +1323,161 @@ describe('ChatStream running state', () => {
     expect((effortBtn as HTMLButtonElement).disabled).toBe(true);
     expect(effortBtn.getAttribute('title')).toBe('agent.configOptionUnsupported');
   });
+
+  it('nests subagent events inside the parent Task card (tool/text/result)', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      // 父 Task 卡（is_subagent=true）+ 子工具 + 子文本 + 子结果 + 父结果
+      wsInstance!.emit({
+        type: 'tool_call', id: 'task1', name: 'Task',
+        args: '{"description":"调研登录 bug","subagent_type":"general-purpose"}',
+        is_subagent: true, status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'tool_call', id: 'c1', name: 'Read x', tool_kind: 'read',
+        parent_tool_call_id: 'task1', status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'assistant_chunk', content: '子代理文本', parent_tool_call_id: 'task1', final: true,
+      });
+      wsInstance!.emit({
+        type: 'tool_result', id: 'c1', name: 'Read x', result: 'fn main(){}',
+        parent_tool_call_id: 'task1', status: 'completed',
+      });
+      wsInstance!.emit({ type: 'tool_result', id: 'task1', name: 'Task', result: '调研完成', status: 'completed' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    // 子 agent 卡头部显示 description（非 toolName "Task"）
+    expect(await screen.findByText('调研登录 bug')).toBeTruthy();
+    // 父卡已完成（✓ 徽章）
+    expect(screen.getByText('✓')).toBeTruthy();
+    // 默认折叠：子项不可见；展开父卡
+    act(() => {
+      screen.getByText('调研登录 bug').closest('button')!.click();
+    });
+    // 子工具卡（Read）与子文本都嵌套在父卡内
+    expect(screen.getByText('Read')).toBeTruthy();
+    expect(screen.getByText('子代理文本')).toBeTruthy();
+    // 父卡自身 toolResult（Task 最终结果）在展开态末尾展示
+    expect(screen.getByText('调研完成')).toBeTruthy();
+    // 展开子工具卡看结果
+    fireEvent.click(screen.getByText('Read').closest('button')!);
+    expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
+    // 顶层只有一张 Read 卡（子卡嵌套，未重复渲染）
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+  });
+
+  it('merges streamed subagent text chunks into a single nested bubble', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'task1', name: 'Task', is_subagent: true, status: 'in_progress' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '你好', parent_tool_call_id: 'task1' });
+      wsInstance!.emit({ type: 'assistant_chunk', content: '，世界', parent_tool_call_id: 'task1', final: true });
+      wsInstance!.emit({ type: 'done' });
+    });
+    act(() => {
+      // 父卡无 args → 头部回退 toolName "Task"
+      screen.getByText('Task').closest('button')!.click();
+    });
+    // 两个 chunk 合并为一个气泡，不碎片化
+    expect(screen.getByText('你好，世界')).toBeTruthy();
+    expect(screen.queryByText('你好')).toBeNull();
+  });
+
+  it('attaches orphan child events when the parent card arrives later (no loss, no dup)', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 子事件先于父卡到达（时序异常）：工具卡进 pending，文本攒批
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'c1', name: 'Read x', tool_kind: 'read',
+        parent_tool_call_id: 'task1', status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'assistant_chunk', content: '先到的子文本', parent_tool_call_id: 'task1', final: false,
+      });
+    });
+    // 父卡后到：挂载已缓存的子项
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'task1', name: 'Task',
+        args: '{"description":"迟到的父卡"}', is_subagent: true, status: 'in_progress',
+      });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(await screen.findByText('迟到的父卡')).toBeTruthy();
+    act(() => {
+      screen.getByText('迟到的父卡').closest('button')!.click();
+    });
+    // 缓存的子工具卡与文本都挂载进父卡 children（无重复、无丢失）
+    expect(screen.getByText('Read')).toBeTruthy();
+    expect(screen.getByText('先到的子文本')).toBeTruthy();
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+  });
+
+  it('flushes un-mounted orphan events to the main stream on done', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      // 父卡从未出现：子文本 final 时进 pending，done 时平铺回主流
+      wsInstance!.emit({
+        type: 'assistant_chunk', content: '孤儿子文本', parent_tool_call_id: 'ghost', final: true,
+      });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(await screen.findByText('孤儿子文本')).toBeTruthy();
+  });
+
+  it('keeps parallel subagents in independent lanes', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'tool_call', id: 'taskA', name: 'Task', args: '{"description":"A 任务"}',
+        is_subagent: true, status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'tool_call', id: 'taskB', name: 'Task', args: '{"description":"B 任务"}',
+        is_subagent: true, status: 'in_progress',
+      });
+      wsInstance!.emit({
+        type: 'tool_call', id: 'a1', name: 'Read alpha', tool_kind: 'read', parent_tool_call_id: 'taskA',
+      });
+      wsInstance!.emit({
+        type: 'tool_call', id: 'b1', name: 'Read beta', tool_kind: 'read', parent_tool_call_id: 'taskB',
+      });
+      wsInstance!.emit({ type: 'assistant_chunk', content: 'A 的文本', parent_tool_call_id: 'taskA', final: true });
+      wsInstance!.emit({ type: 'assistant_chunk', content: 'B 的文本', parent_tool_call_id: 'taskB', final: true });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(await screen.findByText('A 任务')).toBeTruthy();
+    expect(screen.getByText('B 任务')).toBeTruthy();
+    // 分别展开两张父卡：各自的子工具/文本只出现在自己卡内
+    act(() => {
+      screen.getByText('A 任务').closest('button')!.click();
+      screen.getByText('B 任务').closest('button')!.click();
+    });
+    expect(screen.getByText('alpha')).toBeTruthy();
+    expect(screen.getByText('beta')).toBeTruthy();
+    expect(screen.getByText('A 的文本')).toBeTruthy();
+    expect(screen.getByText('B 的文本')).toBeTruthy();
+  });
+
+  it('renders non-subagent tool frames flat (unsupported engines degrade silently)', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      // 无 parent_tool_call_id / is_subagent 字段：完全走既有平铺行为
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'Read x', tool_kind: 'read', status: 'in_progress' });
+      wsInstance!.emit({ type: 'tool_result', id: 'c1', name: 'Read x', result: 'ok', status: 'completed' });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(await screen.findByText('Read')).toBeTruthy();
+    // 顶层普通工具卡：非子 agent 卡，不渲染 SubagentTaskCard 头
+    expect(screen.queryByText('agent.subagent')).toBeNull();
+    fireEvent.click(screen.getByText('Read').closest('button')!);
+    expect(screen.getByText('ok')).toBeTruthy();
+  });
 });

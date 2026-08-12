@@ -1,6 +1,7 @@
 import type { AgentMessage } from '../../types';
 import type { ChatItem, ToolDiff, ToolKind, ToolLocation } from './types';
 import { parseAcpToolJson, parsePlanEntries } from './types';
+import { groupByParent } from './subagent';
 
 interface CallRecord {
   name: string;
@@ -8,6 +9,8 @@ interface CallRecord {
   toolKind?: ToolKind;
   toolDiffs?: ToolDiff[];
   toolLocations?: ToolLocation[];
+  /** 子 agent 归属：该调用由哪个 Task 父卡发起（tool_calls JSON 元素或行列） */
+  parentToolId?: string;
 }
 
 /** 压缩重插去重：kept 段在 summary 前保留原始行（801c9a6），DB 物理顺序为
@@ -25,7 +28,8 @@ function compactionSkippedIndices(history: AgentMessage[]): Set<number> {
     a.content === b.content &&
     normNull(a.tool_calls) === normNull(b.tool_calls) &&
     normNull(a.tool_call_id) === normNull(b.tool_call_id) &&
-    normNull(a.name) === normNull(b.name);
+    normNull(a.name) === normNull(b.name) &&
+    normNull(a.parent_tool_call_id) === normNull(b.parent_tool_call_id);
   const skipBeforeSummary = new Set<number>();
   for (let s = 0; s < history.length; s++) {
     if (history[s].kind !== 'summary') continue;
@@ -77,6 +81,7 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
         const parsed = JSON.parse(m.tool_calls) as {
           id: string;
           function?: { name?: string; arguments?: string };
+          parent_tool_call_id?: string | null;
         }[];
         const acp = parseAcpToolJson(m.tool_calls);
         for (const c of parsed) {
@@ -87,6 +92,8 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
             args:
               (c as { arguments?: string }).arguments ?? c.function?.arguments ?? '',
             ...acp,
+            // 子 agent 归属：JSON 元素优先（子调用自身），回退行级列
+            parentToolId: c.parent_tool_call_id ?? m.parent_tool_call_id ?? undefined,
           });
         }
       } catch {
@@ -134,6 +141,7 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
         toolKind: call?.toolKind,
         toolDiffs: call?.toolDiffs,
         toolLocations: call?.toolLocations,
+        parentToolId: call?.parentToolId ?? m.parent_tool_call_id ?? undefined,
       });
     } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
       // 旧格式：合并 tool_log JSON 行
@@ -163,6 +171,7 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
             toolKind: call.toolKind,
             toolDiffs: call.toolDiffs,
             toolLocations: call.toolLocations,
+            parentToolId: call.parentToolId ?? m.parent_tool_call_id ?? undefined,
           });
         }
       } else if (!m.tool_call_id && m.tool_calls) {
@@ -185,6 +194,7 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
                 toolKind: call.toolKind,
                 toolDiffs: call.toolDiffs,
                 toolLocations: call.toolLocations,
+                parentToolId: call.parentToolId ?? m.parent_tool_call_id ?? undefined,
               });
             }
           }
@@ -193,13 +203,23 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
         }
       }
     } else if (m.kind === 'message' && m.name === 'thought' && m.content) {
-      loaded.push({ kind: 'thought', content: m.content });
+      loaded.push({
+        kind: 'thought',
+        content: m.content,
+        parentToolId: m.parent_tool_call_id ?? undefined,
+      });
     } else if (m.kind === 'message' && m.name === 'plan') {
       // 只保留最后一条 plan（ACP plan 全量替换语义）：先记录索引，循环后处理
       lastPlanIdx = loaded.length;
       loaded.push({ kind: 'plan', content: '', planEntries: parsePlanEntries(m.content) });
     } else if (m.kind === 'message' && m.content) {
-      loaded.push({ kind: m.role === 'user' ? 'user' : 'assistant', content: m.content });
+      // 子 agent 文本：仅 assistant 行带归属（user 消息永远主 agent 层）
+      loaded.push({
+        kind: m.role === 'user' ? 'user' : 'assistant',
+        content: m.content,
+        parentToolId:
+          m.role === 'user' ? undefined : (m.parent_tool_call_id ?? undefined),
+      });
     } else if (m.kind === 'summary' && m.content) {
       // summary 渲染为 assistant 气泡（muted 样式），避免与普通用户消息混淆
       loaded.push({ kind: 'assistant', content: m.content });
@@ -207,7 +227,17 @@ export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
     // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
   }
   // 历史中多条 plan 行只渲染最后一条
-  return lastPlanIdx >= 0
-    ? loaded.filter((it, i) => it.kind !== 'plan' || i === lastPlanIdx)
-    : loaded;
+  const flat =
+    lastPlanIdx >= 0
+      ? loaded.filter((it, i) => it.kind !== 'plan' || i === lastPlanIdx)
+      : loaded;
+  // 按 parentToolId 分组嵌套：子 agent 的 tool/text/thought 收进父 Task 卡 children，
+  // 与实时 WS 路径渲染结果一致（groupByParent 对孤儿项平铺回主流，内容不丢）。
+  return groupByParent(flat).map((it) =>
+    // 子 agent 父卡有 children 但无 result 时（刷新打断，服务端可能仍在跑），
+    // failed 占位改 in_progress，避免「有进度却标失败」的矛盾展示
+    it.kind === 'tool' && (it.children?.length ?? 0) > 0 && it.toolResult == null && it.toolStatus === 'failed'
+      ? { ...it, toolStatus: 'in_progress' }
+      : it,
+  );
 }

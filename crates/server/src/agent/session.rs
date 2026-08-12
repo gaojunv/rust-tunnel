@@ -855,6 +855,7 @@ mod tests {
             None,
             None,
             "tool_calls",
+            None,
         )
         .await
         .unwrap();
@@ -867,6 +868,7 @@ mod tests {
             Some("c1"),
             Some("read_file"),
             "tool_result",
+            None,
         )
         .await
         .unwrap();
@@ -912,6 +914,7 @@ mod tests {
             None,
             None,
             "summary",
+            None,
         )
         .await
         .unwrap();
@@ -959,6 +962,7 @@ mod tests {
             None,
             None,
             "tool_calls",
+            None,
         )
         .await
         .unwrap();
@@ -971,6 +975,7 @@ mod tests {
             Some("c1"),
             Some("shell"),
             "tool_result",
+            None,
         )
         .await
         .unwrap();
@@ -1012,6 +1017,7 @@ mod tests {
             None,
             None,
             "summary",
+            None,
         )
         .await
         .unwrap();
@@ -1024,6 +1030,7 @@ mod tests {
             Some("c1"),
             Some("shell"),
             "tool_result",
+            None,
         )
         .await
         .unwrap();
@@ -1052,7 +1059,7 @@ mod tests {
         db.agent_add_message("m1", "s1", "user", "改代码", None)
             .await
             .unwrap();
-        db.agent_add_message_v2("m2", "s1", "tool", "", None, None, None, "message")
+        db.agent_add_message_v2("m2", "s1", "tool", "", None, None, None, "message", None)
             .await
             .unwrap();
         db.agent_add_message("m3", "s1", "assistant", "已完成", None)

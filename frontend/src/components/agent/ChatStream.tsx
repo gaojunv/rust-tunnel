@@ -16,10 +16,18 @@ import ApprovalCard from './ApprovalCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import SessionSettingsMenu from './SessionSettingsMenu';
+import SubagentTaskCard from './SubagentTaskCard';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions } from './sessionConfig';
 import { historyToChatItems } from './history';
+import {
+  appendChildStream,
+  chunkKey,
+  parseChunkKey,
+  patchChildToolResult,
+  upsertToolCard,
+} from './subagent';
 import type { SessionConfigOption } from '../../types';
 
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
@@ -90,9 +98,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const streamingKindRef = useRef<'assistant' | 'thought' | null>(null);
   // 在飞 tool_call id 顺序表：tool_result 缺 name 时按 id 回退匹配卡片
   const toolIdsRef = useRef<string[]>([]);
-  // 流式 chunk 攒批缓冲：WS 帧先追加到这里，定时 flush 进 items（节流渲染）
-  const chunkBufRef = useRef('');
+  // 流式 chunk 攒批缓冲（Map：key = chunkKey(parentToolId, kind)）。WS 帧先追加到
+  // 这里，定时 flush 进 items（节流渲染）。主/子文本按 (parent, kind) 分键攒批，
+  // 避免交错时互相串气泡——子 agent 文本收进父卡 children，不污染主流气泡。
+  const chunkBufRef = useRef<Map<string, string>>(new Map());
   const chunkFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 子 agent 流式气泡定位：parentToolId → 该父卡 children 内当前流式气泡下标
+  // （assistant/thought 分气泡）。父卡缺失或工具边界时删除，后续 chunk 新建气泡。
+  const subStreamRef = useRef<Map<string, { idx: number; kind: 'assistant' | 'thought' }>>(
+    new Map(),
+  );
   // 用户是否接近底部（流式时仅接近底部才自动滚动，上翻读历史不被拽回）
   const stickToBottomRef = useRef(true);
   // 会话内最新 history 的 ref 镜像：done/重连后按状态决定是否需要重新装载
@@ -179,26 +194,60 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
   // running 的 ref 镜像供 onclose 闭包使用（onclose 里读不到最新 state）。
   // armRunning/stopRunning 是 useCallback，同步维护。
-  // 把攒批的 chunk 缓冲一次性合并进流式气泡（新建或追加）。同步置 ref 保证
-  // 与后续 setItems 更新的顺序一致（WS 回调在 React 外，flush 时机不依赖渲染）。
+  // 把攒批的 chunk 缓冲一次性合并进流式气泡（新建或追加）。缓冲按
+  // (parentToolId, kind) 分键：主 agent chunk 走主流气泡（streamingIdxRef），
+  // 子 agent chunk 收进父卡 children 的流式气泡（subStreamRef）。同步置 ref
+  // 保证与后续 setItems 更新的顺序一致（WS 回调在 React 外，flush 时机不依赖渲染）。
   const flushChunks = useCallback(() => {
     if (chunkFlushTimerRef.current) {
       clearTimeout(chunkFlushTimerRef.current);
       chunkFlushTimerRef.current = null;
     }
-    const pending = chunkBufRef.current;
-    if (!pending) return;
-    chunkBufRef.current = '';
-    const bubbleKind = streamingKindRef.current ?? 'assistant';
+    if (chunkBufRef.current.size === 0) return;
+    const buf = chunkBufRef.current;
+    chunkBufRef.current = new Map();
     setItems((prev) => {
-      const idx = streamingIdxRef.current;
-      if (idx !== null && prev[idx]?.kind === bubbleKind) {
-        const next = [...prev];
-        next[idx] = { ...next[idx], content: next[idx].content + pending };
-        return next;
+      let next = prev;
+      for (const [key, content] of buf) {
+        const { parent, kind } = parseChunkKey(key);
+        if (!parent) {
+          // 主 agent 流：并入当前流式气泡（同 kind），否则新建。气泡 kind 直接用
+          // 攒批键里的 kind——旧实现读 streamingKindRef，但 flush 的 setItems
+          // updater 延迟执行时其值可能已被后续 chunk 改写（读错 kind 会把 thought
+          // 并入 assistant 气泡）。键内 kind 与 chunk 到达时的 kind 恒等。
+          const idx = streamingIdxRef.current;
+          if (idx !== null && next[idx]?.kind === kind) {
+            next = next.map((it, i) =>
+              i === idx ? { ...it, content: it.content + content } : it,
+            );
+          } else {
+            streamingIdxRef.current = next.length;
+            next = [...next, { kind, content }];
+          }
+          continue;
+        }
+        // 子 agent 流：收进父卡 children 的流式气泡
+        const res = appendChildStream(next, parent, kind, content, subStreamRef.current.get(parent) ?? null);
+        if (res.attached) {
+          next = res.state;
+          if (res.stream) subStreamRef.current.set(parent, res.stream);
+        } else {
+          // 父卡缺失（时序异常）：文本平铺进主流（带 parentToolId 标记）。父卡随后
+          // 到达时经父卡创建的「孤儿收纳」移入 children；永不出现则保持平铺，内容不丢。
+          next = [...next, { kind, content, parentToolId: parent }];
+        }
       }
-      streamingIdxRef.current = prev.length;
-      return [...prev, { kind: bubbleKind, content: pending }];
+      return next;
+    });
+  }, []);
+
+  /** 断开某个子 agent 的流式气泡（工具边界/终态）：后续该父卡的文本 chunk 新建气泡。
+   *  与 breakStream 同语义（ref 置 null 折进 setItems updater 排队执行，先于其入队的
+   *  flush updater 仍能读到当前气泡下标，M1）。 */
+  const breakSubStream = useCallback((parentToolId: string) => {
+    setItems((prev) => {
+      subStreamRef.current.delete(parentToolId);
+      return prev;
     });
   }, []);
 
@@ -297,29 +346,35 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       }
       if (msg.type === 'assistant_chunk') {
         if (msg.content) {
-          // thought 与正文分气泡：kind 切换先 flush 当前缓冲，但不断流——下方
-          // streamingKindRef 更新为新 kind，下个 flush 的 `prev[idx].kind !==
-          // bubbleKind` 检查天然新建气泡；此处若 breakStream 排队置 null 反而会
-          // 在 updater 执行时把刚设的 streamingKindRef 清掉（M1）。
+          const parent = msg.parent_tool_call_id;
           const nextKind = msg.thought ? 'thought' : 'assistant';
-          if (streamingKindRef.current !== null && streamingKindRef.current !== nextKind) {
-            flushChunks();
+          if (!parent) {
+            // 主 agent 流：thought 与正文分气泡——kind 切换先 flush 当前缓冲，
+            // 但不断流（下个 flush 的 `prev[idx].kind !== bubbleKind` 检查天然
+            // 新建气泡，见 M1 注释）。
+            if (streamingKindRef.current !== null && streamingKindRef.current !== nextKind) {
+              flushChunks();
+            }
+            streamingKindRef.current = nextKind;
           }
-          streamingKindRef.current = nextKind;
-          chunkBufRef.current += msg.content;
+          // 子 agent chunk 带 parent_tool_call_id：按 (parent, kind) 分键攒批，
+          // 与主 agent 文本互不干扰（主/子交错时各自归键，flush 后各归其位）。
+          const key = chunkKey(parent, nextKind);
+          chunkBufRef.current.set(key, (chunkBufRef.current.get(key) ?? '') + msg.content);
           scheduleChunkFlush();
         }
         if (msg.final) {
           // 收尾：先冲掉缓冲里的增量（同帧 content+final 的非 SSE 回退也在此落齐），
           // 再关闭流式气泡（ref 置 null 走更新队列，与 flush 的 ref 写入保持顺序）。
           flushChunks();
-          breakStream();
+          if (msg.parent_tool_call_id) breakSubStream(msg.parent_tool_call_id);
+          else breakStream();
         }
       } else if (msg.type === 'stream_reset') {
         // 上游流传输失败重试：丢弃已缓冲的半截增量，并真正移除已 flush 实体化
         // 的半截气泡，让重试的完整文本从新气泡开始（后续 status 帧会提示重试次数）。
         const idx = streamingIdxRef.current;
-        chunkBufRef.current = '';
+        chunkBufRef.current = new Map();
         flushChunks(); // 清缓冲后为 no-op，仅取消 pending flush 定时器
         breakStream();
         setItems((prev) => {
@@ -332,124 +387,160 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           return prev;
         });
       } else if (msg.type === 'tool_call') {
-        if (msg.id) {
-          pendingTools.add(msg.id);
-          toolIdsRef.current.push(msg.id);
-        }
-        // 服务端进入工具执行 → 显示 Running（对无前置 send 的乱序帧同样成立）
-        armRunning();
-        // 工具回合与文本回合交替：先冲掉缓冲里的文本增量（保证气泡顺序），
-        // 再断开流式气泡追加工具卡片
-        flushChunks();
-        breakStream();
-        setItems((prev) => {
-          // 去重：刷新/重连时 live tool_call 可能与 history 已渲染的孤儿卡片
-          // 是同一工具（tool_call 已落库、tool_result 未到）。按 toolId 就地
-          // 更新（覆盖历史误判的 failed 状态为真实运行态），而不是再追加一张
-          // 重复卡——否则 tool_result 只 patch 一张，另一张永远 running。
+        const parentToolId = msg.parent_tool_call_id;
+        const isSubagentCard = msg.is_subagent === true;
+        // 子 agent 内部工具不 gate 主回合 running（父 Task 卡自身 tool_call 已
+        // armRunning）；仅顶层工具（含父 Task 卡）追踪在飞 id
+        if (!parentToolId) {
           if (msg.id) {
-            const idx = prev.findIndex((it) => it.kind === 'tool' && it.toolId === msg.id);
-            if (idx >= 0) {
-              const cur = prev[idx];
-              // 卡片已有结果（历史里 tool_call+tool_result 均已落库，乱序帧又
-              // 重发了 tool_call）：不降级已完成卡片，忽略本帧即可。
-              if (cur.toolResult != null) return prev;
-              const next = [...prev];
-              // args 用有意义值合并（claude-code 首帧 rawInput 常是 {} 占位，
-              // 不能覆盖历史里已回填的真实参数）
-              const isNoop = (a?: string) => {
+            pendingTools.add(msg.id);
+            toolIdsRef.current.push(msg.id);
+          }
+          armRunning();
+        }
+        // 工具回合与文本回合交替：先冲掉缓冲里的文本增量（保证气泡顺序）
+        flushChunks();
+        const toolItem: ChatItem = {
+          kind: 'tool',
+          content: '',
+          toolId: msg.id,
+          toolName: msg.name,
+          parentToolId,
+          toolArgs: msg.args,
+          toolKind: msg.tool_kind,
+          toolStatus: msg.status ?? 'in_progress',
+          toolDiffs: msg.diffs,
+          toolLocations: msg.locations,
+          ...(isSubagentCard ? { isSubagent: true } : {}),
+        };
+        if (parentToolId) {
+          // 子 agent 工具：断该父卡流式气泡（工具边界），再收纳子工具卡。
+          // 父卡缺失（时序异常）→ 子卡平铺进主流（带 parentToolId 标记），父卡
+          // 到达时经父卡创建的「孤儿收纳」移入 children；永不出现则保持平铺。
+          breakSubStream(parentToolId);
+          setItems((prev) => {
+            const parentIdx = prev.findIndex(
+              (it) => it.kind === 'tool' && it.toolId === parentToolId,
+            );
+            if (parentIdx < 0) {
+              return upsertToolCard(prev, toolItem);
+            }
+            const next = [...prev];
+            next[parentIdx] = {
+              ...next[parentIdx],
+              children: upsertToolCard(next[parentIdx].children ?? [], toolItem),
+            };
+            return next;
+          });
+        } else {
+          breakStream();
+          setItems((prev) => {
+            // 去重：刷新/重连时 live tool_call 可能与 history 已渲染的卡片是同一
+            // 工具（tool_call 已落库、tool_result 未到）。按 toolId 就地升级
+            // （upsertToolCard：覆盖历史误判的 failed 状态、保留已收纳 children），
+            // 而不是再追加一张重复卡——否则 tool_result 只 patch 一张，另一张永远
+            // running。
+            // 子 agent 父卡到达：先收集此前平铺在顶层的孤儿子项（parentToolId 命中
+            // 本卡 toolId），从主流移除并作为 children 挂载（「孤儿收纳」），保证
+            // 先到子事件最终收纳进父卡、不重复、不丢失。
+            const orphanKids = toolItem.toolId
+              ? prev.filter((it) => it.parentToolId === toolItem.toolId)
+              : [];
+            const filtered =
+              orphanKids.length > 0
+                ? prev.filter((it) => it.parentToolId !== toolItem.toolId)
+                : prev;
+            return upsertToolCard(filtered, {
+              ...toolItem,
+              ...(orphanKids.length > 0 ? { children: orphanKids } : {}),
+            });
+          });
+        }
+      } else if (msg.type === 'tool_result') {
+        const parentToolId = msg.parent_tool_call_id;
+        if (parentToolId) {
+          // 子 agent 工具结果：断该父卡流式气泡（结果边界），再 patch 子工具卡
+          // （按 toolId 命中 children 内卡片就地更新）。父卡缺失 → 在顶层 patch
+          // （子卡正平铺等待父卡；patchChildToolResult 未命中则追加结果卡）。
+          flushChunks();
+          breakSubStream(parentToolId);
+          setItems((prev) => {
+            const parentIdx = prev.findIndex(
+              (it) => it.kind === 'tool' && it.toolId === parentToolId,
+            );
+            if (parentIdx < 0) {
+              return patchChildToolResult(prev, msg);
+            }
+            const next = [...prev];
+            next[parentIdx] = {
+              ...next[parentIdx],
+              children: patchChildToolResult(next[parentIdx].children ?? [], msg),
+            };
+            return next;
+          });
+        } else {
+          if (msg.id) {
+            pendingTools.delete(msg.id);
+            toolIdsRef.current = toolIdsRef.current.filter((x) => x !== msg.id);
+          }
+          setItems((prev) => {
+            const next = [...prev];
+            const patch = (i: number) => {
+              // args 覆盖（不用 ??）：claude-code-acp 的 ToolCall 首帧 rawInput 常是 {}
+              // 占位，真正的命令/路径经 ToolCallUpdate.rawInput 由本帧携带——必须覆盖
+              // 掉首帧的空 args，否则卡片头部摘要/展开详情永远停在空占位。
+              // 防回归：本帧不带 args 时保留旧值（nullish 保留）。
+              const isNoop = (a: string | undefined) => {
                 const t = (a ?? '').trim();
                 return t === '' || t === '{}';
               };
-              next[idx] = {
-                ...cur,
-                toolName: msg.name ?? cur.toolName,
-                toolArgs: !isNoop(msg.args) ? msg.args : cur.toolArgs,
-                toolKind: msg.tool_kind ?? cur.toolKind,
-                toolStatus: msg.status ?? 'in_progress',
-                toolDiffs: msg.diffs ?? cur.toolDiffs,
-                toolLocations: msg.locations ?? cur.toolLocations,
+              next[i] = {
+                ...next[i],
+                toolResult: msg.result,
+                toolStatus: msg.status ?? 'completed',
+                toolName: next[i].toolName ?? msg.name,
+                toolArgs: isNoop(next[i].toolArgs) && !isNoop(msg.args)
+                  ? msg.args
+                  : next[i].toolArgs ?? msg.args,
+                toolKind: next[i].toolKind ?? msg.tool_kind,
+                toolDiffs: next[i].toolDiffs ?? msg.diffs,
+                toolLocations: next[i].toolLocations ?? msg.locations,
               };
-              return next;
-            }
-          }
-          return [
-            ...prev,
-            {
-              kind: 'tool',
-              content: '',
-              toolId: msg.id,
-              toolName: msg.name,
-              toolArgs: msg.args,
-              toolKind: msg.tool_kind,
-              toolStatus: msg.status ?? 'in_progress',
-              toolDiffs: msg.diffs,
-              toolLocations: msg.locations,
-            },
-          ];
-        });
-      } else if (msg.type === 'tool_result') {
-        if (msg.id) {
-          pendingTools.delete(msg.id);
-          toolIdsRef.current = toolIdsRef.current.filter((x) => x !== msg.id);
-        }
-        setItems((prev) => {
-          const next = [...prev];
-          const patch = (i: number) => {
-            // args 覆盖（不用 ??）：claude-code-acp 的 ToolCall 首帧 rawInput 常是 {}
-            // 占位，真正的命令/路径经 ToolCallUpdate.rawInput 由本帧携带——必须覆盖
-            // 掉首帧的空 args，否则卡片头部摘要/展开详情永远停在空占位。
-            // 防回归：本帧不带 args 时保留旧值（nullish 保留）。
-            const isNoop = (a: string | undefined) => {
-              const t = (a ?? '').trim();
-              return t === '' || t === '{}';
             };
-            next[i] = {
-              ...next[i],
-              toolResult: msg.result,
-              toolStatus: msg.status ?? 'completed',
-              toolName: next[i].toolName ?? msg.name,
-              toolArgs: isNoop(next[i].toolArgs) && !isNoop(msg.args)
-                ? msg.args
-                : next[i].toolArgs ?? msg.args,
-              toolKind: next[i].toolKind ?? msg.tool_kind,
-              toolDiffs: next[i].toolDiffs ?? msg.diffs,
-              toolLocations: next[i].toolLocations ?? msg.locations,
-            };
-          };
-          // 权威匹配：按 toolId 精确命中（history 装载/live 追加的卡都带 id）。
-          // 刷新后同名工具可能出现多次（或 tool_result 缺 name），id 是唯一可靠
-          // 身份——比 name 扫描/「最早未完成」回退准确得多。
-          if (msg.id) {
-            const byId = next.findIndex((it) => it.kind === 'tool' && it.toolId === msg.id);
-            if (byId >= 0) {
-              patch(byId);
-              return next;
-            }
-          }
-          // 无 id 或 id 未命中：按 name 匹配（runner/旧帧语义）
-          if (msg.name) {
-            for (let i = next.length - 1; i >= 0; i--) {
-              if (next[i].kind === 'tool' && next[i].toolName === msg.name && next[i].toolResult == null) {
-                patch(i);
+            // 权威匹配：按 toolId 精确命中（history 装载/live 追加的卡都带 id）。
+            // 刷新后同名工具可能出现多次（或 tool_result 缺 name），id 是唯一可靠
+            // 身份——比 name 扫描/「最早未完成」回退准确得多。
+            if (msg.id) {
+              const byId = next.findIndex((it) => it.kind === 'tool' && it.toolId === msg.id);
+              if (byId >= 0) {
+                patch(byId);
                 return next;
               }
             }
-          }
-          // name 缺失/未命中：按 id 回退——id 在 toolIdsRef 的序号对应倒序未完成卡片
-          if (msg.id) {
-            const pendingIdx: number[] = [];
-            for (let i = 0; i < next.length; i++) {
-              if (next[i].kind === 'tool' && next[i].toolResult == null) pendingIdx.push(i);
+            // 无 id 或 id 未命中：按 name 匹配（runner/旧帧语义）
+            if (msg.name) {
+              for (let i = next.length - 1; i >= 0; i--) {
+                if (next[i].kind === 'tool' && next[i].toolName === msg.name && next[i].toolResult == null) {
+                  patch(i);
+                  return next;
+                }
+              }
             }
-            // toolIdsRef 已移除本 id；用 pendingTools 快照不可靠，直接按到达顺序：
-            // 同名匹配失败后取最早未完成卡片（ACP 工具按序完成，最早未完成即当前）
-            if (pendingIdx.length > 0) {
-              patch(pendingIdx[0]);
+            // name 缺失/未命中：按 id 回退——id 在 toolIdsRef 的序号对应倒序未完成卡片
+            if (msg.id) {
+              const pendingIdx: number[] = [];
+              for (let i = 0; i < next.length; i++) {
+                if (next[i].kind === 'tool' && next[i].toolResult == null) pendingIdx.push(i);
+              }
+              // toolIdsRef 已移除本 id；用 pendingTools 快照不可靠，直接按到达顺序：
+              // 同名匹配失败后取最早未完成卡片（ACP 工具按序完成，最早未完成即当前）
+              if (pendingIdx.length > 0) {
+                patch(pendingIdx[0]);
+              }
             }
-          }
-          return next;
+            return next;
         });
+        }
       } else if (msg.type === 'plan') {
         flushChunks();
         breakStream();
@@ -611,10 +702,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         clearTimeout(chunkFlushTimerRef.current);
         chunkFlushTimerRef.current = null;
       }
-      chunkBufRef.current = '';
+      chunkBufRef.current = new Map();
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream, breakSubStream]);
 
   // 虚拟化下 getTotalSize() 随 measureElement 异步修正 item 高度而变：装载长会话时
   // 初始 estimate 不准，totalSize 稳定后需重新对齐底部，否则滚动停在半路、最新消息
@@ -840,7 +931,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
   // （assistant/thought），MessageBubble 据此降级为纯文本渲染（避免 Shiki 每帧
-  // 全量重高亮，见 MessageBubble.tsx 的 PlainBody）。
+  // 全量重高亮，见 MessageBubble.tsx 的 PlainBody）。子 agent 父卡（isSubagent 或
+  // 带 children 的 tool 卡——历史路径只落 parent_tool_call_id、无 is_subagent 标记，
+  // 按 children 有无推断）走 SubagentTaskCard 嵌套渲染 children。
   const renderItem = (it: ChatItem, i: number) => {
     const isStreaming =
       streamingIdxRef.current === i && (it.kind === 'assistant' || it.kind === 'thought');
@@ -849,6 +942,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }
     if (it.kind === 'approval') {
       return <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />;
+    }
+    if (it.kind === 'tool' && (it.isSubagent || (it.children && it.children.length > 0))) {
+      return (
+        <SubagentTaskCard
+          key={it.toolId ?? i}
+          item={it}
+          streamingChildIdx={it.toolId ? subStreamRef.current.get(it.toolId)?.idx : undefined}
+        />
+      );
     }
     return (
       <MessageBubble

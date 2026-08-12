@@ -62,6 +62,13 @@ pub struct AgentMessageRecord {
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
     pub kind: String,
+    /// 子 agent 归属：发起本消息的 Task 工具调用 id（claude-code-acp
+    /// `_meta.claudeCode.parentToolUseId`）。主 agent 消息为 None。列由
+    /// `migrate_agent_messages_v4`（schema.rs）落地；`#[sqlx(default)]` 保证旧库
+    /// 未跑迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub parent_tool_call_id: Option<String>,
     pub created_at: String,
 }
 
@@ -338,11 +345,13 @@ impl Database {
         // 旧接口兼容：role=tool 的合并行推导 kind="tool"（重放时按旧格式跳过），
         // 其余为普通 message。
         let kind = if role == "tool" { "tool" } else { "message" };
-        self.agent_add_message_v2(id, session_id, role, content, tool_calls, None, None, kind)
+        self.agent_add_message_v2(id, session_id, role, content, tool_calls, None, None, kind, None)
             .await
     }
 
     /// 新格式消息写入（全列）。`kind` 取值：message / tool_calls / tool_result / summary。
+    /// `parent_tool_call_id`：子 agent 归属（发起本消息的 Task 工具调用 id），
+    /// 主 agent 消息传 None。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_add_message_v2(
         &self,
@@ -354,10 +363,12 @@ impl Database {
         tool_call_id: Option<&str>,
         name: Option<&str>,
         kind: &str,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO agent_messages (id, session_id, role, content, tool_calls, tool_call_id, name, kind) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO agent_messages \
+             (id, session_id, role, content, tool_calls, tool_call_id, name, kind, parent_tool_call_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(session_id)
@@ -367,6 +378,7 @@ impl Database {
         .bind(tool_call_id)
         .bind(name)
         .bind(kind)
+        .bind(parent_tool_call_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -420,6 +432,9 @@ impl Database {
     ///
     /// tool_calls 覆盖规则：新 JSON 长度 >= 旧值时覆盖（新帧通常带更完整的
     /// rawInput/diffs），否则保持旧值（如回放带来的短占位不覆盖已回填的真实参数）。
+    /// `parent_tool_call_id`：子 agent 归属（发起该调用的 Task 工具调用 id），
+    /// 主 agent 调用传 None；更新路径以 COALESCE 补全（同一 tool_call_id 的归属
+    /// 固定，先到者生效）。
     pub async fn agent_upsert_tool_call(
         &self,
         id: &str,
@@ -427,6 +442,7 @@ impl Database {
         tool_call_id: &str,
         name: Option<&str>,
         tool_calls_json: &str,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let rows: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
             "SELECT rowid, tool_calls FROM agent_messages \
@@ -449,11 +465,13 @@ impl Database {
                 let (rowid, old_json) = max;
                 if tool_calls_json.len() >= old_json.len() {
                     sqlx::query(
-                        "UPDATE agent_messages SET tool_calls = ?, name = COALESCE(?, name) \
+                        "UPDATE agent_messages SET tool_calls = ?, name = COALESCE(?, name), \
+                         parent_tool_call_id = COALESCE(?, parent_tool_call_id) \
                          WHERE rowid = ?",
                     )
                     .bind(tool_calls_json)
                     .bind(name)
+                    .bind(parent_tool_call_id)
                     .bind(rowid)
                     .execute(&self.pool)
                     .await?;
@@ -477,6 +495,7 @@ impl Database {
                     Some(tool_call_id),
                     name,
                     "tool_calls",
+                    parent_tool_call_id,
                 )
                 .await
             }
@@ -485,7 +504,8 @@ impl Database {
 
     /// tool_result upsert：同 [`Self::agent_upsert_tool_call`] 的收敛规则。content
     /// 覆盖规则：新 content 非空时覆盖（终态覆盖中间态空占位）；新 content 为空且
-    /// 已有非空 content 则不动（空占位不抹掉真实结果）。
+    /// 已有非空 content 则不动（空占位不抹掉真实结果）。`parent_tool_call_id`：
+    /// 子 agent 归属（同 tool_call），主 agent 传 None；更新路径 COALESCE 补全。
     pub async fn agent_upsert_tool_result(
         &self,
         id: &str,
@@ -493,6 +513,7 @@ impl Database {
         tool_call_id: &str,
         name: Option<&str>,
         content: &str,
+        parent_tool_call_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let rows: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
             "SELECT rowid, content FROM agent_messages \
@@ -514,11 +535,13 @@ impl Database {
                 let (rowid, old_content) = max;
                 if !content.is_empty() || old_content.is_empty() {
                     sqlx::query(
-                        "UPDATE agent_messages SET content = ?, name = COALESCE(?, name) \
+                        "UPDATE agent_messages SET content = ?, name = COALESCE(?, name), \
+                         parent_tool_call_id = COALESCE(?, parent_tool_call_id) \
                          WHERE rowid = ?",
                     )
                     .bind(content)
                     .bind(name)
+                    .bind(parent_tool_call_id)
                     .bind(rowid)
                     .execute(&self.pool)
                     .await?;
@@ -541,6 +564,7 @@ impl Database {
                     Some(tool_call_id),
                     name,
                     "tool_result",
+                    parent_tool_call_id,
                 )
                 .await
             }
@@ -933,6 +957,7 @@ mod tests {
             Some("c1"),
             Some("Terminal"),
             "tool_calls",
+            None,
         )
         .await
         .unwrap();
@@ -975,11 +1000,11 @@ mod tests {
             .unwrap();
 
         // 中间态：空 content（ToolCallUpdate 首帧常无 raw_output）
-        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "")
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "", None)
             .await
             .unwrap();
         // 终态：非空 content
-        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "a.rs")
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "a.rs", None)
             .await
             .unwrap();
 
@@ -1004,11 +1029,11 @@ mod tests {
             .await
             .unwrap();
 
-        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "result")
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "result", None)
             .await
             .unwrap();
         // 迟到的空占位帧：不覆盖
-        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "")
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "", None)
             .await
             .unwrap();
 
@@ -1032,16 +1057,16 @@ mod tests {
 
         // 短 JSON（首帧 rawInput={} 占位）
         let short = r#"[{"id":"c1","name":"shell","arguments":"{}"}]"#;
-        db.agent_upsert_tool_call("m1", "s1", "c1", Some("shell"), short)
+        db.agent_upsert_tool_call("m1", "s1", "c1", Some("shell"), short, None)
             .await
             .unwrap();
         // 长 JSON（参数/字段更完整）
         let long = r#"[{"id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}","tool_kind":"execute"}]"#;
-        db.agent_upsert_tool_call("m2", "s1", "c1", Some("shell"), long)
+        db.agent_upsert_tool_call("m2", "s1", "c1", Some("shell"), long, None)
             .await
             .unwrap();
         // 更短的 JSON 再写：不得回退已保存的完整 JSON
-        db.agent_upsert_tool_call("m3", "s1", "c1", Some("shell"), r#"[{"id":"c1"}]"#)
+        db.agent_upsert_tool_call("m3", "s1", "c1", Some("shell"), r#"[{"id":"c1"}]"#, None)
             .await
             .unwrap();
 
@@ -1098,6 +1123,7 @@ mod tests {
             None,
             None,
             "tool_calls",
+            None,
         )
         .await
         .unwrap();
@@ -1111,6 +1137,7 @@ mod tests {
             Some("c1"),
             Some("shell"),
             "tool_result",
+            None,
         )
         .await
         .unwrap();
@@ -1130,6 +1157,90 @@ mod tests {
         assert_eq!(msgs[1].name.as_deref(), Some("shell"));
         assert_eq!(msgs[2].kind, "message");
         assert_eq!(msgs[3].kind, "tool"); // 旧格式保持 role=tool 的推导
+    }
+
+    /// parent_tool_call_id 全链路 roundtrip：普通消息 / tool_call / tool_result
+    /// 写入后 SELECT 可读回；无父归属的消息该列为 NULL。
+    #[tokio::test]
+    async fn test_parent_tool_call_id_roundtrip() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 子 agent 文本（v2 直写 parent）
+        db.agent_add_message_v2(
+            "m0",
+            "s1",
+            "assistant",
+            "子 agent 输出",
+            None,
+            None,
+            None,
+            "message",
+            Some("task_1"),
+        )
+        .await
+        .unwrap();
+        // 子 agent 内工具调用（upsert 携带 parent）
+        let calls = serde_json::json!([{"id": "c1", "name": "shell", "arguments": "{}",
+            "parent_tool_call_id": "task_1"}]);
+        db.agent_upsert_tool_call("m1", "s1", "c1", Some("shell"), &calls.to_string(), Some("task_1"))
+            .await
+            .unwrap();
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "ok", Some("task_1"))
+            .await
+            .unwrap();
+        // 主 agent 文本（parent=None → NULL）
+        db.agent_add_message("m3", "s1", "assistant", "主 agent", None)
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        let by_kind = |k: &str| rows.iter().find(|r| r.kind == k).unwrap();
+        assert_eq!(by_kind("message").parent_tool_call_id.as_deref(), Some("task_1"));
+        let tc = by_kind("tool_calls");
+        assert_eq!(tc.parent_tool_call_id.as_deref(), Some("task_1"));
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(tc.tool_calls.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed[0]["parent_tool_call_id"], "task_1");
+        assert_eq!(by_kind("tool_result").parent_tool_call_id.as_deref(), Some("task_1"));
+        // 主 agent 消息 parent 为 NULL
+        let main_text = rows.iter().find(|r| r.content == "主 agent").unwrap();
+        assert!(main_text.parent_tool_call_id.is_none());
+    }
+
+    /// upsert 更新路径的 parent 补全：先无 parent 落库，后到的带 parent 帧
+    /// COALESCE 补上列值（同一 tool_call_id 归属固定）。
+    #[tokio::test]
+    async fn test_upsert_parent_backfilled_on_update() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "", None)
+            .await
+            .unwrap();
+        // 中间态已落库，终态带 parent → 更新路径补列
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "ok", Some("task_9"))
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "ok");
+        assert_eq!(rows[0].parent_tool_call_id.as_deref(), Some("task_9"));
     }
 
     #[tokio::test]
