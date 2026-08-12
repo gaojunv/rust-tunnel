@@ -94,6 +94,10 @@ struct TurnSegment {
     /// true = 落 `name='thought'` 行（思考）；false = 普通 assistant 正文行。
     thought: bool,
     content: String,
+    /// 子 agent 文本归属：发起本文本的 Task 工具调用 id（`_meta.claudeCode
+    /// .parentToolUseId`）。主 agent 文本为 None。同段仅合并归属相同的 chunk——
+    /// 若主/子 agent 文本交错到达，在 parent 变化处开新段，保证每行归属正确。
+    parent_tool_call_id: Option<String>,
 }
 
 /// 一个已 spawn 的 ACP agent 会话。
@@ -1889,10 +1893,16 @@ async fn persist_acp_frame(
             if let Some(a) = map.get_mut(sid) {
                 let content = frame["content"].as_str().unwrap_or("");
                 let is_thought = frame["thought"].as_bool().unwrap_or(false);
-                // 同类型相邻 chunk 合并进当前段（流式分段到达）；正文↔思考切换时
-                // 开新段，保住交错顺序——flush 按此落库，刷新后顺序才与对话一致。
+                // 子 agent 归属：父 Task 工具调用 id（主 agent 文本为 None）。
+                let parent = frame["parent_tool_call_id"].as_str().map(str::to_string);
+                // 同类型且同 parent 的相邻 chunk 合并进当前段（流式分段到达）；
+                // 正文↔思考切换或归属变化（主/子 agent 文本交错）时开新段，保住
+                // 交错顺序——flush 按此落库，刷新后顺序才与对话一致、归属正确。
                 let appended = match a.turn_segments.last_mut() {
-                    Some(last) if last.thought == is_thought => {
+                    Some(last)
+                        if last.thought == is_thought
+                            && last.parent_tool_call_id == parent =>
+                    {
                         last.content.push_str(content);
                         true
                     }
@@ -1902,6 +1912,7 @@ async fn persist_acp_frame(
                     a.turn_segments.push(TurnSegment {
                         thought: is_thought,
                         content: content.to_string(),
+                        parent_tool_call_id: parent,
                     });
                 }
             }
@@ -1912,7 +1923,7 @@ async fn persist_acp_frame(
             // 之前）。否则中途刷新时 DB 里缺当前工具之前的文本段，前端历史里
             // 这段文本消失（顺序乱）。终态 flush 只冲最后一段，行为不变。
             flush_acp_turn_buffers(db, sessions, sid).await;
-            let call = serde_json::json!([{
+            let mut call = serde_json::json!([{
                 "id": frame["id"],
                 "name": frame["name"],
                 "arguments": frame.get("args").cloned().unwrap_or(serde_json::Value::Null),
@@ -1920,6 +1931,12 @@ async fn persist_acp_frame(
                 "diffs": frame.get("diffs").cloned().unwrap_or(serde_json::Value::Null),
                 "locations": frame.get("locations").cloned().unwrap_or(serde_json::Value::Null),
             }]);
+            // 子 agent 归属：数组元素同步带 parent_tool_call_id（有值时），
+            // 前端历史卡片据此归组。
+            if let Some(parent) = frame.get("parent_tool_call_id") {
+                call[0]["parent_tool_call_id"] = parent.clone();
+            }
+            let parent = frame["parent_tool_call_id"].as_str();
             let msg_id = format!("{:032x}", rand::random::<u128>());
             // upsert：同一 (session_id, tool_call_id) 收敛为一行，避免每个事件
             // 纯 INSERT 造成刷新后重复卡片。
@@ -1930,6 +1947,7 @@ async fn persist_acp_frame(
                     frame["id"].as_str().unwrap_or_default(),
                     frame["name"].as_str(),
                     &call.to_string(),
+                    parent,
                 )
                 .await
             {
@@ -1937,6 +1955,7 @@ async fn persist_acp_frame(
             }
         }
         "tool_result" => {
+            let parent = frame["parent_tool_call_id"].as_str();
             let msg_id = format!("{:032x}", rand::random::<u128>());
             // upsert：ToolCallUpdate 中间态（空 result）与终态按同一
             // (session_id, tool_call_id) 收敛，终态覆盖中间态空占位。
@@ -1947,6 +1966,7 @@ async fn persist_acp_frame(
                     frame["id"].as_str().unwrap_or_default(),
                     frame["name"].as_str(),
                     frame["result"].as_str().unwrap_or(""),
+                    parent,
                 )
                 .await
             {
@@ -1969,6 +1989,7 @@ async fn persist_acp_frame(
                     None,
                     Some("plan"),
                     "message",
+                    None, // plan 不归属任何子 agent
                 )
                 .await
             {
@@ -2018,6 +2039,7 @@ async fn flush_acp_turn_buffers(
                 None,
                 name,
                 "message",
+                seg.parent_tool_call_id.as_deref(),
             )
             .await
         {
@@ -2107,12 +2129,27 @@ fn permission_option_to_approval(o: &PermissionOption) -> ApprovalOption {
 
 /// 本服务端声明的 ACP 客户端能力：fs 读写经隧道转发到客户端沙箱执行。
 /// 不声明则 agent 静默降级（如报「不支持」）。
+///
+/// `_meta["subagent-transcript"] = true` 是 claude-code-acp 适配器的 opt-in 约定
+/// （https://github.com/zed-industries/claude-code-acp）：声明后 agent 会在子 agent
+/// （Task/Agent 工具）产出的 tool_call / tool_call_update / agent_message_chunk /
+/// agent_thought_chunk 事件 `_meta.claudeCode` 里带 `subagent` 与
+/// `parentToolUseId`，本服务端据此透传父归属给前端分组渲染。不支持 `_meta` 的
+/// agent（gemini/opencode 等）会忽略未知键，无副作用（事件不带 `_meta`，映射端
+/// 字段缺省、完全无感降级）。
 fn client_capabilities() -> agent_client_protocol::schema::v1::ClientCapabilities {
-    agent_client_protocol::schema::v1::ClientCapabilities::new().fs(
-        agent_client_protocol::schema::v1::FileSystemCapabilities::new()
-            .read_text_file(true)
-            .write_text_file(true),
-    )
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "subagent-transcript".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    agent_client_protocol::schema::v1::ClientCapabilities::new()
+        .fs(
+            agent_client_protocol::schema::v1::FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true),
+        )
+        .meta(meta)
 }
 
 /// 把 ACP 的绝对路径转成工作区相对路径。客户端 `resolve_sandboxed` 只接受相对
@@ -2461,6 +2498,19 @@ mod tests {
         let caps = client_capabilities();
         assert!(caps.fs.read_text_file);
         assert!(caps.fs.write_text_file);
+    }
+
+    #[test]
+    fn test_client_capabilities_declare_subagent_transcript() {
+        // opt-in 约定：_meta["subagent-transcript"]=true 请求 agent 转发子 agent
+        // 事件的 parentToolUseId/subagent 元数据。不支持 _meta 的 agent 忽略该键。
+        let caps = client_capabilities();
+        let meta = caps.meta.expect("capabilities should carry _meta");
+        assert_eq!(
+            meta.get("subagent-transcript").and_then(|v| v.as_bool()),
+            Some(true),
+            "_meta.subagent-transcript must be true: {meta:?}"
+        );
     }
 
     #[test]
@@ -3766,6 +3816,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_turn_segments_split_by_parent() {
+        // 主 agent 文本与子 agent 文本交错到达：同一缓冲段内混入不同 parent 的
+        // chunk 必须在 parent 变化处切分 segment，保证每行消息的父归属正确。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), spawned_agent());
+
+        // 主 agent 开场 → 子 agent（task_1）文本 → 回到主 agent
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({"type": "assistant_chunk", "content": "主开场"}),
+        )
+        .await;
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "assistant_chunk",
+                "content": "子文本",
+                "parent_tool_call_id": "task_1",
+            }),
+        )
+        .await;
+        // 同 parent 的后续 chunk 应合并进子 agent 段
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "assistant_chunk",
+                "content": "续",
+                "parent_tool_call_id": "task_1",
+            }),
+        )
+        .await;
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({"type": "assistant_chunk", "content": "主收尾"}),
+        )
+        .await;
+        flush_acp_turn_buffers(&db, &sessions, "sess-1").await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let texts: Vec<(String, Option<String>)> = rows
+            .iter()
+            .filter(|r| r.kind == "message")
+            .map(|r| (r.content.clone(), r.parent_tool_call_id.clone()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("主开场".to_string(), None),
+                // 同 parent 相邻 chunk 合并成一段，归属正确
+                ("子文本续".to_string(), Some("task_1".to_string())),
+                ("主收尾".to_string(), None),
+            ],
+            "segments must split at parent change: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_acp_persistence_survives_ws_disconnect() {
         // 断线（detach_ws_tx 置 ws_tx=None）期间回合跑完：消息仍落库。
         // 用真实断线路径 detach_ws_tx——区别于 drop(ws_rx) 只关接收端
@@ -4006,10 +4143,12 @@ mod tests {
             TurnSegment {
                 thought: true,
                 content: "先思考".into(),
+                parent_tool_call_id: None,
             },
             TurnSegment {
                 thought: false,
                 content: "再回复".into(),
+                parent_tool_call_id: None,
             },
         ];
         bridge.sessions.lock().await.insert("sess-1".into(), agent);

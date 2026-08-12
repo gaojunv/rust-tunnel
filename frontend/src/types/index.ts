@@ -564,6 +564,8 @@ export interface AgentMessage {
   name?: string | null;
   kind: string;
   created_at: string;
+  /** 子 agent 归属：发起本行的父 Task 工具调用 id；主 agent 行为 null */
+  parent_tool_call_id?: string | null;
 }
 
 export interface SessionConfigSelectOption {
@@ -594,7 +596,16 @@ export interface ApprovalOption {
 }
 
 export type AgentWsEvent =
-  | { type: 'assistant_chunk'; content?: string; final?: boolean; thought?: boolean }
+  | {
+      type: 'assistant_chunk';
+      content?: string;
+      final?: boolean;
+      thought?: boolean;
+      /** 子 agent 归属：该文本 chunk 属于某个 Task 子 agent（值为父 Task 卡的 toolId） */
+      parent_tool_call_id?: string;
+      /** 子 agent 产出的文本（服务端 opt-in 元信息；前端以 parent_tool_call_id 归组） */
+      is_subagent?: boolean;
+    }
   | {
       type: 'tool_call';
       id?: string;
@@ -604,6 +615,10 @@ export type AgentWsEvent =
       tool_kind?: ToolKind;
       diffs?: ToolDiff[];
       locations?: ToolLocation[];
+      /** 子 agent 归属：该工具由某个 Task 子 agent 发起（值为父 Task 卡的 toolId） */
+      parent_tool_call_id?: string;
+      /** 仅父 Task 卡自身的 tool_call 帧：标记这是一张子 agent 卡 */
+      is_subagent?: boolean;
     }
   | {
       type: 'tool_result';
@@ -617,6 +632,9 @@ export type AgentWsEvent =
       tool_kind?: ToolKind;
       diffs?: ToolDiff[];
       locations?: ToolLocation[];
+      /** 子 agent 归属：该工具结果属于某个 Task 子 agent（值为父 Task 卡的 toolId） */
+      parent_tool_call_id?: string;
+      is_subagent?: boolean;
     }
   | { type: 'plan'; entries?: PlanEntryItem[] }
   | { type: 'usage'; used?: number; size?: number }

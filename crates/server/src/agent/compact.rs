@@ -169,6 +169,8 @@ pub async fn maybe_compact(
                 row.tool_call_id.as_deref(),
                 row.name.as_deref(),
                 &row.kind,
+                // 压缩重插保留父子归属，刷新后子 agent 分组不丢失
+                row.parent_tool_call_id.as_deref(),
             )
             .await
         {
@@ -387,6 +389,7 @@ mod tests {
             None,
             None,
             "summary",
+            None,
         )
         .await
         .unwrap();

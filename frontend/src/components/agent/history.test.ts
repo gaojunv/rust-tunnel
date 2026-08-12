@@ -146,6 +146,68 @@ describe('historyToChatItems', () => {
     expect(items.some((it) => it.kind === 'assistant' && it.content === '回答')).toBe(true);
   });
 
+  it('nests subagent rows (tool/text/thought) into the parent Task card (parent_tool_call_id)', () => {
+    // 服务端契约：子 agent 的 tool_result/message 行带 parent_tool_call_id 列，
+    // tool_calls JSON 元素也带。历史还原应与实时路径一致：子项收进父卡 children。
+    const calls = JSON.stringify([
+      { id: 'task1', name: 'Task', arguments: '{"description":"调研 bug","subagent_type":"general-purpose"}' },
+    ]);
+    const childCalls = JSON.stringify([
+      { id: 'c1', name: 'read_file', arguments: '{"path":"a.rs"}', parent_tool_call_id: 'task1' },
+    ]);
+    const items = historyToChatItems([
+      row({ id: 'm1', role: 'user', content: '去调研' }),
+      row({ id: 'm2', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'task1', name: 'Task' }),
+      row({ id: 'm3', kind: 'tool_result', tool_call_id: 'task1', role: 'tool', name: 'Task', content: '调研完成' }),
+      row({ id: 'm4', kind: 'message', content: '子代理的思考', name: 'thought', parent_tool_call_id: 'task1' }),
+      row({ id: 'm5', kind: 'message', content: '子代理的正文', parent_tool_call_id: 'task1' }),
+      row({ id: 'm6', kind: 'tool_calls', tool_calls: childCalls, tool_call_id: 'c1', name: 'read_file' }),
+      row({ id: 'm7', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'read_file', content: 'fn main(){}', parent_tool_call_id: 'task1' }),
+      row({ id: 'm8', content: '主 agent 收尾' }),
+    ]);
+    // 顶层：user + 父 Task 卡 + 主 agent 正文（子项全部收纳进父卡，不占顶层行）
+    expect(items).toHaveLength(3);
+    const parent = items.find((it) => it.kind === 'tool' && it.toolId === 'task1')!;
+    expect(parent).toBeTruthy();
+    expect(parent.toolStatus).toBe('completed');
+    // 父卡 toolResult 是 Task 最终结果
+    expect(parent.toolResult).toBe('调研完成');
+    // children 按到达顺序：thought → 正文 → 子工具卡（c1 带结果）
+    expect(parent.children!.map((c) => c.kind)).toEqual(['thought', 'assistant', 'tool']);
+    expect(parent.children![0]).toMatchObject({ kind: 'thought', content: '子代理的思考' });
+    expect(parent.children![1]).toMatchObject({ kind: 'assistant', content: '子代理的正文' });
+    expect(parent.children![2]).toMatchObject({ kind: 'tool', toolId: 'c1', toolResult: 'fn main(){}', parentToolId: 'task1' });
+    // 主 agent 正文仍在顶层
+    expect(items.some((it) => it.kind === 'assistant' && it.content === '主 agent 收尾')).toBe(true);
+  });
+
+  it('renders a running subagent parent card (children, no result) as in_progress, not failed', () => {
+    // 刷新时子 agent 仍在跑：父 Task 行无配对 result（孤儿），但子项已落库。
+    // 有 children 的父卡不应标 failed（进度与实际矛盾），改 in_progress。
+    const calls = JSON.stringify([{ id: 'task1', name: 'Task', arguments: '{"description":"继续跑"}' }]);
+    const childCalls = JSON.stringify([
+      { id: 'c1', name: 'read_file', arguments: '{"path":"a.rs"}', parent_tool_call_id: 'task1' },
+    ]);
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'task1', name: 'Task' }),
+      row({ id: 'm2', kind: 'tool_calls', tool_calls: childCalls, tool_call_id: 'c1', name: 'read_file', parent_tool_call_id: 'task1' }),
+    ]);
+    const parent = items.find((it) => it.kind === 'tool' && it.toolId === 'task1')!;
+    expect(parent.children).toHaveLength(1);
+    expect(parent.toolStatus).toBe('in_progress');
+    expect(parent.toolResult).toBeUndefined();
+  });
+
+  it('degrades subagent rows whose parent card never appears to top-level (no content loss)', () => {
+    const items = historyToChatItems([
+      row({ id: 'm1', role: 'user', content: 'hi' }),
+      row({ id: 'm2', kind: 'message', content: '孤儿文本', parent_tool_call_id: 'ghost' }),
+    ]);
+    // 孤儿文本平铺回主流
+    expect(items.some((it) => it.kind === 'assistant' && it.content === '孤儿文本')).toBe(true);
+    expect(items).toHaveLength(2);
+  });
+
   it('dedups re-inserted kept segment after compaction (M3)', () => {
     // DB 物理顺序：[旧消息..., 原kept..., summary, 重插kept...]——压缩修复（801c9a6）
     // 使 kept 段以相同内容出现两次，前端必须只渲染一份。summary 后的重插段是 kept

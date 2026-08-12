@@ -27,8 +27,9 @@ function firstLines(text: string, n: number): string {
   return lines.slice(0, n).join('\n');
 }
 
-/** 工具调用的长文本（args/result）：超过阈值折叠为前 3 行 + 展开按钮。 */
-function CollapsiblePre({ text, className }: { text: string; className?: string }) {
+/** 工具调用的长文本（args/result）：超过阈值折叠为前 3 行 + 展开按钮。
+ *  导出供 SubagentTaskCard 复用（父 Task 卡最终结果展示）。 */
+export function CollapsiblePre({ text, className }: { text: string; className?: string }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const lineCount = text.split('\n').length;
@@ -145,8 +146,9 @@ const KIND_META: Record<ToolKind, { label: string; aliases: string[]; stripPrefi
 
 /** 归一化工具标题：返回规范显示名 label 与 title 内嵌目标 extra（可能为 null）。
  *  显式 toolKind（非 other）优先匹配；kind 缺省/other（runner 旧数据）时按别名
- *  全表反查推断类别；均不命中且 kind 有效时，title 整体视为 extra（如命令本体）。 */
-function splitToolTitle(
+ *  全表反查推断类别；均不命中且 kind 有效时，title 整体视为 extra（如命令本体）。
+ *  导出供 SubagentTaskCard 计算子 agent 正在执行的工具名。 */
+export function splitToolTitle(
   name: string | undefined,
   kind: ToolKind | undefined,
 ): { label: string; extra: string | null } {
@@ -174,8 +176,9 @@ function splitToolTitle(
 }
 
 /** 工具状态：failed 优先；result 已产出 → completed（ACP 的 ToolCallUpdate 常省略
- * status，上游若误映射为 running，result 到达后仍应显示完成）；缺省按 result 有无推断。 */
-function resolveToolStatus(item: ChatItem): 'pending' | 'in_progress' | 'running' | 'completed' | 'failed' {
+ * status，上游若误映射为 running，result 到达后仍应显示完成）；缺省按 result 有无推断。
+ * 导出供 SubagentTaskCard 复用（子 agent 父卡状态徽章）。 */
+export function resolveToolStatus(item: ChatItem): 'pending' | 'in_progress' | 'running' | 'completed' | 'failed' {
   if (item.toolStatus === 'failed') return 'failed';
   if (item.toolResult != null) return 'completed';
   return item.toolStatus ?? 'in_progress';
@@ -190,8 +193,9 @@ function StatusBadge({ item }: { item: ChatItem }) {
 }
 
 /** 工具调用卡片：默认收起为一行头部（图标 + 名称 + 摘要 + 状态），点击展开详情。
- *  详情优先级：diffs → args/result 文本（折叠）。 */
-function ToolCard({ item }: { item: ChatItem }) {
+ *  详情优先级：diffs → args/result 文本（折叠）。导出供 SubagentTaskCard 嵌套渲染
+ *  子 agent 的工具卡（迷你卡）。 */
+export function ToolCard({ item }: { item: ChatItem }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const { label, extra } = splitToolTitle(item.toolName, item.toolKind);

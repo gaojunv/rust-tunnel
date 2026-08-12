@@ -30,6 +30,12 @@ export interface ChatItem {
   approvalOptions?: ApprovalOption[];
   /** pending=等待用户响应；approved/denied=用户主动处理；expired=回合终态被动过期 */
   approvalStatus?: 'pending' | 'approved' | 'denied' | 'expired';
+  /** 子 agent 归属：该条消息属于某个 Task 子 agent（值为父卡的 toolId） */
+  parentToolId?: string;
+  /** 子 agent 父卡标记：is_subagent=true 的 tool_call 帧（Task 卡本身） */
+  isSubagent?: boolean;
+  /** 子 agent 父卡的嵌套子项（工具卡/文本/思考气泡按到达顺序收纳） */
+  children?: ChatItem[];
 }
 
 export interface ToolDiff {

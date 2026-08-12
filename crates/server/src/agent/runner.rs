@@ -835,6 +835,7 @@ async fn persist_message(
             tool_call_id,
             name,
             kind,
+            None, // runner 路径无 ACP 子 agent 归属
         )
         .await
     {
