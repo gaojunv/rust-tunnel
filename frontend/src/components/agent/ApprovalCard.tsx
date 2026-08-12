@@ -58,11 +58,12 @@ export default function ApprovalCard({ item, onRespond }: Props) {
     <div className={`rounded-lg border p-3 text-sm ${CARD_CLS[status]}`}>
       <div className="mb-1.5 flex items-center gap-1.5 font-medium">
         <ShieldAlert className={`h-4 w-4 ${ICON_CLS[status]}`} />
-        <span className="min-w-0 truncate">
+        <span className="min-w-0 flex-1 truncate">
           {t('agent.approvalRequired')}: <code>{item.approvalTool}</code>
         </span>
         {!pending && (
-          <span className={`ml-auto inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${BADGE_CLS[status]}`}>
+          // shrink-0 + whitespace-nowrap：长工具名只截断标题，不挤压终态徽章
+          <span className={`ml-auto inline-flex shrink-0 items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium ${BADGE_CLS[status]}`}>
             {badgeText}
           </span>
         )}
