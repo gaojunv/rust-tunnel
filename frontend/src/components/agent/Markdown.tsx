@@ -56,7 +56,13 @@ const Table: Components['table'] = ({ children }) => (
  *  排版覆盖（容器 [&_...]:! 任意变体，特异性高于 Streamdown 内联类）：
  *  - 标题字号收敛到 xl/lg/base 梯度；正文/列表 leading-7 适配 CJK 长文
  *  - 表格单元格 th/td 横竖线 + 表头底色
- *  - pre 的 shiki 内联底色（--shiki-dark-bg 中性灰）置透明，由容器统一承载 */
+ *  - pre 的 shiki 内联底色（--shiki-dark-bg 中性灰）置透明，由容器统一承载
+ *
+ *  `streaming` 流式降级：插件只保留 `cjk`，去掉 `code` 插件。code 插件在每次
+ *  渲染都会对整段代码跑 Shiki codeToTokens——流式每帧重跑是 O(n²)（n 帧 × 每帧
+ *  O(n) tokenize 整块代码）。去掉后加粗/标题/列表/表格等结构仍由 Streamdown
+ *  渲染，代码块退化为无高亮的结构骨架（终态后 streaming=false 切回完整 code
+ *  插件一次性高亮，总代价 O(n)）。 */
 const MD_CLASS = [
   'text-sm leading-7',
   '[&_h1]:!mt-4 [&_h1]:!mb-2 [&_h1]:!text-xl',
@@ -87,11 +93,17 @@ const MD_CLASS = [
   '[&_pre_.block]:before:!text-[13px]',
 ].join(' ');
 
-export default memo(function Markdown({ content }: { content: string }) {
+export default memo(function Markdown({
+  content,
+  streaming,
+}: {
+  content: string;
+  streaming?: boolean;
+}) {
   return (
     <Streamdown
       className={MD_CLASS}
-      plugins={{ code: codePlugin, cjk }}
+      plugins={streaming ? { cjk } : { code: codePlugin, cjk }}
       shikiTheme={['light-plus', 'dark-plus']}
       controls={{ code: { copy: false, download: false } }}
       components={{ pre: PreFrame, table: Table }}

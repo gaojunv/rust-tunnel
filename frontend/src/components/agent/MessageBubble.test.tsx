@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import MessageBubble from './MessageBubble';
+import MessageBubble, { resolveToolStatus } from './MessageBubble';
 import type { ChatItem } from './types';
 
 vi.mock('react-i18next', () => ({
@@ -337,12 +337,17 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
     expect(screen.getByText('✓')).toBeTruthy();
   });
 
-  it('shows completed badge when result present even if toolStatus mis-mapped to running', () => {
-    // 回归（Bug 3）：ACP 的 ToolCallUpdate 常省略 status，上游可能误映射为
-    // running；result 已产出即视为完成，不能显示转圈。
+  it('keeps spinner when toolStatus explicitly running even with a result (subagent mid-state)', () => {
+    // 回归（问题②）：Task 父卡的中间态 ToolCallUpdate 带部分输出（status=running），
+    // 显式 running 优先于 result 推断——子 agent 未执行完不能提前打勾。Bug 3 的
+    // 误映射已由服务端修复（普通工具 status 缺失 + result → completed），前端不再
+    // 需要用 result 覆盖显式 running。
     render(<MessageBubble item={{ ...base, toolStatus: 'running', toolResult: 'ok' }} />);
-    expect(screen.getByText('✓')).toBeTruthy();
+    expect(screen.queryByText('✓')).toBeNull();
     expect(screen.queryByText('✗')).toBeNull();
+    // 状态徽章是转圈图标（运行中）
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.querySelector('svg')).toBeTruthy();
   });
 
   it('shows running spinner when no result yet (in_progress/running)', () => {
@@ -397,5 +402,38 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('用 方案A 实现 foo 函数');
     expect(header.textContent).not.toContain('**');
+  });
+});
+
+describe('resolveToolStatus explicit status priority', () => {
+  it('explicit running + result stays running (subagent mid-state, no early checkmark)', () => {
+    // 回归（问题②）：Task 父卡中间态 ToolCallUpdate 带部分输出（status=running），
+    // toolResult 非空不能覆盖成 completed——否则子 agent 没执行完就打勾。
+    expect(
+      resolveToolStatus({ kind: 'tool', content: '', toolStatus: 'running', toolResult: 'partial' }),
+    ).toBe('running');
+  });
+
+  it('explicit in_progress / pending stay explicit', () => {
+    expect(
+      resolveToolStatus({ kind: 'tool', content: '', toolStatus: 'in_progress', toolResult: 'x' }),
+    ).toBe('in_progress');
+    expect(resolveToolStatus({ kind: 'tool', content: '', toolStatus: 'pending' })).toBe('pending');
+  });
+
+  it('explicit completed / failed win over result', () => {
+    expect(resolveToolStatus({ kind: 'tool', content: '', toolStatus: 'completed' })).toBe('completed');
+    expect(
+      resolveToolStatus({ kind: 'tool', content: '', toolStatus: 'failed', toolResult: 'boom' }),
+    ).toBe('failed');
+  });
+
+  it('missing status infers completed from result (keep legacy inference)', () => {
+    // Bug 3 回归保护：toolStatus 缺省 + result → completed，不能转圈
+    expect(resolveToolStatus({ kind: 'tool', content: '', toolResult: 'ok' })).toBe('completed');
+  });
+
+  it('missing status and no result infers in_progress', () => {
+    expect(resolveToolStatus({ kind: 'tool', content: '' })).toBe('in_progress');
   });
 });

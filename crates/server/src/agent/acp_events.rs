@@ -71,13 +71,23 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             // 信息）→ completed，不能沿用 ToolCall 的 status_str（None→running），
             // 否则已完成工具的前端卡片永远转圈（Bug 3）。真·中间状态更新
             // （无结果、只改 title/content 为空）仍按 running 处理。
+            // 例外：subagent 父卡（is_subagent=true 且无 parentToolUseId，即 Task
+            // 工具调用自身的进度快照）的 status 缺失更新常带部分输出（子 agent
+            // 的中间结果/文本），has_result ≠ 执行完成——误判 completed 会让前端
+            // 在子 agent 未执行完时就打勾（问题②）。子 agent 内部工具
+            // （parentToolUseId 有值）与普通工具保持原 heuristic（不回归 Bug 3）。
             let status = match upd.fields.status {
                 Some(st) => status_str(Some(st)),
                 None => {
                     let has_result = upd.fields.raw_output.is_some()
                         || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
                     if has_result {
-                        "completed"
+                        let (parent, is_subagent) = claude_code_meta(&upd.meta);
+                        if is_subagent && parent.is_none() {
+                            "running"
+                        } else {
+                            "completed"
+                        }
                     } else {
                         "running"
                     }
@@ -396,6 +406,40 @@ mod tests {
             "sessionUpdate": "tool_call_update",
             "toolCallId": "call_1",
             "rawOutput": "a.rs"
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["type"], "tool_result");
+        assert_eq!(frame["status"], "completed");
+        assert_eq!(frame["result"], "a.rs");
+    }
+
+    #[test]
+    fn test_map_tool_call_update_subagent_parent_without_status_is_running() {
+        // 问题②回归：subagent 父卡（is_subagent=true、无 parentToolUseId，即 Task
+        // 工具调用自身的进度快照）的 ToolCallUpdate 常省略 status 但带部分输出
+        // （子 agent 中间结果）——has_result ≠ 执行完成，必须映射 running，
+        // 否则前端在子 agent 未执行完时就打勾。
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "task_1",
+            "rawOutput": "子 agent 的部分输出",
+            "_meta": {"claudeCode": {"subagent": true}}
+        }));
+        let frame = map_update(&u).expect("tool_call_update should map");
+        assert_eq!(frame["type"], "tool_result");
+        assert_eq!(frame["status"], "running");
+        assert_eq!(frame["result"], "子 agent 的部分输出");
+    }
+
+    #[test]
+    fn test_map_tool_call_update_subagent_child_without_status_is_completed() {
+        // 子 agent 内部工具（parentToolUseId 有值）保持 has_result→completed，
+        // 不回归 Bug 3（已完成工具永远转圈）。
+        let u = update(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "sub_tool_1",
+            "rawOutput": "a.rs",
+            "_meta": {"claudeCode": {"parentToolUseId": "task_1", "subagent": true}}
         }));
         let frame = map_update(&u).expect("tool_call_update should map");
         assert_eq!(frame["type"], "tool_result");

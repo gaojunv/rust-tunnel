@@ -117,9 +117,10 @@ describe('ChatStream virtualization', () => {
     expect(screen.queryByText('消息 199')).toBeNull();
   });
 
-  it('renders a streaming assistant bubble as plain text inside the viewport', async () => {
+  it('renders a streaming assistant bubble as Markdown inside the viewport', async () => {
     // 短列表（全部在视口内）+ 视口内 append 流式气泡：验证虚拟化路径下
-    // streaming 降级同样生效（Markdown 语法原样渲染为纯文本，不做 Shiki 高亮）。
+    // streaming 降级同样生效——Markdown 结构（标题/加粗/列表）仍由 Streamdown
+    // 渲染，只是去掉 code 插件避免每帧 Shiki 全量重高亮。
     (listAgentMessages as Mock).mockResolvedValue(Array.from({ length: 5 }, (_, i) => row(i)));
     let flushCb: (() => void) | undefined;
     const origSetTimeout = globalThis.setTimeout;
@@ -147,8 +148,8 @@ describe('ChatStream virtualization', () => {
     act(() => {
       flushCb?.();
     });
-    // 纯文本渲染：Markdown 渲染会把 `# 标题` 解析成 <h1>（文本为"标题"），
-    // streaming 降级则保留原始文本串
-    expect(screen.getByText('# 标题')).toBeTruthy();
+    // streaming 期间仍是 Markdown 渲染：`# 标题` 解析为 <h1>（文本"标题"），
+    // 而非旧 PlainBody 的纯文本串
+    expect(screen.getByText('标题').tagName).toBe('H1');
   });
 });

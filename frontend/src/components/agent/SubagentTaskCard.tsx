@@ -13,10 +13,13 @@ interface Props {
 }
 
 /**
- * 子 agent（Task）父卡：折叠态一行头部（名称/描述 + 类型徽标 + 状态徽章 +
- * 实时进度摘要），展开态嵌套渲染 children（迷你 ToolCard + 文本/思考气泡，
- * 左侧边条缩进分层），末尾展示父卡自身 toolResult（Task 最终结果）。
- * children 的文本/思考气泡在流式期间走 PlainBody 降级（streamingChildIdx 命中）。
+ * 子 agent（Task）父卡：卡片容器（与 MessageBubble 工具卡同构：圆角细线边框 +
+ * muted 淡底）+ 折叠态一行头部（名称/描述 + 类型徽标 + 状态徽章 + 实时进度摘要），
+ * 展开态嵌套渲染 children（迷你 ToolCard + 文本/思考气泡，左侧边条缩进分层），
+ * 末尾展示父卡自身 toolResult（Task 最终结果）。运行中卡片底部显示与 ToolCard
+ * 相同的不确定进度条（呼吸动画），保证两卡视觉一致。
+ * children 的文本/思考气泡在流式期间走 Markdown streaming 降级（streamingChildIdx
+ * 命中）。
  */
 function SubagentTaskCard({ item, streamingChildIdx }: Props) {
   const { t } = useTranslation();
@@ -26,25 +29,29 @@ function SubagentTaskCard({ item, streamingChildIdx }: Props) {
   const children = item.children ?? [];
   const status = resolveToolStatus(item);
   const tools = children.filter((c) => c.kind === 'tool');
-  const done = tools.filter(
-    (c) => c.toolResult != null || c.toolStatus === 'completed' || c.toolStatus === 'failed',
-  ).length;
+  // 当前运行工具 = 最后一个未完成的子工具卡（用 resolveToolStatus：显式
+  // running/in_progress/pending 即未完成——result 到达不覆盖，同父卡状态语义）
   const running = [...tools]
     .reverse()
-    .find(
-      (c) =>
-        c.toolResult == null && c.toolStatus !== 'completed' && c.toolStatus !== 'failed',
-    );
+    .find((c) => {
+      const s = resolveToolStatus(c);
+      return s !== 'completed' && s !== 'failed';
+    });
   const finished = status === 'completed' || status === 'failed';
-  const count = tools.length > 0 ? `${done}/${tools.length} ${t('agent.tools')}` : null;
-  const progress = count
-    ? running && !finished
-      ? `${count} · ${splitToolTitle(running.toolName, running.toolKind).label}`
-      : count
-    : null;
+  const isRunning = !finished;
+  // 进度文案不再显示 done/total（分母只统计已开始的工具、永远接近完成，无意义），
+  // 改为「N 个工具 · 当前工具名」（运行中）/「N 个工具」（已完成）。无工具不显示。
+  const progress =
+    tools.length === 0
+      ? null
+      : finished
+        ? `${tools.length} ${t('agent.tools')}`
+        : running
+          ? `${tools.length} ${t('agent.tools')} · ${splitToolTitle(running.toolName, running.toolKind).label}`
+          : `${tools.length} ${t('agent.tools')}`;
 
   return (
-    <div>
+    <div className="relative w-full overflow-hidden rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -76,6 +83,16 @@ function SubagentTaskCard({ item, streamingChildIdx }: Props) {
           )}
         </span>
       </button>
+      {/* 进度条绝对定位在卡片底部边缘（同 ToolCard）：运行中呼吸动画，完成后
+          透明淡出。不占文档流高度；容器常驻避免出现/消失时 DOM 抖动。 */}
+      <div
+        className={`absolute inset-x-0 bottom-0 h-0.5 overflow-hidden rounded transition-colors duration-300 ${
+          isRunning ? 'bg-muted' : 'bg-transparent'
+        }`}
+        aria-hidden={!isRunning}
+      >
+        {isRunning && <div className="h-full w-1/3 animate-pulse rounded bg-primary/60" />}
+      </div>
       {open && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {children.length > 0 && (

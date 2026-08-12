@@ -175,13 +175,18 @@ export function splitToolTitle(
   return { label: raw || 'Tool', extra: null };
 }
 
-/** 工具状态：failed 优先；result 已产出 → completed（ACP 的 ToolCallUpdate 常省略
- * status，上游若误映射为 running，result 到达后仍应显示完成）；缺省按 result 有无推断。
- * 导出供 SubagentTaskCard 复用（子 agent 父卡状态徽章）。 */
+/** 工具状态：显式状态优先（failed → failed；completed → completed；显式
+ * pending/in_progress/running 原样返回），不再让 toolResult != null 覆盖成
+ * completed——Task 父卡的中间态 ToolCallUpdate 常带部分输出（status=running），
+ * 旧逻辑把 running+result 直接判 completed，子 agent 没执行完就打勾。
+ * 仅 toolStatus 缺省（旧帧/历史 runner 数据）时按 result 有无推断：有→completed，
+ * 无→in_progress。导出供 SubagentTaskCard 复用（子 agent 父卡状态徽章）。 */
 export function resolveToolStatus(item: ChatItem): 'pending' | 'in_progress' | 'running' | 'completed' | 'failed' {
-  if (item.toolStatus === 'failed') return 'failed';
-  if (item.toolResult != null) return 'completed';
-  return item.toolStatus ?? 'in_progress';
+  const s = item.toolStatus;
+  if (s === 'failed') return 'failed';
+  if (s === 'completed') return 'completed';
+  if (s === 'pending' || s === 'in_progress' || s === 'running') return s;
+  return item.toolResult != null ? 'completed' : 'in_progress';
 }
 
 /** 工具执行状态徽章：显式 toolStatus 优先；缺省（旧数据）按 result 有无推断。 */
@@ -271,22 +276,12 @@ export function ToolCard({ item }: { item: ChatItem }) {
   );
 }
 
-/** 流式期间的降级渲染：跳过 Streamdown/Shiki 全量解析，直接渲染纯文本。
- *
- *  流式气泡每 STREAM_FLUSH_MS（50ms）追加一次内容。若每帧都对整段 markdown
- *  重跑 unified 解析 + Shiki codeToTokens，长代码块呈 O(n²)（n 帧 × 每帧
- *  O(n) tokenize 整块代码，且代码块越长常数越大）。流式期间降级为文本节点
- *  （追加渲染 O(1)/帧量级），终态后切回 Markdown 一次性高亮 → 总代价 O(n)。
- *  样式与 Markdown 正文对齐（text-sm leading-7），避免终态切换时跳变。
- */
-function PlainBody({ content }: { content: string }) {
-  return <div className="whitespace-pre-wrap break-words text-sm leading-7">{content}</div>;
-}
-
 /** 单条消息气泡：user / assistant（Markdown）/ tool（默认收起的工具卡片）。
  *  memo 化：流式 chunk 每帧更新列表 state，内容未变的气泡跳过重渲染。
- *  `streaming`：当前正在流式写入的气泡。流式期间 assistant/thought 用 PlainBody
- *  渲染（见上，避免 Shiki 每帧全量重高亮），终态后一次性完整 Markdown。
+ *  `streaming`：当前正在流式写入的气泡。流式期间 assistant/thought 走
+ *  `<Markdown streaming />`——仍是 Streamdown 渲染（加粗/标题/列表/表格结构
+ *  保留），只是去掉 code 插件避免每帧 Shiki 全量重高亮（O(n²)，见 Markdown.tsx
+ *  注释），终态后切回完整 Markdown 一次性高亮。
  *  布局策略（对标主流 AI 聊天 UI）：
  *  - user：右对齐小气泡（primary 淡底），用户消息一般短，气泡让双方身份一眼可辨
  *  - assistant：全宽无气泡正文。LLM 回复是长文（标题/列表/表格/代码块），
@@ -311,7 +306,7 @@ export default memo(function MessageBubble({ item, streaming }: { item: ChatItem
       {item.kind === 'tool' ? (
         <ToolCard item={item} />
       ) : item.kind === 'assistant' ? (
-        streaming ? <PlainBody content={item.content} /> : <Markdown content={item.content} />
+        <Markdown content={item.content} streaming={streaming} />
       ) : item.kind === 'thought' ? (
         <ThoughtBubble content={item.content} streaming={streaming} />
       ) : item.kind === 'plan' ? (
@@ -339,7 +334,8 @@ function thoughtPreview(content: string): string | null {
 /** 思考过程卡片：与 ToolCard 同构（图标 + 标题 + 预览 + chevron 头部，
  *  展开区 border-t 分隔），默认折叠（思考是低信噪过程信息）。
  *  内容按 Markdown 渲染（agent 思考多为 md 格式），muted 弱化以区分正文。
- *  `streaming` 期间展开区走 PlainBody 降级（同正文气泡，避免流式每帧 Shiki 重高亮）。 */
+ *  `streaming` 期间展开区走 `<Markdown streaming />`（同正文气泡：保留 md 结构、
+ *  去掉 code 插件避免流式每帧 Shiki 重高亮）。 */
 function ThoughtBubble({ content, streaming }: { content: string; streaming?: boolean }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -367,7 +363,7 @@ function ThoughtBubble({ content, streaming }: { content: string; streaming?: bo
       </button>
       {open && (
         <div className="mt-2 border-t border-border/60 pt-2 text-muted-foreground [&_pre]:!my-2">
-          {streaming ? <PlainBody content={content} /> : <Markdown content={content} />}
+          <Markdown content={content} streaming={streaming} />
         </div>
       )}
     </div>

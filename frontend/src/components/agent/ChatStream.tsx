@@ -930,8 +930,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   );
 
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
-  // （assistant/thought），MessageBubble 据此降级为纯文本渲染（避免 Shiki 每帧
-  // 全量重高亮，见 MessageBubble.tsx 的 PlainBody）。子 agent 父卡（isSubagent 或
+  // （assistant/thought），MessageBubble 据此用 `<Markdown streaming />` 渲染
+  // （保留 md 结构、去掉 code 插件避免 Shiki 每帧全量重高亮，见 Markdown.tsx）。
+  // 子 agent 父卡（isSubagent 或
   // 带 children 的 tool 卡——历史路径只落 parent_tool_call_id、无 is_subagent 标记，
   // 按 children 有无推断）走 SubagentTaskCard 嵌套渲染 children。
   const renderItem = (it: ChatItem, i: number) => {
