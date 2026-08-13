@@ -16,10 +16,13 @@ import SessionBar from '../components/agent/SessionBar';
 import ActivityBar from '../components/agent/ActivityBar';
 import WorkspaceDialog from '../components/agent/WorkspaceDialog';
 import { useMediaQuery } from '../hooks/useMediaQuery';
+import { useAgentNotifications } from '../notifications/NotificationProvider';
 
 export default function AgentPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // 上报当前查看的会话：全局通知服务据此判断「用户正盯着该会话」时跳过提醒
+  const { setActiveSessionId } = useAgentNotifications();
   // 桌面/移动端分支：ActivityBar 在 <768px 下切到底部图标栏 + Sheet 面板
   const isDesktop = useMediaQuery('(min-width: 768px)');
   const [workspaceId, setWorkspaceId] = useState(
@@ -91,6 +94,13 @@ export default function AgentPage() {
       selectableModels?.models[0]?.id || selectableModels?.groups[0]?.id || '';
     setModel(sessionModel || globalDefault || fallback);
   }, [sessionId, sessions, defaultModel, selectableModels]);
+
+  // 上报当前查看的会话给全局通知服务；离开 Agent 页（卸载）时清空，
+  // 让其它会话的任务完成/需干预事件能正常提醒。
+  useEffect(() => {
+    setActiveSessionId(sessionId || null);
+    return () => setActiveSessionId(null);
+  }, [sessionId, setActiveSessionId]);
 
   const handleNewSession = async () => {
     if (!workspaceId) return;

@@ -84,6 +84,16 @@ vi.mock('../api/agentModels', () => ({
   listAgentSelectableModels: vi.fn().mockResolvedValue({ models: [], groups: [] }),
 }));
 
+// 通知上下文替身：AgentPage 仅上报 activeSessionId，断言不涉及具体行为
+vi.mock('../notifications/NotificationProvider', () => ({
+  useAgentNotifications: () => ({
+    enabled: true,
+    permission: 'default',
+    setEnabled: vi.fn(),
+    setActiveSessionId: vi.fn(),
+  }),
+}));
+
 const renderPage = () => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(

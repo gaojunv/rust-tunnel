@@ -626,6 +626,13 @@ export function agentWsUrl(sessionId: string): string {
   return `${proto}//${location.host}/api/agent/ws?session_id=${sessionId}&token=${encodeURIComponent(token)}`;
 }
 
+/** 工作台全局通知 WS（标签闪动/系统通知用）。应用级建立一条，订阅所有会话事件。 */
+export function agentNotificationsWsUrl(): string {
+  const token = localStorage.getItem('auth_token') ?? '';
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/api/agent/notifications/ws?token=${encodeURIComponent(token)}`;
+}
+
 export async function getFsTree(workspaceId: string, path?: string): Promise<FsEntry[]> {
   const { data } = await api.get<{ entries: FsEntry[] }>(
     `/agent/workspaces/${workspaceId}/fs/tree`,

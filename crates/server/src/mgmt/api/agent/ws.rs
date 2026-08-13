@@ -15,7 +15,7 @@ use crate::auth::{validate_token, AuthConfig};
 use crate::llm::ChatMessage;
 use crate::mgmt::api::ApiState;
 
-use super::dto::{AgentWsQuery, TerminalWsQuery};
+use super::dto::{AgentWsQuery, NotificationsWsQuery, TerminalWsQuery};
 
 /// GET /api/agent/ws?session_id=xxx&token=<jwt>
 /// Public route; JWT validated from query param (browser WebSocket can't set headers).
@@ -32,6 +32,45 @@ pub async fn agent_ws(
     }
     ws.on_upgrade(move |socket| handle_agent_socket(state, socket, params.session_id))
         .into_response()
+}
+
+/// GET /api/agent/notifications/ws?token=<jwt>
+/// Public route; JWT validated from query param（同 `agent_ws`）。全局工作台通知：
+/// 订阅 `AgentState` 的通知广播，任务完成/出错/需用户干预时向浏览器推送
+/// [`crate::agent::notify::AgentNotification`] 帧（标签闪动 + 系统通知用）。
+pub async fn notifications_ws(
+    State(state): State<ApiState>,
+    Query(params): Query<NotificationsWsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if state.auth_config.is_enabled() {
+        let token = params.token.as_deref().unwrap_or("");
+        if token.is_empty() || validate_token(token, &state.auth_config.jwt_secret).is_err() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| handle_notifications_socket(state, socket))
+        .into_response()
+}
+
+/// 通知 WS 连接生命周期：订阅广播 → 逐条下发文本帧。对端断开（send 失败）即退出。
+/// 广播 sender 常驻（挂 `AgentState`），无事件时 `recv()` 挂起即可——连接关闭由
+/// send 返回 Err 暴露，无需额外探测。
+async fn handle_notifications_socket(state: ApiState, socket: WebSocket) {
+    let (mut ws_sink, _ws_stream) = socket.split();
+    let Some(agent) = state.server_state.agent_state else {
+        return;
+    };
+    let mut rx = agent.subscribe_notifications();
+    while let Ok(n) = rx.recv().await {
+        let text = match serde_json::to_string(&n) {
+            Ok(t) => t,
+            Err(_) => continue, // 序列化失败理论上不可达，跳过不中断
+        };
+        if ws_sink.send(Message::Text(text)).await.is_err() {
+            return; // 对端断开
+        }
+    }
 }
 
 /// GET `/api/agent/terminal/ws?workspace_id=xxx&cols=..&rows=..&token=<jwt>`
@@ -482,9 +521,34 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // 完全断线能自愈（send 返回 Err），但"慢而不死"的客户端会永久停摆该会话。
     // 5 秒超时足够覆盖正常网络抖动；超时即视为 sink 死亡，后续事件只 drain 不发。
     const WS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    // 通知广播：本连接所属 workspace 在此解析一次（session 缺失/读库失败为 None，
+    // 跳过通知）。出站帧（runner 与 ACP 的 done/error、审批/elicitation 请求）唯
+    // 一流经 push_task，在此翻译成全局通知广播——未查看该会话的标签页经
+    // /api/agent/notifications/ws 收到提醒。
+    let workspace_id = match &state.server_state.agent_state {
+        Some(agent) => agent
+            .db
+            .agent_get_session(&session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.workspace_id),
+        None => None,
+    };
+    let notify_agent = state.server_state.agent_state.clone();
+    let notify_session_id = session_id.clone();
     let push_task = tokio::spawn(async move {
         let mut sink_alive = true;
         while let Some(ev) = event_rx.recv().await {
+            if let Some(ws_id) = &workspace_id {
+                if let Some(agent) = notify_agent.as_ref() {
+                    if let Some(n) =
+                        crate::agent::notify::notification_from_frame(&ev, &notify_session_id, ws_id)
+                    {
+                        agent.notify(n);
+                    }
+                }
+            }
             let text = serde_json::to_string(&ev).unwrap_or_default();
             if !sink_alive {
                 continue;

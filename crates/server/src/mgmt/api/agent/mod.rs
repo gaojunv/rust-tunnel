@@ -18,7 +18,7 @@ pub use workspaces::{
     create_workspace, delete_workspace, get_fs_file, get_fs_tree, get_git_diff, get_git_status,
     get_workspace, list_workspace_files, list_workspaces, put_fs_file, update_workspace,
 };
-pub use ws::{agent_ws, terminal_ws};
+pub use ws::{agent_ws, notifications_ws, terminal_ws};
 
 /// Generate a random hex id (32 hex chars, 128-bit)。
 /// workspaces/sessions 共用（create_workspace / create_session）。

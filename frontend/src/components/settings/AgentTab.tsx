@@ -3,16 +3,20 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Loader2, Sparkles } from 'lucide-react';
+import { Switch } from '@/components/ui/switch';
+import { BellRing, Loader2, Sparkles } from 'lucide-react';
 import { getAgentDefaultModel, putAgentDefaultModel, getApiErrorMessage } from '@/api/client';
 import { listAgentSelectableModels } from '@/api/agentModels';
+import { useAgentNotifications } from '@/notifications/NotificationProvider';
 
 type Feedback = { type: 'success' | 'error'; text: string } | null;
 
-/** 设置页「Agent」标签：全局默认模型选择。 */
+/** 设置页「Agent」标签：全局默认模型选择 + 浏览器通知开关。 */
 export default function AgentTab() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const { enabled: notificationsEnabled, permission, setEnabled: setNotificationsEnabled } =
+    useAgentNotifications();
   const { data: defaultModel } = useQuery({
     queryKey: ['agent-default-model'],
     queryFn: getAgentDefaultModel,
@@ -107,6 +111,41 @@ export default function AgentTab() {
                 {feedback.text}
               </p>
             )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <BellRing className="h-4 w-4" />
+            </div>
+            <CardTitle className="text-lg">{t('settings.agent.notifications')}</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-xs text-muted-foreground">{t('settings.agent.notificationsDesc')}</p>
+          <div className="flex items-center justify-between gap-4">
+            <div className="space-y-1">
+              <span className="text-sm font-medium">
+                {t('settings.agent.notificationsEnable')}
+              </span>
+              {permission === 'denied' ? (
+                <p className="text-xs text-destructive">
+                  {t('settings.agent.notificationsPermissionDenied')}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.agent.notificationsPermissionHint')}
+                </p>
+              )}
+            </div>
+            <Switch
+              checked={notificationsEnabled}
+              onCheckedChange={(v) => setNotificationsEnabled(v === true)}
+              aria-label={t('settings.agent.notificationsEnable')}
+            />
           </div>
         </CardContent>
       </Card>
