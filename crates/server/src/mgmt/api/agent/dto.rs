@@ -74,6 +74,12 @@ pub struct AgentWsQuery {
     pub token: Option<String>,
 }
 
+/// 全局通知 WS 的 query：无 session 维度，仅 JWT token（复用 `agent_ws` 的鉴权方式）。
+#[derive(Debug, Deserialize)]
+pub struct NotificationsWsQuery {
+    pub token: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TerminalWsQuery {
     pub workspace_id: String,

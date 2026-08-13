@@ -225,6 +225,7 @@ pub async fn run_api_server(
         .route("/api/stats/stream", get(stats::sse_stats_stream))
         .route("/api/logs/stream", get(logs::sse_log_stream))
         .route("/api/agent/ws", get(agent::agent_ws))
+        .route("/api/agent/notifications/ws", get(agent::notifications_ws))
         .route("/api/agent/terminal/ws", get(agent::terminal_ws))
         .route("/api/preferences", get(preferences::get_preferences));
 

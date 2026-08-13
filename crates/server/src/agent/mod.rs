@@ -6,6 +6,7 @@ pub mod approval;
 pub mod compact;
 pub mod executor;
 pub mod llm_bridge;
+pub mod notify;
 pub mod runner;
 pub mod session;
 pub mod spawner;
@@ -16,7 +17,7 @@ pub mod tools;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 use agent_client_protocol::schema::v1::ElicitationContentValue;
 use serde::{Deserialize, Serialize};
@@ -144,10 +145,17 @@ pub struct AgentState {
     /// 惰性 spawn + 事件映射 + LLM 代理路由；控制循环的 AgentSpawnData/Exit、
     /// AgentLlmProxyRequest 经它路由。
     pub acp_bridge: Option<AcpBridge>,
+    /// 工作台全局通知广播：任务完成 / 出错 / 需用户干预时，`push_task`
+    /// （`mgmt/api/agent/ws.rs`）把出站帧翻译成 [`notify::AgentNotification`]
+    /// 发布于此，浏览器全局通知 WS（`/api/agent/notifications/ws`）订阅消费。
+    notifications: broadcast::Sender<notify::AgentNotification>,
 }
 
 impl AgentState {
     pub fn new(registry: ClientRegistry, db: Database) -> Self {
+        // 通知广播先建（在 AcpBridge 构造之前，无循环依赖问题）；订阅者即浏览器的
+        // 全局通知 WS。容量 256 足够覆盖短时突发（通知低频，只发不阻塞）。
+        let (notify_tx, _notify_rx) = broadcast::channel::<notify::AgentNotification>(256);
         // ACP 桥构造在前、AgentState 尚不完整：先建占位（acp_bridge=None），
         // 用克隆（仅用于审批，不触碰 acp_bridge）注入审批回调后回填。
         let mut state = Self {
@@ -160,6 +168,7 @@ impl AgentState {
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
             acp_bridge: None,
+            notifications: notify_tx,
         };
         // 审批走 AgentState::request_approval（与 runner 共用审批弹层/pending map；
         // 克隆只有 acp_bridge=None，request_approval 不依赖它）。
@@ -476,6 +485,16 @@ impl AgentState {
     /// 取出进行中的 exec request_id 并清除（cancel/断连时用，先取后清防重复取消）。
     pub async fn inflight_take(&self, workspace_id: &str) -> Option<String> {
         self.exec_inflight.lock().await.remove(workspace_id)
+    }
+
+    /// 广播一条工作台通知（无订阅者时静默忽略，不阻塞调用方）。
+    pub fn notify(&self, n: notify::AgentNotification) {
+        let _ = self.notifications.send(n);
+    }
+
+    /// 订阅工作台通知广播（浏览器全局通知 WS 用）。
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<notify::AgentNotification> {
+        self.notifications.subscribe()
     }
 }
 

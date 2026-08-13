@@ -48,7 +48,12 @@
       "title": "AI 工作台",
       "defaultModelDesc": "会话未单独设置模型时使用的默认模型。会话可在对话内单独覆盖；修改对新消息生效。",
       "saved": "已保存",
-      "clearDefault": "清除（使用第一个可用模型）"
+      "clearDefault": "清除（使用第一个可用模型）",
+      "notifications": "浏览器通知",
+      "notificationsDesc": "任务完成或需要你干预（审批/表单）时，通过浏览器系统通知与标签页标题闪烁提醒。",
+      "notificationsEnable": "启用通知",
+      "notificationsPermissionDenied": "浏览器已阻止通知，请在浏览器设置中允许本站通知。",
+      "notificationsPermissionHint": "开启后会请求浏览器通知权限；未授权时仅标签页标题闪烁。"
     },
     "general": {
       "system": "系统",
@@ -874,7 +879,15 @@
     "configOptionUnsupported": "当前模型不支持此选项",
     "configOn": "开",
     "configOff": "关",
-    "agentModelHint": "Agent 内部模型；实际 LLM 调用由上方网关模型决定"
+    "agentModelHint": "Agent 内部模型；实际 LLM 调用由上方网关模型决定",
+    "notifTurnDone": "任务完成",
+    "notifTurnDoneBody": "AI 工作台会话已完成",
+    "notifTurnError": "任务出错",
+    "notifTurnErrorBody": "AI 工作台会话执行出错",
+    "notifApproval": "需要审批",
+    "notifApprovalBody": "工具 {{tool}} 需要你的批准",
+    "notifElicitation": "需要你输入",
+    "notifElicitationBody": "Agent 向你提出了一个问题"
   },
   "logs": {
     "title": "日志",

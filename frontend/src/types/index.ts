@@ -714,6 +714,30 @@ export type AgentWsEvent =
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
   | { type: 'current_mode_update'; mode_id?: string };
 
+/** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
+ *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */
+export type AgentNotification =
+  | { event: 'turn_done'; session_id: string; workspace_id: string }
+  | {
+      event: 'turn_error';
+      session_id: string;
+      workspace_id: string;
+      message?: string;
+    }
+  | {
+      event: 'approval_needed';
+      session_id: string;
+      workspace_id: string;
+      tool: string;
+      summary: string;
+    }
+  | {
+      event: 'elicitation_needed';
+      session_id: string;
+      workspace_id: string;
+      message: string;
+    };
+
 export interface FsEntry {
   name: string;
   is_dir: boolean;

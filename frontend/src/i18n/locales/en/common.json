@@ -48,7 +48,12 @@
       "title": "AI Workbench",
       "defaultModelDesc": "Default model used when a session has no model of its own. Sessions can override it per chat; changes apply to new messages.",
       "saved": "Saved",
-      "clearDefault": "Clear (use first available model)"
+      "clearDefault": "Clear (use first available model)",
+      "notifications": "Browser notifications",
+      "notificationsDesc": "Get a browser notification and tab-title flash when a task finishes or needs your input (approval / form).",
+      "notificationsEnable": "Enable notifications",
+      "notificationsPermissionDenied": "Notifications are blocked by the browser. Allow them for this site in your browser settings.",
+      "notificationsPermissionHint": "Enabling will request browser notification permission; without it, only the tab title flashes."
     },
     "general": {
       "system": "System",
@@ -877,7 +882,15 @@
     "configOptionUnsupported": "Current agent model does not support this option",
     "configOn": "On",
     "configOff": "Off",
-    "agentModelHint": "Agent-internal model; actual LLM calls use the gateway model above"
+    "agentModelHint": "Agent-internal model; actual LLM calls use the gateway model above",
+    "notifTurnDone": "Task completed",
+    "notifTurnDoneBody": "An AI workbench session finished",
+    "notifTurnError": "Task failed",
+    "notifTurnErrorBody": "An AI workbench session hit an error",
+    "notifApproval": "Approval needed",
+    "notifApprovalBody": "Tool {{tool}} needs your approval",
+    "notifElicitation": "Input needed",
+    "notifElicitationBody": "The agent asked you a question"
   },
   "logs": {
     "title": "Logs",

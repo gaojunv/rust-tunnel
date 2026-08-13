@@ -3,6 +3,7 @@ import { Outlet, useNavigate } from 'react-router-dom';
 import { Header } from './Header';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { logout as apiLogout } from '@/api/client';
+import { AgentNotificationsProvider } from '@/notifications/NotificationProvider';
 
 export default function AppLayout() {
   const navigate = useNavigate();
@@ -31,7 +32,10 @@ export default function AppLayout() {
                 </div>
               }
             >
-              <Outlet />
+              {/* 全局工作台通知：订阅所有会话事件，标签闪动 + 系统通知（需开启开关） */}
+              <AgentNotificationsProvider>
+                <Outlet />
+              </AgentNotificationsProvider>
             </Suspense>
           </div>
         </main>
