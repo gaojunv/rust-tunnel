@@ -78,9 +78,10 @@ describe('MessageBubble tool card collapsing', () => {
       />,
     );
     const header = screen.getByRole('button', { expanded: false });
-    // runner 旧格式工具名 read_file 归一化为规范名 Read
+    // runner 旧格式工具名 read_file 归一化为规范名 Read；路径只显示文件名
     expect(header.textContent).toContain('Read');
-    expect(header.textContent).toContain('src/main.rs');
+    expect(header.textContent).toContain('main.rs');
+    expect(header.textContent).not.toContain('src/main.rs');
     // 未展开：args 与 result 均不可见
     expect(screen.queryByText('{"path":"src/main.rs"}')).toBeNull();
     expect(screen.queryByText('pub fn main() {}')).toBeNull();
@@ -148,14 +149,15 @@ describe('MessageBubble tool card collapsing', () => {
     expect(header.textContent).toContain('ls -la');
   });
 
-  it('ACP edit 工具摘要显示 file_path（title 风格工具名 + file_path 字段）', () => {
+  it('ACP edit 工具摘要显示 file_path（title 风格工具名 + file_path 字段），路径只显示文件名', () => {
     render(
       <MessageBubble
         item={{ kind: 'tool', content: '', toolName: 'Edit src/a.ts', toolArgs: '{"file_path":"src/a.ts","old_string":"x"}' }}
       />,
     );
     const header = screen.getByRole('button', { expanded: false });
-    expect(header.textContent).toContain('src/a.ts');
+    expect(header.textContent).toContain('a.ts');
+    expect(header.textContent).not.toContain('src/a.ts');
   });
 
   it('ACP write 工具摘要显示 file_path（带 toolKind=edit）', () => {
@@ -227,7 +229,7 @@ describe('MessageBubble tool card collapsing', () => {
     expect(header.textContent).toContain('run npm test');
   });
 
-  it('title 内嵌相对路径与 args 绝对路径去重，只显示一份', () => {
+  it('title 内嵌相对路径与 args 绝对路径去重，只显示一份（basename）', () => {
     render(
       <MessageBubble
         item={{
@@ -241,7 +243,8 @@ describe('MessageBubble tool card collapsing', () => {
     );
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('Edit');
-    expect(header.textContent?.match(/src\/a\.ts/g)).toHaveLength(1);
+    expect(header.textContent).not.toContain('src/a.ts');
+    expect(header.textContent?.match(/a\.ts/g)).toHaveLength(1);
   });
 
   it('Edit args 与 title 均无路径时回退到 diffs 路径', () => {
@@ -262,7 +265,8 @@ describe('MessageBubble tool card collapsing', () => {
     );
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('Edit');
-    expect(header.textContent).toContain('src/a.ts');
+    expect(header.textContent).toContain('a.ts');
+    expect(header.textContent).not.toContain('src/a.ts');
   });
 
   it('Edit args 与 title 均无路径时回退到 locations 路径', () => {
@@ -280,7 +284,8 @@ describe('MessageBubble tool card collapsing', () => {
     );
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('Edit');
-    expect(header.textContent).toContain('src/b.ts');
+    expect(header.textContent).toContain('b.ts');
+    expect(header.textContent).not.toContain('src/b.ts');
   });
 
   it('args/title/diffs/locations 均无路径时头部仅显示工具名，不崩溃', () => {
@@ -435,5 +440,83 @@ describe('resolveToolStatus explicit status priority', () => {
 
   it('missing status and no result infers in_progress', () => {
     expect(resolveToolStatus({ kind: 'tool', content: '' })).toBe('in_progress');
+  });
+});
+
+describe('MessageBubble PathTip 完整路径提示', () => {
+  afterEach(cleanup);
+
+  const fileItem: ChatItem = {
+    kind: 'tool',
+    content: '',
+    toolName: 'Read File',
+    toolKind: 'read',
+    toolArgs: '{"file_path":"/home/u/proj/src/main.rs"}',
+  };
+
+  it('文件工具头部只显示 basename，鼠标悬浮显示完整路径', () => {
+    render(<MessageBubble item={fileItem} />);
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs');
+    expect(header.textContent).not.toContain('/home/u/proj');
+
+    fireEvent.mouseEnter(screen.getByText('main.rs'));
+    expect(screen.getByRole('tooltip').textContent).toBe('/home/u/proj/src/main.rs');
+  });
+
+  it('点击（模拟触摸）路径切换显示完整路径，点击外部关闭', () => {
+    render(<MessageBubble item={fileItem} />);
+    // 触摸点击路径：弹出完整路径 tip
+    fireEvent.click(screen.getByText('main.rs'));
+    expect(screen.getByRole('tooltip').textContent).toBe('/home/u/proj/src/main.rs');
+    // 点击外部任意处关闭
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('点击路径不展开工具卡片（stopPropagation）', () => {
+    render(<MessageBubble item={fileItem} />);
+    fireEvent.click(screen.getByText('main.rs'));
+    expect(screen.getByRole('button', { expanded: false })).toBeTruthy();
+    expect(screen.queryByRole('button', { expanded: true })).toBeNull();
+  });
+
+  it('相对路径同样只显示文件名', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Edit a.ts',
+          toolKind: 'edit',
+          toolArgs: '{"file_path":"src/components/a.ts"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('a.ts');
+    expect(header.textContent).not.toContain('src/components');
+  });
+
+  it('非文件工具（execute）摘要保留完整命令，不生成 PathTip', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'Bash', toolKind: 'execute', toolArgs: '{"command":"ls -la /home/u"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('ls -la /home/u');
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('search 摘要保留 path ⌕ pattern，不做 basename 处理', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'search', toolArgs: '{"path":"src","pattern":"todo"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('src ⌕ todo');
+    expect(screen.queryByRole('tooltip')).toBeNull();
   });
 });

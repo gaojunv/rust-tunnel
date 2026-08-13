@@ -1,4 +1,6 @@
-import { memo, useState } from 'react';
+import { memo, useCallback, useEffect, useId, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import {
   ArrowRightLeft,
@@ -72,6 +74,36 @@ function isNoopArgs(args: string): boolean {
   return false;
 }
 
+/** 取路径最后一段（文件名/目录名），兼容 `/` 与 `\` 分隔符；空串与纯分隔符原样返回。 */
+function basename(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, '');
+  const i = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return i >= 0 ? trimmed.slice(i + 1) : trimmed;
+}
+
+/** 文件类工具别名（含空格版用于匹配 ACP title 前缀，如 "Edit src/a.ts"）。 */
+const FILE_ALIASES = [
+  'read file', 'read_file', 'read', 'list directory', 'list dir', 'list_dir',
+  'edit file', 'edit', 'write file', 'write_file', 'write',
+  'patch file', 'patch_file', 'patch',
+  'delete', 'remove file', 'remove',
+  'move file', 'move', 'rename',
+];
+
+/** 是否为文件类工具（摘要为文件/目录路径而非命令）。runner 旧格式认
+ *  read_file/write_file/patch_file/list_dir 等规范名，ACP 认 kind=read/edit/
+ *  delete/move 或 title 前缀（"Edit src/a.ts"）。供 toolSummary 判断摘要类别、
+ *  ToolCard 决定是否只显示 basename。 */
+function isFileTool(kind: ToolKind | undefined, name: string | undefined): boolean {
+  if (kind === 'read' || kind === 'edit' || kind === 'delete' || kind === 'move') return true;
+  const nm = (name ?? '').toLowerCase();
+  if (['read_file', 'write_file', 'patch_file', 'list_dir', 'read', 'write', 'edit', 'delete', 'move', 'glob'].includes(nm)) {
+    return true;
+  }
+  // ACP title 风格：内嵌目标在标题末尾（"Edit src/a.ts"），按文件类别名前缀剥离识别
+  return FILE_ALIASES.some((alias) => nm.startsWith(`${alias} `));
+}
+
 /** 从 toolArgs JSON 提取一行摘要。
  *
  * 兼容两套数据：runner 旧格式（toolName 是规范工具名 shell/read_file…，字段
@@ -102,10 +134,7 @@ function toolSummary(
   const nm = (name ?? '').toLowerCase();
   const isExec = kind === 'execute' || ['shell', 'bash', 'execute', 'run', 'sh', 'cmd'].includes(nm);
   if (isExec) return str('cmd', 'command');
-  const isFile =
-    kind === 'read' || kind === 'edit' || kind === 'delete' || kind === 'move' ||
-    ['read_file', 'write_file', 'patch_file', 'list_dir', 'read', 'write', 'edit', 'delete', 'move', 'glob'].includes(nm);
-  if (isFile) return str('path', 'file_path');
+  if (isFileTool(kind, name)) return str('path', 'file_path');
   if (kind === 'search' || ['search', 'grep', 'find'].includes(nm)) {
     const path = str('path', 'file_path') ?? '.';
     const pattern = str('pattern', 'query');
@@ -218,6 +247,109 @@ function StatusBadge({ item }: { item: ChatItem }) {
   return <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />;
 }
 
+/** 文件路径提示：头部摘要只显示 basename，鼠标悬浮 / 点击（触屏）时用 portal
+ *  在视图层弹出完整路径。卡片容器 overflow-hidden 会裁剪绝对定位，故渲染到
+ *  body（fixed 定位）；滚动 / 缩放 / 点击外部自动关闭。hover 与点击并存：
+ *  鼠标进出 trigger/tip 控制显示，点击 trigger 切换（stopPropagation 防止
+ *  误触卡片展开）。下划线点线提示该路径可点开看全貌（触屏无 hover，需要
+ *  affordance 暗示可点击）。 */
+function PathTip({ path, children }: { path: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const tipRef = useRef<HTMLDivElement>(null);
+  const timerRef = useRef(0);
+  const id = useId();
+
+  // 基于 trigger 当前布局计算 tip 位置：优先显示在路径下方，下方空间不足时翻转到上方
+  const updatePos = useCallback(() => {
+    const el = triggerRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const tipW = Math.min(360, window.innerWidth - 16);
+    const tipH = 26;
+    const left = Math.max(6, Math.min(rect.left, window.innerWidth - tipW - 6));
+    const top =
+      rect.bottom + tipH + 6 <= window.innerHeight
+        ? rect.bottom + 6
+        : Math.max(6, rect.top - tipH - 6);
+    setPos({ top, left });
+  }, []);
+
+  const show = useCallback(() => {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = 0;
+    updatePos();
+    setOpen(true);
+  }, [updatePos]);
+
+  const hide = useCallback(() => {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => setOpen(false), 100);
+  }, []);
+
+  const toggle = useCallback(() => {
+    window.clearTimeout(timerRef.current);
+    timerRef.current = 0;
+    updatePos();
+    setOpen((v) => !v);
+  }, [updatePos]);
+
+  // 打开期间：点击外部关闭；滚动/窗口变化关闭（fixed 定位需重算，直接隐藏更稳）
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (triggerRef.current?.contains(e.target as Node)) return;
+      if (tipRef.current?.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    const onDismiss = () => setOpen(false);
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('scroll', onDismiss, true);
+    window.addEventListener('resize', onDismiss);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('scroll', onDismiss, true);
+      window.removeEventListener('resize', onDismiss);
+    };
+  }, [open]);
+
+  return (
+    <>
+      <span
+        ref={triggerRef}
+        id={id}
+        aria-describedby={open ? `${id}-tip` : undefined}
+        className="min-w-0 cursor-pointer truncate font-mono text-muted-foreground underline decoration-dotted decoration-muted-foreground/40 underline-offset-2"
+        onMouseEnter={show}
+        onMouseLeave={hide}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggle();
+        }}
+      >
+        {children}
+      </span>
+      {open && pos && (
+        createPortal(
+          <div
+            ref={tipRef}
+            id={`${id}-tip`}
+            role="tooltip"
+            className="pointer-events-auto fixed z-50 max-w-[360px] truncate rounded-md border bg-popover px-2 py-1 font-mono text-xs text-popover-foreground shadow-md"
+            style={{ top: pos.top, left: pos.left }}
+            onMouseEnter={show}
+            onMouseLeave={hide}
+          >
+            {path}
+          </div>,
+          document.body,
+        )
+      )}
+    </>
+  );
+}
+
 /** 工具调用卡片：默认收起为一行头部（图标 + 名称 + 摘要 + 状态），点击展开详情。
  *  详情优先级：diffs → args/result 文本（折叠）。导出供 SubagentTaskCard 嵌套渲染
  *  子 agent 的工具卡（迷你卡）。 */
@@ -236,6 +368,9 @@ export function ToolCard({ item }: { item: ChatItem }) {
     item.toolDiffs?.[0]?.path ??
     item.toolLocations?.[0]?.path ??
     null;
+  // 文件类工具的摘要是路径：头部只显示文件名，完整路径挂 PathTip（悬浮/点击查看）
+  const isFile = isFileTool(item.toolKind, item.toolName);
+  const displaySummary = isFile && summary ? basename(summary) : summary;
   const status = resolveToolStatus(item);
   const isError = status === 'failed';
   // 不确定进度条：工具仍在执行（pending/in_progress/running，result 未产出）时
@@ -252,8 +387,12 @@ export function ToolCard({ item }: { item: ChatItem }) {
       >
         <KindChip kind={item.toolKind ?? 'other'} />
         <span className="font-medium text-foreground/90">{label}</span>
-        {summary && (
-          <span className="min-w-0 truncate font-mono text-muted-foreground">{summary}</span>
+        {displaySummary && (
+          isFile ? (
+            <PathTip path={summary as string}>{displaySummary}</PathTip>
+          ) : (
+            <span className="min-w-0 truncate font-mono text-muted-foreground">{displaySummary}</span>
+          )
         )}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           <StatusBadge item={item} />
