@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentMessage } from '../../types';
-import { historyToChatItems } from './history';
+import { historyToChatItems, historyToChatItemsWithSkip, prependSkip } from './history';
 
 const row = (overrides: Partial<AgentMessage> & { id: string }): AgentMessage => ({
   session_id: 's1',
@@ -232,5 +232,60 @@ describe('historyToChatItems', () => {
     expect(items.filter((it) => it.kind === 'tool')).toHaveLength(1);
     expect(items.filter((it) => it.kind === 'assistant' && it.content === '早期回答')).toHaveLength(1);
     expect(items.some((it) => it.kind === 'assistant' && it.content === '[上下文摘要] 之前讨论了 A')).toBe(true);
+  });
+
+  it('skips cross-page compaction originals when prepending an earlier page (boundary)', () => {
+    // 分页边界把压缩重插段劈成两页：新页（更早）是「原 kept 段 + summary」，
+    // 已加载页是「重插 kept 段」。若只按新页独立去重，summary 前的原件会渲染，
+    // 与已加载页的重插副本重复。prependSkip 在完整集合（新页+已加载页）上算
+    // skip 并过滤到新页范围 → 原件被跳过、summary 保留。
+    const calls = JSON.stringify([{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.rs"}' } }]);
+    const toolCallsRow = (id: string) => row({ id, kind: 'tool_calls', tool_calls: calls });
+    const toolResultRow = (id: string) =>
+      row({ id, kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'read_file', content: 'fn main(){}' });
+
+    const page2 = [
+      row({ id: 'p2-old', role: 'user', content: '更早的问题' }),
+      row({ id: 'k1', role: 'user', content: '保留问题' }),
+      toolCallsRow('k2'),
+      toolResultRow('k3'),
+      row({ id: 'sum', role: 'user', kind: 'summary', content: '[上下文摘要] 之前讨论了 A' }),
+    ];
+    const page1 = [
+      row({ id: 'k1r', role: 'user', content: '保留问题' }),
+      toolCallsRow('k2r'),
+      toolResultRow('k3r'),
+      row({ id: 'new1', role: 'user', content: '压缩后的新问题' }),
+    ];
+
+    // prependSkip：新页（page2）的 skip 下标
+    const skipLocal = prependSkip(page2, page1);
+    // 原 kept 段（k1/k2/k3）全部命中 → 在新页范围内被跳过
+    expect([...skipLocal]).toEqual([1, 2, 3]);
+    const olderItems = historyToChatItemsWithSkip(page2, skipLocal);
+    // 原件被跳过 → 只剩「更早的问题」+ summary（无重复工具卡/保留问题）
+    expect(olderItems.filter((it) => it.kind === 'user' && it.content === '保留问题')).toHaveLength(0);
+    expect(olderItems.filter((it) => it.kind === 'tool')).toHaveLength(0);
+    expect(olderItems.some((it) => it.kind === 'user' && it.content === '更早的问题')).toBe(true);
+    expect(olderItems.some((it) => it.kind === 'assistant' && it.content === '[上下文摘要] 之前讨论了 A')).toBe(true);
+
+    // 与已加载页合并后整体只渲染一份「保留问题」+ 一张工具卡
+    const full = [...olderItems, ...historyToChatItems(page1)];
+    expect(full.filter((it) => it.kind === 'user' && it.content === '保留问题')).toHaveLength(1);
+    expect(full.filter((it) => it.kind === 'tool')).toHaveLength(1);
+    expect(full.some((it) => it.kind === 'user' && it.content === '压缩后的新问题')).toBe(true);
+  });
+
+  it('prependSkip leaves non-compaction pages untouched', () => {
+    // 普通分页（无 summary / 无跨页重复）：新页所有行原样转换，无跳过。
+    const page2 = [
+      row({ id: 'a', role: 'user', content: '第一条' }),
+      row({ id: 'b', content: '第二条' }),
+    ];
+    const page1 = [row({ id: 'c', role: 'user', content: '第三条' })];
+    const skipLocal = prependSkip(page2, page1);
+    expect([...skipLocal]).toEqual([]);
+    const items = historyToChatItemsWithSkip(page2, skipLocal);
+    expect(items.map((it) => it.content)).toEqual(['第一条', '第二条']);
   });
 });

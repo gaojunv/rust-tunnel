@@ -602,8 +602,20 @@ export async function updateAgentSessionTitle(id: string, title: string): Promis
   await api.put(`/agent/sessions/${id}`, { title });
 }
 
-export async function listAgentMessages(sessionId: string): Promise<AgentMessage[]> {
-  const { data } = await api.get(`/agent/sessions/${sessionId}/messages`);
+/** 会话消息分页响应：`messages` 为升序的最近一页，`has_more` 表示是否还有更早。 */
+export interface AgentMessagesPage {
+  messages: AgentMessage[];
+  has_more: boolean;
+}
+
+export async function listAgentMessages(
+  sessionId: string,
+  opts?: { before?: string; limit?: number },
+): Promise<AgentMessagesPage> {
+  const { data } = await api.get<AgentMessagesPage>(
+    `/agent/sessions/${sessionId}/messages`,
+    { params: opts },
+  );
   return data;
 }
 

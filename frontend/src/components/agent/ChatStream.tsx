@@ -12,7 +12,8 @@ import {
   listAgentMessages,
   updateAgentSessionModel,
 } from '../../api/client';
-import type { AgentWsEvent } from '../../types';
+import type { AgentMessagesPage } from '../../api/client';
+import type { AgentMessage, AgentWsEvent } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
 import ElicitationCard from './ElicitationCard';
@@ -24,7 +25,7 @@ import SubagentPanel from './SubagentPanel';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions } from './sessionConfig';
-import { historyToChatItems } from './history';
+import { historyToChatItems, historyToChatItemsWithSkip, prependSkip } from './history';
 import {
   appendChildStream,
   chunkKey,
@@ -38,6 +39,20 @@ import type { SessionConfigOption } from '../../types';
 const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
 /** 流式 chunk 合并 flush 间隔：token 级 WS 帧攒批后一次性写 state，避免每 token 全列表重渲染。 */
 export const STREAM_FLUSH_MS = 50;
+/** 分页「加载更早」每页条数（与后端默认 limit 一致）。 */
+const EARLIER_PAGE_SIZE = 200;
+
+/** 历史查询数据归一化：兼容 `{ messages, has_more }`（新 API）与裸数组
+ * （旧缓存 / 测试替身）。取消息行数组。 */
+function historyRows(h: AgentMessagesPage | AgentMessage[] | undefined): AgentMessage[] {
+  if (!h) return [];
+  return Array.isArray(h) ? h : (h.messages ?? []);
+}
+
+/** 历史查询数据的 has_more（裸数组旧形态恒为 false）。 */
+function historyHasMore(h: AgentMessagesPage | AgentMessage[] | undefined): boolean {
+  return !Array.isArray(h) && (h?.has_more ?? false);
+}
 
 interface Props {
   sessionId: string;
@@ -96,6 +111,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
+  // 分页「加载更早」状态：has_more 表示是否还有更早消息；loading 为在飞请求。
+  // loadedRawRef 保存所有已加载的原始消息行（rowid 升序），prepend 时把新页与
+  // 它拼成完整集合做压缩重插去重（见 loadEarlier），保证跨页 summary 去重正确。
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const loadingEarlierRef = useRef(false);
+  const loadedRawRef = useRef<AgentMessage[]>([]);
   // items 的 ref 镜像：历史 effect 自愈守卫读（避免把 items 加入 effect 依赖）
   const itemsRef = useRef<ChatItem[]>([]);
   useEffect(() => {
@@ -182,7 +204,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 缓存——切到别的 session 再切回时 key={sessionId} 触发全新挂载，但 React
   // Query 直接命中旧缓存、不发请求，若离开期间回合已在服务端跑完落库，聊天区
   // 永远停留在旧内容。挂载时总是拉取，配合下面的「增量装载」保证不覆盖流式增量。
-  const { data: history } = useQuery({
+  const { data: history } = useQuery<AgentMessagesPage | AgentMessage[]>({
     queryKey: ['agent-messages', sessionId],
     queryFn: () => listAgentMessages(sessionId),
     refetchOnMount: 'always',
@@ -190,9 +212,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   });
   useEffect(() => {
     historyRef.current = history;
+    const rows = historyRows(history);
     if (!history) return;
     // 自愈：已装载但聊天区为空而历史转非空（陈旧空缓存被 refetch 纠正）→ 允许重装
-    if (loadedRef.current && !(itemsRef.current.length === 0 && history.length > 0)) return;
+    if (loadedRef.current && !(itemsRef.current.length === 0 && rows.length > 0)) return;
     // done 后的对账重载（见 done 处理器）：只重建 items、跳过 running 兜底——
     // 该重载的末行可能是 tool_result（回合在工具执行中结束），按现状会误置
     // running=true 并锁死发送按钮 10 分钟，而回合其实已终态。
@@ -206,13 +229,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       return;
     }
     loadedRef.current = true;
-    if (!isReconcileReload && history.length > 0) {
+    if (!isReconcileReload && rows.length > 0) {
       // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
       // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true）。把
       // running 置 true 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧
       // 或 10 分钟超时解除。运行中发送已放开（服务端 busy 会排队），误置的代价只是
       // 指示器多亮一阵、消息走排队路径，优于用户以为回合已结束而重复发送。
-      const last = history[history.length - 1];
+      const last = rows[rows.length - 1];
       if ((last.kind === 'tool_calls' || last.kind === 'tool_result') && !runningRef.current) {
         // 半截装载标记：done 到达时允许 refetch 重渲染完整历史（对账）
         partialLoadRef.current = true;
@@ -229,10 +252,63 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }
     // 纯函数装载：历史行 → ChatItem（含同一 tool_call_id 多行去重、压缩重插
     // 去重、plan 只留最后一条），见 history.ts。
-    setItems(historyToChatItems(history));
+    setItems(historyToChatItems(rows));
+    loadedRawRef.current = rows;
     // t 用于 running 超时提示文案；语言切换后重跑 effect 只影响尚未触发的
     // 超时回调文案，代价可忽略。
   }, [history, t]);
+
+  // has_more 只随查询数据（history）变化同步：单独 effect 避免主装载 effect 的
+  // `t` 依赖（语言切换/测试替身每次渲染新引用）重跑时把「加载更早」后的 hasMore
+  // 复位为首页的 has_more。
+  useEffect(() => {
+    setHasMore(historyHasMore(history));
+  }, [history]);
+
+  // 分页「加载更早消息」：以当前已加载最旧一条的 id 作 before 游标，取更早的一页，
+  // 转换后 unshift 进 items 头部。不整体重建 items——流式渲染依赖 streamingIdxRef/
+  // subStreamRef 等索引，整体替换会破坏进行中的流式气泡（尤其多标签页后台流式时）。
+  // 去重只对「新页 + 已加载页」的完整集合做判断：压缩重插（kept 段原样复制）的原件
+  // 若落在新页、重插副本在已加载页，跨页也能被 compactionSkippedIndices 命中并跳过
+  //（把 skip 下标过滤到新页范围后传 historyToChatItemsWithSkip）。streamingIdxRef
+  // 在同一个 setItems updater 里右移（flush 的 updater 按其入队顺序先读到旧下标，
+  // 后读到已位移的下标，与 M1 的「ref 折进 updater 排队执行」同一语义）。
+  const loadEarlier = async () => {
+    if (loadingEarlierRef.current) return;
+    const oldestId = loadedRawRef.current[0]?.id;
+    if (!oldestId) return;
+    loadingEarlierRef.current = true;
+    setLoadingEarlier(true);
+    try {
+      const page = await listAgentMessages(sessionId, {
+        before: oldestId,
+        limit: EARLIER_PAGE_SIZE,
+      });
+      if (page.messages.length === 0) {
+        setHasMore(false);
+        return;
+      }
+      // 跨页压缩重插去重：完整集合（新页 + 已加载页）算 skip 后过滤到新页范围，
+      // 详见 history.ts 的 prependSkip。
+      const olderItems = historyToChatItemsWithSkip(
+        page.messages,
+        prependSkip(page.messages, loadedRawRef.current),
+      );
+      loadedRawRef.current = [...page.messages, ...loadedRawRef.current];
+      setHasMore(page.has_more);
+      setItems((prev) => {
+        if (streamingIdxRef.current !== null) {
+          streamingIdxRef.current += olderItems.length;
+        }
+        return [...olderItems, ...prev];
+      });
+    } catch {
+      // 加载失败静默：保留现状，用户可再次点击重试
+    } finally {
+      loadingEarlierRef.current = false;
+      setLoadingEarlier(false);
+    }
+  };
 
   const clearRunningTimeout = useCallback(() => {
     if (timeoutRef.current) {
@@ -1104,6 +1180,20 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         {/* 限宽包裹层：与下方悬浮输入框的 max-w-3xl 对齐，控制长文阅读行长，
             避免消息流全宽铺开与居中输入框的视觉错位。渐隐占位留在层外保持全宽。 */}
         <div className="mx-auto w-full max-w-3xl">
+        {hasMore && items.length > 0 && (
+          <div className="flex justify-center py-1.5">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => void loadEarlier()}
+              disabled={loadingEarlier}
+              className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+            >
+              {loadingEarlier ? t('agent.loadingEarlier') : t('agent.loadEarlierMessages')}
+            </Button>
+          </div>
+        )}
         {items.length === 0 && !running && (
           <p className="text-center text-sm text-muted-foreground">{t('agent.chatEmptyHint')}</p>
         )}

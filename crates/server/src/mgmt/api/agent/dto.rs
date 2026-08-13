@@ -1,6 +1,8 @@
 //! Agent workbench 请求 / 响应 / query 类型（DTO）。
 use serde::Deserialize;
 
+use crate::persistence::db::agent::AgentMessageRecord;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceRequest {
     pub name: String,
@@ -66,6 +68,24 @@ pub struct DefaultModelResponse {
 #[derive(Debug, Deserialize)]
 pub struct UpdateSessionRequest {
     pub title: String,
+}
+
+/// `GET /api/agent/sessions/:id/messages` 的 query 参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct ListMessagesParams {
+    /// 返回条数；缺省 200，handler 层 clamp 到 [1, 500]。
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// 游标：返回该消息**更早**（rowid 更小）的最近 `limit` 条，游标本身不含。
+    #[serde(default)]
+    pub before: Option<String>,
+}
+
+/// `GET /api/agent/sessions/:id/messages` 的响应体：分页消息 + 是否还有更早。
+#[derive(Debug, serde::Serialize)]
+pub struct ListMessagesResponse {
+    pub messages: Vec<AgentMessageRecord>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]

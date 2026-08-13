@@ -1609,4 +1609,95 @@ describe('ChatStream running state', () => {
     fireEvent.click(screen.getByText('Read').closest('button')!);
     expect(screen.getByText('ok')).toBeTruthy();
   });
+
+  it('prepends earlier messages on load-earlier (pagination)', async () => {
+    // 首页（最近 3 条 m3..m5，has_more=true）；点击「加载更早」→ 更早一页 m0..m2
+    const row = (i: number) => ({
+      id: `m${i}`,
+      session_id: 's1',
+      role: 'user' as const,
+      content: `消息 ${i}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind: 'message' as const,
+      created_at: '2026-08-05',
+    });
+    (listAgentMessages as Mock)
+      .mockResolvedValueOnce({ messages: [row(3), row(4), row(5)], has_more: true })
+      .mockResolvedValue({ messages: [row(0), row(1), row(2)], has_more: false });
+    renderChat();
+    // 首页渲染 + 顶部出现「加载更早」按钮
+    expect(await screen.findByText('消息 3')).toBeTruthy();
+    expect(screen.getByText('消息 4')).toBeTruthy();
+    expect(screen.getByText('agent.loadEarlierMessages')).toBeTruthy();
+    // 点击加载更早：更早消息 prepend 进头部，且整体顺序正确
+    await act(async () => {
+      fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
+    });
+    expect(await screen.findByText('消息 0')).toBeTruthy();
+    const msgs = screen
+      .getAllByText(/^消息 \d$/)
+      .map((el) => el.textContent)
+      .filter((x): x is string => x !== null);
+    expect(msgs).toEqual(['消息 0', '消息 1', '消息 2', '消息 3', '消息 4', '消息 5']);
+    // 无更多 → 按钮隐藏
+    expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
+  });
+
+  it('keeps streaming bubble intact when prepending earlier messages (idx shift)', async () => {
+    // 回归：流式气泡已实体化（streamingIdxRef 指向下标 2），随后点击「加载更早」
+    // 在头部 unshift 2 条——streamingIdxRef 必须右移，否则续文会新建碎片气泡。
+    const row = (i: number) => ({
+      id: `m${i}`,
+      session_id: 's1',
+      role: 'user' as const,
+      content: `消息 ${i}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind: 'message' as const,
+      created_at: '2026-08-05',
+    });
+    let flushCb: (() => void) | undefined;
+    const origSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        if (ms === STREAM_FLUSH_MS) {
+          flushCb = cb;
+          return {} as unknown as ReturnType<typeof setTimeout>; // 手动触发，保持 streaming 状态
+        }
+        return origSetTimeout(cb, ms ?? 0) as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout,
+    );
+    (listAgentMessages as Mock)
+      .mockResolvedValueOnce({ messages: [row(0), row(1)], has_more: true })
+      .mockResolvedValue({ messages: [row(10), row(11)], has_more: false });
+    renderChat();
+    await screen.findByText('消息 0');
+    // 流式「前文」实体化为气泡（index 2）
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '前文', final: false });
+    });
+    act(() => {
+      flushCb?.();
+    });
+    expect(screen.getByText('前文')).toBeTruthy();
+    // 缓冲「续文」后，在 flush 之前点击「加载更早」→ 头部 unshift 2 条
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '续文', final: false });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
+    });
+    // 更早消息在顶部
+    expect(screen.getByText('消息 10')).toBeTruthy();
+    expect(screen.getByText('消息 11')).toBeTruthy();
+    // flush：续文必须并入「前文」气泡（streamingIdxRef 已右移），不产生碎片
+    act(() => {
+      flushCb?.();
+    });
+    expect(screen.getByText('前文续文')).toBeTruthy();
+    expect(screen.queryByText('续文')).toBeNull();
+  });
 });

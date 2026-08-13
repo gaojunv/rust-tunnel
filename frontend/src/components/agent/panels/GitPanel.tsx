@@ -9,6 +9,7 @@ import {
   getAgentGitStatus,
   listAgentMessages,
 } from '../../../api/client';
+import type { AgentMessagesPage } from '../../../api/client';
 import type { AgentMessage } from '../../../types';
 
 export type GitStatusKind =
@@ -328,10 +329,12 @@ export default function GitPanel({
     retry: false,
   });
 
-  // 仅回退路径需要消息：主 API 不可用（如客户端离线 503）时才拉取
-  const messagesQuery = useQuery<AgentMessage[]>({
+  // 仅回退路径需要消息：主 API 不可用（如客户端离线 503）时才拉取。
+  // 分页上限传 500 尽量覆盖 git_status 结果；与 ChatStream 共享 queryKey，
+  // 回合完成 invalidate 后自动刷新。
+  const messagesQuery = useQuery<AgentMessagesPage>({
     queryKey: ['agent-messages', sessionId],
-    queryFn: () => listAgentMessages(sessionId),
+    queryFn: () => listAgentMessages(sessionId, { limit: 500 }),
     enabled: statusQuery.isError,
     retry: false,
   });
@@ -345,7 +348,7 @@ export default function GitPanel({
   if (statusQuery.isError) {
     return (
       <div className="overflow-y-auto p-2">
-        <FallbackGitStatus messages={messagesQuery.data ?? []} />
+        <FallbackGitStatus messages={messagesQuery.data?.messages ?? []} />
       </div>
     );
   }

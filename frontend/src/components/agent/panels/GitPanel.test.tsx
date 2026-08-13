@@ -140,26 +140,29 @@ M  src/lib.rs
 
   it('falls back to cached git_status tool result when status API errors', async () => {
     vi.mocked(getAgentGitStatus).mockRejectedValue(new Error('503 offline'));
-    vi.mocked(listAgentMessages).mockResolvedValue([
-      {
-        id: 'm1',
-        session_id: 's1',
-        role: 'tool',
-        content: ' M src/main.rs\n?? notes.md',
-        name: 'git_status',
-        kind: 'tool_result',
-        created_at: '',
-      },
-      {
-        id: 'm2',
-        session_id: 's1',
-        role: 'assistant',
-        content: 'some unrelated text',
-        name: null,
-        kind: 'text',
-        created_at: '',
-      },
-    ]);
+    vi.mocked(listAgentMessages).mockResolvedValue({
+      messages: [
+        {
+          id: 'm1',
+          session_id: 's1',
+          role: 'tool',
+          content: ' M src/main.rs\n?? notes.md',
+          name: 'git_status',
+          kind: 'tool_result',
+          created_at: '',
+        },
+        {
+          id: 'm2',
+          session_id: 's1',
+          role: 'assistant',
+          content: 'some unrelated text',
+          name: null,
+          kind: 'text',
+          created_at: '',
+        },
+      ],
+      has_more: false,
+    });
 
     renderPanel();
     expect(await screen.findByText(/src\/main\.rs/)).toBeTruthy();

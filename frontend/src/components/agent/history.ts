@@ -19,8 +19,11 @@ interface CallRecord {
  *  会把行数放大、多跳掉没有重复副本的合法旧行）。改为内容匹配：对每个 summary，
  *  以「summary 后紧跟的重插段」为模板，从 summary 前紧邻行向前找等长且逐行全等
  *  （kind/role/content/tool_calls/tool_call_id/name）的连续段——重插段是 kept 段
- *  原样复制，故 summary 前必存在这样一段原件。 */
-function compactionSkippedIndices(history: AgentMessage[]): Set<number> {
+ *  原样复制，故 summary 前必存在这样一段原件。
+ *
+ *  导出供分页「加载更早消息」复用：新页 + 已加载页拼成完整集合算 skip，再把落在
+ *  新页范围内的下标过滤出来，跳过跨页压缩重插的原件（见 ChatStream 的 prepend）。 */
+export function compactionSkippedIndices(history: AgentMessage[]): Set<number> {
   const normNull = (v: unknown) => (v === undefined ? null : v);
   const rowEquals = (a: AgentMessage, b: AgentMessage) =>
     a.kind === b.kind &&
@@ -71,7 +74,30 @@ function compactionSkippedIndices(history: AgentMessage[]): Set<number> {
  *  - 旧格式合并行（kind==='tool'||role==='tool'）与 runner 旧格式（tool_call_id
  *    列为空、JSON 内带 id）没有 tool_call_id 列值可去重，走原路径。 */
 export function historyToChatItems(history: AgentMessage[]): ChatItem[] {
-  const skip = compactionSkippedIndices(history);
+  return historyToChatItemsWithSkip(history, compactionSkippedIndices(history));
+}
+
+/** 分页「加载更早」去重：对「新页 + 已加载页」的完整集合算压缩重插 skip，再只取
+ *  落在新页范围内的下标。跨页压缩重插（kept 段原样复制）的原件若在新页、重插副本
+ *  在已加载页，只有在此完整集合上匹配才跳得掉；已加载页内的 skip 在首次装载时
+ *  已生效，忽略。返回可直接传给 `historyToChatItemsWithSkip(newRows, ...)` 的集合。 */
+export function prependSkip(newRows: AgentMessage[], loadedRows: AgentMessage[]): Set<number> {
+  const combined = [...newRows, ...loadedRows];
+  const skip = compactionSkippedIndices(combined);
+  const local = new Set<number>();
+  for (const i of skip) {
+    if (i < newRows.length) local.add(i);
+  }
+  return local;
+}
+
+/** 带预计算 skip 集合的转换：供分页「加载更早」使用。`skip` 是对 `history` 的
+ *  压缩重插去重下标集（通常由 `compactionSkippedIndices` 在**完整已加载集合**上
+ *  计算后过滤出本页范围），与 `historyToChatItems` 内部自动计算的语义一致。 */
+export function historyToChatItemsWithSkip(
+  history: AgentMessage[],
+  skip: Set<number>,
+): ChatItem[] {
   // 新格式：kind='tool_calls' 行的原始调用记录，按 tool_call_id 关联 args；
   // 同时保留 ACP 新格式的 tool_kind/diffs/locations 供 tool_result 行合并
   const callArgs = new Map<string, CallRecord>();

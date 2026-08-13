@@ -587,6 +587,73 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
+
+    /// 分页读取会话消息（游标翻页）。排序语义与 [`Self::agent_list_messages`] 一致
+    /// （按 rowid/插入顺序）：无 `before_id` 时取最近 `limit` 条；带 `before_id`
+    /// 时取该消息**之前**（rowid 更小）的最近 `limit` 条，返回均按升序。
+    ///
+    /// 返回 `(messages, has_more)`：`has_more` 表示游标之前（或最旧一条之前）
+    /// 是否还有更早的消息。`limit` 由调用方 clamp（默认 200、上限 500）。
+    ///
+    /// 游标语义：`before_id` 指向的消息本身**不**包含在返回里；指向不存在的 id
+    /// 或不属于本会话的 id 时返回空页且 `has_more = false`。has_more 用「多取一条
+    /// （limit+1）」判断：拿到 limit+1 条说明还有更早的没取完。
+    pub async fn agent_list_messages_page(
+        &self,
+        session_id: &str,
+        before_id: Option<&str>,
+        limit: i64,
+    ) -> Result<(Vec<AgentMessageRecord>, bool), sqlx::Error> {
+        // 游标解析：before_id → 该消息的 rowid（rowid < before 即「更早」）。
+        let before_rowid = match before_id {
+            Some(id) => {
+                let rowid: Option<i64> = sqlx::query_scalar(
+                    "SELECT rowid FROM agent_messages WHERE session_id = ? AND id = ?",
+                )
+                .bind(session_id)
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+                match rowid {
+                    Some(r) => Some(r),
+                    None => return Ok((Vec::new(), false)),
+                }
+            }
+            None => None,
+        };
+
+        let fetch = limit + 1; // 多取一条判断 has_more
+        let rows: Vec<AgentMessageRecord> = match before_rowid {
+            Some(r) => {
+                sqlx::query_as::<_, AgentMessageRecord>(
+                    "SELECT * FROM agent_messages WHERE session_id = ? AND rowid < ? \
+                     ORDER BY rowid DESC LIMIT ?",
+                )
+                .bind(session_id)
+                .bind(r)
+                .bind(fetch)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, AgentMessageRecord>(
+                    "SELECT * FROM agent_messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?",
+                )
+                .bind(session_id)
+                .bind(fetch)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        let has_more = rows.len() as i64 > limit;
+        let mut msgs = if has_more {
+            rows.into_iter().take(limit as usize).collect::<Vec<_>>()
+        } else {
+            rows
+        };
+        msgs.reverse(); // 倒序取回 → 升序返回
+        Ok((msgs, has_more))
+    }
 }
 
 #[cfg(test)]
@@ -878,6 +945,154 @@ mod tests {
         // 删除会话级联删除消息
         db.agent_delete_session("s1").await.unwrap();
         assert!(db.agent_list_messages("s1").await.unwrap().is_empty());
+    }
+
+    /// 分页测试种子：插入 n 条 user 消息，id 从 `start` 起连续编号 m{start}..m{start+n-1}
+    /// （rowid 升序、id 数值后缀与序号一致）。
+    async fn seed_messages_from(db: &Database, session_id: &str, start: i64, n: i64) {
+        for i in start..start + n {
+            db.agent_add_message(
+                &format!("m{i}"),
+                session_id,
+                "user",
+                &format!("msg {i}"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// 解析 id 的数值后缀（m{n} → n），供按 rowid 顺序断言使用。
+    fn msg_seq(id: &str) -> i64 {
+        id.trim_start_matches('m').parse::<i64>().unwrap()
+    }
+
+    /// 无参取最近 N 条（升序、has_more）+ 带 before 翻页取更早一页。
+    #[tokio::test]
+    async fn test_message_page_last_n_and_before() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        seed_messages_from(&db, "s1", 0, 250).await;
+
+        // 无 before：最近 200 条（m50..m249），升序，has_more=true
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
+        assert!(has_more, "250 > 200 应还有更早消息");
+        assert_eq!(msgs.len(), 200);
+        assert_eq!(msgs.first().unwrap().id, "m50");
+        assert_eq!(msgs.last().unwrap().id, "m249");
+        assert!(
+            msgs.windows(2).all(|w| msg_seq(&w[0].id) < msg_seq(&w[1].id)),
+            "返回必须按 rowid（插入顺序）升序"
+        );
+
+        // 带 before 翻页：m50 之前还有 50 条 → 全量返回、has_more=false
+        let (msgs, has_more) = db.agent_list_messages_page("s1", Some("m50"), 200).await.unwrap();
+        assert!(!has_more);
+        assert_eq!(msgs.len(), 50);
+        assert_eq!(msgs.first().unwrap().id, "m0");
+        assert_eq!(msgs.last().unwrap().id, "m49");
+
+        // 翻页中间一页：before=m150 → 取 m50..m149（正好 100 条），has_more=true
+        let (msgs, has_more) = db
+            .agent_list_messages_page("s1", Some("m150"), 100)
+            .await
+            .unwrap();
+        assert!(has_more, "m150 之前还有 150 条");
+        assert_eq!(msgs.len(), 100);
+        assert_eq!(msgs.first().unwrap().id, "m50");
+        assert_eq!(msgs.last().unwrap().id, "m149");
+    }
+
+    /// has_more 边界：恰好等于 limit / 少于 limit / limit 超过总数。
+    #[tokio::test]
+    async fn test_message_page_has_more_boundary() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        // 少于 limit：50 条、limit=200 → 全量、has_more=false
+        seed_messages_from(&db, "s1", 0, 50).await;
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
+        assert!(!has_more);
+        assert_eq!(msgs.len(), 50);
+        assert_eq!(msgs.first().unwrap().id, "m0");
+
+        // 恰好等于 limit：再补到 200 条、limit=200 → has_more=false
+        seed_messages_from(&db, "s1", 50, 150).await; // 现在共 200 条（m0..m199）
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
+        assert!(!has_more, "恰好等于 limit 不应有更多");
+        assert_eq!(msgs.len(), 200);
+
+        // limit+1 条：再补 1 条 → has_more=true，且只返回最近 limit 条
+        seed_messages_from(&db, "s1", 200, 1).await; // 现在共 201 条
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
+        assert!(has_more);
+        assert_eq!(msgs.len(), 200);
+        assert_eq!(msgs.first().unwrap().id, "m1", "最旧一条 m0 被排除");
+
+        // limit 超过总数：300 条、limit=500 → 全量、has_more=false
+        seed_messages_from(&db, "s1", 201, 99).await; // 现在共 300 条
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 500).await.unwrap();
+        assert!(!has_more);
+        assert_eq!(msgs.len(), 300);
+    }
+
+    /// 空会话与游标指向不存在的 id：都返回空页且 has_more=false。
+    #[tokio::test]
+    async fn test_message_page_empty_and_missing_cursor() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+
+        // 空会话
+        let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
+        assert!(msgs.is_empty());
+        assert!(!has_more);
+
+        // before 指向不存在的 id
+        seed_messages_from(&db, "s1", 0, 10).await;
+        let (msgs, has_more) = db
+            .agent_list_messages_page("s1", Some("no-such-id"), 200)
+            .await
+            .unwrap();
+        assert!(msgs.is_empty());
+        assert!(!has_more);
+
+        // before 指向属于其他会话的 id：视为游标不存在 → 空页、has_more=false
+        db.agent_create_session("s2", "w1", None, None).await.unwrap();
+        db.agent_add_message("other-x", "s2", "user", "other", None)
+            .await
+            .unwrap();
+        let (msgs, has_more) = db
+            .agent_list_messages_page("s1", Some("other-x"), 200)
+            .await
+            .unwrap();
+        assert!(msgs.is_empty(), "s2 的 other-x 不能作为 s1 的游标");
+        assert!(!has_more);
+
+        // 正常游标：s1 的 m5 → 返回 m0..m4（m5 本身不含）
+        let (msgs, has_more) = db
+            .agent_list_messages_page("s1", Some("m5"), 200)
+            .await
+            .unwrap();
+        assert_eq!(msgs.len(), 5, "m5 之前的 5 条（m0..m4）");
+        assert_eq!(msgs.first().unwrap().id, "m0");
+        assert_eq!(msgs.last().unwrap().id, "m4");
+        assert!(!has_more);
     }
 
     /// 插入顺序 ≠ created_at 顺序时，列表必须按插入顺序（rowid）返回。
