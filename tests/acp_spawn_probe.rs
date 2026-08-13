@@ -72,7 +72,7 @@ async fn acp_spawn_baseline() {
 
         let t0 = Instant::now();
         bridge
-            .ensure_session("sess-acp", &ws, ws_tx)
+            .ensure_session("sess-acp", &ws, ws_tx, 1)
             .await
             .expect("ensure_session");
         println!("[probe] ensure_session (full pipeline): {:?}", t0.elapsed());
@@ -123,7 +123,7 @@ async fn acp_spawn_with_config_injection() {
 
         let t0 = Instant::now();
         bridge
-            .ensure_session("sess-acp", &ws, ws_tx)
+            .ensure_session("sess-acp", &ws, ws_tx, 1)
             .await
             .expect("ensure_session");
         println!(

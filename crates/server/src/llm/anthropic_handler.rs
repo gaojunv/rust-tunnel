@@ -1,3 +1,4 @@
+#[cfg(test)]
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -6,7 +7,6 @@ use axum::Json;
 use serde_json::{json, Value};
 
 use super::openai_handler::LlmHandlerState;
-use super::router::resolve_with_failover;
 use super::{ChatCompletionRequest, ChatMessage};
 
 /// 拆解 Anthropic 消息 content 字段的结果。
@@ -329,65 +329,38 @@ pub async fn handle_messages(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     // Validate API key
-    let auth = match super::auth::authenticate(&state.llm, &headers).await {
-        Some(a) => a,
-        None => {
-            // 记录认证失败
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    protocol: "anthropic".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
-            }
-            return state.error_for_protocol(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key".into(),
-                "authentication_error",
-            );
-        }
-    };
-    let (api_key_id, api_key_name) = auth;
+    let (api_key_id, api_key_name) =
+        match super::pipeline::authenticate_or_reject(&state, &headers, "anthropic").await {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
 
     // 提取 model 名用于路由解析
-    let model = match body.get("model").and_then(|v| v.as_str()) {
-        Some(m) => m.to_string(),
-        None => {
-            // 记录请求错误（缺少 model）
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    api_key_id: Some(api_key_id.clone()),
-                    api_key_name: api_key_name.clone(),
-                    protocol: "anthropic".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
-            }
-            return state.error_for_protocol(
-                StatusCode::BAD_REQUEST,
-                "model is required".into(),
-                "invalid_request_error",
-            );
-        }
+    let model = match super::pipeline::extract_model_or_reject(
+        &state,
+        &body,
+        &api_key_id,
+        &api_key_name,
+        "anthropic",
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
 
     // Resolve model → 候选链（模型组故障转移）
-    let chain = match resolve_with_failover(&state.llm, &model).await {
+    let chain = match super::pipeline::resolve_chain_or_reject(
+        &state,
+        &model,
+        &api_key_id,
+        &api_key_name,
+        "anthropic",
+    )
+    .await
+    {
         Ok(c) => c,
-        Err(e) => {
-            // 记录路由失败到用量日志
-            if let Some(ref db) = state.llm.db {
-                let ctx = super::usage::UsageContext {
-                    api_key_id: Some(api_key_id.clone()),
-                    api_key_name: api_key_name.clone(),
-                    requested_model: model.clone(),
-                    protocol: "anthropic".into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 404, "model_resolution_error", std::time::Instant::now());
-            }
-            return super::router::resolve_error_response(&state.llm, e).await;
-        }
+        Err(resp) => return resp,
     };
     // 首选候选：provider 级配置（compat 开关 / anthropic_base_url 直通判定）以首选为准——
     // RAG/compat 改写在循环外只做一次，`execute_with_failover` 循环内仅 clone body + 改 model。
@@ -510,230 +483,64 @@ pub async fn handle_messages(
     let mut request = request;
     request.model = actual_model;
 
-    // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
-    // 直通路径（anthropic_base_url 分支）不注入 —— 规格边界。
-    #[allow(unused_mut, reason = "assigned only inside the rag-gated inject block")]
-    let mut rag_injected: i64 = 0;
-    #[cfg(feature = "rag")]
-    if let Some(ref db) = db {
-        if let Ok(Some(kb_id)) = db.rag_get_kb_id_for_api_key(&api_key_id_for_rag).await {
-            let outcome = super::rag::enhance(
-                db,
-                &state.llm.rag_store,
-                state.llm.cipher.as_ref(),
-                &kb_id,
-                &mut request,
-            )
-            .await;
-            rag_injected = outcome.injected as i64;
-        }
-    }
-    if rag_injected > 0 {
-        ctx.rag_chunks_injected = Some(rag_injected);
-        // 改写回写:raw_body 是透传基底,这里保证上行的是 RAG/compat 改写后的 messages。
-        if let Some(raw) = request.raw_body.as_mut() {
-            if let Ok(v) = serde_json::to_value(&request.messages) {
-                raw["messages"] = v;
-            }
-        }
-    }
-
     let compat_enabled =
         super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
-    if compat_enabled {
-        super::compat::rewrite_tool_history(&mut request.messages);
-        super::compat::inject_tool_call_guidance(&mut request.messages);
-        // 改写回写:与 RAG 相同,保证上行的是改写后的 messages。
-        if let Some(raw) = request.raw_body.as_mut() {
-            if let Ok(v) = serde_json::to_value(&request.messages) {
-                raw["messages"] = v;
-            }
-        }
-    }
 
-    // 构造完整上游请求体（Anthropic→OpenAI 转换 + RAG + compat 改写后的最终内容），
-    // 写日志后发送，保证日志与实际发送内容一致。
-    let req_body = super::upstream::build_upstream_body(&request);
-    super::log_llm_request(
-        &state.llm,
-        "anthropic",
-        &request.model,
-        request.messages.len(),
-        request.tools.is_some(),
-        request.stream,
-        None,
-        None,
-        0,
-        &req_body,
-    )
-    .await;
-    let outcome = super::upstream::execute_with_failover(
-        &state.llm.breakers,
-        &chain,
-        &req_body,
-        request.stream,
-    )
-    .await;
-    match outcome {
-        super::upstream::FailoverOutcome::Success {
-            resp,
-            candidate,
-            failed_over,
-        } => {
-            // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
-            if failed_over {
-                ctx.provider_id = Some(candidate.provider.id.clone());
-                ctx.provider_name = candidate.provider.name.clone();
-                ctx.model_id = Some(candidate.model_id.clone());
-                ctx.model_name = candidate.model_name.clone();
-                ctx.failover_from = Some(first_candidate.model_name.clone());
-            }
-            let elapsed_ms = started.elapsed().as_millis();
-            super::log_llm_request(
-                &state.llm,
-                "anthropic",
-                &ctx.model_name,
-                request.messages.len(),
-                request.tools.is_some(),
-                request.stream,
-                Some(200),
-                None,
-                elapsed_ms,
-                &req_body,
-            )
-            .await;
-            // 回退路径：上游是 OpenAI 格式，先做 compat 后处理（伪工具调用还原），
-            // 再转成 Anthropic 格式。非流式整体转换会消费 body，因此转换后再包一层。
-            let resp = if compat_enabled {
-                if request.stream {
-                    // compat 模式：流式路径同样先解析伪工具调用，
-                    // 再转成 Anthropic SSE 事件流。
-                    super::openai_handler::rewrite_pseudo_tool_calls_in_stream(resp).await
-                } else {
-                    // compat 模式：先解析伪工具调用还原为结构化 tool_calls，
-                    // 再转成 Anthropic 格式（Anthropic 的 tool_use 块）。
-                    super::openai_handler::rewrite_pseudo_tool_calls_in_response(resp).await
-                }
-            } else {
-                resp
-            };
-            let resp = if request.stream {
-                convert_openai_stream_to_anthropic(resp)
-            } else {
-                convert_openai_to_anthropic_response(resp).await
-            };
-            super::usage::wrap_and_record(resp, ctx, db, started).await
-        }
-        super::upstream::FailoverOutcome::Exhausted {
-            status,
-            message: msg,
-            failed_over,
-        } => {
-            let elapsed_ms = started.elapsed().as_millis();
-            super::log_llm_request(
-                &state.llm,
-                "anthropic",
-                &request.model,
-                request.messages.len(),
-                request.tools.is_some(),
-                request.stream,
-                Some(status.as_u16()),
-                Some(&msg),
-                elapsed_ms,
-                &req_body,
-            )
-            .await;
-            // 全部候选失败：记录失败请求到用量日志
+    // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
+    // 直通路径（anthropic_base_url 分支）不注入 —— 规格边界。
+    let kb_id_for_rag: Option<String> = {
+        #[cfg(feature = "rag")]
+        {
             if let Some(ref db) = db {
-                // 全部候选失败但实际尝试过转移：failover_from 记首选（被跳过的）模型名
-                if failed_over {
-                    ctx.failover_from = Some(first_candidate.model_name.clone());
-                }
-                ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
-            }
-            state.error_for_protocol(status, msg, "upstream_error")
-        }
-    }
-}
-
-/// 流式：把上游 OpenAI SSE 响应体逐 chunk 转换为 Anthropic SSE 事件流。
-fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
-    use futures_util::StreamExt;
-
-    let byte_stream = openai_resp.into_body().into_data_stream();
-    let translator = std::sync::Arc::new(std::sync::Mutex::new(
-        super::format::AnthropicSseTranslator::new(),
-    ));
-    let out = byte_stream.filter_map(move |chunk| {
-        let translator = translator.clone();
-        async move {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = translator.lock().unwrap().push(&bytes);
-                    if converted.is_empty() {
-                        None
-                    } else {
-                        Some(Ok(converted))
-                    }
-                }
-                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+                db.rag_get_kb_id_for_api_key(&api_key_id_for_rag)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
             }
         }
-    });
+        #[cfg(not(feature = "rag"))]
+        {
+            None
+        }
+    };
+    super::pipeline::inject_rag_and_compat(
+        &state.llm,
+        db.as_ref(),
+        kb_id_for_rag,
+        compat_enabled,
+        &mut request,
+        &mut ctx,
+    )
+    .await;
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "keep-alive")
-        .body(Body::from_stream(out))
-        .unwrap()
+    let message_count = request.messages.len();
+    let has_tools = request.tools.is_some();
+    let prepared = super::pipeline::PreparedRequest {
+        request,
+        message_count,
+        has_tools,
+        compat_enabled,
+    };
+    super::pipeline::run_execution(
+        &state,
+        "anthropic",
+        prepared,
+        &chain,
+        &first_candidate.model_name,
+        ctx,
+        db,
+        started,
+        super::pipeline::ResponsePostProcess::ToAnthropic,
+    )
+    .await
 }
 
 /// 测试专用：暴露流式 OpenAI→Anthropic 转换，供跨模块端到端测试使用。
 #[cfg(test)]
 pub(crate) fn convert_openai_stream_to_anthropic_for_test(openai_resp: Response) -> Response {
-    convert_openai_stream_to_anthropic(openai_resp)
-}
-
-/// Convert OpenAI chat completion response to Anthropic Messages format.
-async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
-    let status = openai_resp.status();
-    // 上限与 compat 非流式改写路径一致（16MB）。超限时 to_bytes 返回 Err，
-    // 必须返回 502 而非静默丢弃 body 后透传原始状态码——否则客户端会拿到
-    // "200 + 空内容"的假象，整段生成结果丢失。
-    let body_bytes = match axum::body::to_bytes(openai_resp.into_body(), 16 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "text/plain; charset=utf-8")
-                .body(Body::from(format!(
-                    "failed to read upstream response (too large or read error): {e}"
-                )))
-                .unwrap();
-        }
-    };
-
-    let openai: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(_) => {
-            return Response::builder()
-                .status(status)
-                .header("Content-Type", "application/json")
-                .body(Body::from(body_bytes))
-                .unwrap();
-        }
-    };
-
-    // Build Anthropic-format response
-    let anthropic_resp = super::format::openai_response_to_anthropic(&openai);
-
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&anthropic_resp).unwrap()))
-        .unwrap()
+    super::format::convert_openai_stream_to_anthropic(openai_resp)
 }
 
 #[cfg(test)]
@@ -1158,7 +965,7 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&openai_body).unwrap()))
             .unwrap();
 
-        let converted = convert_openai_to_anthropic_response(resp).await;
+        let converted = crate::llm::format::convert_openai_to_anthropic_response(resp).await;
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1179,7 +986,7 @@ mod tests {
             .body(Body::from(oversized))
             .unwrap();
 
-        let converted = convert_openai_to_anthropic_response(resp).await;
+        let converted = crate::llm::format::convert_openai_to_anthropic_response(resp).await;
         assert_eq!(converted.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
@@ -1205,7 +1012,7 @@ mod tests {
             .body(Body::from(upstream_sse))
             .unwrap();
 
-        let converted = convert_openai_stream_to_anthropic(resp);
+        let converted = crate::llm::format::convert_openai_stream_to_anthropic(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();

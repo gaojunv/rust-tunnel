@@ -5,6 +5,7 @@ pub mod compat;
 pub mod crypto;
 pub mod format;
 pub mod openai_handler;
+pub mod pipeline;
 pub mod provider;
 #[cfg(feature = "rag")]
 pub mod rag;
