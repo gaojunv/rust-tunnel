@@ -203,10 +203,13 @@ export default function AgentPage() {
     setShowWorkspaceDialog(true);
   };
 
-  // 高度 = 100dvh - Header(h-14 + 1px border = 3.5rem+1px) - 内容区上下 padding(mobile py-3=1.5rem / md py-6=3rem)。
-  // -2px 留余量：3856cfc 调小高度时少减了 1px，导致外层 ScrollArea 出现整页滚动条。
+  // 高度由外层布局决定：AppLayout 对 /agent 路由走非滚动分支（h-dvh → flex-1 →
+  // h-full 高度链），本页用 h-full 精确填满 Header 以下剩余空间。此前用
+  // calc(100dvh-…) 视口单位拼凑高度，移动端 100dvh 与外层 100vh 不一致（地址栏
+  // 动态变化）会导致 AgentPage 高出外层剩余空间 → 外层 ScrollArea 与消息区叠出
+  // 双重滚动条（历史：5ad703a 修过一次仍复发）。
   return (
-    <div className="flex h-[calc(100dvh-5rem-2px)] min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:h-[calc(100dvh-6.5rem-2px)] md:min-h-[480px]">
+    <div className="flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
       {/* 顶栏：logo + WorkspaceBar + SessionBar */}
       <div className="flex flex-wrap items-center gap-2 border-b border-border/60 p-1.5 md:flex-nowrap md:p-2">
         <Sparkles className="h-4 w-4 shrink-0 text-primary" />
