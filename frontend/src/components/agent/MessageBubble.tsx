@@ -1,6 +1,7 @@
 import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  ArrowRightLeft,
   Brain,
   ChevronDown,
   ChevronUp,
@@ -11,6 +12,7 @@ import {
   Pencil,
   Search,
   TerminalSquare,
+  Trash2,
   Wrench,
 } from 'lucide-react';
 import type { ChatItem, ToolKind, PlanEntryItem } from './types';
@@ -112,19 +114,38 @@ function toolSummary(
   return null;
 }
 
-/** toolKind → 图标（视觉分类；未知/缺省一律 Wrench）。 */
-const KIND_ICON: Record<ToolKind, typeof Wrench> = {
-  read: FileText,
-  edit: Pencil,
-  delete: Pencil,
-  move: Pencil,
-  search: Search,
-  execute: TerminalSquare,
-  think: Brain,
-  fetch: Globe,
-  switch_mode: Wrench,
-  other: Wrench,
+/** toolKind → 图标 + 语义色 chip 样式。
+ *  每种工具类别配独立色相，用户扫一眼图标颜色即可分辨"这次动作是什么"
+ *  （读=sky / 写=amber / 删=red / 移=violet / 搜=teal / 执行=emerald /
+ *  思考=purple / 抓取=cyan）；switch_mode/缺省归类为"系统动作"，用 muted
+ *  灰不抢视觉。chip 采用「淡色圆角底 + 彩色图标」：颜色只是类别标签而非
+ *  状态（状态交给徽章 ✓/✗/转圈），底/字双配 light/dark 两套色保证可读。 */
+const KIND_STYLE: Record<ToolKind, { icon: typeof Wrench; chipClass: string; iconClass: string }> = {
+  read: { icon: FileText, chipClass: 'bg-sky-500/10', iconClass: 'text-sky-600 dark:text-sky-400' },
+  edit: { icon: Pencil, chipClass: 'bg-amber-500/10', iconClass: 'text-amber-600 dark:text-amber-400' },
+  delete: { icon: Trash2, chipClass: 'bg-red-500/10', iconClass: 'text-red-600 dark:text-red-400' },
+  move: { icon: ArrowRightLeft, chipClass: 'bg-violet-500/10', iconClass: 'text-violet-600 dark:text-violet-400' },
+  search: { icon: Search, chipClass: 'bg-teal-500/10', iconClass: 'text-teal-600 dark:text-teal-400' },
+  execute: { icon: TerminalSquare, chipClass: 'bg-emerald-500/10', iconClass: 'text-emerald-600 dark:text-emerald-400' },
+  think: { icon: Brain, chipClass: 'bg-purple-500/10', iconClass: 'text-purple-600 dark:text-purple-400' },
+  fetch: { icon: Globe, chipClass: 'bg-cyan-500/10', iconClass: 'text-cyan-600 dark:text-cyan-400' },
+  // 系统动作（切换模式/未知）：muted 灰 + bg-muted 底，不参与语义色
+  switch_mode: { icon: Wrench, chipClass: 'bg-muted', iconClass: 'text-muted-foreground' },
+  other: { icon: Wrench, chipClass: 'bg-muted', iconClass: 'text-muted-foreground' },
 };
+
+/** 把 kind 渲染为「淡色圆角底 + 彩色图标」的小 chip：头部图标位统一用 chip，
+ *  未知/缺省 kind 落到 other（Wrench 灰）。ThoughtBubble 复用 think 条目保证
+ *  思考语义色与工具卡一致。 */
+function KindChip({ kind }: { kind: ToolKind }) {
+  const style = KIND_STYLE[kind] ?? KIND_STYLE.other;
+  const Icon = style.icon;
+  return (
+    <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md ${style.chipClass}`}>
+      <Icon className={`h-3 w-3 ${style.iconClass}`} />
+    </span>
+  );
+}
 
 /** toolKind → 规范显示名 + title 别名表。ACP 各 agent 上报的 title 形态不一
  *  （"Read File"/"Read"/"Edit src/a.ts"/命令本体），统一按 kind 归一为规范名，
@@ -215,7 +236,6 @@ export function ToolCard({ item }: { item: ChatItem }) {
     item.toolDiffs?.[0]?.path ??
     item.toolLocations?.[0]?.path ??
     null;
-  const Icon = KIND_ICON[item.toolKind ?? 'other'] ?? Wrench;
   const status = resolveToolStatus(item);
   const isError = status === 'failed';
   // 不确定进度条：工具仍在执行（pending/in_progress/running，result 未产出）时
@@ -230,7 +250,7 @@ export function ToolCard({ item }: { item: ChatItem }) {
         className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        <Icon className="h-3.5 w-3.5 shrink-0 text-primary" />
+        <KindChip kind={item.toolKind ?? 'other'} />
         <span className="font-medium text-foreground/90">{label}</span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-muted-foreground">{summary}</span>
@@ -348,7 +368,8 @@ function ThoughtBubble({ content, streaming }: { content: string; streaming?: bo
         className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        <Brain className="h-3.5 w-3.5 shrink-0 text-primary" />
+        {/* 思考气泡的 Brain 与工具 kind=think 语义一致，复用其紫色 chip */}
+        <KindChip kind="think" />
         <span className="font-medium text-foreground/90">{t('agent.thought')}</span>
         {!open && preview && (
           <span className="min-w-0 truncate text-muted-foreground">{preview}</span>
