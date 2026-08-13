@@ -242,7 +242,7 @@ export default function AgentPage() {
         />
       )}
 
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 pb-12 md:pb-0">
         {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例） */}
         {tabs.active && (
           <ActivityBar
