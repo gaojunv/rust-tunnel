@@ -1,0 +1,105 @@
+name: Deploy Server (No Artifacts)
+
+# 单 job 构建 + 部署：不使用 Artifact，避免存储配额问题
+# 手动触发；如需 tag 触发可取消下方注释（注意与 release-server.yml 的 tag 触发会重复部署）
+on:
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - 'v*'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------- 前端 ----------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache node_modules and npm
+        uses: actions/cache@v4
+        with:
+          path: |
+            frontend/node_modules
+            ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Build frontend and stage for embedding
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          cd ..
+          rm -rf frontend-dist
+          cp -r frontend/dist frontend-dist
+
+      # ---------- 后端 ----------
+      - name: Install Rust with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Install musl tools
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: musl-tools
+          version: 1.0
+
+      - name: Build server (static linking with musl)
+        run: |
+          cargo build --release -p rust-tunnel-server --target x86_64-unknown-linux-musl --features rag,embed-frontend
+          strip target/x86_64-unknown-linux-musl/release/rust-tunnel-server
+          cp target/x86_64-unknown-linux-musl/release/rust-tunnel-server ./rust-tunnel-server
+
+      # ---------- 部署 ----------
+      - name: Generate config from template
+        run: |
+          sed \
+            -e "s|\${ADMIN_PASSWORD}|${{ secrets.ADMIN_PASSWORD }}|g" \
+            -e "s|\${CLIENT_AUTH_TOKEN}|${{ secrets.CLIENT_AUTH_TOKEN }}|g" \
+            -e "s|\${SS_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
+            -e "s|\${TROJAN_PASSWORD}|${{ secrets.SS_PASSWORD }}|g" \
+            contrib/config.toml.template > config.toml
+
+      - name: Deploy files to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: "./rust-tunnel-server,./contrib/rust-tunnel-server.service,./config.toml"
+          target: ${{ secrets.DEPLOY_PATH }}
+
+      - name: Install config, service and restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            # 安装配置文件
+            sudo mkdir -p /etc/rust-tunnel
+            sudo cp ${{ secrets.DEPLOY_PATH }}/config.toml /etc/rust-tunnel/config.toml
+
+            # 安装 systemd service 文件
+            sudo cp ${{ secrets.DEPLOY_PATH }}/contrib/rust-tunnel-server.service /etc/systemd/system/rust-tunnel-server.service
+            sudo systemctl daemon-reload
+
+            # 重启服务
+            sudo systemctl restart rust-tunnel-server
