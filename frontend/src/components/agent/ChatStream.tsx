@@ -1258,7 +1258,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 onChange={sendConfigOption}
                 placeholder={configOptions.length > 0 && !effortOption}
               />
-              {running && (
+              {/* 发送/暂停互斥（Claude Code 风格）：运行中仅显示停止按钮，
+                  空闲时仅显示发送按钮，二者不并存。运行中输入框仍可编辑草稿，
+                  需先停止当前回合才能发送新消息。 */}
+              {running ? (
                 <Button
                   onClick={stop}
                   size="sm"
@@ -1268,17 +1271,18 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 >
                   <Square className="h-4 w-4 fill-current" />
                 </Button>
+              ) : (
+                <Button
+                  onClick={send}
+                  disabled={!input.trim() || hasPendingInteraction}
+                  size="sm"
+                  variant="ghost"
+                  aria-label={t('agent.send')}
+                  className="h-8 w-8 rounded-full p-0"
+                >
+                  <SendHorizontal className="h-4 w-4" />
+                </Button>
               )}
-              <Button
-                onClick={send}
-                disabled={!input.trim() || hasPendingInteraction}
-                size="sm"
-                variant="ghost"
-                aria-label={t('agent.send')}
-                className="h-8 w-8 rounded-full p-0"
-              >
-                <SendHorizontal className="h-4 w-4" />
-              </Button>
             </div>
           </div>
         </div>

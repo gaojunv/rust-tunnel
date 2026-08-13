@@ -564,7 +564,7 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
     expect(screen.getByText('agent.running')).toBeTruthy();
-    // 停止按钮（aria-label = t('agent.stop')）：running 期间与发送按钮并存
+    // 停止按钮（aria-label = t('agent.stop')）：running 期间替换发送按钮（互斥）
     const stopBtn = screen.getByRole('button', { name: 'agent.stop' });
     expect(stopBtn).toBeTruthy();
     // 捕获当前活跃连接：i18n mock 的 t 每次渲染返回新引用 → armRunning（WS effect
@@ -581,28 +581,25 @@ describe('ChatStream running state', () => {
     expect(screen.getByText(/agent.stopped/)).toBeTruthy();
   });
 
-  it('keeps send button usable while running (queues instead of dropping)', async () => {
+  it('running 时发送按钮被停止按钮替换，二者互斥不并存（Claude Code 风格）', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
-    // 进入 running：回合进行中用户仍可提交消息（服务端 busy 时排队，回 queued 帧）
+    // 空闲：仅发送按钮可见，无停止按钮
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    // 进入 running：发送按钮消失，仅剩停止按钮
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
     expect(screen.getByText('agent.running')).toBeTruthy();
-    // 停止按钮与发送按钮并存
     expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
-    const sendBtn = screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement;
-    // 无输入时发送按钮仍禁用
-    expect(sendBtn.disabled).toBe(true);
-    // 输入后可用
-    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '排队消息' } });
-    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
-    // 点击发送：照常发 user_message 帧（服务端 busy 会排队而非丢弃）
-    const ws = wsInstance!;
-    fireEvent.click(screen.getByRole('button', { name: 'agent.send' }));
-    expect(ws.sent.some((s) => s.includes('"type":"user_message"') && s.includes('排队消息'))).toBe(true);
-    // running 状态保持（当前回合仍在服务端执行）
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.send' })).toBeNull();
+    // 结束回合（done）：停止按钮消失，发送按钮回归
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
   });
 
   it('shows queued hint on queued frame while running', async () => {
