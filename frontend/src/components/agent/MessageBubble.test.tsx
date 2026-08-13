@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import MessageBubble, { resolveToolStatus } from './MessageBubble';
+import MessageBubble, { CollapsiblePre, resolveToolStatus } from './MessageBubble';
 import type { ChatItem } from './types';
 
 vi.mock('react-i18next', () => ({
@@ -59,6 +59,62 @@ describe('MessageBubble tool output collapsing', () => {
     render(<MessageBubble item={{ kind: 'user', content: 'hello' }} />);
     expect(screen.getByText('hello')).toBeTruthy();
     expect(screen.queryByText(/agent.expandLines/)).toBeNull();
+  });
+});
+
+describe('CollapsiblePre character limit protection', () => {
+  afterEach(cleanup);
+
+  it('truncates a single-line text longer than MAX_CHARS (no newlines) with an expand button', () => {
+    const longLine = 'a'.repeat(9000);
+    render(<CollapsiblePre text={longLine} />);
+    const pre = document.querySelector('pre');
+    // 前 8000 字符 + 省略标记：超长单行（无换行，行数=1 不触发行折叠）也被字符保护截断
+    expect(pre?.textContent).toHaveLength(8001);
+    expect(pre?.textContent).toContain('a'.repeat(8000));
+    expect(pre?.textContent).not.toContain('a'.repeat(8001));
+    // 按钮文案提示字符总量
+    expect(screen.getByText('agent.expandChars:9000')).toBeTruthy();
+  });
+
+  it('char truncation takes precedence over line folding for long multi-line text', () => {
+    const line = 'z'.repeat(100);
+    const multi = Array.from({ length: 120 }, () => line).join('\n');
+    expect(multi.length).toBeGreaterThan(8000);
+    render(<CollapsiblePre text={multi} />);
+    const pre = document.querySelector('pre');
+    expect(pre?.textContent).toHaveLength(8001);
+    expect(screen.getByText(`agent.expandChars:${multi.length}`)).toBeTruthy();
+  });
+
+  it('renders normal short text fully without a button', () => {
+    render(<CollapsiblePre text="hello world" />);
+    expect(screen.getByText('hello world')).toBeTruthy();
+    expect(screen.queryByText(/agent\.(expandLines|expandChars|collapse)/)).toBeNull();
+  });
+
+  it('expanding reveals the full text, collapsing returns to the truncated view', () => {
+    const longLine = 'a'.repeat(9000);
+    render(<CollapsiblePre text={longLine} />);
+    expect(document.querySelector('pre')?.textContent).toHaveLength(8001);
+    fireEvent.click(screen.getByText('agent.expandChars:9000'));
+    // 展开后显示完整文本（无省略标记）
+    expect(document.querySelector('pre')?.textContent).toBe(longLine);
+    fireEvent.click(screen.getByText('agent.collapse'));
+    expect(document.querySelector('pre')?.textContent).toHaveLength(8001);
+  });
+
+  it('char truncation does not split a surrogate pair (no garbled breakpoint)', () => {
+    const emoji = '😀'; // U+1F600 = 😀，占 2 个 UTF-16 码元
+    const text = 'a'.repeat(7999) + emoji + 'b'.repeat(100);
+    render(<CollapsiblePre text={text} />);
+    const shown = document.querySelector('pre')?.textContent ?? '';
+    expect(shown.endsWith('…')).toBe(true);
+    // 截断点回退到代理对之前：省略号前一个码元不是孤立代理（无乱码半字符）
+    const beforeEllipsis = shown.charCodeAt(shown.length - 2);
+    expect(beforeEllipsis >= 0xd800 && beforeEllipsis <= 0xdfff).toBe(false);
+    // 完整 emoji 未显示（回退丢弃整个代理对，避免截出半截）
+    expect(shown).not.toContain(emoji);
   });
 });
 

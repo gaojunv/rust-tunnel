@@ -24,11 +24,24 @@ import ToolDiffView from './ToolDiffView';
 /** 折叠阈值：tool 参数/结果超过该行数时只显示前 3 行，可手动展开。 */
 const COLLAPSE_LINE_THRESHOLD = 6;
 const COLLAPSE_VISIBLE_LINES = 3;
+/** 字符上限保护：文本超过该字符数即折叠（防超长单行/巨量文本直接全量渲染撑爆
+ *  布局），未展开时仅显示前 COLLAPSE_MAX_CHARS 字符。 */
+const COLLAPSE_MAX_CHARS = 8000;
 
 function firstLines(text: string, n: number): string {
   const lines = text.split('\n');
   if (lines.length <= n) return text;
   return lines.slice(0, n).join('\n');
+}
+
+/** UTF-16 安全截断：slice 按 UTF-16 码元切分，落在代理对中间会产出孤立半字符
+ *  （乱码）。若截断点恰为代理对高位，回退 1 码元保证断点完整（无需 grapheme 级
+ *  处理）。 */
+function truncateChars(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const code = text.charCodeAt(max - 1);
+  const end = code >= 0xd800 && code <= 0xdbff ? max - 1 : max;
+  return text.slice(0, end);
 }
 
 /** 工具调用的长文本（args/result）：超过阈值折叠为前 3 行 + 展开按钮。
@@ -37,8 +50,19 @@ export function CollapsiblePre({ text, className }: { text: string; className?: 
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const lineCount = text.split('\n').length;
-  const collapsible = lineCount > COLLAPSE_LINE_THRESHOLD;
-  const shown = collapsible && !expanded ? firstLines(text, COLLAPSE_VISIBLE_LINES) : text;
+  const charCount = text.length;
+  const lineCollapsed = lineCount > COLLAPSE_LINE_THRESHOLD;
+  const charCollapsed = charCount > COLLAPSE_MAX_CHARS;
+  const collapsible = lineCollapsed || charCollapsed;
+  const collapsed = collapsible && !expanded;
+  // 折叠态内容：字符超限优先——显示前 MAX_CHARS 字符 + 省略标记（超长单行也
+  // 会被截断）；仅行超限时维持「前 3 行」折叠。展开后一律显示完整文本（用户
+  // 主动承担大文本渲染）。两者都未超限则全量显示、无按钮。
+  const shown = collapsed
+    ? charCollapsed
+      ? `${truncateChars(text, COLLAPSE_MAX_CHARS)}…`
+      : firstLines(text, COLLAPSE_VISIBLE_LINES)
+    : text;
 
   return (
     <div className={className}>
@@ -53,6 +77,11 @@ export function CollapsiblePre({ text, className }: { text: string; className?: 
             <>
               <ChevronUp className="h-3 w-3" />
               {t('agent.collapse')}
+            </>
+          ) : charCollapsed ? (
+            <>
+              <ChevronDown className="h-3 w-3" />
+              {t('agent.expandChars', { count: charCount })}
             </>
           ) : (
             <>
