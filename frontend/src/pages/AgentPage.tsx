@@ -159,12 +159,12 @@ export default function AgentPage() {
       selectableModels?.groups[0]?.id ||
       '');
 
-  // 上报当前查看的会话给全局通知服务；离开 Agent 页（卸载）时清空，
+  // 上报当前查看的会话（激活标签页）给全局通知服务；离开 Agent 页（卸载）时清空，
   // 让其它会话的任务完成/需干预事件能正常提醒。
   useEffect(() => {
-    setActiveSessionId(sessionId || null);
+    setActiveSessionId(tabs.active || null);
     return () => setActiveSessionId(null);
-  }, [sessionId, setActiveSessionId]);
+  }, [tabs.active, setActiveSessionId]);
 
   const handleNewSession = async () => {
     if (!workspaceId) return;
