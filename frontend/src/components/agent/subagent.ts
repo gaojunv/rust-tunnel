@@ -51,6 +51,58 @@ export function extractSubagentMeta(toolArgs?: string, toolName?: string): Subag
   return { label, description, subagentType };
 }
 
+/** subagent 类型徽标的展示元信息。 */
+export interface SubagentTypeMeta {
+  /** 本地化显示名的 i18n key；缺省时组件直接用原始 subagent_type 原值 */
+  labelKey?: string;
+  /** 淡色圆角底（chip 底色，light/dark 双配，与 KindChip 同构） */
+  chipClass: string;
+  /** 彩色文字 */
+  textClass: string;
+}
+
+/** subagent_type → 展示元信息。claude-code Task 子代理常见类型各配语义色，
+ *  与工具卡 KindChip 的「淡色底 + 彩色文字」语言一致：explore（只读探索）→
+ *  teal（同 search 工具色）；general-purpose（全能助手）→ slate 中性灰；
+ *  plan（规划方案）→ violet（同 think 工具色）。未知类型回退 muted 灰 + 原值
+ *  显示，不翻译、不抢视觉。
+ *  `as const satisfies` 保留 labelKey 的字面量类型，让 SubagentTypeBadge 里
+ *  `t(meta.labelKey)` 通过 i18next 的强类型 key 校验。 */
+const SUBAGENT_TYPE_STYLE = {
+  explore: {
+    labelKey: 'agent.subagentTypeExplore',
+    chipClass: 'bg-teal-500/10',
+    textClass: 'text-teal-600 dark:text-teal-400',
+  },
+  'general-purpose': {
+    labelKey: 'agent.subagentTypeGeneral',
+    chipClass: 'bg-slate-500/10',
+    textClass: 'text-slate-600 dark:text-slate-400',
+  },
+  plan: {
+    labelKey: 'agent.subagentTypePlan',
+    chipClass: 'bg-violet-500/10',
+    textClass: 'text-violet-600 dark:text-violet-400',
+  },
+} as const satisfies Record<string, SubagentTypeMeta>;
+
+/** 已知 subagent 类型 → 语义色元信息（labelKey 为字面量联合，供 t() 强类型）；
+ *  未知类型返回 muted 灰 + labelKey 缺省（组件回退显示原值）。空/未定义返回
+ *  undefined（调用方不渲染徽标）。 */
+export function subagentTypeMeta(type?: string) {
+  if (!type) return undefined;
+  // as const 对象无 string 索引签名：运行时未知 key 返回 undefined 走回退，
+  // keyof 断言保留 labelKey 字面量类型（供 t() 强类型校验）
+  const key = type.trim().toLowerCase() as keyof typeof SUBAGENT_TYPE_STYLE;
+  return (
+    SUBAGENT_TYPE_STYLE[key] ?? {
+      labelKey: undefined,
+      chipClass: 'bg-muted',
+      textClass: 'text-muted-foreground',
+    }
+  );
+}
+
 /**
  * 把平铺的 ChatItem 列表按 parentToolId 分组：子项（带 parentToolId）嵌套进父
  * 工具卡的 `children`（父卡按 toolId 匹配），顶层只保留无归属项。支持任意嵌套
