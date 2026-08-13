@@ -71,7 +71,7 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
   };
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex shrink-0 items-center gap-2">
       <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
           <Button

@@ -210,8 +210,9 @@ export default function AgentPage() {
   // 双重滚动条（历史：5ad703a 修过一次仍复发）。
   return (
     <div className="flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border/70 bg-card md:min-h-[480px]">
-      {/* 顶栏：logo + WorkspaceBar + SessionBar */}
-      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 p-1.5 md:flex-nowrap md:p-2">
+      {/* 顶栏：logo + WorkspaceBar + SessionBar + 多会话标签（同一行，省空间；
+          标签区 flex-1 横向滚动，全关时隐藏，引导页提供新建入口） */}
+      <div className="flex items-center gap-1.5 border-b border-border/60 p-1.5 md:gap-2 md:p-2">
         <Sparkles className="h-4 w-4 shrink-0 text-primary" />
         <WorkspaceBar
           workspaceId={workspaceId}
@@ -228,19 +229,17 @@ export default function AgentPage() {
             onNew={handleNewSession}
           />
         )}
+        {tabs.open.length > 0 && (
+          <SessionTabBar
+            workspaceId={workspaceId}
+            open={tabs.open}
+            active={tabs.active}
+            onSelect={handleSelectSession}
+            onClose={handleCloseTab}
+            onNew={handleNewSession}
+          />
+        )}
       </div>
-
-      {/* 多会话标签栏（浏览器 tab 式）：全关时隐藏，引导页提供新建入口 */}
-      {tabs.open.length > 0 && (
-        <SessionTabBar
-          workspaceId={workspaceId}
-          open={tabs.open}
-          active={tabs.active}
-          onSelect={handleSelectSession}
-          onClose={handleCloseTab}
-          onNew={handleNewSession}
-        />
-      )}
 
       <div className="flex min-h-0 flex-1 pb-12 md:pb-0">
         {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例） */}

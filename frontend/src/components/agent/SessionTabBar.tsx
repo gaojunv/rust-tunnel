@@ -32,7 +32,7 @@ export default function SessionTabBar({ workspaceId, open, active, onSelect, onC
     <div
       role="tablist"
       aria-label={t('agent.openTabs')}
-      className="flex items-center gap-0.5 overflow-x-auto border-b border-border/60 bg-card px-1.5"
+      className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto"
     >
       {open.map((id) => {
         const s = byId.get(id);
@@ -53,10 +53,10 @@ export default function SessionTabBar({ workspaceId, open, active, onSelect, onC
               }
             }}
             className={cn(
-              'group flex max-w-[8rem] cursor-pointer items-center gap-1 rounded-t border-b-2 px-2 py-1.5 text-sm md:max-w-[12rem]',
+              'group flex max-w-[8rem] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 py-1.5 text-sm transition-colors md:max-w-[12rem]',
               isActive
-                ? 'border-primary bg-background text-foreground'
-                : 'border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                ? 'bg-primary/10 font-medium text-primary'
+                : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
             )}
           >
             <span className="min-w-0 flex-1 truncate">{title}</span>

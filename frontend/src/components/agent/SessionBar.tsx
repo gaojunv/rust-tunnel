@@ -85,7 +85,7 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
   };
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex shrink-0 items-center gap-2">
       {error && (
         <span className="text-xs text-destructive" role="alert" aria-live="polite">
           {error}
