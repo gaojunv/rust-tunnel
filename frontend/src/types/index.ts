@@ -595,6 +595,51 @@ export interface ApprovalOption {
   kind: string;
 }
 
+/** ACP elicitation form 的 property schema（服务端透传原始 JSON，宽松类型） */
+export interface ElicitationPropertySchema {
+  type: string; // 'string' | 'number' | 'integer' | 'boolean' | 'array' | 未知
+  title?: string;
+  description?: string;
+  default?: unknown;
+  enum?: string[];
+  oneOf?: ElicitationEnumOption[];
+  format?: string;
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  minItems?: number;
+  maxItems?: number;
+  items?: {
+    type?: string;
+    enum?: string[];
+    anyOf?: ElicitationEnumOption[];
+  };
+  _meta?: { [key: string]: unknown };
+}
+
+/** oneOf/enum 单选或多选选项（claude-agent-acp 的 AskUserQuestion 选项） */
+export interface ElicitationEnumOption {
+  const: string;
+  title: string;
+  description?: string;
+  _meta?: {
+    [key: string]: unknown;
+    /** claude-agent-acp：选项 preview 展示（AskUserQuestion option.preview） */
+    _claude?: { askUserQuestionOption?: { preview?: string } };
+  };
+}
+
+/** elicitation/create 的 requested_schema（顶层固定为 object） */
+export interface ElicitationRequestSchema {
+  type: 'object';
+  title?: string;
+  description?: string;
+  properties?: Record<string, ElicitationPropertySchema>;
+  required?: string[];
+  _meta?: { [key: string]: unknown };
+}
+
 export type AgentWsEvent =
   | {
       type: 'assistant_chunk';
@@ -654,6 +699,13 @@ export type AgentWsEvent =
       args_preview: string;
       /** ACP `request_permission` 选项透传（空 = 无选项，保持 approve/deny 二元按钮） */
       options?: ApprovalOption[];
+    }
+  | {
+      type: 'elicitation_request';
+      request_id: string;
+      message: string;
+      /** ACP `elicitation/create` 的原始 JSON schema（后端透传，前端渲染表单） */
+      schema: ElicitationRequestSchema;
     }
   | { type: 'error'; message?: string }
   // 上游流传输失败重试信号：前端应丢弃已缓冲的半截增量，等重试后的完整文本从新气泡开始

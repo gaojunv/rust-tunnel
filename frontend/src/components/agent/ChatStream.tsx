@@ -13,6 +13,7 @@ import {
 import type { AgentWsEvent } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
+import ElicitationCard from './ElicitationCard';
 import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import SessionSettingsMenu from './SessionSettingsMenu';
@@ -280,14 +281,18 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   }, [clearRunningTimeout]);
 
   // 回合终态处理：done/stopped/error/本地停止/10 分钟超时都把仍在 pending 的审批
-  // 卡片置为 expired。否则卡片永久 pending → hasPendingApproval 恒 true → 发送按钮
-  // 被锁死（服务端 5 分钟审批超时实际按 deny 继续回合，UI 必须与服务端结果对齐）。
-  // expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝。
-  const expirePendingApprovals = useCallback(() => {
+  // 卡片置为 expired、pending 的 elicitation 卡片置为 cancelled。否则卡片永久
+  // pending → hasPendingInteraction 恒 true → 发送按钮被锁死（服务端 5 分钟审批
+  // 超时实际按 deny 继续回合、elicitation 超时按 Cancel 回 agent，UI 必须与服务端
+  // 结果对齐）。expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝；
+  // cancelled 同理区别于用户主动跳过（declined）。
+  const expirePendingInteractions = useCallback(() => {
     setItems((prev) => prev.map((it) =>
       it.kind === 'approval' && it.approvalStatus === 'pending'
         ? { ...it, approvalStatus: 'expired' }
-        : it
+        : it.kind === 'elicitation' && it.elicitationStatus === 'pending'
+          ? { ...it, elicitationStatus: 'cancelled' }
+          : it
     ));
   }, []);
 
@@ -299,10 +304,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
     timeoutRef.current = globalThis.setTimeout(() => {
       setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
-      expirePendingApprovals();
+      expirePendingInteractions();
       stopRunning();
     }, RUNNING_TIMEOUT_MS);
-  }, [clearRunningTimeout, stopRunning, expirePendingApprovals]);
+  }, [clearRunningTimeout, stopRunning, expirePendingInteractions]);
 
   // 切换会话：清空上一会话的配置快照（新会话的 session_state 帧到达前不残留
   // 旧会话的 mode/effort 快捷按钮）
@@ -573,15 +578,15 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
-        // 回合已终态，未响应的审批请求随回合作废 → 卡片过期
-        expirePendingApprovals();
+        // 回合已终态，未响应的审批/elicitation 请求随回合作废 → 卡片置终态
+        expirePendingInteractions();
       } else if (msg.type === 'cancel_fallback') {
         // 停止超时兜底：agent 进程未在时限内退出，服务端强制杀掉并重启。
         // 当前回合已死（上下文可能丢失）——按终态处理并提示用户。
         flushChunks();
         breakStream();
         stopRunning();
-        expirePendingApprovals();
+        expirePendingInteractions();
         setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.cancelFallback') }]);
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
@@ -589,9 +594,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
-        // 回合成功结束：服务端 5 分钟审批超时按 deny 继续回合，仍 pending 的
-        // 卡片必须过期，否则 hasPendingApproval 恒 true 锁死发送按钮
-        expirePendingApprovals();
+        // 回合成功结束：服务端 5 分钟审批超时按 deny、elicitation 超时按 Cancel
+        // 继续回合，仍 pending 的卡片必须置终态，否则 hasPendingInteraction 恒
+        // true 锁死发送按钮
+        expirePendingInteractions();
         // 半截装载对账：本次会话是「刷新/断线时回合仍在跑」加载的，DB 当时缺
         // 终态 flush 的文本/结果（ACP 文本缓冲到终态落库）。done 到达时服务端
         // 已 flush 完整落库——重置 loadedRef 让紧随的 refetch 重渲染完整历史
@@ -639,6 +645,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           approvalOptions: msg.options,
           approvalStatus: 'pending',
         }]);
+      } else if (msg.type === 'elicitation_request') {
+        // ACP AskUserQuestion / MCP elicitation / refusal-fallback 表单：先冲掉缓冲
+        // 里的文本增量，再追加表单卡片（等待用户填表，schema 由后端原始 JSON 透传）。
+        flushChunks();
+        breakStream();
+        setItems((prev) => [...prev, {
+          kind: 'elicitation',
+          content: '',
+          elicitationId: msg.request_id,
+          elicitationMessage: msg.message,
+          elicitationSchema: msg.schema,
+          elicitationStatus: 'pending',
+        }]);
       } else if (msg.type === 'error') {
         // 「设置失败」error 帧（服务端 set_config_option 失败，格式 `设置失败: {e}`）：
         // 乐观更新从未生效，回滚到发送前快照，按钮不再显示假性值。
@@ -650,8 +669,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         breakStream();
         setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: msg.message ?? '' }]);
         stopRunning();
-        // 回合以错误终态结束，未响应的审批卡片一并过期
-        expirePendingApprovals();
+        // 回合以错误终态结束，未响应的审批/elicitation 卡片一并置终态
+        expirePendingInteractions();
       }
     };
 
@@ -669,9 +688,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           ]);
         }
         stopRunning();
-        // 断线时服务端 turn 被 drop、未响应审批按 deny 落定；本地卡片同样置
-        // expired，否则重连后历史 refetch 失败会永久锁死发送按钮
-        expirePendingApprovals();
+        // 断线时服务端 turn 被 drop、未响应审批按 deny、elicitation 按 Cancel 落定；
+        // 本地卡片同样置终态，否则重连后历史 refetch 失败会永久锁死发送按钮
+        expirePendingInteractions();
         setDisconnected(true);
         needHistoryReload = true;
         const delay = Math.min(1000 * 2 ** attempts, 15000);
@@ -705,7 +724,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       chunkBufRef.current = new Map();
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingApprovals, breakStream, breakSubStream]);
+  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingInteractions, breakStream, breakSubStream]);
 
   // 虚拟化下 getTotalSize() 随 measureElement 异步修正 item 高度而变：装载长会话时
   // 初始 estimate 不准，totalSize 稳定后需重新对齐底部，否则滚动停在半路、最新消息
@@ -747,8 +766,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     return () => ro.disconnect();
   }, []);
 
-  // 存在未响应的审批卡片时禁止继续发送（服务端在该审批响应前挂起回合）
-  const hasPendingApproval = items.some((it) => it.kind === 'approval' && it.approvalStatus === 'pending');
+  // 存在未响应的审批/elicitation 卡片时禁止继续发送（服务端在该响应前挂起回合）
+  const hasPendingInteraction = items.some((it) =>
+    (it.kind === 'approval' && it.approvalStatus === 'pending') ||
+    (it.kind === 'elicitation' && it.elicitationStatus === 'pending'));
 
   // 审批响应：approved=true 时 remember 决定「仅本次」还是「本会话记住」；
   // ACP options 路径由 ApprovalCard 传入 optionId（原样回传 option_id，后端优先
@@ -771,6 +792,32 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     setItems((prev) => prev.map((it) =>
       it.kind === 'approval' && it.approvalId === id
         ? { ...it, approvalStatus: approved ? 'approved' : 'denied' }
+        : it
+    ));
+  };
+
+  // elicitation 响应：accept 带 content（仅非空时回传，服务端按 requested_schema
+  // 解析字段值）；decline/cancel 无 content。无论 WS 是否可用都先落本地状态
+  // （卡片从 pending 变终态），与 respondApproval 同模式。
+  const respondElicitation = (
+    id: string,
+    action: 'accept' | 'decline' | 'cancel',
+    content?: Record<string, unknown>,
+  ) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const payload: Record<string, unknown> = {
+        type: 'elicitation_response',
+        request_id: id,
+        action,
+      };
+      if (content && Object.keys(content).length > 0) payload.content = content;
+      ws.send(JSON.stringify(payload));
+    }
+    const status = action === 'accept' ? 'accepted' : action === 'decline' ? 'declined' : 'cancelled';
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'elicitation' && it.elicitationId === id
+        ? { ...it, elicitationStatus: status }
         : it
     ));
   };
@@ -826,8 +873,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const send = () => {
     const text = input.trim();
     // 运行中不再短路：服务端 busy 时会排队（回 queued 帧），消息不会丢。
-    // hasPendingApproval 仍需阻塞——服务端在该审批响应前挂起回合，发送必被吞。
-    if (!text || hasPendingApproval) return;
+    // hasPendingInteraction 仍需阻塞——服务端在该审批/elicitation 响应前挂起回合，
+    // 发送必被吞。
+    if (!text || hasPendingInteraction) return;
     const ws = wsRef.current;
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
@@ -862,8 +910,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     flushChunks();
     breakStream();
     stopRunning();
-    // 本地停止路径同样作废未响应的审批卡片（cancel 帧可能因断线永远不回来）
-    expirePendingApprovals();
+    // 本地停止路径同样作废未响应的审批/elicitation 卡片（cancel 帧可能因断线永远不回来）
+    expirePendingInteractions();
     setItems((prev) => [...prev, { kind: 'system', systemTone: 'stopped', content: t('agent.stopped') }]);
   };
 
@@ -943,6 +991,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }
     if (it.kind === 'approval') {
       return <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />;
+    }
+    if (it.kind === 'elicitation') {
+      return <ElicitationCard key={it.elicitationId ?? i} item={it} onRespond={respondElicitation} />;
     }
     if (it.kind === 'tool' && (it.isSubagent || (it.children && it.children.length > 0))) {
       return (
@@ -1145,7 +1196,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               )}
               <Button
                 onClick={send}
-                disabled={!input.trim() || hasPendingApproval}
+                disabled={!input.trim() || hasPendingInteraction}
                 size="sm"
                 variant="ghost"
                 aria-label={t('agent.send')}

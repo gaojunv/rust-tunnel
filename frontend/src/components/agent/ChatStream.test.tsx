@@ -913,7 +913,7 @@ describe('ChatStream running state', () => {
       });
     });
     // 断线：服务端 turn 被 drop、审批按 deny 落定；重连后历史 refetch 若失败，
-    // 本地卡片不置终态会让 hasPendingApproval 恒 true → 发送按钮永久锁死
+    // 本地卡片不置终态会让 hasPendingInteraction 恒 true → 发送按钮永久锁死
     act(() => {
       wsInstance!.onclose?.();
     });
@@ -923,6 +923,124 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
     // 输入文本后发送按钮恢复可用
     fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('renders elicitation card and submits accept with content', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 elicitation_request 帧（AskUserQuestion 单选 schema）
+    act(() => {
+      wsInstance!.emit({
+        type: 'elicitation_request',
+        request_id: 'req1',
+        message: 'Choose a color',
+        schema: {
+          type: 'object',
+          properties: {
+            question_1: {
+              type: 'string',
+              title: 'Color',
+              oneOf: [
+                { const: 'red', title: 'Red' },
+                { const: 'blue', title: 'Blue' },
+              ],
+            },
+          },
+          required: ['question_1'],
+        },
+      });
+    });
+    // 卡片出现（标题 + 消息 + 单选选项）
+    expect(screen.getByText(/agent\.elicitationRequired/)).toBeTruthy();
+    expect(screen.getByText('Choose a color')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Red/ })).toBeTruthy();
+    // 必填未填 → 提交禁用；选中 Red 后提交
+    expect((screen.getByRole('button', { name: 'agent.elicitationSubmit' }) as HTMLButtonElement).disabled).toBe(true);
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: /Red/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'agent.elicitationSubmit' }));
+    expect(
+      ws.sent.some(
+        (s) =>
+          s.includes('"type":"elicitation_response"') &&
+          s.includes('"request_id":"req1"') &&
+          s.includes('"action":"accept"') &&
+          s.includes('"content":{"question_1":"red"}'),
+      ),
+    ).toBe(true);
+    // 卡片变已提交：操作按钮消失、终态文案出现
+    expect(screen.queryByRole('button', { name: 'agent.elicitationSubmit' })).toBeNull();
+    expect(screen.getByText(/agent\.elicitationAnswered/)).toBeTruthy();
+  });
+
+  it('declines elicitation card and sends decline frame', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'elicitation_request',
+        request_id: 'req2',
+        message: 'Confirm?',
+        schema: { type: 'object', properties: {}, required: [] },
+      });
+    });
+    const ws = wsInstance!;
+    fireEvent.click(screen.getByRole('button', { name: 'agent.elicitationDecline' }));
+    expect(
+      ws.sent.some(
+        (s) =>
+          s.includes('"type":"elicitation_response"') &&
+          s.includes('"request_id":"req2"') &&
+          s.includes('"action":"decline"'),
+      ),
+    ).toBe(true);
+    // 卡片变已跳过：操作按钮消失、跳过徽章出现
+    expect(screen.queryByRole('button', { name: 'agent.elicitationDecline' })).toBeNull();
+    expect(screen.getByText(/agent\.elicitationDeclined/)).toBeTruthy();
+  });
+
+  it('locks send while elicitation pending and unlocks after done frame', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // pending elicitation：hasPendingInteraction 门控 → 发送按钮禁用（服务端挂起回合）
+    act(() => {
+      wsInstance!.emit({
+        type: 'elicitation_request',
+        request_id: 'req1',
+        message: 'Fill this',
+        schema: { type: 'object', properties: {}, required: [] },
+      });
+    });
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(true);
+    // done 帧到达（服务端 elicitation 超时按 Cancel 继续回合）→ 卡片置 cancelled、发送解锁
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.getByText('agent.elicitationCancelled')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.elicitationSubmit' })).toBeNull();
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('expires pending elicitation card on disconnect and unlocks send', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'elicitation_request',
+        request_id: 'req1',
+        message: 'Fill this',
+        schema: { type: 'object', properties: {}, required: [] },
+      });
+    });
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: 'hi' } });
+    expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(true);
+    // 断线：服务端 turn 被 drop、elicitation 按 Cancel 落定 → 卡片置 cancelled、发送解锁
+    act(() => {
+      wsInstance!.onclose?.();
+    });
+    expect(screen.getByText('agent.elicitationCancelled')).toBeTruthy();
     expect((screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
