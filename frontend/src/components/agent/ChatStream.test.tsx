@@ -1348,13 +1348,14 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_result', id: 'task1', name: 'Task', result: '调研完成', status: 'completed' });
       wsInstance!.emit({ type: 'done' });
     });
-    // 子 agent 卡头部显示 description（非 toolName "Task"）
-    expect(await screen.findByText('调研登录 bug')).toBeTruthy();
-    // 父卡已完成（✓ 徽章）
-    expect(screen.getByText('✓')).toBeTruthy();
-    // 默认折叠：子项不可见；展开父卡
+    // 子 agent 卡头部显示 description（非 toolName "Task"）；固定面板聚合行同 label
+    expect((await screen.findAllByText('调研登录 bug')).length).toBeGreaterThan(0);
+    // 父卡已完成（✓ 徽章）；面板行同样标记完成 ✓
+    expect(screen.getAllByText('✓').length).toBeGreaterThan(0);
+    // 默认折叠：子项不可见；展开父卡（面板行在 DOM 前、对话卡在后，取最后一个）
     act(() => {
-      screen.getByText('调研登录 bug').closest('button')!.click();
+      const labels = screen.getAllByText('调研登录 bug');
+      labels[labels.length - 1].closest('button')!.click();
     });
     // 子工具卡（Read）与子文本都嵌套在父卡内
     expect(screen.getByText('Read')).toBeTruthy();
@@ -1378,8 +1379,9 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'done' });
     });
     act(() => {
-      // 父卡无 args → 头部回退 toolName "Task"
-      screen.getByText('Task').closest('button')!.click();
+      // 父卡无 args → 头部回退 toolName "Task"；面板聚合行同 label，取对话卡（靠后）
+      const labels = screen.getAllByText('Task');
+      labels[labels.length - 1].closest('button')!.click();
     });
     // 两个 chunk 合并为一个气泡，不碎片化
     expect(screen.getByText('你好，世界')).toBeTruthy();
@@ -1407,9 +1409,10 @@ describe('ChatStream running state', () => {
       });
       wsInstance!.emit({ type: 'done' });
     });
-    expect(await screen.findByText('迟到的父卡')).toBeTruthy();
+    expect((await screen.findAllByText('迟到的父卡')).length).toBeGreaterThan(0);
     act(() => {
-      screen.getByText('迟到的父卡').closest('button')!.click();
+      const labels = screen.getAllByText('迟到的父卡');
+      labels[labels.length - 1].closest('button')!.click();
     });
     // 缓存的子工具卡与文本都挂载进父卡 children（无重复、无丢失）
     expect(screen.getByText('Read')).toBeTruthy();
@@ -1452,12 +1455,14 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'assistant_chunk', content: 'B 的文本', parent_tool_call_id: 'taskB', final: true });
       wsInstance!.emit({ type: 'done' });
     });
-    expect(await screen.findByText('A 任务')).toBeTruthy();
-    expect(screen.getByText('B 任务')).toBeTruthy();
-    // 分别展开两张父卡：各自的子工具/文本只出现在自己卡内
+    expect((await screen.findAllByText('A 任务')).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('B 任务').length).toBeGreaterThan(0);
+    // 分别展开两张父卡：各自的子工具/文本只出现在自己卡内（面板行在 DOM 前，取对话卡）
     act(() => {
-      screen.getByText('A 任务').closest('button')!.click();
-      screen.getByText('B 任务').closest('button')!.click();
+      const a = screen.getAllByText('A 任务');
+      a[a.length - 1].closest('button')!.click();
+      const b = screen.getAllByText('B 任务');
+      b[b.length - 1].closest('button')!.click();
     });
     expect(screen.getByText('alpha')).toBeTruthy();
     expect(screen.getByText('beta')).toBeTruthy();

@@ -1,4 +1,5 @@
 import type { ChatItem } from './types';
+import { resolveToolStatus, splitToolTitle } from './MessageBubble';
 
 /**
  * 子 agent 分组纯函数集。
@@ -241,4 +242,55 @@ export function parseChunkKey(key: string): { parent: string; kind: 'assistant' 
     | 'assistant'
     | 'thought';
   return { parent, kind };
+}
+
+/** 子 agent 固定状态面板的摘要行（从 ChatItem 列表提取，纯函数、可单测）。
+ *  status/progress 语义与 SubagentTaskCard 头部完全一致。 */
+export interface SubagentSummary {
+  /** 在 items 中的下标：虚拟化滚动定位用 */
+  index: number;
+  toolId?: string;
+  /** 头部主标签（extractSubagentMeta().label，可能为空串 → 渲染处回退 i18n） */
+  label: string;
+  subagentType?: string;
+  status: 'pending' | 'in_progress' | 'running' | 'completed' | 'failed';
+  /** children 中工具卡数（0 时不显示进度段） */
+  toolCount: number;
+  /** 最后一个未完成子工具卡的归一化 label（无则 null） */
+  runningToolLabel: string | null;
+}
+
+/**
+ * 提取 items 中所有子 agent 父卡（is_subagent 或带 children 的 tool 卡，判定与
+ * ChatStream 渲染 SubagentTaskCard 的条件一致）的状态摘要，供固定状态面板渲染。
+ * 进度语义与 SubagentTaskCard 相同：运行中显示「N 工具 · 当前工具」，已完成仅
+ * 「N 工具」；无子工具卡则无进度段。
+ */
+export function collectSubagents(items: ChatItem[]): SubagentSummary[] {
+  const out: SubagentSummary[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.kind !== 'tool') continue;
+    if (!(it.isSubagent || (it.children && it.children.length > 0))) continue;
+    const meta = extractSubagentMeta(it.toolArgs, it.toolName);
+    const tools = (it.children ?? []).filter((c) => c.kind === 'tool');
+    const running = [...tools]
+      .reverse()
+      .find((c) => {
+        const s = resolveToolStatus(c);
+        return s !== 'completed' && s !== 'failed';
+      });
+    out.push({
+      index: i,
+      toolId: it.toolId,
+      label: meta.label ?? '',
+      subagentType: meta.subagentType,
+      status: resolveToolStatus(it),
+      toolCount: tools.length,
+      runningToolLabel: running
+        ? splitToolTitle(running.toolName, running.toolKind).label
+        : null,
+    });
+  }
+  return out;
 }

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Button } from '@/components/ui/button';
 import { Loader2, SendHorizontal, Square } from 'lucide-react';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 import {
   agentWsUrl,
   getApiErrorMessage,
@@ -17,6 +18,7 @@ import MentionPopup from './MentionPopup';
 import MessageBubble from './MessageBubble';
 import SessionSettingsMenu from './SessionSettingsMenu';
 import SubagentTaskCard from './SubagentTaskCard';
+import SubagentPanel from './SubagentPanel';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions } from './sessionConfig';
@@ -24,6 +26,7 @@ import { historyToChatItems } from './history';
 import {
   appendChildStream,
   chunkKey,
+  collectSubagents,
   parseChunkKey,
   patchChildToolResult,
   upsertToolCard,
@@ -52,6 +55,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   }, [t]);
   const queryClient = useQueryClient();
   const [items, setItems] = useState<ChatItem[]>([]);
+  // 响应式分支：桌面端（≥768px）右侧固定栏，移动端顶部固定面板。
+  // jsdom/SSR 无 matchMedia → 恒 false（测试环境走 top 形态）。
+  const isDesktop = useMediaQuery('(min-width: 768px)');
+  // subagent 固定面板数据源：从消息流提取子代理父卡摘要（纯函数，items 变化时重算）
+  const subagents = useMemo(() => collectSubagents(items), [items]);
+  // subagent 联动展开：toolId 集合——固定面板点击与对话卡受控展开双向同步
+  const [expandedSubagents, setExpandedSubagents] = useState<ReadonlySet<string>>(new Set());
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
@@ -135,6 +145,34 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   });
   const virtualItems = canVirtualize ? virtualizer.getVirtualItems() : null;
 
+  // subagent 展开翻转：固定面板点击与对话卡头部点击共用同一份受控状态
+  const toggleExpandedSubagent = useCallback((toolId: string) => {
+    setExpandedSubagents((prev) => {
+      const next = new Set(prev);
+      if (next.has(toolId)) next.delete(toolId);
+      else next.add(toolId);
+      return next;
+    });
+  }, []);
+
+  // 固定面板行点击：联动展开对话中对应 subagent 卡 + 虚拟化滚动定位到该卡
+  // （itemsRef 读最新 items，避免把 items 加入依赖导致回调重建）
+  const handleSelectSubagent = useCallback(
+    (index: number) => {
+      const item = itemsRef.current[index];
+      if (item?.toolId) {
+        setExpandedSubagents((prev) => {
+          const next = new Set(prev);
+          if (next.has(item.toolId!)) next.delete(item.toolId!);
+          else next.add(item.toolId!);
+          return next;
+        });
+      }
+      virtualizer.scrollToIndex(index, { align: 'center' });
+    },
+    [virtualizer],
+  );
+
   // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）。
   // 关键：staleTime 0 + refetchOnMount 'always'。staleTime Infinity 会留下陈旧
   // 缓存——切到别的 session 再切回时 key={sessionId} 触发全新挂载，但 React
@@ -151,12 +189,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     if (!history) return;
     // 自愈：已装载但聊天区为空而历史转非空（陈旧空缓存被 refetch 纠正）→ 允许重装
     if (loadedRef.current && !(itemsRef.current.length === 0 && history.length > 0)) return;
-    loadedRef.current = true;
     // done 后的对账重载（见 done 处理器）：只重建 items、跳过 running 兜底——
     // 该重载的末行可能是 tool_result（回合在工具执行中结束），按现状会误置
     // running=true 并锁死发送按钮 10 分钟，而回合其实已终态。
     const isReconcileReload = reconcileRef.current;
     reconcileRef.current = false;
+    // 实时保护：挂载后 WS 流式增量先落地（history fetch 慢）、history 后到时，
+    // 不应覆盖已渲染的实时消息——否则回合中一次无关重渲染（如展开卡片）就会
+    // 清空聊天区。对账重载（done 后补全）显式放行覆盖。
+    if (!isReconcileReload && itemsRef.current.length > 0) {
+      loadedRef.current = true;
+      return;
+    }
+    loadedRef.current = true;
     if (!isReconcileReload && history.length > 0) {
       // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
       // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true）。把
@@ -950,6 +995,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           key={it.toolId ?? i}
           item={it}
           streamingChildIdx={it.toolId ? subStreamRef.current.get(it.toolId)?.idx : undefined}
+          // 受控展开：与 subagent 固定面板联动（toolId 缺失时保持非受控内部态）
+          open={it.toolId ? expandedSubagents.has(it.toolId) : undefined}
+          onToggle={it.toolId ? () => toggleExpandedSubagent(it.toolId!) : undefined}
         />
       );
     }
@@ -963,7 +1011,18 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   };
 
   return (
-    <div className="relative flex h-full flex-col">
+    <div className="relative flex h-full">
+      {/* 对话列（消息滚动 + 悬浮输入框）；移动端在顶部插入 subagent 固定面板，
+          桌面端由右侧栏承担（见下方 sidebar 分支） */}
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {!isDesktop && subagents.length > 0 && (
+          <SubagentPanel
+            variant="top"
+            summaries={subagents}
+            onSelect={handleSelectSubagent}
+            expandedIds={expandedSubagents}
+          />
+        )}
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4 dark:text-foreground/85"
@@ -1158,6 +1217,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         </div>
         </div>
       </div>
+      </div>
+      {/* 桌面端：右侧固定 subagent 栏（占文档流全高，不覆盖对话滚动条） */}
+      {isDesktop && subagents.length > 0 && (
+        <SubagentPanel
+          variant="sidebar"
+          summaries={subagents}
+          onSelect={handleSelectSubagent}
+          expandedIds={expandedSubagents}
+        />
+      )}
     </div>
   );
 }

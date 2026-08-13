@@ -10,6 +10,10 @@ interface Props {
   item: ChatItem;
   /** 当前正在流式写入的子气泡下标（children 内索引）；无则 undefined */
   streamingChildIdx?: number;
+  /** 受控展开：提供时展开态由外部持有（点击调 onToggle），缺省走内部 useState */
+  open?: boolean;
+  /** 受控展开时的点击回调（外部负责翻转 open） */
+  onToggle?: () => void;
 }
 
 /**
@@ -20,10 +24,19 @@ interface Props {
  * 相同的不确定进度条（呼吸动画），保证两卡视觉一致。
  * children 的文本/思考气泡在流式期间走 Markdown streaming 降级（streamingChildIdx
  * 命中）。
+ * 展开支持受控（open/onToggle，供 subagent 固定面板联动展开）与非受控（内部
+ * useState，历史行为不变）双路径。
  */
-function SubagentTaskCard({ item, streamingChildIdx }: Props) {
+function SubagentTaskCard({ item, streamingChildIdx, open, onToggle }: Props) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
+  const [openState, setOpenState] = useState(false);
+  // 受控优先：open 提供时外部持有展开态；否则回退内部 state（既有行为不变）
+  const isControlled = open !== undefined;
+  const expanded = isControlled ? open : openState;
+  const toggle = () => {
+    if (isControlled) onToggle?.();
+    else setOpenState((v) => !v);
+  };
   const meta = extractSubagentMeta(item.toolArgs, item.toolName);
   const label = meta.label ?? t('agent.subagent');
   const children = item.children ?? [];
@@ -54,9 +67,9 @@ function SubagentTaskCard({ item, streamingChildIdx }: Props) {
     <div className="relative w-full overflow-hidden rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={toggle}
         className="flex w-full items-center gap-2 text-left text-xs"
-        aria-expanded={open}
+        aria-expanded={expanded}
       >
         <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
         <span className="font-medium text-foreground/90">{label}</span>
@@ -93,7 +106,7 @@ function SubagentTaskCard({ item, streamingChildIdx }: Props) {
       >
         {isRunning && <div className="h-full w-1/3 animate-pulse rounded bg-primary/60" />}
       </div>
-      {open && (
+      {expanded && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {children.length > 0 && (
             <div className="space-y-2 border-l border-border/40 pl-3">

@@ -3,6 +3,7 @@ import type { ChatItem } from './types';
 import {
   appendChildStream,
   chunkKey,
+  collectSubagents,
   extractSubagentMeta,
   groupByParent,
   parseChunkKey,
@@ -235,5 +236,71 @@ describe('chunkKey', () => {
     expect(chunkKey('task1', 'thought')).not.toBe(chunkKey('task1', 'assistant'));
     expect(parseChunkKey(chunkKey('task1', 'thought'))).toEqual({ parent: 'task1', kind: 'thought' });
     expect(parseChunkKey(chunkKey(undefined, 'assistant'))).toEqual({ parent: '', kind: 'assistant' });
+  });
+});
+
+describe('collectSubagents', () => {
+  it('collects subagent parent cards with status/progress summary', () => {
+    const items: ChatItem[] = [
+      { kind: 'user', content: 'hi' },
+      tool({
+        toolId: 'task1',
+        toolName: 'Task',
+        isSubagent: true,
+        toolArgs: '{"description":"A 任务","subagent_type":"general-purpose"}',
+        toolStatus: 'in_progress',
+        children: [
+          tool({ toolId: 'c1', toolName: 'Read x', toolKind: 'read', toolStatus: 'completed', toolResult: 'ok' }),
+          tool({ toolId: 'c2', toolName: 'Bash', toolKind: 'execute', toolStatus: 'running' }),
+        ],
+      }),
+      text('主回复'),
+    ];
+    const out = collectSubagents(items);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      index: 1,
+      toolId: 'task1',
+      label: 'A 任务',
+      subagentType: 'general-purpose',
+      status: 'in_progress',
+      toolCount: 2,
+    });
+    // 当前运行工具 = 最后一个未完成子工具 → Bash 归一化 label Terminal
+    expect(out[0].runningToolLabel).toBe('Terminal');
+  });
+
+  it('marks completed and failed parent cards with their status', () => {
+    const items: ChatItem[] = [
+      tool({ toolId: 'a', toolName: 'Task', isSubagent: true, toolStatus: 'completed', toolResult: 'done' }),
+      tool({ toolId: 'b', toolName: 'Task', isSubagent: true, toolStatus: 'failed' }),
+    ];
+    const out = collectSubagents(items);
+    expect(out.map((s) => s.status)).toEqual(['completed', 'failed']);
+    expect(out[0].runningToolLabel).toBeNull();
+  });
+
+  it('ignores non-subagent tool cards and flat items', () => {
+    const items: ChatItem[] = [
+      { kind: 'user', content: 'hi' },
+      tool({ toolId: 'c1', toolName: 'Read x', toolKind: 'read' }), // 顶层普通工具卡
+    ];
+    expect(collectSubagents(items)).toEqual([]);
+  });
+
+  it('includes tool cards with children even without is_subagent flag (history path)', () => {
+    const items: ChatItem[] = [
+      tool({
+        toolId: 'task1',
+        toolName: 'Task',
+        children: [
+          tool({ toolId: 'c1', toolName: 'Read x', parentToolId: 'task1', toolStatus: 'completed', toolResult: 'ok' }),
+        ],
+      }),
+    ];
+    const out = collectSubagents(items);
+    expect(out).toHaveLength(1);
+    expect(out[0].toolId).toBe('task1');
+    expect(out[0].toolCount).toBe(1);
   });
 });

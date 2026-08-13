@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import SubagentTaskCard from './SubagentTaskCard';
 import type { ChatItem } from './types';
 
@@ -85,6 +85,22 @@ describe('SubagentTaskCard', () => {
       />,
     );
     expect(screen.queryByText(/个工具/)).toBeNull();
+  });
+
+  it('supports controlled expansion via open/onToggle (subagent panel linkage)', () => {
+    const onToggle = vi.fn();
+    const item = parent({
+      children: [{ kind: 'assistant', content: '子文本', parentToolId: 'task1' }],
+    });
+    const { rerender } = render(<SubagentTaskCard item={item} open={false} onToggle={onToggle} />);
+    // 受控折叠：children 不可见
+    expect(screen.queryByText('子文本')).toBeNull();
+    // 点击头部触发 onToggle（而非内部翻转）
+    fireEvent.click(screen.getByRole('button'));
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    // 外部把 open 置 true → children 可见
+    rerender(<SubagentTaskCard item={item} open onToggle={onToggle} />);
+    expect(screen.getByText('子文本')).toBeTruthy();
   });
 
   it('shows the breathing progress bar while running and fades out when done', () => {
