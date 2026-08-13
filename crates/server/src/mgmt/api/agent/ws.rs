@@ -268,6 +268,13 @@ enum WsFrame {
         option_id: Option<String>,
         remember: bool,
     },
+    /// elicitation 响应（AskUserQuestion 表单）：`action` ∈ accept/decline/cancel；
+    /// accept 时 `content` 为字段值对象（与 requested_schema 匹配）。
+    ElicitationResponse {
+        request_id: String,
+        action: String,
+        content: Option<serde_json::Value>,
+    },
     /// ACP 会话配置切换（session/set_config_option 透传）
     SetConfigOption {
         config_id: String,
@@ -329,6 +336,28 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                     body.get("remember").and_then(|v| v.as_str()),
                     Some("session")
                 ),
+            }
+        }
+        Some("elicitation_response") => {
+            let request_id = body
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let action = body
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // request_id 缺省或 action 非法 → Other（与 approval_response 同款
+            // 容错：非法帧静默忽略，不 panic）。
+            if request_id.is_empty() || !["accept", "decline", "cancel"].contains(&action.as_str()) {
+                return WsFrame::Other;
+            }
+            WsFrame::ElicitationResponse {
+                request_id,
+                action,
+                content: body.get("content").cloned(),
             }
         }
         Some("set_config_option") => {
@@ -569,6 +598,22 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                     option_id,
                                     remember,
                                 )
+                                .await;
+                        }
+                    }
+                    continue;
+                }
+                WsFrame::ElicitationResponse {
+                    request_id,
+                    action,
+                    content,
+                } => {
+                    // elicitation 仅 ACP 路径产生（runner 无表单概念）；未知
+                    // request_id 幂等忽略（可能已超时清除 / 不属本进程）。
+                    if acp_active {
+                        if let Some(agent) = state.server_state.agent_state.as_ref() {
+                            agent
+                                .resolve_elicitation(&session_id, &request_id, &action, content)
                                 .await;
                         }
                     }
@@ -872,6 +917,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             // 配置切换是 ACP 会话概念：本内层循环只跑自研 runner
                             // 路径（ACP 回合在外层循环处理），无会话配置可切换，忽略。
                             WsFrame::SetConfigOption { .. } => {}
+                            // elicitation 仅 ACP 路径产生：runner 回合内不可能有
+                            // pending 表单，忽略（resolve_elicitation 对未知 id
+                            // 是 no-op，ACP 帧只在外层处理，保持最小改动）。
+                            WsFrame::ElicitationResponse { .. } => {}
                             WsFrame::Other => {}
                         },
                     },
@@ -1091,6 +1140,54 @@ mod tests {
             r#"{"type":"approval_response","approved":true}"#.into(),
         ));
         assert!(matches!(bad, WsFrame::Other));
+    }
+
+    #[test]
+    fn test_parse_ws_frame_elicitation_response() {
+        // accept + content（字段值对象）
+        let accept = parse_ws_frame(Message::Text(
+            r#"{"type":"elicitation_response","request_id":"r1","action":"accept","content":{"name":"Alice","age":3}}"#.into(),
+        ));
+        match accept {
+            WsFrame::ElicitationResponse {
+                request_id,
+                action,
+                content,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(action, "accept");
+                let content = content.expect("accept should carry content");
+                assert_eq!(content["name"], "Alice");
+                assert_eq!(content["age"], 3);
+            }
+            _ => panic!("expected ElicitationResponse(accept)"),
+        }
+
+        // decline / cancel：无 content
+        for action in ["decline", "cancel"] {
+            let frame = parse_ws_frame(Message::Text(format!(
+                r#"{{"type":"elicitation_response","request_id":"r2","action":"{action}"}}"#
+            )));
+            assert!(
+                matches!(
+                    frame,
+                    WsFrame::ElicitationResponse { action: a, content: None, .. } if a == action
+                ),
+                "action={action} frame should parse"
+            );
+        }
+
+        // 缺 request_id → Other
+        let no_id = parse_ws_frame(Message::Text(
+            r#"{"type":"elicitation_response","action":"accept"}"#.into(),
+        ));
+        assert!(matches!(no_id, WsFrame::Other));
+
+        // 非法 action → Other
+        let bad_action = parse_ws_frame(Message::Text(
+            r#"{"type":"elicitation_response","request_id":"r3","action":"maybe"}"#.into(),
+        ));
+        assert!(matches!(bad_action, WsFrame::Other));
     }
 
     #[test]

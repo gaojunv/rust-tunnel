@@ -1,8 +1,8 @@
-import type { ApprovalOption } from '../../types';
+import type { ApprovalOption, ElicitationRequestSchema } from '../../types';
 
 /** 聊天区单条消息。 */
 export interface ChatItem {
-  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'thought' | 'plan' | 'system';
+  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'elicitation' | 'thought' | 'plan' | 'system';
   content: string;
   /** kind='system'：提示行语气（状态/警告/错误/停止），缺省按 info 渲染 */
   systemTone?: 'info' | 'warning' | 'error' | 'stopped';
@@ -30,6 +30,12 @@ export interface ChatItem {
   approvalOptions?: ApprovalOption[];
   /** pending=等待用户响应；approved/denied=用户主动处理；expired=回合终态被动过期 */
   approvalStatus?: 'pending' | 'approved' | 'denied' | 'expired';
+  /** kind='elicitation'：用户表单卡（AskUserQuestion / MCP elicitation / refusal-fallback） */
+  elicitationId?: string;
+  elicitationMessage?: string;
+  elicitationSchema?: ElicitationRequestSchema;
+  /** pending=等待用户填表；accepted/declined=用户主动处理；cancelled=回合终态/断线/超时被动取消 */
+  elicitationStatus?: 'pending' | 'accepted' | 'declined' | 'cancelled';
   /** 子 agent 归属：该条消息属于某个 Task 子 agent（值为父卡的 toolId） */
   parentToolId?: string;
   /** 子 agent 父卡标记：is_subagent=true 的 tool_call 帧（Task 卡本身） */

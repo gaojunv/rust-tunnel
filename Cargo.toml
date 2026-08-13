@@ -74,7 +74,10 @@ x509-parser = "0.16"
 base64 = "0.22"
 urlencoding = "2.1"
 trust-dns-resolver = "0.23"
-agent-client-protocol = "2"
+# ACP 协议 crate：unstable_elicitation 提供 AskUserQuestion 表单（elicitation/create）
+# 的类型与路由。只开这一个 unstable feature，不开全量 unstable（避免 mcp/auth 等
+# 无关不稳定类型）。旧版 claude-code-acp 不识别该 capability，行为与现状一致。
+agent-client-protocol = { version = "2", features = ["unstable_elicitation"] }
 libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3.0"

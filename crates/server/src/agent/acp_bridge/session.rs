@@ -12,14 +12,15 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, DeleteSessionRequest, InitializeRequest,
-    NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    PromptRequest, ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigValueId, SessionId,
-    SessionNotification, SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest,
-    WriteTextFileResponse,
+    CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
+    DeleteSessionRequest, ElicitationAcceptAction, ElicitationAction, ElicitationMode,
+    InitializeRequest, NewSessionRequest, PermissionOption, PermissionOptionId,
+    PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client};
@@ -27,7 +28,7 @@ use agent_client_protocol::{ByteStreams, Client};
 use crate::agent::acp_events::map_update;
 use crate::agent::llm_bridge;
 use crate::agent::spawner::AgentSpawner;
-use crate::agent::{ApprovalOption, ApprovalResult};
+use crate::agent::{ApprovalOption, ApprovalResult, ElicitationResult};
 use crate::db::Database;
 use crate::persistence::db::agent::AgentWorkspaceRecord;
 use rust_tunnel_common::ControlMessage;
@@ -36,8 +37,8 @@ use super::pump::{run_stdio_pump, FuturesIo};
 use super::reaper::touch_activity;
 use super::store::{flush_acp_turn_buffers, persist_acp_frame};
 use super::{
-    AcpBridge, ApproveFn, PendingPrompt, SpawnedAgent, CONFIG_OPTION_TIMEOUT, MAX_PENDING_PROMPTS,
-    READY_TIMEOUT, SPAWN_TIMEOUT,
+    AcpBridge, ApproveFn, ElicitFn, PendingPrompt, SpawnedAgent, CONFIG_OPTION_TIMEOUT,
+    MAX_PENDING_PROMPTS, READY_TIMEOUT, SPAWN_TIMEOUT,
 };
 
 impl AcpBridge {
@@ -300,6 +301,7 @@ impl AcpBridge {
         let sid = session_id.to_string();
         let cwd = cwd.to_string();
         let approval = self.approval.clone();
+        let elicitation = self.elicitation.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
         let spawner = self.spawner.clone();
@@ -634,6 +636,83 @@ impl AcpBridge {
                                     );
                                 }
                             }
+                            Ok(())
+                        }
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    {
+                        // elicitation/create：仅支持 mode=form。schema 是复杂 serde
+                        // 枚举（string/number/integer/boolean/array + oneOf/anyOf/
+                        // _meta 等），后端不重建表单模型，`serde_json::to_value` 原样
+                        // JSON 透传前端渲染。会话已回收/无 WS 通道 → 立即回 Cancel
+                        // （错误会被 agent 视为硬失败，Cancel 是稳的降级）。未声明
+                        // url 能力；防御性兜底：收到 url/other 模式 → Cancel + warn。
+                        let sid = sid.clone();
+                        let sessions = sessions.clone();
+                        let elicitation = elicitation.clone();
+                        async move |request: CreateElicitationRequest, responder, _cx| {
+                            let schema = match &request.mode {
+                                ElicitationMode::Form(form) => {
+                                    serde_json::to_value(&form.requested_schema).unwrap_or_else(
+                                        |_| {
+                                            serde_json::json!({"type": "object", "properties": {}})
+                                        },
+                                    )
+                                }
+                                _ => {
+                                    tracing::warn!(
+                                        session_id = %sid,
+                                        "elicitation/create: unsupported mode, cancelling"
+                                    );
+                                    let _ = responder.respond(
+                                        CreateElicitationResponse::new(ElicitationAction::Cancel),
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                            // 动态解析当前 WS 通道 + 连接标识 + 连接变化 watch
+                            // （同 request_permission，评审 Finding 1）。
+                            let Some((ws_tx, conn_id, conn_rx)) =
+                                current_ws_channel(&sessions, &sid).await
+                            else {
+                                // 会话已回收（kill/reaper）：无表单通道可推，立即取消。
+                                let _ = responder.respond(CreateElicitationResponse::new(
+                                    ElicitationAction::Cancel,
+                                ));
+                                return Ok(());
+                            };
+                            // WS 已断开（detach 置 None）：构造立即失效通道，
+                            // request_elicitation 发送失败即取消（同审批路径）。
+                            let ws_tx = ws_tx.unwrap_or_else(|| {
+                                let (tx, _rx) = mpsc::channel::<serde_json::Value>(1);
+                                tx
+                            });
+                            let result = elicit_or_disconnect(
+                                elicitation.clone(),
+                                sid.clone(),
+                                request.message.clone(),
+                                schema,
+                                ws_tx,
+                                conn_id,
+                                conn_rx,
+                            )
+                            .await;
+                            let response = match result {
+                                ElicitationResult::Accept(content) => {
+                                    CreateElicitationResponse::new(ElicitationAction::Accept(
+                                        ElicitationAcceptAction::new().content(content),
+                                    ))
+                                }
+                                ElicitationResult::Decline => {
+                                    CreateElicitationResponse::new(ElicitationAction::Decline)
+                                }
+                                ElicitationResult::Cancel => {
+                                    CreateElicitationResponse::new(ElicitationAction::Cancel)
+                                }
+                            };
+                            let _ = responder.respond(response);
                             Ok(())
                         }
                     },
@@ -1594,6 +1673,34 @@ pub(super) async fn approve_or_disconnect(
         }
     }
 }
+/// elicitation 等待 + 断线/重连即时取消（与 [`approve_or_disconnect`] 同模式，
+/// 独立成函数便于单元测试）。表单等待期间连接断开/重连（conn_rx 变为 ≠ 捕获的
+/// conn_id）→ 立即 `Cancel`，避免 `request_elicitation` 等满 5 分钟超时阻塞
+/// agent 的下一个工具调用。
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn elicit_or_disconnect(
+    elicitation: Arc<ElicitFn>,
+    sid: String,
+    message: String,
+    schema: serde_json::Value,
+    ws_tx: mpsc::Sender<serde_json::Value>,
+    captured_conn_id: u64,
+    mut conn_rx: watch::Receiver<u64>,
+) -> ElicitationResult {
+    // subscribe 之后立即检查：可能在 subscribe 之前已变化（detach/重连已发生）。
+    if *conn_rx.borrow() != captured_conn_id {
+        return ElicitationResult::Cancel;
+    }
+    tokio::select! {
+        result = elicitation(sid, message, schema, ws_tx) => {
+            result
+        }
+        _ = conn_rx.wait_for(|v| *v != captured_conn_id) => {
+            // WS 断线/重连 → Cancel（不等表单超时）。
+            ElicitationResult::Cancel
+        }
+    }
+}
 /// 从权限选项里挑指定 kind 的 option id（approve→AllowAlways/AllowOnce，
 /// deny→RejectAlways/RejectOnce；优先 Always 对齐"记住本会话"语义）。
 fn pick_option(
@@ -1644,6 +1751,13 @@ pub(super) fn client_capabilities() -> agent_client_protocol::schema::v1::Client
                 .write_text_file(true),
         )
         .meta(meta)
+        // 声明 elicitation.form：claude-code-acp 据此启用 AskUserQuestion（否则放入
+        // disallowedTools 报「not enabled in this context」）。只声明 form、不声明
+        // url（缺省 None → 序列化不含；收到 url/other 模式回 Cancel + warn 降级）。
+        .elicitation(
+            agent_client_protocol::schema::v1::ElicitationCapabilities::new()
+                .form(agent_client_protocol::schema::v1::ElicitationFormCapabilities::new()),
+        )
 }
 /// 把 ACP 的绝对路径转成工作区相对路径。客户端 `resolve_sandboxed` 只接受相对
 /// 路径（拒绝绝对路径、拒绝逃逸工作区）；ACP `Read/WriteTextFileRequest.path`

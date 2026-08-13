@@ -13,10 +13,12 @@ pub mod sse;
 pub mod title;
 pub mod tools;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use agent_client_protocol::schema::v1::ElicitationContentValue;
 use serde::{Deserialize, Serialize};
 
 use crate::client_registry::ClientRegistry;
@@ -25,6 +27,10 @@ use crate::db::Database;
 use self::acp_bridge::AcpBridge;
 use self::llm_bridge::LlmGatewayEndpoint;
 use self::spawner::AgentSpawner;
+
+/// elicitation 等待超时（与审批一致 5 分钟；超时按 `Cancel` 回 agent，前端表单
+/// 卡悬停过久同样取消，agent 不卡死）。
+const ELICITATION_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// 审批卡片上展示的选项（ACP `session/request_permission` 透传；runner 路径为空）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,38 +58,59 @@ impl ApprovalResult {
     }
 }
 
-/// 挂起的审批请求表：`request_id` → (工具名, 唤醒 `sender`)。别名化避免
-/// `clippy::type_complexity` 在多层嵌套字段上触发。
-type PendingApprovals = HashMap<String, (String, oneshot::Sender<ApprovalResult>)>;
+/// 挂起请求表结构（审批 / elicitation 共用）：`request_id` → (标识, 唤醒 `sender`)。
+/// 别名化避免 `clippy::type_complexity` 在多层嵌套字段上触发。
+type PendingMap<V> = HashMap<String, (String, oneshot::Sender<V>)>;
 
-/// `request_approval` 的清理 guard：future 被 drop（cancel/断连）时移除 pending 条目，
-/// 防止泄漏。正常完成时通过 [`Self::disarm`] 避免重复移除（无害但省一次锁）。
-struct ApprovalGuard {
-    approvals: Arc<Mutex<PendingApprovals>>,
+/// 挂起的审批请求表：`request_id` → (工具名, 唤醒 `sender`)。
+type PendingApprovals = PendingMap<ApprovalResult>;
+
+/// `request_elicitation` 的用户响应结果（与 `ApprovalResult` 并列）。`Accept` 携带
+/// 与 `requested_schema` 匹配的字段值（可空）；`Decline` 用户跳过；`Cancel` 会话已
+/// 回收 / 断线 / 超时 / 发送失败等非用户主动选择。镜像审批链路，前端表单卡三按钮
+/// 各自映射。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationResult {
+    /// 用户接受并填表：content 为与 `requested_schema` 匹配的字段值（可空）。
+    Accept(Option<BTreeMap<String, ElicitationContentValue>>),
+    /// 用户跳过。
+    Decline,
+    /// 取消（会话已回收 / 断线 / 超时 / 发送失败）。
+    Cancel,
+}
+
+/// 挂起的 elicitation 请求表：`request_id` → (session_id, 唤醒 `sender`)。
+type PendingElicitations = PendingMap<ElicitationResult>;
+
+/// 挂起请求的清理 guard（审批 / elicitation 共用）：future 被 drop（cancel/断连）
+/// 时移除 pending 条目，防止泄漏。正常完成时通过 [`Self::disarm`] 避免重复移除
+/// （无害但省一次锁）。
+struct PendingGuard<V: Send + 'static> {
+    pending: Arc<Mutex<PendingMap<V>>>,
     request_id: String,
     armed: bool,
 }
 
-impl ApprovalGuard {
+impl<V: Send + 'static> PendingGuard<V> {
     fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for ApprovalGuard {
+impl<V: Send + 'static> Drop for PendingGuard<V> {
     fn drop(&mut self) {
         if self.armed {
-            let approvals = self.approvals.clone();
+            let pending = self.pending.clone();
             let id = std::mem::take(&mut self.request_id);
             // Drop 不能 await：try_lock 失败则 spawn 异步清理（锁竞争极短，几乎不会失败）。
             // try_lock 的 Result 持有借用直至被显式 drop，先绑定再用 drop 释放以允许 move。
-            let lock = approvals.try_lock();
+            let lock = pending.try_lock();
             if let Ok(mut map) = lock {
                 map.remove(&id);
             } else {
                 drop(lock);
                 tokio::spawn(async move {
-                    approvals.lock().await.remove(&id);
+                    pending.lock().await.remove(&id);
                 });
             }
         }
@@ -104,6 +131,10 @@ pub struct AgentState {
     /// 等待用户审批的工具调用：`request_id` → (工具名, 唤醒 `sender`)。
     /// 跨 `runner`/`WS` 读循环共享（挂 `AgentState` 而非单连接）。
     approvals: Arc<Mutex<PendingApprovals>>,
+    /// 等待用户响应的 elicitation（AskUserQuestion 表单）：`request_id` →
+    /// (session_id, 唤醒 `sender`)。与 approvals 同模式挂 `AgentState`；仅 ACP
+    /// 路径产生（runner 无表单概念），WS 外层读循环按 `acp_active` 门控分发。
+    elicitations: Arc<Mutex<PendingElicitations>>,
     /// "本会话允许此类工具"记忆集：`session_id` → 工具名集合。内存态，进程重启清零。
     session_allowed: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// 进行中的 exec：workspace_id → request_id。WS cancel/断连时据此把取消
@@ -125,6 +156,7 @@ impl AgentState {
             workspace_locks: Arc::new(Mutex::new(HashMap::new())),
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(Mutex::new(HashMap::new())),
+            elicitations: Arc::new(Mutex::new(HashMap::new())),
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
             acp_bridge: None,
@@ -132,23 +164,39 @@ impl AgentState {
         // 审批走 AgentState::request_approval（与 runner 共用审批弹层/pending map；
         // 克隆只有 acp_bridge=None，request_approval 不依赖它）。
         let approval_agent = state.clone();
-        let bridge = AcpBridge::new(AgentSpawner::new(registry), db).with_approval(Arc::new(
-            move |session_id, tool, summary, args_preview, options, ws_tx| {
-                let agent = approval_agent.clone();
-                Box::pin(async move {
-                    agent
-                        .request_approval(
-                            &session_id,
-                            &tool,
-                            &summary,
-                            &args_preview,
-                            &options,
-                            &ws_tx,
-                        )
-                        .await
-                })
-            },
-        ));
+        let elicitation_agent = state.clone();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db)
+            .with_approval(Arc::new(
+                move |session_id, tool, summary, args_preview, options, ws_tx| {
+                    let agent = approval_agent.clone();
+                    Box::pin(async move {
+                        agent
+                            .request_approval(
+                                &session_id,
+                                &tool,
+                                &summary,
+                                &args_preview,
+                                &options,
+                                &ws_tx,
+                            )
+                            .await
+                    })
+                },
+            ))
+            // elicitation 走 AgentState::request_elicitation（与审批同理由：克隆
+            // 只有 acp_bridge=None，request_elicitation 不依赖它）。AskUserQuestion
+            // 表单经 `elicitation_request` 帧推前端，用户响应经 `elicitation_response`
+            // 回传（WS 外层循环分发）。
+            .with_elicitation(Arc::new(
+                move |session_id, message, schema, ws_tx| {
+                    let agent = elicitation_agent.clone();
+                    Box::pin(async move {
+                        agent
+                            .request_elicitation(&session_id, &message, &schema, &ws_tx)
+                            .await
+                    })
+                },
+            ));
         state.acp_bridge = Some(bridge);
         state
     }
@@ -222,8 +270,8 @@ impl AgentState {
             .await
             .insert(request_id.clone(), (tool.to_string(), tx));
         // 清理 guard：future 被 drop（cancel/断连）时兜底移除 pending 条目，防止泄漏。
-        let mut guard = ApprovalGuard {
-            approvals: self.approvals.clone(),
+        let mut guard = PendingGuard::<ApprovalResult> {
+            pending: self.approvals.clone(),
             request_id: request_id.clone(),
             armed: true,
         };
@@ -284,6 +332,100 @@ impl AgentState {
         }
     }
 
+    /// 发 elicitation 请求帧（AskUserQuestion 表单）并挂起等待用户响应。镜像
+    /// [`Self::request_approval`]：发送失败（前端已断开）、5 分钟超时、连接取消
+    /// （sender 被 drop）一律视为 `Cancel`。发送失败立即返回，不等超时——否则
+    /// 调用方（ACP 连接任务的请求处理器）会被占用 5 分钟，阻塞 agent 下一个
+    /// 工具调用。
+    ///
+    /// `schema`：agent 的 `elicitation/create` 请求里 `requestedSchema` 的原始
+    /// JSON（复杂 serde 枚举，后端不做表单模型重建，原样透传前端渲染）。
+    pub async fn request_elicitation(
+        &self,
+        session_id: &str,
+        message: &str,
+        schema: &serde_json::Value,
+        ws_tx: &mpsc::Sender<serde_json::Value>,
+    ) -> ElicitationResult {
+        self.request_elicitation_inner(session_id, message, schema, ws_tx, ELICITATION_TIMEOUT)
+            .await
+    }
+
+    /// `request_elicitation` 的 timeout 可参数化内部变体（测试传短超时；生产用
+    /// 默认 5 分钟）。
+    async fn request_elicitation_inner(
+        &self,
+        session_id: &str,
+        message: &str,
+        schema: &serde_json::Value,
+        ws_tx: &mpsc::Sender<serde_json::Value>,
+        timeout: Duration,
+    ) -> ElicitationResult {
+        let request_id = format!("{:032x}", rand::random::<u128>());
+        let (tx, rx) = oneshot::channel();
+        self.elicitations
+            .lock()
+            .await
+            .insert(request_id.clone(), (session_id.to_string(), tx));
+        // 清理 guard：future 被 drop（cancel/断连）时兜底移除 pending 条目。
+        let mut guard = PendingGuard::<ElicitationResult> {
+            pending: self.elicitations.clone(),
+            request_id: request_id.clone(),
+            armed: true,
+        };
+        let send_ok = ws_tx
+            .send(serde_json::json!({
+                "type": "elicitation_request",
+                "request_id": &request_id,
+                "message": message,
+                "schema": schema, // 原始 schema JSON 透传前端
+            }))
+            .await
+            .is_ok();
+        if !send_ok {
+            // 表单帧无法送达（前端已断开/通道关闭）：直接视为取消并立即返回，
+            // 不等待超时。pending 条目在此显式清理（guard 同时 disarmed）。
+            self.elicitations.lock().await.remove(&request_id);
+            guard.disarm();
+            return ElicitationResult::Cancel;
+        }
+        let result = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            _ => ElicitationResult::Cancel, // 超时 / sender 被 drop（取消）
+        };
+        self.elicitations.lock().await.remove(&request_id);
+        guard.disarm();
+        result
+    }
+
+    /// `WS` 收到 `elicitation_response` 时唤醒对应挂起。未知 `id` 静默忽略
+    /// （可能已超时清除 / 不属本进程）。`action` ∈ accept/decline/cancel；
+    /// accept 时把 `content` 解析为字段值对象（解析失败 warn + `Accept(None)`，
+    /// 不 panic、不把错误传给 agent）。
+    pub async fn resolve_elicitation(
+        &self,
+        _session_id: &str,
+        request_id: &str,
+        action: &str,
+        content: Option<serde_json::Value>,
+    ) {
+        let entry = self.elicitations.lock().await.remove(request_id);
+        let Some((_, tx)) = entry else { return };
+        let result = match action {
+            "accept" => {
+                let parsed = content.and_then(|c| {
+                    serde_json::from_value::<BTreeMap<String, ElicitationContentValue>>(c)
+                        .map_err(|e| tracing::warn!(%request_id, "parse elicitation content failed: {e}"))
+                        .ok()
+                });
+                ElicitationResult::Accept(parsed)
+            }
+            "decline" => ElicitationResult::Decline,
+            _ => ElicitationResult::Cancel,
+        };
+        let _ = tx.send(result);
+    }
+
     /// 本会话是否已记住允许此类工具（免审批记忆集命中）。
     pub async fn is_allowed_for_session(&self, session_id: &str, tool: &str) -> bool {
         self.session_allowed
@@ -309,6 +451,12 @@ impl AgentState {
         self.approvals.lock().await.len()
     }
 
+    /// 当前挂起的 elicitation 请求数（仅测试用：泄漏检测）。
+    #[cfg(test)]
+    pub(crate) async fn pending_elicitations_count(&self) -> usize {
+        self.elicitations.lock().await.len()
+    }
+
     /// 生成新 exec 的 request_id 并记入 inflight，返回 id。
     /// WS cancel 用 `inflight_take` 取走；exec 结束后 `inflight_end` 清除。
     pub async fn inflight_begin(&self, workspace_id: &str) -> String {
@@ -328,5 +476,210 @@ impl AgentState {
     /// 取出进行中的 exec request_id 并清除（cancel/断连时用，先取后清防重复取消）。
     pub async fn inflight_take(&self, workspace_id: &str) -> Option<String> {
         self.exec_inflight.lock().await.remove(workspace_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_registry::ClientRegistry;
+    use crate::db::Database;
+
+    /// 构造一个带空 pending 表的 AgentState（elicitation 测试用）。
+    async fn test_agent() -> AgentState {
+        let db = Database::new(":memory:").await.unwrap();
+        AgentState::new(ClientRegistry::new(db.clone()), db)
+    }
+
+    /// 发一个挂起的 elicitation（长超时，测试内 resolve/abort），并等待 pending
+    /// 条目已插入。返回 (spawn 的 JoinHandle, ws_tx 通道里收到的请求帧)。
+    async fn spawn_pending_elicitation(
+        agent: &AgentState,
+    ) -> (
+        tokio::task::JoinHandle<ElicitationResult>,
+        serde_json::Value,
+    ) {
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(1);
+        let agent2 = agent.clone();
+        let handle = tokio::spawn(async move {
+            agent2
+                .request_elicitation_inner(
+                    "s1",
+                    "请选择",
+                    &serde_json::json!({"type": "object", "properties": {}}),
+                    &ws_tx,
+                    Duration::from_secs(3600),
+                )
+                .await
+        });
+        // 等待 pending 条目已插入（future 已执行到 insert + 发帧，随后挂起在 rx）。
+        for _ in 0..100 {
+            if agent.pending_elicitations_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(agent.pending_elicitations_count().await, 1);
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws_rx.recv())
+            .await
+            .expect("elicitation_request frame should be sent")
+            .expect("ws channel closed");
+        assert_eq!(frame["type"], "elicitation_request");
+        assert_eq!(frame["message"], "请选择");
+        assert!(frame["schema"].is_object());
+        (handle, frame)
+    }
+
+    #[tokio::test]
+    async fn test_request_elicitation_send_failure_cancels() {
+        // 前端已断开（接收端 drop）→ 发帧失败 → 立即 Cancel，pending 清空，不等超时。
+        let agent = test_agent().await;
+        let (ws_tx, ws_rx) = mpsc::channel::<serde_json::Value>(1);
+        drop(ws_rx);
+        let result = agent
+            .request_elicitation("s1", "请选择", &serde_json::json!({}), &ws_tx)
+            .await;
+        assert_eq!(result, ElicitationResult::Cancel);
+        assert_eq!(agent.pending_elicitations_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_request_elicitation_timeout_cancels() {
+        // 生产默认 5 分钟；内部变体传 50ms 验证超时 Cancel（接收端不响应）。
+        let agent = test_agent().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(1);
+        let result = agent
+            .request_elicitation_inner(
+                "s1",
+                "请选择",
+                &serde_json::json!({}),
+                &ws_tx,
+                Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(result, ElicitationResult::Cancel);
+        assert_eq!(agent.pending_elicitations_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_elicitation_accept_parses_content() {
+        // accept：content 按 untagged 顺序解析为 String/Integer/StringArray。
+        let agent = test_agent().await;
+        let (handle, frame) = spawn_pending_elicitation(&agent).await;
+        let request_id = frame["request_id"].as_str().unwrap().to_string();
+        agent
+            .resolve_elicitation(
+                "s1",
+                &request_id,
+                "accept",
+                Some(serde_json::json!({
+                    "name": "Alice",
+                    "age": 3,
+                    "tags": ["a", "b"],
+                })),
+            )
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("elicitation should resolve")
+            .expect("spawned task panicked");
+        match result {
+            ElicitationResult::Accept(Some(content)) => {
+                assert_eq!(
+                    content.get("name"),
+                    Some(&ElicitationContentValue::String("Alice".into()))
+                );
+                assert_eq!(content.get("age"), Some(&ElicitationContentValue::Integer(3)));
+                assert_eq!(
+                    content.get("tags"),
+                    Some(&ElicitationContentValue::StringArray(vec![
+                        "a".into(),
+                        "b".into()
+                    ]))
+                );
+            }
+            other => panic!("expected Accept, got {other:?}"),
+        }
+        assert_eq!(agent.pending_elicitations_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_elicitation_decline_cancel() {
+        // decline / cancel 分别唤醒为 Decline / Cancel。
+        for (action, expected) in [("decline", ElicitationResult::Decline), ("cancel", ElicitationResult::Cancel)] {
+            let agent = test_agent().await;
+            let (handle, frame) = spawn_pending_elicitation(&agent).await;
+            let request_id = frame["request_id"].as_str().unwrap().to_string();
+            agent
+                .resolve_elicitation("s1", &request_id, action, None)
+                .await;
+            let result = tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("elicitation should resolve")
+                .expect("spawned task panicked");
+            assert_eq!(result, expected);
+            assert_eq!(agent.pending_elicitations_count().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_elicitation_unknown_id_noop() {
+        // 未知 id（已超时清除 / 不属本进程）：静默忽略，不 panic、不留残留。
+        let agent = test_agent().await;
+        let (handle, frame) = spawn_pending_elicitation(&agent).await;
+        agent
+            .resolve_elicitation("s1", "no-such-id", "accept", None)
+            .await;
+        assert_eq!(agent.pending_elicitations_count().await, 1, "pending must survive");
+        let request_id = frame["request_id"].as_str().unwrap().to_string();
+        agent
+            .resolve_elicitation("s1", &request_id, "cancel", None)
+            .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("elicitation should resolve")
+            .expect("spawned task panicked");
+        assert_eq!(result, ElicitationResult::Cancel);
+        assert_eq!(agent.pending_elicitations_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_guard_drop_cleans() {
+        // 泄漏检测：future 被 drop（abort/cancel/断连）时，PendingGuard 兜底
+        // 移除 pending 条目，不残留（等价 request_elicitation 挂起中被取消）。
+        let agent = test_agent().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(1);
+        let agent2 = agent.clone();
+        let handle = tokio::spawn(async move {
+            agent2
+                .request_elicitation_inner(
+                    "s1",
+                    "请选择",
+                    &serde_json::json!({}),
+                    &ws_tx,
+                    Duration::from_secs(3600),
+                )
+                .await
+        });
+        for _ in 0..100 {
+            if agent.pending_elicitations_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(agent.pending_elicitations_count().await, 1);
+        // abort 是取消信号：任务 drop 在调度后发生，轮询等待 guard 兜底清理完成。
+        handle.abort();
+        for _ in 0..100 {
+            if agent.pending_elicitations_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            agent.pending_elicitations_count().await,
+            0,
+            "dropped future must clean up its pending entry"
+        );
     }
 }
