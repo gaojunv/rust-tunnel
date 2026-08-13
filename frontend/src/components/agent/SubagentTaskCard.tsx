@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Bot, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
 import type { ChatItem } from './types';
 import MessageBubble, { CollapsiblePre, resolveToolStatus, splitToolTitle } from './MessageBubble';
+import SubagentTypeBadge from './SubagentTypeBadge';
 import { extractSubagentMeta } from './subagent';
 
 interface Props {
@@ -73,11 +74,7 @@ function SubagentTaskCard({ item, streamingChildIdx, open, onToggle }: Props) {
       >
         <Bot className="h-3.5 w-3.5 shrink-0 text-primary" />
         <span className="font-medium text-foreground/90">{label}</span>
-        {meta.subagentType && (
-          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-            {meta.subagentType}
-          </span>
-        )}
+        {meta.subagentType && <SubagentTypeBadge type={meta.subagentType} />}
         {progress && (
           <span className="min-w-0 truncate font-mono text-muted-foreground">{progress}</span>
         )}

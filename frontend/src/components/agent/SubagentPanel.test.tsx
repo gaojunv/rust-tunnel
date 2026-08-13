@@ -37,7 +37,8 @@ describe('SubagentPanel', () => {
     );
     expect(screen.getByText('agent.subagents')).toBeTruthy();
     expect(screen.getByText('A 任务')).toBeTruthy();
-    expect(screen.getByText('general-purpose')).toBeTruthy();
+    // 已知类型：本地化 key 渲染（mock t 原样返回 key），不再是裸英文类型名
+    expect(screen.getByText('agent.subagentTypeGeneral')).toBeTruthy();
     // 运行中进度：N 个工具 · 当前工具（splitToolTitle 归一化 label）
     expect(screen.getByText('2 agent.tools · Terminal')).toBeTruthy();
     expect(screen.getByText('B 任务')).toBeTruthy();

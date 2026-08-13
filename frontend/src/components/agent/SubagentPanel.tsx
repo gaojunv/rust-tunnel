@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Bot, ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import SubagentTypeBadge from './SubagentTypeBadge';
 import type { SubagentSummary } from './subagent';
 
 interface Props {
@@ -58,11 +59,7 @@ export default function SubagentPanel({ variant, summaries, onSelect, expandedId
         <span className="min-w-0 truncate font-medium text-foreground/90">
           {s.label || t('agent.subagent')}
         </span>
-        {s.subagentType && (
-          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-            {s.subagentType}
-          </span>
-        )}
+        {s.subagentType && <SubagentTypeBadge type={s.subagentType} />}
         {progress && (
           <span className="ml-auto shrink-0 truncate font-mono text-[10px] text-muted-foreground">
             {progress}

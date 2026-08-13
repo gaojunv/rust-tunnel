@@ -8,6 +8,7 @@ import {
   groupByParent,
   parseChunkKey,
   patchChildToolResult,
+  subagentTypeMeta,
   upsertToolCard,
 } from './subagent';
 
@@ -137,6 +138,41 @@ describe('extractSubagentMeta', () => {
 
   it('returns empty meta when nothing is available', () => {
     expect(extractSubagentMeta(undefined, undefined)).toEqual({});
+  });
+});
+
+describe('subagentTypeMeta', () => {
+  it('maps known types to localized labelKey + semantic chip colors', () => {
+    expect(subagentTypeMeta('explore')).toEqual({
+      labelKey: 'agent.subagentTypeExplore',
+      chipClass: 'bg-teal-500/10',
+      textClass: 'text-teal-600 dark:text-teal-400',
+    });
+    expect(subagentTypeMeta('general-purpose')).toEqual({
+      labelKey: 'agent.subagentTypeGeneral',
+      chipClass: 'bg-slate-500/10',
+      textClass: 'text-slate-600 dark:text-slate-400',
+    });
+    expect(subagentTypeMeta('plan')).toEqual({
+      labelKey: 'agent.subagentTypePlan',
+      chipClass: 'bg-violet-500/10',
+      textClass: 'text-violet-600 dark:text-violet-400',
+    });
+  });
+
+  it('is case/whitespace tolerant for known types', () => {
+    expect(subagentTypeMeta('  Explore ')).toEqual(subagentTypeMeta('explore'));
+  });
+
+  it('falls back to muted style with no labelKey for unknown types (raw value shown)', () => {
+    const meta = subagentTypeMeta('custom-agent');
+    expect(meta).toEqual({ chipClass: 'bg-muted', textClass: 'text-muted-foreground' });
+    expect(meta!.labelKey).toBeUndefined();
+  });
+
+  it('returns undefined for empty/missing type (badge not rendered)', () => {
+    expect(subagentTypeMeta(undefined)).toBeUndefined();
+    expect(subagentTypeMeta('')).toBeUndefined();
   });
 });
 

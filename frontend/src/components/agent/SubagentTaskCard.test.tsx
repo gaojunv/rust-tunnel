@@ -103,6 +103,15 @@ describe('SubagentTaskCard', () => {
     expect(screen.getByText('子文本')).toBeTruthy();
   });
 
+  it('renders subagent type badge (localized key for known type, raw value for unknown)', () => {
+    render(
+      <SubagentTaskCard
+        item={parent({ toolArgs: '{"description":"调研 bug","subagent_type":"explore"}' })}
+      />,
+    );
+    expect(screen.getByText('agent.subagentTypeExplore')).toBeTruthy();
+  });
+
   it('shows the breathing progress bar while running and fades out when done', () => {
     const { container, rerender } = render(
       <SubagentTaskCard
