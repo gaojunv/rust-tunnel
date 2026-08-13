@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -1092,7 +1093,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         )}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4 dark:text-foreground/85"
+        className="chat-fade-bottom flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4 dark:text-foreground/85"
+        style={{ '--fade-float': `${inputFloatH}px` } as CSSProperties}
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
@@ -1135,29 +1137,28 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           </div>
         )}
         {running && (
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            {t('agent.running')}
-          </div>
+          /* 运行中指示：流动丝带（纯 CSS 动画，主题色渐变流转，见 index.css
+             .agent-running-ribbon）；role/aria-label 保留屏幕阅读器的运行状态提示 */
+          <div
+            className="agent-running-ribbon my-2.5 w-full"
+            role="status"
+            aria-label={t('agent.running')}
+          />
         )}
         <div ref={bottomRef} />
         </div>
-        {/* 悬浮输入框占位 + 底部渐隐（合并为一个 sticky 元素）：sticky 固定在可视
-            底部，高度同时充当占位，保证最后一条消息能滚动到输入框之上。作为滚动
-            容器的子元素，浏览器把滚动条绘制在所有后代之上——渐隐不再遮挡滚动条、
-            也不阻断其交互（此前 external absolute + inset-x-0 会盖住右侧细滚动条，
-            导致 thumb 被渐变挡住、滚动条拖不动）；宽度自动等于内容宽度（不含
-            滚动条），无需硬编码滚动条宽度。 */}
-        <div
-          aria-hidden
-          className="pointer-events-none sticky bottom-0 bg-gradient-to-t from-card via-card/85 to-transparent"
-          style={{ height: inputFloatH + 28 }}
-        />
+        {/* 悬浮输入框占位 + 底部渐隐由滚动容器的 ::after 伪元素承担
+            （.chat-fade-bottom，见 index.css）：sticky 固定在可视底部，高度同时
+            充当占位；实心段经 --fade-float/--fade-gap 精确对齐输入框顶部，其上
+            36px 线性淡出。纯 CSS 实现，无额外 div；作为滚动容器后代，浏览器把
+            滚动条绘制在其上，不遮挡滚动条。 */}
       </div>
 
-      {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌 */}
-      <div className="absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-6 md:pb-5">
-        <div ref={inputCardRef} className="mx-auto w-full max-w-3xl">
+      {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌。
+          外层 absolute inset-x-0 横跨含滚动条的整宽，必须 pointer-events-none 放行
+          右下角滚动条（否则滚动条底部区段被盖住拖不动），交互由内层卡片恢复。 */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-6 md:pb-5">
+        <div ref={inputCardRef} className="pointer-events-auto mx-auto w-full max-w-3xl">
         {disconnected && (
           <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
             <Loader2 className="h-3 w-3 animate-spin" />

@@ -80,17 +80,17 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     act(() => {
       wsInstance!.emit({ type: 'tool_result', id: 'c1', name: 'list_dir', result: 'ok' });
     });
     // tool 回齐但未收到 done → 仍 Running
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     act(() => {
       wsInstance!.emit({ type: 'assistant_chunk', content: '完成' });
       wsInstance!.emit({ type: 'done' });
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('clears running on error even with pending tools', async () => {
@@ -101,7 +101,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'error', message: 'boom' });
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('clears running on done even with lost tool_result frames', async () => {
@@ -113,7 +113,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'done' });
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('reconnects after close and shows reconnecting banner', async () => {
@@ -151,7 +151,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // tool_call 引发状态更新 → React Query 对 stale 查询后台 refetch → 挂载过
     // 的 history effect 重新执行（loadedRef 已 true，直接跳过），但 WS effect
     // 不会因此重建——取「当前活跃连接」（wsInstance）触发关闭。
@@ -159,7 +159,7 @@ describe('ChatStream running state', () => {
       wsInstance!.onclose?.();
     });
     // running 解除 + 中断提示（刚发的消息可能未处理）
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
     expect(screen.getByText(/agent.connectionInterrupted/)).toBeTruthy();
   });
 
@@ -179,11 +179,11 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     act(() => {
       timeoutCb?.();
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('renders new-format tool_calls/tool_result history', async () => {
@@ -231,7 +231,7 @@ describe('ChatStream running state', () => {
     // StatusBadge 对 failed 渲染 ✗（折叠卡片头部可见，无需展开）
     expect(screen.getByText('✗')).toBeTruthy();
     // 重载时末尾是 tool_calls 行 → running 兜底置 true（回合可能仍在服务端跑）
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
   });
 
   it('does not render orphan card for tool_calls with paired tool_result', async () => {
@@ -310,7 +310,7 @@ describe('ChatStream running state', () => {
     // 半截装载：孤儿卡 failed + running 兜底
     expect(await screen.findByText('Read')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // done → invalidate → refetch 返回完整历史 → 对账重载
     await act(async () => {
       wsInstance!.emit({ type: 'done' });
@@ -318,7 +318,7 @@ describe('ChatStream running state', () => {
     expect(await screen.findByText('完成')).toBeTruthy();
     expect(screen.getByText('✓')).toBeTruthy();
     // running 兜底不复发（对账重载跳过 running heuristic）
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('merges streamed assistant_chunk deltas into one bubble', async () => {
@@ -563,7 +563,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // 停止按钮（aria-label = t('agent.stop')）：running 期间替换发送按钮（互斥）
     const stopBtn = screen.getByRole('button', { name: 'agent.stop' });
     expect(stopBtn).toBeTruthy();
@@ -577,7 +577,7 @@ describe('ChatStream running state', () => {
     // mockWs.send 被调用且 payload 含 '"type":"cancel"'
     expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
     // running 指示消失 + 停止提示气泡出现
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
     expect(screen.getByText(/agent.stopped/)).toBeTruthy();
   });
 
@@ -591,7 +591,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'agent.send' })).toBeNull();
     // running 中输入文字：按钮切回发送（服务端 busy 排队而非丢弃）
@@ -623,7 +623,7 @@ describe('ChatStream running state', () => {
     });
     expect(screen.getByText('agent.messageQueued')).toBeTruthy();
     // 不打断进行中的回合
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
   });
 
   it('shows cancel_fallback warning and clears running', async () => {
@@ -632,12 +632,12 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // 停止超时兜底：agent 未响应停止，服务端强制杀进程并重启
     act(() => {
       wsInstance!.emit({ type: 'cancel_fallback' });
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
     expect(screen.getByText('agent.cancelFallback')).toBeTruthy();
   });
 
@@ -663,7 +663,7 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     expect((screen.getByRole('button', { name: 'agent.configMode' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
@@ -692,12 +692,12 @@ describe('ChatStream running state', () => {
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // 服务端确认取消（本连接或其他标签页的 cancel 都经 WS 广播 stopped）
     act(() => {
       wsInstance!.emit({ type: 'stopped' });
     });
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
   it('invalidates agent-sessions cache on session_title frame', async () => {
@@ -890,14 +890,14 @@ describe('ChatStream running state', () => {
         args_preview: '{}',
       });
     });
-    expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // 点击前捕获当前连接（stop 触发 state 更新后 WS 实例轮换，cancel 发在旧实例）
     const ws = wsInstance!;
     act(() => {
       screen.getByRole('button', { name: 'agent.stop' }).click();
     });
     expect(ws.sent.some((s) => s.includes('"type":"cancel"'))).toBe(true);
-    expect(screen.queryByText('agent.running')).toBeNull();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
     // 停止 → 卡片过期：操作按钮消失、过期文案出现
     expect(screen.queryByRole('button', { name: 'agent.approveOnce' })).toBeNull();
     expect(screen.getByText('agent.approvalExpired')).toBeTruthy();
