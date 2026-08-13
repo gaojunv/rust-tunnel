@@ -43,9 +43,11 @@ interface Props {
   workspaceId: string;
   model: string;
   onModelChange: (id: string) => void;
+  /** 多标签页模式下当前是否激活（hidden → 可见切换时对齐底部）。缺省视为激活。 */
+  active?: boolean;
 }
 
-export default function ChatStream({ sessionId, workspaceId, model, onModelChange }: Props) {
+export default function ChatStream({ sessionId, workspaceId, model, onModelChange, active }: Props) {
   const { t } = useTranslation();
   // t 的身份随语言切换变化，把它放进 WS effect 的依赖会导致切语言时拆断
   // 进行中的回合（onclose 追加"连接中断"气泡、过期所有 pending 审批、
@@ -782,6 +784,20 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
   }, [items, totalSize]);
+
+  // 多标签页模式：后台 tab 用 hidden 保持挂载（不卸载），尺寸/滚动位置不因切换
+  // 而变。从隐藏变为可见（active false→true）且用户此前接近底部时，把视口重新
+  // 对齐到最新消息（后台流式期间可能已新增内容），并让 virtualizer 重测尺寸。
+  // 首次挂载即 active（第一个 tab）不触发——prevActiveRef 初始值即挂载时 active。
+  const prevActiveRef = useRef(active);
+  useEffect(() => {
+    const wasInactive = prevActiveRef.current !== true;
+    prevActiveRef.current = active;
+    if (active && wasInactive && stickToBottomRef.current) {
+      virtualizer.measure();
+      bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
+    }
+  }, [active, virtualizer]);
 
   // 输入框自适应高度：内容驱动向上长高（输入框锚定底部悬浮），超 10 行才出滚动条
   const autoresizeInput = useCallback(() => {

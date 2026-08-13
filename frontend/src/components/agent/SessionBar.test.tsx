@@ -57,17 +57,19 @@ afterEach(() => {
 
 const renderBar = (sessionId = 's1') => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SessionBar
-        workspaceId="w1"
-        sessionId={sessionId}
-        onSelect={vi.fn()}
-        onDeletedCurrent={vi.fn()}
-        onNew={vi.fn()}
-      />
-    </QueryClientProvider>
-  );
+  const handlers = { onSelect: vi.fn(), onSessionDeleted: vi.fn(), onNew: vi.fn() };
+  return {
+    handlers,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <SessionBar
+          workspaceId="w1"
+          sessionId={sessionId}
+          {...handlers}
+        />
+      </QueryClientProvider>,
+    ),
+  };
 };
 
 /** 打开下拉（Radix 菜单在 pointerdown 时打开；portal 渲染到 body）。 */
@@ -109,7 +111,7 @@ describe('SessionBar', () => {
           workspaceId="w1"
           sessionId="s1"
           onSelect={vi.fn()}
-          onDeletedCurrent={vi.fn()}
+          onSessionDeleted={vi.fn()}
           onNew={onNew}
         />
       </QueryClientProvider>
@@ -120,7 +122,7 @@ describe('SessionBar', () => {
   });
 
   it('deletes a session via Dialog confirm (not window.confirm)', async () => {
-    renderBar('s1');
+    const { handlers } = renderBar('s1');
     await openMenu();
     const deleteButtons = await screen.findAllByLabelText('agent.deleteSession');
     fireEvent.click(deleteButtons[0]); // s1（当前会话）
@@ -130,7 +132,7 @@ describe('SessionBar', () => {
     // 取消：不触发删除
     fireEvent.click(screen.getByText('common.cancel'));
     expect(api.deleteAgentSession).not.toHaveBeenCalled();
-    // 再次触发并确认 → 调用 API
+    // 再次触发并确认 → 调用 API，并回调被删会话 id
     await openMenu();
     const buttons = await screen.findAllByLabelText('agent.deleteSession');
     fireEvent.click(buttons[0]);
@@ -138,6 +140,20 @@ describe('SessionBar', () => {
     await waitFor(() => {
       expect(api.deleteAgentSession).toHaveBeenCalledWith('s1');
     });
+    expect(handlers.onSessionDeleted).toHaveBeenCalledWith('s1');
+  });
+
+  it('invokes onSessionDeleted even when deleting a non-current session', async () => {
+    const { handlers } = renderBar('s1');
+    await openMenu();
+    // 删除非当前会话 s2（列表第二项）
+    const deleteButtons = await screen.findAllByLabelText('agent.deleteSession');
+    fireEvent.click(deleteButtons[1]);
+    fireEvent.click(await screen.findByText('common.delete'));
+    await waitFor(() => {
+      expect(api.deleteAgentSession).toHaveBeenCalledWith('s2');
+    });
+    expect(handlers.onSessionDeleted).toHaveBeenCalledWith('s2');
   });
 });
 
