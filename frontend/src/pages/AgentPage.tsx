@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import {
   listAgentWorkspaces,
   listAgentSessions,
@@ -13,8 +14,18 @@ import type { AgentWorkspace, AgentSession } from '../types';
 import ChatStream from '../components/agent/ChatStream';
 import WorkspaceBar from '../components/agent/WorkspaceBar';
 import SessionBar from '../components/agent/SessionBar';
+import SessionTabBar from '../components/agent/SessionTabBar';
 import ActivityBar from '../components/agent/ActivityBar';
 import WorkspaceDialog from '../components/agent/WorkspaceDialog';
+import {
+  loadTabs,
+  saveTabs,
+  migrateLegacy,
+  reconcile,
+  openOrActivate,
+  closeTab,
+  type TabState,
+} from '../components/agent/tabsStore';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 
 export default function AgentPage() {
@@ -25,16 +36,15 @@ export default function AgentPage() {
   const [workspaceId, setWorkspaceId] = useState(
     () => localStorage.getItem('agent.lastWorkspaceId') ?? '',
   );
-  const [sessionId, setSessionId] = useState(
-    () => localStorage.getItem('agent.lastSessionId') ?? '',
-  );
-  const [model, setModel] = useState('');
+  // 多会话标签页：按 workspace 分桶的 tab 状态（open 有序 + active）；无持久化 = 空态
+  const [tabsByWs, setTabsByWs] = useState<Record<string, TabState>>({});
+  // 每个 workspace 是否已完成首次初始化（StrictMode 双调 / sessions refetch 重入守卫）
+  const initedWsRef = useRef<Record<string, boolean>>({});
+  // 会话模型按 tab 记忆：乐观更新 + 失败回滚（handleModelChange）写入，派生 modelFor 读取
+  const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
   // 编辑模式：传入当前工作区则 WorkspaceDialog 走 PUT（client/运行时不可改）
   const [editingWorkspace, setEditingWorkspace] = useState<AgentWorkspace | null>(null);
-  // 自动选中守卫：切换 workspace / 新建会话 / 手动选择后允许自动选中最近会话；
-  // 删除当前会话后置 false，严格回引导态（不自动重选），直到用户再次手动选择或切 workspace。
-  const autoSelectRef = useRef(true);
 
   const { data: workspaces } = useQuery<AgentWorkspace[]>({
     queryKey: ['agent-workspaces'],
@@ -61,6 +71,20 @@ export default function AgentPage() {
     staleTime: 60_000,
   });
 
+  // 当前 workspace 的 tabs（未初始化/无持久化 = 空态）。
+  // useMemo 保证引用稳定，避免持久化 effect 依赖（tabs）每次渲染都变。
+  const tabs = useMemo<TabState>(
+    () => tabsByWs[workspaceId] ?? { open: [], active: '' },
+    [tabsByWs, workspaceId],
+  );
+
+  const setTabs = (updater: (cur: TabState) => TabState) => {
+    setTabsByWs((prev) => {
+      const cur = prev[workspaceId] ?? { open: [], active: '' };
+      return { ...prev, [workspaceId]: updater(cur) };
+    });
+  };
+
   // 只有一个 workspace 时自动选中
   useEffect(() => {
     if (!workspaceId && workspaces?.length === 1) {
@@ -68,66 +92,99 @@ export default function AgentPage() {
     }
   }, [workspaces, workspaceId]);
 
-  // 选中 workspace 后自动选中最近会话（sessions 已按 created_at DESC 排序）
+  // 每个 workspace 的 tab 状态初始化 / 与 sessions 列表对齐：
+  // 1. 首次：loadTabs（含空态，空态不播种）> migrateLegacy > 播种最近会话。
+  // 2. 非首次：reconcile 过滤已删除的会话（主动删/他处删），有变化才更新。
   useEffect(() => {
     if (!workspaceId || !sessions) return;
-    // 删除当前会话后回引导态：显式清空（删除）后禁止自动重选，直到手动选择/切 workspace
-    if (!autoSelectRef.current) return;
-    if (sessions.length === 0) {
-      setSessionId('');
+    const ids = sessions.map((s) => s.id);
+
+    if (initedWsRef.current[workspaceId]) {
+      setTabsByWs((prev) => {
+        const cur = prev[workspaceId] ?? { open: [], active: '' };
+        const next = reconcile(cur, ids);
+        if (next.open.length === cur.open.length && next.active === cur.active) return prev;
+        return { ...prev, [workspaceId]: next };
+      });
       return;
     }
-    if (!sessions.some((s) => s.id === sessionId)) {
-      setSessionId(sessions[0].id);
-    }
-  }, [sessions, workspaceId, sessionId]);
 
-  // 会话切换：回显其模型（空则回退全局默认，再空则回退第一个可用模型，与后端一致）
+    let state: TabState | null = loadTabs(workspaceId);
+    let source: 'persisted' | 'migrated' | null = null;
+    if (state !== null) {
+      source = 'persisted';
+    } else {
+      state = migrateLegacy(workspaceId);
+      if (state !== null) source = 'migrated';
+    }
+    if (state !== null) {
+      const reconciled = reconcile(state, ids);
+      // 迁移来的单标签若被过滤空（会话已删）且还有其它会话 → fall through 播种；
+      // 持久化的空态（用户主动全关）尊重之，不播种。
+      if (!(source === 'migrated' && reconciled.open.length === 0 && sessions.length > 0)) {
+        setTabsByWs((prev) => ({ ...prev, [workspaceId]: reconciled }));
+        initedWsRef.current[workspaceId] = true;
+        return;
+      }
+    }
+    // 播种：sessions 按 created_at DESC，取最近一条为单标签；无会话则空态
+    setTabsByWs((prev) => ({
+      ...prev,
+      [workspaceId]:
+        sessions.length > 0
+          ? { open: [sessions[0].id], active: sessions[0].id }
+          : { open: [], active: '' },
+    }));
+    initedWsRef.current[workspaceId] = true;
+  }, [workspaceId, sessions]);
+
+  // 刷新恢复：写入最近工作区（工作区记忆）+ 各工作区的 tab 状态（仅初始化后）
   useEffect(() => {
-    const cur = sessions?.find((s) => s.id === sessionId);
-    const sessionModel = cur?.model?.trim();
-    const globalDefault = defaultModel?.trim();
-    const fallback =
-      selectableModels?.models[0]?.id || selectableModels?.groups[0]?.id || '';
-    setModel(sessionModel || globalDefault || fallback);
-  }, [sessionId, sessions, defaultModel, selectableModels]);
+    if (workspaceId) localStorage.setItem('agent.lastWorkspaceId', workspaceId);
+    if (workspaceId && initedWsRef.current[workspaceId]) {
+      saveTabs(workspaceId, tabs);
+    }
+  }, [workspaceId, tabs]);
+
+  // 会话模型派生：tab 局部覆盖优先；否则按「会话模型 → 全局默认 → 第一个可用模型」
+  // 的 falsy 链回退（?? 与 || 混合处加括号，避免语法错误/歧义）。
+  const modelFor = (sid: string) =>
+    modelOverrides[sid] ??
+    (sessions?.find((s) => s.id === sid)?.model?.trim() ||
+      defaultModel?.trim() ||
+      selectableModels?.models[0]?.id ||
+      selectableModels?.groups[0]?.id ||
+      '');
 
   const handleNewSession = async () => {
     if (!workspaceId) return;
-    const s = await createAgentSession(workspaceId, undefined, model || undefined);
-    // 同步写入共享缓存：确保自动选中 effect 不会因陈旧列表把新会话打回旧会话
+    const s = await createAgentSession(workspaceId, undefined, modelFor(tabs.active) || undefined);
+    // 同步写入共享缓存：让列表/标签栏立即可见新会话（无需等 invalidate）
     queryClient.setQueryData<AgentSession[]>(['agent-sessions', workspaceId], (old) => [
       s,
       ...(old ?? []),
     ]);
-    autoSelectRef.current = true;
-    setSessionId(s.id);
+    setTabs((cur) => openOrActivate(cur, s.id));
   };
 
   const handleSelectWorkspace = (id: string) => {
-    // 切换 workspace → 重新允许自动选中最近会话
-    autoSelectRef.current = true;
     setWorkspaceId(id);
-    setSessionId('');
   };
 
-  // 手动选择会话 → 重新允许自动选中（后续列表变更时按需自愈）
+  // 点击标签 / SessionBar 选择会话 → 打开或激活对应 tab
   const handleSelectSession = (id: string) => {
-    autoSelectRef.current = true;
-    setSessionId(id);
+    setTabs((cur) => openOrActivate(cur, id));
   };
 
-  // 删除当前会话 → 严格回引导态：清空选中且禁止自动重选
-  const handleDeletedCurrent = () => {
-    autoSelectRef.current = false;
-    setSessionId('');
+  // 关闭标签：仅关标签，会话数据保留（SessionBar 下拉仍可重新打开）
+  const handleCloseTab = (id: string) => {
+    setTabs((cur) => closeTab(cur, id));
   };
 
-  // 刷新恢复：选中变化即持久化，F5 后回到刷新前的 workspace/session
-  useEffect(() => {
-    if (workspaceId) localStorage.setItem('agent.lastWorkspaceId', workspaceId);
-    localStorage.setItem('agent.lastSessionId', sessionId);
-  }, [workspaceId, sessionId]);
+  // 删除会话：任意会话被删都关掉对应标签（若已打开）
+  const handleSessionDeleted = (id: string) => {
+    setTabs((cur) => closeTab(cur, id));
+  };
 
   // 齿轮入口：打开编辑模式的 WorkspaceDialog（预填当前工作区，client/运行时不可改）
   const openEditWorkspace = () => {
@@ -152,37 +209,58 @@ export default function AgentPage() {
         {workspaceId && (
           <SessionBar
             workspaceId={workspaceId}
-            sessionId={sessionId}
+            sessionId={tabs.active}
             onSelect={handleSelectSession}
-            onDeletedCurrent={handleDeletedCurrent}
+            onSessionDeleted={handleSessionDeleted}
             onNew={handleNewSession}
           />
         )}
       </div>
 
+      {/* 多会话标签栏（浏览器 tab 式）：全关时隐藏，引导页提供新建入口 */}
+      {tabs.open.length > 0 && (
+        <SessionTabBar
+          workspaceId={workspaceId}
+          open={tabs.open}
+          active={tabs.active}
+          onSelect={handleSelectSession}
+          onClose={handleCloseTab}
+          onNew={handleNewSession}
+        />
+      )}
+
       <div className="flex min-h-0 flex-1">
-        {/* VS Code 式 Activity Bar（选中会话后可用） */}
-        {sessionId && (
+        {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例） */}
+        {tabs.active && (
           <ActivityBar
-            sessionId={sessionId}
+            sessionId={tabs.active}
             workspaceId={workspaceId}
             variant={isDesktop ? 'sidebar' : 'mobile'}
           />
         )}
 
-        {/* 对话区 */}
+        {/* 对话区：所有打开的 tab 保持挂载，非激活用 hidden 隐藏（后台流式继续、草稿不丢） */}
         <div className="min-w-0 flex-1">
-          {sessionId ? (
-            <ChatStream
-              key={sessionId}
-              sessionId={sessionId}
-              workspaceId={workspaceId}
-              model={model}
-              onModelChange={setModel}
-            />
+          {tabs.open.length > 0 ? (
+            tabs.open.map((id) => (
+              <div key={id} className={id === tabs.active ? 'h-full' : 'hidden'}>
+                <ChatStream
+                  sessionId={id}
+                  workspaceId={workspaceId}
+                  model={modelFor(id)}
+                  active={id === tabs.active}
+                  onModelChange={(m) => setModelOverrides((o) => ({ ...o, [id]: m }))}
+                />
+              </div>
+            ))
           ) : (
-            <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
-              {workspaceId ? t('agent.selectOrNewSession') : t('agent.selectWorkspaceFirst')}
+            <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-sm text-muted-foreground">
+              <p>{workspaceId ? t('agent.selectOrNewSession') : t('agent.selectWorkspaceFirst')}</p>
+              {workspaceId && (
+                <Button variant="outline" size="sm" onClick={() => void handleNewSession()}>
+                  {t('agent.newSession')}
+                </Button>
+              )}
             </div>
           )}
         </div>
@@ -197,8 +275,6 @@ export default function AgentPage() {
           }}
           onCreated={(w) => {
             setWorkspaceId(w.id);
-            // 编辑模式保留当前会话（只是改设置）；新建才回到引导态
-            if (!editingWorkspace) setSessionId('');
             setShowWorkspaceDialog(false);
             setEditingWorkspace(null);
           }}

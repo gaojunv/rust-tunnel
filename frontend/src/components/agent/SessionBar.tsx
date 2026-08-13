@@ -30,13 +30,13 @@ interface Props {
   workspaceId: string;
   sessionId: string;
   onSelect: (id: string) => void;
-  /** 删除当前会话后回引导态（AgentPage 据此禁止自动重选）。 */
-  onDeletedCurrent: () => void;
+  /** 删除任意会话后回调（AgentPage 据此关闭对应标签页）。 */
+  onSessionDeleted: (id: string) => void;
   onNew: () => void;
 }
 
 /** 顶栏会话选择：图标下拉（sticky 新建会话 + 列表项内改名/删除 + 信息增强）。 */
-export default function SessionBar({ workspaceId, sessionId, onSelect, onDeletedCurrent, onNew }: Props) {
+export default function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -62,7 +62,7 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onDeleted
       await deleteAgentSession(session.id);
       setError(null);
       refresh();
-      if (session.id === sessionId) onDeletedCurrent(); // 删的是当前会话 → 回引导态（AgentPage 禁止自动重选）
+      onSessionDeleted(session.id); // 任意会话被删 → 关掉对应标签页（AgentPage 据此关闭 tab）
     } catch (err) {
       setError(getApiErrorMessage(err));
     }
