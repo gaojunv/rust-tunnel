@@ -605,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_approval_abort_cleans_pending() {
-        // 泄漏回归：turn future 被 drop（cancel/断连）时，ApprovalGuard 必须清掉 pending 条目，
+        // 泄漏回归：turn future 被 drop（cancel/断连）时，PendingGuard 必须清掉 pending 条目，
         // 否则 approvals 表永久残留。
         let state = test_state().await;
         let (tx, _rx) = mpsc::channel(8);
