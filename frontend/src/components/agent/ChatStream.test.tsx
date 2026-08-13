@@ -581,17 +581,26 @@ describe('ChatStream running state', () => {
     expect(screen.getByText(/agent.stopped/)).toBeTruthy();
   });
 
-  it('running 时发送按钮被停止按钮替换，二者互斥不并存（Claude Code 风格）', async () => {
+  it('running 时按钮按输入切换：有文字显示发送、无文字显示停止（Claude Code 风格）', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
     // 空闲：仅发送按钮可见，无停止按钮
     expect(screen.getByRole('button', { name: 'agent.send' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
-    // 进入 running：发送按钮消失，仅剩停止按钮
+    // 进入 running 且无输入：仅停止按钮
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', args: '{}' });
     });
     expect(screen.getByText('agent.running')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'agent.send' })).toBeNull();
+    // running 中输入文字：按钮切回发送（服务端 busy 排队而非丢弃）
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '排队消息' } });
+    expect(screen.queryByRole('button', { name: 'agent.stop' })).toBeNull();
+    const sendBtn = screen.getByRole('button', { name: 'agent.send' }) as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    // 清空输入：恢复停止按钮
+    fireEvent.change(screen.getByPlaceholderText('agent.inputPlaceholder'), { target: { value: '' } });
     expect(screen.getByRole('button', { name: 'agent.stop' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'agent.send' })).toBeNull();
     // 结束回合（done）：停止按钮消失，发送按钮回归

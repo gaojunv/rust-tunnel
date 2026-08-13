@@ -1258,10 +1258,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 onChange={sendConfigOption}
                 placeholder={configOptions.length > 0 && !effortOption}
               />
-              {/* 发送/暂停互斥（Claude Code 风格）：运行中仅显示停止按钮，
-                  空闲时仅显示发送按钮，二者不并存。运行中输入框仍可编辑草稿，
-                  需先停止当前回合才能发送新消息。 */}
-              {running ? (
+              {/* 发送/暂停按输入动态切换（Claude Code 风格）：对话进行中若输入框
+                  有文字则显示发送（服务端 busy 排队），无文字则显示停止；空闲时
+                  固定显示发送。二者不并存。 */}
+              {running && !input.trim() ? (
                 <Button
                   onClick={stop}
                   size="sm"
