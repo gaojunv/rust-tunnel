@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -134,9 +133,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 消息区滚动容器 ref：虚拟化的 getScrollElement 目标。
   const scrollRef = useRef<HTMLDivElement>(null);
-  // 悬浮输入框高度：消息区底部留出同高占位，保证末尾消息可滚动到输入框之上
-  const [inputFloatH, setInputFloatH] = useState(0);
-  const inputCardRef = useRef<HTMLDivElement>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
@@ -1002,16 +998,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     autoresizeInput();
   }, [input, autoresizeInput]);
 
-  // 悬浮输入框高度测量（含长高/重连提示条出现）：消息区底部占位与渐隐随之伸缩
-  useEffect(() => {
-    const el = inputCardRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => setInputFloatH(el.offsetHeight));
-    ro.observe(el);
-    setInputFloatH(el.offsetHeight);
-    return () => ro.disconnect();
-  }, []);
-
   // 存在未响应的审批/elicitation 卡片时禁止继续发送（服务端在该响应前挂起回合）
   const hasPendingInteraction = items.some((it) =>
     (it.kind === 'approval' && it.approvalStatus === 'pending') ||
@@ -1327,21 +1313,19 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         )}
       <div
         ref={scrollRef}
-        // 注意：底部不能留 padding——sticky 的 ::after 渐隐被约束在容器 content-box
-        // 内，padding-bottom 会让渐隐整体上移、遮不住可视底部（底部占位由 ::after
-        // 高度承担，见 index.css .chat-fade-bottom）
-        className="chat-fade-bottom flex-1 overflow-y-auto px-3 pt-3 md:px-5 md:pt-4 dark:text-foreground/85"
-        style={{ '--fade-float': `${inputFloatH}px` } as CSSProperties}
+        className="flex-1 overflow-y-auto px-3 pt-3 md:px-5 md:pt-4 dark:text-foreground/85"
         onScroll={(e) => {
           const el = e.currentTarget;
           // 距底 < 80px 视为「跟随流式输出」；上翻超过阈值即停止自动滚动
           stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
-        {/* 限宽包裹层：比下方悬浮输入框（max-w-3xl）略宽，控制长文阅读行长，
-            同时让消息流视觉上包住输入框。两侧 padding 与输入框外层一致（px-3
-            md:px-5）保证边缘对齐。渐隐占位留在层外保持全宽。 */}
-        <div className="mx-auto w-full max-w-[50rem]">
+        {/* 限宽包裹层：与悬浮输入框共用 max-w-3xl，在滚动容器 content 内同一基准
+            居中——滚动条出现时 content 同步缩窄，sticky 输入框作为本层最后一个
+            子元素自动跟随，因此有/无滚动条时消息流与输入框左/右边缘都精确对齐。
+            min-h-full + flex-col 保证消息不足一屏时输入框仍沉底。 */}
+        <div className="mx-auto flex w-full min-h-full max-w-3xl flex-col">
+        <div className="flex-1">
         {hasMore && items.length > 0 && (
           <div className="flex justify-center py-1.5">
             <Button
@@ -1399,25 +1383,23 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         )}
         <div ref={bottomRef} />
         </div>
-        {/* 悬浮输入框占位 + 底部渐隐由滚动容器的 ::after 伪元素承担
-            （.chat-fade-bottom，见 index.css）：sticky 固定在可视底部，高度同时
-            充当占位；实心段经 --fade-float/--fade-gap 精确对齐输入框顶部，其上
-            36px 线性淡出。纯 CSS 实现，无额外 div；作为滚动容器后代，浏览器把
-            滚动条绘制在其上，不遮挡滚动条。 */}
-      </div>
 
-      {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌。
-          外层 absolute inset-x-0 横跨含滚动条的整宽，必须 pointer-events-none 放行
-          右下角滚动条（否则滚动条底部区段被盖住拖不动），交互由内层卡片恢复。 */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-5 md:pb-5">
-        <div ref={inputCardRef} className="pointer-events-auto mx-auto w-full max-w-3xl">
-        {disconnected && (
-          <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
-            <Loader2 className="h-3 w-3 animate-spin" />
-            {t('agent.reconnecting')}
-          </div>
-        )}
-        <div className="relative rounded-2xl border border-input bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring">
+        {/* 悬浮输入框：sticky 钉在滚动容器可视底部，作为限宽层最后一个子元素与
+            消息流共享同一 content 宽度基准（滚动条占位同步收缩），因此有/无滚动条
+            时都与消息流左/右边缘精确对齐。sticky 在文档流中占位，滚动到底时输入框
+            落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区，
+            滚动内容从输入框底下经过时被 bg-card 遮挡。顶部 absolute 渐隐让内容
+            淡出到输入框，不占文档流高度。 */}
+        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+          <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
+          <div className="mx-auto w-full max-w-3xl">
+          {disconnected && (
+            <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t('agent.reconnecting')}
+            </div>
+          )}
+          <div className="relative rounded-2xl border border-input bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring">
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (
@@ -1539,6 +1521,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               )}
             </div>
           </div>
+          </div>
+        </div>
         </div>
         </div>
       </div>
