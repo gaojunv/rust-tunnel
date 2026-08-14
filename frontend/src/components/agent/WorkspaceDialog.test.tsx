@@ -162,6 +162,8 @@ describe('WorkspaceDialog ACP config', () => {
         agent_type: 'gemini',
         agent_path: '/usr/bin/gemini-acp',
         llm_model_id: 'model:m1',
+        github_owner: '',
+        github_repo: '',
       });
     });
   });
@@ -203,6 +205,8 @@ describe('WorkspaceDialog ACP config', () => {
         agent_type: 'gemini',
         agent_path: '/opt/gemini',
         llm_model_id: 'model:m1',
+        github_owner: '',
+        github_repo: '',
       });
     });
   });
@@ -229,6 +233,8 @@ describe('WorkspaceDialog ACP config', () => {
         docker_image: undefined,
         docker_container_id: undefined,
         agent_type: '',
+        github_owner: '',
+        github_repo: '',
       });
     });
   });
@@ -321,6 +327,8 @@ describe('WorkspaceDialog config overrides UI', () => {
         docker_container_id: undefined,
         agent_type: 'claude-code',
         agent_config_overrides: '{"model":"sonnet"}',
+        github_owner: '',
+        github_repo: '',
       });
     });
   });
@@ -344,5 +352,108 @@ describe('WorkspaceDialog config overrides UI', () => {
     });
     const body = api.createAgentWorkspace.mock.calls[0][0];
     expect(body).not.toHaveProperty('agent_config_overrides');
+  });
+});
+
+describe('WorkspaceDialog GitHub config', () => {
+  const editingGithub: AgentWorkspace = {
+    ...editingWs,
+    github_token_set: true,
+    github_owner: 'octo',
+    github_repo: 'my-repo',
+  };
+
+  it('编辑模式：回填 owner/repo，token 占位提示已保存；留空不发送 token', async () => {
+    renderDialog(editingGithub);
+    await clickTab('agent.tabGithub');
+    // owner/repo 回填
+    expect((screen.getByPlaceholderText('agent.githubOwnerPlaceholder') as HTMLInputElement).value).toBe('octo');
+    expect((screen.getByPlaceholderText('agent.githubRepoPlaceholder') as HTMLInputElement).value).toBe('my-repo');
+    // token 密码框不回填明文，placeholder 提示已保存
+    const token = screen.getByPlaceholderText('agent.githubTokenPlaceholder') as HTMLInputElement;
+    expect(token.value).toBe('');
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(api.updateAgentWorkspace).toHaveBeenCalledWith(
+        'w1',
+        expect.objectContaining({
+          github_owner: 'octo',
+          github_repo: 'my-repo',
+        }),
+      );
+    });
+    const body = api.updateAgentWorkspace.mock.calls[0][1];
+    expect(body).not.toHaveProperty('github_token');
+  });
+
+  it('编辑模式：填写新 token 时发送 github_token', async () => {
+    renderDialog(editingGithub);
+    await clickTab('agent.tabGithub');
+    fireEvent.change(screen.getByPlaceholderText('agent.githubTokenPlaceholder'), {
+      target: { value: 'ghp_new_secret' },
+    });
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(api.updateAgentWorkspace).toHaveBeenCalledWith(
+        'w1',
+        expect.objectContaining({ github_token: 'ghp_new_secret' }),
+      );
+    });
+  });
+
+  it('新建模式：填写 owner/repo/token 后 create 携带全部 GitHub 字段', async () => {
+    api.createAgentWorkspace.mockResolvedValue({ ...editingWs, id: 'w-new' });
+    renderDialog();
+    await screen.findByRole('option', { name: 'nas' });
+    fireEvent.change(screen.getByPlaceholderText('agent.namePlaceholder'), {
+      target: { value: 'gh-proj' },
+    });
+    fireEvent.change(screen.getByLabelText('agent.client'), { target: { value: 'nas' } });
+    fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
+      target: { value: '/p' },
+    });
+    await clickTab('agent.tabGithub');
+    fireEvent.change(screen.getByPlaceholderText('agent.githubOwnerPlaceholder'), {
+      target: { value: 'octo' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('agent.githubRepoPlaceholder'), {
+      target: { value: 'my-repo' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('agent.githubTokenPlaceholderEmpty'), {
+      target: { value: 'ghp_create' },
+    });
+    fireEvent.click(screen.getByText('agent.create'));
+    await waitFor(() => {
+      expect(api.createAgentWorkspace).toHaveBeenCalledWith(
+        expect.objectContaining({
+          github_owner: 'octo',
+          github_repo: 'my-repo',
+          github_token: 'ghp_create',
+        }),
+      );
+    });
+  });
+
+  it('新建模式：token 留空时 create 不发送 github_token', async () => {
+    api.createAgentWorkspace.mockResolvedValue({ ...editingWs, id: 'w-new' });
+    renderDialog();
+    await screen.findByRole('option', { name: 'nas' });
+    fireEvent.change(screen.getByPlaceholderText('agent.namePlaceholder'), {
+      target: { value: 'plain-gh' },
+    });
+    fireEvent.change(screen.getByLabelText('agent.client'), { target: { value: 'nas' } });
+    fireEvent.change(screen.getByPlaceholderText('agent.rootPathPlaceholderHost'), {
+      target: { value: '/p' },
+    });
+    await clickTab('agent.tabGithub');
+    fireEvent.change(screen.getByPlaceholderText('agent.githubOwnerPlaceholder'), {
+      target: { value: 'octo' },
+    });
+    fireEvent.click(screen.getByText('agent.create'));
+    await waitFor(() => {
+      expect(api.createAgentWorkspace).toHaveBeenCalled();
+    });
+    const body = api.createAgentWorkspace.mock.calls[0][0];
+    expect(body).not.toHaveProperty('github_token');
   });
 });

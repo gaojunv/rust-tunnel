@@ -662,6 +662,7 @@ impl Database {
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
         Self::migrate_agent_workspaces_v4(pool).await?;
+        Self::migrate_agent_workspaces_v5(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
         Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
@@ -889,6 +890,38 @@ impl Database {
                     return Err(e);
                 }
                 tracing::debug!("agent_workspaces migration: column already exists");
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_workspaces 补全 GitHub Actions 集成列：`github_token`（TEXT 可空，
+    /// 存 LlmCipher 加密后的密文，绝不存明文）、`github_owner`/`github_repo`
+    /// （TEXT 可空，手工填写的仓库定位，否则经隧道 `git remote get-url` 探测）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_workspaces_v5(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "github_token",
+                "ALTER TABLE agent_workspaces ADD COLUMN github_token TEXT",
+            ),
+            (
+                "github_owner",
+                "ALTER TABLE agent_workspaces ADD COLUMN github_owner TEXT",
+            ),
+            (
+                "github_repo",
+                "ALTER TABLE agent_workspaces ADD COLUMN github_repo TEXT",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_workspaces migration: column already exists");
+                }
             }
         }
         Ok(())
@@ -1205,6 +1238,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total2, 3, "migration must be idempotent");
+    }
+
+    /// v5 迁移：github_token/github_owner/github_repo 三列落到 agent_workspaces 后
+    /// 直接 INSERT 应成功（三列均可空），且重复跑迁移幂等（列已存在时跳过 ALTER）。
+    #[tokio::test]
+    async fn test_migrate_agent_workspaces_v5() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // 三列直接 INSERT（新库 schema 直接建列，旧库走 ALTER，两条路径都应可写）
+        sqlx::query(
+            "INSERT INTO agent_workspaces
+                (id, name, client_id, runtime_type, root_path,
+                 github_token, github_owner, github_repo)
+             VALUES ('w1', 'test', 'c1', 'host', '/tmp',
+                     'enc:v1:ciphertext', 'octo', 'repo')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 幂等：再次跑初始化不报错（列已存在，跳过 ALTER）
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT github_token, github_owner, github_repo FROM agent_workspaces WHERE id = 'w1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("enc:v1:ciphertext"));
+        assert_eq!(row.1.as_deref(), Some("octo"));
+        assert_eq!(row.2.as_deref(), Some("repo"));
+
+        // 三列默认 NULL（未显式提供时 INSERT 成功）
+        sqlx::query(
+            "INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path)
+             VALUES ('w2', 'test', 'c1', 'host', '/tmp')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let nulls: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT github_token, github_owner, github_repo FROM agent_workspaces WHERE id = 'w2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(nulls.0.is_none() && nulls.1.is_none() && nulls.2.is_none());
     }
 
     /// 未显式提供 agent_type 时走列默认空串，INSERT 仍应成功（NOT NULL 约束满足）。

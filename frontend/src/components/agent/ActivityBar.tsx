@@ -1,22 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Folder, TerminalSquare, GitBranch } from 'lucide-react';
+import { Folder, TerminalSquare, GitBranch, Workflow } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import FilesPanel from './panels/FilesPanel';
 import TerminalPanel from './panels/TerminalPanel';
 import GitPanel from './panels/GitPanel';
+import GitHubActionsPanel from './panels/github/GitHubActionsPanel';
 
-type PanelKind = 'files' | 'terminal' | 'git';
+type PanelKind = 'files' | 'terminal' | 'git' | 'github';
 
 const ICONS: {
   kind: PanelKind;
   Icon: typeof Folder;
-  labelKey: 'agent.files' | 'agent.terminal' | 'agent.git';
+  labelKey: 'agent.files' | 'agent.terminal' | 'agent.git' | 'agent.github';
 }[] = [
   { kind: 'files', Icon: Folder, labelKey: 'agent.files' },
   { kind: 'terminal', Icon: TerminalSquare, labelKey: 'agent.terminal' },
   { kind: 'git', Icon: GitBranch, labelKey: 'agent.git' },
+  { kind: 'github', Icon: Workflow, labelKey: 'agent.github' },
 ];
 
 /** 面板默认/最小宽度（px）：终端需要足够列宽（80 列等宽字符），文件树/git 列表用窄栏。 */
@@ -24,11 +26,13 @@ const PANEL_DEFAULT_WIDTH: Record<PanelKind, number> = {
   files: 288,
   git: 320,
   terminal: 576,
+  github: 340,
 };
 const PANEL_MIN_WIDTH: Record<PanelKind, number> = {
   files: 200,
   git: 220,
   terminal: 320,
+  github: 240,
 };
 /** 面板最大宽度：不超过外层容器宽度的 80%（至少保留对话区可见）。 */
 const MAX_WIDTH_RATIO = 0.8;
@@ -154,6 +158,7 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
                 {kind === 'files' && <FilesPanel workspaceId={workspaceId} />}
                 {kind === 'terminal' && <TerminalPanel workspaceId={workspaceId} />}
                 {kind === 'git' && <GitPanel sessionId={sessionId} workspaceId={workspaceId} />}
+                {kind === 'github' && <GitHubActionsPanel workspaceId={workspaceId} />}
               </div>
             </SheetContent>
           </Sheet>
@@ -197,6 +202,7 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
           {active === 'files' && <FilesPanel workspaceId={workspaceId} />}
           {active === 'terminal' && <TerminalPanel workspaceId={workspaceId} />}
           {active === 'git' && <GitPanel sessionId={sessionId} workspaceId={workspaceId} />}
+          {active === 'github' && <GitHubActionsPanel workspaceId={workspaceId} />}
         </div>
       )}
 

@@ -55,6 +55,12 @@ import type {
   GitLogResult,
   GitStashesResult,
   GitDiffResult,
+  GhRepoState,
+  GhWorkflowList,
+  GhWorkflowRuns,
+  GhJobList,
+  GhJobLogs,
+  GhWriteResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -560,6 +566,10 @@ export async function createAgentWorkspace(body: {
   agent_path?: string;
   llm_model_id?: string;
   agent_config_overrides?: string;
+  /** GitHub Actions 面板：owner/repo 空串=不设置；token 仅在非空时发送（服务端加密落库） */
+  github_owner?: string;
+  github_repo?: string;
+  github_token?: string;
 }): Promise<AgentWorkspace> {
   const { data } = await api.post('/agent/workspaces', body);
   return data;
@@ -580,6 +590,10 @@ export const updateAgentWorkspace = (
     agent_path?: string;
     llm_model_id?: string;
     agent_config_overrides?: string;
+    /** GitHub 字段：空串=保持不变（服务端 COALESCE）；token 仅在非空时发送 */
+    github_owner?: string;
+    github_repo?: string;
+    github_token?: string;
   },
 ) => api.put(`/agent/workspaces/${id}`, body);
 
@@ -862,6 +876,111 @@ export function postAgentGitStashDrop(
   return postAgentGit(workspaceId, 'stash/drop', { index }, approved);
 }
 
+// ── GitHub Actions 面板（AI 工作台）────────────────────────────
+
+/** GET /github/repo — 仓库定位检测。`refresh=true` 强制经隧道重探 remote。 */
+export async function getAgentGithubRepo(
+  workspaceId: string,
+  refresh?: boolean,
+): Promise<GhRepoState> {
+  const { data } = await api.get<GhRepoState>(
+    `/agent/workspaces/${workspaceId}/github/repo`,
+    { params: { ...(refresh ? { refresh: true } : {}) } },
+  );
+  return data;
+}
+
+/** GET /github/workflows — GitHub 原生工作流列表。 */
+export async function getAgentGithubWorkflows(
+  workspaceId: string,
+): Promise<GhWorkflowList> {
+  const { data } = await api.get<GhWorkflowList>(
+    `/agent/workspaces/${workspaceId}/github/workflows`,
+  );
+  return data;
+}
+
+/** GET /github/runs — 工作流运行列表（GitHub 原生响应）。 */
+export async function getAgentGithubRuns(
+  workspaceId: string,
+  opts?: { workflow_id?: string; per_page?: number },
+): Promise<GhWorkflowRuns> {
+  const { data } = await api.get<GhWorkflowRuns>(
+    `/agent/workspaces/${workspaceId}/github/runs`,
+    { params: opts },
+  );
+  return data;
+}
+
+/** GET /github/runs/:run_id/jobs — 某次运行的作业列表。 */
+export async function getAgentGithubRunJobs(
+  workspaceId: string,
+  runId: string,
+): Promise<GhJobList> {
+  const { data } = await api.get<GhJobList>(
+    `/agent/workspaces/${workspaceId}/github/runs/${runId}/jobs`,
+  );
+  return data;
+}
+
+/** GET /github/jobs/:job_id/logs — 作业日志（尾部 64KB）。 */
+export async function getAgentGithubJobLogs(
+  workspaceId: string,
+  jobId: string,
+): Promise<GhJobLogs> {
+  const { data } = await api.get<GhJobLogs>(
+    `/agent/workspaces/${workspaceId}/github/jobs/${jobId}/logs`,
+  );
+  return data;
+}
+
+/** GitHub 写操作统一封装：body 不含 approved（首次无确认直接 409 审批拦截）。 */
+async function postAgentGithub(
+  workspaceId: string,
+  path: string,
+  body: Record<string, unknown>,
+  approved?: boolean,
+): Promise<GhWriteResult> {
+  const { data } = await api.post<GhWriteResult>(
+    `/agent/workspaces/${workspaceId}/github/${path}`,
+    { ...body, ...(approved !== undefined ? { approved } : {}) },
+  );
+  return data;
+}
+
+/** POST workflow_dispatch：ref 必填，inputs 可选。 */
+export function postAgentGithubDispatch(
+  workspaceId: string,
+  workflowId: string,
+  ref: string,
+  inputs?: Record<string, string>,
+  approved?: boolean,
+): Promise<GhWriteResult> {
+  return postAgentGithub(
+    workspaceId,
+    `workflows/${workflowId}/dispatch`,
+    { ref, ...(inputs && Object.keys(inputs).length > 0 ? { inputs } : {}) },
+    approved,
+  );
+}
+
+/** POST rerun：重跑某次运行。 */
+export function postAgentGithubRerun(
+  workspaceId: string,
+  runId: string,
+  approved?: boolean,
+): Promise<GhWriteResult> {
+  return postAgentGithub(workspaceId, `runs/${runId}/rerun`, {}, approved);
+}
+
+/** POST cancel：取消进行中的运行。 */
+export function postAgentGithubCancel(
+  workspaceId: string,
+  runId: string,
+  approved?: boolean,
+): Promise<GhWriteResult> {
+  return postAgentGithub(workspaceId, `runs/${runId}/cancel`, {}, approved);
+}
 
 export function agentTerminalWsUrl(workspaceId: string, cols: number, rows: number): string {
   const token = localStorage.getItem('auth_token') ?? '';

@@ -29,7 +29,7 @@ pub fn ser_de_normalized_dt<S: serde::Serializer>(
     ser.serialize_str(&normalize_db_datetime(s))
 }
 
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AgentWorkspaceRecord {
     pub id: String,
     pub name: String,
@@ -44,23 +44,66 @@ pub struct AgentWorkspaceRecord {
     // `#[sqlx(default)]` 保证旧库未跑 v3 迁移前 `SELECT *` 仍可解码（agent_type 为
     // NOT NULL 列，默认空串）。`agent_create/update_workspace` 均已支持读写这三列。
     #[sqlx(default)]
-    #[serde(default)]
     pub agent_type: String,
     #[sqlx(default)]
-    #[serde(default)]
     pub agent_path: Option<String>,
     #[sqlx(default)]
-    #[serde(default)]
     pub llm_model_id: Option<String>,
     /// ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时经
     /// `set_config_option` 注入。列由 `migrate_agent_workspaces_v4` 落地。
     #[sqlx(default)]
-    #[serde(default)]
     pub agent_config_overrides: Option<String>,
-    #[serde(serialize_with = "ser_de_normalized_dt")]
+    // GitHub Actions 集成字段。列由 `migrate_agent_workspaces_v5`（schema.rs）落地；
+    // `#[sqlx(default)]` 保证旧库未跑 v5 迁移前 `SELECT *` 仍可解码。
+    /// GitHub token **密文**（LlmCipher 加密后落库，`enc:v1:` 前缀）。序列化时
+    /// 永不输出——DTO 只暴露 [`Self::github_token_set`]（见手写 `Serialize`）。
+    #[sqlx(default)]
+    pub github_token: Option<String>,
+    #[sqlx(default)]
+    pub github_owner: Option<String>,
+    #[sqlx(default)]
+    pub github_repo: Option<String>,
     pub created_at: String,
-    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
+}
+
+impl AgentWorkspaceRecord {
+    /// 是否已配置 GitHub token（密文非空即视为已配置；密文可能是"明文降级"
+    /// 路径下的原样 token，非 `enc:v1:` 前缀，同样按已配置处理）。
+    pub fn github_token_set(&self) -> bool {
+        self.github_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+    }
+}
+
+/// 手写 `Serialize`：`github_token` 永不进入 JSON（防泄露）；`github_token_set`
+/// 以布尔位替代下发。其余字段与 derive 输出一致（含 created_at/updated_at 的
+/// ISO-8601 归一化）。
+impl serde::Serialize for AgentWorkspaceRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("AgentWorkspaceRecord", 19)?;
+        s.serialize_field("id", &self.id)?;
+        s.serialize_field("name", &self.name)?;
+        s.serialize_field("client_id", &self.client_id)?;
+        s.serialize_field("runtime_type", &self.runtime_type)?;
+        s.serialize_field("root_path", &self.root_path)?;
+        s.serialize_field("docker_image", &self.docker_image)?;
+        s.serialize_field("docker_container_id", &self.docker_container_id)?;
+        s.serialize_field("approval_mode", &self.approval_mode)?;
+        s.serialize_field("system_prompt", &self.system_prompt)?;
+        s.serialize_field("agent_type", &self.agent_type)?;
+        s.serialize_field("agent_path", &self.agent_path)?;
+        s.serialize_field("llm_model_id", &self.llm_model_id)?;
+        s.serialize_field("agent_config_overrides", &self.agent_config_overrides)?;
+        s.serialize_field("github_owner", &self.github_owner)?;
+        s.serialize_field("github_repo", &self.github_repo)?;
+        s.serialize_field("github_token_set", &self.github_token_set())?;
+        s.serialize_field("created_at", &normalize_db_datetime(&self.created_at))?;
+        s.serialize_field("updated_at", &normalize_db_datetime(&self.updated_at))?;
+        s.end()
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -203,6 +246,34 @@ impl Database {
         .bind(agent_path)
         .bind(llm_model_id)
         .bind(agent_config_overrides)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 写 workspace 的 GitHub Actions 集成三列（token 为 LlmCipher 加密后的密文，
+    /// owner/repo 明文）。写语义「空串 / 缺省（None）= 保持已存值，非空 = 更新」，
+    /// 经 `COALESCE(NULLIF(?, ''), col)` 表达：空串归一化为 NULL 后取原列值，
+    /// 非空直接覆盖。调用方（API 层）负责在传参前完成 token 加密。
+    pub async fn agent_set_workspace_github(
+        &self,
+        id: &str,
+        github_token: Option<&str>,
+        github_owner: Option<&str>,
+        github_repo: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_workspaces \
+             SET github_token = COALESCE(NULLIF(?, ''), github_token), \
+                 github_owner = COALESCE(NULLIF(?, ''), github_owner), \
+                 github_repo  = COALESCE(NULLIF(?, ''), github_repo), \
+                 updated_at = datetime('now') \
+             WHERE id = ?",
+        )
+        .bind(github_token)
+        .bind(github_owner)
+        .bind(github_repo)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -1701,5 +1772,99 @@ mod tests {
         .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
+    }
+
+    /// GitHub 三列的写语义 + token 加解密 round-trip：API 层加密后落库 →
+    /// 读回密文 → 用同一 LlmCipher 解密得到明文；「空串/缺省保持、非空更新」。
+    #[tokio::test]
+    async fn test_workspace_github_columns_roundtrip() {
+        use crate::llm::crypto::LlmCipher;
+        let cipher = LlmCipher::from_master_key([7u8; 32]);
+        let token = "ghp_secret_token_123";
+        let stored = cipher.encrypt(token);
+
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+
+        // 初始：三列均 NULL
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert!(ws.github_token.is_none());
+        assert!(!ws.github_token_set());
+        assert!(ws.github_owner.is_none());
+        assert!(ws.github_repo.is_none());
+
+        // 写 token 密文 + owner/repo
+        db.agent_set_workspace_github("w1", Some(&stored), Some("octo"), Some("repo"))
+            .await
+            .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.github_token.as_deref(), Some(stored.as_str()));
+        assert!(ws.github_token_set());
+        assert_eq!(cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(), token);
+        assert_eq!(ws.github_owner.as_deref(), Some("octo"));
+        assert_eq!(ws.github_repo.as_deref(), Some("repo"));
+
+        // 空串 / None 保持原值；非空更新
+        db.agent_set_workspace_github("w1", Some(""), Some(""), None)
+            .await
+            .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.github_token.as_deref(), Some(stored.as_str()), "空串保持密文");
+        assert_eq!(ws.github_owner.as_deref(), Some("octo"), "空串保持 owner");
+        assert_eq!(ws.github_repo.as_deref(), Some("repo"), "None 保持 repo");
+
+        let new_token = cipher.encrypt("ghp_new_token");
+        db.agent_set_workspace_github("w1", Some(&new_token), Some("newowner"), Some("newrepo"))
+            .await
+            .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(), "ghp_new_token");
+        assert_eq!(ws.github_owner.as_deref(), Some("newowner"));
+        assert_eq!(ws.github_repo.as_deref(), Some("newrepo"));
+    }
+
+    /// 脱敏：序列化 AgentWorkspaceRecord 时 github_token 密文/明文绝不进入 JSON，
+    /// 只暴露 github_token_set 布尔位；其余字段（owner/repo）正常下发。
+    #[tokio::test]
+    async fn test_workspace_github_token_redacted_in_json() {
+        use crate::llm::crypto::LlmCipher;
+        let cipher = LlmCipher::from_master_key([9u8; 32]);
+        let token = "ghp_ultra_secret_42";
+        let stored = cipher.encrypt(token);
+
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_set_workspace_github("w1", Some(&stored), Some("octo"), Some("repo"))
+            .await
+            .unwrap();
+
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        let json = serde_json::to_value(&ws).unwrap();
+        // 明文 token 与密文串都不得出现在 JSON 文本中
+        let raw = json.to_string();
+        assert!(!raw.contains(token), "明文 token 不得序列化");
+        assert!(!raw.contains("enc:v1:"), "密文不得序列化");
+        // 布尔位 + owner/repo 正常
+        assert_eq!(json["github_token_set"], true);
+        assert_eq!(json["github_owner"], "octo");
+        assert_eq!(json["github_repo"], "repo");
+        // 未配置时布尔位为 false
+        db.agent_create_workspace(
+            "w2", "q", "nas", "host", "/q", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        let ws2 = db.agent_get_workspace("w2").await.unwrap().unwrap();
+        let json2 = serde_json::to_value(&ws2).unwrap();
+        assert_eq!(json2["github_token_set"], false);
+        assert_eq!(json2["github_owner"], serde_json::Value::Null);
     }
 }

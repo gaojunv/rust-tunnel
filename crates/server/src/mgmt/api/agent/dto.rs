@@ -26,6 +26,14 @@ pub struct CreateWorkspaceRequest {
     /// ACP 引擎选项覆盖（JSON map：config_id → value）；空串归一化为 None。
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
+    /// GitHub Actions 集成：token（API 层加密后落库；空串视为未配置）。
+    #[serde(default)]
+    pub github_token: Option<String>,
+    /// GitHub 仓库定位（手工填写；缺省时经隧道 `git remote get-url origin` 探测）。
+    #[serde(default)]
+    pub github_owner: Option<String>,
+    #[serde(default)]
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +54,14 @@ pub struct UpdateWorkspaceRequest {
     /// ACP 引擎选项覆盖（JSON map：config_id → value）；None 保持原值，`"{}"` 清空。
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
+    /// GitHub Actions 集成字段，COALESCE 语义：缺省（None）/ 空串保持原值，
+    /// 非空更新。token 由 API 层加密后落库。
+    #[serde(default)]
+    pub github_token: Option<String>,
+    #[serde(default)]
+    pub github_owner: Option<String>,
+    #[serde(default)]
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,3 +215,43 @@ git_write_body!(GitStashPushRequest {
 git_write_body!(GitStashIndexRequest {
     index: usize,
 });
+
+// ── GitHub Actions 面板 ───────────────────────────────────────
+
+/// `GET /api/agent/workspaces/:id/github/repo` 的 query：`?refresh=true` 强制重探
+/// （忽略 5 分钟内存缓存）。
+#[derive(Debug, Default, Deserialize)]
+pub struct GithubRepoQuery {
+    #[serde(default)]
+    pub refresh: Option<bool>,
+}
+
+/// `GET /api/agent/workspaces/:id/github/runs` 的 query 参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct GithubRunsQuery {
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    #[serde(default)]
+    pub per_page: Option<usize>,
+}
+
+/// `POST /api/agent/workspaces/:id/github/workflows/:workflow_id/dispatch` 请求体。
+#[derive(Debug, Default, Deserialize)]
+pub struct GithubDispatchBody {
+    /// 触发目标分支 / tag（GitHub workflow_dispatch 的 `ref`，**必填**）。
+    #[serde(default)]
+    pub r#ref: Option<String>,
+    /// 工作流输入（JSON object）；缺省为空对象。
+    #[serde(default)]
+    pub inputs: Option<serde_json::Value>,
+    /// 写操作统一审批标记：前端确认后重发携带 `approved: true`。
+    #[serde(default)]
+    pub approved: Option<bool>,
+}
+
+/// 无参写操作（rerun/cancel）的请求体：允许空 body / `{}` / 仅 `approved`。
+#[derive(Debug, Default, Deserialize)]
+pub struct GithubApprovedBody {
+    #[serde(default)]
+    pub approved: Option<bool>,
+}

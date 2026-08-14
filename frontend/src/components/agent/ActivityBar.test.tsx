@@ -10,6 +10,16 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('../../api/client', () => ({
   listAgentMessages: vi.fn().mockResolvedValue([]),
+  // GitHub 面板容器首屏即拉 repo 定位：默认给「已配置 + 有 token」避免空态分支干扰图标测试
+  getAgentGithubRepo: vi.fn().mockResolvedValue({
+    configured: true,
+    owner: 'octo',
+    repo: 'repo',
+    token_set: true,
+    repo_info: { default_branch: 'main' },
+  }),
+  getAgentGithubRuns: vi.fn().mockResolvedValue({ total_count: 0, workflow_runs: [] }),
+  getAgentGithubWorkflows: vi.fn().mockResolvedValue({ total_count: 0, workflows: [] }),
 }));
 
 afterEach(() => {
@@ -26,11 +36,19 @@ const renderBar = () => {
 };
 
 describe('ActivityBar', () => {
-  it('renders three icon buttons without text labels', () => {
+  it('renders four icon buttons without text labels', () => {
     renderBar();
     expect(screen.getByRole('button', { name: 'agent.files' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'agent.terminal' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'agent.git' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'agent.github' })).toBeTruthy();
+  });
+
+  it('expands github panel on icon click', () => {
+    renderBar();
+    const githubBtn = screen.getByRole('button', { name: 'agent.github' });
+    fireEvent.click(githubBtn);
+    expect(screen.getByTestId('activity-panel').getAttribute('data-panel')).toBe('github');
   });
 
   it('expands git panel on icon click and collapses on second click', () => {

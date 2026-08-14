@@ -540,6 +540,12 @@ export interface AgentWorkspace {
   llm_model_id?: string;
   /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent */
   agent_config_overrides?: string;
+  /** 是否已配置 GitHub token（仅布尔位，token 明文永不回传） */
+  github_token_set?: boolean;
+  /** 手填 GitHub owner（组织/用户名）；为 null 时经隧道从 git remote 探测 */
+  github_owner?: string | null;
+  /** 手填 GitHub 仓库名；为 null 时经隧道从 git remote 探测 */
+  github_repo?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -798,5 +804,92 @@ export interface GitWriteResult {
   output: string;
   stderr?: string;
   exit_code?: number;
+}
+
+// === GitHub Actions 面板 ===
+
+/** `GET /github/repo` 仓库定位检测响应。`repo_info` 仅在 token 已配置且 get_repo
+ *  成功时填充（对象见 GitHub REST 原生响应，按需取子集）；失败保持 null。 */
+export interface GhRepoInfo {
+  full_name?: string;
+  default_branch?: string;
+  private?: boolean;
+}
+
+export interface GhRepoState {
+  configured: boolean;
+  owner?: string | null;
+  repo?: string | null;
+  token_set: boolean;
+  repo_info?: GhRepoInfo | null;
+}
+
+/** GitHub REST 原生 workflow 条目子集。 */
+export interface GhWorkflow {
+  id: number;
+  name: string;
+  path: string;
+  state: string;
+  html_url?: string;
+}
+
+/** GitHub REST 原生 workflow_run 条目子集。status: queued|in_progress|waiting|
+ *  requested|pending|completed；conclusion: success|failure|neutral|cancelled|
+ *  skipped|timed_out|action_required|null（未完成时）。 */
+export interface GhWorkflowRun {
+  id: number;
+  name?: string;
+  display_title?: string;
+  head_branch?: string;
+  workflow_id?: number;
+  status: string;
+  conclusion?: string | null;
+  run_started_at?: string;
+  updated_at?: string;
+  html_url?: string;
+}
+
+export interface GhJobStep {
+  name: string;
+  status: string;
+  conclusion?: string | null;
+}
+
+/** GitHub REST 原生 job 条目子集。 */
+export interface GhJob {
+  id: number;
+  name: string;
+  status: string;
+  conclusion?: string | null;
+  started_at?: string;
+  completed_at?: string;
+  html_url?: string;
+  steps?: GhJobStep[];
+}
+
+export interface GhWorkflowList {
+  total_count: number;
+  workflows: GhWorkflow[];
+}
+
+export interface GhWorkflowRuns {
+  total_count: number;
+  workflow_runs: GhWorkflowRun[];
+}
+
+export interface GhJobList {
+  total_count: number;
+  jobs: GhJob[];
+}
+
+/** `GET /jobs/:job_id/logs`：日志只保留尾部 64KB，truncated 指示是否被截断。 */
+export interface GhJobLogs {
+  logs: string;
+  truncated: boolean;
+}
+
+/** 写操作（dispatch/rerun/cancel）成功响应。 */
+export interface GhWriteResult {
+  status: string;
 }
 

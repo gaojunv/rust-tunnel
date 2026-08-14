@@ -460,6 +460,38 @@ pub async fn run_api_server(
             post(agent::post_git_stash_drop),
         )
         .route(
+            "/api/agent/workspaces/:id/github/repo",
+            get(agent::get_repo_info),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/workflows",
+            get(agent::list_workflows),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/runs",
+            get(agent::list_workflow_runs),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/runs/:run_id/jobs",
+            get(agent::list_run_jobs),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/jobs/:job_id/logs",
+            get(agent::get_job_logs),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/workflows/:workflow_id/dispatch",
+            post(agent::dispatch_workflow),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/runs/:run_id/rerun",
+            post(agent::rerun_workflow),
+        )
+        .route(
+            "/api/agent/workspaces/:id/github/runs/:run_id/cancel",
+            post(agent::cancel_run),
+        )
+        .route(
             "/api/agent/workspaces/:id/sessions",
             get(agent::list_sessions).post(agent::create_session),
         )

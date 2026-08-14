@@ -14,7 +14,7 @@ import {
   DialogTitle,
 } from '../../../../components/ui/dialog';
 import type { GitStatusKind } from './gitUtils';
-import type { GitApprovalState } from './useGitMutation';
+import type { ApprovalState } from '../useApprovalMutation';
 
 export const BADGE: Record<GitStatusKind, { label: string; className: string }> = {
   modified: {
@@ -287,23 +287,29 @@ export function GitGroup({
   );
 }
 
-/** 审批确认对话框：显示后端返回的 git 命令摘要，确认后带 approved=true 重发。 */
-export function GitApprovalDialog({
+/** 审批确认对话框：显示后端返回的写操作摘要，确认后带 approved=true 重发。
+ *  git / GitHub Actions 面板复用；`descKey` 可覆盖说明文案（默认 git）。 */
+export function ApprovalDialog({
   approval,
   onConfirm,
   onCancel,
+  descKey = 'agent.gitApprovalDesc',
 }: {
-  approval: GitApprovalState | null;
+  approval: ApprovalState | null;
   onConfirm: () => void;
   onCancel: () => void;
+  /** 说明文案 i18n key（git 面板默认；GitHub 面板传 github 专属文案）。 */
+  descKey?: string;
 }) {
   const { t } = useTranslation();
+  // descKey 为调用方传入的动态 i18n key，需宽签名 t
+  const translate = t as (key: string) => string;
   return (
     <Dialog open={approval !== null} onOpenChange={(open) => !open && onCancel()}>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{t('agent.approvalRequired')}</DialogTitle>
-          <DialogDescription>{t('agent.gitApprovalDesc')}</DialogDescription>
+          <DialogDescription>{translate(descKey)}</DialogDescription>
         </DialogHeader>
         <pre className="max-h-40 overflow-auto rounded-md bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-all">
           {approval?.summary ?? ''}
@@ -320,3 +326,6 @@ export function GitApprovalDialog({
     </Dialog>
   );
 }
+
+/** 向后兼容导出（既有 git 调用方/测试引用 GitApprovalDialog）。 */
+export const GitApprovalDialog = ApprovalDialog;
