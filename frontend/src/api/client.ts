@@ -48,6 +48,13 @@ import type {
   FsEntry,
   FsFileContent,
   GitStatusResult,
+  GitBranch,
+  GitCommit,
+  GitStashEntry,
+  GitBranchesResult,
+  GitLogResult,
+  GitStashesResult,
+  GitDiffResult,
 } from '../types';
 
 const API_BASE = '/api';
@@ -681,13 +688,180 @@ export async function getAgentGitStatus(workspaceId: string): Promise<GitStatusR
   return data;
 }
 
-export async function getAgentGitDiff(workspaceId: string, path?: string): Promise<string> {
+export async function getAgentGitDiff(
+  workspaceId: string,
+  path?: string,
+  cached?: boolean,
+): Promise<string> {
   const { data } = await api.get<{ diff: string }>(
     `/agent/workspaces/${workspaceId}/git/diff`,
-    { params: path ? { path } : undefined },
+    { params: { ...(path ? { path } : {}), ...(cached ? { cached: true } : {}) } },
   );
   return data.diff;
 }
+
+export async function getAgentGitBranches(workspaceId: string): Promise<GitBranch[]> {
+  const { data } = await api.get<GitBranchesResult>(
+    `/agent/workspaces/${workspaceId}/git/branches`,
+  );
+  return data.branches;
+}
+
+export async function getAgentGitLog(workspaceId: string, limit = 50): Promise<GitCommit[]> {
+  const { data } = await api.get<GitLogResult>(
+    `/agent/workspaces/${workspaceId}/git/log`,
+    { params: { limit } },
+  );
+  return data.commits;
+}
+
+export async function getAgentGitShow(workspaceId: string, rev: string): Promise<string> {
+  const { data } = await api.get<GitDiffResult>(
+    `/agent/workspaces/${workspaceId}/git/show`,
+    { params: { rev } },
+  );
+  return data.diff;
+}
+
+export async function getAgentGitStashes(workspaceId: string): Promise<GitStashEntry[]> {
+  const { data } = await api.get<GitStashesResult>(
+    `/agent/workspaces/${workspaceId}/git/stash`,
+  );
+  return data.stashes;
+}
+
+/** git 写操作统一封装：body 为请求体（不含 approved），approved 为审批确认标记。 */
+async function postAgentGit(
+  workspaceId: string,
+  path: string,
+  body: Record<string, unknown>,
+  approved?: boolean,
+): Promise<void> {
+  await api.post(`/agent/workspaces/${workspaceId}/git/${path}`, {
+    ...body,
+    ...(approved !== undefined ? { approved } : {}),
+  });
+}
+
+export function postAgentGitStage(
+  workspaceId: string,
+  paths: string[],
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'stage', { paths }, approved);
+}
+
+export function postAgentGitUnstage(
+  workspaceId: string,
+  paths: string[],
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'unstage', { paths }, approved);
+}
+
+export function postAgentGitCommit(
+  workspaceId: string,
+  message: string,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'commit', { message }, approved);
+}
+
+export function postAgentGitCheckout(
+  workspaceId: string,
+  branch: string,
+  create?: boolean,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(
+    workspaceId,
+    'checkout',
+    { branch, ...(create ? { create: true } : {}) },
+    approved,
+  );
+}
+
+export function postAgentGitBranchDelete(
+  workspaceId: string,
+  branch: string,
+  force?: boolean,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(
+    workspaceId,
+    'branch/delete',
+    { branch, ...(force ? { force: true } : {}) },
+    approved,
+  );
+}
+
+export function postAgentGitPull(workspaceId: string, approved?: boolean): Promise<void> {
+  return postAgentGit(workspaceId, 'pull', {}, approved);
+}
+
+export function postAgentGitPush(workspaceId: string, approved?: boolean): Promise<void> {
+  return postAgentGit(workspaceId, 'push', {}, approved);
+}
+
+export function postAgentGitRevert(
+  workspaceId: string,
+  rev: string,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'revert', { rev }, approved);
+}
+
+export function postAgentGitReset(
+  workspaceId: string,
+  mode: 'soft' | 'mixed' | 'hard',
+  rev?: string,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(
+    workspaceId,
+    'reset',
+    { mode, ...(rev ? { rev } : {}) },
+    approved,
+  );
+}
+
+export function postAgentGitStashPush(
+  workspaceId: string,
+  message?: string,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(
+    workspaceId,
+    'stash',
+    { ...(message ? { message } : {}) },
+    approved,
+  );
+}
+
+export function postAgentGitStashApply(
+  workspaceId: string,
+  index: number,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'stash/apply', { index }, approved);
+}
+
+export function postAgentGitStashPop(
+  workspaceId: string,
+  index: number,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'stash/pop', { index }, approved);
+}
+
+export function postAgentGitStashDrop(
+  workspaceId: string,
+  index: number,
+  approved?: boolean,
+): Promise<void> {
+  return postAgentGit(workspaceId, 'stash/drop', { index }, approved);
+}
+
 
 export function agentTerminalWsUrl(workspaceId: string, cols: number, rows: number): string {
   const token = localStorage.getItem('auth_token') ?? '';
