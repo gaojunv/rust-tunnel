@@ -36,7 +36,22 @@ import {
 } from './subagent';
 import type { SessionConfigOption } from '../../types';
 
-const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟兜底
+const RUNNING_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟不活动兜底（每帧回合活动重置，非回合总时长）
+/** 计入「回合活动」的 WS 帧类型：到达即重置 running 不活动兜底倒计时。
+ *  配置/标题类帧（session_state/config_option_update/current_mode_update/
+ *  session_title/queued）可能由无关操作（如另一标签页切配置）触发，不代表
+ *  本回合在推进，不计入。 */
+const TURN_ACTIVITY_TYPES = new Set([
+  'assistant_chunk',
+  'stream_reset',
+  'tool_call',
+  'tool_result',
+  'plan',
+  'usage',
+  'status',
+  'approval_request',
+  'elicitation_request',
+]);
 /** 流式 chunk 合并 flush 间隔：token 级 WS 帧攒批后一次性写 state，避免每 token 全列表重渲染。 */
 export const STREAM_FLUSH_MS = 50;
 /** 分页「加载更早」每页条数（与后端默认 limit 一致）。 */
@@ -158,6 +173,62 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // （对账重载的末行可能是 tool_result，按现状会误置 running=true——回合其实已终态）。
   const reconcileRef = useRef(false);
 
+  const clearRunningTimeout = useCallback(() => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }, []);
+
+  const stopRunning = useCallback(() => {
+    runningRef.current = false;
+    setRunning(false);
+    clearRunningTimeout();
+    pendingToolsRef.current.clear();
+  }, [clearRunningTimeout]);
+
+  // 回合终态处理：done/stopped/error/本地停止/10 分钟超时都把仍在 pending 的审批
+  // 卡片置为 expired、pending 的 elicitation 卡片置为 cancelled。否则卡片永久
+  // pending → hasPendingInteraction 恒 true → 发送按钮被锁死（服务端 5 分钟审批
+  // 超时实际按 deny 继续回合、elicitation 超时按 Cancel 回 agent，UI 必须与服务端
+  // 结果对齐）。expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝；
+  // cancelled 同理区别于用户主动跳过（declined）。
+  const expirePendingInteractions = useCallback(() => {
+    setItems((prev) => prev.map((it) =>
+      it.kind === 'approval' && it.approvalStatus === 'pending'
+        ? { ...it, approvalStatus: 'expired' }
+        : it.kind === 'elicitation' && it.elicitationStatus === 'pending'
+          ? { ...it, elicitationStatus: 'cancelled' }
+          : it
+    ));
+  }, []);
+
+  // 不活动兜底触发：连续 RUNNING_TIMEOUT_MS 无任何回合帧（进程卡死/帧丢失）
+  // 才判定超时——提示并强制解除 running（同时把 pending 审批置过期）。
+  const fireRunningTimeout = useCallback(() => {
+    timeoutRef.current = null;
+    setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
+    expirePendingInteractions();
+    stopRunning();
+  }, [expirePendingInteractions, stopRunning]);
+
+  // 启动/重置 running 不活动兜底。关键：这是「静默超时」而非「回合总时长」——
+  // 每收到一帧回合活动（onmessage 里调用）就重新倒计时。旧的绝对定时器从
+  // 回合起算 10 分钟，ACP 长回合（长工具执行/多轮工具调用）跑到一半就被误报
+  // 「响应超时」并过期仍在等待的审批卡，而回合其实还在正常流式推进。
+  // 注：声明位置必须在历史装载 effect 之前（其 deps 数组引用本回调， TDZ）。
+  const armRunningTimeout = useCallback(() => {
+    clearRunningTimeout();
+    timeoutRef.current = globalThis.setTimeout(fireRunningTimeout, RUNNING_TIMEOUT_MS);
+  }, [clearRunningTimeout, fireRunningTimeout]);
+
+  const armRunning = useCallback(() => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setRunning(true);
+    armRunningTimeout();
+  }, [armRunningTimeout]);
+
   // 消息区虚拟化：长会话只渲染视口内气泡，DOM 数量与 items 总数解耦（流式每
   // 50ms 更新时只 re-measure 视口内元素，避免长会话全量 DOM 布局卡顿）。
   // jsdom 无 ResizeObserver（measureElement 依赖它）时退化全量渲染，保证
@@ -241,13 +312,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         partialLoadRef.current = true;
         runningRef.current = true;
         setRunning(true);
-        if (timeoutRef.current) clearTimeout(timeoutRef.current);
-        timeoutRef.current = globalThis.setTimeout(() => {
-          setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
-          runningRef.current = false;
-          setRunning(false);
-          timeoutRef.current = null;
-        }, RUNNING_TIMEOUT_MS);
+        // 与 armRunning 同一不活动兜底：进程若仍在跑，后续活动帧会不断重置倒计时
+        armRunningTimeout();
       }
     }
     // 纯函数装载：历史行 → ChatItem（含同一 tool_call_id 多行去重、压缩重插
@@ -255,8 +321,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     setItems(historyToChatItems(rows));
     loadedRawRef.current = rows;
     // t 用于 running 超时提示文案；语言切换后重跑 effect 只影响尚未触发的
-    // 超时回调文案，代价可忽略。
-  }, [history, t]);
+    // 超时回调文案，代价可忽略。armRunningTimeout 为稳定 useCallback，不引入额外重跑。
+  }, [history, t, armRunningTimeout]);
 
   // has_more 只随查询数据（history）变化同步：单独 effect 避免主装载 effect 的
   // `t` 依赖（语言切换/测试替身每次渲染新引用）重跑时把「加载更早」后的 hasMore
@@ -309,13 +375,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       setLoadingEarlier(false);
     }
   };
-
-  const clearRunningTimeout = useCallback(() => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-  }, []);
 
   // running 的 ref 镜像供 onclose 闭包使用（onclose 里读不到最新 state）。
   // armRunning/stopRunning 是 useCallback，同步维护。
@@ -397,42 +456,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }, STREAM_FLUSH_MS);
   }, [flushChunks]);
 
-  const stopRunning = useCallback(() => {
-    runningRef.current = false;
-    setRunning(false);
-    clearRunningTimeout();
-    pendingToolsRef.current.clear();
-  }, [clearRunningTimeout]);
-
-  // 回合终态处理：done/stopped/error/本地停止/10 分钟超时都把仍在 pending 的审批
-  // 卡片置为 expired、pending 的 elicitation 卡片置为 cancelled。否则卡片永久
-  // pending → hasPendingInteraction 恒 true → 发送按钮被锁死（服务端 5 分钟审批
-  // 超时实际按 deny 继续回合、elicitation 超时按 Cancel 回 agent，UI 必须与服务端
-  // 结果对齐）。expired 与用户主动 denied 区分：被动过期（超时/终态）vs 主动拒绝；
-  // cancelled 同理区别于用户主动跳过（declined）。
-  const expirePendingInteractions = useCallback(() => {
-    setItems((prev) => prev.map((it) =>
-      it.kind === 'approval' && it.approvalStatus === 'pending'
-        ? { ...it, approvalStatus: 'expired' }
-        : it.kind === 'elicitation' && it.elicitationStatus === 'pending'
-          ? { ...it, elicitationStatus: 'cancelled' }
-          : it
-    ));
-  }, []);
-
-  const armRunning = useCallback(() => {
-    if (runningRef.current) return;
-    runningRef.current = true;
-    setRunning(true);
-    clearRunningTimeout();
-    // 10 分钟超时兜底：到点未终态则强制解除（同时把 pending 审批置过期）
-    timeoutRef.current = globalThis.setTimeout(() => {
-      setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
-      expirePendingInteractions();
-      stopRunning();
-    }, RUNNING_TIMEOUT_MS);
-  }, [clearRunningTimeout, stopRunning, expirePendingInteractions]);
-
   // 切换会话：清空上一会话的配置快照（新会话的 session_state 帧到达前不残留
   // 旧会话的 mode/effort 快捷按钮）
   useEffect(() => {
@@ -472,6 +495,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         msg = JSON.parse(ev.data) as AgentWsEvent;
       } catch {
         return;
+      }
+      // 回合活动重置不活动兜底：回合仍在推进时永不触发「响应超时」，只有连续
+      // RUNNING_TIMEOUT_MS 无任何活动帧（进程卡死/帧丢失）才兜底解除 running。
+      if (runningRef.current && TURN_ACTIVITY_TYPES.has(msg.type)) {
+        armRunningTimeout();
       }
       if (msg.type === 'assistant_chunk') {
         if (msg.content) {
@@ -848,7 +876,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       chunkBufRef.current = new Map();
       pendingTools.clear();
     };
-  }, [sessionId, queryClient, armRunning, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingInteractions, breakStream, breakSubStream]);
+  }, [sessionId, queryClient, armRunning, armRunningTimeout, stopRunning, clearRunningTimeout, flushChunks, scheduleChunkFlush, expirePendingInteractions, breakStream, breakSubStream]);
 
   // 虚拟化下 getTotalSize() 随 measureElement 异步修正 item 高度而变：装载长会话时
   // 初始 estimate 不准，totalSize 稳定后需重新对齐底部，否则滚动停在半路、最新消息

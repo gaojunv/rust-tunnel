@@ -186,6 +186,74 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
+  it('resets the 10min running timeout on turn activity frames', async () => {
+    // 不活动兜底语义：回合活动帧（tool_call/assistant_chunk 等）到达必须重置
+    // 倒计时——旧的绝对 10 分钟定时器会在 ACP 长回合流式推进中误报「响应超时」
+    // 并过期仍在等待的审批卡，而回合其实还在正常跑。
+    const armed: { cb: () => void; id: ReturnType<typeof setTimeout> }[] = [];
+    const cleared: (ReturnType<typeof setTimeout> | undefined)[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        const id = origSetTimeout(cb, ms ?? 0);
+        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        return id;
+      }) as typeof setTimeout,
+    );
+    vi.spyOn(globalThis, 'clearTimeout').mockImplementation(
+      (id?: ReturnType<typeof setTimeout>) => {
+        cleared.push(id);
+        return origClearTimeout(id);
+      },
+    );
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    expect(armed.length).toBe(1);
+    // 活动帧到达 → 旧定时器被清除并重新 arm（重置在 onmessage 顶部同步发生，
+    // 不依赖 chunk 攒批 flush）
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '还在跑' });
+    });
+    expect(armed.length).toBe(2);
+    expect(cleared).toContain(armed[0].id);
+    // running 不受重置影响
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    // 最新一次 arm 的回调触发（真正的 10 分钟静默）→ 兜底解除 running
+    act(() => {
+      armed[armed.length - 1].cb();
+    });
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
+
+  it('does not reset the 10min timeout on config/title frames', async () => {
+    // 配置/标题类帧可能由无关操作触发（另一标签页切配置），不代表本回合在推进，
+    // 不得重置不活动兜底——否则真卡死的回合永远等不到兜底。
+    const armed: { cb: () => void; id: ReturnType<typeof setTimeout> }[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        const id = origSetTimeout(cb, ms ?? 0);
+        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        return id;
+      }) as typeof setTimeout,
+    );
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    expect(armed.length).toBe(1);
+    act(() => {
+      wsInstance!.emit({ type: 'session_state', options: [] });
+      wsInstance!.emit({ type: 'session_title' });
+      wsInstance!.emit({ type: 'queued' });
+    });
+    expect(armed.length).toBe(1);
+  });
+
   it('renders new-format tool_calls/tool_result history', async () => {
     (listAgentMessages as Mock).mockResolvedValue([
       { id: 'm1', session_id: 's1', role: 'user', content: '看下文件', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
