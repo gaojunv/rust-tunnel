@@ -1,6 +1,8 @@
 //! 危险操作审批规则：按 workspace approval_mode 判定工具调用是否需用户确认。
 use rust_tunnel_common::AgentCommand;
 
+use super::git_plan::{self, GitRisk};
+
 /// shell 危险模式（大小写不敏感子串匹配）。仅 auto_write 档用于判定 shell；
 /// safe 档下所有写操作都需确认，不经此表。
 /// 匹配前先对命令做空白归一化（任意连续空白折叠为单空格），故 `rm  -rf /`、
@@ -44,6 +46,43 @@ fn is_git_push(cmd_lower: &str) -> bool {
     let has_git = tokens.iter().any(|t| *t == "git" || t.ends_with("/git"));
     let has_push = tokens.contains(&"push");
     has_git && has_push
+}
+
+/// git 危险子命令（GitExec DangerousWrite 档）token 级判定：clean -fd / branch -D /
+/// stash drop / revert / push --force / reset --hard。与 [`is_git_push`] 同模式
+/// （git 上下文 + token 级扫描，容忍 `-C <path>` 等全局选项），防止 shell 形态
+/// 绕过 GitExec 审批矩阵（safe 与 auto_write 档都需确认）。
+///
+/// **入参必须是空白归一化后的原文（不转小写）**：git 的 `-D`（强制删除分支）与
+/// `-d`（安全删除）是大小写敏感 flag，转小写会让 `-D` 退化成 `-d`、绕过危险判定。
+/// 子命令本身用 `eq_ignore_ascii_case` 宽松匹配（git 子命令实际全小写，多一层
+/// 保险）；flag 一律大小写敏感。
+fn is_git_dangerous_subcommand(cmd: &str) -> bool {
+    let force_flag = |t: &str| {
+        matches!(t, "--force" | "-f")
+            || t.starts_with("--force-with-lease")
+            || (t.starts_with('-') && !t.starts_with("--") && t.len() > 2 && t.contains('f'))
+    };
+    let clean_danger = |t: &str| {
+        t.starts_with("--force")
+            || (t.starts_with('-')
+                && !t.starts_with("--")
+                && !t.starts_with("-n")
+                && t.contains('f'))
+    };
+    let branch_danger = |t: &str| matches!(t, "-D" | "--delete") || t.starts_with("--force");
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let has_git = tokens.iter().any(|t| *t == "git" || t.ends_with("/git"));
+    if !has_git {
+        return false;
+    }
+    let has_sub = |sub: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(sub));
+    has_sub("revert")
+        || (has_sub("clean") && tokens.iter().any(|&t| clean_danger(t)))
+        || (has_sub("branch") && tokens.iter().any(|&t| branch_danger(t)))
+        || (has_sub("stash") && tokens.iter().any(|t| t.eq_ignore_ascii_case("drop")))
+        || (has_sub("reset") && tokens.iter().any(|t| t.starts_with("--hard")))
+        || (has_sub("push") && tokens.iter().any(|&t| force_flag(t)))
 }
 
 /// dd 写盘：命令含独立 token "dd"（或以 "/dd" 结尾）且目标为 /dev/ 设备
@@ -152,6 +191,9 @@ pub fn is_dangerous_shell(cmd: &str) -> bool {
     DANGEROUS_SHELL_PATTERNS.iter().any(|p| lower.contains(p))
         || is_force_push(&lower)
         || is_git_push(&lower) // 对 auto_write 而言所有 push 都是"危险"需确认；safe 档本来就全确认
+        // clean -fd / branch -D / stash drop / revert / reset --hard：注意传原文
+        // （不转小写），`-D` 与 `-d` 是大小写敏感 flag。
+        || is_git_dangerous_subcommand(&normalized)
         || is_dd_write(&lower)
         || is_kill_dangerous(&lower)
         || is_recursive_rm(&lower)
@@ -192,6 +234,18 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
         | AgentCommand::PatchFile { .. }
         | AgentCommand::GitCommit { .. } => mode == "safe",
         AgentCommand::GitPush => true, // safe 与 auto_write 都需确认
+        AgentCommand::GitExec { args } => match git_plan::plan(args) {
+            // 与 classify 共用 git_plan 单数据源：Read 免审；SafeWrite 对齐
+            // git_commit（safe 档需审）；DangerousWrite 对齐 git_push（safe 与
+            // auto_write 都需审）。
+            Ok(planned) => match planned.risk {
+                GitRisk::Read => false,
+                GitRisk::SafeWrite => mode == "safe",
+                GitRisk::DangerousWrite => mode == "safe" || mode == "auto_write",
+            },
+            // 非法参数正常在 parse 阶段已拦截；兜底按需审处理（保守）。
+            Err(_) => true,
+        },
     }
 }
 
@@ -210,6 +264,11 @@ pub fn approval_summary(cmd: &AgentCommand) -> String {
         AgentCommand::WriteFile { path, .. } | AgentCommand::PatchFile { path, .. } => path.clone(),
         AgentCommand::GitCommit { message } => truncate(message),
         AgentCommand::GitPush => "git push".to_string(),
+        AgentCommand::GitExec { args } => {
+            // 摘要：子命令 + 截断参数（"git reset --hard" 形态一眼可辨）。
+            // 对含 "git " 前缀的完整串截断，保证总长 ≤ MAX+1。
+            truncate(&format!("git {}", args.join(" ")))
+        }
         _ => String::new(), // 只读工具不会进入审批路径
     }
 }
@@ -333,6 +392,115 @@ mod tests {
     fn test_invalid_mode_falls_back_to_safe() {
         assert!(needs_approval("garbage", &shell("ls")));
         assert!(needs_approval("", &AgentCommand::GitPush));
+    }
+
+    fn git_exec(args: &[&str]) -> AgentCommand {
+        AgentCommand::GitExec {
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_git_exec_read_free_all_modes() {
+        for mode in ["safe", "auto_write", "full_auto"] {
+            assert!(!needs_approval(mode, &git_exec(&["status"])));
+            assert!(!needs_approval(mode, &git_exec(&["diff", "--cached"])));
+            assert!(!needs_approval(mode, &git_exec(&["log", "-n", "10"])));
+            assert!(!needs_approval(mode, &git_exec(&["show", "HEAD"])));
+            assert!(!needs_approval(mode, &git_exec(&["branch", "--list"])));
+            assert!(!needs_approval(mode, &git_exec(&["stash", "list"])));
+            assert!(!needs_approval(mode, &git_exec(&["remote", "get-url", "origin"])));
+        }
+    }
+
+    #[test]
+    fn test_git_exec_safe_write_needs_safe_mode_only() {
+        assert!(needs_approval("safe", &git_exec(&["commit", "-m", "x"])));
+        assert!(!needs_approval("auto_write", &git_exec(&["commit", "-m", "x"])));
+        assert!(!needs_approval("full_auto", &git_exec(&["commit", "-m", "x"])));
+        assert!(needs_approval("safe", &git_exec(&["checkout", "-b", "f"])));
+        assert!(!needs_approval("auto_write", &git_exec(&["checkout", "-b", "f"])));
+        assert!(needs_approval("safe", &git_exec(&["add", "--", "a.rs"])));
+        assert!(!needs_approval("auto_write", &git_exec(&["add", "--", "a.rs"])));
+    }
+
+    #[test]
+    fn test_git_exec_dangerous_needs_safe_and_auto_write() {
+        for args in [
+            &["reset", "--hard"][..],
+            &["branch", "-D", "f"][..],
+            &["stash", "drop", "stash@{0}"][..],
+            &["revert", "abc123"][..],
+            &["push", "--force"][..],
+            &["push", "--force-with-lease"][..],
+        ] {
+            assert!(needs_approval("safe", &git_exec(args)), "args = {args:?}");
+            assert!(
+                needs_approval("auto_write", &git_exec(args)),
+                "auto_write args = {args:?}"
+            );
+            assert!(!needs_approval("full_auto", &git_exec(args)), "args = {args:?}");
+        }
+    }
+
+    #[test]
+    fn test_git_exec_invalid_args_conservative_approval() {
+        // 非法参数正常在 parse 阶段拦截；落到审批层时按需审处理（保守方向）。
+        assert!(needs_approval("safe", &git_exec(&["clean", "-fd"])));
+        assert!(needs_approval("safe", &git_exec(&["rm", "-rf"])));
+        assert!(needs_approval("auto_write", &git_exec(&["clean", "-fd"])));
+        assert!(needs_approval("auto_write", &git_exec(&["rm", "-rf"])));
+        // full_auto 恒放行（模式早退，非法参数不例外）
+        assert!(!needs_approval("full_auto", &git_exec(&["rm", "-rf"])));
+    }
+
+    #[test]
+    fn test_shell_dangerous_git_subcommand_bypass() {
+        // auto_write 档下，shell 形态调用 GitExec DangerousWrite 子命令必须需审
+        // （否则模型可用 shell 绕过审批矩阵）。
+        assert!(is_git_dangerous_subcommand("git clean -fd"));
+        assert!(is_git_dangerous_subcommand("git clean -fdx"));
+        assert!(is_git_dangerous_subcommand("git branch -D feature"));
+        assert!(is_git_dangerous_subcommand("git branch --delete --force feature"));
+        assert!(is_git_dangerous_subcommand("git stash drop stash@{0}"));
+        assert!(is_git_dangerous_subcommand("git revert abc123"));
+        assert!(is_git_dangerous_subcommand("git push --force origin main"));
+        assert!(is_git_dangerous_subcommand("git reset --hard HEAD"));
+        assert!(is_git_dangerous_subcommand("git -C /repo reset --hard HEAD"));
+        // 非危险形态不误伤
+        assert!(!is_git_dangerous_subcommand("git status"));
+        assert!(!is_git_dangerous_subcommand("git clean -n")); // 干跑
+        assert!(!is_git_dangerous_subcommand("git branch -d merged-feature")); // 安全删除
+        assert!(!is_git_dangerous_subcommand("git branch feature")); // 创建
+        assert!(!is_git_dangerous_subcommand("git stash list"));
+        assert!(!is_git_dangerous_subcommand("git stash push -m wip"));
+        assert!(!is_git_dangerous_subcommand("git reset --soft HEAD~1")); // 非 hard
+        assert!(!is_git_dangerous_subcommand("git push origin main"));
+        assert!(!is_git_dangerous_subcommand("git pushup -f"));
+        // 无 git 上下文不命中
+        assert!(!is_git_dangerous_subcommand("branch -D x"));
+        assert!(!is_git_dangerous_subcommand("npm run reset --hard"));
+    }
+
+    #[test]
+    fn test_shell_dangerous_git_subcommand_needs_approval_in_auto_write() {
+        for cmd in [
+            "git clean -fd",
+            "git branch -D feature",
+            "git stash drop",
+            "git revert abc123",
+            "git push --force origin main",
+            "git reset --hard HEAD",
+        ] {
+            assert!(
+                needs_approval("auto_write", &shell(cmd)),
+                "auto_write shell '{cmd}' must need approval"
+            );
+        }
+        // 安全形态不误伤
+        assert!(!needs_approval("auto_write", &shell("git branch -d merged")));
+        assert!(!needs_approval("auto_write", &shell("git status")));
+        assert!(!needs_approval("auto_write", &shell("git clean -n")));
     }
 
     #[test]
@@ -498,8 +666,22 @@ mod tests {
             "src/a.rs"
         );
         assert_eq!(approval_summary(&AgentCommand::GitPush), "git push");
+        assert_eq!(
+            approval_summary(&git_exec(&["reset", "--hard", "HEAD"])),
+            "git reset --hard HEAD"
+        );
+        assert_eq!(
+            approval_summary(&git_exec(&["commit", "-m", "fix bug"])),
+            "git commit -m fix bug"
+        );
         let long = shell(&"x".repeat(200));
         assert!(approval_summary(&long).chars().count() <= 121);
+        // GitExec 摘要同样截断
+        let long_args: Vec<String> = vec!["commit".into(), "-m".into(), "x".repeat(300)];
+        assert!(approval_summary(&AgentCommand::GitExec { args: long_args })
+            .chars()
+            .count()
+            <= 121);
     }
 
     use tokio::sync::mpsc;

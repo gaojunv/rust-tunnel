@@ -396,6 +396,70 @@ pub async fn run_api_server(
             get(agent::get_git_diff),
         )
         .route(
+            "/api/agent/workspaces/:id/git/branches",
+            get(agent::get_git_branches),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/log",
+            get(agent::get_git_log),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/show",
+            get(agent::get_git_show),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/stash",
+            get(agent::get_git_stash).post(agent::post_git_stash_push),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/stage",
+            post(agent::post_git_stage),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/unstage",
+            post(agent::post_git_unstage),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/commit",
+            post(agent::post_git_commit),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/checkout",
+            post(agent::post_git_checkout),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/branch/delete",
+            post(agent::post_git_branch_delete),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/pull",
+            post(agent::post_git_pull),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/push",
+            post(agent::post_git_push),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/revert",
+            post(agent::post_git_revert),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/reset",
+            post(agent::post_git_reset),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/stash/apply",
+            post(agent::post_git_stash_apply),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/stash/pop",
+            post(agent::post_git_stash_pop),
+        )
+        .route(
+            "/api/agent/workspaces/:id/git/stash/drop",
+            post(agent::post_git_stash_drop),
+        )
+        .route(
             "/api/agent/workspaces/:id/sessions",
             get(agent::list_sessions).post(agent::create_session),
         )

@@ -5,6 +5,7 @@ pub mod acp_events;
 pub mod approval;
 pub mod compact;
 pub mod executor;
+pub mod git_plan;
 pub mod llm_bridge;
 pub mod notify;
 pub mod runner;

@@ -1,124 +1,42 @@
 import { useState } from 'react';
-import type { ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
-import { cn } from '@/lib/utils';
 import {
-  getAgentGitDiff,
   getAgentGitStatus,
   listAgentMessages,
 } from '../../../api/client';
 import type { AgentMessagesPage } from '../../../api/client';
 import type { AgentMessage } from '../../../types';
+import { GitChangesTab } from './git/ChangesTab';
+import { GitBranchesTab } from './git/BranchesTab';
+import { GitHistoryTab } from './git/HistoryTab';
+import { GitStashTab } from './git/StashTab';
+import { GitTabBar, GitToolbar } from './git/shared';
+import {
+  headerBranch,
+  parsePorcelainEntries,
+  type GitEntry,
+  type GitStatusKind,
+} from './git/gitUtils';
 
-export type GitStatusKind =
-  | 'modified'
-  | 'added'
-  | 'deleted'
-  | 'renamed'
-  | 'untracked'
-  | 'other';
+// 向后兼容导出（gitUtils.ts 内为唯一实现，GitPanel 仅转发，供既有测试/调用方使用）
+export type { GitEntry, GitStatusKind };
+export { parsePorcelainEntries };
 
-export interface GitEntry {
-  path: string;
-  x: string;
-  y: string;
-  status: GitStatusKind;
-  staged: boolean;
-}
+type TabKey = 'changes' | 'branches' | 'history' | 'stash';
 
-function normalizeStatus(x: string, y: string): GitStatusKind {
-  if (x === '?' && y === '?') return 'untracked';
-  if (x === 'R' || y === 'R') return 'renamed';
-  if (x === 'M' || y === 'M') return 'modified';
-  if (x === 'A' || y === 'A') return 'added';
-  if (x === 'D' || y === 'D') return 'deleted';
-  return 'other';
-}
+type TabI18nKey =
+  | 'agent.gitTabChanges'
+  | 'agent.gitTabBranches'
+  | 'agent.gitTabHistory'
+  | 'agent.gitTabStash';
 
-/**
- * 解析 `git status --porcelain=v1 -b` 原文为条目列表。
- * 跳过 `## ` 分支头行；`?? path` → untracked；`XY path` 两字符状态；
- * 重命名行 `R  old -> new` 的 path 取 new。
- */
-export function parsePorcelainEntries(status: string): GitEntry[] {
-  const entries: GitEntry[] = [];
-  for (const rawLine of status.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-    if (line === '' || line.startsWith('## ')) continue;
-
-    if (line.startsWith('?? ')) {
-      entries.push({
-        path: line.slice(3),
-        x: '?',
-        y: '?',
-        status: 'untracked',
-        staged: false,
-      });
-      continue;
-    }
-
-    // porcelain 行最小形态为 "XY path"（至少 4 字符）
-    if (line.length < 4) continue;
-    const x = line[0];
-    const y = line[1];
-    let path = line.slice(3);
-    // 重命名：`R  old -> new`（仅重命名行才按 ` -> ` 拆分，避免误伤普通路径）
-    if ((x === 'R' || y === 'R') && path.includes(' -> ')) {
-      path = path.slice(path.lastIndexOf(' -> ') + 4);
-    }
-    entries.push({
-      path,
-      x,
-      y,
-      status: normalizeStatus(x, y),
-      staged: x !== ' ' && x !== '?',
-    });
-  }
-  return entries;
-}
-
-function headerBranch(status: string): string | null {
-  const line = status.split('\n').find((l) => l.startsWith('## '));
-  return line ? line.slice(3).trim() : null;
-}
-
-function diffLineClass(line: string): string {
-  if (line.startsWith('@@')) return 'text-blue-500';
-  if (line.startsWith('+') && !line.startsWith('+++')) {
-    return 'text-green-600 dark:text-green-400';
-  }
-  if (line.startsWith('-') && !line.startsWith('---')) return 'text-red-600';
-  return '';
-}
-
-const BADGE: Record<GitStatusKind, { label: string; className: string }> = {
-  modified: {
-    label: 'M',
-    className: 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400',
-  },
-  added: {
-    label: 'A',
-    className: 'bg-green-500/15 text-green-600 dark:text-green-400',
-  },
-  deleted: {
-    label: 'D',
-    className: 'bg-red-500/15 text-red-600 dark:text-red-400',
-  },
-  renamed: {
-    label: 'R',
-    className: 'bg-blue-500/15 text-blue-600 dark:text-blue-400',
-  },
-  untracked: {
-    label: 'U',
-    className: 'bg-gray-500/15 text-gray-500 dark:text-gray-400',
-  },
-  other: {
-    label: '?',
-    className: 'bg-gray-500/15 text-gray-500 dark:text-gray-400',
-  },
-};
+const TABS: { key: TabKey; i18nKey: TabI18nKey }[] = [
+  { key: 'changes', i18nKey: 'agent.gitTabChanges' },
+  { key: 'branches', i18nKey: 'agent.gitTabBranches' },
+  { key: 'history', i18nKey: 'agent.gitTabHistory' },
+  { key: 'stash', i18nKey: 'agent.gitTabStash' },
+];
 
 interface ToolLog {
   name: string;
@@ -158,158 +76,13 @@ function FallbackGitStatus({ messages }: { messages: AgentMessage[] }) {
   );
 }
 
-function GitToolbar({
-  onRefresh,
-  refreshLabel,
-}: {
-  onRefresh: () => void;
-  refreshLabel: string;
-}) {
-  const { t } = useTranslation();
-  return (
-    <div className="flex items-center justify-between px-1 py-0.5">
-      <span className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground/70">
-        {t('agent.git')}
-      </span>
-      <button
-        type="button"
-        aria-label={refreshLabel}
-        title={refreshLabel}
-        onClick={onRefresh}
-        className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-      >
-        <RefreshCw className="h-3.5 w-3.5" />
-      </button>
-    </div>
-  );
-}
-
-function DiffView({ workspaceId, path }: { workspaceId: string; path: string }) {
-  const { t } = useTranslation();
-  const diffQuery = useQuery({
-    queryKey: ['agent-git-diff', workspaceId, path],
-    queryFn: () => getAgentGitDiff(workspaceId, path),
-    retry: false,
-  });
-
-  if (diffQuery.isLoading) {
-    return (
-      <div className="px-2 py-1 text-xs text-muted-foreground">{t('common.loading')}</div>
-    );
-  }
-  if (diffQuery.isError) {
-    return (
-      <div className="px-2 py-1 text-xs text-muted-foreground">{t('agent.noGitStatus')}</div>
-    );
-  }
-
-  const lines = (diffQuery.data ?? '').split('\n');
-  if (lines.length <= 1 && lines[0].trim() === '') {
-    return (
-      <div className="px-2 py-1 text-xs text-muted-foreground">{t('agent.diffEmpty')}</div>
-    );
-  }
-
-  return (
-    <pre className="overflow-x-auto rounded-md bg-muted/40 px-2 py-1 font-mono text-xs leading-relaxed">
-      {lines.map((line, i) => (
-        <div key={i} className={diffLineClass(line)}>
-          {line === '' ? ' ' : line}
-        </div>
-      ))}
-    </pre>
-  );
-}
-
-function EntryRow({
-  entry,
-  expanded,
-  onToggle,
-  children,
-}: {
-  entry: GitEntry;
-  expanded: boolean;
-  onToggle: () => void;
-  children?: ReactNode;
-}) {
-  const badge = BADGE[entry.status];
-  return (
-    <div>
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
-        className="flex w-full items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-      >
-        {expanded ? (
-          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-        ) : (
-          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
-        )}
-        <span
-          className={cn(
-            'inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[10px] font-bold',
-            badge.className
-          )}
-        >
-          {badge.label}
-        </span>
-        <span className="truncate font-mono text-xs">{entry.path}</span>
-      </button>
-      {expanded && children}
-    </div>
-  );
-}
-
-function GitGroup({
-  label,
-  count,
-  collapsed,
-  onToggle,
-  children,
-}: {
-  label: string;
-  count: number;
-  collapsed: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <div>
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-expanded={!collapsed}
-        className="flex w-full items-center gap-1 px-1 py-0.5 text-left text-xs font-semibold text-foreground/80 hover:bg-accent/50"
-      >
-        {collapsed ? (
-          <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
-        ) : (
-          <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
-        )}
-        <span className="truncate">{label}</span>
-        <span className="ml-auto text-muted-foreground/70">{count}</span>
-      </button>
-      {!collapsed && <div className="space-y-0.5">{children}</div>}
-    </div>
-  );
-}
-
-type GroupKey = 'staged' | 'changes' | 'untracked';
-
-type GitGroupI18nKey = 'agent.stagedChanges' | 'agent.changes' | 'agent.untracked';
-
-const GROUPS: { key: GroupKey; i18nKey: GitGroupI18nKey }[] = [
-  { key: 'staged', i18nKey: 'agent.stagedChanges' },
-  { key: 'changes', i18nKey: 'agent.changes' },
-  { key: 'untracked', i18nKey: 'agent.untracked' },
-];
-
-function groupOf(entry: GitEntry): GroupKey {
-  if (entry.status === 'untracked') return 'untracked';
-  return entry.staged ? 'staged' : 'changes';
-}
-
+/**
+ * Git 面板（ActivityBar kind='git'）：tab 容器——Changes / Branches / History / Stash。
+ *
+ * status query 归属本容器：非 git 仓库（stderr 非空）与回退路径（主 API 离线）统一
+ * 在此判定，不随 tab 切换丢失。四个 tab 各自维护自己的查询与写操作，写成功后
+ * invalidate `agent-git-status`（本容器持有的 query）实现跨 tab 联动刷新。
+ */
 export default function GitPanel({
   sessionId,
   workspaceId,
@@ -317,11 +90,9 @@ export default function GitPanel({
   sessionId: string;
   workspaceId: string;
 }) {
-  // 面板容器（ActivityBar）已无内边距/滚动，组件自补。
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [expandedPath, setExpandedPath] = useState<string | null>(null);
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [tab, setTab] = useState<TabKey>('changes');
 
   const statusQuery = useQuery({
     queryKey: ['agent-git-status', workspaceId],
@@ -342,9 +113,15 @@ export default function GitPanel({
     retry: false,
   });
 
+  // 全局刷新：一次 invalidate 所有 git 查询（各 tab 懒挂载的 query 也会标记 stale，
+  // 下次挂载时自动重取），避免每个 tab 各自维护一个工具栏。
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['agent-git-status'] });
     queryClient.invalidateQueries({ queryKey: ['agent-git-diff'] });
+    queryClient.invalidateQueries({ queryKey: ['agent-git-branches'] });
+    queryClient.invalidateQueries({ queryKey: ['agent-git-log'] });
+    queryClient.invalidateQueries({ queryKey: ['agent-git-show'] });
+    queryClient.invalidateQueries({ queryKey: ['agent-git-stash'] });
   };
 
   // 回退：保留旧行为——展示缓存里最近一次 git_status 工具结果原文
@@ -377,44 +154,21 @@ export default function GitPanel({
   const branch = headerBranch(status);
 
   return (
-    <div className="space-y-1 overflow-y-auto p-2">
+    <div className="flex h-full min-h-0 flex-col">
       <GitToolbar onRefresh={refresh} refreshLabel={t('agent.refresh')} />
-      {branch && (
-        <p className="truncate px-1 text-[10px] uppercase tracking-wide text-muted-foreground/70">
-          {branch}
-        </p>
-      )}
-      {entries.length === 0 && !branch && (
-        <p className="px-1 text-xs text-muted-foreground">{t('agent.noGitStatus')}</p>
-      )}
-      {GROUPS.map(({ key, i18nKey }) => {
-        const items = entries.filter((e) => groupOf(e) === key);
-        if (items.length === 0) return null;
-        return (
-          <GitGroup
-            key={key}
-            label={t(i18nKey)}
-            count={items.length}
-            collapsed={!!collapsed[key]}
-            onToggle={() => setCollapsed((c) => ({ ...c, [key]: !c[key] }))}
-          >
-            {items.map((entry) => (
-              <EntryRow
-                key={entry.path}
-                entry={entry}
-                expanded={expandedPath === entry.path}
-                onToggle={() =>
-                  setExpandedPath((cur) => (cur === entry.path ? null : entry.path))
-                }
-              >
-                {expandedPath === entry.path && (
-                  <DiffView workspaceId={workspaceId} path={entry.path} />
-                )}
-              </EntryRow>
-            ))}
-          </GitGroup>
-        );
-      })}
+      <GitTabBar
+        tabs={TABS.map((item) => ({ key: item.key, label: t(item.i18nKey) }))}
+        active={tab}
+        onChange={setTab}
+      />
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        {tab === 'changes' && (
+          <GitChangesTab workspaceId={workspaceId} entries={entries} branch={branch} />
+        )}
+        {tab === 'branches' && <GitBranchesTab workspaceId={workspaceId} />}
+        {tab === 'history' && <GitHistoryTab workspaceId={workspaceId} />}
+        {tab === 'stash' && <GitStashTab workspaceId={workspaceId} />}
+      </div>
     </div>
   );
 }

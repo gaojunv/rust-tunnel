@@ -6,9 +6,19 @@ use axum::{
     Json,
 };
 
-use crate::mgmt::api::ApiState;
+use rust_tunnel_common::AgentCommand;
+use rust_tunnel_common::AgentResult;
 
-use super::dto::{CreateWorkspaceRequest, FsPathQuery, PutFsFileRequest, UpdateWorkspaceRequest, WorkspaceFilesQuery};
+use crate::agent::git_plan;
+use crate::mgmt::api::ApiState;
+use crate::persistence::db::agent::AgentWorkspaceRecord;
+
+use super::dto::{
+    CreateWorkspaceRequest, FsPathQuery, GitApprovedBody, GitBranchDeleteRequest,
+    GitCheckoutRequest, GitCommitRequest, GitDiffQuery, GitLogQuery, GitResetRequest,
+    GitRevertRequest, GitShowQuery, GitStageRequest, GitStashIndexRequest, GitStashPushRequest,
+    GitUnstageRequest, PutFsFileRequest, UpdateWorkspaceRequest, WorkspaceFilesQuery,
+};
 use super::new_id;
 
 /// 校验 agent_type：空串（内置 runner）或受支持的 ACP 引擎。
@@ -243,6 +253,248 @@ async fn workspace_exec(
     }
 }
 
+/// 加载 workspace + docker 容器存在性检查 + GitExec 客户端版本门控。
+/// GitExec 是新 bincode 变体：老客户端（<0.5.0）收到会反序列化失败断开控制连接，
+/// 必须在服务端短路为 409 提示升级（面板读/写端点统一走这里）。
+async fn load_git_workspace(
+    state: &ApiState,
+    workspace_id: &str,
+) -> Result<(crate::agent::AgentState, AgentWorkspaceRecord), axum::response::Response> {
+    let Some(agent) = &state.server_state.agent_state else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let ws = match agent.db.agent_get_workspace(workspace_id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    match agent.registry.get(&ws.client_id).await {
+        // 客户端未注册（离线）：与其余面板端点一致 → 503（前端区分「离线」与「升级」）。
+        None => return Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        Some(entry) => {
+            if !crate::agent::runner::client_supports_git_exec(entry.client_version.as_deref()) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "needs_upgrade": true,
+                        "message": "client too old: git panel requires client >= 0.5.0; please upgrade the client",
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    }
+    Ok((agent.clone(), ws))
+}
+
+/// Git 读端点统一流程：加载+版本门控 → git_plan 校验（fail-closed 400）→ 隧道执行。
+/// 返回 FileContent 原文；git 命令失败保留 stderr（503 + error 体，区别于旧的
+/// workspace_exec 裸 503，便于面板展示 git 错误信息）。
+async fn run_git_read(
+    state: &ApiState,
+    workspace_id: &str,
+    git_args: Vec<String>,
+) -> Result<String, axum::response::Response> {
+    let (agent, ws) = load_git_workspace(state, workspace_id).await?;
+    let planned = git_plan::plan(&git_args).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response()
+    })?;
+    let result = crate::agent::executor::exec_on_client(
+        &agent,
+        &ws.id,
+        &ws.client_id,
+        &ws.root_path,
+        ws.docker_container_id.as_deref(),
+        AgentCommand::GitExec { args: planned.args },
+    )
+    .await;
+    match result {
+        AgentResult::FileContent { content } => Ok(content),
+        AgentResult::Error { message } => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response()),
+        _ => Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    }
+}
+
+/// Git 写端点统一流程：git_plan 校验（fail-closed 400）→ 加载+版本门控 →
+/// 审批判定（需审且未确认 → 409 `{needs_approval, summary}`）→ 隧道执行。
+/// 前端带 `approved: true` 重发即跳过审批。
+async fn run_git_write(
+    state: &ApiState,
+    workspace_id: &str,
+    approved: bool,
+    git_args: Vec<String>,
+) -> axum::response::Response {
+    let planned = match git_plan::plan(&git_args) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let ws = match agent.db.agent_get_workspace(workspace_id).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let command = AgentCommand::GitExec {
+        args: planned.args.clone(),
+    };
+    // 审批判定在版本门控之前：需审时无论客户端在线/版本如何都先弹审批卡片，
+    // 前端确认后带 approved=true 重发再走到版本门控。
+    if !approved && crate::agent::approval::needs_approval(&ws.approval_mode, &command) {
+        let summary = crate::agent::approval::approval_summary(&command);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "needs_approval": true,
+                "summary": summary,
+            })),
+        )
+            .into_response();
+    }
+    // 通过审批后：docker 容器存在性 + GitExec 客户端版本门控（离线 503 / 老客户端 409）。
+    if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match agent.registry.get(&ws.client_id).await {
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Some(entry) => {
+            if !crate::agent::runner::client_supports_git_exec(entry.client_version.as_deref()) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "needs_upgrade": true,
+                        "message": "client too old: git panel requires client >= 0.5.0; please upgrade the client",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let result = crate::agent::executor::exec_on_client(
+        agent,
+        &ws.id,
+        &ws.client_id,
+        &ws.root_path,
+        ws.docker_container_id.as_deref(),
+        command,
+    )
+    .await;
+    match result {
+        AgentResult::FileContent { content } => {
+            Json(serde_json::json!({ "output": content })).into_response()
+        }
+        AgentResult::Success => Json(serde_json::json!({ "output": "ok" })).into_response(),
+        AgentResult::Shell {
+            stdout,
+            stderr,
+            exit_code,
+        } => Json(serde_json::json!({
+            "output": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+        }))
+        .into_response(),
+        AgentResult::Error { message } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// 校验 commit / stash message 上限（与控制通道协议上限同源，见 tools::MAX_COMMIT_MSG_LEN）。
+/// 返回 `Some(Response)` 表示非法（400），`None` 表示通过。避免返回大体积
+/// `Err(Response)` 触发 `result_large_err`。
+fn check_git_message(message: &str) -> Option<axum::response::Response> {
+    if message.is_empty() {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "message must not be empty" })),
+        )
+            .into_response());
+    }
+    if message.len() > crate::agent::tools::MAX_COMMIT_MSG_LEN {
+        return Some((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("message too long (>{})", crate::agent::tools::MAX_COMMIT_MSG_LEN)
+            })),
+        )
+            .into_response());
+    }
+    None
+}
+
+/// 解析 `git branch --format=%(refname:short)%09%(HEAD)%09%(upstream:short)` 输出。
+fn parse_branches(content: &str) -> Vec<serde_json::Value> {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut it = line.splitn(3, '\t');
+            let name = it.next().unwrap_or_default().to_string();
+            let head = it.next().unwrap_or_default();
+            let upstream = it.next().unwrap_or_default();
+            serde_json::json!({
+                "name": name,
+                "current": head == "*",
+                "upstream": (!upstream.is_empty()).then_some(upstream.to_string()),
+            })
+        })
+        .collect()
+}
+
+/// 解析 `git log --format=%H%x00%h%x00%an%x00%aI%x00%s` 输出（NUL 分隔字段，
+/// 换行分隔记录；subject 恒为单行）。
+fn parse_commits(content: &str) -> Vec<serde_json::Value> {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split('\0');
+            serde_json::json!({
+                "hash": fields.next().unwrap_or_default(),
+                "short": fields.next().unwrap_or_default(),
+                "author": fields.next().unwrap_or_default(),
+                "date": fields.next().unwrap_or_default(),
+                "subject": fields.next().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// 解析 `git stash list` 输出（每行 `stash@{N}: <message>`）。
+fn parse_stashes(content: &str) -> Vec<serde_json::Value> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("stash@{")?;
+            let (index_str, after) = rest.split_once('}')?;
+            let index = index_str.parse::<usize>().ok()?;
+            let message = after.strip_prefix(": ").unwrap_or_default().to_string();
+            Some(serde_json::json!({ "index": index, "message": message }))
+        })
+        .collect()
+}
+
 /// GET /api/agent/workspaces/:id/fs/tree?path=<rel>
 /// FilesPanel 目录树数据源：ListDir 输出（目录以 '/' 结尾）解析为结构化 JSON。
 pub async fn get_fs_tree(
@@ -368,13 +620,25 @@ pub async fn get_git_status(
     Json(serde_json::json!({ "status": stdout, "stderr": stderr })).into_response()
 }
 
-/// GET /api/agent/workspaces/:id/git/diff?path=<rel>
-/// GitPanel 文件 diff：path 为空时返回整个工作区 diff。
+/// GET /api/agent/workspaces/:id/git/diff?path=<rel>&cached=true
+/// GitPanel 文件 diff：path 为空时返回整个工作区 diff；`cached=true` 取 staged diff
+/// （走 GitExec，要求客户端 ≥0.5.0；非 cached 保留旧 GitDiff 路径兼容老客户端）。
 pub async fn get_git_diff(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    Query(params): Query<FsPathQuery>,
+    Query(params): Query<GitDiffQuery>,
 ) -> impl IntoResponse {
+    if params.cached.unwrap_or(false) {
+        let mut args = vec!["diff".to_string(), "--cached".to_string()];
+        if let Some(path) = params.path.filter(|p| !p.is_empty()) {
+            args.push("--".to_string());
+            args.push(path);
+        }
+        return match run_git_read(&state, &id, args).await {
+            Ok(content) => Json(serde_json::json!({ "diff": content })).into_response(),
+            Err(resp) => resp,
+        };
+    }
     let result = match workspace_exec(
         &state,
         &id,
@@ -391,6 +655,287 @@ pub async fn get_git_diff(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     Json(serde_json::json!({ "diff": content })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/git/branches
+/// 分支列表：{branches:[{name, current, upstream?}]}。
+pub async fn get_git_branches(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let content = match run_git_read(
+        &state,
+        &id,
+        vec![
+            "branch".to_string(),
+            "--format=%(refname:short)%09%(HEAD)%09%(upstream:short)".to_string(),
+        ],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    Json(serde_json::json!({ "branches": parse_branches(&content) })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/git/log?limit=50
+/// 提交历史：{commits:[{hash, short, author, date, subject}]}。
+pub async fn get_git_log(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<GitLogQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let content = match run_git_read(
+        &state,
+        &id,
+        vec![
+            "log".to_string(),
+            "-n".to_string(),
+            limit.to_string(),
+            "--format=%H%x00%h%x00%an%x00%aI%x00%s".to_string(),
+        ],
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    Json(serde_json::json!({ "commits": parse_commits(&content) })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/git/show?rev=<rev>
+/// 提交详情：{diff: <文本>}（git show 原文，含提交元信息 + diff）。
+pub async fn get_git_show(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<GitShowQuery>,
+) -> impl IntoResponse {
+    let mut args = vec!["show".to_string()];
+    if let Some(rev) = params.rev.filter(|r| !r.is_empty()) {
+        args.push(rev);
+    }
+    let content = match run_git_read(&state, &id, args).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    Json(serde_json::json!({ "diff": content })).into_response()
+}
+
+/// GET /api/agent/workspaces/:id/git/stash
+/// stash 列表：{stashes:[{index, message}]}。
+pub async fn get_git_stash(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let content = match run_git_read(&state, &id, vec!["stash".into(), "list".into()]).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    Json(serde_json::json!({ "stashes": parse_stashes(&content) })).into_response()
+}
+
+/// POST /api/agent/workspaces/:id/git/stage  {paths[]}
+pub async fn post_git_stage(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitStageRequest>,
+) -> impl IntoResponse {
+    let mut args = vec!["add".to_string(), "--".to_string()];
+    args.extend(body.paths.iter().cloned());
+    run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
+}
+
+/// POST /api/agent/workspaces/:id/git/unstage  {paths[]}
+pub async fn post_git_unstage(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitUnstageRequest>,
+) -> impl IntoResponse {
+    let mut args = vec!["restore".to_string(), "--staged".to_string(), "--".to_string()];
+    args.extend(body.paths.iter().cloned());
+    run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
+}
+
+/// POST /api/agent/workspaces/:id/git/commit  {message}
+pub async fn post_git_commit(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitCommitRequest>,
+) -> impl IntoResponse {
+    if let Some(resp) = check_git_message(&body.message) {
+        return resp;
+    }
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec!["commit".to_string(), "-m".to_string(), body.message],
+    )
+    .await
+}
+
+/// POST /api/agent/workspaces/:id/git/checkout  {branch, create?}
+pub async fn post_git_checkout(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitCheckoutRequest>,
+) -> impl IntoResponse {
+    let args = if body.create.unwrap_or(false) {
+        vec!["checkout".to_string(), "-b".to_string(), body.branch]
+    } else {
+        vec!["checkout".to_string(), body.branch]
+    };
+    run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
+}
+
+/// POST /api/agent/workspaces/:id/git/branch/delete  {branch, force?}
+pub async fn post_git_branch_delete(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitBranchDeleteRequest>,
+) -> impl IntoResponse {
+    let flag = if body.force.unwrap_or(false) { "-D" } else { "-d" };
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec!["branch".to_string(), flag.to_string(), body.branch],
+    )
+    .await
+}
+
+/// POST /api/agent/workspaces/:id/git/pull  请求体可为空 / {} / {approved}
+pub async fn post_git_pull(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Option<Json<GitApprovedBody>>,
+) -> impl IntoResponse {
+    let approved = body.and_then(|b| b.approved).unwrap_or(false);
+    run_git_write(&state, &id, approved, vec!["pull".to_string()]).await
+}
+
+/// POST /api/agent/workspaces/:id/git/push  请求体可为空 / {} / {approved}
+pub async fn post_git_push(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Option<Json<GitApprovedBody>>,
+) -> impl IntoResponse {
+    let approved = body.and_then(|b| b.approved).unwrap_or(false);
+    run_git_write(&state, &id, approved, vec!["push".to_string()]).await
+}
+
+/// POST /api/agent/workspaces/:id/git/revert  {rev}
+pub async fn post_git_revert(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitRevertRequest>,
+) -> impl IntoResponse {
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec!["revert".to_string(), body.rev],
+    )
+    .await
+}
+
+/// POST /api/agent/workspaces/:id/git/reset  {rev?, mode: soft|mixed|hard}
+pub async fn post_git_reset(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitResetRequest>,
+) -> impl IntoResponse {
+    let mut args = vec!["reset".to_string()];
+    match body.mode.as_str() {
+        "soft" | "mixed" | "hard" => args.push(format!("--{}", body.mode)),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "mode must be soft|mixed|hard" })),
+            )
+                .into_response();
+        }
+    }
+    if let Some(rev) = body.rev {
+        args.push(rev);
+    }
+    run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
+}
+
+/// POST /api/agent/workspaces/:id/git/stash/push  {message?}
+pub async fn post_git_stash_push(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitStashPushRequest>,
+) -> impl IntoResponse {
+    let mut args = vec!["stash".to_string(), "push".to_string()];
+    if let Some(message) = body.message {
+        if let Some(resp) = check_git_message(&message) {
+            return resp;
+        }
+        args.push("-m".to_string());
+        args.push(message);
+    }
+    run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
+}
+
+/// POST /api/agent/workspaces/:id/git/stash/apply  {index}
+pub async fn post_git_stash_apply(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitStashIndexRequest>,
+) -> impl IntoResponse {
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec![
+            "stash".to_string(),
+            "apply".to_string(),
+            format!("stash@{{{}}}", body.index),
+        ],
+    )
+    .await
+}
+
+/// POST /api/agent/workspaces/:id/git/stash/pop  {index}
+pub async fn post_git_stash_pop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitStashIndexRequest>,
+) -> impl IntoResponse {
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec![
+            "stash".to_string(),
+            "pop".to_string(),
+            format!("stash@{{{}}}", body.index),
+        ],
+    )
+    .await
+}
+
+/// POST /api/agent/workspaces/:id/git/stash/drop  {index}
+pub async fn post_git_stash_drop(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<GitStashIndexRequest>,
+) -> impl IntoResponse {
+    run_git_write(
+        &state,
+        &id,
+        body.approved.unwrap_or(false),
+        vec![
+            "stash".to_string(),
+            "drop".to_string(),
+            format!("stash@{{{}}}", body.index),
+        ],
+    )
+    .await
 }
 
 /// 单引号 shell 转义：' → '\''（标准做法），包裹后任意输入安全。
@@ -950,13 +1495,46 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let resp = get_git_diff(
-            State(state),
+            State(state.clone()),
             Path("ghost".to_string()),
-            Query(FsPathQuery { path: None }),
+            Query(GitDiffQuery {
+                path: None,
+                cached: None,
+            }),
         )
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let responses = vec![
+            get_git_branches(State(state.clone()), Path("ghost".to_string()))
+                .await
+                .into_response(),
+            get_git_log(
+                State(state.clone()),
+                Path("ghost".to_string()),
+                Query(GitLogQuery { limit: None }),
+            )
+            .await
+            .into_response(),
+            get_git_show(
+                State(state.clone()),
+                Path("ghost".to_string()),
+                Query(GitShowQuery { rev: None }),
+            )
+            .await
+            .into_response(),
+            get_git_stash(State(state.clone()), Path("ghost".to_string()))
+                .await
+                .into_response(),
+        ];
+        for resp in responses {
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "git read endpoint on ghost workspace should 404"
+            );
+        }
     }
 
     #[tokio::test]
@@ -994,13 +1572,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let resp = get_git_diff(
-            State(state),
+            State(state.clone()),
             Path("w1".to_string()),
-            Query(FsPathQuery { path: None }),
+            Query(GitDiffQuery {
+                path: None,
+                cached: None,
+            }),
         )
         .await
         .into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // cached diff 走 GitExec：客户端离线 → 503
+        let resp = get_git_diff(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Query(GitDiffQuery {
+                path: None,
+                cached: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // GitExec 读端点：客户端离线 → 503
+        let responses = vec![
+            get_git_branches(State(state.clone()), Path("w1".to_string()))
+                .await
+                .into_response(),
+            get_git_log(
+                State(state.clone()),
+                Path("w1".to_string()),
+                Query(GitLogQuery { limit: None }),
+            )
+            .await
+            .into_response(),
+            get_git_show(
+                State(state.clone()),
+                Path("w1".to_string()),
+                Query(GitShowQuery { rev: None }),
+            )
+            .await
+            .into_response(),
+            get_git_stash(State(state.clone()), Path("w1".to_string()))
+                .await
+                .into_response(),
+        ];
+        for resp in responses {
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "git read endpoint with offline client should 503"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1122,5 +1747,303 @@ mod tests {
         assert_eq!(shell_escape_q("main"), "'main'");
         assert_eq!(shell_escape_q("it's"), r#"'it'\''s'"#);
         assert_eq!(shell_escape_q("a';b|rm"), r#"'a'\'';b|rm'"#); // 单引号转义后特殊字符在引号内安全
+    }
+
+    // ── Git 面板（GitExec）─────────────────────────────────────────────────────
+
+    /// 注册一个客户端（版本可指定）到 registry，模拟在线状态。
+    async fn register_client(state: &ApiState, db: &Database, name: &str, version: Option<&str>) {
+        db.save_server_auth("secret").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        state
+            .server_state
+            .agent_state
+            .as_ref()
+            .expect("agent_state")
+            .registry
+            .register(name, None, version.map(str::to_string), "secret", tx)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_git_read_old_client_409_upgrade() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        register_client(&state, &db, "nas", Some("0.4.0")).await;
+        // 老客户端（<0.5.0）：GitExec 新变体会断其控制连接，服务端短路 409 提示升级
+        let resp = get_git_branches(State(state), Path("w1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["needs_upgrade"], true);
+    }
+
+    #[tokio::test]
+    async fn test_git_read_new_client_offline_after_exec_503() {
+        // 客户端在线（0.5.0）但隧道执行失败（无人消费控制通道 → 超时）→ 503。
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        register_client(&state, &db, "nas", Some("0.5.0")).await;
+        let resp = get_git_branches(State(state), Path("w1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_git_write_safe_mode_approval_flow() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        // 默认 approval_mode=safe：git commit 属 SafeWrite → 未确认 409 needs_approval
+        let resp = post_git_commit(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(GitCommitRequest {
+                message: "fix".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["needs_approval"], true);
+        assert!(json["summary"].as_str().unwrap().contains("git commit"));
+
+        // 确认后重发 → 通过审批 → 客户端离线（未注册）503
+        let resp = post_git_commit(
+            State(state),
+            Path("w1".to_string()),
+            Json(GitCommitRequest {
+                message: "fix".into(),
+                approved: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_git_write_dangerous_auto_write_approval() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_update_workspace(
+            "w1",
+            "proj",
+            "/p",
+            None,
+            Some("auto_write"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // auto_write：普通写放行（reset --soft → SafeWrite），危险写需审（reset --hard）
+        let resp = post_git_reset(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(GitResetRequest {
+                rev: Some("HEAD~1".into()),
+                mode: "soft".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE); // 免审直接执行 → 离线 503
+
+        let resp = post_git_reset(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(GitResetRequest {
+                rev: None,
+                mode: "hard".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["needs_approval"], true);
+
+        // 确认后重发 → 免审放行 → 离线 503
+        let resp = post_git_reset(
+            State(state),
+            Path("w1".to_string()),
+            Json(GitResetRequest {
+                rev: None,
+                mode: "hard".into(),
+                approved: Some(true),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_git_write_plan_validation_400() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        // 路径注入在 plan 阶段 fail-closed → 400（不触碰隧道）
+        let resp = post_git_stage(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(GitStageRequest {
+                paths: vec!["../etc/passwd".into()],
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 空 paths → 400
+        let resp = post_git_stage(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(GitStageRequest {
+                paths: vec![],
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 非法 reset mode → 400
+        let resp = post_git_reset(
+            State(state),
+            Path("w1".to_string()),
+            Json(GitResetRequest {
+                rev: None,
+                mode: "danger".into(),
+                approved: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_git_write_old_client_409_upgrade() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        register_client(&state, &db, "nas", Some("0.4.0")).await;
+        // 已确认重发：审批跳过，但老客户端版本门控 → 409 升级提示
+        let resp = post_git_push(
+            State(state),
+            Path("w1".to_string()),
+            Some(Json(GitApprovedBody {
+                approved: Some(true),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["needs_upgrade"], true);
+    }
+
+    #[tokio::test]
+    async fn test_git_write_empty_body_pull() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        // 空 body（无 JSON）也能解出 GitApprovedBody（approved=None）
+        let resp = post_git_pull(State(state), Path("w1".to_string()), None)
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT); // safe 档 pull 需审
+    }
+
+    #[test]
+    fn test_parse_branches() {
+        let out = parse_branches("main\t*\torigin/main\nfeature\t\torigin/feature\n");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["name"], "main");
+        assert_eq!(out[0]["current"], true);
+        assert_eq!(out[0]["upstream"], "origin/main");
+        assert_eq!(out[1]["name"], "feature");
+        assert_eq!(out[1]["current"], false);
+        assert_eq!(out[1]["upstream"], "origin/feature");
+    }
+
+    #[test]
+    fn test_parse_branches_no_upstream() {
+        let out = parse_branches("main\t*\t\nlocal\t\t\n");
+        assert_eq!(out[0]["upstream"], serde_json::Value::Null);
+        assert_eq!(out[1]["current"], false);
+    }
+
+    #[test]
+    fn test_parse_commits() {
+        let content = "\
+abc\0ab\0Alice\02026-08-14T10:00:00+08:00\0first commit\n\
+def\0de\0Bob\02026-08-13T09:00:00+08:00\0second commit\n";
+        let out = parse_commits(content);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["hash"], "abc");
+        assert_eq!(out[0]["short"], "ab");
+        assert_eq!(out[0]["author"], "Alice");
+        assert_eq!(out[0]["date"], "2026-08-14T10:00:00+08:00");
+        assert_eq!(out[0]["subject"], "first commit");
+        assert_eq!(out[1]["subject"], "second commit");
+    }
+
+    #[test]
+    fn test_parse_stashes() {
+        let out = parse_stashes("stash@{0}: WIP on main: 1a2b3c fix\nstash@{1}: On feature: wip\n");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["index"], 0);
+        assert_eq!(out[0]["message"], "WIP on main: 1a2b3c fix");
+        assert_eq!(out[1]["index"], 1);
+        assert_eq!(out[1]["message"], "On feature: wip");
+        // 无关行 / 空行忽略
+        assert!(parse_stashes("\n  \nnot a stash\n").is_empty());
     }
 }

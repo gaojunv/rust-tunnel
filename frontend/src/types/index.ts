@@ -757,3 +757,44 @@ export interface GitDiffResult {
   diff: string;
 }
 
+/** `GET /git/branches` 条目：当前分支 current=true，upstream 仅在有上游时存在。 */
+export interface GitBranch {
+  name: string;
+  current: boolean;
+  upstream?: string;
+}
+
+/** `GET /git/log` 条目：date 为 ISO 8601 时间串（git 提交作者时间）。 */
+export interface GitCommit {
+  hash: string;
+  short: string;
+  author: string;
+  date: string;
+  subject: string;
+}
+
+/** `GET /git/stash` 条目：index 即 stash@{N} 的 N。 */
+export interface GitStashEntry {
+  index: number;
+  message: string;
+}
+
+export interface GitBranchesResult {
+  branches: GitBranch[];
+}
+
+export interface GitLogResult {
+  commits: GitCommit[];
+}
+
+export interface GitStashesResult {
+  stashes: GitStashEntry[];
+}
+
+/** git 写操作结果：output 为命令 stdout，失败命令可能带 stderr / exit_code。 */
+export interface GitWriteResult {
+  output: string;
+  stderr?: string;
+  exit_code?: number;
+}
+

@@ -9,12 +9,43 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../../api/client', () => ({
+  getApiErrorMessage: (err: unknown): string => {
+    const data = (err as { response?: { data?: unknown } })?.response?.data;
+    if (typeof data === 'string') return data;
+    if (data && typeof data === 'object') {
+      const msg = (data as { error?: unknown }).error;
+      if (typeof msg === 'string') return msg;
+    }
+    return err instanceof Error ? err.message : String(err);
+  },
   getAgentGitStatus: vi.fn(),
   getAgentGitDiff: vi.fn(),
   listAgentMessages: vi.fn().mockResolvedValue([]),
+  getAgentGitBranches: vi.fn(),
+  getAgentGitLog: vi.fn(),
+  getAgentGitShow: vi.fn(),
+  getAgentGitStashes: vi.fn(),
+  postAgentGitStage: vi.fn(),
+  postAgentGitUnstage: vi.fn(),
+  postAgentGitCommit: vi.fn(),
+  postAgentGitCheckout: vi.fn(),
+  postAgentGitBranchDelete: vi.fn(),
+  postAgentGitPull: vi.fn(),
+  postAgentGitPush: vi.fn(),
+  postAgentGitRevert: vi.fn(),
+  postAgentGitReset: vi.fn(),
+  postAgentGitStashPush: vi.fn(),
+  postAgentGitStashApply: vi.fn(),
+  postAgentGitStashPop: vi.fn(),
+  postAgentGitStashDrop: vi.fn(),
 }));
 
-import { getAgentGitDiff, getAgentGitStatus, listAgentMessages } from '../../../api/client';
+import {
+  getAgentGitBranches,
+  getAgentGitDiff,
+  getAgentGitStatus,
+  listAgentMessages,
+} from '../../../api/client';
 
 afterEach(() => {
   cleanup();
@@ -167,5 +198,27 @@ M  src/lib.rs
     renderPanel();
     expect(await screen.findByText(/src\/main\.rs/)).toBeTruthy();
     expect(screen.getByText(/notes\.md/)).toBeTruthy();
+  });
+
+  it('renders tab bar and switches to Branches tab', async () => {
+    vi.mocked(getAgentGitStatus).mockResolvedValue({
+      status: '## main\n M src/main.rs\n',
+      stderr: '',
+    });
+    vi.mocked(getAgentGitBranches).mockResolvedValue([
+      { name: 'main', current: true, upstream: 'origin/main' },
+      { name: 'dev', current: false },
+    ]);
+
+    renderPanel();
+    // 该 status 无 staged 条目，等 Tab 栏渲染（面板加载完成的标志）
+    expect(await screen.findByRole('tab', { name: 'agent.gitTabChanges' })).toBeTruthy();
+
+    // 四个 tab 都在
+    fireEvent.click(screen.getByRole('tab', { name: 'agent.gitTabBranches' }));
+    expect(await screen.findByText('dev')).toBeTruthy();
+    expect(screen.getByText('main')).toBeTruthy();
+    // 非当前分支有上游展示
+    expect(screen.getByText(/origin\/main/)).toBeTruthy();
   });
 });
