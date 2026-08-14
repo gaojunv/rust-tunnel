@@ -7,6 +7,12 @@ use tokio::sync::{mpsc, Mutex};
 
 use rust_tunnel_common::ControlMessage;
 
+/// 单次 LLM 代理请求 body 上限：控制通道协议 1MB 硬上限（`read_from_stream`
+/// 超限即报 `Message too large` 并断开整个控制连接）。900KB 给 bincode 序列化
+/// 头留足余量；超限的请求在客户端本地直接回 HTTP 413，绝不把大消息发上
+/// 控制通道（否则 agent 的 LLM 调用会把控制连接打掉，连带全部 ACP 会话）。
+const MAX_LLM_PROXY_BODY: usize = 900 * 1024;
+
 /// request_id -> 等待响应 chunk 的 HTTP 连接发送端
 pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>;
 
@@ -114,6 +120,21 @@ async fn handle_conn(
         }
     }
     let body = buf[body_start..body_start + content_length].to_vec();
+
+    // 协议 1MB 上限：body 超限本地直接回 413，不让大消息进入控制通道
+    // （服务端 read_from_stream 超限会断开控制连接，杀掉该客户端全部 ACP 会话）。
+    if body.len() > MAX_LLM_PROXY_BODY {
+        let msg = format!(
+            "llm proxy request body too large: {} bytes (max: {MAX_LLM_PROXY_BODY})",
+            body.len()
+        );
+        let head = format!(
+            "HTTP/1.1 413 Payload Too Large\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{msg}",
+            msg.len()
+        );
+        let _ = stream.write_all(head.as_bytes()).await;
+        return;
+    }
 
     let request_id = format!("{:032x}", rand::random::<u128>());
     let (resp_tx, mut resp_rx) = mpsc::channel(256);
@@ -277,5 +298,52 @@ mod tests {
     fn test_find_header_end() {
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(14));
         assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n"), None);
+    }
+
+    /// 回归：请求体超协议上限时必须本地回 413，且不向控制通道发
+    /// AgentLlmProxyRequest（否则服务端 read_from_stream 超限断开整个控制连接，
+    /// 连带全部 ACP 会话）。
+    #[tokio::test]
+    async fn test_proxy_rejects_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = new_pending_map();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
+
+        let big = vec![b'x'; MAX_LLM_PROXY_BODY + 1];
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            big.len()
+        );
+        conn.write_all(head.as_bytes()).await.unwrap();
+        conn.write_all(&big).await.unwrap();
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.starts_with("HTTP/1.1 413"),
+            "expected 413, got: {text}"
+        );
+        assert!(text.contains("too large"), "body should explain: {text}");
+
+        // 控制通道不得收到该请求（body 被拦截在本地）
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .is_ok();
+        assert!(!leaked, "oversized request must not reach the control channel");
+
+        kill_tx.send(()).unwrap();
     }
 }

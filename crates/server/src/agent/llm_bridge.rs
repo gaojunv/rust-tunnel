@@ -151,12 +151,22 @@ pub fn forward(
         while let Some(item) = stream.next().await {
             match item {
                 Ok(bytes) => {
-                    yield AgentLlmProxyChunk {
-                        request_id: request_id.clone(),
-                        data: bytes.to_vec(),
-                        done: false,
-                        status,
-                    };
+                    // 协议 1MB 上限：body data stream 的块可能远超限制（非流式
+                    // 整个响应、compat 流式重写后单块），必须切 ≤512KB 再发，
+                    // 否则 AgentLlmProxyChunk 编码超限会断开客户端控制连接
+                    // （对称缺陷，见 client llm_proxy 的 413 保护）。
+                    const MAX_CHUNK: usize = 512 * 1024;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    for piece in bytes.chunks(MAX_CHUNK) {
+                        yield AgentLlmProxyChunk {
+                            request_id: request_id.clone(),
+                            data: piece.to_vec(),
+                            done: false,
+                            status,
+                        };
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -497,6 +507,83 @@ mod tests {
         assert!(
             !body.contains("model is required"),
             "model injected → must not fail on missing model, body: {body}"
+        );
+    }
+
+    /// 回归：非流式大响应（单块远超 1MB 协议切块线）必须被切 ≤512KB 下发，
+    /// 否则 AgentLlmProxyChunk 编码超限会断开客户端控制连接。
+    #[tokio::test]
+    async fn test_forward_slices_large_body_chunk() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let db = Database::new(":memory:").await.unwrap();
+
+        // mock 上游：返回 ~600KB 非流式 JSON 响应（单块远超协议 1MB 切块线）
+        let big_body = vec![b'a'; 600 * 1024];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_for_server = big_body.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                match sock.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n",
+                body_for_server.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body_for_server).await;
+        });
+
+        save_provider_model(&db, "model-big", &format!("http://{addr}"), true).await;
+        seed_configured_session(&db, "sess-big", "model-big").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-big".into(),
+            "req-big".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            // 必须有合法 messages，否则 handler 在参数校验就 400，到不了上游
+            br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+                .to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+
+        // 关键断言：每块 ≤512KB；所有 data 拼接 == 上游 body；done 只在末块
+        let mut joined = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.data.len() <= 512 * 1024,
+                "chunk {i} exceeds 512KB: {} bytes",
+                c.data.len()
+            );
+            if i + 1 < chunks.len() {
+                assert!(!c.done, "done must only be on the final chunk");
+            }
+            joined.extend_from_slice(&c.data);
+        }
+        assert_eq!(
+            joined, big_body,
+            "sliced chunks must reassemble to the upstream body"
+        );
+        assert!(chunks.last().unwrap().done, "stream must end with done=true");
+        assert!(
+            chunks.len() > 1,
+            "600KB body should span multiple ≤512KB chunks, got {}",
+            chunks.len()
         );
     }
 }
