@@ -136,6 +136,14 @@ struct SpawnedAgent {
     /// 连接任务的通知/请求处理器**每次事件**都经 [`current_ws_tx`] 动态读此
     /// 字段，重连（dedup 刷新）后流式帧自动切到新连接。
     ws_tx: Option<mpsc::Sender<serde_json::Value>>,
+    /// 本会话所有 WS 连接的事件通道（`(conn_id, tx)`）。多标签页/多窗口打开同一
+    /// 会话时，流式回合帧（assistant_chunk/tool_call/tool_result/plan/status/
+    /// done/error/queued/cancel_fallback）广播到全部连接（fan-out）——根治
+    /// 「最新连接获胜」劫持：被动打开的新标签页不应把正在运行回合的后续帧切走，
+    /// 原标签页永久卡 running。`ensure_session` 注册/刷新，`detach_ws_tx` 按
+    /// conn_id 移除。审批/elicitation 请求帧仍走主通道 `ws_tx`（最近注册连接），
+    /// 多连接下审批卡只在主连接展示（响应按 request_id 全局可达，任意连接可答）。
+    ws_conns: Vec<(u64, mpsc::Sender<serde_json::Value>)>,
     /// 当前注册 WS 通道所属的连接唯一标识：`detach_ws_tx` 按它判断「这个
     /// teardown 是不是注册方本人」。刷新竞态下旧连接 teardown 晚于新连接注册，
     /// 若无条件清空会误清新连接通道（tool_result/done 全丢）。
@@ -346,6 +354,7 @@ mod tests {
             stdout_tx: None,
             client_id: "nas".into(),
             ws_tx: None,
+            ws_conns: Vec::new(),
             ws_conn_id: 0,
             ws_conn_watch: watch::channel(0).0,
             busy: false,
@@ -410,6 +419,9 @@ mod tests {
         agent.stdout_tx = Some(stdout_tx.clone());
         agent.ws_tx = Some(ws_tx.clone());
         agent.ws_conn_id = TEST_CONN_ID;
+        // 广播列表同步登记（与真实路径 ensure_session 建条目一致）：多连接 fan-out
+        // 测试依赖 setup 时就含首连接。
+        agent.ws_conns = vec![(TEST_CONN_ID, ws_tx.clone())];
         bridge.sessions.lock().await.insert("sess-1".into(), agent);
 
         tokio::spawn(run_stdio_pump(
@@ -1487,11 +1499,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconnect_swaps_ws_channel_for_streaming() {
-        // 回归（评审 Finding 1）：连接任务的通知处理器在 handshake 时捕获过一次
-        // ws_tx，重连后 ensure_session 的 dedup 只刷新条目里的 ws_tx——旧捕获会把
-        // 流式帧推给已断开的旧连接（try_send 静默失败，新连接只能看到 done）。
-        // 修复后处理器每次事件动态解析，流式帧应全部到达新连接。
+    async fn test_multitab_broadcasts_frames_and_detach_stops_old_tab() {
+        // 回归（H5）：多标签页/多窗口共用同一 ACP 进程。旧实现「最新连接获胜」——
+        // ensure_session 把流式帧切到最新连接，回合进行中被动打开的第二个标签页把
+        // 正在运行回合的帧/done 全劫走，原标签页永久卡 running。修复后流式/终态帧
+        // fan-out 到全部连接；已 detach 的旧标签页不再收到后续帧。
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
@@ -1502,25 +1514,24 @@ mod tests {
             .unwrap();
         let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
 
-        // 旧连接 A：handshake 建立常驻连接任务。
+        // 标签页 A：handshake 建立常驻连接任务（setup 已把 A 登记进 ws_conns）。
         let (ws_tx_a, mut ws_rx_a) = mpsc::channel::<serde_json::Value>(16);
-        setup_handshake(&bridge, ws_tx_a).await;
+        setup_handshake(&bridge, ws_tx_a.clone()).await;
 
-        // 新连接 B：重连 → ensure_session dedup 把条目里的 ws_tx 刷新到 B。
-        // B 用独立 conn_id（旧连接 A 是 TEST_CONN_ID），验证事件按通道切到 B。
+        // 标签页 B：重连 → ensure_session dedup 把 B 追加进广播列表（独立 conn_id）。
         let (ws_tx_b, mut ws_rx_b) = mpsc::channel::<serde_json::Value>(16);
         bridge
             .ensure_session("sess-1", &acp_workspace(), ws_tx_b, TEST_CONN_ID + 1)
             .await
-            .expect("reconnect dedup should refresh ws_tx");
+            .expect("reconnect dedup should register second connection");
 
         bridge
             .prompt("sess-1", "hello")
             .await
             .expect("prompt should send");
 
-        // 流式帧（assistant_chunk / tool_call / tool_result / thought / plan）+
-        // done 应全部到达 B。
+        // 回合帧（assistant_chunk / tool_call / tool_result / thought / plan / done）
+        // 应**同时**到达 A 与 B——广播而非「最新连接获胜」劫持。
         for expected in [
             "assistant_chunk",
             "tool_call",
@@ -1529,20 +1540,49 @@ mod tests {
             "plan",
             "done",
         ] {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_b.recv())
+            let ev_a = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_a.recv())
                 .await
-                .expect("timed out waiting for ws event on new channel")
+                .expect("timed out waiting for ws event on tab A")
                 .expect("ws channel closed");
-            assert_eq!(ev["type"], expected, "event on new channel: {ev}");
+            assert_eq!(ev_a["type"], expected, "event on tab A: {ev_a}");
+            let ev_b = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_b.recv())
+                .await
+                .expect("timed out waiting for ws event on tab B")
+                .expect("ws channel closed");
+            assert_eq!(ev_b["type"], expected, "event on tab B: {ev_b}");
         }
-        // 旧连接 A 不应收到任何帧（handshake 后捕获的旧 sender 已不再被使用）。
-        // 注意：swap 后 A 通道所有 sender 都已 drop，recv 会以 Ok(None)（通道关闭）
-        // 或 Err（超时）返回——两者都表示"没有帧"，只有 Ok(Some(..)) 才是泄漏。
+
+        // A 关闭：detach 只移除 A（且把主通道顺延到 B），B 继续收到后续回合帧。
+        bridge.detach_ws_tx("sess-1", TEST_CONN_ID).await;
+
+        bridge
+            .prompt("sess-1", "again")
+            .await
+            .expect("prompt should send");
+
+        for expected in [
+            "assistant_chunk",
+            "tool_call",
+            "tool_result",
+            "assistant_chunk",
+            "plan",
+            "done",
+        ] {
+            let ev_b = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx_b.recv())
+                .await
+                .expect("timed out waiting for ws event on tab B after A detached")
+                .expect("ws channel closed");
+            assert_eq!(
+                ev_b["type"], expected,
+                "event on tab B after A detached: {ev_b}"
+            );
+        }
+        // A 已从广播列表移除：后续帧不再到达（只有 Ok(Some) 才是泄漏）。
         let stale =
             tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv()).await;
         assert!(
             !matches!(stale, Ok(Some(_))),
-            "old channel should receive nothing after reconnect: {stale:?}"
+            "detached tab A should receive nothing: {stale:?}"
         );
     }
 
@@ -1608,6 +1648,84 @@ mod tests {
             assert!(!s.get("sess-1").unwrap().busy);
             assert!(s.get("sess-1").unwrap().cancelled_turns.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_crash_sends_error_frame() {
+        // 回归（H1）：进程崩溃（exited 置位、非用户取消）后 PromptResponse 到达
+        // 时，终态回调必须发 error 帧上报前端——否则前端 running 永久卡死。
+        // 与 test_cancel_suppresses_terminal_frame 相对：取消抑制终态帧，崩溃上报。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        // prompt_permits 控制 mock 何时回 PromptResponse：允许我们在回调触发前
+        // 置 exited=true，精确模拟「进程在回合中途崩溃」。
+        let (permits_tx, permits_rx) = mpsc::channel::<()>(1);
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permits_rx),
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+
+        // 消费流式通知，确保 mock 已进入等待许可（回合 busy、PromptResponse 未回）。
+        for expected in [
+            "assistant_chunk",
+            "tool_call",
+            "tool_result",
+            "assistant_chunk",
+            "plan",
+        ] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for streamed event")
+                .expect("ws channel closed");
+            assert_eq!(ev["type"], expected, "event: {ev}");
+        }
+
+        // 模拟进程崩溃：直接置 exited=true（等价 handle_spawn_exit 的语义——进程
+        // 退出后 ACP 连接关闭，PromptResponse 回调以 Err 触发，`alive` 变 false）。
+        bridge
+            .sessions
+            .lock()
+            .await
+            .get_mut("sess-1")
+            .unwrap()
+            .exited = true;
+
+        // 释放许可，mock 回 PromptResponse → 终态回调触发。
+        permits_tx.send(()).await.expect("permit send");
+
+        // 崩溃（非取消）必须发 error 帧，前端据此解除 running。
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.recv())
+            .await
+            .expect("timed out waiting for error frame")
+            .expect("ws channel closed");
+        assert_eq!(err["type"], "error", "crash must emit error frame: {err}");
+        assert!(
+            err["message"].as_str().unwrap_or("").contains("进程已退出"),
+            "error message should mention process exit: {err}"
+        );
+        // busy 已复位（回合状态不被卡死）。
+        assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
     }
 
     #[tokio::test]

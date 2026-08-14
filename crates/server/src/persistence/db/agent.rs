@@ -388,15 +388,21 @@ impl Database {
     /// rawInput 常是 {}，真正的参数经后续 ToolCallUpdate.rawInput 才到达；若不回填，
     /// 重载后历史卡片无操作内容）。只重写 `tool_calls` JSON 数组中 id 匹配项的
     /// `arguments` 字段，其余字段（name/tool_kind/diffs/locations）保持原样。
+    ///
+    /// `session_id` 必须传入：部分 agent 用顺序 id（如 `call_1`），不同会话会出现
+    /// 相同 tool_call_id，缺 session 约束会把会话 A 的 args 回填到会话 B 的
+    /// tool_calls 行（跨会话历史卡片参数错乱），查询也退化为全表扫描。
     pub async fn agent_update_tool_call_args(
         &self,
+        session_id: &str,
         tool_call_id: &str,
         args: &str,
     ) -> Result<(), sqlx::Error> {
         let rows = sqlx::query_as::<_, (i64, String)>(
             "SELECT rowid, tool_calls FROM agent_messages \
-             WHERE kind = 'tool_calls' AND tool_call_id = ?",
+             WHERE kind = 'tool_calls' AND session_id = ? AND tool_call_id = ?",
         )
+        .bind(session_id)
         .bind(tool_call_id)
         .fetch_all(&self.pool)
         .await?;
@@ -1177,7 +1183,7 @@ mod tests {
         .await
         .unwrap();
 
-        db.agent_update_tool_call_args("c1", "{\"command\":\"echo hi\"}")
+        db.agent_update_tool_call_args("s1", "c1", "{\"command\":\"echo hi\"}")
             .await
             .unwrap();
 
@@ -1193,11 +1199,65 @@ mod tests {
         assert_eq!(parsed[1]["arguments"], "{\"path\":\"a.rs\"}");
 
         // 不存在的 tool_call_id：无错误、无变更
-        db.agent_update_tool_call_args("nope", "x").await.unwrap();
+        db.agent_update_tool_call_args("s1", "nope", "x").await.unwrap();
         let msgs = db.agent_list_messages("s1").await.unwrap();
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(msgs[0].tool_calls.as_deref().unwrap()).unwrap();
         assert_eq!(parsed[0]["arguments"], "{\"command\":\"echo hi\"}");
+    }
+
+    /// 跨会话隔离：另一会话有相同 tool_call_id（顺序 id 如 call_1）时，
+    /// 回填只更新目标会话的行，不污染其它会话的历史卡片。
+    #[tokio::test]
+    async fn test_update_tool_call_args_scoped_to_session() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_create_session("s2", "w1", None, None)
+            .await
+            .unwrap();
+        let calls = serde_json::json!([
+            {"id": "call_1", "name": "Terminal", "arguments": "{}", "tool_kind": "execute"},
+        ]);
+        for (sid, mid) in [("s1", "m1"), ("s2", "m2")] {
+            db.agent_add_message_v2(
+                mid,
+                sid,
+                "assistant",
+                "",
+                Some(&calls.to_string()),
+                Some("call_1"),
+                Some("Terminal"),
+                "tool_calls",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 只回填 s1：s2 的 call_1 必须保持原样（旧实现缺 session 约束会把两行都改掉）
+        db.agent_update_tool_call_args("s1", "call_1", "{\"command\":\"ls\"}")
+            .await
+            .unwrap();
+
+        let s1_msgs = db.agent_list_messages("s1").await.unwrap();
+        let s1_parsed: Vec<serde_json::Value> =
+            serde_json::from_str(s1_msgs[0].tool_calls.as_deref().unwrap()).unwrap();
+        assert_eq!(s1_parsed[0]["arguments"], "{\"command\":\"ls\"}");
+
+        let s2_msgs = db.agent_list_messages("s2").await.unwrap();
+        let s2_parsed: Vec<serde_json::Value> =
+            serde_json::from_str(s2_msgs[0].tool_calls.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            s2_parsed[0]["arguments"], "{}",
+            "other session's tool_calls must not be backfilled"
+        );
     }
 
     /// tool_result upsert 去重：先写中间态空 content，再写终态非空 content →

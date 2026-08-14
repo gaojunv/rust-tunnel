@@ -74,11 +74,24 @@ impl AcpBridge {
             match sessions.get(session_id) {
                 Some(agent) if !agent.exited => {
                     // 已有活跃进程：仅刷新事件通道（多标签页/重连共用同一进程；
-                    // 事件推给最新连接，避免断线后的旧 sender 占位）。同时记录
-                    // 本连接的 conn_id，供 detach 按身份清空。
+                    // 广播列表按 conn_id 替换/追加，流式/终态帧 fan-out 到全部连接，
+                    // 新连接不会把正在运行回合的帧切走）。同时记录本连接的 conn_id，
+                    // 供 detach 按身份清空。
                     if let Some(a) = sessions.get_mut(session_id) {
                         a.ws_tx = Some(ws_tx.clone());
                         a.ws_conn_id = conn_id;
+                        // 多连接广播列表：同 conn_id（重连）替换 tx，新 conn_id
+                        // （新标签页/新窗口）追加——流式帧 fan-out 到全部连接，
+                        // 不再「最新连接获胜」劫持正在运行的回合。
+                        if let Some(slot) = a
+                            .ws_conns
+                            .iter_mut()
+                            .find(|(id, _)| *id == conn_id)
+                        {
+                            slot.1 = ws_tx.clone();
+                        } else {
+                            a.ws_conns.push((conn_id, ws_tx.clone()));
+                        }
                         // 通知审批等待者连接已切换（重连/多标签页）：旧 conn_id
                         // 的 request_permission 等待立即拒绝，新连接才能看到审批卡。
                         a.ws_conn_watch.send_replace(conn_id);
@@ -112,6 +125,7 @@ impl AcpBridge {
                     stdout_tx: Some(stdout_tx),
                     client_id: workspace.client_id.clone(),
                     ws_tx: Some(ws_tx.clone()),
+                    ws_conns: vec![(conn_id, ws_tx.clone())],
                     ws_conn_id: conn_id,
                     ws_conn_watch: watch::channel(conn_id).0,
                     busy: false,
@@ -435,7 +449,7 @@ impl AcpBridge {
                                                 tool_args.get(&id).map(String::as_str);
                                             if meaningful && persisted != Some(a) {
                                                 if let Err(e) = db
-                                                    .agent_update_tool_call_args(&id, a)
+                                                    .agent_update_tool_call_args(&sid, &id, a)
                                                     .await
                                                 {
                                                     tracing::warn!(session_id = %sid,
@@ -447,18 +461,14 @@ impl AcpBridge {
                                     }
                                     _ => {}
                                 }
-                                // 推送：每次事件动态解析当前 WS 通道（评审 Finding 1）——
-                                // handshake 时捕获的 ws_tx 在重连后会过时，ensure_session
-                                // 的 dedup 刷新与 detach_ws_tx 清空只改条目里的 ws_tx，
-                                // 必须读最新值，否则流式帧会推给已断开的旧连接（try_send
-                                // 静默失败，新连接只能看到 done）。断线（None）则跳过推送，
-                                // 不影响已完成的落库。try_send 丢帧（前端消费跟不上）是
-                                // 实时流可容忍的，避免阻塞卡死整个 ACP 连接。
-                                if let Some(ws_tx) = current_ws_tx(&sessions, &sid).await {
-                                    if ws_tx.try_send(frame).is_err() {
-                                        tracing::trace!(session_id = %sid, "acp event dropped (ws channel full/closed)");
-                                    }
-                                }
+                                // 推送：广播到本会话所有连接（H5）——多标签页/多窗口
+                                // 共用同一 ACP 进程，流式帧 fan-out 到全部连接，不再
+                                // 「最新连接获胜」劫持：新打开的标签页不再把正在运行
+                                // 回合的帧切走（原标签页永久卡 running）。连接列表空
+                                // （全部断开）则跳过，不影响已完成的落库。try_send
+                                // 丢帧（单连接消费跟不上）是实时流可容忍的，避免慢
+                                // 消费端阻塞卡死整个 ACP 连接。
+                                broadcast_ws_frame(&sessions, &sid, &frame, false).await;
                             }
                             Ok(())
                         }
@@ -874,6 +884,18 @@ impl AcpBridge {
     /// 兜底杀进程/进程崩溃（exited）后不 drain——排队消息在 ensure_session 重拉新
     /// 进程时迁移，避免往死进程发请求丢失。
     pub async fn prompt(&self, session_id: &str, content: &str) -> Result<(), String> {
+        self.prompt_inner(session_id, content, false).await
+    }
+
+    /// `prompt` 的内部变体。`drain=true` 表示由终态回调的队列 drain 路径调用：
+    /// 此时 `busy` 已被终态回调在同一锁内为下一条重新置位（防 `submit_prompt`
+    /// 抢跑，见终态回调注释），故跳过 `busy` 检查，直接发送。
+    async fn prompt_inner(
+        &self,
+        session_id: &str,
+        content: &str,
+        drain: bool,
+    ) -> Result<(), String> {
         let (connection, acp_session_id, turn_gen) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
@@ -882,7 +904,9 @@ impl AcpBridge {
             if agent.exited {
                 return Err("agent process has exited".into());
             }
-            if agent.busy {
+            // drain 路径：busy 已由终态回调为下一条置位，跳过检查；用户路径：
+            // busy 时防御性报错（submit_prompt 已保证进行中消息排队）。
+            if !drain && agent.busy {
                 return Err("ACP 回合进行中，请等待完成或取消后再发送".into());
             }
             // 先校验再置 busy：校验失败（handshake 未完成等）不污染回合状态。
@@ -922,7 +946,7 @@ impl AcpBridge {
                 // （若会话存活）。取消/杀进程后的终态帧抑制按代数匹配而非全局
                 // 布尔：cancel 后立即重发 prompt 时，新回合的终态回调不会被旧回合
                 // 的取消标记误吞（评审 Finding）。
-                let (ws_tx, next, cancelled, alive) = {
+                let (next, cancelled, alive) = {
                     let mut map = sessions.lock().await;
                     match map.get_mut(&sid) {
                         Some(a) => {
@@ -943,7 +967,16 @@ impl AcpBridge {
                             } else {
                                 None
                             };
-                            (a.ws_tx.clone(), next, cancelled, alive)
+                            // 防抢跑竞态（M1）：队列非空时锁内立即把 busy 重新置
+                            // true——下一条已确定由 drain 路径运行。若不置位，紧跟
+                            // 在后的 submit_prompt 会看到 busy=false 且队列空而抢跑
+                            // 置忙，drain 的 prompt 拿到「回合进行中」错误把这条
+                            // 排队消息静默丢弃。锁内同步完成（无 await），
+                            // submit_prompt 观察不到 busy=false 的空窗。
+                            if next.is_some() {
+                                a.busy = true;
+                            }
+                            (next, cancelled, alive)
                         }
                         // 会话已 kill/回收：条目移除，不再发终态帧。
                         None => return Ok(()),
@@ -959,28 +992,54 @@ impl AcpBridge {
                     spawn_drain_next(bridge.clone(), sid.clone(), next);
                     return Ok(());
                 }
-                // 队列排空：被取消或会话已死的回合不发生产者终态帧（stopped 帧
-                // 已由 WS handler 回发、cancel_fallback 由兜底任务回发，再补
-                // error/done 会造成误导）。
-                if cancelled || !alive {
+                // 队列排空：被取消的回合不发生产者终态帧（stopped 帧已由 WS
+                // handler 回发、cancel_fallback 由兜底任务回发，再补 error/done
+                // 会造成误导）。
+                if cancelled {
                     return Ok(());
                 }
-                let Some(ws_tx) = ws_tx else {
-                    return Ok(()); // 前端已断开：无消费端，终态帧不发
-                };
+                // 进程异常退出（非用户取消）：`alive=false` 由 handle_spawn_exit
+                // 置位，可能是进程崩溃/被杀。此时必须把终态上报前端，否则前端
+                // running 指示永久卡死（与 SpawnedAgent 注释一致：进程自行崩溃时
+                // exited 也置位，仍须把错误上报）。回调以 Err 触发时下方 match
+                // 会发 acp prompt failed；这里统一补一个明确的进程退出提示。
+                if !alive {
+                    broadcast_ws_frame(
+                        &sessions,
+                        &sid,
+                        &serde_json::json!({
+                            "type": "error",
+                            "message": "agent 进程已退出，回合被终止"
+                        }),
+                        true,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                // 终态帧广播到所有连接（低频、必须送达）：前端在时通道很快被
+                // push_task 排空，不会长期阻塞。连接全断开时为空广播（无消费端，
+                // 与旧「无 ws_tx 直接返回」等价）。
                 match result {
                     Ok(_resp) => {
-                        // 终态帧走阻塞发送：低频、必须送达；前端在时通道很快被
-                        // push_task 排空，不会长期阻塞。
-                        let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
+                        broadcast_ws_frame(
+                            &sessions,
+                            &sid,
+                            &serde_json::json!({"type": "done"}),
+                            true,
+                        )
+                        .await;
                     }
                     Err(e) => {
-                        let _ = ws_tx
-                            .send(serde_json::json!({
+                        broadcast_ws_frame(
+                            &sessions,
+                            &sid,
+                            &serde_json::json!({
                                 "type": "error",
                                 "message": format!("acp prompt failed: {e}")
-                            }))
-                            .await;
+                            }),
+                            true,
+                        )
+                        .await;
                     }
                 }
                 Ok(())
@@ -1029,9 +1088,10 @@ impl AcpBridge {
                     content: content.to_string(),
                     refs,
                 });
-                // queued 帧：状态提示，try_send 丢帧可接受（与通知处理器同语义）。
-                if let Some(ws_tx) = a.ws_tx.clone() {
-                    let _ = ws_tx.try_send(serde_json::json!({"type": "queued"}));
+                // queued 帧：状态提示，广播到所有连接（多标签页都看到排队提示）；
+                // try_send 无 await、持锁安全，丢帧可接受（与通知处理器同语义）。
+                for (_, tx) in &a.ws_conns {
+                    let _ = tx.try_send(serde_json::json!({"type": "queued"}));
                 }
                 return Ok(());
             }
@@ -1043,8 +1103,9 @@ impl AcpBridge {
                     content: content.to_string(),
                     refs,
                 });
-                if let Some(ws_tx) = a.ws_tx.clone() {
-                    let _ = ws_tx.try_send(serde_json::json!({"type": "queued"}));
+                // queued 帧：广播到所有连接（同 busy 分支语义）。
+                for (_, tx) in &a.ws_conns {
+                    let _ = tx.try_send(serde_json::json!({"type": "queued"}));
                 }
                 a.pending_prompts
                     .pop_front()
@@ -1109,23 +1170,28 @@ impl AcpBridge {
                 // 超时：二次确认（仍 busy 且本代数仍被取消）才杀进程——避免误杀
                 // 已恢复的回合 / 终态回调已清 busy 的正常路径。
                 _ = tokio::time::sleep(grace) => {
-                    let (should_kill, ws_tx) = {
+                    let should_kill = {
                         let mut map = sessions.lock().await;
                         match map.get_mut(&sid) {
                             Some(a) if a.busy && a.cancelled_turns.contains(&turn_gen) => {
                                 a.busy = false;
                                 a.cancelled_turns.remove(&turn_gen);
-                                (true, a.ws_tx.clone())
+                                true
                             }
-                            _ => (false, None),
+                            _ => false,
                         }
                     };
                     if should_kill {
                         tracing::warn!(session_id = %sid, "ACP agent did not respond to cancel within grace; killing process");
                         spawner.send_agent_cancel(&client_id, &sid).await;
-                        if let Some(ws_tx) = ws_tx {
-                            let _ = ws_tx.try_send(serde_json::json!({"type": "cancel_fallback"}));
-                        }
+                        // cancel_fallback 帧：广播到所有连接（多标签页都解除 running）。
+                        broadcast_ws_frame(
+                            &sessions,
+                            &sid,
+                            &serde_json::json!({"type": "cancel_fallback"}),
+                            false,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1150,6 +1216,9 @@ impl AcpBridge {
         self.spawner.send_agent_cancel(&client_id, session_id).await;
         // 终结会话：一并释放 LLM 回环代理监听端口（防泄漏）。
         self.spawner.stop_llm_proxy(&client_id, session_id).await;
+        // 先 flush 回合缓冲：进行中回合未到终态/工具边界的流式文本落库（与
+        // drop_client_sessions 一致），避免用户已看到的输出在归档/删除后丢库。
+        flush_acp_turn_buffers(&self.db, &self.sessions, session_id).await;
         self.sessions.lock().await.remove(session_id);
         tracing::info!(session_id, "killed ACP session");
     }
@@ -1190,13 +1259,29 @@ impl AcpBridge {
     /// 的通道），旧连接 teardown 若无条件置 None 会把新连接的通道一起清掉
     /// → 后续 tool_result/done 帧全部丢弃、前端 running 卡死。
     pub async fn detach_ws_tx(&self, session_id: &str, my_conn_id: u64) {
-        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
-            if a.ws_conn_id == my_conn_id {
-                a.ws_tx = None;
-                // 通知审批等待者本连接已断开：值变化 → wait_for 唤醒 → 立即拒绝
-                // （若 detach 早于订阅，borrow 已看到 0，同样短路拒绝）。
-                a.ws_conn_watch.send_replace(0);
+        let mut sessions = self.sessions.lock().await;
+        let Some(a) = sessions.get_mut(session_id) else {
+            return;
+        };
+        // 从广播列表移除本连接（无论是否主通道）——流式帧不再发往已断开的连接。
+        a.ws_conns.retain(|(id, _)| *id != my_conn_id);
+        // 本连接是主通道（审批/elicitation 帧通道）：清空并把主通道顺延到剩余
+        // 连接里最近注册的一个（ws_conns 按注册顺序 push，末尾即最近），保持
+        // 审批/表单帧有主通道可发；全部断开则归 0。通知审批等待者连接已切换：
+        // 值变化 → wait_for 唤醒 → 旧连接等待立即拒绝（detach 早于订阅时
+        // borrow 已看到新值，同样短路拒绝）。
+        if a.ws_conn_id == my_conn_id {
+            a.ws_tx = None;
+            a.ws_conn_id = a.ws_conns.last().map(|(id, _)| *id).unwrap_or(0);
+            if let Some(tx) = a
+                .ws_conns
+                .iter()
+                .find(|(id, _)| *id == a.ws_conn_id)
+                .map(|(_, tx)| tx.clone())
+            {
+                a.ws_tx = Some(tx);
             }
+            a.ws_conn_watch.send_replace(a.ws_conn_id);
         }
     }
 
@@ -1600,7 +1685,8 @@ impl AcpBridge {
 /// （发完即返回），spawn 后本函数立即返回，不构成同步递归。
 fn spawn_drain_next(bridge: AcpBridge, sid: String, next: PendingPrompt) {
     tokio::spawn(async move {
-        if let Err(e) = bridge.prompt(&sid, &next.content).await {
+        // drain=true：跳过 busy 检查——busy 已由终态回调为下一条锁内置位。
+        if let Err(e) = bridge.prompt_inner(&sid, &next.content, true).await {
             tracing::warn!(session_id = %sid, "drain queued prompt failed: {e}");
         }
     });
@@ -1640,6 +1726,39 @@ async fn current_ws_channel(
         agent.ws_conn_id,
         agent.ws_conn_watch.subscribe(),
     ))
+}
+/// 把帧广播到本会话**所有** WS 连接（多标签页/多窗口 fan-out）。遍历 `ws_conns`
+/// 逐个发送：某连接断开/通道满只丢弃该连接，不影响其余——根治「最新连接获胜」
+/// 劫持（H5）：被动打开的新标签页不再把正在运行回合的流式帧/终态帧切走，原标签页
+/// 永久卡 running。审批/elicitation 请求帧不走这里（仍只发主通道 `ws_tx`，见
+/// [`current_ws_channel`]——多连接下审批卡只在主连接展示，响应按 request_id
+/// 全局可达，任意连接可答）。
+///
+/// 顺带刷新 last_activity（同 [`current_ws_tx`] 语义：长回合无 stdout 不被 idle
+/// reaper 误回收）。`must_deliver` 用于终态帧（done/error）：低频、必须送达，
+/// 走阻塞发送（前端在时通道很快被 push_task 排空，不会长期阻塞）；流式/状态帧
+/// 用 try_send（实时流丢帧可容忍，避免慢消费端阻塞整个 ACP 连接任务）。
+async fn broadcast_ws_frame(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+    frame: &serde_json::Value,
+    must_deliver: bool,
+) {
+    let conns: Vec<mpsc::Sender<serde_json::Value>> = {
+        let mut map = sessions.lock().await;
+        let Some(a) = map.get_mut(sid) else {
+            return;
+        };
+        a.last_activity = std::time::Instant::now();
+        a.ws_conns.iter().map(|(_, tx)| tx.clone()).collect()
+    };
+    for tx in conns {
+        if must_deliver {
+            let _ = tx.send(frame.clone()).await;
+        } else if tx.try_send(frame.clone()).is_err() {
+            tracing::trace!(session_id = %sid, "acp event dropped (ws channel full/closed)");
+        }
+    }
 }
 /// 审批等待 + 断线/重连即时拒绝（select 逻辑独立成函数便于单元测试）。
 ///

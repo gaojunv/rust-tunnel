@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use super::store::flush_acp_turn_buffers;
 use super::{AcpBridge, SpawnedAgent};
 
 /// 空闲 30 分钟杀进程（重挂 ACP 连接由客户端 spawn manager 处理）。
@@ -23,6 +24,7 @@ impl AcpBridge {
     pub(super) fn start_idle_reaper(&self) {
         let sessions = self.sessions.clone();
         let spawner = self.spawner.clone();
+        let db = self.db.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REAP_INTERVAL).await;
@@ -36,21 +38,26 @@ impl AcpBridge {
                 for id in stale {
                     // 二次锁内复查：收集 stale 到移除之间条目可能被新活动刷新
                     // （prompt/cancel/stdio），此时不应误删。
+                    let still_stale = {
+                        let guard = sessions.lock().await;
+                        guard
+                            .get(&id)
+                            .is_some_and(|a| a.last_activity.elapsed() > IDLE_TIMEOUT)
+                    };
+                    if !still_stale {
+                        continue;
+                    }
+                    // 锁外 flush 回合缓冲：进行中回合未到终态的流式文本落库
+                    // （与 drop_client_sessions/kill 一致），避免用户已看到的输出
+                    // 在空闲回收后丢库。flush 内部会再锁 sessions，必须在上面的
+                    // 复查锁释放后调用（tokio::sync::Mutex 不可重入）。
+                    flush_acp_turn_buffers(&db, &sessions, &id).await;
+                    // 移除条目并取 client_id（真杀进程锁外发送）。
                     let client_id = {
                         let mut guard = sessions.lock().await;
-                        let still_stale = guard
-                            .get(&id)
-                            .is_some_and(|a| a.last_activity.elapsed() > IDLE_TIMEOUT);
-                        if still_stale {
-                            let client_id = guard.get(&id).map(|a| a.client_id.clone());
-                            guard.remove(&id);
-                            tracing::info!(session_id = %id, "evicted idle ACP session");
-                            client_id
-                        } else {
-                            None
-                        }
+                        guard.remove(&id).map(|a| a.client_id)
                     };
-                    // 真杀进程（锁外发送，避免持锁 await 控制通道）。
+                    tracing::info!(session_id = %id, "evicted idle ACP session");
                     if let Some(client_id) = client_id {
                         spawner.send_agent_cancel(&client_id, &id).await;
                     }
