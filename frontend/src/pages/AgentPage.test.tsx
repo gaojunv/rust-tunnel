@@ -93,6 +93,7 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../api/agentModels', () => ({
   listAgentSelectableModels: vi.fn().mockResolvedValue({ models: [], groups: [] }),
+  resolveWorkspaceModelRef: vi.fn(() => ''),
 }));
 
 // 通知上下文替身：AgentPage 仅上报 activeSessionId，断言不涉及具体行为

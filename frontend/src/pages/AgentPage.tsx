@@ -9,7 +9,7 @@ import {
   createAgentSession,
   getAgentDefaultModel,
 } from '../api/client';
-import { listAgentSelectableModels } from '../api/agentModels';
+import { listAgentSelectableModels, resolveWorkspaceModelRef } from '../api/agentModels';
 import type { AgentWorkspace, AgentSession } from '../types';
 import ChatStream from '../components/agent/ChatStream';
 import WorkspaceBar from '../components/agent/WorkspaceBar';
@@ -149,11 +149,20 @@ export default function AgentPage() {
     }
   }, [workspaceId, tabs]);
 
-  // 会话模型派生：tab 局部覆盖优先；否则按「会话模型 → 全局默认 → 第一个可用模型」
-  // 的 falsy 链回退（?? 与 || 混合处加括号，避免语法错误/歧义）。
+  // 会话模型派生：tab 局部覆盖优先；否则按「会话模型 → workspace 默认 →
+  // 全局默认 → 第一个可用模型」的 falsy 链回退（?? 与 || 混合处加括号，避免
+  // 语法错误/歧义）。workspace 层（M11）：后端按 session→workspace→全局 解析，
+  // 前端链此前缺 workspace 层，会把全局默认/首个可用误当 workspace 默认展示、
+  // 并在新建会话时静默覆盖 workspace 级默认模型。
+  const currentWorkspace = workspaces?.find((w) => w.id === workspaceId);
+  const workspaceModel = useMemo(
+    () => resolveWorkspaceModelRef(currentWorkspace?.llm_model_id, selectableModels),
+    [currentWorkspace?.llm_model_id, selectableModels],
+  );
   const modelFor = (sid: string) =>
     modelOverrides[sid] ??
     (sessions?.find((s) => s.id === sid)?.model?.trim() ||
+      workspaceModel ||
       defaultModel?.trim() ||
       selectableModels?.models[0]?.id ||
       selectableModels?.groups[0]?.id ||
@@ -168,7 +177,12 @@ export default function AgentPage() {
 
   const handleNewSession = async () => {
     if (!workspaceId) return;
-    const s = await createAgentSession(workspaceId, undefined, modelFor(tabs.active) || undefined);
+    // 仅在用户显式选择过模型（tab 记忆）时继承；否则不落库 model，交由后端按
+    // session→workspace→全局 链解析（M11）——把前端推导值（workspace 默认/
+    // 全局默认/首个可用）持久化为 session.model 会静默覆盖 workspace 级默认模型，
+    // 且 workspace 默认模型后续变更时旧会话无法跟随。
+    const explicit = modelOverrides[tabs.active];
+    const s = await createAgentSession(workspaceId, undefined, explicit || undefined);
     // 同步写入共享缓存：让列表/标签栏立即可见新会话（无需等 invalidate）
     queryClient.setQueryData<AgentSession[]>(['agent-sessions', workspaceId], (old) => [
       s,
