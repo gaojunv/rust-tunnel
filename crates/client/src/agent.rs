@@ -474,6 +474,12 @@ pub async fn handle_exec_request(
             .await
         }
         AgentCommand::GitPush => git_exec(&["push"], root_path, docker_container, timeout).await,
+        AgentCommand::GitExec { args } => {
+            // 通用 git：参数已由服务端 git_plan 白名单校验（fail-closed），
+            // 这里按 arg 向量直跑，host/docker 两模式由 git_exec 统一处理。
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            git_exec(&refs, root_path, docker_container, timeout).await
+        }
         AgentCommand::Search {
             pattern,
             path,
@@ -1117,6 +1123,84 @@ mod tests {
             }
             other => panic!("expected FileContent, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_git_exec_generic_args() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        // GitExec 通用命令：host 模式按 arg 向量直跑
+        let result = handle_exec_request(
+            &AgentCommand::GitExec {
+                args: vec!["status".into(), "--short".into()],
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            AgentResult::FileContent { content } => assert!(content.contains("a.txt")),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+
+        // stage → commit → log（全程 GitExec；add 路径顺带覆盖）
+        let staged = handle_exec_request(
+            &AgentCommand::GitExec {
+                args: vec!["add".into(), "--".into(), "a.txt".into()],
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(staged, AgentResult::FileContent { .. }));
+        let committed = handle_exec_request(
+            &AgentCommand::GitExec {
+                args: vec!["commit".into(), "-m".into(), "add a".into()],
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(committed, AgentResult::FileContent { .. }));
+        let log = handle_exec_request(
+            &AgentCommand::GitExec {
+                args: vec!["log".into(), "-n".into(), "1".into()],
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        match log {
+            AgentResult::FileContent { content } => assert!(content.contains("add a")),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_exec_error_surfaces_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        // 非 git 仓库：git 命令失败，错误经 stderr 归一为 Error
+        let result = handle_exec_request(
+            &AgentCommand::GitExec {
+                args: vec!["status".into()],
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, AgentResult::Error { .. }));
     }
 
     #[tokio::test]

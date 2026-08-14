@@ -127,3 +127,75 @@ pub struct PutFsFileRequest {
     /// 前端确认后重发携带：跳过审批检查（用户已在面板确认）。
     pub approved: Option<bool>,
 }
+
+/// `GET /api/agent/workspaces/:id/git/log` 的 query 参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct GitLogQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/agent/workspaces/:id/git/diff` 的 query 参数（`cached=true` 取 staged diff）。
+#[derive(Debug, Default, Deserialize)]
+pub struct GitDiffQuery {
+    pub path: Option<String>,
+    #[serde(default)]
+    pub cached: Option<bool>,
+}
+
+/// `GET /api/agent/workspaces/:id/git/show` 的 query 参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct GitShowQuery {
+    pub rev: Option<String>,
+}
+
+/// 无参数写操作（pull/push）的请求体：允许空 body / `{}` / 仅 `approved`。
+#[derive(Debug, Default, Deserialize)]
+pub struct GitApprovedBody {
+    #[serde(default)]
+    pub approved: Option<bool>,
+}
+
+/// 写操作统一审批标记：`approved: true` 表示用户已在面板确认后重发。
+/// 面板所有 Git 写端点的请求体都携带该字段。
+macro_rules! git_write_body {
+    ($name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
+        #[derive(Debug, Deserialize)]
+        pub struct $name {
+            $(pub $field: $ty,)*
+            #[serde(default)]
+            pub approved: Option<bool>,
+        }
+    };
+}
+
+git_write_body!(GitStageRequest {
+    paths: Vec<String>,
+});
+git_write_body!(GitUnstageRequest {
+    paths: Vec<String>,
+});
+git_write_body!(GitCommitRequest {
+    message: String,
+});
+git_write_body!(GitCheckoutRequest {
+    branch: String,
+    create: Option<bool>,
+});
+git_write_body!(GitBranchDeleteRequest {
+    branch: String,
+    force: Option<bool>,
+});
+git_write_body!(GitRevertRequest {
+    rev: String,
+});
+git_write_body!(GitResetRequest {
+    rev: Option<String>,
+    mode: String,
+});
+git_write_body!(GitStashPushRequest {
+    message: Option<String>,
+});
+git_write_body!(GitStashIndexRequest {
+    index: usize,
+});

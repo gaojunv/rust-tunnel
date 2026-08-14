@@ -252,6 +252,18 @@ pub(crate) fn client_supports_cancel(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_CANCEL_CLIENT_VERSION)
 }
 
+/// 首个支持 `AgentCommand::GitExec`（通用 git 参数）的客户端版本。
+/// 面板 Git 功能与新增 git_* LLM 工具（stage/log/branch/checkout 等）都依赖它。
+const MIN_GIT_EXEC_CLIENT_VERSION: (u64, u64, u64) = (0, 5, 0);
+
+/// 客户端版本是否支持通用 git 命令（GitExec）；缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_git_exec(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_GIT_EXEC_CLIENT_VERSION)
+}
+
 /// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
 const TOOL_RESULT_MAX_LINES: usize = 300;
 const TOOL_RESULT_MAX_BYTES: usize = 30 * 1024;
@@ -364,25 +376,33 @@ async fn handle_tool_calls(
                         continue;
                     }
                 }
-                // 老客户端不认识 Search/PatchFile 变体：bincode 按索引反序列化，
-                // 未知索引直接导致控制连接断开。版本不足时在服务端短路为错误喂回模型。
-                let needs_new_client = matches!(
-                    command,
-                    AgentCommand::Search { .. } | AgentCommand::PatchFile { .. }
-                );
-                if needs_new_client {
+                // 老客户端不认识 Search/PatchFile/GitExec 变体：bincode 按索引
+                // 反序列化，未知索引直接导致控制连接断开。版本不足时在服务端短路
+                // 为错误喂回模型（不触碰隧道）。各变体的最低版本见对应常量。
+                let gated = match &command {
+                    AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => Some((
+                        MIN_SEARCH_PATCH_CLIENT_VERSION,
+                        client_supports_search_patch as fn(Option<&str>) -> bool,
+                    )),
+                    AgentCommand::GitExec { .. } => Some((
+                        MIN_GIT_EXEC_CLIENT_VERSION,
+                        client_supports_git_exec as fn(Option<&str>) -> bool,
+                    )),
+                    _ => None,
+                };
+                if let Some((min_version, supports)) = gated {
                     let version = agent
                         .registry
                         .get(&rt.client_id)
                         .await
                         .and_then(|e| e.client_version.clone());
-                    if !client_supports_search_patch(version.as_deref()) {
+                    if !supports(version.as_deref()) {
                         let text = format!(
                             "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
                             call.name,
-                            MIN_SEARCH_PATCH_CLIENT_VERSION.0,
-                            MIN_SEARCH_PATCH_CLIENT_VERSION.1,
-                            MIN_SEARCH_PATCH_CLIENT_VERSION.2,
+                            min_version.0,
+                            min_version.1,
+                            min_version.2,
                         );
                         let _ = ws_tx
                             .send(serde_json::json!({
@@ -988,6 +1008,20 @@ mod tests {
         assert!(!client_supports_cancel(Some("0.3.0+agent")));
         assert!(!client_supports_cancel(None));
         assert!(!client_supports_cancel(Some("garbage")));
+    }
+
+    #[test]
+    fn test_client_supports_git_exec() {
+        assert!(client_supports_git_exec(Some("0.5.0")));
+        assert!(client_supports_git_exec(Some("v0.5.1")));
+        assert!(client_supports_git_exec(Some("1.0.0")));
+        assert!(!client_supports_git_exec(Some("0.4.9")));
+        assert!(!client_supports_git_exec(Some("0.4.0+agent")));
+        assert!(!client_supports_git_exec(None));
+        assert!(!client_supports_git_exec(Some("garbage")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
+        assert!(client_supports_git_exec(Some("0.5.0+agent")));
+        assert!(!client_supports_git_exec(Some("0.4.0")));
     }
 
     #[test]

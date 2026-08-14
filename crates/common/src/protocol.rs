@@ -71,6 +71,11 @@ pub enum AgentCommand {
         old_string: String,
         new_string: String,
     },
+    /// 通用 git 命令：参数已由服务端 `git_plan::plan` 白名单校验（未知子命令/
+    /// flag fail-closed，pathspec 防注入），客户端按 arg 向量直接执行（host/docker）。
+    GitExec {
+        args: Vec<String>,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -846,6 +851,9 @@ mod tests {
                 message: "fix bug".into(),
             },
             AgentCommand::GitPush,
+            AgentCommand::GitExec {
+                args: vec!["log".into(), "-n".into(), "5".into()],
+            },
         ];
         for command in commands {
             let msg = ControlMessage::AgentExecRequest {
@@ -858,6 +866,23 @@ mod tests {
             let bytes = msg.serialize().unwrap();
             let decoded: ControlMessage = bincode::deserialize(&bytes[4..]).unwrap();
             assert!(matches!(decoded, ControlMessage::AgentExecRequest { .. }));
+        }
+    }
+
+    #[test]
+    fn test_agent_command_git_exec_roundtrip() {
+        // GitExec 是新变体：验证 bincode round-trip（arg 向量原样保留）。
+        let args = vec![
+            "push".to_string(),
+            "--force-with-lease".to_string(),
+            "origin".to_string(),
+            "main".to_string(),
+        ];
+        let bytes = bincode::serialize(&AgentCommand::GitExec { args: args.clone() }).unwrap();
+        let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+        match back {
+            AgentCommand::GitExec { args: got } => assert_eq!(got, args),
+            other => panic!("expected GitExec, got {other:?}"),
         }
     }
 
