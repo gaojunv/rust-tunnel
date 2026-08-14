@@ -330,10 +330,13 @@ export default function GitPanel({
   });
 
   // 仅回退路径需要消息：主 API 不可用（如客户端离线 503）时才拉取。
-  // 分页上限传 500 尽量覆盖 git_status 结果；与 ChatStream 共享 queryKey，
-  // 回合完成 invalidate 后自动刷新。
+  // 分页上限传 500 尽量覆盖 git_status 结果。注意：不能用 ['agent-messages',
+  // sessionId] 裸 key——ChatStream 的同一 key 拉的是默认 200 条、has_more 语义
+  // 不同，两者共享缓存槽会互相覆盖、破坏「加载更早」状态。用带子键的独立 key：
+  // 缓存互相隔离，但 ChatStream done/重连的 ['agent-messages', sessionId] 前缀
+  // invalidate 仍能命中并联动刷新。
   const messagesQuery = useQuery<AgentMessagesPage>({
-    queryKey: ['agent-messages', sessionId],
+    queryKey: ['agent-messages', sessionId, 'git-fallback'],
     queryFn: () => listAgentMessages(sessionId, { limit: 500 }),
     enabled: statusQuery.isError,
     retry: false,

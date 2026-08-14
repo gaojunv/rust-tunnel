@@ -483,7 +483,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         setDisconnected(false);
         if (needHistoryReload) {
           needHistoryReload = false;
-          // 允许历史 effect 重新装载（与断线期间服务端已落库的内容对齐）
+          // 允许历史 effect 重新装载（与断线期间服务端已落库的内容对齐）。
+          // 必须置 reconcileRef：history effect 的「实时保护」守卫在聊天区非空时
+          // 会早退并把 loadedRef 重新置 true，仅置 loadedRef=false 会被拦截——
+          // 断线时聊天区几乎必然非空（历史 + 用户消息 + 连接中断提示），否则
+          // 断线期间服务端跑完落库的内容永不补齐，需整页刷新。reconcileRef 与
+          // done 对账重载同路径：放行覆盖并跳过 running 兜底 heuristic。
+          reconcileRef.current = true;
           loadedRef.current = false;
           void queryClient.invalidateQueries({ queryKey: ['agent-messages', sessionId] });
         }
