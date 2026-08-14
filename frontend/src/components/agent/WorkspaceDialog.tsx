@@ -115,6 +115,11 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
   const [overrideRows, setOverrideRows] = useState<OverrideRow[]>(
     parseOverrides(editing?.agent_config_overrides),
   );
+  // GitHub Actions 面板：owner/repo 可手填（探测失败的兜底）；token 密码框——
+  // 已配置时不回填明文，placeholder 提示「留空保持不变」，且本版本不支持清空。
+  const [githubOwner, setGithubOwner] = useState(editing?.github_owner ?? '');
+  const [githubRepo, setGithubRepo] = useState(editing?.github_repo ?? '');
+  const [githubToken, setGithubToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // provider_id → 供应商名（模型下拉展示「模型名（供应商名）」）
@@ -158,6 +163,10 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           ...(overridesPayload() !== undefined
             ? { agent_config_overrides: overridesPayload() }
             : {}),
+          // GitHub 字段：owner/repo 空串=保持不变（后端 COALESCE）；token 仅非空时更新
+          github_owner: githubOwner.trim(),
+          github_repo: githubRepo.trim(),
+          ...(githubToken.trim() !== '' ? { github_token: githubToken.trim() } : {}),
         });
         w = {
           ...editing,
@@ -169,6 +178,11 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_path: agentPath.trim() !== '' ? agentPath.trim() : undefined,
           llm_model_id: llmModelId !== '' ? llmModelId : undefined,
           agent_config_overrides: overridesPayload(),
+          github_owner: githubOwner.trim() !== '' ? githubOwner.trim() : editing.github_owner,
+          github_repo: githubRepo.trim() !== '' ? githubRepo.trim() : editing.github_repo,
+          github_token_set: githubToken.trim() !== ''
+            ? true
+            : editing.github_token_set,
         };
       } else {
         w = createdRef.current ?? (await createAgentWorkspace({
@@ -184,6 +198,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           ...(overridesPayload() !== undefined
             ? { agent_config_overrides: overridesPayload() }
             : {}),
+          github_owner: githubOwner.trim(),
+          github_repo: githubRepo.trim(),
+          ...(githubToken.trim() !== '' ? { github_token: githubToken.trim() } : {}),
         }));
         createdRef.current = w;
         // 后端 create 不含 system_prompt/approval_mode 字段（仅在 PUT 支持），
@@ -227,12 +244,15 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
         {/* Tabs 触发器本身带 aria-label（可访问名），与内容 Label 的文本区分，
             避免与 Label>控件 组合后 testing-library 精确匹配出现歧义。 */}
         <Tabs defaultValue="basic" className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="basic" aria-label={t('agent.tabBasic')}>
               {t('agent.tabBasic')}
             </TabsTrigger>
             <TabsTrigger value="engine" aria-label={t('agent.tabEngine')}>
               {t('agent.tabEngine')}
+            </TabsTrigger>
+            <TabsTrigger value="github" aria-label={t('agent.tabGithub')}>
+              {t('agent.tabGithub')}
             </TabsTrigger>
             <TabsTrigger value="advanced" aria-label={t('agent.tabAdvanced')}>
               {t('agent.tabAdvanced')}
@@ -435,6 +455,41 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                 </div>
               </>
             )}
+          </TabsContent>
+
+          {/* GitHub：owner / repo / token——AI 工作台 GitHub Actions 面板的仓库定位与凭据 */}
+          <TabsContent value="github" className="mt-4 space-y-4">
+            <div className="space-y-2">
+              <Label>{t('agent.githubOwner')}</Label>
+              <Input
+                value={githubOwner}
+                onChange={(e) => setGithubOwner(e.target.value)}
+                placeholder={t('agent.githubOwnerPlaceholder')}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>{t('agent.githubRepo')}</Label>
+              <Input
+                value={githubRepo}
+                onChange={(e) => setGithubRepo(e.target.value)}
+                placeholder={t('agent.githubRepoPlaceholder')}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>{t('agent.githubToken')}</Label>
+              <Input
+                type="password"
+                value={githubToken}
+                onChange={(e) => setGithubToken(e.target.value)}
+                placeholder={
+                  editing?.github_token_set
+                    ? t('agent.githubTokenPlaceholder')
+                    : t('agent.githubTokenPlaceholderEmpty')
+                }
+                autoComplete="new-password"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">{t('agent.githubHint')}</p>
           </TabsContent>
 
           {/* 高级：审批模式 / 系统提示 */}
