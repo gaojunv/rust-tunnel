@@ -56,6 +56,12 @@ const TURN_ACTIVITY_TYPES = new Set([
 export const STREAM_FLUSH_MS = 50;
 /** 分页「加载更早」每页条数（与后端默认 limit 一致）。 */
 const EARLIER_PAGE_SIZE = 200;
+/** 连接假死判定阈值：服务端应用层心跳每 25s 一帧，连续 3 个心跳周期（75s）
+ *  无任何帧即认为连接被中间设备静默掐断（半开 TCP 不触发 onclose），由看门狗
+ *  主动 close 走既有 onclose 重连路径。 */
+const HEARTBEAT_TIMEOUT_MS = 75_000;
+/** 看门狗扫描周期：远小于心跳超时，保证假死判定延迟在可接受范围。 */
+const WATCHDOG_INTERVAL_MS = 30_000;
 
 /** 历史查询数据归一化：兼容 `{ messages, has_more }`（新 API）与裸数组
  * （旧缓存 / 测试替身）。取消息行数组。 */
@@ -119,6 +125,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // 最近一帧到达时间（含应用层心跳）：看门狗据此判定连接假死（半开 TCP）。
+  // 用组件级 ref——重连的 connect() 闭包都要读写它；effect 内局部变量会在 effect
+  // 重建（语言切换等）时丢基线，新连接 onopen 虽重置，但旧连接存活期间重建会
+  // 让看门狗误判。组件级 ref 在组件生命周期内恒定。
+  const lastFrameAtRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 消息区滚动容器 ref：虚拟化的 getScrollElement 目标。
@@ -482,6 +493,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     let attempts = 0;
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // 连接假死看门狗：中间设备静默掐断 TCP 时 onclose 不触发，浏览器重连逻辑
+    // 依赖 onclose 永远不会执行。每 WATCHDOG_INTERVAL_MS 检查最近一帧，超过
+    // HEARTBEAT_TIMEOUT_MS 无帧即主动 close——走既有 onclose 重连 + needHistoryReload
+    // 历史对账路径（半开连接经服务端心跳探活确认已死，重连后按 DB 对齐）。
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
     // 断线且重连成功时需要重载历史：服务端在断线期间可能已把回合跑完并落库
     let needHistoryReload = false;
     // ref 在组件生命周期内恒定，复制到局部变量供 handler/cleanup 使用（exhaustive-deps）
@@ -494,6 +510,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       ws.onopen = () => {
         attempts = 0;
         setDisconnected(false);
+        // 新连接给足一个完整心跳窗口：onopen 即重置看门狗基线（此后每帧刷新）
+        lastFrameAtRef.current = Date.now();
         if (needHistoryReload) {
           needHistoryReload = false;
           // 允许历史 effect 重新装载（与断线期间服务端已落库的内容对齐）。
@@ -509,6 +527,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       };
 
       ws.onmessage = (ev) => {
+      // 任意帧（含应用层心跳）到达都刷新看门狗基线：连接活着即不被误判假死
+      lastFrameAtRef.current = Date.now();
       let msg: AgentWsEvent;
       try {
         msg = JSON.parse(ev.data) as AgentWsEvent;
@@ -520,7 +540,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       if (runningRef.current && TURN_ACTIVITY_TYPES.has(msg.type)) {
         armRunningTimeout();
       }
-      if (msg.type === 'assistant_chunk') {
+      if (msg.type === 'heartbeat') {
+        // 应用层心跳：不渲染；连接活着的回合静默是合法的（长工具执行无输出），
+        // 重置 running 不活动兜底——进程真卡死由服务端 idle reaper/exec 超时
+        // 负责终态帧，前端不再对长任务误报「响应超时」。
+        if (runningRef.current) armRunningTimeout();
+      } else if (msg.type === 'assistant_chunk') {
         if (msg.content) {
           const parent = msg.parent_tool_call_id;
           const nextKind = msg.thought ? 'thought' : 'assistant';
@@ -897,8 +922,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     };
 
     connect();
+    watchdogTimer = globalThis.setInterval(() => {
+      const w = wsRef.current;
+      if (!w || w.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastFrameAtRef.current > HEARTBEAT_TIMEOUT_MS) {
+        // 连接假死（半开 TCP 不触发 onclose）：主动 close 走既有 onclose 重连 +
+        // needHistoryReload 历史对账路径
+        w.close();
+      }
+    }, WATCHDOG_INTERVAL_MS);
     return () => {
       closedByCleanup = true;
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

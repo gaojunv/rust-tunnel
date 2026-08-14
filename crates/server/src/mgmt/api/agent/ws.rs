@@ -17,6 +17,19 @@ use crate::mgmt::api::ApiState;
 
 use super::dto::{AgentWsQuery, NotificationsWsQuery, TerminalWsQuery};
 
+/// 应用层心跳间隔：浏览器 JS 观测不到协议层 Ping 帧，探活必须用文本帧；
+/// 心跳流量同时保活 NAT/代理的空闲映射（典型空闲超时 60s+，25s 足够密集）。
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// 应用层心跳帧：前端看门狗以「任意帧到达」判定连接存活（含本帧）。
+fn heartbeat_frame() -> serde_json::Value {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    serde_json::json!({"type": "heartbeat", "ts": ts})
+}
+
 /// GET /api/agent/ws?session_id=xxx&token=<jwt>
 /// Public route; JWT validated from query param (browser WebSocket can't set headers).
 pub async fn agent_ws(
@@ -62,13 +75,30 @@ async fn handle_notifications_socket(state: ApiState, socket: WebSocket) {
         return;
     };
     let mut rx = agent.subscribe_notifications();
-    while let Ok(n) = rx.recv().await {
-        let text = match serde_json::to_string(&n) {
-            Ok(t) => t,
-            Err(_) => continue, // 序列化失败理论上不可达，跳过不中断
-        };
-        if ws_sink.send(Message::Text(text)).await.is_err() {
-            return; // 对端断开
+    // 心跳分支：通知连接同样可能长空闲被中间设备掐断（无事件时 recv 挂起、
+    // 无任何出站帧），按 HEARTBEAT_INTERVAL 下发文本心跳帧探活，send 失败即退出。
+    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            n = rx.recv() => {
+                // 广播 sender 关闭/Lagged 时 recv 返回 Err：保持原 `while let Ok`
+                // 的退出语义（任何 Err 即 return），不顺手改。
+                let Ok(n) = n else { return };
+                let text = match serde_json::to_string(&n) {
+                    Ok(t) => t,
+                    Err(_) => continue, // 序列化失败理论上不可达，跳过不中断
+                };
+                if ws_sink.send(Message::Text(text)).await.is_err() {
+                    return; // 对端断开
+                }
+            }
+            _ = hb.tick() => {
+                let text = serde_json::to_string(&heartbeat_frame()).unwrap_or_default();
+                if ws_sink.send(Message::Text(text)).await.is_err() {
+                    return; // 对端断开
+                }
+            }
         }
     }
 }
@@ -509,6 +539,12 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     // detach_ws_tx 按它判断「是否仍是我注册的通道」。刷新竞态下旧连接 close
     // 晚于新连接注册，若无身份判断会误清新连接的通道（tool_result/done 全丢）。
     let conn_id = rand::random::<u64>();
+    // 死连接传导：push_task 判定 sink 死亡（发送失败/超时）后 notify 一次，
+    // 主循环（外层 select / 内层 turn select）任一正在等待的 `notified()` 立即
+    // 完成 → teardown。notify_one 无等待者时 permit 留存，后到的 notified() 也会
+    // 立刻返回，正覆盖「push_task 先死、主循环后到」的时序。
+    let dead_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let dead_notify_clone = dead_notify.clone();
 
     // 推送任务：event_rx → WebSocket。对端断开导致 send 失败时不再 break，而是
     // 继续 drain event_rx——runner 内部仍是阻塞式 send().await，但只要接收端持续
@@ -539,27 +575,53 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
     let notify_session_id = session_id.clone();
     let push_task = tokio::spawn(async move {
         let mut sink_alive = true;
-        while let Some(ev) = event_rx.recv().await {
-            if let Some(ws_id) = &workspace_id {
-                if let Some(agent) = notify_agent.as_ref() {
-                    if let Some(n) =
-                        crate::agent::notify::notification_from_frame(&ev, &notify_session_id, ws_id)
-                    {
-                        agent.notify(n);
+        // 心跳与事件合流：长任务期间 WS 长时间无帧，中间设备会静默掐断空闲 TCP，
+        // 服务端永远发现不了半开死连接。以文本心跳帧（HEARTBEAT_INTERVAL 节拍）
+        // 制造持续出站流量——send 失败/超时即判定 sink 死亡并通知主循环 teardown。
+        let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
+        hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                ev = event_rx.recv() => {
+                    let Some(ev) = ev else { break }; // 所有发送方 drop，连接收尾
+                    if let Some(ws_id) = &workspace_id {
+                        if let Some(agent) = notify_agent.as_ref() {
+                            if let Some(n) =
+                                crate::agent::notify::notification_from_frame(&ev, &notify_session_id, ws_id)
+                            {
+                                agent.notify(n);
+                            }
+                        }
+                    }
+                    let text = serde_json::to_string(&ev).unwrap_or_default();
+                    if !sink_alive {
+                        continue;
+                    }
+                    let send_result =
+                        tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(text))).await;
+                    match send_result {
+                        Ok(Ok(())) => {} // 发送成功
+                        Ok(Err(_)) | Err(_) => {
+                            // 发送失败或超时：标记 sink 死亡，后续事件继续 drain 但不再发
+                            sink_alive = false;
+                            // sink 已死，主循环应立即 teardown，不必等下一次心跳。
+                            dead_notify_clone.notify_one();
+                        }
                     }
                 }
-            }
-            let text = serde_json::to_string(&ev).unwrap_or_default();
-            if !sink_alive {
-                continue;
-            }
-            let send_result =
-                tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(text))).await;
-            match send_result {
-                Ok(Ok(())) => {} // 发送成功
-                Ok(Err(_)) | Err(_) => {
-                    // 发送失败或超时：标记 sink 死亡，后续事件继续 drain 但不再发
-                    sink_alive = false;
+                _ = hb.tick() => {
+                    // 心跳帧不经过 notification_from_frame 翻译（直接发送）。
+                    // sink 已判定死亡时只 drain 不发，心跳分支同样跳过。
+                    if !sink_alive {
+                        continue;
+                    }
+                    let text = serde_json::to_string(&heartbeat_frame()).unwrap_or_default();
+                    let send_result =
+                        tokio::time::timeout(WS_SEND_TIMEOUT, ws_sink.send(Message::Text(text))).await;
+                    if matches!(send_result, Ok(Err(_)) | Err(_)) {
+                        sink_alive = false;
+                        dead_notify_clone.notify_one(); // 见上：主循环立即 teardown
+                    }
                 }
             }
         }
@@ -626,9 +688,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         let (content, refs) = if let Some(p) = pending.take() {
             p
         } else {
-            let msg = match ws_stream.next().await {
-                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
-                Some(Ok(m)) => m,
+            let msg = tokio::select! {
+                msg = ws_stream.next() => match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(m)) => m,
+                },
+                // push_task 判定 sink 死亡（半开连接/慢客户端）：无需等对端 close，
+                // 直接 teardown——释放会话锁、detach ACP ws_tx、abort push_task。
+                _ = dead_notify.notified() => break,
             };
             match parse_ws_frame(msg) {
                 WsFrame::UserMessage { content, refs } => (content, refs),
@@ -988,6 +1055,13 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             WsFrame::Other => {}
                         },
                     },
+                    // 死连接：与 None/Err/Close 同款断连处理（turn 内先下发 exec
+                    // 取消信号再丢弃 turn future），区别是触发方为 push_task 的
+                    // 心跳判定而非对端帧——半开连接不会发 close，只能靠出站探活。
+                    _ = dead_notify.notified() => {
+                        send_cancel_to_client(&agent, &cancel_workspace_id, &cancel_client_id, &event_tx).await;
+                        break TurnOutcome::Disconnected;
+                    },
                 }
             }
         };
@@ -1090,6 +1164,16 @@ mod tests {
     use crate::control::ServerState;
     use crate::db::Database;
     use std::sync::Arc;
+
+    #[test]
+    fn test_heartbeat_frame_shape() {
+        // 前端看门狗以「任意帧到达」判定存活，只要求 type 与自增时间戳两个字段
+        // 稳定可解析；ts 必须为正整数（u64 秒），前端据此可计算最后活动时间。
+        let frame = heartbeat_frame();
+        assert_eq!(frame["type"], "heartbeat");
+        let ts = frame["ts"].as_u64().expect("ts must be a u64");
+        assert!(ts > 0, "ts should be a positive unix timestamp, got {ts}");
+    }
 
     #[test]
     fn test_turn_outcome_cancel_is_not_success() {
