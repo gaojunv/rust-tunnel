@@ -1300,9 +1300,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}
       >
-        {/* 限宽包裹层：与下方悬浮输入框的 max-w-3xl 对齐，控制长文阅读行长，
-            避免消息流全宽铺开与居中输入框的视觉错位。渐隐占位留在层外保持全宽。 */}
-        <div className="mx-auto w-full max-w-3xl">
+        {/* 限宽包裹层：比下方悬浮输入框（max-w-3xl）略宽，控制长文阅读行长，
+            同时让消息流视觉上包住输入框。两侧 padding 与输入框外层一致（px-3
+            md:px-5）保证边缘对齐。渐隐占位留在层外保持全宽。 */}
+        <div className="mx-auto w-full max-w-[50rem]">
         {hasMore && items.length > 0 && (
           <div className="flex justify-center py-1.5">
             <Button
@@ -1370,7 +1371,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       {/* 悬浮输入框（VS Code Claude Code 风格）：模型选择(左下) + 发送图标(右下) 内嵌。
           外层 absolute inset-x-0 横跨含滚动条的整宽，必须 pointer-events-none 放行
           右下角滚动条（否则滚动条底部区段被盖住拖不动），交互由内层卡片恢复。 */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-6 md:pb-5">
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:px-5 md:pb-5">
         <div ref={inputCardRef} className="pointer-events-auto mx-auto w-full max-w-3xl">
         {disconnected && (
           <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
@@ -1449,10 +1450,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
-            className="w-full min-h-[3.5rem] resize-none rounded-t-2xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
+            className="w-full min-h-[2.25rem] resize-none rounded-t-2xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
             rows={1}
           />
-          <div className="flex flex-wrap items-center justify-between gap-1 px-1.5 pb-1.5 md:px-2">
+          {/* 底部操作行：上边框与输入区分隔（模型/模式/effort 按钮 vs 文本输入） */}
+          <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border/60 px-1.5 pb-1.5 pt-1 md:px-2">
             <SessionSettingsMenu
               model={model}
               onModelChange={handleModelChange}
