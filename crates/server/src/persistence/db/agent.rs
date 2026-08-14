@@ -1,6 +1,34 @@
 //! Agent workbench persistence: workspaces / sessions / messages.
 use super::Database;
 
+/// 把 SQLite `datetime('now')` 的空格分隔时间（UTC、无时区标记）归一化为
+/// ISO-8601 `YYYY-MM-DDTHH:MM:SSZ`（M12）。Safari 的 `new Date` 不认空格格式
+/// （会话相对时间整行不渲染）；Chrome 虽宽容但按本地时间误解析，UTC 存值偏差
+/// 数小时。已含 T/Z 或其它格式的字符串原样返回（其它写入方可能直接存 ISO）。
+/// 原子字符串：长度 ≥19 且第 11 个字符为空格即命中；带毫秒/偏移由 JS Date 宽容
+/// 解析，不在此处理。
+pub fn normalize_db_datetime(raw: &str) -> String {
+    if raw.len() >= 19 && raw.as_bytes().get(10) == Some(&b' ') {
+        let mut s = raw.to_string();
+        s.replace_range(10..11, "T");
+        s.push('Z');
+        s
+    } else {
+        raw.to_string()
+    }
+}
+
+/// [`normalize_db_datetime`] 的 serde `serialize_with` 适配（String 字段）。
+/// `&String` 是 serde `serialize_with` 对 String 字段要求的固定签名（非可改写的
+/// `&str`），故 allow `ptr_arg`。
+#[allow(clippy::ptr_arg)]
+pub fn ser_de_normalized_dt<S: serde::Serializer>(
+    s: &String,
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&normalize_db_datetime(s))
+}
+
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWorkspaceRecord {
     pub id: String,
@@ -29,7 +57,9 @@ pub struct AgentWorkspaceRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
+    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
 
@@ -48,7 +78,9 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub acp_session_id: Option<String>,
+    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
 
@@ -69,6 +101,7 @@ pub struct AgentMessageRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub parent_tool_call_id: Option<String>,
+    #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
 }
 
@@ -665,6 +698,23 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_db_datetime() {
+        // SQLite datetime('now') 空格格式 → ISO-8601（T 分隔 + Z，UTC 标记）
+        assert_eq!(
+            normalize_db_datetime("2026-08-14 13:00:00"),
+            "2026-08-14T13:00:00Z"
+        );
+        // 已含 T 的 ISO 字符串原样返回（其它写入方直接存 ISO）
+        assert_eq!(
+            normalize_db_datetime("2026-08-14T13:00:00Z"),
+            "2026-08-14T13:00:00Z"
+        );
+        // 空串 / 非 19 位格式原样返回（防御：不破坏异常数据）
+        assert_eq!(normalize_db_datetime(""), "");
+        assert_eq!(normalize_db_datetime("2026-08-14"), "2026-08-14");
+    }
 
     /// 测试专用：给 workspace 补写 llm_model_id（正式 CRUD 写入口随 Task 7
     /// 提供）。llm_bridge 测试用它构造已配置链路。
