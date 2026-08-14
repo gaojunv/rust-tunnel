@@ -46,11 +46,30 @@ fn is_git_push(cmd_lower: &str) -> bool {
     has_git && has_push
 }
 
-/// dd 写盘：命令含独立 token "dd" 且任一 token 以 "if=" 开头（参数序无关）。
+/// dd 写盘：命令含独立 token "dd"（或以 "/dd" 结尾）且目标为 /dev/ 设备
+/// （任一 token 以 "of=/dev/" 开头且非 of=/dev/null）。不要求 if=——
+/// `dd of=/dev/sda < /tmp/img`（无 if=，数据经 stdin 进块设备）同样命中。
+/// 仅凭 if= 不再触发：`dd if=/dev/zero of=/tmp/out.img` 写普通文件并不危险。
 fn is_dd_write(cmd_lower: &str) -> bool {
-    let mut tokens = cmd_lower.split_whitespace();
-    let has_dd = tokens.any(|t| t == "dd" || t.ends_with("/dd"));
-    has_dd && cmd_lower.split_whitespace().any(|t| t.starts_with("if="))
+    let has_dd = cmd_lower
+        .split_whitespace()
+        .any(|t| t == "dd" || t.ends_with("/dd"));
+    has_dd
+        && cmd_lower.split_whitespace().any(|t| {
+            t.starts_with("of=/dev/") && !t.starts_with("of=/dev/null")
+        })
+}
+
+/// 命令把 /dev/ 设备节点作为裸目标参数（如 `cp x /dev/sda`、`tee /dev/sda`、
+/// `wipefs /dev/sda`）：任一 token 以 "/dev/" 开头且非 /dev/null 即危险。
+/// 只豁免 /dev/null（数据黑洞，写入无害）；/dev/stdout、/dev/stderr、/dev/stdin、
+/// /dev/tty 等伪设备不豁免——写 tty 可向终端注入按键，同样可被恶意利用，故
+/// 保守方向一律拦截（宁可多拦截，不放过设备写形态）。读取形态（如 `cat
+/// /dev/urandom`）也会被拦截，属预期内的过拦截，auto_write 下弹一次确认即可。
+fn writes_to_device(cmd_lower: &str) -> bool {
+    cmd_lower
+        .split_whitespace()
+        .any(|t| t.starts_with("/dev/") && t != "/dev/null")
 }
 
 /// kill 危险信号：独立 token `kill`（或以 `/kill` 结尾，排除 killall/killall5）
@@ -137,6 +156,20 @@ pub fn is_dangerous_shell(cmd: &str) -> bool {
         || is_kill_dangerous(&lower)
         || is_recursive_rm(&lower)
         || redirects_to_device(&lower)
+        || writes_to_device(&lower)
+}
+
+/// 命令是否"破坏性"：即使会话已 allow_always 记住该工具，破坏性命令仍不可免审
+/// （防"记住 shell"整条绕过安全网——`rm -rf /`、`dd of=/dev/sda` 不得因一次
+/// allow_always 就静默放行）。Shell → 按危险命令判定；GitPush → 永远破坏性
+/// （推送不可撤销地改写远程，safe/auto_write 下都应确认）；其余工具（文件读写、
+/// 提交等）由审批矩阵单独覆盖，allow_always 记住后免审语义不受影响。
+pub fn command_is_destructive(cmd: &AgentCommand) -> bool {
+    match cmd {
+        AgentCommand::Shell { cmd, .. } => is_dangerous_shell(cmd),
+        AgentCommand::GitPush => true,
+        _ => false,
+    }
 }
 
 /// 按审批模式判定工具调用是否需用户确认。非法 mode 按 "safe" 处理（保守）。
@@ -351,12 +384,50 @@ mod tests {
 
     #[test]
     fn test_is_dd_write() {
-        // 参数序无关均命中
+        // 目标为 /dev/ 设备（of=/dev/<非null>）即命中，参数序无关、不要求 if=
         assert!(is_dangerous_shell("dd if=/dev/zero of=/dev/sda"));
-        assert!(is_dangerous_shell("sudo dd bs=1M if=x of=y"));
-        // 非独立 token 或只有 of= 不命中
+        assert!(is_dangerous_shell("sudo dd bs=1M of=/dev/sda"));
+        assert!(is_dangerous_shell("dd of=/dev/sda < /tmp/disk.img")); // 无 if=，stdin 进块设备
+        // 写普通文件不命中（仅凭 if= 不再触发）
+        assert!(!is_dangerous_shell("dd if=/dev/zero of=/tmp/out.img"));
+        assert!(!is_dangerous_shell("sudo dd bs=1M if=x of=y"));
+        // 非独立 token 或 of= 目标非设备不命中
         assert!(!is_dangerous_shell("ddd if=x"));
         assert!(!is_dangerous_shell("dd of=x"));
+        assert!(!is_dangerous_shell("dd of=/dev/null"));
+    }
+
+    #[test]
+    fn test_device_write_forms() {
+        // BUG A 回归：写设备形态不得因缺 if= / 缺 `>` 重定向而静默放行
+        assert!(is_dangerous_shell("dd of=/dev/sda < /tmp/disk.img"));
+        assert!(is_dangerous_shell("cp /tmp/img /dev/sda"));
+        assert!(is_dangerous_shell("tee /dev/sda < x"));
+        assert!(is_dangerous_shell("wipefs /dev/sda"));
+        assert!(is_dangerous_shell("sudo wipefs -a /dev/sdb"));
+        assert!(is_dangerous_shell("mkfs.ext4 /dev/sda")); // mkfs 模式
+        // 良性：/dev/null 数据黑洞豁免、普通文件目标不命中
+        assert!(!is_dangerous_shell("cp /etc/hostname /dev/null"));
+        assert!(!is_dangerous_shell("cp a b"));
+        assert!(!is_dangerous_shell("npm run build > /dev/null 2>&1"));
+    }
+
+    #[test]
+    fn test_command_is_destructive() {
+        // BUG B 回归：allow_always 记住 shell 后，破坏性命令仍须确认
+        assert!(command_is_destructive(&shell("rm -rf /")));
+        assert!(command_is_destructive(&shell("dd of=/dev/sda")));
+        assert!(!command_is_destructive(&shell("ls")));
+        assert!(!command_is_destructive(&shell("npm test")));
+        assert!(command_is_destructive(&AgentCommand::GitPush));
+        // 非 shell 工具不判破坏性（allow_always 免审语义不受影响）
+        assert!(!command_is_destructive(&AgentCommand::WriteFile {
+            path: "a".into(),
+            content: "x".into()
+        }));
+        assert!(!command_is_destructive(&AgentCommand::GitCommit {
+            message: "m".into()
+        }));
     }
 
     #[test]

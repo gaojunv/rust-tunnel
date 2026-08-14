@@ -329,13 +329,17 @@ async fn handle_tool_calls(
 
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
-                // 审批：session 记忆集命中 → 放行；否则按 workspace approval_mode 判定，
-                // 需确认时发 approval_request 挂起等待。拒绝落库 [denied by user]，
-                // 回合不中断（模型看到拒绝可自行换方案）。
-                if !agent
+                // 审批：session 记忆集命中且命令非破坏性 → 放行；否则按 workspace
+                // approval_mode 判定，需确认时发 approval_request 挂起等待。拒绝落库
+                // [denied by user]，回合不中断（模型看到拒绝可自行换方案）。
+                // 破坏性命令（is_dangerous_shell / GitPush）即便被 allow_always 记住
+                // 也仍走审批——防"记住 shell"整条绕过安全网（rm -rf /、dd of=/dev/sda）。
+                let remembered = agent
                     .is_allowed_for_session(&rt.session_id, &call.name)
-                    .await
-                    && super::approval::needs_approval(&rt.approval_mode, &command)
+                    .await;
+                let needs_confirm = super::approval::needs_approval(&rt.approval_mode, &command);
+                if (super::approval::command_is_destructive(&command) || !remembered)
+                    && needs_confirm
                 {
                     let summary = super::approval::approval_summary(&command);
                     let args_preview: String = call.args.chars().take(500).collect();
