@@ -24,7 +24,7 @@ import SubagentTaskCard from './SubagentTaskCard';
 import SubagentPanel from './SubagentPanel';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
-import { normalizeConfigOptions } from './sessionConfig';
+import { normalizeConfigOptions, optionValue, restoreConfigValue } from './sessionConfig';
 import { historyToChatItems, historyToChatItemsWithSkip, prependSkip } from './history';
 import {
   appendChildStream,
@@ -109,10 +109,13 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
   // ACP 会话配置快照（session_state/config_option_update 全量帧；空数组 = 非 ACP 或未就绪）
   const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
-  // config option 乐观更新的回滚快照：发送后保留，等服务端权威确认帧
-  // （session_state/config_option_update，确认生效则清空）或「设置失败」error 帧
-  // （回滚到快照）。断线/重连时快照作废——它属于上一连接生命周期。
-  const configRollbackRef = useRef<SessionConfigOption[] | null>(null);
+  // config option 乐观更新的回滚快照：按 config_id 分键（prev=发送前值，opt=乐观值），
+  // 并发点击不同选项互不覆盖（旧实现单槽快照互相覆盖，M19）。发送后保留，等
+  // 服务端权威确认帧（session_state/config_option_update，已确认项移除）或「设置失败」
+  // error 帧（回滚未确认项）。断线/重连时快照作废——它属于上一连接生命周期。
+  const configRollbackRef = useRef<
+    Record<string, { prev: string | boolean; opt: string | boolean }> | null
+  >(null);
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -172,6 +175,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // done 后对账重载的标记：history effect 读到它时跳过 running 兜底 heuristic
   // （对账重载的末行可能是 tool_result，按现状会误置 running=true——回合其实已终态）。
   const reconcileRef = useRef(false);
+  // plan 气泡是否已在本回合出现过：回合内 plan 是「全量替换」语义（就地更新最后
+  // 一条）；跨回合必须新建气泡——done/stopped/error/cancel_fallback/超时兜底时
+  // 复位。否则新回合的 plan 会就地覆盖旧回合的 plan 位置，时间序颠倒（M17）。
+  const planSeenThisTurnRef = useRef(false);
+  // 已响应的审批/elicitation request_id 集合：防双击/连点重复提交（M18）。每
+  // 个 request 只允许一次响应；组件重挂载自然重置（新会话从服务端重新对账）。
+  const respondedRequestRef = useRef<Set<string>>(new Set());
+  // 模型切换请求序号：仅最新一次切换的失败才回滚——旧请求失败回滚会覆盖后续
+  // 已成功的切换值（并发切换竞态，M21）。
+  const modelChangeSeqRef = useRef(0);
 
   const clearRunningTimeout = useCallback(() => {
     if (timeoutRef.current) {
@@ -209,6 +222,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     timeoutRef.current = null;
     setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
     expirePendingInteractions();
+    // 回合按终态处理：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17）
+    planSeenThisTurnRef.current = false;
     stopRunning();
   }, [expirePendingInteractions, stopRunning]);
 
@@ -320,16 +335,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // 去重、plan 只留最后一条），见 history.ts。
     setItems(historyToChatItems(rows));
     loadedRawRef.current = rows;
+    // has_more 只在真正装载（重建 items）时随首页数据同步（M20）：done 对账重载、
+    // 自愈重装都走这里。后台 refetch 被「实时保护」守卫早退、t 依赖重跑也早退，
+    // 均不触达——否则用户翻页到底（hasMore=false）后一次 history refetch 就把
+    // hasMore 复位成首页的 true，「加载更早」按钮闪烁/旧页消失。
+    setHasMore(historyHasMore(history));
     // t 用于 running 超时提示文案；语言切换后重跑 effect 只影响尚未触发的
     // 超时回调文案，代价可忽略。armRunningTimeout 为稳定 useCallback，不引入额外重跑。
   }, [history, t, armRunningTimeout]);
-
-  // has_more 只随查询数据（history）变化同步：单独 effect 避免主装载 effect 的
-  // `t` 依赖（语言切换/测试替身每次渲染新引用）重跑时把「加载更早」后的 hasMore
-  // 复位为首页的 has_more。
-  useEffect(() => {
-    setHasMore(historyHasMore(history));
-  }, [history]);
 
   // 分页「加载更早消息」：以当前已加载最旧一条的 id 作 before 游标，取更早的一页，
   // 转换后 unshift 进 items 头部。不整体重建 items——流式渲染依赖 streamingIdxRef/
@@ -708,8 +721,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         const entries = msg.entries ?? [];
+        // 本回合首个 plan：新建气泡（M17）。跨回合的 plan 不得就地覆盖旧回合的
+        // plan 位置——否则新回合的计划盖在旧计划上，时间序颠倒。置位必须同步
+        // （不能在 setItems updater 里写——updater 惰性执行，同一事件内连续两个
+        // plan 帧时第二个仍读到 false，会误建第二个气泡）。
+        if (!planSeenThisTurnRef.current) {
+          planSeenThisTurnRef.current = true;
+          setItems((prev) => [...prev, { kind: 'plan', content: '', planEntries: entries }]);
+          return;
+        }
+        // 回合内后续 plan（ACP plan 全量替换语义）：就地更新最后一条；无则追加
         setItems((prev) => {
-          // 就地更新最后一条 plan 气泡（ACP plan 是全量替换语义）；无则追加
           for (let i = prev.length - 1; i >= 0; i--) {
             if (prev[i].kind === 'plan') {
               const next = [...prev];
@@ -736,7 +758,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
-        // 回合已终态，未响应的审批/elicitation 请求随回合作废 → 卡片置终态
+        // 回合已终态：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17），
+        // 未响应的审批/elicitation 请求随回合作废 → 卡片置终态
+        planSeenThisTurnRef.current = false;
         expirePendingInteractions();
       } else if (msg.type === 'cancel_fallback') {
         // 停止超时兜底：agent 进程未在时限内退出，服务端强制杀掉并重启。
@@ -744,6 +768,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
+        planSeenThisTurnRef.current = false;
         expirePendingInteractions();
         setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.cancelFallback') }]);
       } else if (msg.type === 'done') {
@@ -752,9 +777,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
-        // 回合成功结束：服务端 5 分钟审批超时按 deny、elicitation 超时按 Cancel
-        // 继续回合，仍 pending 的卡片必须置终态，否则 hasPendingInteraction 恒
-        // true 锁死发送按钮
+        // 回合成功结束：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17）；
+        // 服务端 5 分钟审批超时按 deny、elicitation 超时按 Cancel 继续回合，仍
+        // pending 的卡片必须置终态，否则 hasPendingInteraction 恒 true 锁死发送按钮
+        planSeenThisTurnRef.current = false;
         expirePendingInteractions();
         // 半截装载对账：本次会话是「刷新/断线时回合仍在跑」加载的，DB 当时缺
         // 终态 flush 的文本/结果（ACP 文本缓冲到终态落库）。done 到达时服务端
@@ -777,9 +803,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
       } else if (msg.type === 'session_state' || msg.type === 'config_option_update') {
         // 全量配置快照（session_state=初始，config_option_update=变更后）：归一化覆盖
-        setConfigOptions(normalizeConfigOptions(msg.options));
-        // 服务端权威状态到达 = 乐观更新确认生效：放弃回滚快照
-        configRollbackRef.current = null;
+        const serverOptions = normalizeConfigOptions(msg.options);
+        setConfigOptions(serverOptions);
+        // 服务端权威状态到达：确认生效的项从回滚快照移除（M19）——并发点击下旧
+        // 实现直接清空整份快照，会让后点的选项（尚未确认）丢失回滚能力。
+        reconcileConfigRollback(serverOptions);
       } else if (msg.type === 'current_mode_update') {
         // agent 侧自行切 mode（如 shift+tab）：同步 mode 项当前值
         setConfigOptions((prev) =>
@@ -818,16 +846,24 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         }]);
       } else if (msg.type === 'error') {
         // 「设置失败」error 帧（服务端 set_config_option 失败，格式 `设置失败: {e}`）：
-        // 乐观更新从未生效，回滚到发送前快照，按钮不再显示假性值。
+        // 乐观更新从未生效，回滚未确认项到发送前值（按选项快照，M19），按钮不再
+        // 显示假性值。只回滚仍 pending 的选项，不波及已确认生效的项。
         if (configRollbackRef.current && msg.message?.startsWith('设置失败')) {
-          setConfigOptions(configRollbackRef.current);
+          const roll = configRollbackRef.current;
           configRollbackRef.current = null;
+          setConfigOptions((cur) =>
+            cur.map((o) =>
+              roll[o.id] !== undefined ? restoreConfigValue(o, roll[o.id]!.prev) : o,
+            ),
+          );
         }
         flushChunks();
         breakStream();
         setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: msg.message ?? '' }]);
         stopRunning();
-        // 回合以错误终态结束，未响应的审批/elicitation 卡片一并置终态
+        // 回合以错误终态结束：plan 归属随回合终结（M17），未响应的审批/elicitation
+        // 卡片一并置终态
+        planSeenThisTurnRef.current = false;
         expirePendingInteractions();
       }
     };
@@ -945,22 +981,29 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
   // 审批响应：approved=true 时 remember 决定「仅本次」还是「本会话记住」；
   // ACP options 路径由 ApprovalCard 传入 optionId（原样回传 option_id，后端优先
-  // 解析），remember 对 allow_always 选项置 true。无论 WS 是否可用都先落本地
-  // 状态（卡片从 pending 变 approved/denied）
+  // 解析），remember 对 allow_always 选项置 true。仅帧真正发出后才落本地状态——
+  // WS 断开时帧发不出去（服务端审批请求仍挂起），落本地「成功」会让用户误以为
+  // 已响应、回合却永久卡住（M18）；此时提示连接丢失、卡片保持 pending。
   const respondApproval = (id: string, approved: boolean, remember: boolean, optionId?: string) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const payload: Record<string, unknown> = {
-        type: 'approval_response',
-        request_id: id,
-        approved,
-        remember: remember ? 'session' : 'none',
-      };
-      if (optionId) {
-        payload.option_id = optionId;
-      }
-      ws.send(JSON.stringify(payload));
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      return;
     }
+    // 防双击/连点：同一 request 只允许响应一次（M18）。二次点击帧不再发出，
+    // 卡片状态保持首次点击结果。
+    if (respondedRequestRef.current.has(id)) return;
+    respondedRequestRef.current.add(id);
+    const payload: Record<string, unknown> = {
+      type: 'approval_response',
+      request_id: id,
+      approved,
+      remember: remember ? 'session' : 'none',
+    };
+    if (optionId) {
+      payload.option_id = optionId;
+    }
+    ws.send(JSON.stringify(payload));
     setItems((prev) => prev.map((it) =>
       it.kind === 'approval' && it.approvalId === id
         ? { ...it, approvalStatus: approved ? 'approved' : 'denied' }
@@ -969,23 +1012,29 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   };
 
   // elicitation 响应：accept 带 content（仅非空时回传，服务端按 requested_schema
-  // 解析字段值）；decline/cancel 无 content。无论 WS 是否可用都先落本地状态
-  // （卡片从 pending 变终态），与 respondApproval 同模式。
+  // 解析字段值）；decline/cancel 无 content。仅帧真正发出后才落本地状态（卡片从
+  // pending 变终态）——WS 断开时帧发不出去，落本地「成功」会让用户误以为已响应、
+  // 服务端表单却一直挂着（M18）；此时提示连接丢失、卡片保持 pending。
   const respondElicitation = (
     id: string,
     action: 'accept' | 'decline' | 'cancel',
     content?: Record<string, unknown>,
   ) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const payload: Record<string, unknown> = {
-        type: 'elicitation_response',
-        request_id: id,
-        action,
-      };
-      if (content && Object.keys(content).length > 0) payload.content = content;
-      ws.send(JSON.stringify(payload));
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      return;
     }
+    // 防双击/连点：同一 request 只允许响应一次（M18）。
+    if (respondedRequestRef.current.has(id)) return;
+    respondedRequestRef.current.add(id);
+    const payload: Record<string, unknown> = {
+      type: 'elicitation_response',
+      request_id: id,
+      action,
+    };
+    if (content && Object.keys(content).length > 0) payload.content = content;
+    ws.send(JSON.stringify(payload));
     const status = action === 'accept' ? 'accepted' : action === 'decline' ? 'declined' : 'cancelled';
     setItems((prev) => prev.map((it) =>
       it.kind === 'elicitation' && it.elicitationId === id
@@ -1089,6 +1138,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
 
   const handleModelChange = (id: string) => {
     const prev = model;
+    const seq = ++modelChangeSeqRef.current;
     onModelChange(id);
     void updateAgentSessionModel(sessionId, id)
       .then(() => {
@@ -1096,7 +1146,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         void queryClient.invalidateQueries({ queryKey: ['agent-sessions'] });
       })
       .catch((err: unknown) => {
-        // 失败：本地 state 回滚到旧值 + 用户可见错误提示
+        // 失败：仅最新一次切换失败才回滚——旧请求失败回滚会覆盖后续已成功的切换
+        // 值（并发切换竞态，M21）。陈旧请求既已让位，也不展示误导性失败提示。
+        if (seq !== modelChangeSeqRef.current) return;
         onModelChange(prev);
         setItems((prevItems) => [
           ...prevItems,
@@ -1108,10 +1160,34 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // ACP config option 切换：乐观更新 + WS 发送；发送失败或服务端「设置失败」
   // error 帧回滚（configRollbackRef 快照），生效确认以服务端回推的
   // config_option_update / session_state 全量帧为准。
+
+  // 服务端权威配置帧到达后对账回滚快照：服务端值已等于乐观值的项 = 确认生效，
+  // 从快照移除；仍 pending 的项保留（在途或失败待回滚）。并发点击不同选项时，
+  // 后到确认帧不再清空整份快照，避免丢失其它在途选项的回滚能力（M19）。
+  const reconcileConfigRollback = (serverOptions: SessionConfigOption[]) => {
+    const roll = configRollbackRef.current;
+    if (!roll) return;
+    const next: typeof roll = {};
+    for (const [id, entry] of Object.entries(roll)) {
+      const serverVal = serverOptions.find((o) => o.id === id) && optionValue(serverOptions.find((o) => o.id === id)!);
+      if (serverVal !== entry.opt) next[id] = entry;
+    }
+    configRollbackRef.current = Object.keys(next).length > 0 ? next : null;
+  };
+
   const sendConfigOption = (configId: string, value: string) => {
-    const prev = configOptions;
-    // 保留回滚快照；不在此清空——发送成功与否要等服务端权威确认帧
-    configRollbackRef.current = prev;
+    // 按选项记录回滚快照（M19）：prev=发送前值、opt=乐观值，按 config_id 分键，
+    // 并发点击不同选项各自独立、互不覆盖；同选项重复点击保留首次 prev（true 前态）。
+    // 快照不清空——发送成功与否要等服务端权威确认帧（reconcileConfigRollback 按
+    // 确认移除）或「设置失败」error 帧（整体回滚未确认项）。
+    const target = configOptions.find((o) => o.id === configId);
+    if (target) {
+      const optVal: string | boolean =
+        target.type === 'boolean' ? value === 'true' : value;
+      const roll = configRollbackRef.current ?? {};
+      roll[configId] = { prev: roll[configId]?.prev ?? optionValue(target), opt: optVal };
+      configRollbackRef.current = roll;
+    }
     setConfigOptions((cur) =>
       cur.map((o) => {
         if (o.id !== configId) return o;
@@ -1124,17 +1200,27 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     );
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      // 帧未发出：本地回滚即操作终结，快照一并作废
+      // 帧未发出：回滚本选项乐观值，快照一并作废
+      const entry = configRollbackRef.current?.[configId];
       configRollbackRef.current = null;
-      setConfigOptions(prev);
+      if (entry) {
+        setConfigOptions((cur) =>
+          cur.map((o) => (o.id === configId ? restoreConfigValue(o, entry.prev) : o)),
+        );
+      }
       return;
     }
     try {
       ws.send(JSON.stringify({ type: 'set_config_option', config_id: configId, value }));
     } catch {
-      // send 同步抛错：帧未到达服务端，回滚并作废快照
+      // send 同步抛错：帧未到达服务端，回滚本选项并作废快照
+      const entry = configRollbackRef.current?.[configId];
       configRollbackRef.current = null;
-      setConfigOptions(prev);
+      if (entry) {
+        setConfigOptions((cur) =>
+          cur.map((o) => (o.id === configId ? restoreConfigValue(o, entry.prev) : o)),
+        );
+      }
       setItems((prevItems) => [
         ...prevItems,
         { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') },

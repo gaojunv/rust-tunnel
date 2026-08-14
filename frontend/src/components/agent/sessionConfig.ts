@@ -36,6 +36,25 @@ export function currentOptionLabel(o: SessionConfigOption): string {
   return o.options?.find((v) => v.value === o.currentValue)?.name ?? String(o.currentValue ?? '');
 }
 
+/** 取选项当前值（归一化：boolean → 布尔真值 currentBool，select → currentValue 字符串）。
+ * 与 [`restoreConfigValue`] 配套，用于乐观更新回滚快照（M19）的存取。 */
+export function optionValue(o: SessionConfigOption): string | boolean {
+  return o.type === 'boolean' ? (o.currentBool ?? false) : (o.currentValue ?? '');
+}
+
+/** 把选项恢复到某前值：boolean 同时写回 currentBool 与 "true"/"false" 的
+ * currentValue（保持归一化形态），select 写 currentValue。 */
+export function restoreConfigValue(
+  o: SessionConfigOption,
+  prev: string | boolean,
+): SessionConfigOption {
+  if (o.type === 'boolean') {
+    const b = Boolean(prev);
+    return { ...o, currentBool: b, currentValue: b ? 'true' : 'false' };
+  }
+  return { ...o, currentValue: String(prev) };
+}
+
 function flattenOptions(raw: unknown): SessionConfigSelectOption[] {
   if (!Array.isArray(raw)) return [];
   const out: SessionConfigSelectOption[] = [];
