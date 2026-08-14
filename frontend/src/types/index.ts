@@ -710,6 +710,8 @@ export type AgentWsEvent =
   | { type: 'error'; message?: string }
   // 上游流传输失败重试信号：前端应丢弃已缓冲的半截增量，等重试后的完整文本从新气泡开始
   | { type: 'stream_reset' }
+  // 应用层心跳：看门狗探活 + 重置 running 不活动兜底，不渲染
+  | { type: 'heartbeat'; ts?: number }
   | { type: 'session_state'; options?: SessionConfigOption[] }
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
   | { type: 'current_mode_update'; mode_id?: string };

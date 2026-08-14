@@ -19,9 +19,12 @@ vi.mock('react-i18next', () => ({
 // ── WebSocket 替身：捕获实例供手动触发 onmessage ───────────────
 const wsInstances: FakeWs[] = [];
 class FakeWs {
+  static OPEN = 1;
+  readyState = 1;
   onmessage: ((ev: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  onopen: (() => void) | null = null;
   close = vi.fn(() => {
     this.onclose?.();
   });
@@ -145,5 +148,42 @@ describe('AgentNotificationsProvider', () => {
     renderProvider();
     act(() => api.setEnabled(true));
     expect(MockNotification.requestPermission).toHaveBeenCalled();
+  });
+
+  it('ignores heartbeat frames (no notification, no title flash)', () => {
+    renderProvider();
+    fire(wsInstances[0], { type: 'heartbeat', ts: 1720000000 } as unknown as AgentNotification);
+    // 心跳仅探活：不触发标题闪烁、不弹系统通知
+    expect(document.title).toBe('Aurora Tunnel Admin');
+    expect(MockNotification.instances).toHaveLength(0);
+  });
+
+  it('watchdog closes a half-open connection with no frames for >75s', () => {
+    // 捕获 30s 看门狗 interval 回调（与 ChatStream 测试同手法）；控制 Date.now：
+    // onopen 建立基线后推进 >75s 模拟静默假死（半开 TCP 无 onclose）。
+    let watchdogCb: (() => void) | undefined;
+    const origSetInterval = globalThis.setInterval;
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        if (ms === 30_000) watchdogCb = cb;
+        return origSetInterval(cb, ms ?? 0) as ReturnType<typeof setInterval>;
+      }) as typeof setInterval,
+    );
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    renderProvider();
+    const ws = wsInstances[0];
+    act(() => {
+      ws.onopen?.();
+    });
+    expect(watchdogCb).toBeTypeOf('function');
+    nowSpy.mockReturnValue(1_000_000 + 80_000);
+    act(() => {
+      watchdogCb?.();
+    });
+    // 看门狗判定假死 → 主动 close（close 触发 onclose → 指数退避重连 scheduled）
+    expect(ws.close).toHaveBeenCalled();
+    // 恢复本测试创建的 spy（文件 afterEach 只 unstub globals，不 restore spies）
+    nowSpy.mockRestore();
+    setIntervalSpy.mockRestore();
   });
 });

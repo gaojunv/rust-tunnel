@@ -40,7 +40,10 @@ class FakeWs {
   send(s: string) {
     this.sent.push(s);
   }
-  close() {}
+  // close 同步触发 onclose（浏览器语义）：看门狗测试据此走既有重连路径
+  close = vi.fn(() => {
+    this.onclose?.();
+  });
   emit(msg: object) {
     this.onmessage?.({ data: JSON.stringify(msg) });
   }
@@ -252,6 +255,88 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'queued' });
     });
     expect(armed.length).toBe(1);
+  });
+
+  it('ignores heartbeat frames (no bubble, no system message)', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'heartbeat', ts: 1720000000 });
+    });
+    // 应用层心跳不渲染：不产生任何气泡/系统消息（items 不变，空态提示仍在）
+    expect(screen.getByText('agent.chatEmptyHint')).toBeTruthy();
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
+
+  it('heartbeat frames reset the running inactivity fallback (long silent tool exec)', () => {
+    // 长工具执行静默回合合法：仅心跳帧持续到达时不得误报「响应超时」（heartbeat
+    // 不在 TURN_ACTIVITY_TYPES 里，需显式分支重置 10min 不活动兜底）。
+    // 与「回合活动帧重置兜底」同手法：捕获 10min arm 回调并断言旧定时器被重建。
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    const armed: { cb: () => void; id: ReturnType<typeof setTimeout> }[] = [];
+    const cleared: (ReturnType<typeof setTimeout> | undefined)[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    const origClearTimeout = globalThis.clearTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        const id = origSetTimeout(cb, ms ?? 0);
+        if (ms === 10 * 60 * 1000) armed.push({ cb, id });
+        return id;
+      }) as typeof setTimeout,
+    );
+    vi.spyOn(globalThis, 'clearTimeout').mockImplementation(
+      (id?: ReturnType<typeof setTimeout>) => {
+        cleared.push(id);
+        return origClearTimeout(id);
+      },
+    );
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'shell', args: '{}' });
+    });
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    expect(armed.length).toBe(1);
+    // 心跳帧到达 → 重置不活动兜底（旧定时器被清除并重新 arm）
+    act(() => {
+      wsInstance!.emit({ type: 'heartbeat', ts: 1720000000 });
+    });
+    expect(armed.length).toBe(2);
+    expect(cleared).toContain(armed[0].id);
+    // running 不受影响
+    expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
+    // 真正 10 分钟静默（心跳也停了）→ 兜底解除 running
+    act(() => {
+      armed[armed.length - 1].cb();
+    });
+    expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
+  });
+
+  it('watchdog closes a half-open connection with no frames for >75s', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    // 捕获 30s 看门狗 interval 回调（与「spy 捕获定时器回调」同手法）；再控制
+    // Date.now：onopen 建立基线后推进 >75s 模拟静默假死（半开 TCP 无 onclose）。
+    let watchdogCb: (() => void) | undefined;
+    const origSetInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(
+      ((cb: () => void, ms?: number) => {
+        if (ms === 30_000 /* WATCHDOG_INTERVAL_MS */) watchdogCb = cb;
+        return origSetInterval(cb, ms ?? 0) as ReturnType<typeof setInterval>;
+      }) as typeof setInterval,
+    );
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    renderChat();
+    expect(watchdogCb).toBeTypeOf('function');
+    act(() => {
+      wsInstance!.onopen?.(); // 新连接：看门狗基线
+    });
+    nowSpy.mockReturnValue(1_000_000 + 80_000);
+    act(() => {
+      watchdogCb?.();
+    });
+    // 看门狗判定假死 → 主动 close；close 触发 onclose（退避未到期不新建连接，
+    // wsInstance 仍指向被关的实例）→ 走既有 onclose 重连路径
+    expect(wsInstance!.close).toHaveBeenCalled();
+    expect(screen.getByText('agent.reconnecting')).toBeTruthy();
   });
 
   it('renders new-format tool_calls/tool_result history', async () => {

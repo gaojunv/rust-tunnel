@@ -45,6 +45,12 @@ const NOTIFICATION_TAG_PREFIX = 'agent-notif-';
 const FLASH_INTERVAL_MS = 1000;
 /** 通知 WS 断线重连退避上限（与 ChatStream 一致）。 */
 const MAX_RECONNECT_MS = 15000;
+/** 连接假死判定阈值：服务端应用层心跳每 25s 一帧，连续 3 个心跳周期（75s）
+ *  无任何帧即认为连接被中间设备静默掐断（半开 TCP 不触发 onclose），由看门狗
+ *  主动 close 走既有 onclose 指数退避重连。 */
+const HEARTBEAT_TIMEOUT_MS = 75_000;
+/** 看门狗扫描周期：远小于心跳超时，保证假死判定延迟在可接受范围。 */
+const WATCHDOG_INTERVAL_MS = 30_000;
 
 export function AgentNotificationsProvider({ children }: { children: ReactNode }) {
   const { t } = useTranslation();
@@ -73,6 +79,10 @@ export function AgentNotificationsProvider({ children }: { children: ReactNode }
 
   // 当前正在查看的会话（AgentPage 上报；无会话/离开时为 null）。
   const activeSessionIdRef = useRef<string | null>(null);
+  // 最近一帧到达时间（含应用层心跳）：看门狗据此判定连接假死（半开 TCP 不触发
+  // onclose，长任务静默期间浏览器不会自行断开——没有探活就永远发现不了）。
+  // 组件级 ref：enabled 开关翻转重建 effect 时保留基线。
+  const lastFrameAtRef = useRef(0);
 
   // ── 标题闪烁 ────────────────────────────────────────────────
   const originalTitleRef = useRef<string | null>(null);
@@ -208,16 +218,30 @@ export function AgentNotificationsProvider({ children }: { children: ReactNode }
     let closedByCleanup = false;
     let attempts = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    // 连接假死看门狗：中间设备静默掐断 TCP 时 onclose 不触发，浏览器重连逻辑
+    // 依赖 onclose 永远不会执行。每 WATCHDOG_INTERVAL_MS 检查最近一帧，超过
+    // HEARTBEAT_TIMEOUT_MS 无帧即主动 close——走既有 onclose 指数退避重连。
+    let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
     const connect = () => {
       ws = new WebSocket(agentNotificationsWsUrl());
+      ws.onopen = () => {
+        // 新连接给足一个完整心跳窗口：onopen 即重置看门狗基线（此后每帧刷新）
+        lastFrameAtRef.current = Date.now();
+      };
       ws.onmessage = (ev) => {
+        // 任意帧（含应用层心跳）到达都刷新看门狗基线：连接活着即不被误判假死
+        lastFrameAtRef.current = Date.now();
         let n: AgentNotification;
         try {
           n = JSON.parse(ev.data) as AgentNotification;
         } catch {
           return;
         }
+        // 应用层心跳帧（服务端每 25s 一帧）：仅探活，不触发任何通知。
+        // 心跳无 session_id，shouldNotify 在「前台 + 无活跃会话」时会对它返回 true
+        // 并误弹一条空通知，必须在此显式滤掉。
+        if ((n as { type?: string }).type === 'heartbeat') return;
         if (
           !shouldNotify(n, {
             enabled: enabledRef.current,
@@ -241,8 +265,20 @@ export function AgentNotificationsProvider({ children }: { children: ReactNode }
     };
 
     connect();
+    watchdogTimer = globalThis.setInterval(() => {
+      const w = ws;
+      if (!w || w.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastFrameAtRef.current > HEARTBEAT_TIMEOUT_MS) {
+        // 连接假死（半开 TCP 不触发 onclose）：主动 close 走既有重连路径
+        w.close();
+      }
+    }, WATCHDOG_INTERVAL_MS);
     return () => {
       closedByCleanup = true;
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
