@@ -255,12 +255,18 @@ async fn run_host(
 
     // stdout/stderr 读 task：各自持有管道并把输出搬进独立 Vec，child 只被 wait
     // （保留 kill 能力）。wait 结束后 join 回收读出的字节。
+    // 边读边限：累计达 MAX_OUTPUT + 1 即停读（丢弃后续字节），避免大输出
+    // （如 `cat /dev/zero`）在超时窗口内无限累积 OOM。停读后管道读端随 task
+    // 结束关闭，子进程后续写入收到 EPIPE（或由下方 deadline 杀进程组兜底）。
     let stdout_reader = child.stdout.take().map(|mut so| {
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(MAX_OUTPUT + 1);
             let mut buf = [0u8; 8192];
             loop {
+                if out.len() > MAX_OUTPUT {
+                    break;
+                }
                 match so.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => out.extend_from_slice(&buf[..n]),
@@ -272,9 +278,12 @@ async fn run_host(
     let stderr_reader = child.stderr.take().map(|mut se| {
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(MAX_OUTPUT + 1);
             let mut buf = [0u8; 8192];
             loop {
+                if out.len() > MAX_OUTPUT {
+                    break;
+                }
                 match se.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => out.extend_from_slice(&buf[..n]),
@@ -392,14 +401,7 @@ pub async fn handle_exec_request(
         AgentCommand::ReadFile { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => docker_read_file(c, &p, timeout).await,
-                None => match tokio::fs::read_to_string(&p).await {
-                    Ok(content) => AgentResult::FileContent {
-                        content: truncate_output(content),
-                    },
-                    Err(e) => AgentResult::Error {
-                        message: format!("read {} failed: {e}", p.display()),
-                    },
-                },
+                None => read_file_host(&p).await,
             },
             Err(e) => AgentResult::Error { message: e },
         },
@@ -572,6 +574,10 @@ async fn shell_exec(
     }
 }
 
+/// list_dir 单次返回条目上限：超出只保留前 N 条并在末尾标记真实总数，
+/// 避免海量目录（node_modules/target）join 后撑爆 1MB 控制帧上限。
+const LIST_DIR_MAX_ENTRIES: usize = 5000;
+
 async fn list_dir(path: &Path) -> AgentResult {
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(rd) => rd,
@@ -582,15 +588,57 @@ async fn list_dir(path: &Path) -> AgentResult {
         }
     };
     let mut lines = Vec::new();
+    let mut total = 0usize;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-        lines.push(if is_dir { format!("{name}/") } else { name });
+        total += 1;
+        if lines.len() < LIST_DIR_MAX_ENTRIES {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            lines.push(if is_dir { format!("{name}/") } else { name });
+        }
     }
     lines.sort();
-    AgentResult::FileContent {
-        content: lines.join("\n"),
+    let truncated_entries = total > LIST_DIR_MAX_ENTRIES;
+    let mut content = lines.join("\n");
+    if truncated_entries {
+        content.push_str(&format!("\n[truncated, total {total} entries]"));
     }
+    AgentResult::FileContent {
+        content: truncate_output(content),
+    }
+}
+
+/// 宿主模式读取文件：用 `take(MAX_OUTPUT + 1)` 只读上限字节，避免整读大文件
+/// （如 5GB 日志）OOM。读满上限即视为截断，复用 `truncate_output` 保留头尾。
+/// 无效 UTF-8 按 lossy 替换（与 `run_host` 的管道读取语义一致）。
+async fn read_file_host(abs: &Path) -> AgentResult {
+    use tokio::io::AsyncReadExt;
+    let file = match tokio::fs::File::open(abs).await {
+        Ok(f) => f,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    let mut buf = Vec::with_capacity(MAX_OUTPUT + 1);
+    let n = match file
+        .take((MAX_OUTPUT + 1) as u64)
+        .read_to_end(&mut buf)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    if n > MAX_OUTPUT {
+        content = truncate_output(content);
+    }
+    AgentResult::FileContent { content }
 }
 
 /// 在容器内执行 `cat -- <abs_path>`；非零退出码（如文件不存在）归一为 Error。
@@ -865,6 +913,84 @@ mod tests {
             }
             other => panic!("expected FileContent, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_truncates_many_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // 创建 LIST_DIR_MAX_ENTRIES + 1 个文件，验证条数上限截断
+        for i in 0..=LIST_DIR_MAX_ENTRIES {
+            std::fs::write(dir.path().join(format!("f{i:05}")), "").unwrap();
+        }
+        let rd = handle_exec_request(
+            &AgentCommand::ListDir { path: ".".into() },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        let AgentResult::FileContent { content } = rd else {
+            panic!("expected FileContent, got {rd:?}");
+        };
+        // 保留前 N 条 + 末尾截断标记（标记真实总数）
+        assert!(content.contains(&format!(
+            "\n[truncated, total {} entries]",
+            LIST_DIR_MAX_ENTRIES + 1
+        )));
+        assert_eq!(content.lines().count(), LIST_DIR_MAX_ENTRIES + 1);
+        assert!(!content.contains("f05000"));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_truncates_huge_output_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2000 个 ~205 字符长文件名：未超条数上限，但 join 后 > MAX_OUTPUT，
+        // 验证字节级截断兜底（头尾保留、内容有界）
+        for i in 0..2000 {
+            let name = format!("n{i:04}-{}", "x".repeat(200));
+            std::fs::write(dir.path().join(&name), "").unwrap();
+        }
+        let rd = handle_exec_request(
+            &AgentCommand::ListDir { path: ".".into() },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        let AgentResult::FileContent { content } = rd else {
+            panic!("expected FileContent, got {rd:?}");
+        };
+        assert!(content.len() <= MAX_OUTPUT + 64, "len = {}", content.len());
+        assert!(content.contains("[truncated]"));
+        assert!(content.starts_with("n0000-"));
+        assert!(content.ends_with("x"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_large_returns_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        // 200KB 文件：宿主分支必须只读上限字节并截断，不能整读（防 OOM）
+        std::fs::write(dir.path().join("big.log"), "A".repeat(MAX_OUTPUT * 2)).unwrap();
+        let rd = handle_exec_request(
+            &AgentCommand::ReadFile {
+                path: "big.log".into(),
+            },
+            dir.path(),
+            Duration::from_secs(10),
+            None,
+            None,
+        )
+        .await;
+        let AgentResult::FileContent { content } = rd else {
+            panic!("expected FileContent, got {rd:?}");
+        };
+        assert!(content.len() <= MAX_OUTPUT + 64, "len = {}", content.len());
+        assert!(content.contains("[truncated]"));
+        // truncate_output 保留头尾
+        assert!(content.starts_with("AAAAA"));
+        assert!(content.ends_with("AAAAA"));
     }
 
     #[tokio::test]
