@@ -92,6 +92,14 @@ pub async fn create_workspace(
         .agent_config_overrides
         .as_deref()
         .filter(|s| !s.is_empty());
+    // GitHub 字段：token 空串归一化 None；非空则用 LlmCipher 加密后落库（与 LLM
+    // provider API Key 同一机制，未配置主密钥时明文兼容降级）。owner/repo 空串
+    // 归一化 None。写入走独立的 `agent_set_workspace_github`（COALESCE 语义）。
+    let cipher = super::agent_cipher(&state).await;
+    let github_token = body.github_token.as_deref().filter(|s| !s.is_empty());
+    let github_owner = body.github_owner.as_deref().filter(|s| !s.is_empty());
+    let github_repo = body.github_repo.as_deref().filter(|s| !s.is_empty());
+    let github_token_stored = github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
     let id = new_id();
     match agent
         .db
@@ -110,10 +118,24 @@ pub async fn create_workspace(
         )
         .await
     {
-        Ok(()) => match agent.db.agent_get_workspace(&id).await {
-            Ok(Some(ws)) => Json(ws).into_response(),
-            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
+        Ok(()) => {
+            if let Err(e) = agent
+                .db
+                .agent_set_workspace_github(
+                    &id,
+                    github_token_stored.as_deref(),
+                    github_owner,
+                    github_repo,
+                )
+                .await
+            {
+                tracing::error!(workspace_id = %id, "persist github fields failed: {e}");
+            }
+            match agent.db.agent_get_workspace(&id).await {
+                Ok(Some(ws)) => Json(ws).into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -184,6 +206,13 @@ pub async fn update_workspace(
         .agent_config_overrides
         .as_deref()
         .filter(|s| !s.is_empty());
+    // GitHub 字段：token 空串/缺省 → None（DB COALESCE 保持已存密文）；非空 →
+    // 加密后更新。owner/repo 同语义。写入走独立的 `agent_set_workspace_github`。
+    let cipher = super::agent_cipher(&state).await;
+    let github_token = body.github_token.as_deref().filter(|s| !s.is_empty());
+    let github_owner = body.github_owner.as_deref().filter(|s| !s.is_empty());
+    let github_repo = body.github_repo.as_deref().filter(|s| !s.is_empty());
+    let github_token_stored = github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
     match agent
         .db
         .agent_update_workspace(
@@ -199,7 +228,22 @@ pub async fn update_workspace(
         )
         .await
     {
-        Ok(()) => get_workspace(State(state), Path(id)).await.into_response(),
+        Ok(()) => {
+            if let Err(e) = agent
+                .db
+                .agent_set_workspace_github(
+                    &id,
+                    github_token_stored.as_deref(),
+                    github_owner,
+                    github_repo,
+                )
+                .await
+            {
+                tracing::error!(workspace_id = %id, "persist github fields failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            get_workspace(State(state), Path(id)).await.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1036,6 +1080,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1062,6 +1109,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1085,6 +1135,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1128,6 +1181,9 @@ mod tests {
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1159,6 +1215,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1186,6 +1245,9 @@ mod tests {
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1195,6 +1257,149 @@ mod tests {
         assert_eq!(ws.agent_type, "gemini");
         assert_eq!(ws.agent_path.as_deref(), Some("/opt/gemini"));
         assert_eq!(ws.llm_model_id.as_deref(), Some("model-1"));
+    }
+
+    // ── GitHub 集成字段（创建/更新落库 + 脱敏）──────────────────
+
+    #[tokio::test]
+    async fn test_create_workspace_persists_github_fields() {
+        let (state, db) = test_state().await;
+        let resp = create_workspace(
+            State(state.clone()),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                github_token: Some("ghp_secret_123".into()),
+                github_owner: Some("octo".into()),
+                github_repo: Some("repo".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 响应体脱敏：无 github_token 字段 / 无 token 明文，只有布尔位 + owner/repo
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let raw = json.to_string();
+        assert!(!raw.contains("ghp_secret_123"), "token 明文不得出现在响应");
+        assert!(!raw.contains("github_token\""), "不得有 github_token 字段");
+        assert_eq!(json["github_token_set"], true);
+        assert_eq!(json["github_owner"], "octo");
+        assert_eq!(json["github_repo"], "repo");
+
+        // 落库：token 已加密（test_state 未注入主密钥 → 明文降级，但写语义一致）
+        let id = json["id"].as_str().expect("created workspace id");
+        let ws = db.agent_get_workspace(id).await.unwrap().unwrap();
+        assert_eq!(ws.github_owner.as_deref(), Some("octo"));
+        assert_eq!(ws.github_repo.as_deref(), Some("repo"));
+        assert_eq!(ws.github_token.as_deref(), Some("ghp_secret_123"));
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_empty_github_fields_are_null() {
+        let (state, _db) = test_state().await;
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                github_token: Some("".into()), // 空串归一化 → 未配置
+                github_owner: Some("".into()),
+                github_repo: Some("".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["github_token_set"], false);
+        assert_eq!(json["github_owner"], serde_json::Value::Null);
+        assert_eq!(json["github_repo"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_github_keep_or_replace() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_set_workspace_github("w1", Some("ghp_existing"), Some("octo"), Some("repo"))
+            .await
+            .unwrap();
+
+        // 1) 空串 / 缺省 → 保持已存值（COALESCE 语义）
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                github_token: Some("".into()),
+                github_owner: Some("".into()),
+                github_repo: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.github_token.as_deref(), Some("ghp_existing"), "空串保持已存 token");
+        assert_eq!(ws.github_owner.as_deref(), Some("octo"), "空串保持已存 owner");
+
+        // 2) 非空 → 覆盖更新
+        let resp = update_workspace(
+            State(state),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                github_token: Some("ghp_new".into()),
+                github_owner: Some("newowner".into()),
+                github_repo: Some("newrepo".into()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.github_token.as_deref(), Some("ghp_new"));
+        assert_eq!(ws.github_owner.as_deref(), Some("newowner"));
+        assert_eq!(ws.github_repo.as_deref(), Some("newrepo"));
     }
 
     #[tokio::test]
@@ -1229,6 +1434,9 @@ mod tests {
                 agent_path: Some("".into()),
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1261,6 +1469,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1287,6 +1498,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("not-json".into()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1307,6 +1521,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some(r#"["model"]"#.into()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1327,6 +1544,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some(r#"{"model": 1}"#.into()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1373,6 +1593,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1397,6 +1620,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("{}".into()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await
@@ -1418,6 +1644,9 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("not-json".into()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
             }),
         )
         .await

@@ -5,11 +5,16 @@
 //! 本模块对外（`crate::mgmt::api::agent::xxx`）通过 `pub use` 保持原扁平路径兼容。
 
 mod dto;
+mod github;
 mod sessions;
 mod workspaces;
 mod ws;
 
 pub use dto::*;
+pub use github::{
+    cancel_run, dispatch_workflow, get_job_logs, get_repo_info, list_run_jobs, list_workflow_runs,
+    list_workflows, rerun_workflow,
+};
 pub use sessions::{
     archive_session, create_session, delete_session, get_default_model, list_messages,
     list_sessions, put_default_model, update_session, update_session_model,
@@ -28,4 +33,13 @@ pub use ws::{agent_ws, notifications_ws, terminal_ws};
 /// workspaces/sessions 共用（create_workspace / create_session）。
 fn new_id() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+/// 取 LLM 字段加密器（github_token 落库复用同一机制；未初始化 / 未配置主密钥时
+/// 为 None → 明文兼容降级，与 provider API Key 一致）。
+pub(crate) async fn agent_cipher(
+    state: &crate::mgmt::api::ApiState,
+) -> Option<crate::llm::crypto::LlmCipher> {
+    let guard = state.server_state.proxy_state.llm_state.read().await;
+    guard.as_ref().and_then(|l| l.cipher.clone())
 }

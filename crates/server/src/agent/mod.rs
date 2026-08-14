@@ -6,6 +6,7 @@ pub mod approval;
 pub mod compact;
 pub mod executor;
 pub mod git_plan;
+pub mod github;
 pub mod llm_bridge;
 pub mod notify;
 pub mod runner;
@@ -150,6 +151,9 @@ pub struct AgentState {
     /// （`mgmt/api/agent/ws.rs`）把出站帧翻译成 [`notify::AgentNotification`]
     /// 发布于此，浏览器全局通知 WS（`/api/agent/notifications/ws`）订阅消费。
     notifications: broadcast::Sender<notify::AgentNotification>,
+    /// GitHub REST API base URL（可注入覆盖，测试指向本地 axum mock；生产保持
+    /// 默认 [`crate::agent::github::GITHUB_API_BASE`]）。
+    github_base_url: String,
 }
 
 impl AgentState {
@@ -170,6 +174,7 @@ impl AgentState {
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
             acp_bridge: None,
             notifications: notify_tx,
+            github_base_url: crate::agent::github::GITHUB_API_BASE.to_string(),
         };
         // 审批走 AgentState::request_approval（与 runner 共用审批弹层/pending map；
         // 克隆只有 acp_bridge=None，request_approval 不依赖它）。
@@ -223,6 +228,18 @@ impl AgentState {
             self.acp_bridge = Some(bridge.with_cipher(cipher));
         }
         self
+    }
+
+    /// 覆盖 GitHub REST API base URL（测试注入本地 mock；生产保持默认）。
+    #[must_use]
+    pub fn with_github_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.github_base_url = base_url.into();
+        self
+    }
+
+    /// GitHub REST API base URL（默认 `https://api.github.com`）。
+    pub fn github_base_url(&self) -> &str {
+        &self.github_base_url
     }
 
     /// 把 LLM 网关入口（内部回环地址 + API key + 双协议域名）注入 ACP 桥。

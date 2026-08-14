@@ -334,6 +334,9 @@ mod tests {
             agent_path: None,
             llm_model_id: Some("model-1".into()),
             agent_config_overrides: None,
+            github_token: None,
+            github_owner: None,
+            github_repo: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
