@@ -1169,7 +1169,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         )}
       <div
         ref={scrollRef}
-        className="chat-fade-bottom flex-1 overflow-y-auto px-3 py-3 md:px-5 md:py-4 dark:text-foreground/85"
+        // 注意：底部不能留 padding——sticky 的 ::after 渐隐被约束在容器 content-box
+        // 内，padding-bottom 会让渐隐整体上移、遮不住可视底部（底部占位由 ::after
+        // 高度承担，见 index.css .chat-fade-bottom）
+        className="chat-fade-bottom flex-1 overflow-y-auto px-3 pt-3 md:px-5 md:pt-4 dark:text-foreground/85"
         style={{ '--fade-float': `${inputFloatH}px` } as CSSProperties}
         onScroll={(e) => {
           const el = e.currentTarget;
