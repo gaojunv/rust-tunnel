@@ -300,6 +300,23 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
                 }
             }
         }));
+        // Skill 库 use_skill 工具：服务端本地短路（同 remember，不进 AgentCommand
+        // 协议、不落审批）。会话开始已注入 <skills> 清单（name + 触发边界），模型
+        // 按需调本工具拉全文。
+        tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "use_skill",
+                "description": "Load the full content of a skill from the skill library by its name. A list of available skills (name + description) was provided at the start of this session — call this only for a skill in that list when you need its detailed steps.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The skill name exactly as listed at session start"}
+                    },
+                    "required": ["name"]
+                }
+            }
+        }));
     }
     tools
 }

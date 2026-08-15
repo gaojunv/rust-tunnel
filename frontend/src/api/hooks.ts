@@ -79,7 +79,14 @@ import {
   updateMemory,
   deleteMemory,
   pinMemory,
+  listSkills,
+  getSkill,
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  toggleSkill,
   type MemoryListParams,
+  type SkillListParams,
 } from './client';
 import type {
   LoginRequest,
@@ -98,6 +105,8 @@ import type {
   MemorySettingsRequest,
   CreateMemoryRequest,
   UpdateMemoryRequest,
+  CreateSkillRequest,
+  UpdateSkillRequest,
 } from '../types';
 
 // Shadowsocks hooks
@@ -837,14 +846,72 @@ export function useClients() {
   return useQuery({ queryKey: ['clients'], queryFn: () => clientsApi.list() });
 }
 
-/** 订阅记忆 SSE：事件到达即失效记忆列表（后台重拉）。
- *  事件不带逐条记忆 id，故无 KbDetail 的 override 通道，仅 invalidate。 */
+/** 订阅记忆/技能 SSE：事件到达即失效记忆与技能列表（后台重拉）。
+ *  事件不带逐条 id，故无 KbDetail 的 override 通道，仅 invalidate。 */
 export function useMemoryStream() {
   const qc = useQueryClient();
   useEffect(() => {
     const unsub = memoryStream.subscribe(() => {
       qc.invalidateQueries({ queryKey: ['agent-memories'] });
+      qc.invalidateQueries({ queryKey: ['agent-skills'] });
     });
     return unsub;
   }, [qc]);
+}
+
+// ── Agent Skill ──────────────────────────────────────────────────
+
+/** 技能列表查询参数（含 UI 过滤映射后的空值剔除）。queryKey `['agent-skills', params]`。 */
+export function useSkills(params: SkillListParams = {}) {
+  return useQuery({
+    queryKey: ['agent-skills', params],
+    queryFn: () => listSkills(params),
+  });
+}
+
+/** 技能详情（含 content）。queryKey `['agent-skill', id]`。 */
+export function useSkill(id: string) {
+  return useQuery({
+    queryKey: ['agent-skill', id],
+    queryFn: () => getSkill(id),
+    enabled: !!id,
+  });
+}
+
+export function useCreateSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: CreateSkillRequest) => createSkill(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-skills'] }),
+  });
+}
+
+export function useUpdateSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & UpdateSkillRequest) => updateSkill(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-skills'] });
+      qc.invalidateQueries({ queryKey: ['agent-skill', vars.id] });
+    },
+  });
+}
+
+export function useDeleteSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteSkill(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-skills'] }),
+  });
+}
+
+export function useToggleSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => toggleSkill(id),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ['agent-skills'] });
+      qc.invalidateQueries({ queryKey: ['agent-skill', id] });
+    },
+  });
 }

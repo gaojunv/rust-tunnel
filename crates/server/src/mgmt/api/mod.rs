@@ -539,6 +539,8 @@ pub async fn run_api_server(
         // AI 记忆体管理路由（settings / memories CRUD / clear / 手动蒸馏 / SSE）
         protected_routes = protected_routes.merge(agent::memory::protected_router());
         public_routes = public_routes.merge(agent::memory::public_router());
+        // Skill 库管理路由（skills CRUD + toggle）
+        protected_routes = protected_routes.merge(agent::skills::protected_router());
     }
 
     // Only apply auth middleware if password is set

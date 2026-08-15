@@ -10,6 +10,8 @@ pub mod github;
 pub mod llm_bridge;
 #[cfg(feature = "rag")]
 pub mod memory;
+#[cfg(feature = "rag")]
+pub mod skill;
 pub mod notify;
 pub mod runner;
 pub mod session;

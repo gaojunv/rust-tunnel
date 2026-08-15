@@ -364,6 +364,29 @@ async fn handle_tool_calls(
             continue;
         }
 
+        // use_skill 工具短路：服务端本地加载 Skill 全文（**不进 AgentCommand 协议**、
+        // 不落审批）。未匹配/禁用/未开启 skill 库的错误文本喂回模型。同 remember
+        // 先例（无 rag 时该工具不出现在 schema，模型不会调用；此处防御性兜底）。
+        #[cfg(feature = "rag")]
+        if call.name == "use_skill" {
+            let text = match crate::agent::skill::use_skill_from_agent(agent, rt, &call.args)
+                .await
+            {
+                Ok(msg) => msg,
+                Err(e) => format!("error: {e}"),
+            };
+            let _ = ws_tx
+                .send(serde_json::json!({
+                    "type": "tool_result",
+                    "id": &call.id,
+                    "name": &call.name,
+                    "result": &text,
+                }))
+                .await;
+            record_tool_result(agent, rt, &call.id, &call.name, text).await;
+            continue;
+        }
+
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
                 // 审批：session 记忆集命中且命令非破坏性 → 放行；否则按 workspace
@@ -612,6 +635,32 @@ pub async fn run_agent_turn(
                 Some(b)
             }
             _ => Some(String::new()), // 缓存空，避免每回合重试检索
+        };
+    }
+
+    // Skill 清单注入：记忆块之后、首回合前，每会话检索一次并缓存
+    // （rt.skill_list_block）。纯 SQL 无 embedding 依赖——skill_enabled 关闭或无
+    // 可见技能返回 None（缓存空串，避免每回合重试）。块以 `\n\n---\n\n` 分隔
+    // 追加进 system 单条（同 memory_block 段格式）。
+    #[cfg(feature = "rag")]
+    if rt.skill_list_block.is_none() {
+        let block = if let Some(memory) = agent.memory.as_ref() {
+            crate::agent::skill::retrieve_skill_list_for_session(
+                memory,
+                &rt.client_id,
+                &rt.workspace_id,
+            )
+            .await
+        } else {
+            None
+        };
+        rt.skill_list_block = match block {
+            Some(b) if !b.is_empty() => {
+                let base = rt.messages[0].content.as_deref().unwrap_or_default();
+                rt.messages[0] = ChatMessage::text("system", format!("{base}\n\n---\n\n{b}"));
+                Some(b)
+            }
+            _ => Some(String::new()),
         };
     }
 

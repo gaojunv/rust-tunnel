@@ -100,6 +100,7 @@ mod tests {
             approval_mode: "safe".into(),
             agents_md: None,
             memory_block: None,
+            skill_list_block: None,
             messages: Vec::new(),
         }
     }

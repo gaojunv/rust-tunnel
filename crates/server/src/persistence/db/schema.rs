@@ -674,6 +674,8 @@ impl Database {
                 score_threshold REAL NOT NULL DEFAULT 0.40,
                 inject_budget_tokens INTEGER NOT NULL DEFAULT 1500,
                 pin_always_inject INTEGER NOT NULL DEFAULT 1,
+                skill_enabled INTEGER NOT NULL DEFAULT 0,
+                skill_list_max INTEGER NOT NULL DEFAULT 20,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
@@ -721,6 +723,45 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // AI Skill 库主表：可复用执行经验（排障手册/发布清单/评审步骤等），
+        // 含触发边界（description）+ 执行步骤（content Markdown 全文）。**不向量化**
+        // （数量少、清单注入无需语义检索、按 name+scope 文本去重）——纯 SQLite + SQL，
+        // embedding 未配置也能工作。作用域隔离对齐 agent_memories（global|client|workspace）。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                scope_type TEXT NOT NULL DEFAULT 'workspace',
+                client_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                source_session_id TEXT NOT NULL DEFAULT '',
+                source_trigger TEXT NOT NULL DEFAULT '',
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_skills_scope ON agent_skills(client_id, workspace_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_skills_source ON agent_skills(source_session_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_skills_enabled ON agent_skills(enabled)")
+            .execute(pool)
+            .await?;
+
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
@@ -729,9 +770,38 @@ impl Database {
         Self::migrate_agent_sessions_v2(pool).await?;
         Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_sessions_add_distilled(pool).await?;
+        Self::migrate_agent_memory_settings_add_skill_columns(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
         Self::migrate_agent_messages_v4(pool).await?;
 
+        Ok(())
+    }
+
+    /// agent_memory_settings 补 Skill 库设置列（skill_enabled/skill_list_max）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_memory_settings_add_skill_columns(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "skill_enabled",
+                "ALTER TABLE agent_memory_settings ADD COLUMN skill_enabled INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "skill_list_max",
+                "ALTER TABLE agent_memory_settings ADD COLUMN skill_list_max INTEGER NOT NULL DEFAULT 20",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_memory_settings migration: column already exists");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1457,6 +1527,58 @@ mod tests {
             "idx_memories_source",
             "idx_memories_pinned",
         ] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(idx)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "索引 {idx} 应存在");
+        }
+    }
+
+    /// Skill 库 schema：agent_skills 建表默认值 + 三索引；agent_memory_settings
+    /// 两列（skill_enabled=0/skill_list_max=20）幂等迁移（初始化两次不报错）。
+    #[tokio::test]
+    async fn test_skill_schema_and_settings_migration() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+        // 幂等：再次初始化（skill_* 列已存在，ALTER 跳过）
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // agent_skills 默认值
+        sqlx::query("INSERT INTO agent_skills (id, name, content) VALUES ('s1', 'deploy', '## 步骤')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (scope, enabled, use_count, trigger): (String, i64, i64, String) = sqlx::query_as(
+            "SELECT scope_type, enabled, use_count, source_trigger FROM agent_skills WHERE id = 's1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scope, "workspace");
+        assert_eq!(enabled, 1);
+        assert_eq!(use_count, 0);
+        assert_eq!(trigger, "");
+
+        // settings 新列默认值
+        sqlx::query("INSERT INTO agent_memory_settings (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (skill_enabled, skill_list_max): (i64, i64) = sqlx::query_as(
+            "SELECT skill_enabled, skill_list_max FROM agent_memory_settings WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(skill_enabled, 0, "skill_enabled 默认 0（opt-in）");
+        assert_eq!(skill_list_max, 20, "skill_list_max 默认 20");
+
+        // 三索引存在
+        for idx in ["idx_skills_scope", "idx_skills_source", "idx_skills_enabled"] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
             )

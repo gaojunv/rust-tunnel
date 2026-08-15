@@ -192,6 +192,11 @@ struct SpawnedAgent {
     /// 注入块。`prompt_inner` 发送前把块 prepend 到 user content 头部（不进 DB，
     /// 持久化保持干净；distill 渲染也会剥离 `<memory>` 块，无回环）。
     memory_block: Option<String>,
+    /// Skill 清单注入缓存（同 memory_block 模式）：None = 尚未检索；Some("") =
+    /// 无可用技能；Some(非空) = 已注入 `<skills>` 块。`prompt_inner` 与 memory_block
+    /// 一并 prepend；distill 渲染也会剥离 `<skills>` 块，无回环。纯 SQL 检索，
+    /// 零 embedding 依赖。
+    skill_list_block: Option<String>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -346,6 +351,24 @@ impl AcpBridge {
             a.memory_block = block;
         }
     }
+
+    /// 读会话的 Skill 清单注入缓存（None = 尚未检索）。WS handler 在首条消息检索后
+    /// 经 [`Self::set_skill_list_block`] 写入；`prompt_inner` 发送前与 memory_block
+    /// 一并 prepend。
+    pub async fn cached_skill_list_block(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|a| a.skill_list_block.clone())
+    }
+
+    /// 写会话的 Skill 清单注入缓存。语义与 [`Self::set_memory_block`] 一致。
+    pub async fn set_skill_list_block(&self, session_id: &str, block: Option<String>) {
+        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+            a.skill_list_block = block;
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -390,6 +413,7 @@ mod tests {
     fn spawned_agent() -> SpawnedAgent {
         SpawnedAgent {
             memory_block: None,
+            skill_list_block: None,
             acp_session_id: None,
             connection: None,
             agent_io: None,

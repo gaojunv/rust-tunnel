@@ -51,6 +51,10 @@ import type {
   CreateMemoryRequest,
   UpdateMemoryRequest,
   MemorySettingsRequest,
+  AgentSkill,
+  AgentSkillsResponse,
+  CreateSkillRequest,
+  UpdateSkillRequest,
   FsEntry,
   FsFileContent,
   GitStatusResult,
@@ -737,6 +741,58 @@ export async function pinMemory(id: string): Promise<AgentMemory> {
 /** 手动重蒸馏指定会话（复位 distilled=0 重跑）。 */
 export async function distillSession(sessionId: string): Promise<void> {
   await api.post(`/agent/sessions/${encodeURIComponent(sessionId)}/distill`);
+}
+
+// ── Agent Skill ──────────────────────────────────────────────────
+
+/** 技能列表查询参数；空值会自动剔除（不进 URL）。 */
+export interface SkillListParams {
+  scope?: string;
+  client_id?: string;
+  workspace_id?: string;
+  q?: string;
+  enabled?: boolean;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listSkills(params: SkillListParams = {}): Promise<AgentSkillsResponse> {
+  const clean: Record<string, string | number> = {};
+  if (params.scope) clean.scope = params.scope;
+  if (params.client_id) clean.client_id = params.client_id;
+  if (params.workspace_id) clean.workspace_id = params.workspace_id;
+  if (params.q) clean.q = params.q;
+  if (params.enabled !== undefined) clean.enabled = params.enabled ? 'true' : 'false';
+  if (params.sort) clean.sort = params.sort;
+  if (params.limit !== undefined) clean.limit = params.limit;
+  if (params.offset !== undefined) clean.offset = params.offset;
+  const { data } = await api.get('/agent/skills', { params: clean });
+  return { skills: data.skills ?? [], total: data.total ?? 0 };
+}
+
+export async function getSkill(id: string): Promise<AgentSkill> {
+  const { data } = await api.get(`/agent/skills/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function createSkill(req: CreateSkillRequest): Promise<AgentSkill> {
+  const { data } = await api.post('/agent/skills', req);
+  return data;
+}
+
+export async function updateSkill(id: string, req: UpdateSkillRequest): Promise<AgentSkill> {
+  const { data } = await api.put(`/agent/skills/${encodeURIComponent(id)}`, req);
+  return data;
+}
+
+export async function deleteSkill(id: string): Promise<void> {
+  await api.delete(`/agent/skills/${encodeURIComponent(id)}`);
+}
+
+export async function toggleSkill(id: string): Promise<AgentSkill> {
+  const { data } = await api.post(`/agent/skills/${encodeURIComponent(id)}/toggle`);
+  return data;
 }
 
 export function agentWsUrl(sessionId: string): string {

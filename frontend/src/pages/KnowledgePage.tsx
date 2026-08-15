@@ -14,6 +14,7 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import SharedEmbeddingSettings from '@/components/knowledge/SharedEmbeddingSettings';
 import KbSection from '@/components/knowledge/KbSection';
 import MemorySection from '@/components/knowledge/MemorySection';
+import SkillSection from '@/components/knowledge/SkillSection';
 
 /** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出共享 Embedding 配置。 */
 export default function KnowledgePage() {
@@ -28,6 +29,7 @@ export default function KnowledgePage() {
           <TabsList>
             <TabsTrigger value="kb">{t('nav.knowledgeBase')}</TabsTrigger>
             <TabsTrigger value="memory">{t('nav.memory')}</TabsTrigger>
+            <TabsTrigger value="skill">{t('nav.skill')}</TabsTrigger>
           </TabsList>
           <Button variant="outline" size="sm" onClick={() => setSettingsOpen(true)}>
             <Settings className="mr-1 h-4 w-4" />
@@ -39,6 +41,9 @@ export default function KnowledgePage() {
         </TabsContent>
         <TabsContent value="memory" className="mt-4">
           <MemorySection />
+        </TabsContent>
+        <TabsContent value="skill" className="mt-4">
+          <SkillSection />
         </TabsContent>
       </Tabs>
 
