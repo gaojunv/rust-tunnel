@@ -24,11 +24,17 @@ import SubagentPanel from './SubagentPanel';
 import SystemMessage from './SystemMessage';
 import ConfigOptionButton from './ConfigOptionButton';
 import { normalizeConfigOptions, optionValue, restoreConfigValue } from './sessionConfig';
-import { historyToChatItems, historyToChatItemsWithSkip, prependSkip } from './history';
+import {
+  compactionSkippedIndices,
+  historyToChatItems,
+  historyToChatItemsWithSkip,
+  prependSkip,
+} from './history';
 import {
   appendChildStream,
   chunkKey,
   collectSubagents,
+  mergePages,
   parseChunkKey,
   patchChildToolResult,
   upsertToolCard,
@@ -133,6 +139,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // 消息区滚动容器 ref：虚拟化的 getScrollElement 目标。
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 「加载更早」按钮占位高度：虚拟化下按钮显隐会改变滚动内容高度，显隐切换时
+  // 按此补偿 scrollTop，保持可视内容位置不因按钮占位变化而跳动（尤其 subagent
+  // 固定面板定位）。按钮卸载后无法测高，故在 loadEarlier 期间（按钮仍挂载）捕获
+  // 到 lastButtonHeightRef，effect 读它补偿。
+  const earlierButtonRef = useRef<HTMLDivElement>(null);
+  const lastButtonHeightRef = useRef(0);
+  // 上次 hasMore 值：null = 首次装载（无滚动基线，不补偿）
+  const prevHasMoreRef = useRef<boolean | null>(null);
   // 历史只在挂载时装载一次：refetch（done 后 invalidate）会改写聊天区，
   // 而对话中新增的 item 是会话内的实时增量，不能用服务器历史整体覆盖。
   const loadedRef = useRef(false);
@@ -143,6 +157,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const loadingEarlierRef = useRef(false);
   const loadedRawRef = useRef<AgentMessage[]>([]);
+  // 更早分页的原始行数（loadedRawRef 中「更早分页」与「最新页」的切分界标）。
+  // 对账重载（断线重连/done 后 refetch）需要保留更早分页、只刷新最新页——按此前缀
+  // 从 loadedRawRef 切出更早行，与 refetch 拿到的最新页拼成完整集合重建 items。
+  const earlierCountRef = useRef(0);
   // items 的 ref 镜像：历史 effect 自愈守卫读（避免把 items 加入 effect 依赖）
   const itemsRef = useRef<ChatItem[]>([]);
   useEffect(() => {
@@ -157,8 +175,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const streamingIdxRef = useRef<number | null>(null);
   // 流式气泡的种类：文本与 thought 分气泡（kind 切换即断流）
   const streamingKindRef = useRef<'assistant' | 'thought' | null>(null);
-  // 在飞 tool_call id 顺序表：tool_result 缺 name 时按 id 回退匹配卡片
-  const toolIdsRef = useRef<string[]>([]);
   // 流式 chunk 攒批缓冲（Map：key = chunkKey(parentToolId, kind)）。WS 帧先追加到
   // 这里，定时 flush 进 items（节流渲染）。主/子文本按 (parent, kind) 分键攒批，
   // 避免交错时互相串气泡——子 agent 文本收进父卡 children，不污染主流气泡。
@@ -292,6 +308,25 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     [virtualizer],
   );
 
+  // 按钮显隐补偿：hasMore 翻转（出现 true / 消失 false）时，滚动内容因按钮占位
+  // 变化而整体位移 h——把 scrollTop 反向调整 h 使可视内容保持原位。首轮装载
+  // （prevHasMoreRef 为 null）不补偿：挂载时 scrollTop=0 无基线，且首屏内容随
+  // 历史装载自然下移属正常。h 由 loadEarlier 在按钮仍挂载时捕获（lastButtonHeightRef）。
+  useEffect(() => {
+    if (prevHasMoreRef.current === null) {
+      prevHasMoreRef.current = hasMore;
+      return;
+    }
+    if (prevHasMoreRef.current === hasMore) return;
+    prevHasMoreRef.current = hasMore;
+    const el = scrollRef.current;
+    if (!el) return;
+    const h = lastButtonHeightRef.current;
+    if (h <= 0) return;
+    // 按钮出现（false→true）：其占位把内容下推 h，需下滚 h 拉回；消失（true→false）反向
+    el.scrollTop += hasMore ? h : -h;
+  }, [hasMore]);
+
   // 历史消息（与 ActivityBar 的 Git 面板共享 queryKey，invalidate 后自动刷新）。
   // 关键：staleTime 0 + refetchOnMount 'always'。staleTime Infinity 会留下陈旧
   // 缓存——切到别的 session 再切回时 key={sessionId} 触发全新挂载，但 React
@@ -322,7 +357,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       return;
     }
     loadedRef.current = true;
-    if (!isReconcileReload && rows.length > 0) {
+    if (isReconcileReload) {
+      // 对账重载（断线重连/done 后 refetch）：不再整体重置为最新一页——用户已加载
+      // 的更早分页从视口消失要重新翻（DB 未丢但体验差）。改为合并：保留更早分页
+      // 原始行（loadedRawRef 按 earlierCountRef 切分），只把「最新页」替换为
+      // refetch 拿到的最新数据（断线期间服务端跑完落库/新增的消息在此补齐）。
+      // hasMore 保持用户当前状态（不随首页重取复位，M20）。
+      const earlierRows = loadedRawRef.current.slice(0, earlierCountRef.current);
+      const mergedRaw = [...earlierRows, ...rows];
+      loadedRawRef.current = mergedRaw;
+      // 在完整合并集合上重算压缩重插去重：跨页重复/对账期间新增的 summary 重插段
+      // 一并处理（groupByParent 在集合内跨页归组，父卡缺席的孤儿子项不会残留）。
+      setItems(historyToChatItemsWithSkip(mergedRaw, compactionSkippedIndices(mergedRaw)));
+      return;
+    }
+    if (rows.length > 0) {
       // 装载历史时若末尾是 tool_calls/tool_result 行，说明上次回合可能在工具执行中
       // 被打断（刷新/断线/服务端崩溃）。ACP 会话进程可能仍在跑（busy=true）。把
       // running 置 true 让用户看到「回合可能仍在执行」，直到 done/stopped/error 帧
@@ -342,6 +391,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // 去重、plan 只留最后一条），见 history.ts。
     setItems(historyToChatItems(rows));
     loadedRawRef.current = rows;
+    earlierCountRef.current = 0;
     // has_more 只在真正装载（重建 items）时随首页数据同步（M20）：done 对账重载、
     // 自愈重装都走这里。后台 refetch 被「实时保护」守卫早退、t 依赖重跑也早退，
     // 均不触达——否则用户翻页到底（hasMore=false）后一次 history refetch 就把
@@ -365,6 +415,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     if (!oldestId) return;
     loadingEarlierRef.current = true;
     setLoadingEarlier(true);
+    // 按钮仍挂载时捕获其占位高度：本页加载完成后 hasMore 可能翻转（按钮卸载），
+    // 显隐补偿 effect 需要此值来抵消滚动内容的高度变化（见 hasMore effect）。
+    lastButtonHeightRef.current = earlierButtonRef.current?.offsetHeight ?? 0;
     try {
       const page = await listAgentMessages(sessionId, {
         before: oldestId,
@@ -380,13 +433,23 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         page.messages,
         prependSkip(page.messages, loadedRawRef.current),
       );
+      earlierCountRef.current += page.messages.length;
       loadedRawRef.current = [...page.messages, ...loadedRawRef.current];
       setHasMore(page.has_more);
       setItems((prev) => {
+        // 跨页孤儿重归组：更早页的父 Task 卡到达时，把已加载页中指向它的顶层孤儿
+        // 子项收进父卡 children（mergePages，见 subagent.ts）。返回被吸收孤儿在
+        // prev 中的下标——孤儿从顶层移除后其后各项下标额外 -1，streamingIdxRef
+        // 需据此修正（仅按 olderItems.length 位移会把流式气泡下标算偏，破坏续文合并）。
+        const { items, absorbedIndexes } = mergePages(olderItems, prev);
         if (streamingIdxRef.current !== null) {
-          streamingIdxRef.current += olderItems.length;
+          let shift = olderItems.length;
+          for (const i of absorbedIndexes) {
+            if (i < streamingIdxRef.current) shift -= 1;
+          }
+          streamingIdxRef.current += shift;
         }
-        return [...olderItems, ...prev];
+        return items;
       });
     } catch {
       // 加载失败静默：保留现状，用户可再次点击重试
@@ -591,7 +654,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         if (!parentToolId) {
           if (msg.id) {
             pendingTools.add(msg.id);
-            toolIdsRef.current.push(msg.id);
           }
           armRunning();
         }
@@ -678,7 +740,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         } else {
           if (msg.id) {
             pendingTools.delete(msg.id);
-            toolIdsRef.current = toolIdsRef.current.filter((x) => x !== msg.id);
           }
           setItems((prev) => {
             const next = [...prev];
@@ -723,14 +784,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
                 }
               }
             }
-            // name 缺失/未命中：按 id 回退——id 在 toolIdsRef 的序号对应倒序未完成卡片
+            // name 缺失/未命中：按 id 回退——遍历 items 取最早未完成卡片。ACP
+            // 工具按序完成，最早未完成即当前工具；pendingTools 快照在重连后不可靠
+            // （DB 已落库的卡无对应 pending），故直接在 items 上扫描。
             if (msg.id) {
               const pendingIdx: number[] = [];
               for (let i = 0; i < next.length; i++) {
                 if (next[i].kind === 'tool' && next[i].toolResult == null) pendingIdx.push(i);
               }
-              // toolIdsRef 已移除本 id；用 pendingTools 快照不可靠，直接按到达顺序：
-              // 同名匹配失败后取最早未完成卡片（ACP 工具按序完成，最早未完成即当前）
               if (pendingIdx.length > 0) {
                 patch(pendingIdx[0]);
               }
@@ -1313,6 +1374,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         )}
       <div
         ref={scrollRef}
+        data-testid="chat-scroll-container"
         className="flex-1 overflow-y-auto px-3 pt-3 md:px-5 md:pt-4 dark:text-foreground/85"
         onScroll={(e) => {
           const el = e.currentTarget;
@@ -1327,7 +1389,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         <div className="mx-auto flex w-full min-h-full max-w-3xl flex-col">
         <div className="flex-1">
         {hasMore && items.length > 0 && (
-          <div className="flex justify-center py-1.5">
+          <div ref={earlierButtonRef} className="flex justify-center py-1.5">
             <Button
               type="button"
               variant="ghost"

@@ -210,6 +210,21 @@ describe('AgentPage', () => {
     });
   });
 
+  it('falls back to first workspace when restored lastWorkspaceId is invalid (M7)', async () => {
+    // 从 localStorage 恢复的 workspaceId 已不在 workspaces 列表（工作区被删除）：
+    // 必须回退到第一个可用工作区，而不是卡在失效 id（否则会话列表按失效 id 拉取恒空）。
+    localStorage.setItem('agent.lastWorkspaceId', 'ghost-ws');
+    api.listAgentSessions.mockResolvedValue([sessionFixtures.s1]);
+
+    renderPage();
+
+    // 顶栏回退显示第一个工作区名称（proj），会话列表按 w1 拉取并播种 s1
+    expect(await screen.findByText('proj')).toBeTruthy();
+    expect(api.listAgentSessions).toHaveBeenCalledWith('w1');
+    const stream = await screen.findByTestId('chat-stream');
+    expect(sessionIdOf(stream)).toBe('s1');
+  });
+
   it('falls back to newest session when stored id is gone', async () => {
     localStorage.setItem('agent.lastWorkspaceId', 'w1');
     localStorage.setItem('agent.lastSessionId', 's-deleted');

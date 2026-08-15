@@ -144,6 +144,65 @@ export function groupByParent(flat: ChatItem[]): ChatItem[] {
   return [...grouped, ...orphans];
 }
 
+/** mergePages 的返回：合并后的列表 + 被吸收的孤儿在已加载页中的下标（升序）。
+ *  调用方据此修正流式气泡 ref 的位移（孤儿从顶层移除后，其后各项下标额外 -1）。 */
+export interface MergePagesResult {
+  items: ChatItem[];
+  absorbedIndexes: number[];
+}
+
+/**
+ * 分页「加载更早」的跨页孤儿重归组：更早一页（`older`，含父 Task 卡）到达时，
+ * 把已加载页（`loaded`）中按 `parentToolId` 指向这些父卡的顶层孤儿子项收进父卡
+ * children，与「父卡后到」的实时路径（orphan 收纳）行为一致。
+ *
+ * 时序背景：分页加载时父 Task 卡的 tool_calls 行可能落在更早页、而其子项
+ * （parent_tool_call_id 指向父卡 id 的 tool/text/thought 行）在已加载页。已加载页
+ * 首次转换时父卡缺席，子项经 groupByParent 降级为顶层孤儿平铺；父卡随更早页并入后
+ * 必须把它们收回 children，否则子项永久停留在主流（跨页孤儿 Bug）。
+ *
+ * - 只移动顶层孤儿（`loaded` 内带 parentToolId 且命中 `older` 顶层父卡 toolId 的项）；
+ * - 孤儿按到达顺序追加到父卡既有 children 之后（子项在更早页之后落库，chronologically 靠后）；
+ * - 父卡在 `older` 内嵌套（本身是更早层父卡的 children）时同样按递归命中；
+ * - 返回被吸收孤儿在 `loaded` 中的下标，供调用方修正 streamingIdxRef 等下标位移。
+ */
+export function mergePages(older: ChatItem[], loaded: ChatItem[]): MergePagesResult {
+  // 更早页中出现的父卡 toolId 集合（含嵌套在 children 里的父卡）
+  const parentIds = new Set<string>();
+  const collectIds = (it: ChatItem) => {
+    if (it.kind === 'tool' && it.toolId) parentIds.add(it.toolId);
+    for (const c of it.children ?? []) collectIds(c);
+  };
+  for (const it of older) collectIds(it);
+  if (parentIds.size === 0) return { items: [...older, ...loaded], absorbedIndexes: [] };
+
+  const orphans: ChatItem[] = [];
+  const absorbedIndexes: number[] = [];
+  const rest: ChatItem[] = [];
+  for (let i = 0; i < loaded.length; i++) {
+    const it = loaded[i];
+    if (it.parentToolId && parentIds.has(it.parentToolId)) {
+      orphans.push(it);
+      absorbedIndexes.push(i);
+    } else {
+      rest.push(it);
+    }
+  }
+  if (orphans.length === 0) return { items: [...older, ...loaded], absorbedIndexes: [] };
+
+  // 把孤儿按 parentToolId 收进对应父卡 children（递归命中嵌套父卡）
+  const attach = (it: ChatItem): ChatItem => {
+    const children = (it.children ?? []).map(attach);
+    if (it.kind === 'tool' && it.toolId) {
+      const kids = orphans.filter((o) => o.parentToolId === it.toolId);
+      if (kids.length > 0) return { ...it, children: [...children, ...kids] };
+    }
+    if (it.children && it.children.length > 0) return { ...it, children };
+    return it;
+  };
+  return { items: [...older.map(attach), ...rest], absorbedIndexes };
+}
+
 /**
  * 工具卡按 toolId 就地升级（live tool_call 与历史孤儿卡/已收纳子卡去重）：
  * 避免同一工具两张卡（tool_result 只 patch 一张，另一张永远 running）。

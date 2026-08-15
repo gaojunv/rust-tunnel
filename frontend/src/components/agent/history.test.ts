@@ -55,6 +55,80 @@ describe('historyToChatItems', () => {
     expect(tools[0].toolResult).toBe('最终结果');
   });
 
+  it('parses JSON tool_result content: text + status + diffs + locations (M2)', () => {
+    // 服务端新契约：kind='tool_result' 行 content 为 JSON {text,status,diffs,locations}。
+    // text 作卡片结果、status 作终态（failed 不再恒显 ✓）、diffs/locations 合并进卡。
+    const calls = JSON.stringify([{ id: 'c1', name: 'edit_file', arguments: '{"path":"a.ts"}' }]);
+    const content = JSON.stringify({
+      text: '已修改',
+      status: 'failed',
+      diffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      locations: [{ path: 'a.ts', line: 3 }],
+    });
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'c1', name: 'edit_file' }),
+      row({ id: 'm2', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'edit_file', content }),
+    ]);
+    const tool = items.find((it) => it.kind === 'tool' && it.toolId === 'c1')!;
+    expect(tool).toMatchObject({
+      toolResult: '已修改',
+      toolStatus: 'failed',
+      toolDiffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      toolLocations: [{ path: 'a.ts', line: 3 }],
+    });
+  });
+
+  it('treats legacy plain-text tool_result as completed (M2 backward compat)', () => {
+    const calls = JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]);
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'c1', name: 'list_dir' }),
+      row({ id: 'm2', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'list_dir', content: 'src/ tests/' }),
+    ]);
+    const tool = items.find((it) => it.kind === 'tool' && it.toolId === 'c1')!;
+    expect(tool.toolResult).toBe('src/ tests/');
+    expect(tool.toolStatus).toBe('completed');
+  });
+
+  it('falls back to raw text when tool_result content is JSON without a string text (M2)', () => {
+    // 非新契约结构（JSON 数组/缺 text 字段）→ 按纯文本原样展示，不吞内容
+    const calls = JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]);
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'c1', name: 'list_dir' }),
+      row({ id: 'm2', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'list_dir', content: '{"status":"weird"}' }),
+    ]);
+    const tool = items.find((it) => it.kind === 'tool' && it.toolId === 'c1')!;
+    expect(tool.toolResult).toBe('{"status":"weird"}');
+    expect(tool.toolStatus).toBe('completed');
+  });
+
+  it('JSON intermediate running row does not mask the final failed row (failed shows failed)', () => {
+    // 同一 tool_call_id 多行 tool_result：中间态 JSON（{"status":"running"}）先落库、
+    // 终态失败行（{"status":"failed","text":...}）后落库。终态行有 content 且靠后，
+    // 应胜出——卡片状态 failed（修复「历史上失败工具恒显 ✓」）。
+    const calls = JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]);
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'c1', name: 'list_dir' }),
+      row({ id: 'm2', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'list_dir', content: JSON.stringify({ status: 'running' }) }),
+      row({ id: 'm3', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'list_dir', content: JSON.stringify({ text: '无权限', status: 'failed' }) }),
+    ]);
+    const tool = items.find((it) => it.kind === 'tool' && it.toolId === 'c1')!;
+    expect(tool).toMatchObject({ toolResult: '无权限', toolStatus: 'failed' });
+  });
+
+  it('JSON diffs only on tool_result survive refresh even without diffs on tool_calls (M2)', () => {
+    // 仅 ToolCallUpdate 携带的 diff 刷新后丢失：tool_calls 行无 diffs、tool_result
+    // content JSON 带 diffs → 卡片必须拿到 diffs。
+    const calls = JSON.stringify([{ id: 'c1', name: 'Edit a.ts', arguments: '{"path":"a.ts"}' }]);
+    const content = JSON.stringify({ text: 'done', diffs: [{ path: 'a.ts', old_text: 'a', new_text: 'b' }] });
+    const items = historyToChatItems([
+      row({ id: 'm1', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'c1', name: 'Edit a.ts' }),
+      row({ id: 'm2', kind: 'tool_result', tool_call_id: 'c1', role: 'tool', name: 'Edit a.ts', content }),
+    ]);
+    const tool = items.find((it) => it.kind === 'tool' && it.toolId === 'c1')!;
+    expect(tool.toolDiffs).toEqual([{ path: 'a.ts', old_text: 'a', new_text: 'b' }]);
+    expect(tool.toolResult).toBe('done');
+  });
+
   it('renders orphan tool_calls row as failed placeholder card (turn interrupted mid-tool)', () => {
     // 回合在工具执行中被刷新/断线打断：tool_call 已落库，tool_result 永不到达。
     // 无配对 → failed 占位卡，否则该工具从聊天区彻底消失。

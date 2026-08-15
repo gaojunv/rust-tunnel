@@ -51,4 +51,14 @@ export default [
       ],
     },
   },
+  {
+    // Vite 配置运行于 Node 侧（vite.config.js/ts 为 tsc 产物或 TS 源），声明 node 全局
+    files: ['vite.config.js', 'vite.config.ts'],
+    languageOptions: {
+      globals: {
+        __dirname: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
 ];

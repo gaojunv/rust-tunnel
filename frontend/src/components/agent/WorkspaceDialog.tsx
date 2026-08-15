@@ -137,9 +137,15 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
 
   // 序列化 overrides：有有效行 → JSON；无有效行且原记录有值（编辑模式）→ "{}" 清空；
   // 否则 undefined（不发送该字段，后端保持原值）。
-  const overridesPayload = (): string | undefined =>
-    serializeOverrides(overrideRows) ??
-    (editing?.agent_config_overrides ? '{}' : undefined);
+  // 非 ACP 引擎（agent_type 为空 = 内置 runner）不提交 overrides：overrideRows 在
+  // UI 上随引擎切换被隐藏，仍随表单提交会带着旧值「复活」到后端（切回 ACP 时旧配置
+  // 重现）；内置 runner 不用 overrides，省略字段由后端按其 agent_type 语义处理。
+  const overridesPayload = (): string | undefined => {
+    if (agentType === '') return undefined;
+    return (
+      serializeOverrides(overrideRows) ?? (editing?.agent_config_overrides ? '{}' : undefined)
+    );
+  };
 
   const submit = async () => {
     if (!canSubmit || submitting) return;

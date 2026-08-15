@@ -128,6 +128,49 @@ export function parseAcpToolJson(json: string): {
   }
 }
 
+const TOOL_STATUSES = ['pending', 'in_progress', 'running', 'completed', 'failed'] as const;
+
+function asToolStatus(v: unknown): ChatItem['toolStatus'] | undefined {
+  return typeof v === 'string' && (TOOL_STATUSES as readonly string[]).includes(v)
+    ? (v as ChatItem['toolStatus'])
+    : undefined;
+}
+
+/** kind='tool_result' 行 content 结构化解析结果（服务端新契约，见
+ *  `parseToolResultContent`）。空字段省略。 */
+export interface ParsedToolResult {
+  text: string;
+  status?: ChatItem['toolStatus'];
+  diffs?: ToolDiff[];
+  locations?: ToolLocation[];
+}
+
+/** 解析 kind='tool_result' 行 content：服务端新契约把它从纯文本升级为 JSON
+ *  `{"text": string, "status"?: string, "diffs"?: ToolDiff[], "locations"?: ToolLocation[]}`
+ *  （空字段省略；status 为 running/completed/failed 等）。向后兼容：存量旧行仍是
+ *  纯文本——解析失败或 JSON 不含 string 型 `text`（非该结构）一律按纯文本原样返回。
+ *  导出供 history.ts（历史还原卡片）与 GitPanel（git_status 回退展示）等消费。 */
+export function parseToolResultContent(content: string): ParsedToolResult {
+  if (!content) return { text: content };
+  try {
+    const v: unknown = JSON.parse(content);
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const obj = v as Record<string, unknown>;
+      if (typeof obj.text === 'string') {
+        return {
+          text: obj.text,
+          status: asToolStatus(obj.status),
+          diffs: asDiffs(obj.diffs),
+          locations: asLocations(obj.locations),
+        };
+      }
+    }
+  } catch {
+    /* 非 JSON → 纯文本旧格式 */
+  }
+  return { text: content };
+}
+
 /** 解析历史行 plan content（entries JSON 文本）。 */
 export function parsePlanEntries(json: string): PlanEntryItem[] {
   try {

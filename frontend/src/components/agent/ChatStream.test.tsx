@@ -1853,4 +1853,153 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('前文续文')).toBeTruthy();
     expect(screen.queryByText('续文')).toBeNull();
   });
+
+  it('re-groups cross-page subagent orphans into the parent card from the earlier page', async () => {
+    // 分页边界：父 Task 卡在更早页、子项（parent_tool_call_id 指向父卡）在已加载页。
+    // 已加载页首次转换时父卡缺席 → 子项孤儿平铺；更早页并入后必须重新收进父卡 children。
+    const row = (id: string, role: string, content: string, kind: string) => ({
+      id,
+      session_id: 's1',
+      role,
+      content,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      parent_tool_call_id: null,
+      kind,
+      created_at: '2026-08-05',
+    });
+    const taskCall = JSON.stringify([{ id: 'task1', name: 'Task', arguments: '{"description":"调研任务"}' }]);
+    const childCall = JSON.stringify([{ id: 'c1', name: 'read_file', arguments: '{"path":"a.rs"}' }]);
+    (listAgentMessages as Mock)
+      .mockResolvedValueOnce({
+        messages: [
+          { ...row('m3', 'user', '看下目录', 'message') },
+          { ...row('m4', 'assistant', '', 'tool_calls'), tool_calls: childCall, tool_call_id: 'c1', name: 'read_file', parent_tool_call_id: 'task1' },
+          { ...row('m5', 'tool', 'fn main(){}', 'tool_result'), tool_call_id: 'c1', name: 'read_file', parent_tool_call_id: 'task1' },
+          { ...row('m6', 'assistant', '子代理文本', 'message'), parent_tool_call_id: 'task1' },
+        ],
+        has_more: true,
+      })
+      .mockResolvedValue({
+        messages: [
+          { ...row('m1', 'assistant', '', 'tool_calls'), tool_calls: taskCall, tool_call_id: 'task1', name: 'Task' },
+          { ...row('m2', 'tool', '调研完成', 'tool_result'), tool_call_id: 'task1', name: 'Task' },
+        ],
+        has_more: false,
+      });
+    renderChat();
+    // 首页：父卡缺席，孤儿子项平铺可见
+    expect(await screen.findByText('看下目录')).toBeTruthy();
+    expect(screen.getByText('子代理文本')).toBeTruthy();
+    // 加载更早页：父 Task 卡出现，孤儿被收进父卡 children（默认折叠 → 不可见）。
+    // 注意「调研任务」会出现两处：subagent 固定面板行 + 对话卡头部（联动展示）。
+    await act(async () => {
+      fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
+    });
+    const parentLabels = await screen.findAllByText('调研任务');
+    expect(parentLabels.length).toBeGreaterThan(0);
+    expect(screen.queryByText('子代理文本')).toBeNull();
+    // 展开对话卡（面板行在 DOM 前，取最后一个）：子项在 children 内可见（无顶层重复）
+    act(() => {
+      parentLabels[parentLabels.length - 1].closest('button')!.click();
+    });
+    expect(screen.getByText('子代理文本')).toBeTruthy();
+    // 展开子工具卡（read_file 归一化为 Read）→ 其结果在 children 内
+    fireEvent.click(screen.getAllByText('Read')[0].closest('button')!);
+    expect(screen.getByText(/fn main\(\)/)).toBeTruthy();
+    // 顶层只有一张 Read 卡（子卡嵌套，未重复渲染）
+    expect(screen.getAllByText('Read')).toHaveLength(1);
+  });
+
+  it('keeps loaded earlier pages on done reconcile reload (merge instead of reset)', async () => {
+    // 对账重载路径：半截装载（末行 tool_calls）→ done 到达后服务端已完整落库 →
+    // refetch 重渲染。此前把 items 整体重置为最新页，用户已加载的更早分页从视口
+    // 消失；修复后合并——保留更早分页、只刷新最新页，hasMore 不复位（按钮不复活）。
+    const row = (i: number, overrides: Record<string, unknown> = {}) => ({
+      id: `m${i}`,
+      session_id: 's1',
+      role: 'user' as const,
+      content: `消息 ${i}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      parent_tool_call_id: null,
+      kind: 'message' as const,
+      created_at: '2026-08-05',
+      ...overrides,
+    });
+    const orphanCalls = JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]);
+    (listAgentMessages as Mock)
+      .mockResolvedValueOnce({
+        messages: [row(4), row(5, { kind: 'tool_calls', content: '', tool_calls: orphanCalls, tool_call_id: 'c1', name: 'list_dir' })],
+        has_more: true,
+      })
+      .mockResolvedValueOnce({ messages: [row(0), row(1), row(2)], has_more: false })
+      .mockResolvedValue({
+        messages: [
+          row(4),
+          row(5, { kind: 'tool_calls', content: '', tool_calls: orphanCalls, tool_call_id: 'c1', name: 'list_dir' }),
+          row(6, { kind: 'tool_result', content: 'src/ tests/', tool_call_id: 'c1', name: 'list_dir' }),
+          row(7, { content: '完成' }),
+        ],
+        has_more: true,
+      });
+    renderChat();
+    // 半截装载：孤儿工具卡（failed）+ running 兜底
+    expect(await screen.findByText('消息 4')).toBeTruthy();
+    expect(screen.getByText('✗')).toBeTruthy();
+    // 加载更早页（m0..m2，最后一页 → hasMore false，按钮消失）
+    await act(async () => {
+      fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
+    });
+    expect(await screen.findByText('消息 0')).toBeTruthy();
+    expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
+    // done → 服务端已完整落库 → invalidate → refetch 返回完整最新页（m4..m7）
+    await act(async () => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    // 对账合并：更早页（m0..m2）保留 + 最新页刷新（m4..m7），hasMore 保持 false
+    expect(await screen.findByText('完成')).toBeTruthy();
+    expect(screen.getByText('消息 0')).toBeTruthy();
+    expect(screen.getByText('消息 1')).toBeTruthy();
+    expect(screen.getByText('消息 2')).toBeTruthy();
+    expect(screen.getByText('消息 4')).toBeTruthy();
+    // 孤儿卡变完成（✓），不再误标 running
+    expect(screen.getByText('✓')).toBeTruthy();
+    expect(screen.queryByText('✗')).toBeNull();
+    // 没有更多 → 「加载更早」按钮不复活
+    expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
+  });
+
+  it('compensates scrollTop when the load-earlier button disappears (last page)', async () => {
+    const row = (i: number) => ({
+      id: `m${i}`,
+      session_id: 's1',
+      role: 'user' as const,
+      content: `消息 ${i}`,
+      tool_calls: null,
+      tool_call_id: null,
+      name: null,
+      kind: 'message' as const,
+      created_at: '2026-08-05',
+    });
+    (listAgentMessages as Mock)
+      .mockResolvedValueOnce({ messages: [row(3), row(4), row(5)], has_more: true })
+      .mockResolvedValue({ messages: [row(0), row(1), row(2)], has_more: false });
+    renderChat();
+    expect(await screen.findByText('消息 3')).toBeTruthy();
+    // jsdom 无布局：按钮占位高度手动注入（模拟真实 ~40px）
+    const wrapper = screen.getByText('agent.loadEarlierMessages').closest('div')!;
+    Object.defineProperty(wrapper, 'offsetHeight', { configurable: true, value: 40 });
+    const scrollEl = screen.getByTestId('chat-scroll-container') as HTMLElement;
+    scrollEl.scrollTop = 200;
+    // 加载最后一页 → hasMore 翻转 false → 按钮消失 → 滚动偏移补偿 -40
+    await act(async () => {
+      fireEvent.click(screen.getByText('agent.loadEarlierMessages'));
+    });
+    expect(await screen.findByText('消息 0')).toBeTruthy();
+    expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
+    expect(scrollEl.scrollTop).toBe(160);
+  });
 });

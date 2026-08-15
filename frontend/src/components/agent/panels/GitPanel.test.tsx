@@ -200,6 +200,31 @@ M  src/lib.rs
     expect(screen.getByText(/notes\.md/)).toBeTruthy();
   });
 
+  it('falls back to git_status JSON tool_result content (new contract text extraction)', async () => {
+    // 服务端新契约：tool_result content 为 JSON {text,status,...}，回退展示只取 text。
+    vi.mocked(getAgentGitStatus).mockRejectedValue(new Error('503 offline'));
+    vi.mocked(listAgentMessages).mockResolvedValue({
+      messages: [
+        {
+          id: 'm1',
+          session_id: 's1',
+          role: 'tool',
+          content: JSON.stringify({ text: ' M src/main.rs\n?? notes.md', status: 'completed' }),
+          name: 'git_status',
+          kind: 'tool_result',
+          created_at: '',
+        },
+      ],
+      has_more: false,
+    });
+
+    renderPanel();
+    expect(await screen.findByText(/src\/main\.rs/)).toBeTruthy();
+    expect(screen.getByText(/notes\.md/)).toBeTruthy();
+    // 不渲染 JSON 外壳（text 之外的字段不进入展示文本）
+    expect(screen.queryByText(/"status"/)).toBeNull();
+  });
+
   it('renders tab bar and switches to Branches tab', async () => {
     vi.mocked(getAgentGitStatus).mockResolvedValue({
       status: '## main\n M src/main.rs\n',
