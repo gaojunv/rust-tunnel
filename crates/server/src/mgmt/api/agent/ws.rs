@@ -893,6 +893,18 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         .unwrap_or_default();
                         bridge.set_memory_block(&session_id, Some(block)).await;
                     }
+                    // Skill 清单注入（ACP）：与记忆同模式缓存到 SpawnedAgent，纯 SQL
+                    // 零 embedding 依赖。prompt_inner 与 <memory> 块一并 prepend。
+                    if bridge.cached_skill_list_block(&session_id).await.is_none() {
+                        let block = crate::agent::skill::retrieve_skill_list_for_session(
+                            memory,
+                            &acp_workspace.client_id,
+                            &acp_workspace.id,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        bridge.set_skill_list_block(&session_id, Some(block)).await;
+                    }
                 }
                 // 持久化 user 消息（与 runner 路径同款）：落的是注入后的 content，
                 // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。排队消息同样

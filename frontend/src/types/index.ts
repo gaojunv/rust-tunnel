@@ -556,6 +556,10 @@ export interface AgentMemorySettings {
   score_threshold: number;
   inject_budget_tokens: number;
   pin_always_inject: boolean;
+  /** 技能库总闸（Skill 二期）：会话蒸馏时同时提炼技能、会话开始注入技能清单。 */
+  skill_enabled: boolean;
+  /** 会话开始注入的技能清单最大条数。 */
+  skill_list_max: number;
   /** API 密钥是否已配置（脱敏标志）。 */
   has_key: boolean;
   created_at?: string;
@@ -567,6 +571,8 @@ export interface MemoryEvent {
   session_id: string;
   status: string; // "distilled" | "failed" | "skipped" 等
   facts_found: number;
+  /** 本次蒸馏提炼出的技能条数（缺省 0，向后兼容）。 */
+  skills_found?: number;
 }
 
 export interface CreateMemoryRequest {
@@ -597,6 +603,8 @@ export interface MemorySettingsRequest {
   score_threshold?: number;
   inject_budget_tokens?: number;
   pin_always_inject?: boolean;
+  skill_enabled?: boolean;
+  skill_list_max?: number;
 }
 
 /** 记忆列表分页响应。 */
@@ -612,6 +620,63 @@ export interface MemoryFilters {
   workspaceId: string;
   q: string;
   pinned: boolean;
+}
+
+// === Agent Skill（Chat Memory 二期） ===
+
+/** 一条 AI 技能（可复用执行经验：排障手册、发布清单、评审步骤）。
+ *  scope=global 时 client_id/workspace_id 为空串；content 仅 detail 响应含（列表不含）。 */
+export interface AgentSkill {
+  id: string;
+  name: string;
+  description: string;
+  scope_type: AgentMemoryScope;
+  client_id: string;
+  workspace_id: string;
+  content: string; // content 仅 detail 响应含
+  tags: string[];
+  enabled: boolean;
+  source_session_id: string;
+  source_trigger: AgentMemoryTrigger;
+  use_count: number;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 技能列表分页响应。 */
+export interface AgentSkillsResponse {
+  skills: AgentSkill[];
+  total: number;
+}
+
+/** 技能列表 UI 过滤条件（SkillSection 持有，映射到 API 查询参数）。 */
+export interface SkillFilters {
+  scope: 'all' | AgentMemoryScope;
+  clientId: string;
+  workspaceId: string;
+  q: string;
+  enabledOnly: boolean;
+}
+
+/** 新建技能（POST /api/agent/skills）。scope_type 缺省 → workspace。 */
+export interface CreateSkillRequest {
+  name: string;
+  description?: string;
+  content: string;
+  scope_type?: AgentMemoryScope;
+  client_id?: string;
+  workspace_id?: string;
+  tags?: string[];
+}
+
+/** 编辑技能（PUT /api/agent/skills/:id，partial）。scope 变更坐标由后端归一化。 */
+export interface UpdateSkillRequest {
+  name?: string;
+  description?: string;
+  content?: string;
+  scope_type?: AgentMemoryScope;
+  tags?: string[];
 }
 
 // === Agent Workbench ===

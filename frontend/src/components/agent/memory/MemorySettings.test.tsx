@@ -31,6 +31,8 @@ const settingsFixture: AgentMemorySettings = {
   score_threshold: 0.4,
   inject_budget_tokens: 1500,
   pin_always_inject: true,
+  skill_enabled: false,
+  skill_list_max: 20,
   has_key: true,
   created_at: '',
   updated_at: '',

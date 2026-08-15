@@ -139,6 +139,7 @@ impl AcpBridge {
                     pending_prompts: migrated_prompts,
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
                     memory_block: None,
+                    skill_list_block: None,
                 },
             );
             Some((pump_io, stdout_rx))
@@ -897,7 +898,7 @@ impl AcpBridge {
         content: &str,
         drain: bool,
     ) -> Result<(), String> {
-        let (connection, acp_session_id, turn_gen, memory_block) = {
+        let (connection, acp_session_id, turn_gen, memory_block, skill_list_block) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
                 .get_mut(session_id)
@@ -927,19 +928,30 @@ impl AcpBridge {
             agent.turn_generation += 1;
             let turn_gen = agent.turn_generation;
             let memory_block = agent.memory_block.clone().unwrap_or_default();
-            (connection, acp_session_id, turn_gen, memory_block)
+            let skill_list_block = agent.skill_list_block.clone().unwrap_or_default();
+            (connection, acp_session_id, turn_gen, memory_block, skill_list_block)
         };
 
         let bridge = self.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
         let sid = session_id.to_string();
-        // AI 记忆注入：`<memory>` 块 prepend 到发给 agent 的 user content 头部。
-        // 只进 agent 侧上下文，不落 DB（持久化/蒸馏保持干净，无回环）。
-        let final_content = if memory_block.is_empty() {
-            content.to_string()
-        } else {
-            format!("{memory_block}\n\n{content}")
+        // 上下文注入：`<memory>` 记忆块 + `<skills>` 技能清单**合并一次** prepend
+        // 到发给 agent 的 user content 头部。只进 agent 侧上下文，不落 DB（持久化/
+        // 蒸馏保持干净，无回环）。
+        let final_content = {
+            let mut parts: Vec<String> = Vec::with_capacity(2);
+            if !memory_block.is_empty() {
+                parts.push(memory_block);
+            }
+            if !skill_list_block.is_empty() {
+                parts.push(skill_list_block);
+            }
+            if parts.is_empty() {
+                content.to_string()
+            } else {
+                format!("{}\n\n{content}", parts.join("\n\n"))
+            }
         };
         let prompt = vec![ContentBlock::Text(TextContent::new(final_content))];
         let send_result = connection

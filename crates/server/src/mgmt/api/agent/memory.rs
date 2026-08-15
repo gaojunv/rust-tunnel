@@ -33,7 +33,7 @@ use crate::llm::rag::store::ChunkPoint;
 use crate::mgmt::api::dto::SseQuery;
 use crate::mgmt::api::ApiState;
 
-use super::new_id;
+use super::{mem_runtime, new_id};
 
 // ── 请求体 DTO ──────────────────────────────────────────────────
 
@@ -64,6 +64,12 @@ pub struct UpdateMemorySettingsRequest {
     pub inject_budget_tokens: Option<i64>,
     #[serde(default)]
     pub pin_always_inject: Option<bool>,
+    /// Skill 库总闸（opt-in 默认关；开启不要求 embedding——Skill 蒸馏仅需 LLM）。
+    #[serde(default)]
+    pub skill_enabled: Option<bool>,
+    /// 会话开始注入的技能清单条数上限（默认 20）。
+    #[serde(default)]
+    pub skill_list_max: Option<i64>,
 }
 
 /// GET /api/agent/memories 的 query 参数。`limit` 默认 50（handler 层 clamp 到 [1, 200]）。
@@ -117,23 +123,6 @@ pub struct UpdateMemoryRequest {
 
 const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
 
-/// 从 ApiState 取 AI 记忆体运行时；未初始化（非 rag 构建 / 未注入）→ 503。
-fn mem_runtime(state: &ApiState) -> Result<MemoryState, (StatusCode, String)> {
-    let Some(agent) = &state.server_state.agent_state else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent workbench not initialized".to_string(),
-        ));
-    };
-    let Some(mem) = &agent.memory else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AI memory runtime not initialized".to_string(),
-        ));
-    };
-    Ok(mem.clone())
-}
-
 /// settings 视图 JSON：`emb_api_key` 永不回传（密文/明文都不出库），只回 `has_key`
 /// 布尔表示是否存有可用 key（对齐 provider api-key 列表的脱敏策略）。
 fn settings_json(s: &AgentMemorySettingsRecord, cipher: Option<&LlmCipher>) -> serde_json::Value {
@@ -153,6 +142,8 @@ fn settings_json(s: &AgentMemorySettingsRecord, cipher: Option<&LlmCipher>) -> s
         "score_threshold": s.score_threshold,
         "inject_budget_tokens": s.inject_budget_tokens,
         "pin_always_inject": s.pin_always_inject != 0,
+        "skill_enabled": s.skill_enabled != 0,
+        "skill_list_max": s.skill_list_max,
         "created_at": normalize_db_datetime(&s.created_at),
         "updated_at": normalize_db_datetime(&s.updated_at),
     })
@@ -204,8 +195,9 @@ fn validate_content_and_scope(
     Ok(())
 }
 
-/// 校验 tags（数量 ≤ MAX_TAGS、每项非空且 ≤ TAG_MAX_CHARS）。
-fn validate_tags(tags: &[String]) -> Result<(), (StatusCode, String)> {
+/// 校验 tags（数量 ≤ MAX_TAGS、每项非空且 ≤ TAG_MAX_CHARS）。`pub(crate)` 供
+/// skills.rs（Skill 手动创建/编辑复用同一 tags 约束）。
+pub(crate) fn validate_tags(tags: &[String]) -> Result<(), (StatusCode, String)> {
     if tags.len() > MAX_TAGS {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -387,6 +379,8 @@ pub async fn put_settings(
             body.pin_always_inject
                 .unwrap_or(current.pin_always_inject != 0),
         ),
+        skill_enabled: i32::from(body.skill_enabled.unwrap_or(current.skill_enabled != 0)),
+        skill_list_max: body.skill_list_max.unwrap_or(current.skill_list_max),
         created_at: current.created_at,
         updated_at: current.updated_at,
     };
@@ -1019,6 +1013,51 @@ mod tests {
         .await;
         assert_eq!(status, HttpStatus::OK, "empty key keep: {body}");
         assert_eq!(body["has_key"], json!(true), "沿用已存 key");
+    }
+
+    #[tokio::test]
+    async fn settings_skill_fields_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(test_api_state(dir.path()).await);
+
+        // 默认：skill_enabled=false、skill_list_max=20
+        let (status, body) = call(
+            &app,
+            json_request(Method::GET, "/api/agent/memory/settings".to_string(), &json!(null)),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["skill_enabled"], json!(false));
+        assert_eq!(body["skill_list_max"], json!(20));
+
+        // 只开 skill_enabled（不要求 emb 配置——Skill 蒸馏仅需 LLM）
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/agent/memory/settings".to_string(),
+                &json!({ "skill_enabled": true, "skill_list_max": 8 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "skill_enabled 单独开启: {body}");
+        assert_eq!(body["skill_enabled"], json!(true));
+        assert_eq!(body["skill_list_max"], json!(8));
+        assert_eq!(body["enabled"], json!(false), "记忆总闸不受影响");
+
+        // 部分更新只改 skill_list_max：skill_enabled 保持
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                "/api/agent/memory/settings".to_string(),
+                &json!({ "skill_list_max": 30 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["skill_enabled"], json!(true), "缺省字段沿用当前值");
+        assert_eq!(body["skill_list_max"], json!(30));
     }
 
     #[tokio::test]

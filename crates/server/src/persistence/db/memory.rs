@@ -24,6 +24,10 @@ pub struct AgentMemorySettingsRecord {
     pub score_threshold: f64,
     pub inject_budget_tokens: i64,
     pub pin_always_inject: i32,
+    /// Skill 库总闸（opt-in 默认关：避免零配置用户产生非预期蒸馏 LLM 开销）。
+    pub skill_enabled: i32,
+    /// 会话开始注入的技能清单条数上限（默认 20）。
+    pub skill_list_max: i64,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
@@ -46,6 +50,8 @@ impl AgentMemorySettingsRecord {
             score_threshold: 0.40,
             inject_budget_tokens: 1500,
             pin_always_inject: 1,
+            skill_enabled: 0,
+            skill_list_max: 20,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -99,14 +105,17 @@ impl Database {
         &self,
         s: &AgentMemorySettingsRecord,
     ) -> Result<(), sqlx::Error> {
+        // 注意：INSERT OR REPLACE 是显式列绑定——加列必须同步 INSERT 列清单与
+        // bind 序列（INSERT 列清单与下方 bind 一一对应），否则每次 upsert 会把
+        // 新列重置为 DEFAULT。
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO agent_memory_settings (
                 id, enabled, emb_base_url, emb_api_key, emb_model, emb_dimension,
                 distill_model, top_k, score_threshold, inject_budget_tokens,
-                pin_always_inject, created_at, updated_at
+                pin_always_inject, skill_enabled, skill_list_max, created_at, updated_at
             ) VALUES (
-                1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE((SELECT created_at FROM agent_memory_settings WHERE id = 1), datetime('now')),
                 datetime('now')
             )
@@ -122,6 +131,8 @@ impl Database {
         .bind(s.score_threshold)
         .bind(s.inject_budget_tokens)
         .bind(s.pin_always_inject)
+        .bind(s.skill_enabled)
+        .bind(s.skill_list_max)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -357,6 +368,8 @@ mod tests {
         assert_eq!(s.inject_budget_tokens, 1500);
         assert_eq!(s.score_threshold, 0.40);
         assert_eq!(s.pin_always_inject, 1);
+        assert_eq!(s.skill_enabled, 0, "skill_enabled 默认 0（opt-in）");
+        assert_eq!(s.skill_list_max, 20, "skill_list_max 默认 20");
 
         // upsert → 读回
         let mut s2 = s.clone();
@@ -366,6 +379,8 @@ mod tests {
         s2.emb_model = "nomic-embed-text".to_string();
         s2.emb_dimension = 768;
         s2.top_k = 16;
+        s2.skill_enabled = 1;
+        s2.skill_list_max = 12;
         db.memory_upsert_settings(&s2).await.unwrap();
         let s3 = db.memory_get_settings().await.unwrap();
         assert_eq!(s3.enabled, 1);
@@ -373,13 +388,18 @@ mod tests {
         assert_eq!(s3.emb_api_key, "encrypted-key");
         assert_eq!(s3.emb_dimension, 768);
         assert_eq!(s3.top_k, 16);
+        assert_eq!(s3.skill_enabled, 1);
+        assert_eq!(s3.skill_list_max, 12);
 
-        // 再次 upsert：created_at 保持、top_k 更新
+        // 再次 upsert：created_at 保持、top_k 更新；**INSERT OR REPLACE 不重置
+        // 新列**（显式列绑定遗漏会在每次 upsert 把 skill_* 重置为 DEFAULT）
         let mut s4 = s3.clone();
         s4.top_k = 32;
         db.memory_upsert_settings(&s4).await.unwrap();
         let s5 = db.memory_get_settings().await.unwrap();
         assert_eq!(s5.top_k, 32);
+        assert_eq!(s5.skill_enabled, 1, "upsert 不应重置 skill_enabled");
+        assert_eq!(s5.skill_list_max, 12, "upsert 不应重置 skill_list_max");
         assert_eq!(s5.created_at, s3.created_at, "created_at 应保持首建时间");
     }
 

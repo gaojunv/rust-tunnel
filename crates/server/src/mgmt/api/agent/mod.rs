@@ -8,6 +8,8 @@ mod dto;
 mod github;
 #[cfg(feature = "rag")]
 pub mod memory;
+#[cfg(feature = "rag")]
+pub mod skills;
 mod sessions;
 mod workspaces;
 mod ws;
@@ -44,4 +46,25 @@ pub(crate) async fn agent_cipher(
 ) -> Option<crate::llm::crypto::LlmCipher> {
     let guard = state.server_state.proxy_state.llm_state.read().await;
     guard.as_ref().and_then(|l| l.cipher.clone())
+}
+
+/// 从 ApiState 取 AI 记忆体运行时；未初始化（非 rag 构建 / 未注入）→ 503。
+/// memory.rs 与 skills.rs 共用（上提到本模块避免子模块间循环引用）。
+#[cfg(feature = "rag")]
+pub(crate) fn mem_runtime(
+    state: &crate::mgmt::api::ApiState,
+) -> Result<crate::agent::memory::MemoryState, (axum::http::StatusCode, String)> {
+    let Some(agent) = &state.server_state.agent_state else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent workbench not initialized".to_string(),
+        ));
+    };
+    let Some(mem) = &agent.memory else {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "AI memory runtime not initialized".to_string(),
+        ));
+    };
+    Ok(mem.clone())
 }

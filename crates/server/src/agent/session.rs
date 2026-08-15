@@ -159,6 +159,10 @@ pub struct SessionRuntime {
     /// AI 记忆注入缓存：None = 尚未检索；Some("") = 无可用记忆；Some(非空) = 已注入
     /// 到 `messages[0]`（system 单条，不落库）。每会话只检索一次（对齐 agents_md）。
     pub memory_block: Option<String>,
+    /// Skill 清单注入缓存：None = 尚未检索；Some("") = 无可用技能（或 skill 库
+    /// 未开启）；Some(非空) = 已注入 `<skills>` 块到 `messages[0]`。与 memory_block
+    /// 同模式：每会话只检索一次（纯 SQL，零 embedding 依赖）。
+    pub skill_list_block: Option<String>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -268,6 +272,7 @@ impl SessionRuntime {
             approval_mode: workspace.approval_mode.clone(),
             agents_md: None,
             memory_block: None,
+            skill_list_block: None,
             messages,
         })
     }

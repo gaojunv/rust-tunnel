@@ -43,6 +43,10 @@ pub struct MemoryEvent {
     /// 判别字段：`distilled` / `failed` / `skipped` 等。
     pub status: String,
     pub facts_found: usize,
+    /// 蒸馏产出的 Skill 条数（二期新增）。`#[serde(default)]`：旧前端/旧事件
+    /// 缺字段时反序列化为 0（向后兼容）。
+    #[serde(default)]
+    pub skills_found: usize,
 }
 
 /// AI 记忆体运行时。`store` 与 `llm.rag_store` 是**同一** VectorStore 实例
