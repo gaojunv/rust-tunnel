@@ -5,6 +5,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { Button } from '@/components/ui/button';
 import { Loader2, SendHorizontal, Square } from 'lucide-react';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import {
   agentWsUrl,
   getApiErrorMessage,
@@ -129,6 +130,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   >(null);
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // IME 组词守卫：回车在组词中是「确认候选」而非发送（详见 useImeGuard）
+  const ime = useImeGuard();
   const wsRef = useRef<WebSocket | null>(null);
   // 最近一帧到达时间（含应用层心跳）：看门狗据此判定连接假死（半开 TCP）。
   // 用组件级 ref——重连的 connect() 闭包都要读写它；effect 内局部变量会在 effect
@@ -1486,9 +1489,10 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             ref={textareaRef}
             value={input}
             onChange={handleInputChange}
+            {...ime.bind}
             onKeyDown={(e) => {
               // IME 组词中（拼音候选窗）的按键不触发任何快捷键：回车是确认候选而非发送
-              if (e.nativeEvent.isComposing) return;
+              if (ime.isComposing(e)) return;
               if (e.key === 'Escape') {
                 closeMention();
                 return;

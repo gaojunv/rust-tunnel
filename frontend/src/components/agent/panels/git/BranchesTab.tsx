@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { GitBranchPlus, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import {
   getAgentGitBranches,
   postAgentGitBranchDelete,
@@ -29,6 +30,7 @@ export function GitBranchesTab({ workspaceId }: { workspaceId: string }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [newBranch, setNewBranch] = useState('');
+  const ime = useImeGuard();
   const [deleteTarget, setDeleteTarget] = useState<GitBranch | null>(null);
   const [forceDelete, setForceDelete] = useState(false);
 
@@ -87,7 +89,10 @@ export function GitBranchesTab({ workspaceId }: { workspaceId: string }) {
         <input
           value={newBranch}
           onChange={(e) => setNewBranch(e.target.value)}
+          {...ime.bind}
           onKeyDown={(e) => {
+            // IME 组词中回车是确认候选，不触发建分支
+            if (ime.isComposing(e)) return;
             if (e.key === 'Enter' && canCreate) createMutation.mutate(newBranch.trim());
           }}
           placeholder={t('agent.gitNewBranchPlaceholder')}

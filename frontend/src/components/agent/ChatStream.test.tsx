@@ -1261,6 +1261,44 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('src/main.rs')).toBeNull();
   });
 
+  it('IME 组词回车只确认候选不发送，composition 结束后的回车才发送', async () => {
+    renderChat();
+    const textarea = screen.getByPlaceholderText('agent.inputPlaceholder') as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: '你好' } });
+    const noUserMessage = () =>
+      wsInstances.every((w) => !w.sent.some((s) => s.includes('"type":"user_message"')));
+
+    // Chrome/多数输入法：确认 Enter 的 keydown isComposing=true → 不发送
+    fireEvent.compositionStart(textarea);
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+    fireEvent.compositionEnd(textarea);
+    expect(noUserMessage()).toBe(true);
+    expect(textarea.value).toBe('你好');
+
+    // 部分输入法：全程不触发 composition 事件，仅 keyCode=229 标记组词 → 不发送
+    fireEvent.keyDown(textarea, { key: 'Enter', keyCode: 229, isComposing: false });
+    expect(noUserMessage()).toBe(true);
+    expect(textarea.value).toBe('你好');
+
+    // Safari 顺序：compositionend 先于确认 Enter 的 keydown 触发，且该 keydown 的
+    // isComposing=false、keyCode=13 → 靠 composingRef 延迟重置兜底，仍不发送
+    fireEvent.compositionStart(textarea);
+    fireEvent.compositionEnd(textarea);
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: false, keyCode: 13 });
+    expect(noUserMessage()).toBe(true);
+    expect(textarea.value).toBe('你好');
+
+    // 组词彻底结束（compositionEnd 的 setTimeout(0) 延迟重置已生效）后回车 → 正常发送
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(
+      wsInstances.some((w) => w.sent.some((s) => s.includes('"type":"user_message"'))),
+    ).toBe(true);
+    expect(textarea.value).toBe('');
+  });
+
   it('removes a single chip independently', async () => {
     (listWorkspaceFiles as Mock).mockResolvedValue({ files: ['src/a.rs', 'src/b.rs'] });
     renderChat();

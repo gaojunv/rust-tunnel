@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Archive, ArrowDownToLine, Play, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import {
   getAgentGitStashes,
   postAgentGitStashApply,
@@ -32,6 +33,7 @@ export function GitStashTab({ workspaceId }: { workspaceId: string }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [stashMsg, setStashMsg] = useState('');
+  const ime = useImeGuard();
   const [dropTarget, setDropTarget] = useState<GitStashEntry | null>(null);
 
   const stashesQuery = useQuery<GitStashEntry[]>({
@@ -109,7 +111,10 @@ export function GitStashTab({ workspaceId }: { workspaceId: string }) {
         <input
           value={stashMsg}
           onChange={(e) => setStashMsg(e.target.value)}
+          {...ime.bind}
           onKeyDown={(e) => {
+            // IME 组词中回车是确认候选，不触发 stash push
+            if (ime.isComposing(e)) return;
             if (e.key === 'Enter' && canPush) pushMutation.mutate(stashMsg);
           }}
           placeholder={t('agent.gitStashPushPlaceholder')}

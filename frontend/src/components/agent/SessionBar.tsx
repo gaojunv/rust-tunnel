@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -41,6 +42,8 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
+  // IME 组词守卫：中文改名时回车是确认候选，不应立即提交重命名
+  const ime = useImeGuard();
   const [error, setError] = useState<string | null>(null);
   // 受控打开态：删除时需先关闭下拉再弹确认 Dialog，避免两个浮层叠放
   const [menuOpen, setMenuOpen] = useState(false);
@@ -130,7 +133,9 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
                         onChange={(e) => setEditTitle(e.target.value)}
                         placeholder={t('agent.sessionNamePlaceholder')}
                         className="h-7 flex-1 rounded border border-input bg-background px-2 text-sm"
+                        {...ime.bind}
                         onKeyDown={(e) => {
+                          if (ime.isComposing(e)) return;
                           if (e.key === 'Enter') handleRename(s.id);
                           if (e.key === 'Escape') setEditingId(null);
                         }}

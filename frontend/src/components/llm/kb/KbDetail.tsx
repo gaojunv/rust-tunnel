@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import { kbStream } from '@/api/kbStream';
 import {
   useLlmKbDocs,
@@ -132,6 +133,7 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
   const deleteKbMutation = useDeleteLlmKb();
 
   const [query, setQuery] = useState('');
+  const ime = useImeGuard();
   const [dragging, setDragging] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -354,7 +356,10 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
             <Input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
+              {...ime.bind}
               onKeyDown={(e) => {
+                // IME 组词中回车是确认候选，不触发检索
+                if (ime.isComposing(e)) return;
                 if (e.key === 'Enter') runQuery();
               }}
               placeholder={t('kb.queryPlaceholder')}
