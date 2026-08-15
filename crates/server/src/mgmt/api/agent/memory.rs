@@ -37,24 +37,25 @@ use super::new_id;
 
 // ── 请求体 DTO ──────────────────────────────────────────────────
 
-/// PUT /api/agent/memory/settings 请求体。
+/// PUT /api/agent/memory/settings 请求体（部分更新：缺省字段沿用当前值）。
 ///
 /// - `emb_api_key` 空串 = 沿用已存（密文原样保留，不二次加密）；
 /// - `emb_dimension` 与已存值不同 → 409（需先 `POST /clear` 清空重建）；
-/// - `enabled` 置 1 前必须 emb 配置齐全。
+/// - 启用（`enabled` 置 1）前必须 emb 配置齐全。
 #[derive(Debug, Deserialize)]
 pub struct UpdateMemorySettingsRequest {
-    pub enabled: bool,
     #[serde(default)]
-    pub emb_base_url: String,
+    pub enabled: Option<bool>,
     #[serde(default)]
-    pub emb_api_key: String,
+    pub emb_base_url: Option<String>,
     #[serde(default)]
-    pub emb_model: String,
+    pub emb_api_key: Option<String>,
     #[serde(default)]
-    pub emb_dimension: i64,
+    pub emb_model: Option<String>,
     #[serde(default)]
-    pub distill_model: String,
+    pub emb_dimension: Option<i64>,
+    #[serde(default)]
+    pub distill_model: Option<String>,
     #[serde(default)]
     pub top_k: Option<i64>,
     #[serde(default)]
@@ -294,16 +295,32 @@ pub async fn put_settings(
     };
     let current = mem.settings().await;
 
-    // 启用前配置校验
-    if body.enabled {
-        if body.emb_base_url.trim().is_empty() || body.emb_model.trim().is_empty() {
+    // 部分更新：请求缺省字段沿用当前值。最终生效值 = 请求覆盖 + 当前基线。
+    let enabled = body.enabled.unwrap_or(current.enabled != 0);
+    let emb_base_url = body
+        .emb_base_url
+        .as_deref()
+        .unwrap_or(&current.emb_base_url)
+        .trim()
+        .to_string();
+    let emb_model = body
+        .emb_model
+        .as_deref()
+        .unwrap_or(&current.emb_model)
+        .trim()
+        .to_string();
+    let emb_dimension = body.emb_dimension.unwrap_or(current.emb_dimension);
+
+    // 启用前配置校验（基于最终值）
+    if enabled {
+        if emb_base_url.is_empty() || emb_model.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
                 "enabling memory requires emb_base_url and emb_model",
             )
                 .into_response();
         }
-        if body.emb_dimension <= 0 {
+        if emb_dimension <= 0 {
             return (
                 StatusCode::BAD_REQUEST,
                 "enabling memory requires emb_dimension > 0",
@@ -313,7 +330,11 @@ pub async fn put_settings(
         let has_stored_key = !decrypt_field(mem.cipher.as_ref(), &current.emb_api_key)
             .unwrap_or_default()
             .is_empty();
-        if body.emb_api_key.trim().is_empty() && !has_stored_key {
+        let key_provided = body
+            .emb_api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty());
+        if !key_provided && !has_stored_key {
             return (
                 StatusCode::BAD_REQUEST,
                 "enabling memory requires emb_api_key",
@@ -322,38 +343,41 @@ pub async fn put_settings(
         }
     }
 
-    // dim 冲突：已存 dim>0 且请求携带不同 dim>0 → 409
-    if body.emb_dimension > 0
-        && current.emb_dimension > 0
-        && body.emb_dimension != current.emb_dimension
-    {
-        return (
-            StatusCode::CONFLICT,
-            "emb_dimension change requires clearing existing memories first \
-             (POST /api/agent/memory/clear)",
-        )
-            .into_response();
+    // dim 冲突：请求显式携带新 dim 且与已存（都 >0）不同 → 409
+    if let Some(dim) = body.emb_dimension {
+        if dim > 0 && current.emb_dimension > 0 && dim != current.emb_dimension {
+            return (
+                StatusCode::CONFLICT,
+                "emb_dimension change requires clearing existing memories first \
+                 (POST /api/agent/memory/clear)",
+            )
+                .into_response();
+        }
     }
 
-    // 空串 key 保持已存（密文原样），否则加密新值
-    let api_key = if body.emb_api_key.trim().is_empty() {
-        current.emb_api_key.clone()
-    } else {
-        encrypt_field(mem.cipher.as_ref(), body.emb_api_key.trim())
+    // 空串/未提供 key 保持已存（密文原样），否则加密新值
+    let api_key = match body.emb_api_key.as_deref() {
+        Some(k) if !k.trim().is_empty() => encrypt_field(mem.cipher.as_ref(), k.trim()),
+        _ => current.emb_api_key.clone(),
     };
 
     let s = AgentMemorySettingsRecord {
         id: 1,
-        enabled: i32::from(body.enabled),
-        emb_base_url: body.emb_base_url.trim().to_string(),
+        enabled: i32::from(enabled),
+        emb_base_url,
         emb_api_key: api_key,
-        emb_model: body.emb_model.trim().to_string(),
-        emb_dimension: if body.emb_dimension > 0 {
-            body.emb_dimension
+        emb_model,
+        emb_dimension: if emb_dimension > 0 {
+            emb_dimension
         } else {
             current.emb_dimension
         },
-        distill_model: body.distill_model.trim().to_string(),
+        distill_model: body
+            .distill_model
+            .as_deref()
+            .unwrap_or(&current.distill_model)
+            .trim()
+            .to_string(),
         top_k: body.top_k.unwrap_or(current.top_k),
         score_threshold: body.score_threshold.unwrap_or(current.score_threshold),
         inject_budget_tokens: body

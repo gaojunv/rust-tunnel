@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardContent } from '@/components/ui/card';
 import MemoryList from '@/components/agent/memory/MemoryList';
 import MemoryDetail from '@/components/agent/memory/MemoryDetail';
@@ -9,7 +8,8 @@ import MemorySettings from '@/components/agent/memory/MemorySettings';
 import { useMemories } from '@/api/hooks';
 import type { AgentMemory, MemoryFilters } from '@/types';
 
-export default function MemoryPage() {
+/** 会话记忆 Tab 内容（原 MemoryPage，去掉页面级 PageHeader）。 */
+export default function MemorySection() {
   const { t } = useTranslation();
   const [filters, setFilters] = useState<MemoryFilters>({
     scope: 'all',
@@ -40,7 +40,6 @@ export default function MemoryPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title={t('memory.title')} description={t('memory.description')} />
       <MemorySettings />
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         {/* 移动端选中记忆后隐藏列表，仅桌面保持左侧栏 */}

@@ -104,6 +104,7 @@
     "ai": "AI",
     "llmGateway": "LLM 网关",
     "knowledgeBase": "知识库",
+    "knowledge": "知识库与记忆",
     "agentWorkbench": "AI 工作台",
     "memory": "记忆库",
     "system": "系统",
@@ -694,6 +695,11 @@
     "testEmbeddingOk": "测试成功 — 维度 {{dimension}}（耗时 {{latency}} ms）",
     "testEmbeddingErr": "Embedding 测试失败：{{error}}",
     "embLockedHint": "Embedding 配置在创建后固定，不可修改",
+    "useGlobalEmbedding": "使用全局 Embedding 配置",
+    "globalEmbeddingHint": "将使用全局配置：{{model}} · dim {{dimension}}",
+    "globalEmbMissingHint": "尚未配置全局 Embedding，请在上方共享设置中配置，或在此自定义填写。",
+    "globalEmbNotConfigured": "全局 Embedding 尚未配置，请先在上方共享设置中配置。",
+    "embRequired": "自定义 Embedding 需填写 Base URL、模型与维度。",
     "advanced": "高级参数",
     "topK": "Top K",
     "chunkSize": "分块大小",
@@ -727,6 +733,12 @@
     "queryError": "检索失败。请检查 embedding 服务后重试。",
     "noResults": "未找到匹配的分块。",
     "score": "分数"
+  },
+  "knowledge": {
+    "title": "知识库与记忆",
+    "description": "管理 RAG 知识库与 AI 会话记忆，共享同一套 Embedding 配置",
+    "sharedEmbeddingTitle": "共享 Embedding 配置",
+    "sharedEmbeddingDesc": "知识库与 AI 记忆体共用此 Embedding（Base URL / 密钥 / 模型 / 维度）。修改维度将影响现有知识库的向量检索。"
   },
   "memory": {
     "title": "AI 记忆体",

@@ -1,16 +1,20 @@
 //! RAG 知识库管理 API 请求体类型（DTO）。
 
-/// POST /api/llm/kb 请求体。`emb_dimension` 必填（前端经 `test-embedding` 探测）。
+/// POST /api/llm/kb 请求体。`emb_*` 可选：不提供时回退到全局共享 embedding 配置
+/// （`agent_memory_settings`，见 `create_kb` 的解析逻辑）。
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateKbRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub emb_base_url: String,
     #[serde(default)]
-    pub emb_api_key: String,
-    pub emb_model: String,
-    pub emb_dimension: i64,
+    pub emb_base_url: Option<String>,
+    #[serde(default)]
+    pub emb_api_key: Option<String>,
+    #[serde(default)]
+    pub emb_model: Option<String>,
+    #[serde(default)]
+    pub emb_dimension: Option<i64>,
     #[serde(default)]
     pub top_k: Option<i64>,
     #[serde(default)]

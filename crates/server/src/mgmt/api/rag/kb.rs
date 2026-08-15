@@ -7,11 +7,11 @@ use axum::{
 };
 
 use crate::db::rag::RagKnowledgeBaseRecord;
-use crate::llm::crypto::encrypt_field;
+use crate::llm::crypto::{decrypt_field, encrypt_field};
 use crate::mgmt::api::ApiState;
 
 use super::dto::{CreateKbRequest, UpdateKbRequest};
-use super::{llm_state, rag_rt};
+use super::{llm_state, rag_rt, RagRuntime};
 
 /// KB 视图 JSON：`emb_api_key` 不回显（同 provider `api_key` 策略），额外带文档数。
 fn kb_json(kb: &RagKnowledgeBaseRecord, doc_count: i64) -> serde_json::Value {
@@ -56,6 +56,65 @@ fn validate_kb_params(
     None
 }
 
+/// 解析创建 KB 的 embedding 配置：请求显式提供完整 embedding（base_url / model
+/// 非空且 dimension ≥ 1）时用之；否则回退到全局共享配置（`agent_memory_settings`，
+/// 与 AI 记忆体共用同一套 embedding）。全局也未配置时返回 400。返回值
+/// `(emb_base_url, emb_api_key_raw, emb_model, emb_dimension)`，key 为解密后的明文，
+/// 由调用方落库前再加密。
+async fn resolve_kb_embedding(
+    rt: &RagRuntime,
+    body: &CreateKbRequest,
+) -> Result<(String, String, String, i64), (StatusCode, String)> {
+    let explicit = body.emb_base_url.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || body.emb_model.as_deref().is_some_and(|s| !s.trim().is_empty())
+        || body.emb_dimension.is_some();
+    if explicit {
+        // 任一显式提供即要求完整：避免「只填 model、漏 base_url」静默回退。
+        let base = body.emb_base_url.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "emb_base_url is required when customizing embedding".to_string(),
+        ))?;
+        let model = body.emb_model.as_deref().ok_or((
+            StatusCode::BAD_REQUEST,
+            "emb_model is required when customizing embedding".to_string(),
+        ))?;
+        let dim = body.emb_dimension.ok_or((
+            StatusCode::BAD_REQUEST,
+            "emb_dimension must be >= 1 (probe it via /test-embedding)".to_string(),
+        ))?;
+        if base.trim().is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "emb_base_url is required".to_string()));
+        }
+        if model.trim().is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "emb_model is required".to_string()));
+        }
+        if dim < 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "emb_dimension must be >= 1 (probe it via /test-embedding)".to_string(),
+            ));
+        }
+        let key = body.emb_api_key.clone().unwrap_or_default();
+        return Ok((base.to_string(), key, model.to_string(), dim));
+    }
+
+    // 回退全局共享配置
+    let s = rt
+        .db
+        .memory_get_settings()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")))?;
+    if s.emb_base_url.trim().is_empty() || s.emb_model.trim().is_empty() || s.emb_dimension < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "embedding is not configured: set a global embedding config in the shared settings first"
+                .to_string(),
+        ));
+    }
+    let key = decrypt_field(rt.cipher.as_ref(), &s.emb_api_key).unwrap_or_default();
+    Ok((s.emb_base_url, key, s.emb_model, s.emb_dimension))
+}
+
 pub async fn list_kbs(State(state): State<ApiState>) -> impl IntoResponse {
     let rt = match rag_rt(&state).await {
         Ok(rt) => rt,
@@ -86,19 +145,6 @@ pub async fn create_kb(
     if body.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
     }
-    if body.emb_base_url.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "emb_base_url is required").into_response();
-    }
-    if body.emb_model.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "emb_model is required").into_response();
-    }
-    if body.emb_dimension < 1 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "emb_dimension must be >= 1 (probe it via /test-embedding)".to_string(),
-        )
-            .into_response();
-    }
     let top_k = body.top_k.unwrap_or(5);
     let chunk_size = body.chunk_size.unwrap_or(512);
     let chunk_overlap = body.chunk_overlap.unwrap_or(64);
@@ -108,9 +154,16 @@ pub async fn create_kb(
     }
     let enabled = body.enabled.unwrap_or(true);
 
+    // embedding 配置：请求显式提供则用之，否则回退全局共享配置（见 resolve_kb_embedding）。
+    let (emb_base_url, emb_api_key_raw, emb_model, emb_dimension) =
+        match resolve_kb_embedding(&rt, &body).await {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+
     // 敏感字段落库前加密（AES-256-GCM；未配置主密钥时明文兼容，同 llm.rs 模式）
     let cipher = llm_state(&state).await.and_then(|l| l.cipher.clone());
-    let emb_api_key = encrypt_field(cipher.as_ref(), &body.emb_api_key);
+    let emb_api_key = encrypt_field(cipher.as_ref(), &emb_api_key_raw);
 
     let id = uuid::Uuid::new_v4().to_string();
     if let Err(e) = rt
@@ -119,10 +172,10 @@ pub async fn create_kb(
             &id,
             &body.name,
             &body.description,
-            &body.emb_base_url,
+            &emb_base_url,
             &emb_api_key,
-            &body.emb_model,
-            body.emb_dimension,
+            &emb_model,
+            emb_dimension,
             top_k,
             chunk_size,
             chunk_overlap,

@@ -104,6 +104,7 @@
     "ai": "AI",
     "llmGateway": "LLM Gateway",
     "knowledgeBase": "Knowledge Base",
+    "knowledge": "Knowledge & Memory",
     "agentWorkbench": "AI Workbench",
     "memory": "Memory",
     "system": "System",
@@ -694,6 +695,11 @@
     "testEmbeddingOk": "OK — dimension {{dimension}} ({{latency}} ms)",
     "testEmbeddingErr": "Embedding test failed: {{error}}",
     "embLockedHint": "Embedding configuration is fixed after creation",
+    "useGlobalEmbedding": "Use global embedding config",
+    "globalEmbeddingHint": "Will use global config: {{model}} · dim {{dimension}}",
+    "globalEmbMissingHint": "No global embedding configured yet. Set it in the shared settings above, or customize below.",
+    "globalEmbNotConfigured": "Global embedding is not configured yet. Set it in the shared settings above first.",
+    "embRequired": "Custom embedding requires Base URL, model and dimension.",
     "advanced": "Advanced Parameters",
     "topK": "Top K",
     "chunkSize": "Chunk Size",
@@ -727,6 +733,12 @@
     "queryError": "Query failed. Check the embedding service and try again.",
     "noResults": "No matching chunks found.",
     "score": "Score"
+  },
+  "knowledge": {
+    "title": "Knowledge & Memory",
+    "description": "Manage RAG knowledge bases and AI conversation memory, sharing one embedding config",
+    "sharedEmbeddingTitle": "Shared Embedding Config",
+    "sharedEmbeddingDesc": "Knowledge bases and AI memory share this embedding (Base URL / key / model / dimension). Changing the dimension affects existing knowledge base vectors."
   },
   "memory": {
     "title": "AI Memory",
