@@ -717,11 +717,9 @@ impl Database {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_memories_pinned ON agent_memories(pinned)",
-        )
-        .execute(pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_memories_pinned ON agent_memories(pinned)")
+            .execute(pool)
+            .await?;
 
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
@@ -1015,34 +1013,25 @@ impl Database {
     }
 
     /// Migrate old proxy_rules CHECK constraint to include 'llm'.
-    /// Idempotent: tests if 'llm' type is accepted; if so, no-op.
+    /// Idempotent: 直接读 `sqlite_master` 里 proxy_rules 的建表 SQL，判断 CHECK 是否
+    /// 已含 'llm'，已含则无操作。
+    ///
+    /// 不再用「插入探针行再删除」的写探测：WAL 模式下失败 INSERT（CHECK 拒绝）偶发
+    /// 留下幽灵探针行，且只在表重建（DROP+RENAME）后才可见——`rules.len()` 偶得 3
+    /// （`migration_rebuilds_proxy_rules_check_for_llm` flake，已在 -j 2 多跑复现：
+    /// 探针失败/迁移拷贝均不含探针，`Database::new` 返回后探针行却出现在表里）。
+    /// 纯读探测无写入、无残留，且语义更直接（直接看 CHECK 是否含 'llm'）。
     async fn migrate_proxy_rules_check_for_llm(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-        // Test if the current CHECK accepts 'llm'
-        let probe_id = "__migration_probe_llm_check__";
-        let test_result = sqlx::query(
-            "INSERT INTO proxy_rules (id, name, type, listen_addr, created_at, updated_at)
-             VALUES (?, 'probe', 'llm', '127.0.0.1:1', datetime('now'), datetime('now'))",
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proxy_rules'",
         )
-        .bind(probe_id)
-        .execute(pool)
-        .await;
-
-        match test_result {
-            Ok(_) => {
-                // CHECK already accepts 'llm' — clean up probe and return
-                sqlx::query("DELETE FROM proxy_rules WHERE id = ?")
-                    .bind(probe_id)
-                    .execute(pool)
-                    .await?;
-                return Ok(());
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if !msg.contains("CHECK constraint failed") {
-                    return Err(e);
-                }
-                // Fall through to migration
-            }
+        .fetch_optional(pool)
+        .await?;
+        let Some((ddl,)) = row else {
+            return Ok(()); // 表不存在（全新库由 CREATE IF NOT EXISTS 用新 schema 建）
+        };
+        if ddl.contains("'llm'") {
+            return Ok(()); // CHECK 已接受 'llm'：无操作
         }
 
         // Run migration: rebuild table with updated CHECK.
@@ -1421,10 +1410,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let distilled: i64 = sqlx::query_scalar("SELECT distilled FROM agent_sessions WHERE id = 's1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let distilled: i64 =
+            sqlx::query_scalar("SELECT distilled FROM agent_sessions WHERE id = 's1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(distilled, 0, "distilled 列应存在且默认 0");
 
         // agent_memory_settings：单行 id=1 约束（非 1 拒绝），其余列默认值落库
@@ -1462,7 +1452,11 @@ mod tests {
         assert_eq!(trigger, "");
 
         // 索引存在
-        for idx in ["idx_memories_scope", "idx_memories_source", "idx_memories_pinned"] {
+        for idx in [
+            "idx_memories_scope",
+            "idx_memories_source",
+            "idx_memories_pinned",
+        ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
             )

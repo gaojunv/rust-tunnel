@@ -22,10 +22,7 @@ pub fn normalize_db_datetime(raw: &str) -> String {
 /// `&String` 是 serde `serialize_with` 对 String 字段要求的固定签名（非可改写的
 /// `&str`），故 allow `ptr_arg`。
 #[allow(clippy::ptr_arg)]
-pub fn ser_de_normalized_dt<S: serde::Serializer>(
-    s: &String,
-    ser: S,
-) -> Result<S::Ok, S::Error> {
+pub fn ser_de_normalized_dt<S: serde::Serializer>(s: &String, ser: S) -> Result<S::Ok, S::Error> {
     ser.serialize_str(&normalize_db_datetime(s))
 }
 
@@ -71,9 +68,7 @@ impl AgentWorkspaceRecord {
     /// 是否已配置 GitHub token（密文非空即视为已配置；密文可能是"明文降级"
     /// 路径下的原样 token，非 `enc:v1:` 前缀，同样按已配置处理）。
     pub fn github_token_set(&self) -> bool {
-        self.github_token
-            .as_deref()
-            .is_some_and(|t| !t.is_empty())
+        self.github_token.as_deref().is_some_and(|t| !t.is_empty())
     }
 }
 
@@ -454,8 +449,10 @@ impl Database {
         // 旧接口兼容：role=tool 的合并行推导 kind="tool"（重放时按旧格式跳过），
         // 其余为普通 message。
         let kind = if role == "tool" { "tool" } else { "message" };
-        self.agent_add_message_v2(id, session_id, role, content, tool_calls, None, None, kind, None)
-            .await
+        self.agent_add_message_v2(
+            id, session_id, role, content, tool_calls, None, None, kind, None,
+        )
+        .await
     }
 
     /// 新格式消息写入（全列）。`kind` 取值：message / tool_calls / tool_result / summary。
@@ -621,6 +618,13 @@ impl Database {
     /// 覆盖规则：新 content 非空时覆盖（终态覆盖中间态空占位）；新 content 为空且
     /// 已有非空 content 则不动（空占位不抹掉真实结果）。`parent_tool_call_id`：
     /// 子 agent 归属（同 tool_call），主 agent 传 None；更新路径 COALESCE 补全。
+    ///
+    /// content 格式（2026-08 M2 起，ACP 路径）：结构化 JSON 字符串
+    /// `{"text": string, "status": string, "diffs"?: [...], "locations"?: [...]}`
+    /// （空字段省略），status 落库供前端区分失败/成功（修复失败工具刷新后恒显 ✓）。
+    /// 存量旧行是纯文本，读取方须向后兼容。中间态空占位（无产出、非异常终态）
+    /// 传 ""，不覆盖已落库真实结果；failed 等异常终态即使 text 为空也须传非空
+    /// JSON。装配见 [`crate::agent::tool_result::tool_result_persist_content`]。
     pub async fn agent_upsert_tool_result(
         &self,
         id: &str,
@@ -738,28 +742,27 @@ impl Database {
         };
 
         let fetch = limit + 1; // 多取一条判断 has_more
-        let rows: Vec<AgentMessageRecord> = match before_rowid {
-            Some(r) => {
-                sqlx::query_as::<_, AgentMessageRecord>(
-                    "SELECT * FROM agent_messages WHERE session_id = ? AND rowid < ? \
+        let rows: Vec<AgentMessageRecord> =
+            match before_rowid {
+                Some(r) => {
+                    sqlx::query_as::<_, AgentMessageRecord>(
+                        "SELECT * FROM agent_messages WHERE session_id = ? AND rowid < ? \
                      ORDER BY rowid DESC LIMIT ?",
-                )
-                .bind(session_id)
-                .bind(r)
-                .bind(fetch)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as::<_, AgentMessageRecord>(
+                    )
+                    .bind(session_id)
+                    .bind(r)
+                    .bind(fetch)
+                    .fetch_all(&self.pool)
+                    .await?
+                }
+                None => sqlx::query_as::<_, AgentMessageRecord>(
                     "SELECT * FROM agent_messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?",
                 )
                 .bind(session_id)
                 .bind(fetch)
                 .fetch_all(&self.pool)
-                .await?
-            }
-        };
+                .await?,
+            };
         let has_more = rows.len() as i64 > limit;
         let mut msgs = if has_more {
             rows.into_iter().take(limit as usize).collect::<Vec<_>>()
@@ -1109,7 +1112,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         seed_messages_from(&db, "s1", 0, 250).await;
 
         // 无 before：最近 200 条（m50..m249），升序，has_more=true
@@ -1119,12 +1124,16 @@ mod tests {
         assert_eq!(msgs.first().unwrap().id, "m50");
         assert_eq!(msgs.last().unwrap().id, "m249");
         assert!(
-            msgs.windows(2).all(|w| msg_seq(&w[0].id) < msg_seq(&w[1].id)),
+            msgs.windows(2)
+                .all(|w| msg_seq(&w[0].id) < msg_seq(&w[1].id)),
             "返回必须按 rowid（插入顺序）升序"
         );
 
         // 带 before 翻页：m50 之前还有 50 条 → 全量返回、has_more=false
-        let (msgs, has_more) = db.agent_list_messages_page("s1", Some("m50"), 200).await.unwrap();
+        let (msgs, has_more) = db
+            .agent_list_messages_page("s1", Some("m50"), 200)
+            .await
+            .unwrap();
         assert!(!has_more);
         assert_eq!(msgs.len(), 50);
         assert_eq!(msgs.first().unwrap().id, "m0");
@@ -1150,7 +1159,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         // 少于 limit：50 条、limit=200 → 全量、has_more=false
         seed_messages_from(&db, "s1", 0, 50).await;
@@ -1188,7 +1199,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
 
         // 空会话
         let (msgs, has_more) = db.agent_list_messages_page("s1", None, 200).await.unwrap();
@@ -1205,7 +1218,9 @@ mod tests {
         assert!(!has_more);
 
         // before 指向属于其他会话的 id：视为游标不存在 → 空页、has_more=false
-        db.agent_create_session("s2", "w1", None, None).await.unwrap();
+        db.agent_create_session("s2", "w1", None, None)
+            .await
+            .unwrap();
         db.agent_add_message("other-x", "s2", "user", "other", None)
             .await
             .unwrap();
@@ -1325,7 +1340,9 @@ mod tests {
         assert_eq!(parsed[1]["arguments"], "{\"path\":\"a.rs\"}");
 
         // 不存在的 tool_call_id：无错误、无变更
-        db.agent_update_tool_call_args("s1", "nope", "x").await.unwrap();
+        db.agent_update_tool_call_args("s1", "nope", "x")
+            .await
+            .unwrap();
         let msgs = db.agent_list_messages("s1").await.unwrap();
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(msgs[0].tool_calls.as_deref().unwrap()).unwrap();
@@ -1443,6 +1460,77 @@ mod tests {
         assert_eq!(rows[0].content, "result");
     }
 
+    /// M2 结构化 content JSON 落库：agent_upsert_tool_result 原样存储 JSON 字符串
+    /// （text/status/diffs/locations），重放读取不丢字段。
+    #[tokio::test]
+    async fn test_upsert_tool_result_stores_structured_json() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        let content = crate::agent::tool_result::tool_result_persist_content(
+            Some("a.rs"),
+            Some("failed"),
+            Some(&serde_json::json!([{"old": "x", "new": "y"}])),
+            Some(&serde_json::json!([{"path": "a.rs", "line": 3}])),
+        );
+        assert!(!content.is_empty());
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), &content, None)
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+        assert_eq!(v["text"], "a.rs");
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["diffs"][0]["old"], "x");
+        assert_eq!(v["locations"][0]["line"], 3);
+        // 读取方解析：提取 text 应成功（新格式）
+        assert_eq!(
+            crate::agent::tool_result::tool_result_text(&rows[0].content),
+            Some("a.rs".to_string())
+        );
+    }
+
+    /// 旧纯文本 tool_result 行兼容：解析 helper 返回 None（走旧路径），且
+    /// agent_upsert_tool_result 对其原样收敛（非空纯文本覆盖中间态空占位）。
+    #[tokio::test]
+    async fn test_upsert_tool_result_legacy_plain_text_compat() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 中间态空占位 → 终态旧纯文本（runner 路径/历史数据形态）
+        db.agent_upsert_tool_result("m1", "s1", "c1", Some("shell"), "", None)
+            .await
+            .unwrap();
+        db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "plain result", None)
+            .await
+            .unwrap();
+
+        let rows = db.agent_list_messages("s1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "plain result");
+        assert_eq!(
+            crate::agent::tool_result::tool_result_text(&rows[0].content),
+            None,
+            "旧纯文本行必须走旧路径"
+        );
+    }
+
     /// tool_calls upsert：保更长/更完整的 JSON（回放短占位不覆盖已回填参数）。
     #[tokio::test]
     async fn test_upsert_tool_call_keeps_longer_json() {
@@ -1462,7 +1550,8 @@ mod tests {
             .await
             .unwrap();
         // 长 JSON（参数/字段更完整）
-        let long = r#"[{"id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}","tool_kind":"execute"}]"#;
+        let long =
+            r#"[{"id":"c1","name":"shell","arguments":"{\"cmd\":\"ls\"}","tool_kind":"execute"}]"#;
         db.agent_upsert_tool_call("m2", "s1", "c1", Some("shell"), long, None)
             .await
             .unwrap();
@@ -1591,9 +1680,16 @@ mod tests {
         // 子 agent 内工具调用（upsert 携带 parent）
         let calls = serde_json::json!([{"id": "c1", "name": "shell", "arguments": "{}",
             "parent_tool_call_id": "task_1"}]);
-        db.agent_upsert_tool_call("m1", "s1", "c1", Some("shell"), &calls.to_string(), Some("task_1"))
-            .await
-            .unwrap();
+        db.agent_upsert_tool_call(
+            "m1",
+            "s1",
+            "c1",
+            Some("shell"),
+            &calls.to_string(),
+            Some("task_1"),
+        )
+        .await
+        .unwrap();
         db.agent_upsert_tool_result("m2", "s1", "c1", Some("shell"), "ok", Some("task_1"))
             .await
             .unwrap();
@@ -1604,13 +1700,19 @@ mod tests {
 
         let rows = db.agent_list_messages("s1").await.unwrap();
         let by_kind = |k: &str| rows.iter().find(|r| r.kind == k).unwrap();
-        assert_eq!(by_kind("message").parent_tool_call_id.as_deref(), Some("task_1"));
+        assert_eq!(
+            by_kind("message").parent_tool_call_id.as_deref(),
+            Some("task_1")
+        );
         let tc = by_kind("tool_calls");
         assert_eq!(tc.parent_tool_call_id.as_deref(), Some("task_1"));
         let parsed: Vec<serde_json::Value> =
             serde_json::from_str(tc.tool_calls.as_deref().unwrap()).unwrap();
         assert_eq!(parsed[0]["parent_tool_call_id"], "task_1");
-        assert_eq!(by_kind("tool_result").parent_tool_call_id.as_deref(), Some("task_1"));
+        assert_eq!(
+            by_kind("tool_result").parent_tool_call_id.as_deref(),
+            Some("task_1")
+        );
         // 主 agent 消息 parent 为 NULL
         let main_text = rows.iter().find(|r| r.content == "主 agent").unwrap();
         assert!(main_text.parent_tool_call_id.is_none());
@@ -1809,7 +1911,10 @@ mod tests {
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.github_token.as_deref(), Some(stored.as_str()));
         assert!(ws.github_token_set());
-        assert_eq!(cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(), token);
+        assert_eq!(
+            cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(),
+            token
+        );
         assert_eq!(ws.github_owner.as_deref(), Some("octo"));
         assert_eq!(ws.github_repo.as_deref(), Some("repo"));
 
@@ -1818,7 +1923,11 @@ mod tests {
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
-        assert_eq!(ws.github_token.as_deref(), Some(stored.as_str()), "空串保持密文");
+        assert_eq!(
+            ws.github_token.as_deref(),
+            Some(stored.as_str()),
+            "空串保持密文"
+        );
         assert_eq!(ws.github_owner.as_deref(), Some("octo"), "空串保持 owner");
         assert_eq!(ws.github_repo.as_deref(), Some("repo"), "None 保持 repo");
 
@@ -1827,7 +1936,10 @@ mod tests {
             .await
             .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
-        assert_eq!(cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(), "ghp_new_token");
+        assert_eq!(
+            cipher.decrypt(ws.github_token.as_deref().unwrap()).unwrap(),
+            "ghp_new_token"
+        );
         assert_eq!(ws.github_owner.as_deref(), Some("newowner"));
         assert_eq!(ws.github_repo.as_deref(), Some("newrepo"));
     }

@@ -8,7 +8,8 @@
 //! 已注入的记忆不会被当成对话内容再次蒸馏。
 
 use super::{
-    upsert_memory_with_dedup, MemoryEvent, MemoryState, MAX_TAGS, MEMORY_CONTENT_MAX_CHARS, TAG_MAX_CHARS,
+    upsert_memory_with_dedup, MemoryEvent, MemoryState, MAX_TAGS, MEMORY_CONTENT_MAX_CHARS,
+    TAG_MAX_CHARS,
 };
 use crate::db::agent::AgentMessageRecord;
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
@@ -103,7 +104,12 @@ pub async fn trigger_distill_with_snapshot(
 
 /// 读蒸馏快照（会话 → workspace → 消息）。任一步失败/缺失返回 None。
 pub async fn load_snapshot(memory: &MemoryState, session_id: &str) -> Option<DistillSnapshot> {
-    let session = memory.db.agent_get_session(session_id).await.ok().flatten()?;
+    let session = memory
+        .db
+        .agent_get_session(session_id)
+        .await
+        .ok()
+        .flatten()?;
     let workspace = memory
         .db
         .agent_get_workspace(&session.workspace_id)
@@ -235,11 +241,7 @@ tags 最多 3 个；confidence 为 0 到 1 的数值，表示你对这条事实�
 
 /// 非流式无 tools LLM 调用（抄 title.rs 的 resolve_with_failover +
 /// build_upstream_body + execute_with_failover 模式）。
-async fn call_distill_llm(
-    llm: &LlmState,
-    model: &str,
-    rendered: &str,
-) -> Result<String, String> {
+async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result<String, String> {
     let chain = crate::llm::router::resolve_with_failover(llm, model)
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
@@ -291,8 +293,8 @@ pub struct DistillFact {
 /// JSON / 缺 facts 数组 / 全部条目非法 → Err。单条非法（空 content/超长）跳过。
 fn parse_facts(raw: &str) -> Result<Vec<DistillFact>, String> {
     let cleaned = strip_code_fence(raw);
-    let value: serde_json::Value = serde_json::from_str(&cleaned)
-        .map_err(|e| format!("invalid distill JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&cleaned).map_err(|e| format!("invalid distill JSON: {e}"))?;
     let arr = value
         .get("facts")
         .and_then(|v| v.as_array())
@@ -307,7 +309,10 @@ fn parse_facts(raw: &str) -> Result<Vec<DistillFact>, String> {
         if content.is_empty() || content.len() > MEMORY_CONTENT_MAX_CHARS {
             continue;
         }
-        let scope = item.get("scope").and_then(|v| v.as_str()).unwrap_or("workspace");
+        let scope = item
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("workspace");
         let scope = if matches!(scope, "global" | "client") {
             scope.to_string()
         } else {
@@ -316,7 +321,11 @@ fn parse_facts(raw: &str) -> Result<Vec<DistillFact>, String> {
         let tags: Vec<String> = item
             .get("tags")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         let confidence = item
             .get("confidence")
@@ -359,12 +368,18 @@ pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
         match (m.role.as_str(), m.tool_calls.as_deref()) {
             ("tool", _) => {
                 let name = m.name.as_deref().unwrap_or("?");
-                let sanitized = sanitize_distill_content(&m.content);
+                // M2 起 ACP 路径落库 content 为 JSON `{"text","status",...}`——
+                // 蒸馏渲染只取 text（否则把 JSON 壳喂给蒸馏 LLM）；旧纯文本行
+                // 原样使用（tool_result_text 返回 None）。
+                let content = crate::agent::tool_result::tool_result_text(&m.content)
+                    .unwrap_or_else(|| m.content.clone());
+                let sanitized = sanitize_distill_content(&content);
                 let truncated = truncate_chars(&sanitized, TOOL_RESULT_TRUNCATE_CHARS);
                 out.push_str(&format!("tool({name}): {truncated}\n"));
             }
             (_, Some(calls)) if !calls.trim().is_empty() => {
-                let parsed: Vec<serde_json::Value> = serde_json::from_str(calls).unwrap_or_default();
+                let parsed: Vec<serde_json::Value> =
+                    serde_json::from_str(calls).unwrap_or_default();
                 let names: Vec<&str> = parsed
                     .iter()
                     .filter_map(|c| c.pointer("/function/name").and_then(|n| n.as_str()))
@@ -551,9 +566,8 @@ mod tests {
     #[test]
     fn render_total_capped_at_32kb() {
         let big = "y".repeat(40 * 1024);
-        let msgs: Vec<AgentMessageRecord> = (0..8)
-            .map(|_| msg("assistant", &big, "message"))
-            .collect();
+        let msgs: Vec<AgentMessageRecord> =
+            (0..8).map(|_| msg("assistant", &big, "message")).collect();
         let out = render_distill_text(&msgs);
         assert!(out.len() <= DISTILL_MAX_CHARS + 32);
         assert!(out.contains("[truncated]"));

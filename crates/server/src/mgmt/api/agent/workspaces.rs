@@ -99,7 +99,8 @@ pub async fn create_workspace(
     let github_token = body.github_token.as_deref().filter(|s| !s.is_empty());
     let github_owner = body.github_owner.as_deref().filter(|s| !s.is_empty());
     let github_repo = body.github_repo.as_deref().filter(|s| !s.is_empty());
-    let github_token_stored = github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
+    let github_token_stored =
+        github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
     let id = new_id();
     match agent
         .db
@@ -212,7 +213,8 @@ pub async fn update_workspace(
     let github_token = body.github_token.as_deref().filter(|s| !s.is_empty());
     let github_owner = body.github_owner.as_deref().filter(|s| !s.is_empty());
     let github_repo = body.github_repo.as_deref().filter(|s| !s.is_empty());
-    let github_token_stored = github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
+    let github_token_stored =
+        github_token.map(|t| crate::llm::crypto::encrypt_field(cipher.as_ref(), t));
     match agent
         .db
         .agent_update_workspace(
@@ -469,11 +471,13 @@ async fn run_git_write(
 /// `Err(Response)` 触发 `result_large_err`。
 fn check_git_message(message: &str) -> Option<axum::response::Response> {
     if message.is_empty() {
-        return Some((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "message must not be empty" })),
-        )
-            .into_response());
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "message must not be empty" })),
+            )
+                .into_response(),
+        );
     }
     if message.len() > crate::agent::tools::MAX_COMMIT_MSG_LEN {
         return Some((
@@ -797,7 +801,11 @@ pub async fn post_git_unstage(
     Path(id): Path<String>,
     Json(body): Json<GitUnstageRequest>,
 ) -> impl IntoResponse {
-    let mut args = vec!["restore".to_string(), "--staged".to_string(), "--".to_string()];
+    let mut args = vec![
+        "restore".to_string(),
+        "--staged".to_string(),
+        "--".to_string(),
+    ];
     args.extend(body.paths.iter().cloned());
     run_git_write(&state, &id, body.approved.unwrap_or(false), args).await
 }
@@ -840,7 +848,11 @@ pub async fn post_git_branch_delete(
     Path(id): Path<String>,
     Json(body): Json<GitBranchDeleteRequest>,
 ) -> impl IntoResponse {
-    let flag = if body.force.unwrap_or(false) { "-D" } else { "-d" };
+    let flag = if body.force.unwrap_or(false) {
+        "-D"
+    } else {
+        "-d"
+    };
     run_git_write(
         &state,
         &id,
@@ -1372,8 +1384,16 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
-        assert_eq!(ws.github_token.as_deref(), Some("ghp_existing"), "空串保持已存 token");
-        assert_eq!(ws.github_owner.as_deref(), Some("octo"), "空串保持已存 owner");
+        assert_eq!(
+            ws.github_token.as_deref(),
+            Some("ghp_existing"),
+            "空串保持已存 token"
+        );
+        assert_eq!(
+            ws.github_owner.as_deref(),
+            Some("octo"),
+            "空串保持已存 owner"
+        );
 
         // 2) 非空 → 覆盖更新
         let resp = update_workspace(
@@ -1654,6 +1674,92 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
+    }
+
+    /// create 空串归一化：agent_path/llm_model_id/agent_config_overrides 传
+    /// `Some("")` → 落库为 NULL（未设置 ≠ 空串，读取方与注入路径统一按 None 处理）。
+    #[tokio::test]
+    async fn test_create_workspace_empty_strings_normalized_to_null() {
+        let (state, db) = test_state().await;
+        let resp = create_workspace(
+            State(state),
+            Json(CreateWorkspaceRequest {
+                name: "p".into(),
+                client_id: "nas".into(),
+                runtime_type: "host".into(),
+                root_path: "/p".into(),
+                docker_image: None,
+                docker_container_id: None,
+                agent_type: String::new(),
+                agent_path: Some(String::new()),
+                llm_model_id: Some(String::new()),
+                agent_config_overrides: Some(String::new()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_list_workspaces().await.unwrap();
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].agent_path, None, "空串应归一化为 NULL: {ws:?}");
+        assert_eq!(ws[0].llm_model_id, None, "空串应归一化为 NULL");
+        assert_eq!(ws[0].agent_config_overrides, None, "空串应归一化为 NULL");
+    }
+
+    /// update 空串归一化：传 `Some("")` → filter 归一化为 None → DB COALESCE 保持
+    /// 原值（空串 update 不得把已有配置抹成空串）。
+    #[tokio::test]
+    async fn test_update_workspace_empty_string_keeps_existing_value() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1",
+            "p",
+            "nas",
+            "host",
+            "/p",
+            None,
+            None,
+            "gemini",
+            Some("/opt/agent"),
+            Some("model-1"),
+            Some(r#"{"mode":"plan"}"#),
+        )
+        .await
+        .unwrap();
+        let resp = update_workspace(
+            State(state),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: Some(String::new()),
+                llm_model_id: Some(String::new()),
+                agent_config_overrides: Some(String::new()),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_path.as_deref(),
+            Some("/opt/agent"),
+            "空串 update 应保持原值: {ws:?}"
+        );
+        assert_eq!(ws.llm_model_id.as_deref(), Some("model-1"));
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"mode":"plan"}"#)
+        );
     }
 
     #[tokio::test]
