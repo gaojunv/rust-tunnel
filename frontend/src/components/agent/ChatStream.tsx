@@ -1437,11 +1437,6 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             {items.map((it, i) => renderItem(it, i))}
           </div>
         )}
-        {running && (
-          /* 运行中指示：视觉已迁移到输入框彩色边框（容器 .agent-input-running，
-             见 index.css），此处仅保留视觉隐藏的 status 语义供屏幕阅读器播报 */
-          <span role="status" aria-label={t('agent.running')} className="sr-only" />
-        )}
         <div ref={bottomRef} />
         </div>
 
@@ -1454,6 +1449,14 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
           <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
           <div className="mx-auto w-full max-w-3xl">
+          {running && (
+            /* 运行中指示：视觉已迁移到输入框彩色边框（容器 .agent-input-running，
+               见 index.css），此处仅保留视觉隐藏的 status 语义供屏幕阅读器播报。
+               注意：不能放在消息流内——absolute 定位的 sr-only 会触发滚动容器
+               sticky 输入框跳顶的 Chrome 布局 bug（见 05895ca 回归），故置于
+               sticky 输入框容器内。 */
+            <span role="status" aria-label={t('agent.running')} className="sr-only" />
+          )}
           {disconnected && (
             <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
               <Loader2 className="h-3 w-3 animate-spin" />
