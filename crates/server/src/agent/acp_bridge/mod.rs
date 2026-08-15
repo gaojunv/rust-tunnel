@@ -197,6 +197,13 @@ struct SpawnedAgent {
     /// 一并 prepend；distill 渲染也会剥离 `<skills>` 块，无回环。纯 SQL 检索，
     /// 零 embedding 依赖。
     skill_list_block: Option<String>,
+    /// 本会话 MCP 端点访问令牌（`/mcp/<token>` 路径）。ensure_session 铸造；
+    /// 条目移除（kill/重拉/reaper）即吊销。仅 rag + memory 注入时 Some。
+    /// 读取只在 rag 门控的 `/mcp/` 隧道（`handle_mcp_tunnel`）里；字段保持不
+    /// cfg（非 rag 构建占位插入统一构造），故非 rag 下视为不可读（同 PendingPrompt
+    /// refs 的记录保留语义）。
+    #[allow(dead_code)]
+    mcp_token: Option<String>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -414,6 +421,7 @@ mod tests {
         SpawnedAgent {
             memory_block: None,
             skill_list_block: None,
+            mcp_token: None,
             acp_session_id: None,
             connection: None,
             agent_io: None,
@@ -508,10 +516,76 @@ mod tests {
             recorded,
             resume_fails,
             fail_config_id.map(str::to_string),
+            // 本 helper 不含 MCP 注入参数：缺省 http=false + 丢弃记录
+            // （MCP 注入协商走专用 setup_handshake_mcp）。
+            false,
+            Arc::new(Mutex::new(Vec::new())),
         ));
 
         bridge
-            .acp_handshake("sess-1", "/mock", persisted_id.map(str::to_string))
+            .acp_handshake(
+                "sess-1",
+                "/mock",
+                persisted_id.map(str::to_string),
+                45678,
+                None,
+            )
+            .await
+            .expect("handshake should complete");
+    }
+
+    /// 装配 mock agent 并完成 ACP handshake，带 MCP 注入参数（专用 MCP 协商测试）。
+    ///
+    /// `mcp_http`：initialize 响应声明 `mcpCapabilities.http`（false = 无 http 能力）；
+    /// `mcp_token`：传给 `acp_handshake` 的本会话 MCP 端点 token（None = 不注入）；
+    /// `mcp_servers` 记录 mock 收到的 `session/new` 与 `session/resume` 的
+    /// `params.mcpServers`（原样 JSON，空数组 = 未注入）。
+    async fn setup_handshake_mcp(
+        bridge: &AcpBridge,
+        ws_tx: mpsc::Sender<serde_json::Value>,
+        mcp_http: bool,
+        mcp_token: Option<&str>,
+        mcp_servers: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
+        let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
+
+        let mut agent = spawned_agent();
+        agent.agent_io = Some(agent_io);
+        agent.stdout_tx = Some(stdout_tx.clone());
+        agent.ws_tx = Some(ws_tx.clone());
+        agent.ws_conn_id = TEST_CONN_ID;
+        agent.ws_conns = vec![(TEST_CONN_ID, ws_tx.clone())];
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+
+        tokio::spawn(run_stdio_pump(
+            pump_io,
+            stdout_rx,
+            control_tx,
+            "sess-1".into(),
+        ));
+        tokio::spawn(mock_acp_agent(
+            control_rx,
+            stdout_tx,
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+            None,
+            false,
+            None,
+            mcp_http,
+            mcp_servers,
+        ));
+
+        bridge
+            .acp_handshake(
+                "sess-1",
+                "/mock",
+                None,
+                45678,
+                mcp_token.map(str::to_string),
+            )
             .await
             .expect("handshake should complete");
     }
@@ -1187,6 +1261,161 @@ mod tests {
             .await;
     }
 
+    // ── MCP remember 端点 token 校验（`/mcp/<token>` 路由）────────
+
+    /// 装配 MCP 隧道测试环境：注册客户端 + 可选会话条目（带 mcp_token）。
+    /// `seed_session` 为 true 时在 DB 建 workspace/session（valid-token 用例需要
+    /// `agent_get_session` 解析 workspace_id）。
+    #[cfg(feature = "rag")]
+    async fn mcp_tunnel_env(
+        mcp_token: Option<&str>,
+        seed_session: bool,
+    ) -> (AcpBridge, mpsc::Receiver<ControlMessage>) {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        if seed_session {
+            db.agent_create_workspace(
+                "w1",
+                "proj",
+                "nas",
+                "host",
+                "/workspace",
+                None,
+                None,
+                "gemini",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+                .await
+                .unwrap();
+        }
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let (tx, rx) = mpsc::channel(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        if let Some(t) = mcp_token {
+            let mut agent = spawned_agent();
+            agent.mcp_token = Some(t.to_string());
+            bridge.sessions.lock().await.insert("sess-1".into(), agent);
+        }
+        (bridge, rx)
+    }
+
+    /// 发一个 AgentLlmProxyRequest（/mcp/ 路径）并取回唯一一个 AgentLlmProxyChunk。
+    #[cfg(feature = "rag")]
+    async fn send_mcp_request(
+        bridge: &AcpBridge,
+        rx: &mut mpsc::Receiver<ControlMessage>,
+        path: &str,
+        body: Vec<u8>,
+    ) -> (String, u16, bool, Vec<u8>) {
+        bridge
+            .handle_client_msg(
+                "nas",
+                ControlMessage::AgentLlmProxyRequest {
+                    request_id: "req-1".into(),
+                    session_id: "sess-1".into(),
+                    path: path.into(),
+                    body,
+                },
+            )
+            .await;
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for chunk")
+            .expect("channel closed")
+        {
+            ControlMessage::AgentLlmProxyChunk {
+                request_id,
+                status,
+                done,
+                data,
+            } => (request_id, status, done, data),
+            other => panic!("expected AgentLlmProxyChunk, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn test_mcp_tunnel_valid_token_returns_initialize() {
+        // 有效 token + 合法 initialize → 200 done=true，body 为 MCP initialize 响应。
+        let (mut bridge, mut rx) = mcp_tunnel_env(Some("tok-123"), true).await;
+        let base = crate::agent::memory::mock_embedding_server(8).await;
+        let (_mdb, memory) = crate::agent::memory::test_memory_with_embedding(&base).await;
+        bridge = bridge.with_memory(memory);
+        let (_rid, status, done, data) = send_mcp_request(
+            &bridge,
+            &mut rx,
+            "/mcp/tok-123",
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#
+                .to_vec(),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(done, "MCP 响应必须单 chunk done=true");
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
+    }
+
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn test_mcp_tunnel_invalid_token_returns_404() {
+        // token 不匹配 → 404 + JSON-RPC error（-32001），done=true。
+        let (bridge, mut rx) = mcp_tunnel_env(Some("real-token"), false).await;
+        let (_rid, status, done, data) = send_mcp_request(
+            &bridge,
+            &mut rx,
+            "/mcp/wrong-token",
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert!(done);
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["error"]["code"], -32001);
+        assert_eq!(v["error"]["message"], "invalid mcp token");
+    }
+
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn test_mcp_tunnel_revoked_token_returns_404() {
+        // 会话条目被移除（kill/重拉/reaper）→ token 即吊销 → 404。
+        let (bridge, mut rx) = mcp_tunnel_env(None, false).await;
+        let (_rid, status, done, data) = send_mcp_request(
+            &bridge,
+            &mut rx,
+            "/mcp/stale-token",
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert!(done);
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["error"]["code"], -32001);
+    }
+
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn test_mcp_tunnel_empty_body_returns_405() {
+        // 空 body（旧客户端 GET SSE 探测等非 POST）→ 405（MCP SDK 视 405 为
+        // 静默成功，不阻断 initialize）。
+        let (bridge, mut rx) = mcp_tunnel_env(Some("tok"), false).await;
+        let (_rid, status, done, data) =
+            send_mcp_request(&bridge, &mut rx, "/mcp/tok", Vec::new()).await;
+        assert_eq!(status, 405);
+        assert!(done);
+        assert!(data.is_empty());
+    }
+
     // ── stdio pump ─────────────────────────────────────────────
 
     #[tokio::test]
@@ -1344,6 +1573,7 @@ mod tests {
     /// `recorded`（None 不记录）：收集收到的 method/通知名（如 `session/cancel`）。
     /// `resume_fails`：true 时 `session/resume` 回 JSON-RPC error（测回退 session/new）。
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn mock_acp_agent(
         mut stdin_rx: mpsc::Receiver<ControlMessage>,
         stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -1353,6 +1583,8 @@ mod tests {
         recorded: Option<Arc<Mutex<Vec<String>>>>,
         resume_fails: bool,
         fail_config_id: Option<String>,
+        mcp_http: bool,
+        mcp_servers: Arc<Mutex<Vec<serde_json::Value>>>,
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
@@ -1382,19 +1614,30 @@ mod tests {
                 match method.as_str() {
                     "initialize" => {
                         // 声明 loadSession + session/resume/delete 能力，与
-                        // claude-agent-acp 对齐（resume 测试依赖它）。
+                        // claude-agent-acp 对齐（resume 测试依赖它）。mcpCapabilities
+                        // 由调用方配置：缺省 http=false → acp_handshake 不注入
+                        // mcpServers（与真实无该能力的 agent 行为一致）。
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {
                                 "protocolVersion": 1,
                                 "agentCapabilities": {
                                     "loadSession": true,
+                                    "mcpCapabilities": { "http": mcp_http, "sse": false },
                                     "sessionCapabilities": { "resume": {}, "delete": {} }
                                 }
                             }
                         }));
                     }
                     "session/new" => {
+                        // 记录注入的 mcpServers（http=true + token 时应有 1 条 http
+                        // server；否则空数组）。与 applied 同模式：mock 侧收到什么
+                        // 原样入列，断言交给测试。
+                        let servers = json
+                            .pointer("/params/mcpServers")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        mcp_servers.lock().await.push(servers);
                         out_lines.push(serde_json::json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": { "sessionId": "acp-1", "configOptions": config_options }
@@ -1402,7 +1645,13 @@ mod tests {
                     }
                     "session/resume" => {
                         // 成功回显请求的 sessionId；失败回 JSON-RPC error
-                        // （acp_handshake 据此回退 session/new）。
+                        // （acp_handshake 据此回退 session/new）。resume 与 new 同样
+                        // 记录 mcpServers（两种会话建立路径都注入）。
+                        let servers = json
+                            .pointer("/params/mcpServers")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        mcp_servers.lock().await.push(servers);
                         if resume_fails {
                             out_lines.push(serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
@@ -2809,12 +3058,15 @@ mod tests {
     /// 经 `SpawnedAgent.stdout_tx` 送回 pump → ACP 连接。生产接线
     /// `ensure_session` 全链路（start_llm_proxy → spawn_agent → handshake → 配置注入）
     /// 不经此桥无法完成，测试由此验证真实调用顺序。
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_e2e_client(
         registry: &crate::client_registry::ClientRegistry,
         sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
         config_options: serde_json::Value,
         applied: Arc<Mutex<Vec<(String, String)>>>,
         fail_config_id: Option<&str>,
+        mcp_http: bool,
+        mcp_servers: Arc<Mutex<Vec<serde_json::Value>>>,
     ) {
         let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
         registry
@@ -2834,6 +3086,8 @@ mod tests {
             None,
             false,
             fail_config_id.map(str::to_string),
+            mcp_http,
+            mcp_servers,
         ));
         // 客户端侧：协商应答 + stdin（server→process）桥接到进程侧
         tokio::spawn(async move {
@@ -2935,7 +3189,17 @@ mod tests {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
         let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone());
-        spawn_e2e_client(&registry, &bridge.sessions, options, applied.clone(), None).await;
+        // 本用例不测 MCP 注入：mock 缺省 http=false，mcpServers 丢弃。
+        spawn_e2e_client(
+            &registry,
+            &bridge.sessions,
+            options,
+            applied.clone(),
+            None,
+            false,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
 
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -2979,6 +3243,189 @@ mod tests {
                 .config_options
                 .len(),
             2
+        );
+    }
+
+    // ── remember MCP server 注入协商 ───────────────────────────
+
+    /// 构造带注册客户端（nas）的空 bridge（MCP 注入协商测试用）。
+    async fn handshake_test_bridge() -> AcpBridge {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        AcpBridge::new(AgentSpawner::new(registry), db)
+    }
+
+    /// agent 声明 mcp http 能力 + 会话 token → session/new 的 mcpServers 注入
+    /// remember MCP server（type=http、name=rust-tunnel-memory、URL 指向回环代理
+    /// `http://127.0.0.1:45678/mcp/tok123`）。
+    #[tokio::test]
+    async fn test_handshake_injects_mcp_server_when_http_capable() {
+        let bridge = handshake_test_bridge().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mcp_servers = Arc::new(Mutex::new(Vec::new()));
+        setup_handshake_mcp(&bridge, ws_tx, true, Some("tok123"), mcp_servers.clone()).await;
+
+        let received = mcp_servers.lock().await.clone();
+        assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+        let servers = received[0].as_array().expect("mcpServers 应为数组");
+        assert_eq!(servers.len(), 1, "http 能力 + token 应注入 1 条 server: {received:?}");
+        let entry = &servers[0];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["name"], "rust-tunnel-memory");
+        assert_eq!(entry["url"], "http://127.0.0.1:45678/mcp/tok123");
+    }
+
+    /// agent 无 mcp http 能力（缺省 http=false）→ mcpServers 为空数组，handshake
+    /// 照常成功（降级不报错）。
+    #[tokio::test]
+    async fn test_handshake_skips_mcp_injection_without_http_capability() {
+        let bridge = handshake_test_bridge().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mcp_servers = Arc::new(Mutex::new(Vec::new()));
+        // 有 token 但无能力：能力是注入的前置条件
+        setup_handshake_mcp(&bridge, ws_tx, false, Some("tok123"), mcp_servers.clone()).await;
+
+        let received = mcp_servers.lock().await.clone();
+        assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
+        assert!(
+            received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "无 http 能力时 mcpServers 应为空: {received:?}"
+        );
+        // 会话照常建立
+        assert!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .connection
+                .is_some()
+        );
+    }
+
+    /// 有 http 能力但会话未铸造 token（memory 未启用等）→ 不注入，不报错。
+    #[tokio::test]
+    async fn test_handshake_skips_mcp_injection_without_token() {
+        let bridge = handshake_test_bridge().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mcp_servers = Arc::new(Mutex::new(Vec::new()));
+        setup_handshake_mcp(&bridge, ws_tx, true, None, mcp_servers.clone()).await;
+
+        let received = mcp_servers.lock().await.clone();
+        assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
+        assert!(
+            received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "无 token 时 mcpServers 应为空: {received:?}"
+        );
+    }
+
+    /// 生产接线端到端（MCP 注入）：带 memory 的 `ensure_session` 在 handshake 的
+    /// session/new 注入 mcpServers——URL 端口 = e2e mock 的 LLM 回环代理端口
+    /// （45678），token = ensure_session 铸造的 32 位 hex；spawn_ready 照常置位。
+    #[cfg(feature = "rag")]
+    #[tokio::test]
+    async fn test_ensure_session_injects_mcp_server_with_memory() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            Some("model-1"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+
+        let options = serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}]}
+        ]);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let mcp_servers = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        // memory 注入（token 铸造前置条件）：mock embedding server + 开启 settings。
+        let base = crate::agent::memory::mock_embedding_server(8).await;
+        let (_mdb, memory) = crate::agent::memory::test_memory_with_embedding(&base).await;
+        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone())
+            .with_memory(memory);
+        // e2e mock 声明 mcp http 能力并记录收到的 mcpServers。
+        spawn_e2e_client(
+            &registry,
+            &bridge.sessions,
+            options,
+            applied.clone(),
+            None,
+            true,
+            mcp_servers.clone(),
+        )
+        .await;
+
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        bridge
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
+            .await
+            .expect("ensure_session 应带 memory 完整走通");
+
+        // session/new 收到注入的 mcpServers（1 条 http server）
+        let received = mcp_servers.lock().await.clone();
+        assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+        let servers = received[0].as_array().expect("mcpServers 应为数组");
+        assert_eq!(servers.len(), 1, "http 能力 + memory 应注入 1 条 server: {received:?}");
+        let entry = &servers[0];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["name"], "rust-tunnel-memory");
+        let url = entry["url"].as_str().expect("mcp url 应为字符串");
+        let token = url
+            .strip_prefix("http://127.0.0.1:45678/mcp/")
+            .expect("URL 应指向 e2e mock 的 LLM 回环代理端口: {url}");
+        assert_eq!(token.len(), 32, "token 应为 32 位 hex: {token}");
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "token 应全为 hex: {token}"
+        );
+        // 注入的 URL token 与会话条目内 mcp_token 一致（token 本体只存这里，吊销靠条目移除）
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .mcp_token
+                .as_deref(),
+            Some(token),
+            "mcp_token 应与注入 URL 的 token 一致"
+        );
+        // 配置注入全部完成后 spawn_ready 照常置位（MCP 注入不改变 spawn 完成信号）
+        assert!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .spawn_ready
+                .borrow()
+                .clone(),
+            "spawn_ready 应在注入后置位"
         );
     }
 

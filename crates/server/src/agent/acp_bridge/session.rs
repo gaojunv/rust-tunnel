@@ -14,14 +14,18 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
     DeleteSessionRequest, ElicitationAcceptAction, ElicitationAction, ElicitationMode,
-    InitializeRequest, NewSessionRequest, PermissionOption, PermissionOptionId,
-    PermissionOptionKind, PromptRequest, ReadTextFileRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
-    TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
+    PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
+    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
+#[cfg(feature = "rag")]
+use crate::agent::memory::MemoryState;
+#[cfg(feature = "rag")]
+use crate::agent::mcp::McpHttpResponse;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client};
 
@@ -66,6 +70,17 @@ impl AcpBridge {
         // 一经拉起随时可能产出 stdout（AgentSpawnData{stdin:false}），此时
         // handle_spawn_data 能立即转发到 pump 通道 → duplex 缓冲，ACP 连接
         // 建立后消费——handshake 期间早产字节不会丢（Task 6 评审要求）。
+        // 本会话 MCP 端点访问令牌（`/mcp/<token>` 路径）：仅 rag + memory 启用时
+        // 铸造（32 hex）。token 随 SpawnedAgent 条目生灭——kill/重拉/reaper 移除
+        // 条目即吊销，不落盘。写入占位条目 + 交 acp_handshake 注入 mcpServers。
+        #[cfg(feature = "rag")]
+        let mcp_token: Option<String> = if self.memory.is_some() {
+            Some(format!("{:032x}", rand::random::<u128>()))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "rag"))]
+        let mcp_token: Option<String> = None;
         let pump_setup: Option<(tokio::io::DuplexStream, mpsc::Receiver<Vec<u8>>)> = {
             let mut sessions = self.sessions.lock().await;
             // 兜底杀进程后重拉：旧（exited）条目里排队等待的 prompt 迁移到新条目，
@@ -140,6 +155,7 @@ impl AcpBridge {
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
                     memory_block: None,
                     skill_list_block: None,
+                    mcp_token: mcp_token.clone(),
                 },
             );
             Some((pump_io, stdout_rx))
@@ -221,8 +237,14 @@ impl AcpBridge {
                 .flatten()
                 .and_then(|s| s.acp_session_id);
             let root_path = workspace.root_path.clone();
-            self.acp_handshake(session_id, &root_path, persisted_acp_session_id)
-                .await?;
+            self.acp_handshake(
+                session_id,
+                &root_path,
+                persisted_acp_session_id,
+                port,
+                mcp_token,
+            )
+            .await?;
             tracing::info!(
                 session_id,
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
@@ -294,6 +316,13 @@ impl AcpBridge {
     /// 客户端磁盘恢复 agent 侧对话上下文），失败/不支持回退 `session/new`。
     /// 最终生效的 session id 落库（best-effort），供下次重拉继续 resume。
     ///
+    /// `mcp_port` 是客户端内嵌 LLM 回环代理监听端口，`mcp_token` 是本会话 MCP
+    /// 端点访问令牌（ensure_session 铸造，None 时不注入）。两者只在 agent 声明
+    /// `mcp_capabilities.http` 时用于把 remember MCP server 注入 session/new 与
+    /// session/resume 的 `mcpServers`（URL `http://127.0.0.1:{mcp_port}/mcp/{token}`，
+    /// agent 经回环代理转发到服务端 `handle_mcp_tunnel`）。降级：能力缺失/无 token
+    /// 不注入、不报错（仅 info 日志）。
+    ///
     /// 注意：`agent_client_protocol::Client` 是角色标记（unit struct），并非
     /// 连接句柄；连接句柄是 `ConnectionTo<Agent>`。每 session 一条专用连接，
     /// 通知无需按 session id 过滤。
@@ -302,6 +331,8 @@ impl AcpBridge {
         session_id: &str,
         cwd: &str,
         persisted_acp_session_id: Option<String>,
+        mcp_port: u16,
+        mcp_token: Option<String>,
     ) -> Result<(), String> {
         // 取走 duplex 的 ACP 端（占用即移除；后续 kill 不再持有）。
         let agent_io = {
@@ -759,6 +790,47 @@ impl AcpBridge {
                                 .session_capabilities
                                 .resume
                                 .is_some();
+                            // remember MCP server 注入：agent 声明 mcp http 能力且本
+                            // 会话铸造了 token → session/new 与 session/resume 都带
+                            // mcpServers（两种会话建立路径都会连 MCP）。非 rag（token
+                            // 恒 None）/ memory 未启用 / agent 无 http 能力 → 不注入，
+                            // 仅 info 日志，降级不报错。
+                            let mcp_http_capable = init_resp.agent_capabilities.mcp_capabilities.http;
+                            let mcp_servers: Option<Vec<McpServer>> =
+                                match (mcp_http_capable, &mcp_token) {
+                                    (true, Some(token)) => {
+                                        tracing::info!(
+                                            session_id = %sid,
+                                            "agent 声明 mcp http 能力，注入 remember MCP server"
+                                        );
+                                        Some(vec![McpServer::Http(McpServerHttp::new(
+                                            "rust-tunnel-memory",
+                                            format!("http://127.0.0.1:{mcp_port}/mcp/{token}"),
+                                        ))])
+                                    }
+                                    (false, _) => {
+                                        tracing::info!(
+                                            session_id = %sid,
+                                            "agent 未声明 mcp http 能力，跳过 remember MCP 注入"
+                                        );
+                                        None
+                                    }
+                                    _ => None,
+                                };
+                            // 统一构造请求（按需带 mcpServers）。
+                            let build_new_req = |cwd: &str| match &mcp_servers {
+                                Some(servers) => {
+                                    NewSessionRequest::new(cwd).mcp_servers(servers.clone())
+                                }
+                                None => NewSessionRequest::new(cwd),
+                            };
+                            let build_resume_req = |session_id: SessionId, cwd: &str| {
+                                match &mcp_servers {
+                                    Some(servers) => ResumeSessionRequest::new(session_id, cwd)
+                                        .mcp_servers(servers.clone()),
+                                    None => ResumeSessionRequest::new(session_id, cwd),
+                                }
+                            };
                             // 会话建立：resume 成功复用旧 id；失败/无 id/不支持 →
                             // session/new（全新会话，原行为）。
                             let (acp_session_id, config_options): (
@@ -767,7 +839,7 @@ impl AcpBridge {
                             ) = match persisted_acp_session_id.as_deref() {
                                 Some(persisted) if resume_capable => {
                                     match cx
-                                        .send_request(ResumeSessionRequest::new(
+                                        .send_request(build_resume_req(
                                             SessionId::new(persisted),
                                             &cwd,
                                         ))
@@ -793,7 +865,7 @@ impl AcpBridge {
                                                 "acp resume failed, fall back to new session: {e}"
                                             );
                                             let new_session = cx
-                                                .send_request(NewSessionRequest::new(&cwd))
+                                                .send_request(build_new_req(&cwd))
                                                 .block_task()
                                                 .await?;
                                             (
@@ -808,7 +880,7 @@ impl AcpBridge {
                                 }
                                 _ => {
                                     let new_session = cx
-                                        .send_request(NewSessionRequest::new(&cwd))
+                                        .send_request(build_new_req(&cwd))
                                         .block_task()
                                         .await?;
                                     (
@@ -1665,6 +1737,34 @@ impl AcpBridge {
             tracing::warn!(client_name, %request_id, "llm proxy: client offline, dropping request");
             return;
         };
+        // `/mcp/<token>`：ACP agent 经内网 LLM 回环代理发来的 MCP 请求（remember
+        // 工具）。单 chunk 回 AgentLlmProxyChunk{status, data, done:true}（MCP 报文
+        // ~1KB 量级，无需切片）。非 rag 构建无此端点，落下方 llm_bridge 白名单
+        // 404（行为同现状，零回归）。
+        if path.starts_with("/mcp/") {
+            #[cfg(feature = "rag")]
+            {
+                let sessions = self.sessions.clone();
+                let memory = self.memory.clone();
+                let db = self.db.clone();
+                let sid = session_id;
+                let p = path;
+                let b = body;
+                tokio::spawn(async move {
+                    let resp =
+                        handle_mcp_tunnel(&sessions, memory.as_ref(), &db, &sid, &p, b).await;
+                    let _ = control_tx
+                        .send(ControlMessage::AgentLlmProxyChunk {
+                            request_id,
+                            data: resp.data,
+                            done: true,
+                            status: resp.status,
+                        })
+                        .await;
+                });
+                return;
+            }
+        }
         // 会话必须已登记（ensure_session 已跑）。未登记时无法解析模型，按契约发 502 done chunk。
         if !self.sessions.lock().await.contains_key(&session_id) {
             let _ = control_tx
@@ -1708,6 +1808,86 @@ impl AcpBridge {
         });
     }
 }
+/// 处理 ACP agent 经回环代理转发的 MCP 请求（`/mcp/<token>`）。
+///
+/// token 校验：与 [`SpawnedAgent`] 的 `mcp_token`（ensure_session 铸造）精确比对；
+/// 条目移除（kill/重拉/reaper）即吊销。校验通过后解析 workspace 坐标并转交
+/// [`crate::agent::mcp::handle_request`] 做 JSON-RPC 分发（只暴露 remember 工具）。
+#[cfg(feature = "rag")]
+async fn handle_mcp_tunnel(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    memory: Option<&MemoryState>,
+    db: &Database,
+    session_id: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> McpHttpResponse {
+    // 空 body → 405：防御旧客户端 GET SSE 探测等非 POST（MCP SDK 把 GET 405
+    // 视为静默成功，不阻断 initialize）。
+    if body.is_empty() {
+        return McpHttpResponse {
+            status: 405,
+            data: Vec::new(),
+        };
+    }
+    // 解析 token：strip_prefix("/mcp/") → 去 query（`/mcp/<token>?xxx`）→ 非空。
+    let token = match path.strip_prefix("/mcp/").map(|t| t.split('?').next()) {
+        Some(Some(t)) if !t.is_empty() => t,
+        _ => return mcp_token_rejected(),
+    };
+    // 锁 sessions 比对 token（不匹配/会话不在 → 404 + JSON-RPC error）。
+    let client_id = {
+        let sessions = sessions.lock().await;
+        match sessions.get(session_id) {
+            Some(agent) if agent.mcp_token.as_deref() == Some(token) => agent.client_id.clone(),
+            _ => return mcp_token_rejected(),
+        }
+    };
+    // workspace 坐标：remember 落库需要（scope=workspace 时）。会话行缺失/DB 错误
+    // 属服务端异常，500 防御。
+    let workspace_id = match db.agent_get_session(session_id).await {
+        Ok(Some(s)) => s.workspace_id,
+        _ => {
+            tracing::warn!(session_id, "mcp tunnel: agent session missing in db");
+            return mcp_internal_error("agent session not found");
+        }
+    };
+    // memory 缺失（防御：构造时未注入）→ 500。
+    let Some(memory) = memory else {
+        tracing::warn!(session_id, "mcp tunnel: memory runtime not configured");
+        return mcp_internal_error("memory not configured");
+    };
+    crate::agent::mcp::handle_request(memory, &client_id, &workspace_id, session_id, &body).await
+}
+
+/// token 无效/会话条目不在：404 + JSON-RPC error（MCP SDK 视连接失败，重试/报错）。
+#[cfg(feature = "rag")]
+fn mcp_token_rejected() -> McpHttpResponse {
+    McpHttpResponse {
+        status: 404,
+        data: serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": {"code": -32001, "message": "invalid mcp token"},
+        }))
+        .unwrap_or_default(),
+    }
+}
+
+/// 服务端内部错误：500 + JSON-RPC error。
+#[cfg(feature = "rag")]
+fn mcp_internal_error(message: &str) -> McpHttpResponse {
+    McpHttpResponse {
+        status: 500,
+        data: serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": {"code": -32000, "message": message},
+        }))
+        .unwrap_or_default(),
+    }
+}
+
 /// 从终态回调发起下一条排队 prompt（fire-and-forget，队列 drain）。
 ///
 /// 抽成独立 sync fn：在 async 闭包（`on_receiving_result` 回调）里直接

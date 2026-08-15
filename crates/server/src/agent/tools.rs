@@ -280,24 +280,17 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
         }),
     ];
     // AI 记忆体 remember 工具：服务端本地短路（runner.rs handle_tool_calls 提前
-    // 拦截，不进 AgentCommand 协议）。仅 rag feature 下出现在 schema——无 rag 构建
-    // 模型看不到该工具，不会调用。
+    // 拦截，不进 AgentCommand 协议）。description/parameters 与 MCP 端点共用
+    // memory 模块的共享 schema，避免两处漂移。仅 rag feature 下出现在 schema——
+    // 无 rag 构建模型看不到该工具，不会调用。
     #[cfg(feature = "rag")]
     {
         tools.push(serde_json::json!({
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "Save a durable atomic fact about the machine environment, user preferences, or key project decisions for reuse in future sessions. Only save stable reusable knowledge — never credentials, API keys, or transient state.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "The atomic fact to remember (max 2048 chars)"},
-                        "scope": {"type": "string", "enum": ["workspace", "client", "global"], "description": "Visibility: workspace = this project only; client = all projects on this machine; global = everywhere (default workspace)"},
-                        "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags (max 8, each max 32 chars)"}
-                    },
-                    "required": ["content"]
-                }
+                "description": crate::agent::memory::REMEMBER_TOOL_DESCRIPTION,
+                "parameters": crate::agent::memory::remember_tool_schema(),
             }
         }));
         // Skill 库 use_skill 工具：服务端本地短路（同 remember，不进 AgentCommand

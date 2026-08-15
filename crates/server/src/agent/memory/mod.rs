@@ -36,6 +36,25 @@ pub(crate) const MAX_TAGS: usize = 8;
 /// 单 tag 长度上限。
 pub(crate) const TAG_MAX_CHARS: usize = 32;
 
+// ── remember 工具 schema（runner 内置短路与 MCP tools/list 共用）────
+
+/// remember 工具给模型的描述（OpenAI function schema 与 MCP 端点共用）。
+pub(crate) const REMEMBER_TOOL_DESCRIPTION: &str = "Save a durable atomic fact about the machine environment, user preferences, or key project decisions for reuse in future sessions. Only save stable reusable knowledge — never credentials, API keys, or transient state.";
+
+/// remember 工具的 parameters JSON schema。`tools.rs` 的 OpenAI function schema 直接
+/// 内嵌此对象；MCP `tools/list` 的 `inputSchema` 同样取它（两者同构）。
+pub(crate) fn remember_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "The atomic fact to remember (max 2048 chars)"},
+            "scope": {"type": "string", "enum": ["workspace", "client", "global"], "description": "Visibility: workspace = this project only; client = all projects on this machine; global = everywhere (default workspace)"},
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags (max 8, each max 32 chars)"}
+        },
+        "required": ["content"]
+    })
+}
+
 /// 蒸馏/注入过程广播给前端 SSE 的事件。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemoryEvent {
