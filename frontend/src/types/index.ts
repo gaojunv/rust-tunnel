@@ -495,10 +495,11 @@ export interface KbEvent {
 export interface CreateLlmKbRequest {
   name: string;
   description: string;
-  emb_base_url: string;
-  emb_api_key: string;
-  emb_model: string;
-  emb_dimension: number;
+  /** 不提供时后端回退到全局共享 embedding 配置。 */
+  emb_base_url?: string;
+  emb_api_key?: string;
+  emb_model?: string;
+  emb_dimension?: number;
   top_k?: number;
   chunk_size?: number;
   chunk_overlap?: number;

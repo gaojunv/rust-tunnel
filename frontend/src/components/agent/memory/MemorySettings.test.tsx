@@ -12,7 +12,6 @@ vi.mock('react-i18next', () => ({
 const api = vi.hoisted(() => ({
   getMemorySettings: vi.fn(),
   updateMemorySettings: vi.fn(),
-  testMemoryEmbedding: vi.fn(),
   clearMemory: vi.fn(),
 }));
 
@@ -27,7 +26,7 @@ const settingsFixture: AgentMemorySettings = {
   emb_api_key: '',
   emb_model: 'text-embedding-3-small',
   emb_dimension: 1536,
-  distill_model: '',
+  distill_model: 'deepseek-chat',
   top_k: 8,
   score_threshold: 0.4,
   inject_budget_tokens: 1500,
@@ -52,29 +51,24 @@ describe('MemorySettings', () => {
     vi.clearAllMocks();
   });
 
-  it('loads settings into the form and saves edited values', async () => {
+  it('loads memory-specific settings and saves without embedding fields', async () => {
     api.getMemorySettings.mockResolvedValue(settingsFixture);
     api.updateMemorySettings.mockResolvedValue(settingsFixture);
     renderSettings();
 
-    // 等表单从 settings 初始化
-    await screen.findByDisplayValue('https://emb.example.com/v1');
-    expect((screen.getByLabelText('memory.settings.embDimension') as HTMLInputElement).value).toBe(
-      '1536',
-    );
+    // embedding 字段已移至页面顶部的共享设置（SharedEmbeddingSettings），此处不应渲染
+    expect(screen.queryByLabelText('memory.settings.embBaseUrl')).toBeNull();
 
+    await screen.findByDisplayValue('deepseek-chat');
     fireEvent.change(screen.getByLabelText('memory.settings.distillModel'), {
-      target: { value: 'deepseek-chat' },
+      target: { value: 'gpt-4o-mini' },
     });
     fireEvent.click(screen.getByText('memory.settings.save'));
 
     await waitFor(() => {
       expect(api.updateMemorySettings).toHaveBeenCalledWith({
         enabled: true,
-        emb_base_url: 'https://emb.example.com/v1',
-        emb_model: 'text-embedding-3-small',
-        emb_dimension: 1536,
-        distill_model: 'deepseek-chat',
+        distill_model: 'gpt-4o-mini',
         top_k: 8,
         score_threshold: 0.4,
         inject_budget_tokens: 1500,
@@ -83,35 +77,18 @@ describe('MemorySettings', () => {
     });
   });
 
-  it('probe dimension calls testEmbedding and auto-fills the dimension input', async () => {
+  it('clears all memories via the clear button', async () => {
     api.getMemorySettings.mockResolvedValue(settingsFixture);
-    api.testMemoryEmbedding.mockResolvedValue({ dimension: 1024, latency_ms: 42 });
+    api.clearMemory.mockResolvedValue({});
     renderSettings();
 
-    await screen.findByDisplayValue('https://emb.example.com/v1');
-
-    fireEvent.change(screen.getByLabelText('memory.settings.embBaseUrl'), {
-      target: { value: 'https://new.example.com/v1' },
-    });
-    fireEvent.change(screen.getByLabelText('memory.settings.embApiKey'), {
-      target: { value: 'sk-test' },
-    });
-    fireEvent.change(screen.getByLabelText('memory.settings.embModel'), {
-      target: { value: 'my-emb' },
-    });
-    fireEvent.click(screen.getByText('memory.settings.testEmbedding'));
+    await screen.findByDisplayValue('deepseek-chat');
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.click(screen.getByText('memory.settings.clear'));
 
     await waitFor(() => {
-      expect(api.testMemoryEmbedding).toHaveBeenCalledWith({
-        base_url: 'https://new.example.com/v1',
-        api_key: 'sk-test',
-        model: 'my-emb',
-      });
+      expect(api.clearMemory).toHaveBeenCalled();
     });
-    await waitFor(() => {
-      expect(
-        (screen.getByLabelText('memory.settings.embDimension') as HTMLInputElement).value,
-      ).toBe('1024');
-    });
+    confirmSpy.mockRestore();
   });
 });

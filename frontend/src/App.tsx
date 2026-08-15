@@ -21,9 +21,8 @@ const ClientsPage = lazy(() => import('./pages/ClientsPage'));
 const ClientDetailPage = lazy(() => import('./pages/ClientDetailPage'));
 const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const LLMPage = lazy(() => import('./pages/LLMPage'));
-const KbPage = lazy(() => import('./pages/KbPage'));
+const KnowledgePage = lazy(() => import('./pages/KnowledgePage'));
 const AgentPage = lazy(() => import('./pages/AgentPage'));
-const MemoryPage = lazy(() => import('./pages/MemoryPage'));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -67,9 +66,10 @@ const router = createBrowserRouter([
           { path: '/logs', element: <LogsPage /> },
           { path: '/clients/:name', element: <ClientDetailPage /> },
           { path: '/llm', element: <LLMPage /> },
-          { path: '/llm/kb', element: <KbPage /> },
+          { path: '/llm/knowledge', element: <KnowledgePage /> },
+          { path: '/llm/kb', element: <Navigate to="/llm/knowledge" replace /> },
           { path: '/agent', element: <AgentPage /> },
-          { path: '/agent/memory', element: <MemoryPage /> },
+          { path: '/agent/memory', element: <Navigate to="/llm/knowledge" replace /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },

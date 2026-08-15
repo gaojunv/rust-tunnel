@@ -4,14 +4,14 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { PreferencesProvider } from '@/preferences/PreferencesProvider';
 import { readCachedPreferences } from '@/preferences/preferencesStore';
-import type { AgentMemorySettings } from '../types';
-import MemoryPage from './MemoryPage';
+import type { AgentMemorySettings } from '@/types';
+import MemorySection from './MemorySection';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }));
 
-vi.mock('../api/preferences', () => ({
+vi.mock('@/api/preferences', () => ({
   fetchPreferences: () => {
     try {
       const cached = readCachedPreferences(
@@ -32,7 +32,6 @@ vi.mock('../api/preferences', () => ({
 const api = vi.hoisted(() => ({
   getMemorySettings: vi.fn(),
   updateMemorySettings: vi.fn(),
-  testMemoryEmbedding: vi.fn(),
   clearMemory: vi.fn(),
   listMemories: vi.fn(),
   createMemory: vi.fn(),
@@ -43,13 +42,13 @@ const api = vi.hoisted(() => ({
   clientsApi: { list: vi.fn() },
 }));
 
-vi.mock('../api/client', () => ({
+vi.mock('@/api/client', () => ({
   ...api,
   getApiErrorMessage: (err: unknown) => (err as Error)?.message ?? String(err),
 }));
 
 // SSE 全局单例替身：不建立真实 EventSource
-vi.mock('../api/memoryStream', () => ({
+vi.mock('@/api/memoryStream', () => ({
   memoryStream: { subscribe: vi.fn(() => () => {}) },
 }));
 
@@ -69,18 +68,18 @@ const settingsFixture: AgentMemorySettings = {
   updated_at: '',
 };
 
-const renderPage = () => {
+const renderSection = () => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <PreferencesProvider>
-        <MemoryPage />
+        <MemorySection />
       </PreferencesProvider>
     </QueryClientProvider>
   );
 };
 
-describe('MemoryPage', () => {
+describe('MemorySection', () => {
   beforeEach(() => {
     api.listMemories.mockResolvedValue({ memories: [], total: 0 });
     api.getMemorySettings.mockResolvedValue(settingsFixture);
@@ -106,10 +105,9 @@ describe('MemoryPage', () => {
     vi.clearAllMocks();
   });
 
-  it('renders page header, settings card and empty list state', async () => {
-    renderPage();
+  it('renders memory settings card and empty list state', async () => {
+    renderSection();
 
-    expect(await screen.findByText('memory.title')).toBeTruthy();
     expect(screen.getByText('memory.settings.title')).toBeTruthy();
     // 空态：无记忆 + 未选中详情引导
     expect(await screen.findByText('memory.empty')).toBeTruthy();
@@ -141,7 +139,7 @@ describe('MemoryPage', () => {
       total: 1,
     });
 
-    renderPage();
+    renderSection();
 
     expect(await screen.findByText('user prefers rust over go')).toBeTruthy();
     expect(screen.queryByText('memory.empty')).toBeNull();

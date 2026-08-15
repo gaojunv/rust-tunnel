@@ -13,6 +13,7 @@ import {
   useCreateLlmKb,
   useUpdateLlmKb,
   useTestEmbedding,
+  useMemorySettings,
 } from '@/api/hooks';
 
 interface Props {
@@ -25,6 +26,7 @@ interface Props {
 export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   const { t } = useTranslation();
   const { data: kbs } = useLlmKbs();
+  const { data: globalSettings } = useMemorySettings();
   const createMutation = useCreateLlmKb();
   const updateMutation = useUpdateLlmKb();
   const testMutation = useTestEmbedding();
@@ -32,12 +34,18 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   const existing = kbId ? kbs?.find((k) => k.id === kbId) ?? null : null;
   const isEdit = !!existing;
 
+  // 全局共享 embedding 是否已配置（SharedEmbeddingSettings 顶部管理）。
+  const globalEmbConfigured =
+    !!globalSettings &&
+    (globalSettings.emb_base_url.trim() !== '' || globalSettings.emb_model.trim() !== '');
+
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [embBaseUrl, setEmbBaseUrl] = useState('');
   const [embApiKey, setEmbApiKey] = useState('');
   const [embModel, setEmbModel] = useState('');
   const [embDimension, setEmbDimension] = useState<number | ''>('');
+  const [useGlobalEmb, setUseGlobalEmb] = useState(false);
   const [topK, setTopK] = useState(5);
   const [chunkSize, setChunkSize] = useState(512);
   const [chunkOverlap, setChunkOverlap] = useState(64);
@@ -48,6 +56,13 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   const [testError, setTestError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // 用户是否手动切换过"使用全局配置"开关（防加载竞态下的自动回填覆盖用户选择）。
+  const userToggledGlobal = useRef(false);
+  const toggleUseGlobal = (v: boolean) => {
+    userToggledGlobal.current = true;
+    setUseGlobalEmb(v);
+  };
+
   // Initialize the form exactly once per open cycle. `existing` is an object
   // reference inside the live `llm-kbs` query array, so it changes on every
   // refetch (window focus, SSE invalidate while documents ingest); re-running
@@ -57,6 +72,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   useEffect(() => {
     if (!open) {
       initRef.current = false;
+      userToggledGlobal.current = false;
       return;
     }
     if (initRef.current) return;
@@ -74,6 +90,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
       setChunkOverlap(existing.chunk_overlap);
       setScoreThreshold(existing.score_threshold);
       setEnabled(existing.enabled);
+      setUseGlobalEmb(false);
     } else {
       setName('');
       setDescription('');
@@ -81,6 +98,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
       setEmbApiKey('');
       setEmbModel('');
       setEmbDimension('');
+      setUseGlobalEmb(globalEmbConfigured);
       setTopK(5);
       setChunkSize(512);
       setChunkOverlap(64);
@@ -91,7 +109,15 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
     setTestMsg(null);
     setTestError(null);
     setSubmitError(null);
-  }, [open, existing]);
+  }, [open, existing, globalEmbConfigured]);
+
+  // 全局配置在 dialog 打开后才加载完成时，默认切到"使用全局"（除非用户已手动选择）。
+  useEffect(() => {
+    if (isEdit || !open || userToggledGlobal.current) return;
+    if (globalEmbConfigured) {
+      setUseGlobalEmb(true);
+    }
+  }, [globalEmbConfigured, open, isEdit]);
 
   const runTest = () => {
     setTestMsg(null);
@@ -134,15 +160,19 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           onError: fail,
         },
       );
-    } else {
+      return;
+    }
+
+    if (useGlobalEmb) {
+      // 使用全局共享 embedding：不发送 emb_* 字段，后端回退全局配置。
+      if (!globalEmbConfigured) {
+        setSubmitError(t('kb.globalEmbNotConfigured'));
+        return;
+      }
       createMutation.mutate(
         {
           name: name.trim(),
           description,
-          emb_base_url: embBaseUrl.trim(),
-          emb_api_key: embApiKey,
-          emb_model: embModel.trim(),
-          emb_dimension: typeof embDimension === 'number' ? embDimension : 0,
           top_k: topK,
           chunk_size: chunkSize,
           chunk_overlap: chunkOverlap,
@@ -157,10 +187,41 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           onError: fail,
         },
       );
+      return;
     }
+
+    // 自定义 embedding：需完整（base_url / model / dimension）。
+    if (!embBaseUrl.trim() || !embModel.trim() || typeof embDimension !== 'number' || embDimension < 1) {
+      setSubmitError(t('kb.embRequired'));
+      return;
+    }
+    createMutation.mutate(
+      {
+        name: name.trim(),
+        description,
+        emb_base_url: embBaseUrl.trim(),
+        emb_api_key: embApiKey,
+        emb_model: embModel.trim(),
+        emb_dimension: embDimension,
+        top_k: topK,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        score_threshold: scoreThreshold,
+        enabled,
+      },
+      {
+        onSuccess: (res) => {
+          onClose();
+          onCreated?.(res.id);
+        },
+        onError: fail,
+      },
+    );
   };
 
   const busy = createMutation.isPending || updateMutation.isPending || testMutation.isPending;
+  const embeddingIncomplete =
+    !embBaseUrl.trim() || !embModel.trim() || embDimension === '' || Number(embDimension) < 1;
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
@@ -180,53 +241,80 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
 
           {!isEdit && (
             <>
-              <div className="space-y-2">
-                <Label>{t('kb.embBaseUrl')}</Label>
-                <Input
-                  value={embBaseUrl}
-                  onChange={(e) => setEmbBaseUrl(e.target.value)}
-                  placeholder="https://api.openai.com/v1"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>{t('kb.embApiKey')}</Label>
-                <Input
-                  type="password"
-                  value={embApiKey}
-                  onChange={(e) => setEmbApiKey(e.target.value)}
-                  placeholder="sk-..."
-                />
-              </div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <div className="space-y-2">
-                  <Label>{t('kb.embModel')}</Label>
-                  <Input value={embModel} onChange={(e) => setEmbModel(e.target.value)} placeholder="text-embedding-3-small" />
+              {globalEmbConfigured ? (
+                <div className="rounded-lg border bg-muted/30 p-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <Label className="text-sm">{t('kb.useGlobalEmbedding')}</Label>
+                      <p className="text-xs text-muted-foreground">
+                        {t('kb.globalEmbeddingHint', {
+                          model: globalSettings?.emb_model ?? '',
+                          dimension: globalSettings?.emb_dimension ?? 0,
+                        })}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={useGlobalEmb}
+                      onCheckedChange={toggleUseGlobal}
+                      aria-label={t('kb.useGlobalEmbedding')}
+                    />
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label>{t('kb.embDimension')}</Label>
-                  <Input
-                    type="number"
-                    min={1}
-                    value={embDimension === '' ? '' : String(embDimension)}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setEmbDimension(v === '' ? '' : Number(v));
-                    }}
-                  />
-                </div>
-              </div>
-              <div>
-                <Button type="button" variant="outline" size="sm" onClick={runTest} disabled={busy}>
-                  {testMutation.isPending ? (
-                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                  ) : (
-                    <Wifi className="mr-1 h-4 w-4" />
-                  )}
-                  {t('kb.testEmbedding')}
-                </Button>
-                {testMsg && <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">{testMsg}</p>}
-                {testError && <p className="mt-2 text-xs text-destructive">{testError}</p>}
-              </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t('kb.globalEmbMissingHint')}</p>
+              )}
+
+              {!useGlobalEmb && (
+                <>
+                  <div className="space-y-2">
+                    <Label>{t('kb.embBaseUrl')}</Label>
+                    <Input
+                      value={embBaseUrl}
+                      onChange={(e) => setEmbBaseUrl(e.target.value)}
+                      placeholder="https://api.openai.com/v1"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t('kb.embApiKey')}</Label>
+                    <Input
+                      type="password"
+                      value={embApiKey}
+                      onChange={(e) => setEmbApiKey(e.target.value)}
+                      placeholder="sk-..."
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label>{t('kb.embModel')}</Label>
+                      <Input value={embModel} onChange={(e) => setEmbModel(e.target.value)} placeholder="text-embedding-3-small" />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>{t('kb.embDimension')}</Label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={embDimension === '' ? '' : String(embDimension)}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setEmbDimension(v === '' ? '' : Number(v));
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Button type="button" variant="outline" size="sm" onClick={runTest} disabled={busy}>
+                      {testMutation.isPending ? (
+                        <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Wifi className="mr-1 h-4 w-4" />
+                      )}
+                      {t('kb.testEmbedding')}
+                    </Button>
+                    {testMsg && <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">{testMsg}</p>}
+                    {testError && <p className="mt-2 text-xs text-destructive">{testError}</p>}
+                  </div>
+                </>
+              )}
             </>
           )}
 
@@ -283,7 +371,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
           <Button
             onClick={submit}
-            disabled={busy || !name.trim() || (!isEdit && (!embBaseUrl.trim() || !embModel.trim() || embDimension === ''))}
+            disabled={busy || !name.trim() || (!isEdit && !useGlobalEmb && embeddingIncomplete)}
           >
             {busy && <Loader2 className="mr-1 h-4 w-4 animate-spin" />}
             {t('common.save')}

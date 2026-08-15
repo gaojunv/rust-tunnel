@@ -6,35 +6,25 @@ import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import { AlertTriangle, ChevronDown, Loader2, Wifi } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
-import {
-  useClearMemory,
-  useMemorySettings,
-  useTestMemoryEmbedding,
-  useUpdateMemorySettings,
-} from '@/api/hooks';
+import { useClearMemory, useMemorySettings, useUpdateMemorySettings } from '@/api/hooks';
 
+/** 记忆体专属设置。embedding 全局配置已移至页面顶部的共享设置
+ *  （SharedEmbeddingSettings），此处仅管理记忆体特有参数。 */
 export default function MemorySettings() {
   const { t } = useTranslation();
   const { data: settings, isLoading } = useMemorySettings();
   const updateMutation = useUpdateMemorySettings();
-  const testMutation = useTestMemoryEmbedding();
   const clearMutation = useClearMemory();
 
   const [enabled, setEnabled] = useState(false);
-  const [embBaseUrl, setEmbBaseUrl] = useState('');
-  const [embApiKey, setEmbApiKey] = useState('');
-  const [embModel, setEmbModel] = useState('');
-  const [embDimension, setEmbDimension] = useState<number | ''>('');
   const [distillModel, setDistillModel] = useState('');
   const [topK, setTopK] = useState(8);
   const [scoreThreshold, setScoreThreshold] = useState(0.4);
   const [injectBudgetTokens, setInjectBudgetTokens] = useState(1500);
   const [pinAlwaysInject, setPinAlwaysInject] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [testMsg, setTestMsg] = useState<string | null>(null);
-  const [testError, setTestError] = useState<string | null>(null);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
@@ -45,10 +35,6 @@ export default function MemorySettings() {
     if (!settings || initRef.current) return;
     initRef.current = true;
     setEnabled(settings.enabled);
-    setEmbBaseUrl(settings.emb_base_url);
-    setEmbApiKey('');
-    setEmbModel(settings.emb_model);
-    setEmbDimension(settings.emb_dimension || '');
     setDistillModel(settings.distill_model);
     setTopK(settings.top_k);
     setScoreThreshold(settings.score_threshold);
@@ -56,33 +42,12 @@ export default function MemorySettings() {
     setPinAlwaysInject(settings.pin_always_inject);
   }, [settings]);
 
-  const runTest = () => {
-    setTestMsg(null);
-    setTestError(null);
-    testMutation.mutate(
-      { base_url: embBaseUrl, api_key: embApiKey, model: embModel },
-      {
-        onSuccess: (res) => {
-          setEmbDimension(res.dimension);
-          setTestMsg(t('memory.settings.testEmbeddingOk', { dimension: res.dimension, latency: res.latency_ms }));
-        },
-        onError: (err) => {
-          setTestError(t('memory.settings.testEmbeddingErr', { error: getApiErrorMessage(err) }));
-        },
-      },
-    );
-  };
-
   const submit = () => {
     setSaveMsg(null);
     setSaveError(null);
     updateMutation.mutate(
       {
         enabled,
-        emb_base_url: embBaseUrl.trim(),
-        ...(embApiKey ? { emb_api_key: embApiKey } : {}),
-        emb_model: embModel.trim(),
-        emb_dimension: typeof embDimension === 'number' ? embDimension : 0,
         distill_model: distillModel.trim(),
         top_k: topK,
         score_threshold: scoreThreshold,
@@ -91,7 +56,6 @@ export default function MemorySettings() {
       },
       {
         onSuccess: () => {
-          setEmbApiKey('');
           setSaveMsg(t('memory.settings.saved'));
         },
         onError: (err) => {
@@ -114,7 +78,7 @@ export default function MemorySettings() {
     }
   };
 
-  const busy = updateMutation.isPending || testMutation.isPending || clearMutation.isPending;
+  const busy = updateMutation.isPending || clearMutation.isPending;
 
   return (
     <Card>
@@ -124,9 +88,6 @@ export default function MemorySettings() {
           <p className="mt-1 text-sm text-muted-foreground">{t('memory.settings.enabledDesc')}</p>
         </div>
         <div className="flex items-center gap-2">
-          {settings?.has_key && (
-            <span className="text-xs text-muted-foreground">{t('memory.settings.hasKeyHint')}</span>
-          )}
           <Switch
             checked={enabled}
             onCheckedChange={setEnabled}
@@ -141,59 +102,6 @@ export default function MemorySettings() {
         ) : (
           <>
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label>{t('memory.settings.embBaseUrl')}</Label>
-                <Input
-                  value={embBaseUrl}
-                  onChange={(e) => setEmbBaseUrl(e.target.value)}
-                  placeholder="https://api.openai.com/v1"
-                  aria-label={t('memory.settings.embBaseUrl')}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>{t('memory.settings.embApiKey')}</Label>
-                <Input
-                  type="password"
-                  value={embApiKey}
-                  onChange={(e) => setEmbApiKey(e.target.value)}
-                  placeholder={settings?.has_key ? t('memory.settings.embApiKeyPlaceholder') : 'sk-...'}
-                  aria-label={t('memory.settings.embApiKey')}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>{t('memory.settings.embModel')}</Label>
-                <Input
-                  value={embModel}
-                  onChange={(e) => setEmbModel(e.target.value)}
-                  placeholder="text-embedding-3-small"
-                  aria-label={t('memory.settings.embModel')}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>{t('memory.settings.embDimension')}</Label>
-                <div className="flex items-center gap-2">
-                  <Input
-                    type="number"
-                    min={1}
-                    value={embDimension === '' ? '' : String(embDimension)}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setEmbDimension(v === '' ? '' : Number(v));
-                    }}
-                    aria-label={t('memory.settings.embDimension')}
-                  />
-                  <Button type="button" variant="outline" size="sm" onClick={runTest} disabled={busy}>
-                    {testMutation.isPending ? (
-                      <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                    ) : (
-                      <Wifi className="mr-1 h-4 w-4" />
-                    )}
-                    {t('memory.settings.testEmbedding')}
-                  </Button>
-                </div>
-                {testMsg && <p className="text-xs text-emerald-600 dark:text-emerald-400">{testMsg}</p>}
-                {testError && <p className="text-xs text-destructive">{testError}</p>}
-              </div>
               <div className="space-y-2">
                 <Label>{t('memory.settings.distillModel')}</Label>
                 <Input

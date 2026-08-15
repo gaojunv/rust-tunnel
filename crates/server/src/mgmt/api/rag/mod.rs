@@ -676,8 +676,9 @@ mod tests {
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
 
-        // emb_dimension 缺失 → 422（serde 必填）
-        let (status, _body) = call(
+        // 部分提供 embedding（缺 dimension）→ 400（emb_* 现为可选，显式提供
+        // 任一即要求完整，见 resolve_kb_embedding）
+        let (status, body_text) = call_raw(
             &app,
             json_request(
                 Method::POST,
@@ -686,7 +687,27 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, HttpStatus::UNPROCESSABLE_ENTITY);
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(
+            body_text.contains("emb_dimension"),
+            "缺 dimension 应提示 emb_dimension, got: {body_text}"
+        );
+
+        // 完全不提供 embedding 且全局未配置 → 400，提示先配置共享 embedding
+        let (status, body_text) = call_raw(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/llm/kb".to_string(),
+                &json!({ "name": "n" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(
+            body_text.contains("embedding is not configured"),
+            "缺 embedding 且全局未配置应 400, got: {body_text}"
+        );
 
         // chunk_overlap >= chunk_size → 400
         let (status, _body) = call(
@@ -713,6 +734,52 @@ mod tests {
             .expect("build request");
         let (status, _body) = call(&app, req).await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_kb_falls_back_to_global_embedding() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+
+        // 先配置全局共享 embedding（agent_memory_settings，明文 key 落库）
+        let mut s = crate::db::memory::AgentMemorySettingsRecord::default_disabled();
+        s.enabled = 1;
+        s.emb_base_url = base.clone();
+        s.emb_api_key = "sk-global".to_string();
+        s.emb_model = "global-model".to_string();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
+
+        // POST 不带 emb_* → 201，embedding 回退全局
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/llm/kb".to_string(),
+                &json!({ "name": "全局库", "top_k": 5 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            HttpStatus::CREATED,
+            "create with global embedding: {body}"
+        );
+        let kb_id = body["id"].as_str().expect("kb id").to_string();
+
+        let stored = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        assert_eq!(stored.emb_base_url, base);
+        assert_eq!(stored.emb_model, "global-model");
+        assert_eq!(stored.emb_dimension, 8);
+        // 全局 key 落库前已加密（固定测试主密钥 → 密文前缀）
+        assert!(
+            stored.emb_api_key.starts_with("enc:v1:"),
+            "global api key should be encrypted, got: {}",
+            stored.emb_api_key
+        );
     }
 
     #[tokio::test]

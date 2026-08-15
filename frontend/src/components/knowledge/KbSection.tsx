@@ -1,13 +1,13 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { PageHeader } from '@/components/layout/PageHeader';
 import { Card, CardContent } from '@/components/ui/card';
 import KbList from '@/components/llm/kb/KbList';
 import KbDialog from '@/components/llm/kb/KbDialog';
 import KbDetail from '@/components/llm/kb/KbDetail';
 import { useLlmKbs } from '@/api/hooks';
 
-export default function KbPage() {
+/** 知识库 Tab 内容（原 KbPage，去掉页面级 PageHeader）。 */
+export default function KbSection() {
   const { t } = useTranslation();
   const { data: kbs, isLoading } = useLlmKbs();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -17,7 +17,6 @@ export default function KbPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title={t('kb.title')} description={t('kb.description')} />
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         {/* 移动端选中 KB 后隐藏列表，仅桌面保持左侧栏 */}
         <div className={selectedKb ? 'hidden lg:block lg:w-80 lg:shrink-0' : 'lg:w-80 lg:shrink-0'}>
