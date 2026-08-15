@@ -98,6 +98,12 @@ async fn handle_conn(
         }
     }
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let method = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("GET")
+        .to_string();
     let path = headers
         .lines()
         .next()
@@ -136,6 +142,15 @@ async fn handle_conn(
         return;
     }
 
+    let is_mcp = path.starts_with("/mcp/");
+    if is_mcp && method != "POST" {
+        // MCP streamable HTTP：GET(SSE 探测)/DELETE → 405，服务端不开 SSE（规范允许 405）。
+        // 不转发、不占控制通道。
+        let head = "HTTP/1.1 405 Method Not Allowed\r\nallow: POST\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes()).await;
+        return;
+    }
+
     let request_id = format!("{:032x}", rand::random::<u128>());
     let (resp_tx, mut resp_rx) = mpsc::channel(256);
     pending.lock().await.insert(request_id.clone(), resp_tx);
@@ -160,8 +175,24 @@ async fn handle_conn(
     }) = resp_rx.recv().await
     {
         if !wrote_headers {
+            let reason = match status {
+                200 => "OK",
+                202 => "Accepted",
+                400 => "Bad Request",
+                404 => "Not Found",
+                405 => "Method Not Allowed",
+                413 => "Payload Too Large",
+                500 => "Internal Server Error",
+                502 => "Bad Gateway",
+                _ => "",
+            };
+            let ctype = if is_mcp {
+                "application/json"
+            } else {
+                "text/event-stream"
+            };
             let head = format!(
-                "HTTP/1.1 {status} OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: {ctype}\r\ntransfer-encoding: chunked\r\n\r\n"
             );
             if stream.write_all(head.as_bytes()).await.is_err() {
                 break;
@@ -344,6 +375,227 @@ mod tests {
             .is_ok();
         assert!(!leaked, "oversized request must not reach the control channel");
 
+        kill_tx.send(()).unwrap();
+    }
+
+    /// MCP POST：正常转发，响应头 content-type 必须为 application/json
+    /// （MCP SDK 按 content-type 决定 JSON/SSE 解析）。
+    #[tokio::test]
+    async fn test_mcp_post_returns_json_content_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = new_pending_map();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
+
+        // 模拟服务端：收到 MCP 请求后回一个 JSON chunk + done
+        let server = tokio::spawn(async move {
+            let Some(ControlMessage::AgentLlmProxyRequest {
+                request_id,
+                path,
+                body,
+                ..
+            }) = rx.recv().await
+            else {
+                panic!("expected proxy request");
+            };
+            assert_eq!(path, "/mcp/sometoken");
+            assert_eq!(body, b"{\"jsonrpc\":\"2.0\"}".to_vec());
+            route_chunk(
+                &pending,
+                &ControlMessage::AgentLlmProxyChunk {
+                    request_id: request_id.clone(),
+                    data: b"{\"jsonrpc\":\"2.0\",\"result\":{}}".to_vec(),
+                    done: false,
+                    status: 200,
+                },
+            )
+            .await;
+            route_chunk(
+                &pending,
+                &ControlMessage::AgentLlmProxyChunk {
+                    request_id,
+                    data: vec![],
+                    done: true,
+                    status: 200,
+                },
+            )
+            .await;
+        });
+
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn.write_all(
+            b"POST /mcp/sometoken HTTP/1.1\r\nContent-Length: 17\r\n\r\n{\"jsonrpc\":\"2.0\"}",
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(
+            text.contains("content-type: application/json"),
+            "got: {text}"
+        );
+        assert!(text.contains("{\"jsonrpc\":\"2.0\",\"result\":{}}"), "got: {text}");
+        server.await.unwrap();
+        kill_tx.send(()).unwrap();
+    }
+
+    /// 回归：非 /mcp/ 路径（LLM 转发）响应 content-type 保持 text/event-stream。
+    #[tokio::test]
+    async fn test_llm_post_keeps_event_stream_content_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = new_pending_map();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
+
+        let server = tokio::spawn(async move {
+            let Some(ControlMessage::AgentLlmProxyRequest { request_id, .. }) = rx.recv().await
+            else {
+                panic!("expected proxy request");
+            };
+            route_chunk(
+                &pending,
+                &ControlMessage::AgentLlmProxyChunk {
+                    request_id: request_id.clone(),
+                    data: b"data: one\n\n".to_vec(),
+                    done: false,
+                    status: 200,
+                },
+            )
+            .await;
+            route_chunk(
+                &pending,
+                &ControlMessage::AgentLlmProxyChunk {
+                    request_id,
+                    data: vec![],
+                    done: true,
+                    status: 200,
+                },
+            )
+            .await;
+        });
+
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn.write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(
+            text.contains("content-type: text/event-stream"),
+            "got: {text}"
+        );
+        server.await.unwrap();
+        kill_tx.send(()).unwrap();
+    }
+
+    /// MCP streamable HTTP：GET(SSE 探测)/DELETE 应本地回 405（allow: POST），
+    /// 且不得向控制通道发 AgentLlmProxyRequest。
+    #[tokio::test]
+    async fn test_mcp_get_returns_405_without_forwarding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = new_pending_map();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
+
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn.write_all(b"GET /mcp/sometoken HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 405"), "got: {text}");
+        assert!(text.contains("allow: POST"), "got: {text}");
+
+        // 控制通道不得收到任何 AgentLlmProxyRequest
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .is_ok();
+        assert!(!leaked, "MCP GET must not reach the control channel");
+
+        kill_tx.send(()).unwrap();
+    }
+
+    /// MCP notification：服务端回 202 空 body，reason phrase 应为 "Accepted"。
+    #[tokio::test]
+    async fn test_mcp_202_reason_phrase() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = new_pending_map();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
+            .await
+            .unwrap();
+
+        let server = tokio::spawn(async move {
+            let Some(ControlMessage::AgentLlmProxyRequest { request_id, .. }) = rx.recv().await
+            else {
+                panic!("expected proxy request");
+            };
+            route_chunk(
+                &pending,
+                &ControlMessage::AgentLlmProxyChunk {
+                    request_id,
+                    data: vec![],
+                    done: true,
+                    status: 202,
+                },
+            )
+            .await;
+        });
+
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        conn.write_all(b"POST /mcp/sometoken HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_to_end(&mut resp),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(text.starts_with("HTTP/1.1 202 Accepted"), "got: {text}");
+        server.await.unwrap();
         kill_tx.send(()).unwrap();
     }
 }
