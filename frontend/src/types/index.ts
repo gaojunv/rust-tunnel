@@ -520,6 +520,99 @@ export interface TestEmbeddingResult {
   latency_ms: number;
 }
 
+// === Agent Memory ===
+
+export type AgentMemoryScope = 'global' | 'client' | 'workspace';
+export type AgentMemoryTrigger = 'distill' | 'remember' | 'manual';
+
+/** 一条 AI 记忆（原子事实）。scope=global 时 client_id/workspace_id 为空串。 */
+export interface AgentMemory {
+  id: string;
+  content: string;
+  scope_type: AgentMemoryScope;
+  client_id: string;
+  workspace_id: string;
+  tags: string[];
+  confidence: number;
+  source_session_id: string;
+  source_trigger: AgentMemoryTrigger;
+  pinned: boolean;
+  hit_count: number;
+  last_hit_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 记忆体全局设置（单行）。emb_api_key 恒为空串（后端脱敏），是否已配置看 has_key。 */
+export interface AgentMemorySettings {
+  enabled: boolean;
+  emb_base_url: string;
+  emb_api_key: string; // 恒为空字符串（后端不回显）
+  emb_model: string;
+  emb_dimension: number;
+  distill_model: string;
+  top_k: number;
+  score_threshold: number;
+  inject_budget_tokens: number;
+  pin_always_inject: boolean;
+  /** API 密钥是否已配置（脱敏标志）。 */
+  has_key: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** 记忆 SSE 事件（`GET /api/agent/memory/events`，事件名 "memory"）。 */
+export interface MemoryEvent {
+  session_id: string;
+  status: string; // "distilled" | "failed" | "skipped" 等
+  facts_found: number;
+}
+
+export interface CreateMemoryRequest {
+  content: string;
+  scope: AgentMemoryScope;
+  client_id?: string;
+  workspace_id?: string;
+  tags?: string[];
+  confidence?: number;
+}
+
+export interface UpdateMemoryRequest {
+  content?: string;
+  tags?: string[];
+  scope?: AgentMemoryScope;
+  confidence?: number;
+}
+
+/** 更新记忆设置（PUT /api/agent/memory/settings）。emb_api_key 仅非空时发送。 */
+export interface MemorySettingsRequest {
+  enabled?: boolean;
+  emb_base_url?: string;
+  emb_api_key?: string;
+  emb_model?: string;
+  emb_dimension?: number;
+  distill_model?: string;
+  top_k?: number;
+  score_threshold?: number;
+  inject_budget_tokens?: number;
+  pin_always_inject?: boolean;
+}
+
+/** 记忆列表分页响应。 */
+export interface AgentMemoriesResponse {
+  memories: AgentMemory[];
+  total: number;
+}
+
+/** 记忆列表 UI 过滤条件（MemoryPage 持有，映射到 API 查询参数）。 */
+export interface MemoryFilters {
+  scope: 'all' | AgentMemoryScope;
+  clientId: string;
+  workspaceId: string;
+  q: string;
+  pinned: boolean;
+}
+
 // === Agent Workbench ===
 
 export interface AgentWorkspace {

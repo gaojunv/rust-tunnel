@@ -188,6 +188,10 @@ struct SpawnedAgent {
     /// 回合终态唤醒信号：`prompt()` 终态回调清 busy 后 notify_waiters，取消的
     /// 兜底任务（见 [`AcpBridge::cancel`]）据此走优雅路径提前退出，不再等宽限期。
     cancel_notify: Arc<tokio::sync::Notify>,
+    /// AI 记忆注入缓存：None = 尚未检索；Some("") = 无可用记忆；Some(非空) = 已
+    /// 注入块。`prompt_inner` 发送前把块 prepend 到 user content 头部（不进 DB，
+    /// 持久化保持干净；distill 渲染也会剥离 `<memory>` 块，无回环）。
+    memory_block: Option<String>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -250,6 +254,10 @@ pub struct AcpBridge {
     /// 取消宽限期：`cancel()` 发出 session/cancel 后 agent 未在此时限内响应
     /// PromptResponse 则兜底杀进程。
     cancel_grace: Duration,
+    /// AI 记忆体运行时（kill/断线/idle 蒸馏触发用）。仅 `rag` feature 下存在，
+    /// 由 `AgentState::with_memory` 注入（与 AgentState.memory 同一实例）。
+    #[cfg(feature = "rag")]
+    memory: Option<super::memory::MemoryState>,
 }
 impl AcpBridge {
     pub fn new(spawner: AgentSpawner, db: Database) -> Self {
@@ -263,6 +271,8 @@ impl AcpBridge {
             spawn_errors: Arc::new(Mutex::new(HashMap::new())),
             gateway: None,
             cancel_grace: DEFAULT_CANCEL_GRACE,
+            #[cfg(feature = "rag")]
+            memory: None,
         };
         bridge.start_idle_reaper();
         bridge
@@ -308,6 +318,34 @@ impl AcpBridge {
         self.elicitation = elicitation;
         self
     }
+
+    /// 注入 AI 记忆体运行时（kill/断线/idle 蒸馏触发用）。由 `AgentState::with_memory`
+    /// 在 `init_llm_state` 后调用，与 `AgentState.memory` 共享同一 `MemoryState` 实例。
+    #[cfg(feature = "rag")]
+    #[must_use]
+    pub fn with_memory(mut self, memory: super::memory::MemoryState) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// 读会话的 AI 记忆注入缓存（None = 尚未检索）。`prompt_inner` 发送前读它
+    /// prepend `<memory>` 块；WS handler 在首条消息检索后经 [`Self::set_memory_block`]
+    /// 写入。
+    pub async fn cached_memory_block(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|a| a.memory_block.clone())
+    }
+
+    /// 写会话的 AI 记忆注入缓存。`Some(block)`（含空串=无可用记忆）覆盖；此字段
+    /// 仅在会话条目存活期间有意义，kill/reaper 移除条目后自然消失。
+    pub async fn set_memory_block(&self, session_id: &str, block: Option<String>) {
+        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+            a.memory_block = block;
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -348,6 +386,7 @@ mod tests {
     /// 测试用的会话条目默认值（connection/duplex 未建立）。
     fn spawned_agent() -> SpawnedAgent {
         SpawnedAgent {
+            memory_block: None,
             acp_session_id: None,
             connection: None,
             agent_io: None,

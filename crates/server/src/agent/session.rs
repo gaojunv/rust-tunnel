@@ -156,6 +156,9 @@ pub struct SessionRuntime {
     /// AGENTS.md 内容缓存：None = 尚未尝试读取；Some("") = 已读但不存在/为空；
     /// Some(非空) = 已注入。runner 据此决定是否发起首次读取。
     pub agents_md: Option<String>,
+    /// AI 记忆注入缓存：None = 尚未检索；Some("") = 无可用记忆；Some(非空) = 已注入
+    /// 到 `messages[0]`（system 单条，不落库）。每会话只检索一次（对齐 agents_md）。
+    pub memory_block: Option<String>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -258,6 +261,7 @@ impl SessionRuntime {
             },
             approval_mode: workspace.approval_mode.clone(),
             agents_md: None,
+            memory_block: None,
             messages,
         })
     }

@@ -5,6 +5,8 @@
 //! 本模块对外（`crate::mgmt::api::agent::xxx`）通过 `pub use` 保持原扁平路径兼容。
 
 mod dto;
+#[cfg(feature = "rag")]
+pub mod memory;
 mod sessions;
 mod workspaces;
 mod ws;

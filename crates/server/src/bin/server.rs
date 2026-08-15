@@ -355,17 +355,38 @@ async fn main() -> TunnelResult<()> {
     // LLM 网关初始化后，把主密钥解密器注入 ACP 桥：provider API Key 落库加密
     // 时（配置了主密钥即默认生产路径），agent 的 LLM 代理请求须在服务端解密
     // 后才能调上游；不注入则 decrypt_field(None, ...) 失败、所有请求 502。
-    // 注意要在任何 state.clone() 之前完成，确保所有后续克隆共享注入后的桥。
+    // rag feature 下把 AI 记忆体运行时合并进同一次 take→链式配置→回填（严禁
+    // 二次 VectorStore::new——双 EdgeShard 对同一目录各自 flush 会竞态 panic，
+    // 必须克隆 LlmState.rag_store 同一实例）。注意要在任何 state.clone() 之前
+    // 完成，确保所有后续克隆共享注入后的桥。
     {
-        let llm_cipher = state
-            .proxy_state
-            .llm_state
-            .read()
-            .await
-            .as_ref()
-            .and_then(|llm| llm.cipher.clone());
-        if let Some(agent_state) = state.agent_state.take() {
-            state.agent_state = Some(agent_state.with_acp_cipher(llm_cipher));
+        let llm_state_opt = state.proxy_state.llm_state.read().await.clone();
+        if let Some(llm_state) = llm_state_opt {
+            let llm_cipher = llm_state.cipher.clone();
+            let agent_state = state
+                .agent_state
+                .take()
+                .map(|a| a.with_acp_cipher(llm_cipher));
+            // 无 rag feature 时本条 cfg 掉，`agent_state` 直接走下方回填，无 mut。
+            #[cfg(feature = "rag")]
+            let agent_state = agent_state.map(|a| {
+                if let Some(db) = state.db().cloned() {
+                    let memory_state = rust_tunnel_server::agent::memory::MemoryState::new(
+                        db,
+                        llm_state.rag_store.clone(),
+                        llm_state.cipher.clone(),
+                        (*llm_state).clone(),
+                    );
+                    tracing::info!("AI memory runtime injected into agent state");
+                    a.with_memory(memory_state)
+                } else {
+                    tracing::warn!("no database; AI memory runtime not injected");
+                    a
+                }
+            });
+            if let Some(agent_state) = agent_state {
+                state.agent_state = Some(agent_state);
+            }
         }
     }
 

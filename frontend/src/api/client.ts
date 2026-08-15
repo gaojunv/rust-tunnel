@@ -45,6 +45,12 @@ import type {
   AgentWorkspace,
   AgentSession,
   AgentMessage,
+  AgentMemory,
+  AgentMemorySettings,
+  AgentMemoriesResponse,
+  CreateMemoryRequest,
+  UpdateMemoryRequest,
+  MemorySettingsRequest,
   FsEntry,
   FsFileContent,
   GitStatusResult,
@@ -637,6 +643,86 @@ export async function getAgentDefaultModel(): Promise<string> {
 
 export async function putAgentDefaultModel(model: string): Promise<void> {
   await api.put('/agent/default-model', { model });
+}
+
+// ── Agent Memory ────────────────────────────────────────────────
+
+export async function getMemorySettings(): Promise<AgentMemorySettings> {
+  const { data } = await api.get('/agent/memory/settings');
+  return data;
+}
+
+export async function updateMemorySettings(req: MemorySettingsRequest): Promise<AgentMemorySettings> {
+  const { data } = await api.put('/agent/memory/settings', req);
+  return data;
+}
+
+export async function testMemoryEmbedding(req: {
+  base_url: string;
+  api_key: string;
+  model: string;
+}): Promise<TestEmbeddingResult> {
+  const { data } = await api.post('/agent/memory/settings/test-embedding', req);
+  return data;
+}
+
+export async function clearMemory(): Promise<void> {
+  await api.post('/agent/memory/clear');
+}
+
+/** 记忆列表查询参数；空值会自动剔除（不进 URL）。 */
+export interface MemoryListParams {
+  scope?: string;
+  client_id?: string;
+  workspace_id?: string;
+  q?: string;
+  pinned?: boolean;
+  sort?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listMemories(params: MemoryListParams = {}): Promise<AgentMemoriesResponse> {
+  const clean: Record<string, string | number> = {};
+  if (params.scope) clean.scope = params.scope;
+  if (params.client_id) clean.client_id = params.client_id;
+  if (params.workspace_id) clean.workspace_id = params.workspace_id;
+  if (params.q) clean.q = params.q;
+  if (params.pinned) clean.pinned = 'true';
+  if (params.sort) clean.sort = params.sort;
+  if (params.limit !== undefined) clean.limit = params.limit;
+  if (params.offset !== undefined) clean.offset = params.offset;
+  const { data } = await api.get('/agent/memories', { params: clean });
+  return { memories: data.memories ?? [], total: data.total ?? 0 };
+}
+
+export async function getMemory(id: string): Promise<AgentMemory> {
+  const { data } = await api.get(`/agent/memories/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function createMemory(req: CreateMemoryRequest): Promise<AgentMemory> {
+  const { data } = await api.post('/agent/memories', req);
+  return data;
+}
+
+export async function updateMemory(id: string, req: UpdateMemoryRequest): Promise<AgentMemory> {
+  const { data } = await api.put(`/agent/memories/${encodeURIComponent(id)}`, req);
+  return data;
+}
+
+export async function deleteMemory(id: string): Promise<void> {
+  await api.delete(`/agent/memories/${encodeURIComponent(id)}`);
+}
+
+export async function pinMemory(id: string): Promise<AgentMemory> {
+  const { data } = await api.post(`/agent/memories/${encodeURIComponent(id)}/pin`);
+  return data;
+}
+
+/** 手动重蒸馏指定会话（复位 distilled=0 重跑）。 */
+export async function distillSession(sessionId: string): Promise<void> {
+  await api.post(`/agent/sessions/${encodeURIComponent(sessionId)}/distill`);
 }
 
 export function agentWsUrl(sessionId: string): string {

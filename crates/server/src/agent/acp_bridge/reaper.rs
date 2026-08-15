@@ -25,6 +25,8 @@ impl AcpBridge {
         let sessions = self.sessions.clone();
         let spawner = self.spawner.clone();
         let db = self.db.clone();
+        #[cfg(feature = "rag")]
+        let memory = self.memory.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REAP_INTERVAL).await;
@@ -52,6 +54,11 @@ impl AcpBridge {
                     // 在空闲回收后丢库。flush 内部会再锁 sessions，必须在上面的
                     // 复查锁释放后调用（tokio::sync::Mutex 不可重入）。
                     flush_acp_turn_buffers(&db, &sessions, &id).await;
+                    // AI 记忆蒸馏（idle 触发）：flush 后内容完整再蒸馏。CAS 防重。
+                    #[cfg(feature = "rag")]
+                    if let Some(memory) = memory.as_ref() {
+                        crate::agent::memory::distill::trigger_distill(memory, &id, "idle").await;
+                    }
                     // 移除条目并取 client_id（真杀进程锁外发送）。
                     let client_id = {
                         let mut guard = sessions.lock().await;

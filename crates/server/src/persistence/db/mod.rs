@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub mod acme;
 pub mod agent;
 pub mod clients;
+pub mod memory;
 pub mod dns;
 pub mod llm;
 pub mod logs;

@@ -68,6 +68,18 @@ import {
   reindexKbDoc,
   testEmbedding,
   queryKb,
+  clientsApi,
+  listAgentWorkspaces,
+  getMemorySettings,
+  updateMemorySettings,
+  testMemoryEmbedding,
+  clearMemory,
+  listMemories,
+  createMemory,
+  updateMemory,
+  deleteMemory,
+  pinMemory,
+  type MemoryListParams,
 } from './client';
 import type {
   LoginRequest,
@@ -83,6 +95,9 @@ import type {
   UsageGroupBy,
   CreateLlmKbRequest,
   UpdateLlmKbRequest,
+  MemorySettingsRequest,
+  CreateMemoryRequest,
+  UpdateMemoryRequest,
 } from '../types';
 
 // Shadowsocks hooks
@@ -362,6 +377,7 @@ export function useUpdateDnsConfig() {
 // ── Unified Stats Hooks ─────────────────────────────────────────
 
 import { statsStream } from './statsStream';
+import { memoryStream } from './memoryStream';
 import type { StatsSnapshot, StatsSummary } from '@/types';
 import { useEffect, useRef } from 'react';
 
@@ -735,4 +751,100 @@ export function useKbQuery() {
   return useMutation({
     mutationFn: ({ kbId, text }: { kbId: string; text: string }) => queryKb(kbId, text),
   });
+}
+
+// ── Agent Memory ──────────────────────────────────────────────
+
+/** 记忆列表查询参数（含 UI 过滤映射后的空值剔除）。queryKey `['agent-memories', params]`。 */
+export function useMemories(params: MemoryListParams = {}) {
+  return useQuery({
+    queryKey: ['agent-memories', params],
+    queryFn: () => listMemories(params),
+  });
+}
+
+export function useCreateMemory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: CreateMemoryRequest) => createMemory(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
+  });
+}
+
+export function useUpdateMemory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & UpdateMemoryRequest) => updateMemory(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-memories'] });
+      qc.invalidateQueries({ queryKey: ['agent-memory', vars.id] });
+    },
+  });
+}
+
+export function useDeleteMemory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteMemory(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
+  });
+}
+
+export function usePinMemory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => pinMemory(id),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ['agent-memories'] });
+      qc.invalidateQueries({ queryKey: ['agent-memory', id] });
+    },
+  });
+}
+
+export function useMemorySettings() {
+  return useQuery({ queryKey: ['agent-memory-settings'], queryFn: () => getMemorySettings() });
+}
+
+export function useUpdateMemorySettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: MemorySettingsRequest) => updateMemorySettings(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memory-settings'] }),
+  });
+}
+
+export function useTestMemoryEmbedding() {
+  return useMutation({
+    mutationFn: (req: { base_url: string; api_key: string; model: string }) =>
+      testMemoryEmbedding(req),
+  });
+}
+
+export function useClearMemory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => clearMemory(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-memories'] }),
+  });
+}
+
+/** 作用域下拉数据源（复用既有缓存键，避免重复请求）。 */
+export function useAgentWorkspaces() {
+  return useQuery({ queryKey: ['agent-workspaces'], queryFn: () => listAgentWorkspaces() });
+}
+
+export function useClients() {
+  return useQuery({ queryKey: ['clients'], queryFn: () => clientsApi.list() });
+}
+
+/** 订阅记忆 SSE：事件到达即失效记忆列表（后台重拉）。
+ *  事件不带逐条记忆 id，故无 KbDetail 的 override 通道，仅 invalidate。 */
+export function useMemoryStream() {
+  const qc = useQueryClient();
+  useEffect(() => {
+    const unsub = memoryStream.subscribe(() => {
+      qc.invalidateQueries({ queryKey: ['agent-memories'] });
+    });
+    return unsub;
+  }, [qc]);
 }
