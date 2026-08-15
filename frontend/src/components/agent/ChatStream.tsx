@@ -1438,13 +1438,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
           </div>
         )}
         {running && (
-          /* 运行中指示：流动丝带（纯 CSS 动画，主题色渐变流转，见 index.css
-             .agent-running-ribbon）；role/aria-label 保留屏幕阅读器的运行状态提示 */
-          <div
-            className="agent-running-ribbon my-2.5 w-full"
-            role="status"
-            aria-label={t('agent.running')}
-          />
+          /* 运行中指示：视觉已迁移到输入框彩色边框（容器 .agent-input-running，
+             见 index.css），此处仅保留视觉隐藏的 status 语义供屏幕阅读器播报 */
+          <span role="status" aria-label={t('agent.running')} className="sr-only" />
         )}
         <div ref={bottomRef} />
         </div>
@@ -1464,7 +1460,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               {t('agent.reconnecting')}
             </div>
           )}
-          <div className="relative rounded-2xl border border-input bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring">
+          {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边 */}
+          <div className={`relative rounded-2xl border bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring ${running ? 'agent-input-running' : 'border-input'}`}>
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (

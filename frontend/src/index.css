@@ -270,27 +270,24 @@ html body[data-scroll-locked] {
     -webkit-mask-image: radial-gradient(ellipse 85% 90% at 30% 0%, black 30%, transparent 78%);
   }
 
-  /* AI 工作台「运行中」指示丝带（替代原 spinner + 文字）：主题色
-     （primary/chart-2/chart-3）渐变沿条循环流动，叠加 hue-rotate 让色相缓慢
-     流转；两端 mask 渐隐形成丝带形态，微光晕贴合卡片背景。 */
-  .agent-running-ribbon {
-    height: 3px;
-    border-radius: 9999px;
-    background-image: linear-gradient(
-      90deg,
-      hsl(var(--primary) / 0.15),
-      hsl(var(--primary)) 25%,
-      hsl(var(--chart-2)) 50%,
-      hsl(var(--chart-3)) 75%,
-      hsl(var(--primary) / 0.15)
-    );
-    background-size: 200% 100%;
-    box-shadow: 0 0 8px hsl(var(--primary) / 0.3);
-    mask-image: linear-gradient(to right, transparent, black 12%, black 88%, transparent);
-    -webkit-mask-image: linear-gradient(to right, transparent, black 12%, black 88%, transparent);
-    animation:
-      agent-ribbon-flow 1.8s linear infinite,
-      agent-ribbon-hue 7s linear infinite;
+  /* AI 工作台「运行中」输入框边框（替代原消息流丝带）：主题色
+     （primary/chart-2/chart-3）渐变沿边框循环流动。双层背景——padding-box
+     实色盖住容器底色，border-box 渐变透过 transparent 边框显示为彩色描边；
+     与 focus-within ring、shadow-2xl 叠加不冲突。 */
+  .agent-input-running {
+    border-color: transparent;
+    background:
+      linear-gradient(hsl(var(--background)), hsl(var(--background))) padding-box,
+      linear-gradient(
+        90deg,
+        hsl(var(--primary) / 0.35),
+        hsl(var(--primary)) 25%,
+        hsl(var(--chart-2)) 50%,
+        hsl(var(--chart-3)) 75%,
+        hsl(var(--primary) / 0.35)
+      ) border-box;
+    background-size: 100% 100%, 200% 100%;
+    animation: agent-input-border-flow 2.4s linear infinite;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -300,7 +297,7 @@ html body[data-scroll-locked] {
     .text-aurora,
     .logo-glow-breathe,
     .card-aurora:hover,
-    .agent-running-ribbon {
+    .agent-input-running {
       animation: none;
     }
   }
@@ -315,22 +312,13 @@ html body[data-scroll-locked] {
   }
 }
 
-/* 丝带渐变流动（200% 背景位循环）与色相流转 */
-@keyframes agent-ribbon-flow {
+/* 输入框边框渐变流动（200% 背景位循环，仅作用于 border-box 层） */
+@keyframes agent-input-border-flow {
   from {
-    background-position: 0% 0;
+    background-position: 0 0, 0% 0;
   }
   to {
-    background-position: -200% 0;
-  }
-}
-
-@keyframes agent-ribbon-hue {
-  from {
-    filter: hue-rotate(0deg);
-  }
-  to {
-    filter: hue-rotate(360deg);
+    background-position: 0 0, -200% 0;
   }
 }
 
