@@ -9,6 +9,8 @@ pub mod git_plan;
 pub mod github;
 pub mod llm_bridge;
 #[cfg(feature = "rag")]
+pub mod mcp;
+#[cfg(feature = "rag")]
 pub mod memory;
 pub mod notify;
 pub mod runner;
