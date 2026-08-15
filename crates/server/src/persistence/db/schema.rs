@@ -658,6 +658,71 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // AI 记忆体全局设置（单行 id=1，CHECK 约束）。emb_api_key 用 LlmCipher
+        // 加密存储；emb_dimension 首次 test-embedding 探测后固定，改动需清空重建。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_memory_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                emb_base_url TEXT NOT NULL DEFAULT '',
+                emb_api_key TEXT NOT NULL DEFAULT '',
+                emb_model TEXT NOT NULL DEFAULT '',
+                emb_dimension INTEGER NOT NULL DEFAULT 0,
+                distill_model TEXT NOT NULL DEFAULT '',
+                top_k INTEGER NOT NULL DEFAULT 8,
+                score_threshold REAL NOT NULL DEFAULT 0.40,
+                inject_budget_tokens INTEGER NOT NULL DEFAULT 1500,
+                pin_always_inject INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // AI 记忆体主表：原子事实（≤2KB），作用域隔离（global|client|workspace）。
+        // 向量本体在 `<data_dir>/rag/memory/`（kb_id 常量 "memory"），ChunkPoint 的
+        // id 与 doc_id 均取本表 id（删除走 delete_by_doc("memory", dim, memory_id)）。
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                scope_type TEXT NOT NULL DEFAULT 'workspace',
+                client_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.8,
+                source_session_id TEXT NOT NULL DEFAULT '',
+                source_trigger TEXT NOT NULL DEFAULT '',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                last_hit_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_scope ON agent_memories(client_id, workspace_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_source ON agent_memories(source_session_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_pinned ON agent_memories(pinned)",
+        )
+        .execute(pool)
+        .await?;
+
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
@@ -665,6 +730,7 @@ impl Database {
         Self::migrate_agent_workspaces_v5(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
         Self::migrate_agent_sessions_v3(pool).await?;
+        Self::migrate_agent_sessions_add_distilled(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
         Self::migrate_agent_messages_v4(pool).await?;
 
@@ -747,6 +813,27 @@ impl Database {
         match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN acp_session_id TEXT")
             .execute(pool)
             .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_sessions migration: column already exists");
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_sessions 补蒸馏防重列（distilled=1 表示该会话已完成蒸馏）。原子 CAS
+    /// （`memory_mark_distilled_if_not`）在归档/删除/断线/idle 多路并发中保证唯一
+    /// 赢家触发蒸馏。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_sessions_add_distilled(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query(
+            "ALTER TABLE agent_sessions ADD COLUMN distilled INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await
         {
             Ok(_) => {}
             Err(e) => {
@@ -1309,5 +1396,81 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(agent_type, "");
+    }
+
+    /// AI 记忆体 schema：agent_sessions 蒸馏防重列迁移幂等（initialize_schema
+    /// 调两次不报错、列存在且默认 0）；agent_memory_settings 单行 CHECK 约束生效；
+    /// agent_memories 建表且默认值正确。
+    #[tokio::test]
+    async fn test_ai_memory_schema_and_distilled_migration() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // 迁移幂等：再次初始化不报错（distilled 列已存在，ALTER 跳过）
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // agent_sessions.distilled 列存在且默认 0
+        sqlx::query(
+            "INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path) \
+             VALUES ('w1', 'w', 'c1', 'host', '/p')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_sessions (id, workspace_id) VALUES ('s1', 'w1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let distilled: i64 = sqlx::query_scalar("SELECT distilled FROM agent_sessions WHERE id = 's1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(distilled, 0, "distilled 列应存在且默认 0");
+
+        // agent_memory_settings：单行 id=1 约束（非 1 拒绝），其余列默认值落库
+        sqlx::query("INSERT INTO agent_memory_settings (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = sqlx::query("INSERT INTO agent_memory_settings (id) VALUES (2)")
+            .execute(&pool)
+            .await;
+        assert!(err.is_err(), "id != 1 应被 CHECK 约束拒绝");
+        let (enabled, top_k, budget): (i64, i64, i64) = sqlx::query_as(
+            "SELECT enabled, top_k, inject_budget_tokens FROM agent_memory_settings WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((enabled, top_k, budget), (0, 8, 1500));
+
+        // agent_memories：默认值正确
+        sqlx::query("INSERT INTO agent_memories (id, content) VALUES ('m1', 'fact')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (scope, pin, conf, trigger): (String, i64, f64, String) = sqlx::query_as(
+            "SELECT scope_type, pinned, confidence, source_trigger FROM agent_memories \
+             WHERE id = 'm1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scope, "workspace");
+        assert_eq!(pin, 0);
+        assert_eq!(conf, 0.8);
+        assert_eq!(trigger, "");
+
+        // 索引存在
+        for idx in ["idx_memories_scope", "idx_memories_source", "idx_memories_pinned"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(idx)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "索引 {idx} 应存在");
+        }
     }
 }

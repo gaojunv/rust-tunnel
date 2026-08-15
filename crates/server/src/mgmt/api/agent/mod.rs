@@ -6,6 +6,8 @@
 
 mod dto;
 mod github;
+#[cfg(feature = "rag")]
+pub mod memory;
 mod sessions;
 mod workspaces;
 mod ws;

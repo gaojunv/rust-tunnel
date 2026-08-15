@@ -121,7 +121,9 @@ impl TestHarness {
         };
 
         let db = Database::new(&config.db_path).await.expect("db new");
-        let state = control::ServerState::with_db(db);
+        // rag 注入块需要可变绑定；非 rag 构建下 mut 无消费者 → allow。
+        #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
+        let mut state = control::ServerState::with_db(db);
         // Seed a server_auth row so clients can authenticate.
         let client_pw = opts
             .client_password
@@ -150,6 +152,25 @@ impl TestHarness {
                 state.dynamic_config.clone(),
             )
             .await;
+        // AI 记忆体运行时注入（镜像 src/bin/server.rs 生产路径）：克隆
+        // `LlmState.rag_store` 同一实例构造 MemoryState（严禁二次 VectorStore::new
+        // ——双 EdgeShard 对同一目录各自 flush 会竞态 panic），经 with_memory 挂到
+        // AgentState（顺带注入 ACP 桥）。非 rag 构建 cfg 掉，行为与旧 harness 一致。
+        #[cfg(feature = "rag")]
+        {
+            let llm = state.proxy_state.llm_state.read().await.clone();
+            if let Some(llm) = llm {
+                let memory = rust_tunnel_server::agent::memory::MemoryState::new(
+                    state.db().cloned().expect("db present"),
+                    llm.rag_store.clone(),
+                    llm.cipher.clone(),
+                    (*llm).clone(),
+                );
+                if let Some(agent) = state.agent_state.take() {
+                    state.agent_state = Some(agent.with_memory(memory));
+                }
+            }
+        }
         let proxy_state = state.proxy_state.clone();
 
         let auth_config = AuthConfig::new(config.admin_password.clone(), config.jwt_secret.clone());

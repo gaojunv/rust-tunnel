@@ -536,6 +536,9 @@ pub async fn run_api_server(
     {
         public_routes = public_routes.merge(rag::public_router());
         protected_routes = protected_routes.merge(rag::protected_router());
+        // AI 记忆体管理路由（settings / memories CRUD / clear / 手动蒸馏 / SSE）
+        protected_routes = protected_routes.merge(agent::memory::protected_router());
+        public_routes = public_routes.merge(agent::memory::public_router());
     }
 
     // Only apply auth middleware if password is set

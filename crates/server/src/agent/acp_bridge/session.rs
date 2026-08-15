@@ -138,6 +138,7 @@ impl AcpBridge {
                     spawn_ready: watch::channel(false).0,
                     pending_prompts: migrated_prompts,
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
+                    memory_block: None,
                 },
             );
             Some((pump_io, stdout_rx))
@@ -896,7 +897,7 @@ impl AcpBridge {
         content: &str,
         drain: bool,
     ) -> Result<(), String> {
-        let (connection, acp_session_id, turn_gen) = {
+        let (connection, acp_session_id, turn_gen, memory_block) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
                 .get_mut(session_id)
@@ -925,14 +926,22 @@ impl AcpBridge {
             // 误发 error 的竞态（cancelled 布尔无法区分"哪个回合被取消"）。
             agent.turn_generation += 1;
             let turn_gen = agent.turn_generation;
-            (connection, acp_session_id, turn_gen)
+            let memory_block = agent.memory_block.clone().unwrap_or_default();
+            (connection, acp_session_id, turn_gen, memory_block)
         };
 
         let bridge = self.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
         let sid = session_id.to_string();
-        let prompt = vec![ContentBlock::Text(TextContent::new(content.to_string()))];
+        // AI 记忆注入：`<memory>` 块 prepend 到发给 agent 的 user content 头部。
+        // 只进 agent 侧上下文，不落 DB（持久化/蒸馏保持干净，无回环）。
+        let final_content = if memory_block.is_empty() {
+            content.to_string()
+        } else {
+            format!("{memory_block}\n\n{content}")
+        };
+        let prompt = vec![ContentBlock::Text(TextContent::new(final_content))];
         let send_result = connection
             .send_request_to(
                 agent_client_protocol::Agent,
@@ -1219,6 +1228,12 @@ impl AcpBridge {
         // 先 flush 回合缓冲：进行中回合未到终态/工具边界的流式文本落库（与
         // drop_client_sessions 一致），避免用户已看到的输出在归档/删除后丢库。
         flush_acp_turn_buffers(&self.db, &self.sessions, session_id).await;
+        // AI 记忆蒸馏（归档触发）：flush 后会话内容完整再蒸馏。CAS 防重——
+        // archive_session handler 的触发与这里多路并发，只有一个赢家。
+        #[cfg(feature = "rag")]
+        if let Some(memory) = self.memory.as_ref() {
+            crate::agent::memory::distill::trigger_distill(memory, session_id, "archive").await;
+        }
         self.sessions.lock().await.remove(session_id);
         tracing::info!(session_id, "killed ACP session");
     }
@@ -1300,6 +1315,11 @@ impl AcpBridge {
             .collect();
         for sid in sids {
             flush_acp_turn_buffers(&self.db, &self.sessions, &sid).await;
+            // AI 记忆蒸馏（断线触发）：flush 后内容完整再蒸馏。CAS 防重。
+            #[cfg(feature = "rag")]
+            if let Some(memory) = self.memory.as_ref() {
+                crate::agent::memory::distill::trigger_distill(memory, &sid, "disconnect").await;
+            }
             self.sessions.lock().await.remove(&sid);
             tracing::info!(
                 session_id = %sid,

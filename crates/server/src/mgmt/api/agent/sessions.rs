@@ -138,8 +138,16 @@ pub async fn archive_session(
     };
     // 归档即终结：杀掉该 session 的 ACP agent 进程（不存在则 no-op）。
     // 用 kill（保留 agent 侧持久化会话数据）——归档后重开会话可 resume 恢复。
+    // kill 内部 flush 回合缓冲后触发记忆蒸馏（ACP 路径）；runner（非 ACP）会话
+    // 由下方 handler 触发。CAS 防重，两路并发唯一赢家。
     if let Some(bridge) = agent.acp_bridge.as_ref() {
         bridge.kill(&id).await;
+    }
+    // AI 记忆蒸馏（归档触发，runner 路径兜底）：agent_archive_session 之前调用，
+    // 保证会话行存在、快照可读。CAS 未命中（ACP 路径已赢/已蒸馏）直接返回。
+    #[cfg(feature = "rag")]
+    if let Some(memory) = agent.memory.as_ref() {
+        crate::agent::memory::distill::trigger_distill(memory, &id, "archive").await;
     }
     match agent.db.agent_archive_session(&id).await {
         Ok(()) => StatusCode::OK.into_response(),
@@ -154,13 +162,44 @@ pub async fn delete_session(
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // AI 记忆蒸馏（删除触发）：**先同步快照**再删行——FK 级联删会先删消息，
+    // 异步蒸馏（spawn 后读 DB）会无料可用。快照在删行前采集，蒸馏在删行后触发。
+    #[cfg(feature = "rag")]
+    let distill_snapshot = if let Some(memory) = agent.memory.as_ref() {
+        crate::agent::memory::distill::load_snapshot(memory, &id).await
+    } else {
+        None
+    };
+    // 蒸馏 CAS 预留：kill_and_delete → kill 内部会触发归档蒸馏（此时行还在、
+    // 会 CAS 赢）；不预留则删行后 trigger_distill_with_snapshot（行已不在）还会
+    // 再蒸馏一次，同一内容双跑有产生重复记忆的竞态。此处先抢占标记，kill 的
+    // 触发因 CAS 未命中（行存在且已标记）让位——删除路径独占蒸馏权。
+    #[cfg(feature = "rag")]
+    if let Some(memory) = agent.memory.as_ref() {
+        let _ = memory.db.memory_mark_distilled_if_not(&id).await;
+    }
     // 删除即终结：先发 ACP session/delete 让 agent 清理客户端持久化会话文件，
     // 再杀掉进程（不存在则 no-op）。
     if let Some(bridge) = agent.acp_bridge.as_ref() {
         bridge.kill_and_delete(&id).await;
     }
     match agent.db.agent_delete_session(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // 删行后触发蒸馏：CAS 命中不了（行已不存在）但快照在手仍可蒸馏；
+            // 其他路径已赢 CAS（归档已蒸馏）时让位。
+            #[cfg(feature = "rag")]
+            if let Some(snapshot) = distill_snapshot {
+                if let Some(memory) = agent.memory.as_ref() {
+                    crate::agent::memory::distill::trigger_distill_with_snapshot(
+                        memory,
+                        snapshot,
+                        "delete",
+                    )
+                    .await;
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

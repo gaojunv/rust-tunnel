@@ -23,6 +23,7 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const LLMPage = lazy(() => import('./pages/LLMPage'));
 const KbPage = lazy(() => import('./pages/KbPage'));
 const AgentPage = lazy(() => import('./pages/AgentPage'));
+const MemoryPage = lazy(() => import('./pages/MemoryPage'));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -68,6 +69,7 @@ const router = createBrowserRouter([
           { path: '/llm', element: <LLMPage /> },
           { path: '/llm/kb', element: <KbPage /> },
           { path: '/agent', element: <AgentPage /> },
+          { path: '/agent/memory', element: <MemoryPage /> },
           { path: '/settings', element: <SettingsPage /> },
         ],
       },

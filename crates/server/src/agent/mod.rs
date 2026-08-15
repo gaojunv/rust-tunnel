@@ -4,6 +4,8 @@ pub mod acp_bridge;
 pub mod acp_events;
 pub mod approval;
 pub mod compact;
+#[cfg(feature = "rag")]
+pub mod memory;
 pub mod executor;
 pub mod git_plan;
 pub mod github;
@@ -147,6 +149,10 @@ pub struct AgentState {
     /// 惰性 spawn + 事件映射 + LLM 代理路由；控制循环的 AgentSpawnData/Exit、
     /// AgentLlmProxyRequest 经它路由。
     pub acp_bridge: Option<AcpBridge>,
+    /// AI 记忆体运行时（蒸馏/注入/remember 共用）。仅 `rag` feature 下存在；
+    /// `server.rs` 在 `init_llm_state` 之后经 [`Self::with_memory`] 注入。
+    #[cfg(feature = "rag")]
+    pub memory: Option<memory::MemoryState>,
     /// 工作台全局通知广播：任务完成 / 出错 / 需用户干预时，`push_task`
     /// （`mgmt/api/agent/ws.rs`）把出站帧翻译成 [`notify::AgentNotification`]
     /// 发布于此，浏览器全局通知 WS（`/api/agent/notifications/ws`）订阅消费。
@@ -173,6 +179,8 @@ impl AgentState {
             session_allowed: Arc::new(Mutex::new(HashMap::new())),
             exec_inflight: Arc::new(Mutex::new(HashMap::new())),
             acp_bridge: None,
+            #[cfg(feature = "rag")]
+            memory: None,
             notifications: notify_tx,
             github_base_url: crate::agent::github::GITHUB_API_BASE.to_string(),
         };
@@ -252,6 +260,20 @@ impl AgentState {
         if let Some(bridge) = self.acp_bridge.take() {
             self.acp_bridge = Some(bridge.with_llm_gateway(gateway));
         }
+        self
+    }
+
+    /// 把 AI 记忆体运行时挂到 AgentState（蒸馏/注入/remember 经它访问 DB、向量
+    /// 与设置）。`MemoryState` 里的 `store` 必须与 `LlmState.rag_store` 同一实例，
+    /// 由 `server.rs` 在 `init_llm_state` 之后构造注入。同步注入 ACP 桥
+    /// （kill/断线/idle 蒸馏触发用），共享同一实例。
+    #[cfg(feature = "rag")]
+    #[must_use]
+    pub fn with_memory(mut self, memory: memory::MemoryState) -> Self {
+        if let Some(bridge) = self.acp_bridge.take() {
+            self.acp_bridge = Some(bridge.with_memory(memory.clone()));
+        }
+        self.memory = Some(memory);
         self
     }
 

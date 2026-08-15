@@ -876,6 +876,24 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         .await;
                     continue;
                 }
+                // AI 记忆注入（ACP）：每会话检索一次并缓存到 SpawnedAgent（对齐
+                // runner 路径的 rt.memory_block 缓存先例）。prompt_inner 发送前把
+                // <memory> 块 prepend 到发给 agent 的 user content 头部——只进 agent
+                // 侧上下文、不落 DB（持久化/蒸馏保持干净，无回环）。
+                #[cfg(feature = "rag")]
+                if let Some(memory) = agent.memory.as_ref() {
+                    if bridge.cached_memory_block(&session_id).await.is_none() {
+                        let block = crate::agent::memory::inject::retrieve_for_session(
+                            memory,
+                            &acp_workspace.client_id,
+                            &acp_workspace.id,
+                            &content,
+                        )
+                        .await
+                        .unwrap_or_default();
+                        bridge.set_memory_block(&session_id, Some(block)).await;
+                    }
+                }
                 // 持久化 user 消息（与 runner 路径同款）：落的是注入后的 content，
                 // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。排队消息同样
                 // 立即落库——在 submit_prompt 之前，无论本轮是直接跑还是排队。

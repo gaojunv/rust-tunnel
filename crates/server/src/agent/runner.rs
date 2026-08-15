@@ -339,6 +339,31 @@ async fn handle_tool_calls(
             }))
             .await;
 
+        // remember 工具短路：服务端本地保存记忆，**不进 AgentCommand 协议**
+        // （bincode 索引反序列化会破坏协议）。无 rag 时该工具不出现在 schema，
+        // 模型不会调用；防御性兜底：未配置时错误文本喂回模型。不落审批。
+        #[cfg(feature = "rag")]
+        if call.name == "remember" {
+            let text = match crate::agent::memory::remember::remember_from_agent(
+                agent, rt, &call.args,
+            )
+            .await
+            {
+                Ok(msg) => msg,
+                Err(e) => format!("error: {e}"),
+            };
+            let _ = ws_tx
+                .send(serde_json::json!({
+                    "type": "tool_result",
+                    "id": &call.id,
+                    "name": &call.name,
+                    "result": &text,
+                }))
+                .await;
+            record_tool_result(agent, rt, &call.id, &call.name, text).await;
+            continue;
+        }
+
         let result_text = match tools::parse_tool_call(&call.name, &call.args) {
             Ok(command) => {
                 // 审批：session 记忆集命中且命令非破坏性 → 放行；否则按 workspace
@@ -554,6 +579,40 @@ pub async fn run_agent_turn(
             );
         }
         rt.agents_md = Some(content);
+    }
+
+    // AI 记忆注入：AGENTS.md 之后、首回合前，每会话检索一次并缓存
+    // （rt.memory_block）。查询文本 = 最近一条 user 消息（本轮刚 push）。
+    // 块以 `\n\n---\n\n` 分隔追加进 system 单条（messages[0]），同 AGENTS.md
+    // 段格式；system 在 load 时重建、不落库，不会重复注入。
+    #[cfg(feature = "rag")]
+    if rt.memory_block.is_none() {
+        let query = rt
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+        let block = if let Some(memory) = agent.memory.as_ref() {
+            crate::agent::memory::inject::retrieve_for_session(
+                memory,
+                &rt.client_id,
+                &rt.workspace_id,
+                &query,
+            )
+            .await
+        } else {
+            None
+        };
+        rt.memory_block = match block {
+            Some(b) if !b.is_empty() => {
+                let base = rt.messages[0].content.as_deref().unwrap_or_default();
+                rt.messages[0] = ChatMessage::text("system", format!("{base}\n\n---\n\n{b}"));
+                Some(b)
+            }
+            _ => Some(String::new()), // 缓存空，避免每回合重试检索
+        };
     }
 
     'round: for _round in 0..MAX_TOOL_ROUNDS {

@@ -121,6 +121,11 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub acp_session_id: Option<String>,
+    /// 会话蒸馏防重标记（1 = 已蒸馏）。列由 `migrate_agent_sessions_add_distilled`
+    /// （schema.rs）落地；`#[sqlx(default)]` 保证旧库未跑迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub distilled: i32,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
