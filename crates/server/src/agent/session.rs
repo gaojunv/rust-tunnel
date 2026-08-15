@@ -219,9 +219,15 @@ impl SessionRuntime {
                     name: None,
                 }),
                 // 单条工具结果：恢复 tool_call_id/name，与 tool_calls 配对。
+                // M2 起 ACP 路径落库 content 为 JSON `{"text","status",...}`（见
+                // agent/tool_result.rs）——重放给 LLM 只取 text 字段；存量旧行是
+                // 纯文本，tool_result_text 返回 None 时原样使用（向后兼容）。
                 "tool_result" => messages.push(ChatMessage {
                     role: "tool".into(),
-                    content: Some(r.content.clone()),
+                    content: Some(
+                        crate::agent::tool_result::tool_result_text(&r.content)
+                            .unwrap_or_else(|| r.content.clone()),
+                    ),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: r.tool_call_id.clone(),
@@ -993,6 +999,93 @@ mod tests {
         assert_eq!(patched.tool_call_id.as_deref(), Some("c2"));
         assert_eq!(patched.name.as_deref(), Some("read_file"));
         assert!(patched.content.as_deref().unwrap().contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn test_load_tool_result_structured_json_extracts_text() {
+        // M2 契约：ACP 路径落库的 tool_result content 是 JSON
+        // `{"text","status","diffs"?,...}`——load 重放给 LLM 只取 text 字段
+        // （否则把 JSON 壳当工具结果内容）；旧纯文本行原样使用（向后兼容）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_add_message("m1", "s1", "user", "改代码", None)
+            .await
+            .unwrap();
+        // 新格式行 + 旧纯文本行各一
+        db.agent_add_message_v2(
+            "m2",
+            "s1",
+            "assistant",
+            "",
+            Some(r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#),
+            None,
+            None,
+            "tool_calls",
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2(
+            "m3",
+            "s1",
+            "tool",
+            r#"{"text":"a.rs","status":"failed","diffs":[{"old":"x","new":"y"}]}"#,
+            None,
+            Some("c1"),
+            Some("shell"),
+            "tool_result",
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2(
+            "m4",
+            "s1",
+            "assistant",
+            "",
+            Some(r#"[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#),
+            None,
+            None,
+            "tool_calls",
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_add_message_v2(
+            "m5",
+            "s1",
+            "tool",
+            "旧格式纯文本",
+            None,
+            Some("c2"),
+            Some("read_file"),
+            "tool_result",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rt = SessionRuntime::load(&db, "s1", "m").await.unwrap();
+        // system + user + assistant + tool(c1) + assistant + tool(c2)
+        assert_eq!(rt.messages.len(), 6);
+        let c1 = &rt.messages[3];
+        assert_eq!(c1.role, "tool");
+        assert_eq!(
+            c1.content.as_deref(),
+            Some("a.rs"),
+            "新 JSON 格式应只提取 text: {:?}",
+            c1.content
+        );
+        assert_eq!(c1.tool_call_id.as_deref(), Some("c1"));
+        let c2 = &rt.messages[5];
+        assert_eq!(c2.content.as_deref(), Some("旧格式纯文本"), "旧行原样");
     }
 
     #[tokio::test]

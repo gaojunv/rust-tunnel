@@ -423,6 +423,21 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
     expect(screen.queryByText('✓')).toBeNull();
   });
 
+  it('空结果 + 终态状态不误显「执行中」（M5：按 toolStatus 门控）', () => {
+    // 服务端新契约 tool_result JSON status=completed/failed 且 text 为空串时，
+    // 详情区不应再显示「执行中」——状态已是终态，spinner 只在运行中显示。
+    const { unmount } = render(
+      <MessageBubble item={{ ...base, toolStatus: 'completed', toolResult: '' }} />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.queryByText('agent.toolRunning')).toBeNull();
+    unmount();
+    render(<MessageBubble item={{ ...base, toolStatus: 'failed', toolResult: '' }} />);
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.queryByText('agent.toolRunning')).toBeNull();
+    expect(screen.getByText('✗')).toBeTruthy();
+  });
+
   it('renders plan bubble with status markers', () => {
     render(
       <MessageBubble

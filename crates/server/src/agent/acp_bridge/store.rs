@@ -36,8 +36,7 @@ pub(super) async fn persist_acp_frame(
                 // 交错顺序——flush 按此落库，刷新后顺序才与对话一致、归属正确。
                 let appended = match a.turn_segments.last_mut() {
                     Some(last)
-                        if last.thought == is_thought
-                            && last.parent_tool_call_id == parent =>
+                        if last.thought == is_thought && last.parent_tool_call_id == parent =>
                     {
                         last.content.push_str(content);
                         true
@@ -93,6 +92,19 @@ pub(super) async fn persist_acp_frame(
         "tool_result" => {
             let parent = frame["parent_tool_call_id"].as_str();
             let msg_id = format!("{:032x}", rand::random::<u128>());
+            // M2 结构化落库：content 从纯文本改写为 JSON
+            // `{"text","status","diffs"?,"locations"?}`（与前端 ChatStream 契约
+            // 严格一致，见 agent/tool_result.rs）。status 落库修复「失败工具刷新后
+            // 恒显 ✓」——旧实现只落 result 文本、status 丢失；diffs/locations 落库
+            // 使刷新后 diff 展示不丢（此前仅 ToolCallUpdate 实时帧携带）。
+            // 空占位语义保持：中间态（running/completed 且无任何产出）传 ""，upsert
+            // 不覆盖已落库的真实结果；failed 等异常终态即使 text 为空也要落库。
+            let content = crate::agent::tool_result::tool_result_persist_content(
+                frame["result"].as_str(),
+                frame["status"].as_str(),
+                frame.get("diffs"),
+                frame.get("locations"),
+            );
             // upsert：ToolCallUpdate 中间态（空 result）与终态按同一
             // (session_id, tool_call_id) 收敛，终态覆盖中间态空占位。
             if let Err(e) = db
@@ -101,7 +113,7 @@ pub(super) async fn persist_acp_frame(
                     sid,
                     frame["id"].as_str().unwrap_or_default(),
                     frame["name"].as_str(),
-                    frame["result"].as_str().unwrap_or(""),
+                    &content,
                     parent,
                 )
                 .await

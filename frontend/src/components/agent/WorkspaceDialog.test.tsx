@@ -353,6 +353,23 @@ describe('WorkspaceDialog config overrides UI', () => {
     const body = api.createAgentWorkspace.mock.calls[0][0];
     expect(body).not.toHaveProperty('agent_config_overrides');
   });
+
+  it('内置引擎（agent_type 空）不提交 overrides：防切回 ACP 时旧值复活', async () => {
+    // 场景：工作区曾是 ACP 引擎且存有 overrides，编辑时切回内置 runner。
+    // overrideRows 随引擎切换被隐藏但 state 仍持有旧值——必须按 agentType 门控，
+    // 非 ACP 引擎不提交，否则旧值「复活」到后端。
+    renderDialog({ ...editingWs, agent_config_overrides: '{"model":"sonnet"}' });
+    // 引擎 Tab：切回内置引擎（空串）
+    await clickTab('agent.tabEngine');
+    fireEvent.change(screen.getByLabelText('agent.agentEngine'), { target: { value: '' } });
+    fireEvent.click(screen.getByText('common.save'));
+    await waitFor(() => {
+      expect(api.updateAgentWorkspace).toHaveBeenCalledWith('w1', expect.anything());
+    });
+    const body = api.updateAgentWorkspace.mock.calls[0][1];
+    expect(body.agent_type).toBe('');
+    expect(body).not.toHaveProperty('agent_config_overrides');
+  });
 });
 
 describe('WorkspaceDialog GitHub config', () => {

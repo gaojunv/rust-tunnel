@@ -2,7 +2,10 @@
  * 多会话标签页的纯函数状态模块（浏览器 tab 式）。
  * 持久化于 localStorage：`agent.openTabs.<workspaceId>`（JSON：{ open, active }）。
  * 所有函数保持纯/幂等，便于单测与 React state 直接复用。
+ * localStorage 访问统一走 safeStorage 包装（隐私模式/禁用时不抛异常）。
  */
+
+import { safeLocalStorageGet, safeLocalStorageRemove, safeLocalStorageSet } from './safeStorage';
 
 export interface TabState {
   /** 已打开标签的会话 id，有序，front = 最早打开 */
@@ -21,7 +24,7 @@ const storageKey = (workspaceId: string) => `agent.openTabs.${workspaceId}`;
  */
 export function loadTabs(workspaceId: string): TabState | null {
   try {
-    const raw = localStorage.getItem(storageKey(workspaceId));
+    const raw = safeLocalStorageGet(storageKey(workspaceId));
     if (raw == null) return null;
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== 'object' || parsed === null) return null;
@@ -38,11 +41,7 @@ export function loadTabs(workspaceId: string): TabState | null {
 
 /** 写入工作区标签状态。localStorage 异常（容量满等）静默丢弃——本地记忆仅是增强。 */
 export function saveTabs(workspaceId: string, state: TabState): void {
-  try {
-    localStorage.setItem(storageKey(workspaceId), JSON.stringify(state));
-  } catch {
-    /* 忽略 */
-  }
+  safeLocalStorageSet(storageKey(workspaceId), JSON.stringify(state));
 }
 
 /**
@@ -52,11 +51,11 @@ export function saveTabs(workspaceId: string, state: TabState): void {
  */
 export function migrateLegacy(workspaceId: string): TabState | null {
   try {
-    if (localStorage.getItem('agent.lastWorkspaceId') !== workspaceId) return null;
-    const last = localStorage.getItem('agent.lastSessionId');
+    if (safeLocalStorageGet('agent.lastWorkspaceId') !== workspaceId) return null;
+    const last = safeLocalStorageGet('agent.lastSessionId');
     if (!last) return null;
-    localStorage.removeItem('agent.lastWorkspaceId');
-    localStorage.removeItem('agent.lastSessionId');
+    safeLocalStorageRemove('agent.lastWorkspaceId');
+    safeLocalStorageRemove('agent.lastSessionId');
     return { open: [last], active: last };
   } catch {
     return null;

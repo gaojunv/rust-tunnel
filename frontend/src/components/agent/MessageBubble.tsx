@@ -449,12 +449,15 @@ export function ToolCard({ item }: { item: ChatItem }) {
           {item.toolArgs && !isNoopArgs(item.toolArgs) && <CollapsiblePre text={item.toolArgs} />}
           {item.toolResult ? (
             <CollapsiblePre text={item.toolResult} className={item.toolArgs || item.toolDiffs ? 'border-t border-border/60 pt-2' : undefined} />
-          ) : (
+          ) : isRunning ? (
+            // 仅运行中才显示「执行中」：结果为空但状态已是终态（completed/failed）时
+            // 不再误显执行中（M5）——历史 JSON tool_result 的失败工具 status=failed
+            // 且结果可能为空串，卡片只保留 ✗ 徽章 + 失败提示。
             <div className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               {t('agent.toolRunning')}
             </div>
-          )}
+          ) : null}
           {isError && item.toolResult && (
             <div className="text-xs text-destructive">{t('agent.toolFailed')}</div>
           )}

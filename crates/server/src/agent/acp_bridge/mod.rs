@@ -425,6 +425,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
     }
@@ -440,7 +441,8 @@ mod tests {
     ///
     /// `persisted_id`：传给 `acp_handshake` 的持久化 ACP session id（resume 测试
     /// 用；None = 全新会话路径）。`resume_fails`：true 时 mock 的 `session/resume`
-    /// 回 error（测回退 session/new）。
+    /// 回 error（测回退 session/new）。`fail_config_id`：mock 对该 config_id 的
+    /// `session/set_config_option` 回 JSON-RPC error（测「单条失败不阻断其余注入」）。
     #[allow(clippy::too_many_arguments)]
     async fn setup_handshake_with(
         bridge: &AcpBridge,
@@ -451,6 +453,7 @@ mod tests {
         recorded: Option<Arc<Mutex<Vec<String>>>>,
         persisted_id: Option<&str>,
         resume_fails: bool,
+        fail_config_id: Option<&str>,
     ) {
         let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -480,6 +483,7 @@ mod tests {
             prompt_permits,
             recorded,
             resume_fails,
+            fail_config_id.map(str::to_string),
         ));
 
         bridge
@@ -552,8 +556,14 @@ mod tests {
             .elicitation
             .as_ref()
             .expect("capabilities should carry elicitation");
-        assert!(elicitation.form.is_some(), "form capability must be declared");
-        assert!(elicitation.url.is_none(), "url capability must not be declared");
+        assert!(
+            elicitation.form.is_some(),
+            "form capability must be declared"
+        );
+        assert!(
+            elicitation.url.is_none(),
+            "url capability must not be declared"
+        );
         let json = serde_json::to_value(&caps).unwrap();
         assert!(json["elicitation"]["form"].is_object());
         assert!(
@@ -619,9 +629,12 @@ mod tests {
         let conn_rx = agent.ws_conn_watch.subscribe();
         bridge.sessions.lock().await.insert("sess-1".into(), agent);
 
-        let content = serde_json::from_value::<std::collections::BTreeMap<String, agent_client_protocol::schema::v1::ElicitationContentValue>>(
-            serde_json::json!({"name": "Alice"}),
-        )
+        let content = serde_json::from_value::<
+            std::collections::BTreeMap<
+                String,
+                agent_client_protocol::schema::v1::ElicitationContentValue,
+            >,
+        >(serde_json::json!({"name": "Alice"}))
         .unwrap();
         let elicitation: Arc<ElicitFn> = Arc::new(move |_, _, _, _| {
             let content = content.clone();
@@ -641,9 +654,11 @@ mod tests {
             ElicitationResult::Accept(Some(content)) => {
                 assert_eq!(
                     content.get("name"),
-                    Some(&agent_client_protocol::schema::v1::ElicitationContentValue::String(
-                        "Alice".into()
-                    ))
+                    Some(
+                        &agent_client_protocol::schema::v1::ElicitationContentValue::String(
+                            "Alice".into()
+                        )
+                    )
                 );
             }
             other => panic!("expected Accept, got {other:?}"),
@@ -918,7 +933,9 @@ mod tests {
         let mut ws = acp_workspace();
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
-        let _ = bridge.ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID).await;
+        let _ = bridge
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
+            .await;
 
         let err = bridge
             .wait_ready("sess-1")
@@ -961,7 +978,9 @@ mod tests {
         let ws = acp_workspace();
         for _ in 0..2 {
             let (ws_tx, _rx) = mpsc::channel(16);
-            let _ = bridge.ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID).await;
+            let _ = bridge
+                .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
+                .await;
         }
         let err = bridge
             .wait_ready("sess-1")
@@ -1309,6 +1328,7 @@ mod tests {
         mut prompt_permits: Option<mpsc::Receiver<()>>,
         recorded: Option<Arc<Mutex<Vec<String>>>>,
         resume_fails: bool,
+        fail_config_id: Option<String>,
     ) {
         let mut buf = String::new();
         while let Some(msg) = stdin_rx.recv().await {
@@ -1389,6 +1409,15 @@ mod tests {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        // 指定的 config_id 硬失败：回 JSON-RPC error，验证调用方
+                        // 「单条失败不阻断其余注入」。
+                        if fail_config_id.as_deref() == Some(config_id.as_str()) {
+                            out_lines.push(serde_json::json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "error": { "code": -32000, "message": "invalid config value" }
+                            }));
+                            continue;
+                        }
                         // ACP 实际序列化：select 的 value 是裸字符串（"sonnet"）；
                         // boolean 是 bool（{"type":"boolean","value":true} 平铺到
                         // params 顶层）。响应必须带 configOptions 字段（schema 的
@@ -1720,6 +1749,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -1916,11 +1946,14 @@ mod tests {
             serde_json::from_str(calls[0].tool_calls.as_deref().unwrap()).unwrap();
         assert_eq!(call_json[0]["tool_kind"], "other"); // mock 未带 kind → 默认
         assert_eq!(call_json[0]["arguments"], "{\"cmd\":\"ls\"}");
-        // tool_result 行
+        // tool_result 行：M2 起 content 为结构化 JSON（text/status），status 落库
+        // 供前端区分失败/成功。
         let results: Vec<_> = rows.iter().filter(|r| r.kind == "tool_result").collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(results[0].content, "a.rs");
+        let result_json: serde_json::Value = serde_json::from_str(&results[0].content).unwrap();
+        assert_eq!(result_json["text"], "a.rs");
+        assert_eq!(result_json["status"], "completed");
     }
 
     #[tokio::test]
@@ -2145,6 +2178,168 @@ mod tests {
         );
     }
 
+    // ── M2：tool_result 结构化 content 落库 ──────────────────────
+
+    /// 建一个含 workspace/session + 空会话表的 persist 环境。
+    async fn persist_env() -> (Database, Arc<Mutex<HashMap<String, SpawnedAgent>>>) {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert("sess-1".into(), spawned_agent());
+        (db, sessions)
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_persists_structured_json() {
+        // M2 契约：中间态 running（空占位）→ 终态 completed（带 result + diffs），
+        // 落库 content 为 JSON `{"text","status","diffs",...}`——status/diffs
+        // 落库后刷新不丢（失败打叉、diff 展示依赖它）。
+        let (db, sessions) = persist_env().await;
+
+        // 中间态：空占位（running、无产出）
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "running",
+            }),
+        )
+        .await;
+        // 终态：completed + result + diffs + locations
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "completed",
+                "result": "a.rs",
+                "diffs": [{"old": "x", "new": "y"}],
+                "locations": [{"path": "a.rs", "line": 3}],
+            }),
+        )
+        .await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let results: Vec<_> = rows.iter().filter(|r| r.kind == "tool_result").collect();
+        assert_eq!(results.len(), 1, "upsert 收敛为一行: {rows:?}");
+        let v: serde_json::Value = serde_json::from_str(&results[0].content).unwrap();
+        assert_eq!(v["text"], "a.rs");
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["diffs"][0]["new"], "y");
+        assert_eq!(v["locations"][0]["line"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_failed_empty_text_persists() {
+        // 失败工具恒显 ✓ 的根因修复：failed 终态即使 result 为空也要落库
+        // （status=failed），前端据此打叉。
+        let (db, sessions) = persist_env().await;
+
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "running",
+            }),
+        )
+        .await;
+        // 失败终态：无 result 文本
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "failed",
+            }),
+        )
+        .await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let results: Vec<_> = rows.iter().filter(|r| r.kind == "tool_result").collect();
+        assert_eq!(results.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&results[0].content).unwrap();
+        assert_eq!(v["text"], "", "失败终态 text 为空");
+        assert_eq!(
+            v["status"], "failed",
+            "status 必须落库: {}",
+            results[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_late_placeholder_does_not_overwrite() {
+        // 空占位语义：已完成（JSON 落库）后迟到的中间态 running 帧不得覆盖真实结果。
+        let (db, sessions) = persist_env().await;
+
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "completed",
+                "result": "真实结果",
+            }),
+        )
+        .await;
+        // 迟到的中间态帧（刷新/重连乱序）：空占位 → "" → upsert 不覆盖
+        persist_acp_frame(
+            &db,
+            &sessions,
+            "sess-1",
+            &serde_json::json!({
+                "type": "tool_result",
+                "id": "call_1",
+                "name": "shell",
+                "status": "running",
+            }),
+        )
+        .await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        let results: Vec<_> = rows.iter().filter(|r| r.kind == "tool_result").collect();
+        assert_eq!(results.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&results[0].content).unwrap();
+        assert_eq!(v["text"], "真实结果");
+        assert_eq!(v["status"], "completed");
+    }
+
     #[tokio::test]
     async fn test_acp_persistence_survives_ws_disconnect() {
         // 断线（detach_ws_tx 置 ws_tx=None）期间回合跑完：消息仍落库。
@@ -2229,7 +2424,14 @@ mod tests {
         bridge.sessions.lock().await.insert("sess-1".into(), a);
         bridge.detach_ws_tx("sess-1", OLD).await;
         assert!(
-            bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_none(),
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .ws_tx
+                .is_none(),
             "own detach should clear ws_tx"
         );
 
@@ -2240,12 +2442,26 @@ mod tests {
         bridge.sessions.lock().await.insert("sess-1".into(), a);
         bridge.detach_ws_tx("sess-1", OLD).await;
         assert!(
-            bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_some(),
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .ws_tx
+                .is_some(),
             "old connection teardown must not clear newer connection's ws_tx"
         );
         // 新连接自己的 teardown 仍能清空
         bridge.detach_ws_tx("sess-1", NEW).await;
-        assert!(bridge.sessions.lock().await.get("sess-1").unwrap().ws_tx.is_none());
+        assert!(bridge
+            .sessions
+            .lock()
+            .await
+            .get("sess-1")
+            .unwrap()
+            .ws_tx
+            .is_none());
     }
 
     // ── WS 连接变化 watch：审批断线/重连即时拒绝 ──────────────────
@@ -2309,9 +2525,8 @@ mod tests {
         let conn_rx = agent.ws_conn_watch.subscribe();
         bridge.sessions.lock().await.insert("sess-1".into(), agent);
 
-        let approval: Arc<ApproveFn> = Arc::new(|_, _, _, _, _, _| {
-            Box::pin(async { ApprovalResult::Approved })
-        });
+        let approval: Arc<ApproveFn> =
+            Arc::new(|_, _, _, _, _, _| Box::pin(async { ApprovalResult::Approved }));
         let result = approve_or_disconnect(
             approval,
             "sess-1".into(),
@@ -2477,8 +2692,18 @@ mod tests {
              "options": [{"value": "haiku", "name": "Haiku"}]}
         ]);
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
-        setup_handshake_with(&bridge, ws_tx, options, applied.clone(), None, None, None, false)
-            .await;
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            options,
+            applied.clone(),
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
 
         // workspace 注入：fast → haiku；model 先被 workspace 设为 sonnet，随后
         // config_state 回放覆盖为 opus；nonexistent 不在快照中 → 跳过
@@ -2534,7 +2759,15 @@ mod tests {
             let applied = Arc::new(Mutex::new(Vec::new()));
             let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
             setup_handshake_with(
-                &bridge, ws_tx, options.clone(), applied.clone(), None, None, None, false,
+                &bridge,
+                ws_tx,
+                options.clone(),
+                applied.clone(),
+                None,
+                None,
+                None,
+                false,
+                None,
             )
             .await;
             bridge.apply_config_overrides("sess-1", &ws).await;
@@ -2543,6 +2776,312 @@ mod tests {
                 "{label}: apply_config_overrides should be a no-op"
             );
         }
+    }
+
+    /// 端到端 ensure_session mock 客户端：注册模拟客户端，自动应答协商请求
+    /// （AgentLlmProxyStart → AgentLlmProxyReady、AgentSpawnRequest →
+    /// AgentSpawnResponse success），并扮演 ACP 进程——stdin 数据（JSON-RPC 请求）
+    /// 经 pump → 控制通道到达后转发给 [`mock_acp_agent`] 逐行应答，进程 stdout
+    /// 经 `SpawnedAgent.stdout_tx` 送回 pump → ACP 连接。生产接线
+    /// `ensure_session` 全链路（start_llm_proxy → spawn_agent → handshake → 配置注入）
+    /// 不经此桥无法完成，测试由此验证真实调用顺序。
+    async fn spawn_e2e_client(
+        registry: &crate::client_registry::ClientRegistry,
+        sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+        config_options: serde_json::Value,
+        applied: Arc<Mutex<Vec<(String, String)>>>,
+        fail_config_id: Option<&str>,
+    ) {
+        let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
+        registry
+            .register("nas", None, None, "secret", tx)
+            .await
+            .unwrap();
+        let registry2 = registry.clone();
+        let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
+        let (proc_stdout_tx, mut proc_stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+        // 进程侧 ACP 模拟（复用 handshake 测试的 mock_acp_agent 逻辑）
+        tokio::spawn(mock_acp_agent(
+            control_rx,
+            proc_stdout_tx,
+            config_options,
+            applied,
+            None,
+            None,
+            false,
+            fail_config_id.map(str::to_string),
+        ));
+        // 客户端侧：协商应答 + stdin（server→process）桥接到进程侧
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ControlMessage::AgentLlmProxyStart { session_id } => {
+                        registry2
+                            .resolve_spawn_pending(
+                                &session_id,
+                                ControlMessage::AgentLlmProxyReady {
+                                    session_id: session_id.clone(),
+                                    port: 45678,
+                                },
+                            )
+                            .await;
+                    }
+                    ControlMessage::AgentSpawnRequest { session_id, .. } => {
+                        registry2
+                            .resolve_spawn_pending(
+                                &session_id,
+                                ControlMessage::AgentSpawnResponse {
+                                    session_id: session_id.clone(),
+                                    success: true,
+                                    error: None,
+                                },
+                            )
+                            .await;
+                    }
+                    ControlMessage::AgentSpawnData {
+                        data,
+                        stdin: true,
+                        session_id,
+                    } => {
+                        let _ = control_tx
+                            .send(ControlMessage::AgentSpawnData {
+                                data,
+                                stdin: true,
+                                session_id,
+                            })
+                            .await;
+                    }
+                    // AgentLlmProxyStop / AgentExecCancel 等单向清理：忽略。
+                    _ => {}
+                }
+            }
+        });
+        // 进程 stdout（process→server）桥接到 pump（经 SpawnedAgent.stdout_tx）
+        let sessions3 = sessions.clone();
+        tokio::spawn(async move {
+            while let Some(bytes) = proc_stdout_rx.recv().await {
+                let st = sessions3
+                    .lock()
+                    .await
+                    .get("sess-1")
+                    .and_then(|a| a.stdout_tx.clone());
+                if let Some(st) = st {
+                    let _ = st.send(bytes).await;
+                }
+            }
+        });
+    }
+
+    /// 生产接线端到端：`ensure_session` 内部真实调用顺序 apply_config_overrides →
+    /// replay_config_state → spawn_ready（不经手工逐函数调用）。workspace overrides
+    /// 注入后 session 级 config_state 回放覆盖之；全部完成后 spawn_ready 才置位。
+    #[tokio::test]
+    async fn test_ensure_session_production_config_injection_order() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            Some("model-1"),
+            Some(r#"{"model":"sonnet","fast":"haiku"}"#),
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+        // 用户显式 config_state：model→opus，必须覆盖 workspace 注入的 sonnet
+        db.agent_update_session_config_state("sess-1", "model", Some("opus"))
+            .await
+            .unwrap();
+
+        let options = serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "opus", "name": "Opus"}]},
+            {"id": "fast", "name": "Fast model", "type": "select", "currentValue": "haiku",
+             "options": [{"value": "haiku", "name": "Haiku"}]}
+        ]);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone());
+        spawn_e2e_client(&registry, &bridge.sessions, options, applied.clone(), None).await;
+
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        bridge
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
+            .await
+            .expect("ensure_session 应走完全部注入");
+
+        // 调用顺序 = 生产接线：workspace overrides（fast 先于 model）→ config_state
+        // 回放（model→opus，用户显式选择覆盖 workspace 默认）。
+        let calls = applied.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("fast".to_string(), "haiku".to_string()),
+                ("model".to_string(), "sonnet".to_string()),
+                ("model".to_string(), "opus".to_string()),
+            ],
+            "ensure_session 真实注入顺序错误: {calls:?}"
+        );
+        // 配置注入全部完成后 spawn_ready 才置位（wait_ready 依赖此信号，首条
+        // prompt 不与在途 set_config_option 竞态）
+        let ready = bridge
+            .sessions
+            .lock()
+            .await
+            .get("sess-1")
+            .unwrap()
+            .spawn_ready
+            .borrow()
+            .clone();
+        assert!(ready, "spawn_ready 应在配置注入完成后置位");
+        // config_options 快照已从 session/new 捕获
+        assert_eq!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .config_options
+                .len(),
+            2
+        );
+    }
+
+    /// set_config_option 硬失败继续注入（overrides 路径）：mock 对 model 回 JSON-RPC
+    /// error，apply_config_overrides 必须跳过该条并继续注入 fast（nonexistent 本地
+    /// 校验跳过）——现有 mock 恒成功，此路径此前无独立测试。
+    #[tokio::test]
+    async fn test_config_injection_continues_after_hard_failure() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            Some("model-1"),
+            Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+
+        let options = serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "opus", "name": "Opus"}]},
+            {"id": "fast", "name": "Fast model", "type": "select", "currentValue": "haiku",
+             "options": [{"value": "haiku", "name": "Haiku"}]}
+        ]);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        // mock 对 model 的 set_config_option 回 JSON-RPC error
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            options,
+            applied.clone(),
+            None,
+            None,
+            None,
+            false,
+            Some("model"),
+        )
+        .await;
+
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        bridge.apply_config_overrides("sess-1", &ws).await;
+
+        let calls = applied.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![("fast".to_string(), "haiku".to_string())],
+            "model 硬失败后 fast 应继续注入: {calls:?}"
+        );
+    }
+
+    /// set_config_option 硬失败继续注入（config_state 回放路径）：回放按 mode 优先
+    /// 排序，mode 硬失败后 fast 仍注入——单条失败不阻断整个回放。
+    #[tokio::test]
+    async fn test_replay_config_state_continues_after_hard_failure() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            Some("model-1"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+        // 回放含 mode（会硬失败，且按排序必先于 fast）与 fast（应照常注入）
+        db.agent_update_session_config_state("sess-1", "mode", Some("plan"))
+            .await
+            .unwrap();
+        db.agent_update_session_config_state("sess-1", "fast", Some("haiku"))
+            .await
+            .unwrap();
+
+        let options = serde_json::json!([
+            {"id": "mode", "name": "Mode", "type": "select", "currentValue": "normal",
+             "options": [{"value": "normal", "name": "Normal"}, {"value": "plan", "name": "Plan"}]},
+            {"id": "fast", "name": "Fast model", "type": "select", "currentValue": "haiku",
+             "options": [{"value": "haiku", "name": "Haiku"}]}
+        ]);
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx,
+            options,
+            applied.clone(),
+            None,
+            None,
+            None,
+            false,
+            Some("mode"),
+        )
+        .await;
+
+        bridge.replay_config_state("sess-1").await;
+
+        let calls = applied.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![("fast".to_string(), "haiku".to_string())],
+            "mode 硬失败后 fast 回放应继续: {calls:?}"
+        );
     }
 
     // ── submit_prompt 排队 + 优雅取消/兜底杀进程 ────────────────
@@ -2610,6 +3149,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -2652,7 +3192,10 @@ mod tests {
             // mock 每回合发 1 个正文 chunk（thought 也是 assistant_chunk 类型，
             // 用 thought 字段区分，只数正文用于判定「下一回合已开跑」）
             if ev["type"] == "assistant_chunk"
-                && !ev.get("thought").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                && !ev
+                    .get("thought")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
             {
                 text_chunks += 1;
                 if text_chunks >= 2 && !sent_second_permit {
@@ -2667,12 +3210,16 @@ mod tests {
                 break;
             }
         }
-        assert!(sent_second_permit, "queued prompt should auto-send after first turn");
+        assert!(
+            sent_second_permit,
+            "queued prompt should auto-send after first turn"
+        );
         assert_eq!(text_chunks, 2, "both turns should stream");
         let queued = events.iter().filter(|e| e["type"] == "queued").count();
         assert_eq!(queued, 1, "busy queue should push a queued frame");
         assert_eq!(
-            events.last().unwrap()["type"], "done",
+            events.last().unwrap()["type"],
+            "done",
             "done only after the queue drains"
         );
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
@@ -2702,6 +3249,7 @@ mod tests {
             Some(recorded2),
             None,
             false,
+            None,
         )
         .await;
 
@@ -2774,6 +3322,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -2825,6 +3374,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -2867,7 +3417,10 @@ mod tests {
                 .expect("closed");
             // 只数正文 chunk（thought 也是 assistant_chunk 类型）判定回合推进
             if ev["type"] == "assistant_chunk"
-                && !ev.get("thought").and_then(serde_json::Value::as_bool).unwrap_or(false)
+                && !ev
+                    .get("thought")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
             {
                 text_chunks += 1;
                 // 第 2、3 个正文 chunk 分别放行 second/third 的 PromptResponse
@@ -2897,6 +3450,134 @@ mod tests {
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
     }
 
+    /// cancel 路径 flush：回合缓冲的 assistant 文本/thought 在取消时仍正确落库。
+    /// `on_receiving_result`（PromptResponse 到达，含 cancelled）先 flush 已有缓冲
+    /// ——用户能看到的那部分回合过程可追溯，且思考/正文顺序不被颠倒（M11 补测）。
+    #[tokio::test]
+    async fn test_cancel_flushes_buffered_turn_segments() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1",
+            "proj",
+            "nas",
+            "host",
+            "/workspace",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
+            .await
+            .unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);
+        let (permit_tx, permit_rx) = mpsc::channel::<()>(16);
+        setup_handshake_with(
+            &bridge,
+            ws_tx.clone(),
+            serde_json::json!([]),
+            Arc::new(Mutex::new(Vec::new())),
+            Some(permit_rx),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await;
+
+        bridge
+            .prompt("sess-1", "hello")
+            .await
+            .expect("prompt should send");
+        // 消费 mock 的流式通知（assistant_chunk/tool_call/tool_result/thought/plan）
+        // ——tool_call/plan 边界已各自 flush 掉对应缓冲段，缓冲此时为空。
+        for _ in 0..5 {
+            tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
+                .await
+                .expect("timed out waiting for stream")
+                .expect("closed");
+        }
+
+        // 回合进行中（mock 在 permit 上等待）补入未到边界的缓冲段：模拟最后一个
+        // 工具之后的思考→正文尾部（无 tool_call/plan 触发边界 flush）。
+        {
+            let mut s = bridge.sessions.lock().await;
+            let agent = s.get_mut("sess-1").unwrap();
+            agent.turn_segments = vec![
+                TurnSegment {
+                    thought: true,
+                    content: "尾部思考".into(),
+                    parent_tool_call_id: None,
+                },
+                TurnSegment {
+                    thought: false,
+                    content: "尾部正文".into(),
+                    parent_tool_call_id: None,
+                },
+            ];
+        }
+
+        // 触发 cancel（真实路径：记代数 + 发 session/cancel + 兜底任务）
+        bridge.cancel("sess-1").await;
+        // 放行 PromptResponse（stop_reason=cancelled）→ 终态回调 flush 缓冲
+        permit_tx.send(()).await.unwrap();
+        wait_until(Duration::from_secs(2), async || {
+            !bridge.sessions.lock().await.get("sess-1").unwrap().busy
+        })
+        .await;
+
+        let rows = db.agent_list_messages("sess-1").await.unwrap();
+        // 缓冲段已按顺序落库：思考行先行、正文随后（rowid 顺序 = 对话顺序）
+        let tail: Vec<(bool, String)> = rows
+            .iter()
+            .filter(|r| r.kind == "message")
+            .map(|r| (r.name.as_deref() == Some("thought"), r.content.clone()))
+            .collect();
+        assert!(
+            tail.contains(&(true, "尾部思考".to_string())),
+            "cancel 后缓冲 thought 段应落库: {tail:?}"
+        );
+        assert!(
+            tail.contains(&(false, "尾部正文".to_string())),
+            "cancel 后缓冲正文段应落库: {tail:?}"
+        );
+        let thought_pos = tail
+            .iter()
+            .position(|(t, c)| *t && c == "尾部思考")
+            .unwrap();
+        let text_pos = tail
+            .iter()
+            .position(|(t, c)| !*t && c == "尾部正文")
+            .unwrap();
+        assert!(thought_pos < text_pos, "思考段必须先于正文段落库: {tail:?}");
+        // 缓冲已清空（flush 后 turn_segments 归零）
+        assert!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .turn_segments
+                .is_empty(),
+            "flush 后缓冲应清空"
+        );
+        // 被取消的回合不发生产者终态帧（stopped 已由 WS handler 回发）
+        let stale = tokio::time::timeout(Duration::from_millis(300), ws_rx.recv()).await;
+        assert!(
+            matches!(stale, Err(_) | Ok(None)),
+            "cancelled turn must not emit a terminal frame: {stale:?}"
+        );
+    }
+
     // ── ACP 会话上下文持久化：session/resume + session/delete ──
 
     /// 建 workspace w1 + session sess-1（`agent_set_acp_session_id` 落库需要
@@ -2905,17 +3586,7 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1",
-            "proj",
-            "nas",
-            "host",
-            "/ws",
-            None,
-            None,
-            "gemini",
-            None,
-            None,
-            None,
+            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None,
         )
         .await
         .unwrap();
@@ -2943,6 +3614,7 @@ mod tests {
             Some(recorded.clone()),
             Some("acp-persisted-1"),
             false,
+            None,
         )
         .await;
 
@@ -2973,7 +3645,11 @@ mod tests {
         );
         // DB 落库同 id（下次重拉继续 resume）
         assert_eq!(
-            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            db.agent_get_session("sess-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
             Some("acp-persisted-1".into())
         );
     }
@@ -2993,6 +3669,7 @@ mod tests {
             Some(recorded.clone()),
             None,
             false,
+            None,
         )
         .await;
 
@@ -3004,7 +3681,11 @@ mod tests {
         assert!(!methods.iter().any(|m| m == "session/resume"));
         // 新 id（mock 固定返回 acp-1）落库
         assert_eq!(
-            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            db.agent_get_session("sess-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
             Some("acp-1".into())
         );
     }
@@ -3025,6 +3706,7 @@ mod tests {
             Some(recorded.clone()),
             Some("acp-persisted-1"),
             true,
+            None,
         )
         .await;
 
@@ -3045,7 +3727,11 @@ mod tests {
         );
         // 回退后使用新 id（mock 固定返回 acp-1）落库
         assert_eq!(
-            db.agent_get_session("sess-1").await.unwrap().unwrap().acp_session_id,
+            db.agent_get_session("sess-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
             Some("acp-1".into())
         );
     }
@@ -3067,6 +3753,7 @@ mod tests {
             Some(recorded.clone()),
             None,
             false,
+            None,
         )
         .await;
 
@@ -3097,6 +3784,7 @@ mod tests {
             Some(recorded.clone()),
             None,
             false,
+            None,
         )
         .await;
 

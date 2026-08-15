@@ -6,6 +6,7 @@ import {
   collectSubagents,
   extractSubagentMeta,
   groupByParent,
+  mergePages,
   parseChunkKey,
   patchChildToolResult,
   subagentTypeMeta,
@@ -110,6 +111,83 @@ describe('groupByParent', () => {
       text('回复'),
     ];
     expect(groupByParent(flat)).toEqual(flat);
+  });
+});
+
+describe('mergePages', () => {
+  it('re-groups cross-page orphans into the parent card from the earlier page', () => {
+    // 分页边界：更早页含父 Task 卡，已加载页含其子项（父卡缺席 → 顶层孤儿平铺）。
+    // mergePages 把孤儿收进父卡 children，顶层只剩父卡 + 无归属项。
+    const older = [
+      { kind: 'user' as const, content: '早期问题' },
+      tool({ toolId: 'task1', toolName: 'Task', isSubagent: true, toolArgs: '{"description":"调研"}' }),
+    ];
+    const loaded = [
+      text('子代理文本', 'task1'),
+      tool({ toolId: 'c1', toolName: 'Read x', toolKind: 'read', parentToolId: 'task1', toolResult: 'ok' }),
+      { kind: 'assistant' as const, content: '主回复' },
+    ];
+    const { items, absorbedIndexes } = mergePages(older, loaded);
+    // 顶层 = user + 父卡 + 主回复（孤儿被收进父卡 children）
+    expect(items.map((it) => (it.kind === 'tool' ? it.toolId : it.content))).toEqual([
+      '早期问题',
+      'task1',
+      '主回复',
+    ]);
+    const parent = items[1] as ChatItem;
+    expect(parent.children!.map((c) => (c.kind === 'tool' ? c.toolId : c.content))).toEqual([
+      '子代理文本',
+      'c1',
+    ]);
+    // 被吸收孤儿在 loaded 中的下标（用于流式 ref 位移修正）
+    expect(absorbedIndexes).toEqual([0, 1]);
+  });
+
+  it('appends absorbed orphans after the parent children already in the earlier page', () => {
+    const older = [
+      tool({
+        toolId: 'task1',
+        toolName: 'Task',
+        isSubagent: true,
+        children: [tool({ toolId: 'c0', toolName: 'Read first', parentToolId: 'task1' })],
+      }),
+    ];
+    const loaded = [text('迟到的子文本', 'task1')];
+    const { items } = mergePages(older, loaded);
+    const parent = items[0] as ChatItem;
+    expect(parent.children!.map((c) => (c.kind === 'tool' ? c.toolId : c.content))).toEqual([
+      'c0',
+      '迟到的子文本',
+    ]);
+  });
+
+  it('matches nested parents inside the earlier page (recursive attach)', () => {
+    const older = [
+      tool({
+        toolId: 'task1',
+        toolName: 'Task',
+        isSubagent: true,
+        children: [tool({ toolId: 'task2', toolName: 'Task', isSubagent: true, parentToolId: 'task1' })],
+      }),
+    ];
+    const loaded = [text('最深层的文本', 'task2')];
+    const { items, absorbedIndexes } = mergePages(older, loaded);
+    const t1 = items[0] as ChatItem;
+    const t2 = t1.children![0] as ChatItem;
+    expect(t2.children!.map((c) => c.content)).toEqual(['最深层的文本']);
+    expect(absorbedIndexes).toEqual([0]);
+  });
+
+  it('is a no-op when the earlier page has no matching parents or no orphans', () => {
+    const older = [tool({ toolId: 'task1', toolName: 'Task', isSubagent: true })];
+    const loaded = [{ kind: 'assistant' as const, content: '正文' }];
+    const { items, absorbedIndexes } = mergePages(older, loaded);
+    expect(items).toEqual([...older, ...loaded]);
+    expect(absorbedIndexes).toEqual([]);
+    // 孤儿指向不存在的父卡（更早页无该 id）→ 保持平铺，不丢内容
+    const r2 = mergePages([{ kind: 'user' as const, content: 'hi' }], [text('孤儿', 'ghost')]);
+    expect(r2.items).toHaveLength(2);
+    expect(r2.absorbedIndexes).toEqual([]);
   });
 });
 

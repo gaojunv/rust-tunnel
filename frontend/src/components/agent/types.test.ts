@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAcpToolJson, parsePlanEntries } from './types';
+import { parseAcpToolJson, parsePlanEntries, parseToolResultContent } from './types';
 
 describe('parseAcpToolJson', () => {
   it('parses kind/diffs/locations from normalized tool_calls json', () => {
@@ -50,5 +50,38 @@ describe('parsePlanEntries', () => {
 
   it('returns [] on malformed json', () => {
     expect(parsePlanEntries('oops')).toEqual([]);
+  });
+});
+
+describe('parseToolResultContent', () => {
+  it('parses the new JSON contract: text + status + diffs + locations', () => {
+    const raw = JSON.stringify({
+      text: 'ok',
+      status: 'failed',
+      diffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      locations: [{ path: 'a.ts', line: 3 }],
+    });
+    expect(parseToolResultContent(raw)).toEqual({
+      text: 'ok',
+      status: 'failed',
+      diffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+      locations: [{ path: 'a.ts', line: 3 }],
+    });
+  });
+
+  it('maps known statuses and ignores unknown ones', () => {
+    expect(parseToolResultContent(JSON.stringify({ text: 'a', status: 'completed' })).status).toBe('completed');
+    expect(parseToolResultContent(JSON.stringify({ text: 'b', status: 'running' })).status).toBe('running');
+    expect(parseToolResultContent(JSON.stringify({ text: 'c', status: 'weird' })).status).toBeUndefined();
+  });
+
+  it('falls back to plain text for legacy rows (non-JSON or non-conforming JSON)', () => {
+    expect(parseToolResultContent('fn main(){}')).toEqual({ text: 'fn main(){}' });
+    expect(parseToolResultContent('')).toEqual({ text: '' });
+    expect(parseToolResultContent('not json{{{')).toEqual({ text: 'not json{{{' });
+    // JSON 但 text 非 string（数组/标量/缺字段）→ 不认新契约，按纯文本原样返回
+    expect(parseToolResultContent('[1,2]')).toEqual({ text: '[1,2]' });
+    expect(parseToolResultContent('{"status":"failed"}')).toEqual({ text: '{"status":"failed"}' });
+    expect(parseToolResultContent('{"text":123}')).toEqual({ text: '{"text":123}' });
   });
 });

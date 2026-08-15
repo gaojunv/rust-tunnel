@@ -1,6 +1,6 @@
 import type { AgentMessage } from '../../types';
 import type { ChatItem, ToolDiff, ToolKind, ToolLocation } from './types';
-import { parseAcpToolJson, parsePlanEntries } from './types';
+import { parseAcpToolJson, parsePlanEntries, parseToolResultContent } from './types';
 import { groupByParent } from './subagent';
 
 interface CallRecord {
@@ -156,17 +156,22 @@ export function historyToChatItemsWithSkip(
       // tool_call_id 为空的旧数据无 id 可去重，原样渲染。
       if (m.tool_call_id && resultById.get(m.tool_call_id) !== m) continue;
       const call = m.tool_call_id ? callArgs.get(m.tool_call_id) : undefined;
+      // 服务端新契约：content 可能为 JSON `{text, status, diffs, locations}`
+      // （存量旧行仍是纯文本，向后兼容）。text 作卡片结果、status 作终态
+      // （修复「历史上失败工具恒显 ✓」——failed 显失败态）、diffs/locations
+      // 合并进卡片（修复「仅 ToolCallUpdate 携带的 diff 刷新后丢失」）。
+      const parsed = parseToolResultContent(m.content);
       loaded.push({
         kind: 'tool',
         content: '',
         toolName: call?.name ?? m.name ?? '',
         toolId: m.tool_call_id ?? undefined,
         toolArgs: call?.args ?? '',
-        toolResult: m.content,
-        toolStatus: 'completed',
+        toolResult: parsed.text,
+        toolStatus: parsed.status ?? 'completed',
         toolKind: call?.toolKind,
-        toolDiffs: call?.toolDiffs,
-        toolLocations: call?.toolLocations,
+        toolDiffs: call?.toolDiffs ?? parsed.diffs,
+        toolLocations: call?.toolLocations ?? parsed.locations,
         parentToolId: call?.parentToolId ?? m.parent_tool_call_id ?? undefined,
       });
     } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {

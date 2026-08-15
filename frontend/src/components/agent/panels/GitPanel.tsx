@@ -18,6 +18,7 @@ import {
   type GitEntry,
   type GitStatusKind,
 } from './git/gitUtils';
+import { parseToolResultContent } from '../types';
 
 // 向后兼容导出（gitUtils.ts 内为唯一实现，GitPanel 仅转发，供既有测试/调用方使用）
 export type { GitEntry, GitStatusKind };
@@ -48,7 +49,8 @@ function latestGitStatus(messages: AgentMessage[]): string | null {
   let latest: string | null = null;
   for (const m of messages ?? []) {
     if (m.kind === 'tool_result' && m.name === 'git_status') {
-      latest = m.content;
+      // 服务端新契约：tool_result content 可能是 JSON {text,...}（存量旧行为纯文本）
+      latest = parseToolResultContent(m.content).text;
     } else if ((m.kind === 'tool' || m.role === 'tool') && m.tool_calls) {
       // 旧格式兼容
       try {

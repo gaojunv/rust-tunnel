@@ -26,6 +26,7 @@ import {
   closeTab,
   type TabState,
 } from '../components/agent/tabsStore';
+import { safeLocalStorageGet, safeLocalStorageSet } from '../components/agent/safeStorage';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 import { useAgentNotifications } from '../notifications/NotificationProvider';
 
@@ -37,7 +38,7 @@ export default function AgentPage() {
   // 桌面/移动端分支：ActivityBar 在 <768px 下切到底部图标栏 + Sheet 面板
   const isDesktop = useMediaQuery('(min-width: 768px)');
   const [workspaceId, setWorkspaceId] = useState(
-    () => localStorage.getItem('agent.lastWorkspaceId') ?? '',
+    () => safeLocalStorageGet('agent.lastWorkspaceId') ?? '',
   );
   // 多会话标签页：按 workspace 分桶的 tab 状态（open 有序 + active）；无持久化 = 空态
   const [tabsByWs, setTabsByWs] = useState<Record<string, TabState>>({});
@@ -88,10 +89,17 @@ export default function AgentPage() {
     });
   };
 
-  // 只有一个 workspace 时自动选中
+  // 工作区选中：空态下只有一个 workspace 时自动选中；从 localStorage 恢复的
+  // workspaceId 若已不在列表中（被删除/失效），回退到第一个可用工作区，而不是
+  // 卡在失效 id（M7）——否则 sessions query 恒为空、顶栏显示无效工作区。
   useEffect(() => {
-    if (!workspaceId && workspaces?.length === 1) {
-      setWorkspaceId(workspaces[0].id);
+    if (!workspaces) return;
+    if (!workspaceId) {
+      if (workspaces.length === 1) setWorkspaceId(workspaces[0].id);
+      return;
+    }
+    if (!workspaces.some((w) => w.id === workspaceId)) {
+      setWorkspaceId(workspaces[0]?.id ?? '');
     }
   }, [workspaces, workspaceId]);
 
@@ -143,7 +151,7 @@ export default function AgentPage() {
 
   // 刷新恢复：写入最近工作区（工作区记忆）+ 各工作区的 tab 状态（仅初始化后）
   useEffect(() => {
-    if (workspaceId) localStorage.setItem('agent.lastWorkspaceId', workspaceId);
+    if (workspaceId) safeLocalStorageSet('agent.lastWorkspaceId', workspaceId);
     if (workspaceId && initedWsRef.current[workspaceId]) {
       saveTabs(workspaceId, tabs);
     }

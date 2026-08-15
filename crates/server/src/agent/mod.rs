@@ -4,18 +4,19 @@ pub mod acp_bridge;
 pub mod acp_events;
 pub mod approval;
 pub mod compact;
-#[cfg(feature = "rag")]
-pub mod memory;
 pub mod executor;
 pub mod git_plan;
 pub mod github;
 pub mod llm_bridge;
+#[cfg(feature = "rag")]
+pub mod memory;
 pub mod notify;
 pub mod runner;
 pub mod session;
 pub mod spawner;
 pub mod sse;
 pub mod title;
+pub mod tool_result;
 pub mod tools;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -210,16 +211,14 @@ impl AgentState {
             // 只有 acp_bridge=None，request_elicitation 不依赖它）。AskUserQuestion
             // 表单经 `elicitation_request` 帧推前端，用户响应经 `elicitation_response`
             // 回传（WS 外层循环分发）。
-            .with_elicitation(Arc::new(
-                move |session_id, message, schema, ws_tx| {
-                    let agent = elicitation_agent.clone();
-                    Box::pin(async move {
-                        agent
-                            .request_elicitation(&session_id, &message, &schema, &ws_tx)
-                            .await
-                    })
-                },
-            ));
+            .with_elicitation(Arc::new(move |session_id, message, schema, ws_tx| {
+                let agent = elicitation_agent.clone();
+                Box::pin(async move {
+                    agent
+                        .request_elicitation(&session_id, &message, &schema, &ws_tx)
+                        .await
+                })
+            }));
         state.acp_bridge = Some(bridge);
         state
     }
@@ -648,7 +647,10 @@ mod tests {
                     content.get("name"),
                     Some(&ElicitationContentValue::String("Alice".into()))
                 );
-                assert_eq!(content.get("age"), Some(&ElicitationContentValue::Integer(3)));
+                assert_eq!(
+                    content.get("age"),
+                    Some(&ElicitationContentValue::Integer(3))
+                );
                 assert_eq!(
                     content.get("tags"),
                     Some(&ElicitationContentValue::StringArray(vec![
@@ -665,7 +667,10 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_elicitation_decline_cancel() {
         // decline / cancel 分别唤醒为 Decline / Cancel。
-        for (action, expected) in [("decline", ElicitationResult::Decline), ("cancel", ElicitationResult::Cancel)] {
+        for (action, expected) in [
+            ("decline", ElicitationResult::Decline),
+            ("cancel", ElicitationResult::Cancel),
+        ] {
             let agent = test_agent().await;
             let (handle, frame) = spawn_pending_elicitation(&agent).await;
             let request_id = frame["request_id"].as_str().unwrap().to_string();
@@ -689,7 +694,11 @@ mod tests {
         agent
             .resolve_elicitation("s1", "no-such-id", "accept", None)
             .await;
-        assert_eq!(agent.pending_elicitations_count().await, 1, "pending must survive");
+        assert_eq!(
+            agent.pending_elicitations_count().await,
+            1,
+            "pending must survive"
+        );
         let request_id = frame["request_id"].as_str().unwrap().to_string();
         agent
             .resolve_elicitation("s1", &request_id, "cancel", None)
