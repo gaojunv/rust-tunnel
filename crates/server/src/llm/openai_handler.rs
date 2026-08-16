@@ -271,9 +271,20 @@ pub async fn handle_chat_completions(
 /// 如果响应中没有伪工具调用格式，原样返回。
 pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
     let (parts, body) = resp.into_parts();
-    let bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, super::upstream::MAX_UPSTREAM_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::from("failed to read response")),
+        Err(e) => {
+            // 超限必须返回 502，而非旧行为"透传原始状态码 + 空内容"——否则客户端
+            // 拿到 "200 + 空响应"的假象，整段生成结果静默丢失。对齐
+            // `format::convert_openai_to_anthropic_response` 的模式。
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from(format!(
+                    "failed to read upstream response (too large or read error): {e}"
+                )))
+                .unwrap();
+        }
     };
 
     let mut json: serde_json::Value = match serde_json::from_slice(&bytes) {
@@ -1187,6 +1198,29 @@ mod tests {
         assert_eq!(args["command"], "ls");
         // finish_reason 应为 tool_calls
         assert_eq!(v["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_pseudo_tool_calls_overflow_returns_502() {
+        // 构造超过 MAX_UPSTREAM_BODY_BYTES 的响应体：to_bytes 超限必须返回 502，
+        // 而非旧行为"200 + 空内容"的静默降级。
+        let big: Vec<u8> = vec![b'x'; crate::llm::upstream::MAX_UPSTREAM_BODY_BYTES + 1024];
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(big))
+            .unwrap();
+        let converted = rewrite_pseudo_tool_calls_in_response(resp).await;
+        assert_eq!(converted.status(), StatusCode::BAD_GATEWAY);
+        // 错误文案对齐 convert_openai_to_anthropic_response：纯文本、含超限说明
+        let bytes = axum::body::to_bytes(converted.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("failed to read upstream response"),
+            "错误文案不符: {text}"
+        );
     }
 
     #[tokio::test]

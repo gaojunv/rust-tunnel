@@ -38,6 +38,17 @@ static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("failed to build upstream HTTP client")
 });
 
+/// 非流式上游响应体的统一大小上限（16MB）。
+///
+/// 三个消费点共用：
+/// - `relay_upstream_body`：OpenAI/Anthropic 非流式直通的有界读取
+/// - `openai_handler::rewrite_pseudo_tool_calls_in_response`：compat 非流式改写
+/// - `format::convert_openai_to_anthropic_response`：Anthropic 非流式转换
+///
+/// 流式首事件守卫（`call_upstream_stream_guarded` 内的 `MAX_PREFIX_BYTES`，4MB）
+/// 是另一个概念，不在此统一范围。
+pub const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
+
 /// Strip potential secrets (API keys, tokens) from upstream error messages.
 fn sanitize_error_message(body: &str) -> String {
     // Truncate at a valid UTF-8 character boundary (max 500 chars).
@@ -293,15 +304,32 @@ async fn relay_upstream_stream(resp: reqwest::Response) -> Result<Response, (Sta
 }
 
 /// Relay a non-streaming upstream response body to the client.
+///
+/// 有界读取：`bytes_stream()` 循环累加，累计超过 [`MAX_UPSTREAM_BODY_BYTES`]
+/// 即返回 502，防止恶意/失控上游用无限 body 拖垮服务器内存。
 async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (StatusCode, String)> {
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to read upstream response: {}", e),
-        )
-    })?;
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read upstream response: {}", e),
+            )
+        })?;
+        body_bytes.extend_from_slice(&chunk);
+        if body_bytes.len() > MAX_UPSTREAM_BODY_BYTES {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Upstream response exceeded {} byte limit",
+                    MAX_UPSTREAM_BODY_BYTES
+                ),
+            ));
+        }
+    }
 
-    let body = Body::from(body_bytes.to_vec());
+    let body = Body::from(body_bytes);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
@@ -1612,5 +1640,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(err.1.contains("prefix") || err.1.contains("limit"));
+    }
+
+    #[tokio::test]
+    async fn test_relay_upstream_body_overflow_returns_502() {
+        // mock：200 后分块发送 >16MB 纯文本（无 Content-Length，靠 Connection: close 收尾）。
+        // 有界读取累计超限必须返回 502，而非 `resp.bytes().await` 无上限读入整段内存。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..20 {
+                if sock.write_all(&chunk).await.is_err() {
+                    break; // 客户端已断开（relay_upstream_body 返回 Err 后 drop）
+                }
+            }
+        });
+
+        // 用共享上游 client 拿一个真实 2xx 响应（非流式直通路径的入参）
+        let resp = UPSTREAM_CLIENT
+            .post(format!("http://{}/v1/chat/completions", addr))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        let err = relay_upstream_body(resp).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("exceeded"), "错误文案应含 exceeded: {}", err.1);
     }
 }

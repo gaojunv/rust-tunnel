@@ -477,10 +477,13 @@ pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
 /// 从 `anthropic_handler` 下沉（双协议入口共享的「回退路径」在成功时调用）。
 pub async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Response {
     let status = openai_resp.status();
-    // 上限与 compat 非流式改写路径一致（16MB）。超限时 to_bytes 返回 Err，
-    // 必须返回 502 而非静默丢弃 body 后透传原始状态码——否则客户端会拿到
-    // "200 + 空内容"的假象，整段生成结果丢失。
-    let body_bytes = match axum::body::to_bytes(openai_resp.into_body(), 16 * 1024 * 1024).await {
+    // 上限与 compat 非流式改写路径一致（`upstream::MAX_UPSTREAM_BODY_BYTES`，16MB）。
+    // 超限时 to_bytes 返回 Err，必须返回 502 而非静默丢弃 body 后透传原始状态码——
+    // 否则客户端会拿到 "200 + 空内容"的假象，整段生成结果丢失。
+    let body_bytes =
+        match axum::body::to_bytes(openai_resp.into_body(), super::upstream::MAX_UPSTREAM_BODY_BYTES)
+            .await
+        {
         Ok(b) => b,
         Err(e) => {
             return Response::builder()
