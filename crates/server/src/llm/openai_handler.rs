@@ -343,25 +343,17 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
 ///   ToolCall 事件 → 暂存
 ///   finish_reason / [DONE] → 先发暂存的 tool_calls chunk（最后一个带
 ///   finish_reason="tool_calls"），再发 usage chunk，最后 [DONE]。
-pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
+pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
+    use bytes::Bytes;
     use futures_util::StreamExt;
 
     let (parts, body) = resp.into_parts();
-    let mut stream = body.into_data_stream();
-
-    let mut scanner = super::compat::TagScanner::new();
-    let mut byte_buf: Vec<u8> = Vec::new(); // 不完整的 SSE 行（字节，UTF-8 安全）
-    let mut model = String::new();
-    let mut id = String::new();
-    let mut pending_calls: Vec<serde_json::Value> = Vec::new();
-    let mut usage_chunk: Option<serde_json::Value> = None;
-    let mut saw_finish = false;
-    let mut saw_done = false;
-    let mut out = String::new();
+    let stream: futures_util::stream::BoxStream<'static, Result<Bytes, axum::Error>> =
+        body.into_data_stream().boxed();
 
     /// 把一段 delta.content 喂给 scanner，把事件序列化为输出 chunk。
     macro_rules! drain_events {
-        ($events:expr, $out:expr, $id:expr, $model:expr, $pending:expr) => {
+        ($events:expr, $queue:expr, $id:expr, $model:expr, $pending:expr) => {
             for e in $events {
                 match e {
                     super::compat::ScanEvent::Text(t) => {
@@ -372,7 +364,7 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                                     "delta": {"content": t},
                                     "finish_reason": null}]
                             });
-                            $out.push_str(&format!("data: {chunk}\n\n"));
+                            $queue.push_back(Bytes::from(format!("data: {chunk}\n\n")));
                         }
                     }
                     super::compat::ScanEvent::ToolCall(v) => $pending.push(v),
@@ -384,9 +376,9 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
 
     /// 发暂存的 tool_calls chunk（最后一个带 finish_reason）。
     macro_rules! flush_calls {
-        ($out:expr, $id:expr, $model:expr, $pending:expr) => {
+        ($queue:expr, $id:expr, $model:expr, $pending:expr) => {
             if !$pending.is_empty() {
-                let calls = std::mem::take(&mut $pending);
+                let calls = std::mem::take($pending);
                 let n = calls.len();
                 for (i, call) in calls.into_iter().enumerate() {
                     let is_last = i + 1 == n;
@@ -405,109 +397,185 @@ pub async fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                                 serde_json::Value::Null
                             }}]
                     });
-                    $out.push_str(&format!("data: {chunk}\n\n"));
+                    $queue.push_back(Bytes::from(format!("data: {chunk}\n\n")));
                 }
             }
         };
     }
 
-    'outer: while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
-        byte_buf.extend_from_slice(&bytes);
-        while let Some(pos) = byte_buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = byte_buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(
-                line_bytes
-                    .strip_suffix(b"\r\n")
-                    .or_else(|| line_bytes.strip_suffix(b"\n"))
-                    .unwrap_or(&line_bytes),
-            )
-            .into_owned();
-            let Some(payload) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let payload = payload.trim();
-            if payload.is_empty() {
-                continue;
+    /// unfold 状态机的内部状态：上游流 + 行缓冲 + 增量解析器 + 输出队列。
+    struct State {
+        stream: futures_util::stream::BoxStream<'static, Result<Bytes, axum::Error>>,
+        byte_buf: Vec<u8>,
+        scanner: Option<super::compat::TagScanner>,
+        id: String,
+        model: String,
+        pending_calls: Vec<serde_json::Value>,
+        usage_chunk: Option<serde_json::Value>,
+        saw_finish: bool,
+        saw_done: bool,
+        finished: bool,
+        queue: std::collections::VecDeque<Bytes>,
+    }
+
+    let state = State {
+        stream,
+        byte_buf: Vec::new(),
+        scanner: Some(super::compat::TagScanner::new()),
+        id: String::new(),
+        model: String::new(),
+        pending_calls: Vec::new(),
+        usage_chunk: None,
+        saw_finish: false,
+        saw_done: false,
+        finished: false,
+        queue: std::collections::VecDeque::new(),
+    };
+
+    // 逐 chunk 产出：每个 poll 先清空队列，再按需读一个上游 chunk 转换，
+    // 队列空且上游未结束时继续读——客户端无需等流结束即可收到增量文本。
+    let out = futures_util::stream::unfold(state, |mut st| async move {
+        loop {
+            // 1) 队列非空：优先产出已转换的 chunk。
+            if let Some(b) = st.queue.pop_front() {
+                return Some((b, st));
             }
-            if payload == "[DONE]" {
-                saw_done = true;
-                // byte_buf 中 [DONE] 之后仅剩尾随空行（`\n` / `\r\n`），安全丢弃。
-                break 'outer;
+            if st.finished {
+                return None;
             }
-            let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
-                continue;
-            };
-            if id.is_empty() {
-                id = chunk["id"].as_str().unwrap_or("").to_string();
-                model = chunk["model"].as_str().unwrap_or("").to_string();
-            }
-            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
-                usage_chunk = Some(chunk.clone());
-            }
-            if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                drain_events!(scanner.push(content), out, id, model, pending_calls);
-            }
-            // 上游原生 tool_calls（模型走了结构化路径）：原样透传
-            if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
-                out.push_str(&format!("data: {payload}\n\n"));
-                // 如果原生 tool_calls chunk 也携带 usage，清除 usage_chunk 防止重复
-                if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
-                    usage_chunk = None;
-                }
-                continue;
-            }
-            if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
-                if pending_calls.is_empty() {
-                    // 无伪工具调用：原样透传 finish chunk
-                    if !saw_finish {
-                        saw_finish = true;
-                        // 如果 finish chunk 已携带 usage，清除 usage_chunk 防止重复发出
-                        if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
-                            usage_chunk = None;
+
+            // 2) 从上游读一个 chunk，逐行解析填充队列。
+            let mut upstream_done = false;
+            match st.stream.next().await {
+                Some(Ok(bytes)) => {
+                    st.byte_buf.extend_from_slice(&bytes);
+                    while let Some(pos) = st.byte_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes: Vec<u8> = st.byte_buf.drain(..=pos).collect();
+                        let line = String::from_utf8_lossy(
+                            line_bytes
+                                .strip_suffix(b"\r\n")
+                                .or_else(|| line_bytes.strip_suffix(b"\n"))
+                                .unwrap_or(&line_bytes),
+                        )
+                        .into_owned();
+                        let Some(payload) = line.strip_prefix("data:") else {
+                            continue;
+                        };
+                        let payload = payload.trim();
+                        if payload.is_empty() {
+                            continue;
                         }
-                        out.push_str(&format!("data: {payload}\n\n"));
+                        if payload == "[DONE]" {
+                            st.saw_done = true;
+                            // byte_buf 中 [DONE] 之后仅剩尾随空行（`\n` / `\r\n`），安全丢弃。
+                            st.byte_buf.clear();
+                            upstream_done = true;
+                            break;
+                        }
+                        let Ok(chunk) = serde_json::from_str::<serde_json::Value>(payload) else {
+                            continue;
+                        };
+                        if st.id.is_empty() {
+                            st.id = chunk["id"].as_str().unwrap_or("").to_string();
+                            st.model = chunk["model"].as_str().unwrap_or("").to_string();
+                        }
+                        if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                            st.usage_chunk = Some(chunk.clone());
+                        }
+                        if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
+                            drain_events!(
+                                st.scanner
+                                    .as_mut()
+                                    .expect("scanner alive until upstream ends")
+                                    .push(content),
+                                st.queue,
+                                st.id,
+                                st.model,
+                                st.pending_calls
+                            );
+                        }
+                        // 上游原生 tool_calls（模型走了结构化路径）：原样透传
+                        if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
+                            st.queue.push_back(Bytes::from(format!("data: {payload}\n\n")));
+                            // 如果原生 tool_calls chunk 也携带 usage，清除 usage_chunk 防止重复
+                            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                                st.usage_chunk = None;
+                            }
+                            continue;
+                        }
+                        if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
+                            if st.pending_calls.is_empty() {
+                                // 无伪工具调用：原样透传 finish chunk
+                                if !st.saw_finish {
+                                    st.saw_finish = true;
+                                    // 如果 finish chunk 已携带 usage，清除 usage_chunk 防止重复发出
+                                    if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                                        st.usage_chunk = None;
+                                    }
+                                    st.queue
+                                        .push_back(Bytes::from(format!("data: {payload}\n\n")));
+                                }
+                            } else {
+                                // 有伪工具调用：finish 由 flush_calls 的 tool_calls 收尾承担
+                                st.saw_finish = true;
+                                let _ = reason;
+                            }
+                        }
+                        // 非 content/non-tool_calls/finish_reason 的 chunk（如 delta: {"role":"assistant"}）
+                        // 原样透传。排除仅 usage 的 chunk（由收尾分支统一发出）。
+                        if chunk["choices"][0]["delta"]["content"].as_str().is_none()
+                            && !chunk["choices"][0]["delta"]["tool_calls"].is_array()
+                            && chunk["choices"][0]["finish_reason"].as_str().is_none()
+                            && !chunk.get("usage").map(|u| u.is_object()).unwrap_or(false)
+                        {
+                            st.queue.push_back(Bytes::from(format!("data: {payload}\n\n")));
+                        }
                     }
-                } else {
-                    // 有伪工具调用：finish 由 flush_calls 的 tool_calls 收尾承担
-                    saw_finish = true;
-                    let _ = reason;
                 }
+                Some(Err(_)) | None => upstream_done = true,
             }
-            // 非 content/non-tool_calls/finish_reason 的 chunk（如 delta: {"role":"assistant"}）
-            // 原样透传。排除仅 usage 的 chunk（由 saw_done 分支在收尾发出）。
-            if chunk["choices"][0]["delta"]["content"].as_str().is_none()
-                && !chunk["choices"][0]["delta"]["tool_calls"].is_array()
-                && chunk["choices"][0]["finish_reason"].as_str().is_none()
-                && !chunk.get("usage").map(|u| u.is_object()).unwrap_or(false)
-            {
-                out.push_str(&format!("data: {payload}\n\n"));
-            }
-        }
-    }
 
-    // 清算 scanner（未闭合标签剥离）→ 冲刷 tool_calls → usage → [DONE]
-    drain_events!(scanner.finish(), out, id, model, pending_calls);
-    flush_calls!(out, id, model, pending_calls);
-    if saw_done {
-        // [DONE] 行已在流中：usage 从上游 copy 是完整的，直接转发。
-        if let Some(u) = usage_chunk.take() {
-            out.push_str(&format!("data: {u}\n\n"));
-        }
-        out.push_str("data: [DONE]\n\n");
-    } else {
-        // 上游断流未发 [DONE]：补发 usage + [DONE]。
-        if !saw_finish {
-            if let Some(u) = usage_chunk.take() {
-                out.push_str(&format!("data: {u}\n\n"));
+            // 3) 上游断流/[DONE]：清算 scanner（未闭合标签剥离）→ 冲刷 tool_calls →
+            //    usage → [DONE]，全部进队列后由下一轮循环产出。
+            if upstream_done {
+                // take 后 scanner 移出状态，finish() 消耗局部变量不再有 borrow 冲突
+                if let Some(scanner) = st.scanner.take() {
+                    drain_events!(
+                        scanner.finish(),
+                        st.queue,
+                        st.id,
+                        st.model,
+                        st.pending_calls
+                    );
+                }
+                flush_calls!(st.queue, st.id, st.model, &mut st.pending_calls);
+                if st.saw_done {
+                    // [DONE] 行已在流中：usage 从上游 copy 是完整的，直接转发。
+                    if let Some(u) = st.usage_chunk.take() {
+                        st.queue.push_back(Bytes::from(format!("data: {u}\n\n")));
+                    }
+                    st.queue.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
+                } else {
+                    // 上游断流未发 [DONE]：补发 usage + [DONE]。
+                    if !st.saw_finish {
+                        if let Some(u) = st.usage_chunk.take() {
+                            st.queue.push_back(Bytes::from(format!("data: {u}\n\n")));
+                        }
+                    }
+                    let ends_done = st.queue.back().is_some_and(|b: &Bytes| {
+                        std::str::from_utf8(b).is_ok_and(|s| s.ends_with("data: [DONE]\n\n"))
+                    });
+                    if !ends_done {
+                        st.queue.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
+                    }
+                }
+                st.finished = true;
             }
         }
-        if !out.ends_with("data: [DONE]\n\n") {
-            out.push_str("data: [DONE]\n\n");
-        }
-    }
+    })
+    .map(Ok::<_, std::io::Error>);
 
-    Response::from_parts(parts, Body::from(out.into_bytes()))
+    Response::from_parts(parts, Body::from_stream(out))
 }
 
 #[cfg(test)]
@@ -1236,7 +1304,7 @@ mod tests {
             .body(Body::from(sse_data))
             .unwrap();
 
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1270,7 +1338,7 @@ mod tests {
             .body(Body::from(sse_data))
             .unwrap();
 
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1293,7 +1361,7 @@ mod tests {
             .body(Body::from(sse_data))
             .unwrap();
 
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1320,7 +1388,7 @@ mod tests {
             .body(Body::from(sse_data))
             .unwrap();
 
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1372,7 +1440,7 @@ mod tests {
             .header("Content-Type", "text/event-stream")
             .body(Body::from(sse_data))
             .unwrap();
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1408,7 +1476,7 @@ mod tests {
             .header("Content-Type", "text/event-stream")
             .body(Body::from(sse_data))
             .unwrap();
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1438,7 +1506,7 @@ mod tests {
             .status(StatusCode::OK)
             .body(Body::from(sse_data))
             .unwrap();
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1458,7 +1526,7 @@ mod tests {
             .status(StatusCode::OK)
             .body(Body::from(sse_data))
             .unwrap();
-        let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1493,7 +1561,7 @@ mod tests {
                 .header("Content-Type", "text/event-stream")
                 .body(body)
                 .unwrap();
-            let converted = rewrite_pseudo_tool_calls_in_stream(resp).await;
+            let converted = rewrite_pseudo_tool_calls_in_stream(resp);
             let out = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
                 .await
                 .unwrap();
@@ -1508,6 +1576,55 @@ mod tests {
                 "split at byte {i} lost content: {text}"
             );
         }
+    }
+
+    /// v2 增量流式真正流式化：上游未发 [DONE] 时，客户端消费第一个输出 chunk
+    /// 即应收到已解析的文本。旧实现全量缓冲（out: String），流结束后才一次性
+    /// 返回，客户端完全失去增量；此测试用"只发首 chunk、先不结束上游"验证即时性。
+    #[tokio::test]
+    async fn test_stream_rewrite_is_incremental() {
+        use futures_util::StreamExt;
+        use tokio::sync::mpsc;
+
+        // 构造"永不发完"的上游流：首 chunk 含文本，[DONE] 由测试主动补发。
+        let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
+        let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/event-stream")
+            .body(body)
+            .unwrap();
+
+        // 只发第一个 chunk（含即时文本），先不发 [DONE]
+        tx.send(Ok(bytes::Bytes::copy_from_slice(
+            "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"即时文本\"},\"finish_reason\":null}]}\n\n"
+                .as_bytes(),
+        )))
+        .await
+        .unwrap();
+
+        let converted = rewrite_pseudo_tool_calls_in_stream(resp);
+        let mut out = converted.into_body().into_data_stream();
+        // 读取第一个输出 chunk：此时上游流仍打开，应已收到文本 → 真流式证明
+        let first = out.next().await.expect("首 chunk 应有输出").unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        assert!(
+            text.contains("即时文本"),
+            "上游未结束时首 chunk 应含文本（真流式）: {text}"
+        );
+
+        // 补发 [DONE] 并关闭上游，流应正常结束
+        tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        while let Some(item) = out.next().await {
+            rest.push_str(&String::from_utf8(item.unwrap().to_vec()).unwrap());
+        }
+        assert!(rest.contains("[DONE]"), "流应正常收尾: {rest}");
     }
 
     /// v2 非流式：新标签格式还原结构化 tool_calls。

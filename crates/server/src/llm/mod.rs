@@ -357,6 +357,45 @@ impl LlmState {
     }
 }
 
+/// LLM 请求日志中单个字符串字段的截断上限（字符）。
+///
+/// 完整对话正文（可能含用户 secrets）原样落盘是安全风险；日志保留结构
+/// （role/name/tools 等）与正文前段，超长文本省略并标注截断字符数。
+const MAX_LOG_STRING_CHARS: usize = 4000;
+
+/// 脱敏请求体用于日志：递归截断超长字符串字段，避免完整用户内容（含可能的
+/// secrets）原样落盘。结构保留，只对超长文本做省略。修改不影响内存中的原始
+/// 请求体（clone 后处理）。
+pub fn sanitize_request_body(body: &serde_json::Value) -> serde_json::Value {
+    fn truncate(s: &mut String) {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= MAX_LOG_STRING_CHARS {
+            return;
+        }
+        let head: String = chars.iter().take(MAX_LOG_STRING_CHARS).collect();
+        *s = format!("{head}…[truncated {} chars]", chars.len() - MAX_LOG_STRING_CHARS);
+    }
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => truncate(s),
+            serde_json::Value::Array(items) => {
+                for item in items.iter_mut() {
+                    walk(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for val in map.values_mut() {
+                    walk(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = body.clone();
+    walk(&mut out);
+    out
+}
+
 /// 记录 LLM 请求日志（受 dynamic_config.llm_request_logging 开关控制）。
 ///
 /// 在 LLM 网关入口调用（compat/RAG 改写后、上游调用前后）。
@@ -391,7 +430,7 @@ pub async fn log_llm_request(
         status = %status.map_or(0, i64::from),
         error = %error.unwrap_or(""),
         elapsed_ms = %elapsed_ms,
-        request_body = %request_body,
+        request_body = %sanitize_request_body(request_body),
         "LLM request"
     );
 }
@@ -449,6 +488,53 @@ mod tests {
             &body,
         )
         .await;
+    }
+
+    #[test]
+    fn test_sanitize_request_body_truncates_long_strings() {
+        let long = "x".repeat(10_000);
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": long},
+                {"role": "assistant", "content": "短文本"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "Bash", "description": "run"}}],
+            "max_tokens": 100,
+            "nested": {"arr": ["a".repeat(5000), 42, null]}
+        });
+        let out = sanitize_request_body(&body);
+
+        // 超长字符串被截断且带省略标记
+        let c0 = out["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            c0.ends_with("[truncated 6000 chars]"),
+            "应有截断标记: {c0:?}"
+        );
+        assert!(c0.contains('…'), "应含省略号: {c0:?}");
+        assert!(c0.starts_with(&"x".repeat(MAX_LOG_STRING_CHARS)));
+        // 短字符串原样保留
+        assert_eq!(out["messages"][1]["content"], "短文本");
+        // 非字符串字段不变
+        assert_eq!(out["max_tokens"], 100);
+        assert_eq!(out["tools"][0]["function"]["name"], "Bash");
+        // 嵌套数组/对象也递归截断
+        assert!(out["nested"]["arr"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("[truncated 1000 chars]"));
+        // 原始 body 不受影响
+        assert_eq!(body["messages"][0]["content"].as_str().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn test_sanitize_request_body_leaves_small_body_intact() {
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        assert_eq!(sanitize_request_body(&body), body);
     }
 
     #[tokio::test]

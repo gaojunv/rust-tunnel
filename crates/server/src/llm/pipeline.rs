@@ -235,13 +235,15 @@ pub async fn run_execution(
                 Some(200),
                 None,
                 elapsed_ms,
-                &req_body,
+                // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
+                &serde_json::Value::Null,
             )
             .await;
             // compat 模式：先解析伪工具调用还原为结构化 tool_calls，再做协议后处理。
             let resp = if compat_enabled {
                 if request.stream {
-                    super::openai_handler::rewrite_pseudo_tool_calls_in_stream(resp).await
+                    // 真流式：返回 Body::from_stream，客户端即时收到增量文本
+                    super::openai_handler::rewrite_pseudo_tool_calls_in_stream(resp)
                 } else {
                     super::openai_handler::rewrite_pseudo_tool_calls_in_response(resp).await
                 }
@@ -275,7 +277,8 @@ pub async fn run_execution(
                 Some(status.as_u16()),
                 Some(&msg),
                 elapsed_ms,
-                &req_body,
+                // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
+                &serde_json::Value::Null,
             )
             .await;
             // 记录失败请求到用量日志，确保请求明细中可见

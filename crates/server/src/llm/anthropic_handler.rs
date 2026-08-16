@@ -443,7 +443,8 @@ pub async fn handle_messages(
                         Some(200),
                         None,
                         elapsed_ms,
-                        &body,
+                        // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
+                        &serde_json::Value::Null,
                     )
                     .await;
                     super::usage::wrap_and_record(resp, ctx, db, started).await
@@ -460,7 +461,8 @@ pub async fn handle_messages(
                         Some(status.as_u16()),
                         Some(&msg),
                         elapsed_ms,
-                        &body,
+                        // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
+                        &serde_json::Value::Null,
                     )
                     .await;
                     if let Some(ref db) = db {
