@@ -12,11 +12,14 @@ import { Button } from '@/components/ui/button';
 import { Settings } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import SharedEmbeddingSettings from '@/components/knowledge/SharedEmbeddingSettings';
+import MemorySettings from '@/components/agent/memory/MemorySettings';
+import SkillSettings from '@/components/knowledge/SkillSettings';
 import KbSection from '@/components/knowledge/KbSection';
 import MemorySection from '@/components/knowledge/MemorySection';
 import SkillSection from '@/components/knowledge/SkillSection';
 
-/** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出共享 Embedding 配置。 */
+/** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出统一设置弹窗
+ *  （共享 Embedding / 记忆设置 / 技能设置 三个子 Tab）。 */
 export default function KnowledgePage() {
   const { t } = useTranslation();
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -33,7 +36,7 @@ export default function KnowledgePage() {
           </TabsList>
           <Button variant="outline" size="sm" onClick={() => setSettingsOpen(true)}>
             <Settings className="mr-1 h-4 w-4" />
-            {t('knowledge.sharedEmbeddingTitle')}
+            {t('nav.settings')}
           </Button>
         </div>
         <TabsContent value="kb" className="mt-4">
@@ -48,12 +51,27 @@ export default function KnowledgePage() {
       </Tabs>
 
       <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
-        <DialogContent className="max-h-[90vh] overflow-y-auto">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>{t('knowledge.sharedEmbeddingTitle')}</DialogTitle>
-            <DialogDescription>{t('knowledge.sharedEmbeddingDesc')}</DialogDescription>
+            <DialogTitle>{t('nav.settings')}</DialogTitle>
+            <DialogDescription>{t('knowledge.settingsDesc')}</DialogDescription>
           </DialogHeader>
-          <SharedEmbeddingSettings />
+          <Tabs defaultValue="embedding">
+            <TabsList>
+              <TabsTrigger value="embedding">{t('knowledge.sharedEmbeddingTitle')}</TabsTrigger>
+              <TabsTrigger value="memory">{t('nav.memory')}</TabsTrigger>
+              <TabsTrigger value="skill">{t('nav.skill')}</TabsTrigger>
+            </TabsList>
+            <TabsContent value="embedding" className="mt-4">
+              <SharedEmbeddingSettings />
+            </TabsContent>
+            <TabsContent value="memory" className="mt-4">
+              <MemorySettings />
+            </TabsContent>
+            <TabsContent value="skill" className="mt-4">
+              <SkillSettings />
+            </TabsContent>
+          </Tabs>
         </DialogContent>
       </Dialog>
     </div>
