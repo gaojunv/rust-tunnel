@@ -68,6 +68,15 @@ const EARLIER_PAGE_SIZE = 200;
 const HEARTBEAT_TIMEOUT_MS = 75_000;
 /** 看门狗扫描周期：远小于心跳超时，保证假死判定延迟在可接受范围。 */
 const WATCHDOG_INTERVAL_MS = 30_000;
+/** live WS 帧创建消息的稳定 id 计数器：history 行用服务端 rowid（AgentMessage.id），
+ *  live 创建的流式气泡/user/system/plan 消息在创建时分配 `live-N` 唯一 id（React key
+ *  用）。模块级计数跨组件挂载/多标签页递增，与 DB rowid（数字串）格式不冲突。
+ *  stream_reset 移除半截流式气泡后其余项 key 不漂移。 */
+let liveItemSeq = 0;
+function nextLiveItemId(): string {
+  liveItemSeq += 1;
+  return `live-${liveItemSeq}`;
+}
 
 /** 历史查询数据归一化：兼容 `{ messages, has_more }`（新 API）与裸数组
  * （旧缓存 / 测试替身）。取消息行数组。 */
@@ -246,7 +255,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   // 才判定超时——提示并强制解除 running（同时把 pending 审批置过期）。
   const fireRunningTimeout = useCallback(() => {
     timeoutRef.current = null;
-    setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout') }]);
+    setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.responseTimeout'), id: nextLiveItemId() }]);
     expirePendingInteractions();
     // 回合按终态处理：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17）
     planSeenThisTurnRef.current = false;
@@ -492,7 +501,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             );
           } else {
             streamingIdxRef.current = next.length;
-            next = [...next, { kind, content }];
+            next = [...next, { id: nextLiveItemId(), kind, content }];
           }
           continue;
         }
@@ -504,7 +513,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         } else {
           // 父卡缺失（时序异常）：文本平铺进主流（带 parentToolId 标记）。父卡随后
           // 到达时经父卡创建的「孤儿收纳」移入 children；永不出现则保持平铺，内容不丢。
-          next = [...next, { kind, content, parentToolId: parent }];
+          next = [...next, { id: nextLiveItemId(), kind, content, parentToolId: parent }];
         }
       }
       return next;
@@ -812,7 +821,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // plan 帧时第二个仍读到 false，会误建第二个气泡）。
         if (!planSeenThisTurnRef.current) {
           planSeenThisTurnRef.current = true;
-          setItems((prev) => [...prev, { kind: 'plan', content: '', planEntries: entries }]);
+          setItems((prev) => [...prev, { kind: 'plan', content: '', planEntries: entries, id: nextLiveItemId() }]);
           return;
         }
         // 回合内后续 plan（ACP plan 全量替换语义）：就地更新最后一条；无则追加
@@ -824,7 +833,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               return next;
             }
           }
-          return [...prev, { kind: 'plan', content: '', planEntries: entries }];
+          return [...prev, { kind: 'plan', content: '', planEntries: entries, id: nextLiveItemId() }];
         });
       } else if (msg.type === 'usage') {
         // MVP：仅实时推送不落库不渲染（保留帧类型兼容，静默忽略）
@@ -833,11 +842,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         // 不进气泡流 → 冲掉缓冲后断开流式气泡再追加独立行
         flushChunks();
         breakStream();
-        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: msg.message ?? '' }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: msg.message ?? '', id: nextLiveItemId() }]);
       } else if (msg.type === 'queued') {
         // 运行中提交消息 → 服务端 busy 入队确认：轻量提示（不打断当前流式气泡）。
         // 队列在服务端（前端不做本地排队），本连接后续会收到该消息对应的流式帧。
-        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: tRef.current('agent.messageQueued') }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'info', content: tRef.current('agent.messageQueued'), id: nextLiveItemId() }]);
       } else if (msg.type === 'stopped') {
         // 服务端确认取消（本连接或另一标签页发起的 cancel 都会广播到本连接的处理逻辑）
         flushChunks();
@@ -855,7 +864,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         stopRunning();
         planSeenThisTurnRef.current = false;
         expirePendingInteractions();
-        setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.cancelFallback') }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'warning', content: tRef.current('agent.cancelFallback'), id: nextLiveItemId() }]);
       } else if (msg.type === 'done') {
         // 终态：解除 Running。若在飞的工具帧随断线丢失，等回齐会把 UI 锁死
         // 10 分钟——done 到达即无条件解除（工具卡片增量渲染，无需等回齐）。
@@ -944,7 +953,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         }
         flushChunks();
         breakStream();
-        setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: msg.message ?? '' }]);
+        setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: msg.message ?? '', id: nextLiveItemId() }]);
         stopRunning();
         // 回合以错误终态结束：plan 归属随回合终结（M17），未响应的审批/elicitation
         // 卡片一并置终态
@@ -963,7 +972,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         if (runningRef.current) {
           setItems((prev) => [
             ...prev,
-            { kind: 'system', systemTone: 'warning', content: tRef.current('agent.connectionInterrupted') },
+            { kind: 'system', systemTone: 'warning', content: tRef.current('agent.connectionInterrupted'), id: nextLiveItemId() },
           ]);
         }
         stopRunning();
@@ -1075,7 +1084,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const respondApproval = (id: string, approved: boolean, remember: boolean, optionId?: string) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
     // 防双击/连点：同一 request 只允许响应一次（M18）。二次点击帧不再发出，
@@ -1110,7 +1119,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   ) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
     // 防双击/连点：同一 request 只允许响应一次（M18）。
@@ -1189,16 +1198,16 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     // WebSocket may be CONNECTING/CLOSED/CLOSING: sending throws InvalidStateError and
     // the message is silently lost, leaving running stuck true. Gate on OPEN instead.
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
     try {
       ws.send(JSON.stringify({ type: 'user_message', content: text, refs }));
     } catch {
-      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') }]);
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
       return;
     }
-    setItems((prev) => [...prev, { kind: 'user', content: text }]);
+    setItems((prev) => [...prev, { kind: 'user', content: text, id: nextLiveItemId() }]);
     setInput('');
     setRefs([]);
     armRunning();
@@ -1221,7 +1230,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     stopRunning();
     // 本地停止路径同样作废未响应的审批/elicitation 卡片（cancel 帧可能因断线永远不回来）
     expirePendingInteractions();
-    setItems((prev) => [...prev, { kind: 'system', systemTone: 'stopped', content: t('agent.stopped') }]);
+    setItems((prev) => [...prev, { kind: 'system', systemTone: 'stopped', content: t('agent.stopped'), id: nextLiveItemId() }]);
   };
 
   const handleModelChange = (id: string) => {
@@ -1240,7 +1249,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         onModelChange(prev);
         setItems((prevItems) => [
           ...prevItems,
-          { kind: 'system', systemTone: 'error', content: `${t('agent.modelUpdateFailed')}: ${getApiErrorMessage(err)}` },
+          { kind: 'system', systemTone: 'error', content: `${t('agent.modelUpdateFailed')}: ${getApiErrorMessage(err)}`, id: nextLiveItemId() },
         ]);
       });
   };
@@ -1311,7 +1320,7 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
       }
       setItems((prevItems) => [
         ...prevItems,
-        { kind: 'system', systemTone: 'error', content: t('agent.connectionLost') },
+        { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() },
       ]);
     }
   };
@@ -1333,18 +1342,20 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     const isStreaming =
       streamingIdxRef.current === i && (it.kind === 'assistant' || it.kind === 'thought');
     if (it.kind === 'system') {
-      return <SystemMessage key={i} tone={it.systemTone} content={it.content} />;
+      // 稳定 key：stream_reset 移除流式气泡后其余项下标位移，index key 会让
+      // 后续气泡整体重挂载（丢内部展开态/触发 Shiki 重复高亮），改用 id。
+      return <SystemMessage key={it.id ?? i} tone={it.systemTone} content={it.content} />;
     }
     if (it.kind === 'approval') {
-      return <ApprovalCard key={it.approvalId ?? i} item={it} onRespond={respondApproval} />;
+      return <ApprovalCard key={it.approvalId ?? it.id ?? i} item={it} onRespond={respondApproval} />;
     }
     if (it.kind === 'elicitation') {
-      return <ElicitationCard key={it.elicitationId ?? i} item={it} onRespond={respondElicitation} />;
+      return <ElicitationCard key={it.elicitationId ?? it.id ?? i} item={it} onRespond={respondElicitation} />;
     }
     if (it.kind === 'tool' && (it.isSubagent || (it.children && it.children.length > 0))) {
       return (
         <SubagentTaskCard
-          key={it.toolId ?? i}
+          key={it.toolId ?? it.id ?? i}
           item={it}
           streamingChildIdx={it.toolId ? subStreamRef.current.get(it.toolId)?.idx : undefined}
           // 受控展开：与 subagent 固定面板联动（toolId 缺失时保持非受控内部态）
@@ -1355,7 +1366,9 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     }
     return (
       <MessageBubble
-        key={it.kind === 'tool' && it.toolId ? it.toolId : i}
+        // tool 卡保持 toolId 优先（live 卡与历史卡跨对账重载共用同一 key，展开态不丢）；
+        // 其余气泡用稳定 id（stream_reset 移除流式气泡后下标位移也不重挂载）。
+        key={it.kind === 'tool' && it.toolId ? it.toolId : (it.id ?? i)}
         item={it}
         streaming={isStreaming}
       />

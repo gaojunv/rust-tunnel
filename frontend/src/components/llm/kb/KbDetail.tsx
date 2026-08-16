@@ -36,6 +36,10 @@ const TEXT_MAX_BYTES = 2 * 1024 * 1024;
 const BINARY_MAX_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_EXTENSIONS = ['md', 'txt', 'pdf', 'docx', 'xlsx', 'pptx'];
 const TEXT_EXTENSIONS = ['md', 'txt'];
+/** 「正在处理」覆盖状态的过期 TTL：SSE 终态事件丢失（断线/丢帧）时，processing
+ *  override 会永久假卡。30s 后移除 override 并失效文档查询，让 UI 回退到服务端
+ *  DB 状态（真实 status），用户也可手动重试/刷新。 */
+const PROCESSING_TTL_MS = 30_000;
 
 function maxBytesFor(ext: string): number {
   return TEXT_EXTENSIONS.includes(ext) ? TEXT_MAX_BYTES : BINARY_MAX_BYTES;
@@ -140,19 +144,54 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
   const [editOpen, setEditOpen] = useState(false);
   const [overrides, setOverrides] = useState<Record<string, DocOverride>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // per-doc 的 processing 过期定时器（doc_id → timer）：SSE 终态事件丢失时解除
+  // 永久 processing 假卡（详见 PROCESSING_TTL_MS 注释）。
+  const overrideTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   // SSE 订阅：按 kb 过滤，即时更新文档状态并触发后台数据失效。
   useEffect(() => {
+    // 快照 ref 当前值供 cleanup 使用（ref 本身在 effect 生命周期内恒定）
+    const timers = overrideTimersRef.current;
     const unsub = kbStream.subscribe((ev) => {
       if (ev.kb_id !== kb.id) return;
       setOverrides((prev) => ({
         ...prev,
         [ev.doc_id]: { status: ev.status, chunk_count: ev.chunk_count, error: ev.error },
       }));
+      // processing 是过渡态：每收到新事件都重排/取消过期定时器。终态（ready/
+      // failed）清除定时器；processing 则安排 TTL——定时器触发时移除 override，
+      // 让 effectiveDocs 回退到 docs 查询（服务端 DB 真实状态）。
+      const prevTimer = timers.get(ev.doc_id);
+      if (prevTimer) {
+        clearTimeout(prevTimer);
+        timers.delete(ev.doc_id);
+      }
+      if (ev.status === 'processing') {
+        timers.set(
+          ev.doc_id,
+          setTimeout(() => {
+            timers.delete(ev.doc_id);
+            setOverrides((prev) => {
+              // 触发时若已被后续事件改为终态则不动（防御；正常路径下终态已清定时器）
+              if (!prev[ev.doc_id] || prev[ev.doc_id].status !== 'processing') return prev;
+              const next = { ...prev };
+              delete next[ev.doc_id];
+              return next;
+            });
+            // 失效文档查询：移除 override 后 UI 回退到服务端 DB 状态而非陈旧缓存
+            qc.invalidateQueries({ queryKey: ['llm-kb-docs', kb.id] });
+          }, PROCESSING_TTL_MS),
+        );
+      }
       qc.invalidateQueries({ queryKey: ['llm-kb-docs', kb.id] });
       qc.invalidateQueries({ queryKey: ['llm-kbs'] });
     });
-    return unsub;
+    return () => {
+      unsub();
+      // 卸载时清掉所有过期定时器，避免对已卸载组件 setState
+      timers.forEach((timer) => clearTimeout(timer));
+      timers.clear();
+    };
   }, [kb.id, qc]);
 
   const effectiveDocs: LlmKbDocument[] = (docs ?? []).map((d) => {

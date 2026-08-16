@@ -164,6 +164,7 @@ export function historyToChatItemsWithSkip(
       loaded.push({
         kind: 'tool',
         content: '',
+        id: m.id,
         toolName: call?.name ?? m.name ?? '',
         toolId: m.tool_call_id ?? undefined,
         toolArgs: call?.args ?? '',
@@ -194,6 +195,7 @@ export function historyToChatItemsWithSkip(
           loaded.push({
             kind: 'tool',
             content: '',
+            id: m.id,
             toolName: call.name,
             toolId: m.tool_call_id,
             toolArgs: call.args,
@@ -237,23 +239,25 @@ export function historyToChatItemsWithSkip(
       loaded.push({
         kind: 'thought',
         content: m.content,
+        id: m.id,
         parentToolId: m.parent_tool_call_id ?? undefined,
       });
     } else if (m.kind === 'message' && m.name === 'plan') {
       // 只保留最后一条 plan（ACP plan 全量替换语义）：先记录索引，循环后处理
       lastPlanIdx = loaded.length;
-      loaded.push({ kind: 'plan', content: '', planEntries: parsePlanEntries(m.content) });
+      loaded.push({ kind: 'plan', content: '', planEntries: parsePlanEntries(m.content), id: m.id });
     } else if (m.kind === 'message' && m.content) {
       // 子 agent 文本：仅 assistant 行带归属（user 消息永远主 agent 层）
       loaded.push({
         kind: m.role === 'user' ? 'user' : 'assistant',
         content: m.content,
+        id: m.id,
         parentToolId:
           m.role === 'user' ? undefined : (m.parent_tool_call_id ?? undefined),
       });
     } else if (m.kind === 'summary' && m.content) {
       // summary 渲染为 assistant 气泡（muted 样式），避免与普通用户消息混淆
-      loaded.push({ kind: 'assistant', content: m.content });
+      loaded.push({ kind: 'assistant', content: m.content, id: m.id });
     }
     // kind='tool_calls' 行本身不渲染（args 已合并进 tool_result 卡片）
   }

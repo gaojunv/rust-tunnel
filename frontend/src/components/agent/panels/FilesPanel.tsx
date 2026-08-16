@@ -136,13 +136,22 @@ function badgeLetter(status: string): string {
   return status === '??' ? 'U' : status;
 }
 
-/** 目录自身无状态，但存在子路径变更时按首个子项状态着色。 */
-function dirStatus(map: Map<string, string>, dirPath: string): string | null {
-  const prefix = `${dirPath}/`;
+/** 目录自身无状态，但存在子路径变更时按首个子项状态着色。
+ *  预聚合（O(dirs + git entries)，替代原 O(dirs × entries) 逐目录全量扫描）：
+ *  单次遍历 gitMap，把每个 git 条目的路径前缀逐级归入对应目录（`a/b/c.ts` →
+ *  目录 `a`、`a/b`），首个命中者优先——与旧 `dirStatus` 的「Map 迭代序首项」
+ *  语义一致。之后 TreeNode 对任意目录 O(1) 查表。 */
+function buildDirStatus(map: Map<string, string>): Map<string, string> {
+  const dirStatus = new Map<string, string>();
   for (const [path, status] of map) {
-    if (path.startsWith(prefix)) return status;
+    let slash = path.indexOf('/');
+    while (slash !== -1) {
+      const dir = path.slice(0, slash);
+      if (!dirStatus.has(dir)) dirStatus.set(dir, status);
+      slash = path.indexOf('/', slash + 1);
+    }
   }
-  return null;
+  return dirStatus;
 }
 
 // ── shiki 语言映射 ─────────────────────────────────────────────
@@ -234,19 +243,22 @@ function useIsDark(): boolean {
 
 interface NodeViewContextValue {
   gitMap: Map<string, string>;
+  /** 目录路径 → 该目录下首个 git 变更子项的状态（预聚合，O(1) 查表）。 */
+  dirStatus: Map<string, string>;
   onOpenFile: (path: string) => void;
 }
 
 const NodeViewContext = createContext<NodeViewContextValue>({
   gitMap: new Map(),
+  dirStatus: new Map(),
   onOpenFile: () => {},
 });
 
 function TreeNode({ node, style }: NodeRendererProps<FsNode>) {
-  const { gitMap, onOpenFile } = useContext(NodeViewContext);
+  const { gitMap, dirStatus, onOpenFile } = useContext(NodeViewContext);
   const isDir = node.data.isDir;
   const path = node.id;
-  const status = isDir ? dirStatus(gitMap, path) : (gitMap.get(path) ?? null);
+  const status = isDir ? (dirStatus.get(path) ?? null) : (gitMap.get(path) ?? null);
 
   return (
     <div
@@ -530,7 +542,10 @@ export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
     () => (gitQuery.data ? parsePorcelain(gitQuery.data.status) : new Map<string, string>()),
     [gitQuery.data]
   );
-  const contextValue = useMemo(() => ({ gitMap, onOpenFile: setSelectedPath }), [gitMap]);
+  const contextValue = useMemo(
+    () => ({ gitMap, dirStatus: buildDirStatus(gitMap), onOpenFile: setSelectedPath }),
+    [gitMap]
+  );
 
   const handleToggle = async (id: string) => {
     if (loadingRef.current.has(id)) return;

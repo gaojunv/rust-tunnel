@@ -4,6 +4,12 @@ import type { ApprovalOption, ElicitationRequestSchema } from '../../types';
 export interface ChatItem {
   kind: 'user' | 'assistant' | 'tool' | 'approval' | 'elicitation' | 'thought' | 'plan' | 'system';
   content: string;
+  /** 稳定身份，供 React key 使用（渲染时 `id ?? index`）：
+   *  history 装载的行用服务端 rowid（AgentMessage.id），live WS 帧创建的气泡
+   *  （流式 assistant/thought、user、system、plan 等）在创建时分配客户端自增 id。
+   *  流式追加/终态只改 content 不改 id；`stream_reset` 移除半截流式气泡后其余项
+   *  key 不漂移（index 位移会导致后续气泡重挂载，丢 ToolCard/ThoughtBubble 展开态）。 */
+  id?: string;
   /** kind='system'：提示行语气（状态/警告/错误/停止），缺省按 info 渲染 */
   systemTone?: 'info' | 'warning' | 'error' | 'stopped';
   toolName?: string;
