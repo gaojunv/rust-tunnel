@@ -208,7 +208,17 @@ impl AcpBridge {
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
                 "acp spawn stage: llm proxy ready (port {port})"
             );
-            // 2) spawn agent 进程（env 注入 LLM 代理地址）
+            // 2) spawn agent 进程（env 注入 LLM 代理地址）。解析有效模型引用注入
+            //    agent 进程（opencode 经 `OPENCODE_MODEL` 读取；claude-code 不用它，
+            //    仍走 ACP set_config_option）。解析失败不阻断 spawn——best-effort，
+            //    实际请求的 model 由 llm_bridge 每次按 session 从 DB 重新解析覆盖。
+            let spawn_model = crate::agent::session::resolve_effective_model(
+                &self.db,
+                None,
+                session_id,
+            )
+            .await
+            .ok();
             self.spawner
                 .spawn_agent(
                     &client_id,
@@ -218,6 +228,7 @@ impl AcpBridge {
                     port,
                     &workspace.root_path,
                     SPAWN_TIMEOUT,
+                    spawn_model.as_deref(),
                 )
                 .await?;
             tracing::info!(
