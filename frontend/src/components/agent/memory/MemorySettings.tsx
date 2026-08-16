@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -10,8 +9,8 @@ import { AlertTriangle, ChevronDown, Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 import { useClearMemory, useMemorySettings, useUpdateMemorySettings } from '@/api/hooks';
 
-/** 记忆体专属设置。embedding 全局配置已移至页面顶部的共享设置
- *  （SharedEmbeddingSettings），此处仅管理记忆体特有参数。 */
+/** 记忆体专属设置（裸分区，嵌入 KnowledgePage 统一设置弹窗的 Tab 中）。
+ *  embedding 全局配置在共享设置（SharedEmbeddingSettings）Tab，此处仅管理记忆体特有参数。 */
 export default function MemorySettings() {
   const { t } = useTranslation();
   const { data: settings, isLoading } = useMemorySettings();
@@ -81,10 +80,10 @@ export default function MemorySettings() {
   const busy = updateMutation.isPending || clearMutation.isPending;
 
   return (
-    <Card>
-      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+    <div className="space-y-4">
+      <div className="flex flex-row flex-wrap items-center justify-between gap-2">
         <div>
-          <CardTitle className="text-lg">{t('memory.settings.title')}</CardTitle>
+          <h3 className="text-base font-semibold">{t('memory.settings.title')}</h3>
           <p className="mt-1 text-sm text-muted-foreground">{t('memory.settings.enabledDesc')}</p>
         </div>
         <div className="flex items-center gap-2">
@@ -95,8 +94,8 @@ export default function MemorySettings() {
           />
           <span className="text-sm">{t('memory.settings.enabled')}</span>
         </div>
-      </CardHeader>
-      <CardContent className="space-y-4">
+      </div>
+      <div className="space-y-4">
         {isLoading ? (
           <div className="text-sm text-muted-foreground">{t('common.loading')}</div>
         ) : (
@@ -196,7 +195,7 @@ export default function MemorySettings() {
             </div>
           </>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

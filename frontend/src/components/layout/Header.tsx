@@ -79,9 +79,9 @@ const navGroups: NavGroup[] = [
   {
     labelKey: 'nav.ai',
     items: [
-      { labelKey: 'nav.llmGateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
-      { labelKey: 'nav.knowledge', icon: <BookOpen className="h-4 w-4" />, href: '/llm/knowledge' },
       { labelKey: 'nav.agentWorkbench', icon: <Sparkles className="h-4 w-4" />, href: '/agent' },
+      { labelKey: 'nav.knowledge', icon: <BookOpen className="h-4 w-4" />, href: '/llm/knowledge' },
+      { labelKey: 'nav.llmGateway', icon: <Bot className="h-4 w-4" />, href: '/llm' },
     ],
   },
   {

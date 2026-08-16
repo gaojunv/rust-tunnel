@@ -4,11 +4,11 @@ import { Card, CardContent } from '@/components/ui/card';
 import SkillList from '@/components/agent/skill/SkillList';
 import SkillDetail from '@/components/agent/skill/SkillDetail';
 import SkillDialog from '@/components/agent/skill/SkillDialog';
-import SkillSettings from '@/components/knowledge/SkillSettings';
 import { useSkills } from '@/api/hooks';
 import type { AgentSkill, SkillFilters } from '@/types';
 
-/** 技能库 Tab 内容（Skill 二期）。仿 MemorySection：设置卡 + 双栏 + 过滤状态。 */
+/** 技能库 Tab 内容（Skill 二期）。仿 MemorySection：双栏 + 过滤状态。
+ *  技能设置已收进页面右上角统一设置弹窗（KnowledgePage）。 */
 export default function SkillSection() {
   const { t } = useTranslation();
   const [filters, setFilters] = useState<SkillFilters>({
@@ -40,7 +40,6 @@ export default function SkillSection() {
 
   return (
     <div className="space-y-6">
-      <SkillSettings />
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         {/* 移动端选中技能后隐藏列表，仅桌面保持左侧栏 */}
         <div className={selectedSkill ? 'hidden lg:block lg:w-80 lg:shrink-0' : 'lg:w-80 lg:shrink-0'}>

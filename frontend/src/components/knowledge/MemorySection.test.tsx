@@ -107,10 +107,11 @@ describe('MemorySection', () => {
     vi.clearAllMocks();
   });
 
-  it('renders memory settings card and empty list state', async () => {
+  it('renders empty list state without the settings card (moved to page-level dialog)', async () => {
     renderSection();
 
-    expect(screen.getByText('memory.settings.title')).toBeTruthy();
+    // 记忆设置已收进 KnowledgePage 统一设置弹窗，Section 内不再渲染
+    expect(screen.queryByText('memory.settings.title')).toBeNull();
     // 空态：无记忆 + 未选中详情引导
     expect(await screen.findByText('memory.empty')).toBeTruthy();
     expect(screen.getByText('memory.noSelection')).toBeTruthy();

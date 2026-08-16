@@ -4,11 +4,11 @@ import { Card, CardContent } from '@/components/ui/card';
 import MemoryList from '@/components/agent/memory/MemoryList';
 import MemoryDetail from '@/components/agent/memory/MemoryDetail';
 import MemoryDialog from '@/components/agent/memory/MemoryDialog';
-import MemorySettings from '@/components/agent/memory/MemorySettings';
 import { useMemories } from '@/api/hooks';
 import type { AgentMemory, MemoryFilters } from '@/types';
 
-/** 会话记忆 Tab 内容（原 MemoryPage，去掉页面级 PageHeader）。 */
+/** 会话记忆 Tab 内容（原 MemoryPage，去掉页面级 PageHeader）。
+ *  记忆设置已收进页面右上角统一设置弹窗（KnowledgePage）。 */
 export default function MemorySection() {
   const { t } = useTranslation();
   const [filters, setFilters] = useState<MemoryFilters>({
@@ -40,7 +40,6 @@ export default function MemorySection() {
 
   return (
     <div className="space-y-6">
-      <MemorySettings />
       <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
         {/* 移动端选中记忆后隐藏列表，仅桌面保持左侧栏 */}
         <div className={selectedMemory ? 'hidden lg:block lg:w-80 lg:shrink-0' : 'lg:w-80 lg:shrink-0'}>
