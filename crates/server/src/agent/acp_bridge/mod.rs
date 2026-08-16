@@ -3353,11 +3353,12 @@ mod tests {
         );
     }
 
-    /// opencode 特判：即使声明 mcp http 能力 + 有 token，也跳过 remember MCP 注入
-    /// （opencode 的 MCP-over-HTTP 客户端会对隧道最小 MCP 端点挂起，阻塞 session/new
-    /// → 握手超时）。会话仍应照常建立。
+    /// opencode 与其他 agent 一样注入 remember MCP server。opencode 与隧道 MCP
+    /// 端点兼容性已复验（2026-08-16，opencode 1.18.18 全链路 probe，SDK 1.29.0
+    /// StreamableHTTP）：此前误诊的 initialize 挂起实为当时 LLM provider 配置问题，
+    /// 门控已移除，注入行为与 claude-code 等 agent 一致。
     #[tokio::test]
-    async fn test_handshake_skips_mcp_injection_for_opencode() {
+    async fn test_handshake_injects_mcp_for_opencode() {
         let bridge = handshake_test_bridge().await;
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         let mcp_servers = Arc::new(Mutex::new(Vec::new()));
@@ -3372,21 +3373,16 @@ mod tests {
         .await;
 
         let received = mcp_servers.lock().await.clone();
-        assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
+        assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+        let servers = received[0].as_array().expect("mcpServers 应为数组");
+        assert_eq!(servers.len(), 1, "http 能力 + token 应注入 1 条 server: {received:?}");
+        let entry = &servers[0];
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["name"], "rust-tunnel-memory");
+        let url = entry["url"].as_str().expect("mcp url 应为字符串");
         assert!(
-            received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
-            "opencode 即使 http 能力 + token 也不应注入 MCP: {received:?}"
-        );
-        // 会话照常建立（握手不因跳过注入而失败）
-        assert!(
-            bridge
-                .sessions
-                .lock()
-                .await
-                .get("sess-1")
-                .unwrap()
-                .connection
-                .is_some()
+            url.contains("/mcp/tok123"),
+            "mcp url 应指向会话 token 端点: {url}"
         );
     }
 
