@@ -525,6 +525,7 @@ mod tests {
         bridge
             .acp_handshake(
                 "sess-1",
+                "claude-code",
                 "/mock",
                 persisted_id.map(str::to_string),
                 45678,
@@ -546,6 +547,7 @@ mod tests {
         mcp_http: bool,
         mcp_token: Option<&str>,
         mcp_servers: Arc<Mutex<Vec<serde_json::Value>>>,
+        agent_type: &str,
     ) {
         let (agent_io, pump_io) = tokio::io::duplex(64 * 1024);
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -581,6 +583,7 @@ mod tests {
         bridge
             .acp_handshake(
                 "sess-1",
+                agent_type,
                 "/mock",
                 None,
                 45678,
@@ -3269,7 +3272,15 @@ mod tests {
         let bridge = handshake_test_bridge().await;
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         let mcp_servers = Arc::new(Mutex::new(Vec::new()));
-        setup_handshake_mcp(&bridge, ws_tx, true, Some("tok123"), mcp_servers.clone()).await;
+        setup_handshake_mcp(
+            &bridge,
+            ws_tx,
+            true,
+            Some("tok123"),
+            mcp_servers.clone(),
+            "claude-code",
+        )
+        .await;
 
         let received = mcp_servers.lock().await.clone();
         assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
@@ -3289,7 +3300,15 @@ mod tests {
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         let mcp_servers = Arc::new(Mutex::new(Vec::new()));
         // 有 token 但无能力：能力是注入的前置条件
-        setup_handshake_mcp(&bridge, ws_tx, false, Some("tok123"), mcp_servers.clone()).await;
+        setup_handshake_mcp(
+            &bridge,
+            ws_tx,
+            false,
+            Some("tok123"),
+            mcp_servers.clone(),
+            "claude-code",
+        )
+        .await;
 
         let received = mcp_servers.lock().await.clone();
         assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
@@ -3316,13 +3335,58 @@ mod tests {
         let bridge = handshake_test_bridge().await;
         let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
         let mcp_servers = Arc::new(Mutex::new(Vec::new()));
-        setup_handshake_mcp(&bridge, ws_tx, true, None, mcp_servers.clone()).await;
+        setup_handshake_mcp(
+            &bridge,
+            ws_tx,
+            true,
+            None,
+            mcp_servers.clone(),
+            "claude-code",
+        )
+        .await;
 
         let received = mcp_servers.lock().await.clone();
         assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
         assert!(
             received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
             "无 token 时 mcpServers 应为空: {received:?}"
+        );
+    }
+
+    /// opencode 特判：即使声明 mcp http 能力 + 有 token，也跳过 remember MCP 注入
+    /// （opencode 的 MCP-over-HTTP 客户端会对隧道最小 MCP 端点挂起，阻塞 session/new
+    /// → 握手超时）。会话仍应照常建立。
+    #[tokio::test]
+    async fn test_handshake_skips_mcp_injection_for_opencode() {
+        let bridge = handshake_test_bridge().await;
+        let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);
+        let mcp_servers = Arc::new(Mutex::new(Vec::new()));
+        setup_handshake_mcp(
+            &bridge,
+            ws_tx,
+            true,
+            Some("tok123"),
+            mcp_servers.clone(),
+            "opencode",
+        )
+        .await;
+
+        let received = mcp_servers.lock().await.clone();
+        assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
+        assert!(
+            received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "opencode 即使 http 能力 + token 也不应注入 MCP: {received:?}"
+        );
+        // 会话照常建立（握手不因跳过注入而失败）
+        assert!(
+            bridge
+                .sessions
+                .lock()
+                .await
+                .get("sess-1")
+                .unwrap()
+                .connection
+                .is_some()
         );
     }
 
