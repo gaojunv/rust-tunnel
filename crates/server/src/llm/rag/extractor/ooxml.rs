@@ -16,6 +16,12 @@ use super::error::ExtractError;
 /// 解压炸弹 OOM（见 `read_part`）。
 const MAX_PART_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Excel 最大列数：列 XFD = 16,384 列（0 基列号有效范围 `0..MAX_XLSX_COLS`）。
+/// 超过该上限的列号只可能来自不可信输入（如 `<c r="AAAAAA1">`），若据此
+/// `row.resize` 会放大分配数 GB 内存（极小文件即可触发）→ 内存 DoS，
+/// 解析时必须跳过（见 `push_cell`）。
+const MAX_XLSX_COLS: usize = 16_384;
+
 /// 打开 OOXML zip 容器。
 pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractError> {
     zip::ZipArchive::new(Cursor::new(bytes))
@@ -325,7 +331,8 @@ impl Cell {
 }
 
 /// 把一个单元格落进行：共享字符串按下标查表；`t="str"`/无 `t` 取字面值；
-/// 有列号则补空单元格到对应列，无列号则按序追加。
+/// 有列号则补空单元格到对应列，无列号则按序追加。列号超 `MAX_XLSX_COLS`
+/// （不可信输入的放大 DoS 向量）时跳过该 cell，不据此分配内存。
 fn push_cell(row: &mut Vec<String>, cell: Cell, shared: &[String]) {
     let text = if cell.shared {
         cell.value
@@ -341,6 +348,12 @@ fn push_cell(row: &mut Vec<String>, cell: Cell, shared: &[String]) {
     let text = text.trim().to_string();
     match cell.col {
         Some(col) => {
+            // 超限列号（≥ XFD 上限）只可能来自不可信输入：resize 到该列会放大
+            // 分配数 GB 内存 → OOM。跳过该 cell（不分配），其余正常 cell 继续解析。
+            if col >= MAX_XLSX_COLS {
+                tracing::debug!(col, "skipping xlsx cell: column exceeds max");
+                return;
+            }
             if row.len() <= col {
                 row.resize(col + 1, String::new());
             }
@@ -859,5 +872,73 @@ pub(crate) mod tests {
             xlsx_to_markdown(&buf.into_inner()),
             Err(ExtractError::ParseFailed(_))
         ));
+    }
+
+    /// 回归（列号放大内存 DoS）：超限列号（`AAAAAA1` → 0 基 ≈ 1.2e7 列）若触发
+    /// `row.resize` 会分配数 GB 内存。该 cell 必须被跳过（不分配），
+    /// 其余正常 cell 继续解析，整体不得 panic 或 OOM。
+    #[test]
+    fn xlsx_over_limit_column_skipped_not_oom() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("[Content_Types].xml", opts).unwrap();
+            zip.write_all(b"<Types/>").unwrap();
+            zip.start_file("xl/workbook.xml", opts).unwrap();
+            zip.write_all(br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet name="S" sheetId="1"/></sheets></workbook>"#).unwrap();
+            zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+            // 首列正常、次列超限（AAAAAA1）、第三列正常：超限 cell 应被静默跳过。
+            let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1"><v>ok</v></c><c r="AAAAAA1"><v>evil</v></c><c r="B1"><v>fine</v></c></row>
+</sheetData></worksheet>"#;
+            zip.write_all(sheet.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let out = xlsx_to_markdown(&buf.into_inner()).unwrap();
+        assert!(
+            out.contains("| ok | fine |"),
+            "normal cells must parse: {out}"
+        );
+        assert!(
+            !out.contains("evil"),
+            "over-limit cell must be skipped: {out}"
+        );
+    }
+
+    /// push_cell 直接单测：超限列号不分配、不写坏已有列。
+    #[test]
+    fn push_cell_skips_over_limit_column() {
+        let mut row = vec!["ok".to_string()];
+        push_cell(
+            &mut row,
+            Cell {
+                col: Some(MAX_XLSX_COLS),
+                shared: false,
+                value: "evil".into(),
+            },
+            &[],
+        );
+        assert_eq!(row.len(), 1, "over-limit cell must not grow the row");
+        assert_eq!(row[0], "ok");
+    }
+
+    /// push_cell 直接单测：最大合法列 XFD（0 基 `MAX_XLSX_COLS - 1`）行为不变。
+    #[test]
+    fn push_cell_places_last_valid_column() {
+        let mut row = Vec::new();
+        push_cell(
+            &mut row,
+            Cell {
+                col: Some(MAX_XLSX_COLS - 1),
+                shared: false,
+                value: "xfd".into(),
+            },
+            &[],
+        );
+        assert_eq!(row.len(), MAX_XLSX_COLS, "XFD must resize to full width");
+        assert_eq!(row[MAX_XLSX_COLS - 1], "xfd");
     }
 }
