@@ -9,6 +9,7 @@ use super::{
 use crate::db::rag::RagKnowledgeBaseRecord;
 use crate::db::Database;
 use crate::llm::crypto::{decrypt_field, LlmCipher};
+use futures_util::FutureExt;
 use tokio::sync::broadcast;
 
 /// 文档状态变更事件（SSE 推送给前端）。
@@ -52,37 +53,67 @@ pub fn spawn_ingest(
             });
         };
 
-        // processing
-        let _ = db
-            .rag_update_document_status(&doc_id, "processing", 0, None)
-            .await;
-        emit("processing", 0, None);
+        // 任务体整体包进 catch_unwind：提取/分块/embedding/store 任一步 panic
+        // （如解析器内部 expect）不能让任务静默死亡、doc 永久卡 processing。
+        // AssertUnwindSafe 绕过异步状态 UnwindSafe 的静态检查——panic 后我们
+        // 只用任务体自有的克隆（db/doc_id/kb/tx），无跨 await 共享借用。
+        let result = std::panic::AssertUnwindSafe(async {
+            // processing
+            let _ = db
+                .rag_update_document_status(&doc_id, "processing", 0, None)
+                .await;
+            emit("processing", 0, None);
 
-        match do_ingest(
-            &db,
-            &store,
-            cipher.as_ref(),
-            &kb,
-            &doc_id,
-            &source_path,
-            file_type,
-        )
-        .await
-        {
-            Ok(count) => {
-                let _ = db
-                    .rag_update_document_status(&doc_id, "ready", count, None)
-                    .await;
-                emit("ready", count, None);
+            match do_ingest(
+                &db,
+                &store,
+                cipher.as_ref(),
+                &kb,
+                &doc_id,
+                &source_path,
+                file_type,
+            )
+            .await
+            {
+                Ok(count) => {
+                    let _ = db
+                        .rag_update_document_status(&doc_id, "ready", count, None)
+                        .await;
+                    emit("ready", count, None);
+                }
+                Err(e) => {
+                    let _ = db
+                        .rag_update_document_status(&doc_id, "failed", 0, Some(&e))
+                        .await;
+                    emit("failed", 0, Some(e));
+                }
             }
-            Err(e) => {
-                let _ = db
-                    .rag_update_document_status(&doc_id, "failed", 0, Some(&e))
-                    .await;
-                emit("failed", 0, Some(e));
-            }
+        })
+        .catch_unwind()
+        .await;
+
+        // panic 兜底：与 do_ingest 返回 Err 同语义——置 failed 并记录 panic 信息，
+        // 让 doc 不卡 processing、前端能感知失败。
+        if let Err(payload) = result {
+            let msg = panic_message(&*payload);
+            tracing::error!(doc_id = %doc_id, kb_id = %kb.id, panic = %msg, "rag ingest task panicked");
+            let _ = db
+                .rag_update_document_status(&doc_id, "failed", 0, Some(&msg))
+                .await;
+            emit("failed", 0, Some(msg));
         }
     });
+}
+
+/// 从 `catch_unwind` 的 panic payload 提取人类可读消息（`&str` 或 `String`）。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_owned()
+    }
 }
 
 /// 提取 → 分块 → 向量化 → 写 shard → 落库，返回分块数。失败时返回人类可读错误。
@@ -515,5 +546,15 @@ mod tests {
             .as_deref()
             .is_some_and(|e| e.contains("no text layer")));
         assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn panic_message_extracts_readable_payload() {
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&*str_payload), "boom");
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(&*string_payload), "boom");
+        let other: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(panic_message(&*other), "unknown panic");
     }
 }

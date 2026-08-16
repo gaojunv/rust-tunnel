@@ -275,6 +275,24 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 启动对账：把上次运行遗留的 pending/processing 文档统一复位为 failed。
+    /// 服务器若在摄入中途崩溃/panic，这些 doc 永远停在在途态、UI 永久卡住；
+    /// 启动时（API 服务开启前）复位后前端可感知失败并重试（reindex/上传走
+    /// `rag_mark_document_pending_if_idle` CAS 抢占）。返回被复位的行数。
+    pub async fn rag_fail_inflight_documents(&self, error: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE rag_documents
+            SET status = 'failed', chunk_count = 0, error = ?, updated_at = datetime('now')
+            WHERE status IN ('pending', 'processing')
+            "#,
+        )
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn rag_delete_document(&self, id: &str) -> Result<(), sqlx::Error> {
         // 分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_documents WHERE id = ?")
@@ -671,6 +689,68 @@ mod tests {
         let doc = db.rag_get_document("d1").await.unwrap().unwrap();
         assert_eq!(doc.status, "pending");
         assert!(doc.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_stale_inflight_docs() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.rag_create_kb(
+            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
+        )
+        .await
+        .unwrap();
+        db.rag_create_document("d-pending", "kb1", "a.md", "sha256:a", "md")
+            .await
+            .unwrap();
+        db.rag_create_document("d-processing", "kb1", "b.md", "sha256:b", "md")
+            .await
+            .unwrap();
+        db.rag_create_document("d-ready", "kb1", "c.md", "sha256:c", "md")
+            .await
+            .unwrap();
+        db.rag_create_document("d-failed", "kb1", "e.md", "sha256:e", "md")
+            .await
+            .unwrap();
+        // 构造非初始状态：processing/ready/failed 与各自存量数据
+        db.rag_update_document_status("d-processing", "processing", 0, None)
+            .await
+            .unwrap();
+        db.rag_update_document_status("d-ready", "ready", 3, None)
+            .await
+            .unwrap();
+        db.rag_update_document_status("d-failed", "failed", 0, Some("old error"))
+            .await
+            .unwrap();
+
+        // 只复位在途（pending/processing）行
+        let reset = db
+            .rag_fail_inflight_documents("interrupted by server restart")
+            .await
+            .unwrap();
+        assert_eq!(reset, 2);
+
+        // pending/processing → failed，带对账错误信息，chunk_count 清零
+        for id in ["d-pending", "d-processing"] {
+            let doc = db.rag_get_document(id).await.unwrap().unwrap();
+            assert_eq!(doc.status, "failed", "{id} 应被复位为 failed");
+            assert_eq!(
+                doc.error.as_deref(),
+                Some("interrupted by server restart"),
+                "{id} 应带对账错误信息"
+            );
+            assert_eq!(doc.chunk_count, 0, "{id} chunk_count 应清零");
+        }
+        // 终态不受影响：ready 保留 chunk_count，failed 保留原 error
+        let ready = db.rag_get_document("d-ready").await.unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.chunk_count, 3);
+        let failed = db.rag_get_document("d-failed").await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("old error"),
+            "既有 failed 的 error 不应被对账覆盖"
+        );
     }
 
     #[tokio::test]

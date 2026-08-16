@@ -6,6 +6,14 @@
 
 use reqwest::Client;
 
+/// 单次 embed 请求的批大小上限。上游 embedding API 通常限制单请求文本数，
+/// 超长请求会被拒（400/413）或超时；超出时内部切多批逐个请求再按序拼接。
+const EMBED_BATCH_SIZE: usize = 64;
+/// 单批最大尝试次数（首次 + 2 次重试），仍失败才向调用方返回 Err。
+const EMBED_MAX_ATTEMPTS: usize = 3;
+/// 重试基础退避（毫秒）：第 1 次重试 500ms、第 2 次 1s，避免瞬时故障集中重试。
+const EMBED_RETRY_BASE_MS: u64 = 500;
+
 #[derive(Debug)]
 pub enum EmbedError {
     Http(reqwest::Error),
@@ -51,13 +59,49 @@ impl Embedder {
         }
     }
 
-    /// 批量向量化，返回向量顺序与输入一致。
+    /// 批量向量化，返回向量顺序与输入一致。超过 [`EMBED_BATCH_SIZE`] 时内部
+    /// 切多批逐个请求再拼接，对调用方透明；每批失败重试 [`EMBED_MAX_ATTEMPTS`]
+    /// 次（500ms/1s 退避），仍失败才返回 Err。
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(EMBED_BATCH_SIZE) {
+            out.extend(self.embed_batch(batch).await?);
+        }
+        Ok(out)
+    }
+
+    /// 单条向量化（检索查询用）。
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        let mut v = self.embed(&[text.to_string()]).await?;
+        v.pop().ok_or(EmbedError::EmptyResponse)
+    }
+
+    /// 单批 embed（≤ `EMBED_BATCH_SIZE` 条）：失败重试，仍失败返回最后一次错误。
+    async fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut attempt = 0;
+        loop {
+            match self.embed_batch_once(batch).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= EMBED_MAX_ATTEMPTS {
+                        return Err(e);
+                    }
+                    // 退避 500ms → 1s（第 1 次重试睡 500ms，第 2 次睡 1s）
+                    let delay_ms = EMBED_RETRY_BASE_MS << (attempt - 1);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    /// 单次 embed 请求（无重试）。
+    async fn embed_batch_once(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         let url = format!("{}/embeddings", self.base_url);
-        let body = serde_json::json!({ "model": self.model, "input": texts });
+        let body = serde_json::json!({ "model": self.model, "input": batch });
         let resp = self
             .client
             .post(&url)
@@ -77,7 +121,7 @@ impl Embedder {
             .as_array()
             .cloned()
             .ok_or(EmbedError::EmptyResponse)?;
-        // 按 index 排序保证与输入顺序一致
+        // 按 index 排序保证与输入顺序一致（每批内的 index 从 0 开始）
         data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
         let mut out = Vec::with_capacity(data.len());
         for d in data {
@@ -89,12 +133,6 @@ impl Embedder {
             return Err(EmbedError::EmptyResponse);
         }
         Ok(out)
-    }
-
-    /// 单条向量化（检索查询用）。
-    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        let mut v = self.embed(&[text.to_string()]).await?;
-        v.pop().ok_or(EmbedError::EmptyResponse)
     }
 }
 
@@ -158,5 +196,107 @@ mod tests {
         // 连一个几乎不可能开放的端口
         let e = Embedder::new("http://127.0.0.1:1", "sk", "m");
         assert!(e.embed_one("x").await.is_err());
+    }
+
+    /// mock 记录每批 input 长度，且向量首位编码文本自身序号（"item-<i>"），
+    /// 用于断言跨批拼接后顺序与输入一致。
+    #[tokio::test]
+    async fn embed_splits_large_input_into_batches() {
+        use axum::extract::Json;
+        use axum::routing::post;
+        use axum::Router;
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let sizes = batch_sizes.clone();
+        let app = Router::new().route(
+            "/embeddings",
+            post(move |body: Json<Value>| async move {
+                let arr = body["input"].as_array().cloned().unwrap_or_default();
+                sizes.lock().unwrap().push(arr.len());
+                let data: Vec<_> = arr
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let idx: f32 = t
+                            .as_str()
+                            .unwrap_or("")
+                            .trim_start_matches("item-")
+                            .parse()
+                            .unwrap();
+                        json!({
+                            "index": i,
+                            "embedding": vec![idx, 0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                            "object": "embedding"
+                        })
+                    })
+                    .collect();
+                Json(json!({"object": "list", "data": data}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let e = Embedder::new(&format!("http://{addr}"), "sk-test", "test-model");
+        let texts: Vec<String> = (0..150).map(|i| format!("item-{i}")).collect();
+        let out = e.embed(&texts).await.unwrap();
+
+        assert_eq!(out.len(), 150);
+        // 超过批大小（64）被拆成 64/64/22 三批
+        let sizes = batch_sizes.lock().unwrap();
+        assert_eq!(sizes.as_slice(), &[64, 64, 22]);
+        // 跨批拼接顺序与输入一致
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v[0], i as f32, "text {i} out of order");
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_retries_then_succeeds() {
+        use axum::extract::Json;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::Router;
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // 首次返回 500 触发重试，随后成功；断言总请求数 = 2 且结果正常。
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = Router::new().route(
+            "/embeddings",
+            post(move |body: Json<Value>| async move {
+                if calls_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                }
+                let arr = body["input"].as_array().cloned().unwrap_or_default();
+                let data: Vec<_> = (0..arr.len())
+                    .map(|i| {
+                        json!({
+                            "index": i,
+                            "embedding": vec![0.1f32; 8],
+                            "object": "embedding"
+                        })
+                    })
+                    .collect();
+                Json(json!({"object": "list", "data": data})).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let e = Embedder::new(&format!("http://{addr}"), "sk-test", "test-model");
+        let out = e.embed(&["a".to_string(), "b".to_string()]).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

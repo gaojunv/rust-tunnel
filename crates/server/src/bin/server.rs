@@ -352,6 +352,26 @@ async fn main() -> TunnelResult<()> {
         )
         .await;
 
+    // RAG 启动对账：上次运行若在摄入中途崩溃/panic，doc 会永久卡在
+    // pending/processing、前端无法恢复。启动时（API/控制面起服务前）统一
+    // 复位为 failed，UI 可感知失败并让用户重试（reindex/上传走 CAS 抢占）。
+    #[cfg(feature = "rag")]
+    {
+        if let Some(db) = state.db().cloned() {
+            match db
+                .rag_fail_inflight_documents("interrupted by server restart")
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::warn!(
+                    reset = n,
+                    "RAG startup reconciliation: reset stale in-flight documents to failed"
+                ),
+                Err(e) => tracing::warn!(error = %e, "RAG startup reconciliation failed"),
+            }
+        }
+    }
+
     // LLM 网关初始化后，把主密钥解密器注入 ACP 桥：provider API Key 落库加密
     // 时（配置了主密钥即默认生产路径），agent 的 LLM 代理请求须在服务端解密
     // 后才能调上游；不注入则 decrypt_field(None, ...) 失败、所有请求 502。
