@@ -18,7 +18,7 @@ pub fn agent_command(
     let args = match agent_type {
         "gemini" => vec!["--experimental-acp".to_string()],
         "claude-code" => vec![],
-        "opencode" => vec!["--acp".to_string()],
+        "opencode" => vec!["acp".to_string()],
         other => return Err(format!("unsupported agent type: {other}")),
     };
     Ok((path.to_string(), args))
@@ -224,7 +224,7 @@ mod tests {
     fn test_agent_command_opencode() {
         let (cmd, args) = agent_command("opencode", None).unwrap();
         assert_eq!(cmd, "opencode");
-        assert_eq!(args, vec!["--acp"]);
+        assert_eq!(args, vec!["acp"]);
     }
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_agent_opencode_success() {
-        // opencode 路径：命令 `opencode --acp`，env 注入 OPENCODE_MODEL。
+        // opencode 路径：命令 `opencode acp`（子命令，非 `--acp`），env 注入 OPENCODE_MODEL。
         let registry = mock_registry(|req| match req {
             ControlMessage::AgentSpawnRequest {
                 session_id,
@@ -413,7 +413,7 @@ mod tests {
                 cwd,
             } => {
                 assert_eq!(command, "opencode");
-                assert_eq!(args, vec!["--acp"]);
+                assert_eq!(args, vec!["acp"]);
                 assert_eq!(cwd.as_deref(), Some("/workspace"));
                 assert_eq!(
                     env.iter()
