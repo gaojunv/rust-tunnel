@@ -360,7 +360,7 @@ impl AcpBridge {
 
         let sid = session_id.to_string();
         let cwd = cwd.to_string();
-        // 拥有型拷贝：spawn 的连接任务需 'static（MCP 注入门控用到 agent_type）。
+        // 拥有型拷贝：spawn 的连接任务需 'static（MCP 注入日志带 agent_type）。
         let agent_type = agent_type.to_string();
         let approval = self.approval.clone();
         let elicitation = self.elicitation.clone();
@@ -809,27 +809,18 @@ impl AcpBridge {
                             // 会话铸造了 token → session/new 与 session/resume 都带
                             // mcpServers（两种会话建立路径都会连 MCP）。非 rag（token
                             // 恒 None）/ memory 未启用 / agent 无 http 能力 → 不注入，
-                            // 仅 info 日志，降级不报错。
-                            //
-                            // opencode 特判：opencode 的 MCP-over-HTTP 客户端在
-                            // session/new 阶段 eager 连接注入的 MCP 端点，且对隧道
-                            // 最小 MCP 端点的 initialize 响应（JSON/SSE、版本回显
-                            // 均试过）挂起不回 → session/new 永不完成 → 握手超时。
-                            // 故 opencode 一律跳过注入（remember 工具在 opencode
-                            // 会话不可用），其余 agent 维持原行为。
+                            // 仅 info 日志，降级不报错。opencode 1.18.18 已复验兼容
+                            // （2026-08-16，SDK 1.29.0 StreamableHTTP：initialize JSON
+                            // 单响应 + 202 notification + GET 405 均符合规范）；若未来
+                            // opencode 升级破坏兼容，手动探针 tests/opencode_mcp_probe.rs
+                            // 复验。
                             let mcp_http_capable = init_resp.agent_capabilities.mcp_capabilities.http;
                             let mcp_servers: Option<Vec<McpServer>> =
-                                match (mcp_http_capable, &mcp_token, agent_type.as_str()) {
-                                    (true, Some(_token), "opencode") => {
+                                match (mcp_http_capable, &mcp_token) {
+                                    (true, Some(token)) => {
                                         tracing::info!(
                                             session_id = %sid,
-                                            "opencode MCP 客户端与隧道 MCP 端点不兼容，跳过 remember MCP 注入"
-                                        );
-                                        None
-                                    }
-                                    (true, Some(token), _) => {
-                                        tracing::info!(
-                                            session_id = %sid,
+                                            agent_type,
                                             "agent 声明 mcp http 能力，注入 remember MCP server"
                                         );
                                         Some(vec![McpServer::Http(McpServerHttp::new(
@@ -837,14 +828,20 @@ impl AcpBridge {
                                             format!("http://127.0.0.1:{mcp_port}/mcp/{token}"),
                                         ))])
                                     }
-                                    (false, _, _) => {
+                                    (true, None) => {
+                                        tracing::info!(
+                                            session_id = %sid,
+                                            "agent 声明 mcp http 能力但本会话未铸造 token，跳过 remember MCP 注入"
+                                        );
+                                        None
+                                    }
+                                    (false, _) => {
                                         tracing::info!(
                                             session_id = %sid,
                                             "agent 未声明 mcp http 能力，跳过 remember MCP 注入"
                                         );
                                         None
                                     }
-                                    _ => None,
                                 };
                             // 统一构造请求（按需带 mcpServers）。
                             let build_new_req = |cwd: &str| match &mcp_servers {
