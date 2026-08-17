@@ -32,11 +32,22 @@ pub fn agent_command(
 /// 变量——claude-code-acp 认 `ANTHROPIC_AUTH_TOKEN`，而 opencode 只认 `API_KEY`，
 /// 两者都注入、各取所需，互无副作用。
 ///
-/// `model` 是服务端解析出的有效模型引用（`resolve_effective_model`）；opencode
-/// 读取 `OPENCODE_MODEL` 作为默认模型（best-effort——不支持的 agent 忽略未知
-/// 环境变量；实际请求的 model 仍由 llm_bridge 按服务端配置覆盖，此处只保证
-/// opencode 进程启动时有模型可用、UI 显示一致）。
-pub fn agent_env(agent_type: &str, port: u16, model: Option<&str>) -> Vec<(String, String)> {
+/// `model` 是服务端解析出的有效模型引用（`resolve_effective_model`）。claude-code/
+/// gemini 不使用它（模型经 ACP set_config_option 注入）；opencode 不读
+/// `OPENAI_BASE_URL`/`OPENCODE_MODEL`（其 provider SDK 实例化时 baseURL 显式取
+/// `options.baseURL ?? model.api.url`，覆盖了 AI SDK 的 env fallback；flag 层也无
+/// `OPENCODE_MODEL`），故 opencode 分支改用 `OPENCODE_CONFIG_CONTENT` 注入自定义
+/// provider `rust-tunnel`（baseURL 指向回环代理），把 LLM 流量引入隧道——见
+/// [`opencode_config_content`]。
+///
+/// `available_models` 是服务端启用的网关模型 id 列表（仅 opencode 分支用于
+/// provider.models 枚举），其余 agent 传空切片。
+pub fn agent_env(
+    agent_type: &str,
+    port: u16,
+    model: Option<&str>,
+    available_models: &[String],
+) -> Vec<(String, String)> {
     let base = format!("http://127.0.0.1:{port}");
     let mut env = vec![
         ("OPENAI_BASE_URL".into(), format!("{base}/v1")),
@@ -46,11 +57,83 @@ pub fn agent_env(agent_type: &str, port: u16, model: Option<&str>) -> Vec<(Strin
         ("ANTHROPIC_API_KEY".into(), "tunnel-injected".into()),
     ];
     if agent_type == "opencode" {
-        if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-            env.push(("OPENCODE_MODEL".into(), m.to_string()));
+        if let Some(content) = opencode_config_content(port, model, available_models) {
+            env.push(("OPENCODE_CONFIG_CONTENT".into(), content));
         }
     }
     env
+}
+
+/// 构造 opencode 内联配置 JSON（经 `OPENCODE_CONFIG_CONTENT` 注入，local 级、后
+/// 合并，deep merge 不破坏用户其它配置）。
+///
+/// 注册自定义 provider `rust-tunnel`（npm `@ai-sdk/openai-compatible`，opencode
+/// 内置打包）：`options.baseURL` 指向回环代理 `http://127.0.0.1:{port}/v1`，
+/// `options.apiKey` 占位 `"tunnel-injected"`（llm_bridge 服务端真注入认证）。
+/// `provider.models` 枚举服务端启用的网关模型（key 即 modelID，value 为
+/// `{"name": "<model>"}`；opencode 侧模型名只影响展示，实际请求的 model 由服务端
+/// llm_bridge 按 session 配置重写）。`enabled_providers` 白名单 `["rust-tunnel"]`
+/// 防止 opencode 用本机凭据/env placeholder key 选中其它 provider 直连外网。
+///
+/// `default_model` 为非空白字符串时设置顶层 `model`/`small_model` 为
+/// `rust-tunnel/<default>`（small_model 用于标题生成等后台任务；白名单后必须显式
+/// 给）；为 None/空白则不设这两个键（白名单下 opencode 自选好歹可用的模型），
+/// 但 provider 仍注入。`models` 为空且 `default_model` 为 None 时返回 None
+/// （无注入意义）。
+fn opencode_config_content(
+    port: u16,
+    default_model: Option<&str>,
+    models: &[String],
+) -> Option<String> {
+    let mut models_map = serde_json::Map::new();
+    // 去重：available_models + default_model（若有）合并，保持出现顺序。
+    let mut seen = std::collections::HashSet::new();
+    let default_model = default_model.filter(|s| !s.trim().is_empty());
+    let mut names: Vec<&str> = models
+        .iter()
+        .map(String::as_str)
+        .filter(|m| seen.insert((*m).to_string()))
+        .collect();
+    if let Some(dm) = default_model {
+        if seen.insert(dm.to_string()) {
+            names.push(dm);
+        }
+    }
+    for name in &names {
+        models_map.insert(
+            (*name).to_string(),
+            serde_json::json!({"name": name}),
+        );
+    }
+    if models_map.is_empty() && default_model.is_none() {
+        return None;
+    }
+    let mut config = serde_json::Map::new();
+    let provider = serde_json::json!({
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "baseURL": format!("http://127.0.0.1:{port}/v1"),
+            "apiKey": "tunnel-injected",
+        },
+        "models": serde_json::Value::Object(models_map),
+    });
+    config.insert(
+        "provider".to_string(),
+        serde_json::json!({ "rust-tunnel": provider }),
+    );
+
+    if let Some(dm) = default_model {
+        config.insert("model".to_string(), format!("rust-tunnel/{dm}").into());
+        config.insert(
+            "small_model".to_string(),
+            format!("rust-tunnel/{dm}").into(),
+        );
+    }
+    config.insert(
+        "enabled_providers".to_string(),
+        serde_json::json!(["rust-tunnel"]),
+    );
+    serde_json::to_string(&serde_json::Value::Object(config)).ok()
 }
 
 #[derive(Clone)]
@@ -94,8 +177,11 @@ impl AgentSpawner {
     }
 
     /// spawn agent 进程，env 注入 LLM 代理地址。
-    /// `model` 是服务端解析出的有效模型引用（opencode 经 `OPENCODE_MODEL` 注入）。
-    // 8 个参数：每个语义单一，拆 struct 反而绕（brief 指定签名，仿 agent_exec 处理）。
+    /// `model` 是服务端解析出的有效模型引用（opencode 经 `OPENCODE_CONFIG_CONTENT`
+    /// 注入；claude-code 不用它，仍走 ACP set_config_option）。
+    /// `available_models` 是服务端启用的网关模型 id 列表（仅 opencode 分支用于
+    /// provider.models 枚举），其余 agent 传空切片。
+    // 9 个参数：每个语义单一，拆 struct 反而绕（brief 指定签名，仿 agent_exec 处理）。
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent(
         &self,
@@ -107,6 +193,7 @@ impl AgentSpawner {
         cwd: &str,
         timeout: Duration,
         model: Option<&str>,
+        available_models: &[String],
     ) -> Result<(), String> {
         let (command, args) = agent_command(agent_type, agent_path)?;
         let msg = self
@@ -118,7 +205,7 @@ impl AgentSpawner {
                     session_id: session_id.to_string(),
                     command,
                     args,
-                    env: agent_env(agent_type, port, model),
+                    env: agent_env(agent_type, port, model, available_models),
                     cwd: Some(cwd.to_string()),
                 },
                 timeout,
@@ -231,7 +318,7 @@ mod tests {
     fn test_agent_env_common_injects_both_anthropic_key_vars() {
         // claude-code-acp 认 AUTH_TOKEN；opencode 认 API_KEY——两者都注入，
         // 各自按需读取，互无副作用。
-        let env = agent_env("claude-code", 45678, None);
+        let env = agent_env("claude-code", 45678, None, &[]);
         let base = env.iter().find(|(k, _)| k == "OPENAI_BASE_URL").unwrap();
         assert_eq!(base.1, "http://127.0.0.1:45678/v1");
         assert!(
@@ -242,33 +329,85 @@ mod tests {
             env.iter().any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "tunnel-injected"),
             "ANTHROPIC_AUTH_TOKEN must be injected: {env:?}"
         );
-        // 非 opencode agent 不注入 OPENCODE_MODEL
+        // 非 opencode agent 不注入 OPENCODE_CONFIG_CONTENT
         assert!(
-            !env.iter().any(|(k, _)| k == "OPENCODE_MODEL"),
-            "OPENCODE_MODEL must only be injected for opencode: {env:?}"
+            !env.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
+            "OPENCODE_CONFIG_CONTENT must only be injected for opencode: {env:?}"
         );
     }
 
     #[test]
-    fn test_agent_env_opencode_injects_model() {
-        let env = agent_env("opencode", 45678, Some("gpt-4o"));
-        assert_eq!(
-            env.iter()
-                .find(|(k, _)| k == "OPENCODE_MODEL")
-                .map(|(_, v)| v.as_str()),
+    fn test_agent_env_opencode_config_content() {
+        // opencode + 模型 + available_models：注入配置，白名单 + provider.baseURL
+        // + model/small_model + models map。
+        let env = agent_env(
+            "opencode",
+            45678,
             Some("gpt-4o"),
-            "opencode model should be injected: {env:?}"
+            &["gpt-4o-mini".to_string(), "claude-3-5-sonnet".to_string()],
+        );
+        let content = env
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+            .map(|(_, v)| v.as_str())
+            .expect("OPENCODE_CONFIG_CONTENT should be injected: {env:?}");
+        let config: serde_json::Value =
+            serde_json::from_str(content).expect("config should be valid JSON");
+        // 顶层白名单
+        assert_eq!(
+            config["enabled_providers"],
+            serde_json::json!(["rust-tunnel"]),
+            "enabled_providers must whitelist rust-tunnel: {config}"
+        );
+        // model / small_model
+        assert_eq!(config["model"], "rust-tunnel/gpt-4o");
+        assert_eq!(config["small_model"], "rust-tunnel/gpt-4o");
+        // provider baseURL 指向回环代理
+        assert_eq!(
+            config["provider"]["rust-tunnel"]["options"]["baseURL"],
+            "http://127.0.0.1:45678/v1"
+        );
+        assert_eq!(
+            config["provider"]["rust-tunnel"]["options"]["apiKey"],
+            "tunnel-injected"
+        );
+        assert_eq!(
+            config["provider"]["rust-tunnel"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        // models map 含 available_models + default_model（去重）
+        let models_map = config["provider"]["rust-tunnel"]["models"].as_object().unwrap();
+        assert!(models_map.contains_key("gpt-4o-mini"));
+        assert!(models_map.contains_key("claude-3-5-sonnet"));
+        assert!(models_map.contains_key("gpt-4o"));
+        assert_eq!(models_map["gpt-4o"], serde_json::json!({"name": "gpt-4o"}));
+        assert_eq!(models_map.len(), 3);
+        // default None：不注入 model 键但 provider 仍注入
+        let env_none = agent_env("opencode", 45678, None, &["gpt-4o".to_string()]);
+        let content_none = env_none
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+            .map(|(_, v)| v.as_str())
+            .expect("provider should still be injected: {env_none:?}");
+        let config_none: serde_json::Value =
+            serde_json::from_str(content_none).expect("valid JSON");
+        assert!(config_none.get("model").is_none(), "no model key: {config_none}");
+        assert!(config_none.get("small_model").is_none(), "no small_model key");
+        assert_eq!(
+            config_none["provider"]["rust-tunnel"]["options"]["baseURL"],
+            "http://127.0.0.1:45678/v1"
         );
         // 空/None 模型不注入
-        let env_none = agent_env("opencode", 45678, None);
+        let env_blank = agent_env("opencode", 45678, Some("   "), &["gpt-4o".to_string()]);
         assert!(
-            !env_none.iter().any(|(k, _)| k == "OPENCODE_MODEL"),
-            "no model -> no OPENCODE_MODEL: {env_none:?}"
+            env_blank.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
+            "blank model but available models -> still inject provider: {env_blank:?}"
         );
-        let env_blank = agent_env("opencode", 45678, Some("   "));
+        // 空模型 + 空 available_models：无注入意义，返回 None → 不注入环境变量
+        let env_empty = agent_env("opencode", 45678, None, &[]);
         assert!(
-            !env_blank.iter().any(|(k, _)| k == "OPENCODE_MODEL"),
-            "blank model -> no OPENCODE_MODEL: {env_blank:?}"
+            !env_empty.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
+            "empty models + no default -> no injection: {env_empty:?}"
         );
     }
 
@@ -396,6 +535,7 @@ mod tests {
                 "/workspace",
                 Duration::from_secs(2),
                 None,
+                &[],
             )
             .await
             .expect("spawn should succeed");
@@ -403,7 +543,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_agent_opencode_success() {
-        // opencode 路径：命令 `opencode acp`（子命令，非 `--acp`），env 注入 OPENCODE_MODEL。
+        // opencode 路径：命令 `opencode acp`（子命令，非 `--acp`），env 注入
+        // OPENCODE_CONFIG_CONTENT 携带自定义 provider baseURL 指向回环代理。
         let registry = mock_registry(|req| match req {
             ControlMessage::AgentSpawnRequest {
                 session_id,
@@ -415,12 +556,22 @@ mod tests {
                 assert_eq!(command, "opencode");
                 assert_eq!(args, vec!["acp"]);
                 assert_eq!(cwd.as_deref(), Some("/workspace"));
+                let content = env
+                    .iter()
+                    .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+                    .map(|(_, v)| v.as_str())
+                    .expect("OPENCODE_CONFIG_CONTENT should be injected: {env:?}");
+                let config: serde_json::Value =
+                    serde_json::from_str(content).expect("valid JSON");
+                assert!(
+                    config["provider"]["rust-tunnel"]["options"]["baseURL"]
+                        .as_str()
+                        .is_some_and(|u| u == "http://127.0.0.1:45678/v1"),
+                    "config must route to loopback proxy: {config}"
+                );
                 assert_eq!(
-                    env.iter()
-                        .find(|(k, _)| k == "OPENCODE_MODEL")
-                        .map(|(_, v)| v.as_str()),
-                    Some("gpt-4o"),
-                    "OPENCODE_MODEL should be injected: {env:?}"
+                    config["enabled_providers"],
+                    serde_json::json!(["rust-tunnel"])
                 );
                 assert!(
                     env.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"),
@@ -446,6 +597,7 @@ mod tests {
                 "/workspace",
                 Duration::from_secs(2),
                 Some("gpt-4o"),
+                &[],
             )
             .await
             .expect("spawn should succeed");
@@ -470,6 +622,7 @@ mod tests {
                 "/workspace",
                 Duration::from_secs(2),
                 None,
+                &[],
             )
             .await
             .expect_err("client error should propagate");
@@ -491,6 +644,7 @@ mod tests {
                 "/workspace",
                 Duration::from_secs(1),
                 None,
+                &[],
             )
             .await
             .expect_err("unsupported agent type should error locally");

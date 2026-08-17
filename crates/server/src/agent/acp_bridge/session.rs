@@ -209,9 +209,10 @@ impl AcpBridge {
                 "acp spawn stage: llm proxy ready (port {port})"
             );
             // 2) spawn agent 进程（env 注入 LLM 代理地址）。解析有效模型引用注入
-            //    agent 进程（opencode 经 `OPENCODE_MODEL` 读取；claude-code 不用它，
-            //    仍走 ACP set_config_option）。解析失败不阻断 spawn——best-effort，
-            //    实际请求的 model 由 llm_bridge 每次按 session 从 DB 重新解析覆盖。
+            //    agent 进程（opencode 经 `OPENCODE_CONFIG_CONTENT` 注入；claude-code
+            //    不用它，仍走 ACP set_config_option）。解析失败不阻断 spawn——
+            //    best-effort，实际请求的 model 由 llm_bridge 每次按 session 从 DB
+            //    重新解析覆盖。
             let spawn_model = crate::agent::session::resolve_effective_model(
                 &self.db,
                 None,
@@ -219,6 +220,24 @@ impl AcpBridge {
             )
             .await
             .ok();
+            // opencode 枚举服务端启用的网关模型 id，注入配置的 provider.models：
+            // 让 opencode 只能（且能）通过白名单 provider 的路由消费 LLM，流量经
+            // 回环代理进隧道。失败/无 gateway 用空 vec（不阻断 spawn，provider 仍
+            // 注入、无 models 枚举）；非 opencode 恒空。
+            let available_models: Vec<String> = if agent_type == "opencode" {
+                if let Some(gw) = self.gateway.as_ref() {
+                    crate::llm::router::list_available_models(&gw.llm_state)
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|m| m["id"].as_str().map(String::from))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             self.spawner
                 .spawn_agent(
                     &client_id,
@@ -229,6 +248,7 @@ impl AcpBridge {
                     &workspace.root_path,
                     SPAWN_TIMEOUT,
                     spawn_model.as_deref(),
+                    &available_models,
                 )
                 .await?;
             tracing::info!(
