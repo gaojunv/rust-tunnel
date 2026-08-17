@@ -486,12 +486,27 @@ pub enum FailoverOutcome {
     },
 }
 
-/// 在候选链上执行上游调用：熔断跳过 + 可转移重试。
+/// 判定失败状态码是否为"确定性失败"（换多少次重试都必然失败），并给出失败类别：
+/// - 401/403：认证/权限失败 → provider 级（key 失效/被禁，该 provider 全部模型同因失败）
+/// - 404：模型级（上游不存在该模型）
+///
+/// 其余 4xx（400/422…）**不**纳入：它们可能是请求内容相关（上下文超限、内容策略拒绝），
+/// 与具体请求强相关，转移到别的模型/提供商未必失败，缓存会导致错误地阻断后续请求。
+fn deterministic_failure(status: StatusCode) -> Option<crate::llm::down::FailureKind> {
+    match status.as_u16() {
+        401 | 403 => Some(crate::llm::down::FailureKind::ProviderAuth),
+        404 => Some(crate::llm::down::FailureKind::Model),
+        _ => None,
+    }
+}
+
+/// 在候选链上执行上游调用：熔断跳过 + 确定性失败跳过 + 可转移重试。
 ///
 /// 调用方负责 RAG/compat 改写与 `req_body` 构造；本函数循环内仅
 /// clone body + 定点改 `model`。中途失败尝试不记 usage（仅 warn 日志）。
 pub async fn execute_with_failover(
     breakers: &crate::llm::breaker::ModelBreakers,
+    known: &crate::llm::down::KnownFailures,
     chain: &crate::llm::router::CandidateChain,
     req_body: &serde_json::Value,
     stream: bool,
@@ -501,6 +516,27 @@ pub async fn execute_with_failover(
     let mut last_attempted: Option<&str> = None; // 实际发起过上游调用的候选 model_id
 
     for cand in &chain.candidates {
+        // 确定性失败跳过：TTL 内的 401/403/404 → 不发起网络调用，
+        // 单模型链秒回缓存错误，多候选链跳过死候选继续尝试健康备选。
+        let known_auth = format!("p:{}", cand.provider.id);
+        let known_model = format!("m:{}", cand.model_id);
+        if let Some(info) = known
+            .lookup(&known_auth)
+            .or_else(|| known.lookup(&known_model))
+        {
+            tracing::debug!(
+                model_id = %cand.model_id,
+                model = %cand.model_name,
+                status = info.status,
+                "LLM failover: candidate skipped (known deterministic failure)"
+            );
+            last_err = Some((
+                StatusCode::from_u16(info.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                info.message,
+            ));
+            continue;
+        }
+
         if !breakers.allow(&cand.model_id) {
             tracing::debug!(
                 model_id = %cand.model_id,
@@ -557,7 +593,26 @@ pub async fn execute_with_failover(
                     last_err = Some((status, msg));
                     continue;
                 }
-                // 不可转移（4xx）：上游可达，计成功；立即终止
+                // 确定性失败（401/403/404）：记录到 known-failures 缓存，
+                // 并继续尝试后续候选（组场景：dead key 不应再阻塞请求，应转移）。
+                if let Some(kind) = deterministic_failure(status) {
+                    let key = match kind {
+                        crate::llm::down::FailureKind::ProviderAuth => {
+                            format!("p:{}", cand.provider.id)
+                        }
+                        crate::llm::down::FailureKind::Model => format!("m:{}", cand.model_id),
+                    };
+                    known.record(&key, kind, status.as_u16(), &msg);
+                    tracing::warn!(
+                        group = ?chain.group_name,
+                        from_model = %cand.model_name,
+                        status = status.as_u16(),
+                        "LLM failover: upstream deterministic failure recorded, trying next"
+                    );
+                    last_err = Some((status, msg));
+                    continue;
+                }
+                // 不可转移（其余 4xx）：上游可达，计成功；立即终止
                 breakers.record_success(&cand.model_id);
                 return FailoverOutcome::Exhausted {
                     status,
@@ -780,6 +835,10 @@ pub fn model_not_found_response(message: String, available_models: Vec<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 共享空知道失败缓存：既有用例不产生确定性失败记录，静态共享无害。
+    static EMPTY_KNOWN: std::sync::LazyLock<crate::llm::down::KnownFailures> =
+        std::sync::LazyLock::new(crate::llm::down::KnownFailures::new);
 
     #[test]
     fn test_error_response_contains_openai_format() {
@@ -1339,7 +1398,7 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -1378,7 +1437,7 @@ mod tests {
         let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1427,7 +1486,7 @@ mod tests {
         let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1474,7 +1533,7 @@ mod tests {
 
         // 连续 5 次请求把 id-bad 打到熔断
         for _ in 0..5 {
-            let _ = execute_with_failover(&breakers, &chain, &body, false).await;
+            let _ = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         }
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5);
         assert_eq!(
@@ -1482,7 +1541,7 @@ mod tests {
             crate::llm::breaker::BreakerStateView::Open
         );
         // 第 6 次：坏候选被跳过，直接打好候选
-        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
     }
@@ -1500,7 +1559,7 @@ mod tests {
             breakers.record_failure("id2");
         }
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
-        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         let FailoverOutcome::Exhausted {
             status,
             message,
@@ -1544,7 +1603,7 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let started = std::time::Instant::now();
-        let out = execute_with_failover(&breakers, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
         let ttfb = started.elapsed();
         let FailoverOutcome::Success {
             resp, failed_over, ..
@@ -1592,7 +1651,7 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1676,6 +1735,170 @@ mod tests {
 
         let err = relay_upstream_body(resp).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
-        assert!(err.1.contains("exceeded"), "错误文案应含 exceeded: {}", err.1);
+        assert!(
+            err.1.contains("exceeded"),
+            "错误文案应含 exceeded: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failover_401_recorded_and_group_fails_over_to_backup() {
+        // 组 [A(401), B(200)]：首选 key 失效 → 记录确定性失败并转移；
+        // 第二次请求 A 被跳过（TTL 内），直达 B。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let h = a_hits.clone();
+        let a = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(
+                    &mut s,
+                    "401 Unauthorized",
+                    "{\"error\":\"invalid api key\"}",
+                )
+                .await;
+            })
+        })
+        .await;
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let h = b_hits.clone();
+        let b = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let known = crate::llm::down::KnownFailures::new();
+        let chain = test_chain(&[(&a, "m-a", "id-a"), (&b, "m-b", "id-b")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        // 第一次：A 401 → 记录并转移 → B 成功
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let FailoverOutcome::Success {
+            candidate,
+            failed_over,
+            ..
+        } = out
+        else {
+            panic!("expected success via backup");
+        };
+        assert_eq!(candidate.model_id, "id-b");
+        assert!(failed_over, "从失效首选转移到备选应记为 failed_over");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+
+        // 第二次：A 被跳过（known 失败），B 再次成功
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        assert!(matches!(out, FailoverOutcome::Success { .. }));
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            1,
+            "确定性失败后首选不再被请求"
+        );
+        assert_eq!(b_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_failover_single_401_cached_returns_without_network() {
+        // 单元素链 401：第一次真实调用失败并记录；第二次直接秒回，不再打上游。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let a = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "401 Unauthorized", "{\"error\":\"bad key\"}").await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let known = crate::llm::down::KnownFailures::new();
+        let chain = test_chain(&[(&a, "m-a", "id-a")]);
+        let body = serde_json::json!({"model": "single", "stream": false, "messages": []});
+
+        // 第一次：网络调用 → 401
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted { status, .. } = out else {
+            panic!("expected exhausted");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // 第二次：known 命中，不发起网络调用，仍返回 401 错误
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let FailoverOutcome::Exhausted {
+            status, message, ..
+        } = out
+        else {
+            panic!("expected exhausted");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            message.contains("401"),
+            "应返回缓存的上游错误消息: {message}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "确定性失败后不应再发起网络调用"
+        );
+
+        // 手动清除后立即恢复探测
+        known.clear_all();
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        assert!(matches!(out, FailoverOutcome::Exhausted { .. }));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_failover_400_not_cached_and_still_hard_stops() {
+        // 400 不纳入确定性失败：不缓存、不转移（第二个候选不被请求），每次重新请求首选。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let a = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "400 Bad Request", "{\"error\":\"bad input\"}").await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let known = crate::llm::down::KnownFailures::new();
+        let chain = test_chain(&[(&a, "m-a", "id-a"), ("http://127.0.0.1:1", "m-b", "id-b")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        for _ in 0..2 {
+            let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+            let FailoverOutcome::Exhausted { status, .. } = out else {
+                panic!("expected exhausted");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "400 不缓存：每次都重新请求首选"
+        );
     }
 }

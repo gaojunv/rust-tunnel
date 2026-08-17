@@ -116,8 +116,14 @@ async fn generate_title_inner(
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
     let body = crate::llm::upstream::build_upstream_body(&request);
-    let outcome =
-        crate::llm::upstream::execute_with_failover(&llm.breakers, &chain, &body, false).await;
+    let outcome = crate::llm::upstream::execute_with_failover(
+        &llm.breakers,
+        &llm.known_failures,
+        &chain,
+        &body,
+        false,
+    )
+    .await;
     let crate::llm::upstream::FailoverOutcome::Success { resp, .. } = outcome else {
         return Err("LLM unavailable for title generation".to_string());
     };

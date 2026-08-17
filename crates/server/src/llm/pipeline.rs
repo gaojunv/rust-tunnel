@@ -205,6 +205,7 @@ pub async fn run_execution(
     .await;
     let outcome = super::upstream::execute_with_failover(
         &state.llm.breakers,
+        &state.llm.known_failures,
         chain,
         &req_body,
         request.stream,

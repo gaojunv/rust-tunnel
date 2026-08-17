@@ -683,9 +683,14 @@ pub async fn run_agent_turn(
             raw_body: None,
         };
         let req_body = crate::llm::upstream::build_upstream_body(&request);
-        let outcome =
-            crate::llm::upstream::execute_with_failover(&llm.breakers, &chain, &req_body, true)
-                .await;
+        let outcome = crate::llm::upstream::execute_with_failover(
+            &llm.breakers,
+            &llm.known_failures,
+            &chain,
+            &req_body,
+            true,
+        )
+        .await;
 
         let mut resp = match outcome {
             crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
@@ -743,6 +748,7 @@ pub async fn run_agent_turn(
                                 .await;
                             let retry = crate::llm::upstream::execute_with_failover(
                                 &llm.breakers,
+                                &llm.known_failures,
                                 &chain,
                                 &req_body,
                                 true,

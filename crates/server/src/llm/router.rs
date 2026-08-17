@@ -45,51 +45,13 @@ pub struct CandidateChain {
     pub group_name: Option<String>,
 }
 
-/// 按 record 构建 ProviderConfig（api_key / extra_config 解密）。
-async fn build_provider(
-    state: &LlmState,
-    provider_id: &str,
-    model_for_err: &str,
-) -> Result<Option<ProviderConfig>, ResolveError> {
-    let db = state
-        .db
-        .as_ref()
-        .ok_or_else(|| ResolveError::Db("database not available".into()))?;
-    let provider_record = db
-        .llm_get_provider(provider_id)
-        .await
-        .map_err(|e| ResolveError::Db(format!("database error: {}", e)))?
-        .ok_or_else(|| ResolveError::ModelNotFound(model_for_err.to_string()))?;
-    if provider_record.enabled == 0 {
-        return Ok(None); // provider 禁用：候选被过滤（单模型场景由调用方转 ProviderDisabled）
-    }
-    let api_key = super::crypto::decrypt_field(state.cipher.as_ref(), &provider_record.api_key)
-        .map_err(|e| ResolveError::Db(format!("failed to decrypt provider api key: {}", e)))?;
-    let extra_config = match provider_record.extra_config {
-        Some(ec) => Some(
-            super::crypto::decrypt_field(state.cipher.as_ref(), &ec)
-                .map_err(|e| ResolveError::Db(format!("failed to decrypt extra_config: {}", e)))?,
-        ),
-        None => None,
-    };
-    Ok(Some(ProviderConfig {
-        id: provider_record.id,
-        name: provider_record.name,
-        provider_type: provider_record.provider_type,
-        base_url: provider_record.base_url,
-        api_key,
-        extra_config,
-        anthropic_base_url: provider_record.anthropic_base_url,
-        enabled: provider_record.enabled != 0,
-        created_at: provider_record.created_at,
-        updated_at: provider_record.updated_at,
-    }))
-}
-
 /// 解析模型名 / 别名 / 模型组名为有序候选链。
 ///
 /// 解析顺序：`model_name` 精确 → `alias` → 组名（组 enabled）。
 /// 组成员中模型禁用或 provider 禁用者被过滤；过滤后为空视同 `ModelNotFound`。
+///
+/// 全部走 [`crate::llm::route_cache::RouteCache`] 内存快照，不触碰 DB：
+/// 数据一致性由管理面写入后的 `invalidate` 保证（见 `mgmt/api/llm.rs`）。
 pub async fn resolve_with_failover(
     state: &LlmState,
     model: &str,
@@ -98,21 +60,24 @@ pub async fn resolve_with_failover(
         .db
         .as_ref()
         .ok_or_else(|| ResolveError::Db("database not available".into()))?;
+    let snap = state
+        .route_cache
+        .snapshot(Some(db), state.cipher.as_ref())
+        .await;
 
     // 1) model_name / alias 精确命中 → 单元素链（现有行为）
-    if let Some(model_record) = db
-        .llm_find_model_by_name_or_alias(model)
-        .await
-        .map_err(|e| ResolveError::Db(format!("database error: {}", e)))?
-    {
-        let provider = build_provider(state, &model_record.provider_id, model)
-            .await?
-            .ok_or_else(|| ResolveError::ProviderDisabled(model.to_string()))?;
+    if let Some(m) = snap.find_model_by_name_or_alias(model) {
+        let provider = snap
+            .provider(&m.provider_id)
+            .ok_or_else(|| ResolveError::ModelNotFound(model.to_string()))?;
+        if !provider.enabled {
+            return Err(ResolveError::ProviderDisabled(model.to_string()));
+        }
         return Ok(CandidateChain {
             candidates: vec![Candidate {
-                provider,
-                model_name: model_record.model_name,
-                model_id: model_record.id,
+                provider: provider.clone(),
+                model_name: m.model_name.clone(),
+                model_id: m.id.clone(),
                 priority: 0,
             }],
             group_name: None,
@@ -120,32 +85,29 @@ pub async fn resolve_with_failover(
     }
 
     // 2) 组名命中
-    let Some(group) = db
-        .llm_find_group_by_name(model)
-        .await
-        .map_err(|e| ResolveError::Db(format!("database error: {}", e)))?
-    else {
+    let Some(group) = snap.group_by_name(model) else {
         return Err(ResolveError::ModelNotFound(model.to_string()));
     };
 
-    let members = db
-        .llm_list_group_members(&group.id)
-        .await
-        .map_err(|e| ResolveError::Db(format!("database error: {}", e)))?;
-
     let mut candidates = Vec::new();
-    for m in members {
-        if m.model_enabled == 0 {
-            continue;
-        }
-        let Some(provider) = build_provider(state, &m.provider_id, model).await? else {
-            continue; // provider 禁用：过滤
+    for (model_id, priority) in &group.members {
+        let Some(m) = snap.model(model_id) else {
+            continue; // 孤儿成员（模型已删）：过滤
         };
+        if !m.enabled {
+            continue; // 模型禁用：过滤
+        }
+        let Some(provider) = snap.provider(&m.provider_id) else {
+            continue; // provider 缺失（row 悬空）：过滤
+        };
+        if !provider.enabled {
+            continue; // provider 禁用：过滤
+        }
         candidates.push(Candidate {
-            provider,
-            model_name: m.model_name,
-            model_id: m.model_id,
-            priority: i64::from(m.priority),
+            provider: provider.clone(),
+            model_name: m.model_name.clone(),
+            model_id: m.id.clone(),
+            priority: *priority as i64,
         });
     }
 
@@ -155,7 +117,7 @@ pub async fn resolve_with_failover(
 
     Ok(CandidateChain {
         candidates,
-        group_name: Some(group.name),
+        group_name: Some(group.name.clone()),
     })
 }
 
@@ -205,45 +167,11 @@ pub async fn resolve_error_response(
 /// Only returns models whose provider is also enabled.
 pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.as_ref().ok_or("database not available")?;
-
-    let models = db
-        .llm_list_models()
-        .await
-        .map_err(|e| format!("database error: {}", e))?;
-
-    let providers = db
-        .llm_list_providers()
-        .await
-        .map_err(|e| format!("database error: {}", e))?;
-
-    let enabled_providers: std::collections::HashSet<String> = providers
-        .iter()
-        .filter(|p| p.enabled != 0)
-        .map(|p| p.id.clone())
-        .collect();
-
-    let provider_map: std::collections::HashMap<String, String> = providers
-        .iter()
-        .map(|p| (p.id.clone(), p.name.clone()))
-        .collect();
-
-    let result: Vec<serde_json::Value> = models
-        .into_iter()
-        .filter(|m| m.enabled != 0 && enabled_providers.contains(&m.provider_id))
-        .map(|m| {
-            serde_json::json!({
-                "id": if m.alias.is_empty() { &m.model_name } else { &m.alias },
-                "object": "model",
-                "created": 0,
-                "owned_by": provider_map
-                    .get(&m.provider_id)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            })
-        })
-        .collect();
-
-    Ok(result)
+    let snap = state
+        .route_cache
+        .snapshot(Some(db), state.cipher.as_ref())
+        .await;
+    Ok(snap.available_models())
 }
 
 #[cfg(test)]

@@ -312,8 +312,14 @@ async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result
         raw_body: None,
     };
     let req_body = crate::llm::upstream::build_upstream_body(&request);
-    let outcome =
-        crate::llm::upstream::execute_with_failover(&llm.breakers, &chain, &req_body, false).await;
+    let outcome = crate::llm::upstream::execute_with_failover(
+        &llm.breakers,
+        &llm.known_failures,
+        &chain,
+        &req_body,
+        false,
+    )
+    .await;
     let resp = match outcome {
         crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
         crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {

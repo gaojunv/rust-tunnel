@@ -3,12 +3,14 @@ pub mod auth;
 pub mod breaker;
 pub mod compat;
 pub mod crypto;
+pub mod down;
 pub mod format;
 pub mod openai_handler;
 pub mod pipeline;
 pub mod provider;
 #[cfg(feature = "rag")]
 pub mod rag;
+pub mod route_cache;
 pub mod router;
 pub mod upstream;
 pub mod usage;
@@ -315,6 +317,10 @@ pub struct LlmState {
     pub dynamic_config: Arc<RwLock<crate::dynamic_config::DynamicConfig>>,
     /// 按模型粒度的熔断器（故障转移时跳过持续失败的候选）。
     pub breakers: breaker::ModelBreakers,
+    /// 路由实体（provider/model/group）内存缓存，避免请求热路径的 DB 往返。
+    pub route_cache: route_cache::RouteCache,
+    /// 确定性失败缓存（401/403/404 等"必然失败"的候选，TTL 内跳过网络调用）。
+    pub known_failures: down::KnownFailures,
 }
 
 impl LlmState {
@@ -333,6 +339,8 @@ impl LlmState {
                 crate::dynamic_config::DynamicConfig::default_for_llm(),
             )),
             breakers: breaker::ModelBreakers::new(),
+            route_cache: route_cache::RouteCache::new(),
+            known_failures: down::KnownFailures::new(),
         }
     }
 
@@ -353,6 +361,8 @@ impl LlmState {
                 crate::dynamic_config::DynamicConfig::default_for_llm(),
             )),
             breakers: breaker::ModelBreakers::new(),
+            route_cache: route_cache::RouteCache::new(),
+            known_failures: down::KnownFailures::new(),
         }
     }
 }

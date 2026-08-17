@@ -257,6 +257,8 @@ pub async fn create_provider(
             .into_response();
     }
 
+    llm_invalidate(&state).await;
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"status": "ok", "id": id})),
@@ -341,6 +343,8 @@ pub async fn update_provider(
             .into_response();
     }
 
+    llm_invalidate(&state).await;
+
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -361,6 +365,7 @@ pub async fn toggle_provider(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     StatusCode::OK.into_response()
 }
 
@@ -379,6 +384,7 @@ pub async fn delete_provider(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     StatusCode::OK.into_response()
 }
 
@@ -482,6 +488,9 @@ pub async fn add_model(
         )
             .into_response();
     }
+
+    llm_invalidate(&state).await;
+
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"status": "ok", "id": id})),
@@ -517,6 +526,7 @@ pub async fn update_model(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     StatusCode::OK.into_response()
 }
 
@@ -535,6 +545,7 @@ pub async fn delete_model(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     StatusCode::OK.into_response()
 }
 
@@ -839,6 +850,16 @@ async fn llm_breakers(state: &ApiState) -> ModelBreakers {
         .unwrap_or_default()
 }
 
+/// 任何 provider/model/group 配置写入后调用：使路由缓存失效并清空确定性失败缓存，
+/// 让最新配置立即作用于请求热路径（换 key / 改模型 / 调组成员无需等 TTL）。
+async fn llm_invalidate(state: &ApiState) {
+    let guard = state.server_state.proxy_state.llm_state.read().await;
+    if let Some(llm) = guard.as_ref() {
+        llm.route_cache.invalidate().await;
+        llm.known_failures.clear_all();
+    }
+}
+
 /// GET /api/llm/model-groups
 pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoResponse {
     let db = match state.server_state.db() {
@@ -910,6 +931,7 @@ pub async fn create_model_group(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     (
         StatusCode::CREATED,
         Json(serde_json::json!({"status": "ok", "id": id})),
@@ -1037,6 +1059,7 @@ pub async fn update_model_group(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -1067,6 +1090,7 @@ pub async fn delete_model_group(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -1116,6 +1140,7 @@ pub async fn replace_group_members(
         )
             .into_response();
     }
+    llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
@@ -1144,6 +1169,8 @@ pub async fn reset_group_breaker(
     let count = ids.len();
     let breakers = llm_breakers(&state).await;
     breakers.reset_many(&ids);
+    // 同时清空确定性失败缓存（手册重置语义：立即恢复探测，不等 TTL）
+    llm_invalidate(&state).await;
     Json(serde_json::json!({"status": "ok", "reset": count})).into_response()
 }
 
