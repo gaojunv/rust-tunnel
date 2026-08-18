@@ -33,6 +33,13 @@ pub enum SseFeed {
         reasoning: String,
         content: Option<String>,
     },
+    /// tool_calls 增量透传：`calls` 为一行内出现的各 index 增量；
+    /// `content` 为同行 delta 携带的正文增量（同帧 tool_calls + content
+    /// 时两个 WS 帧都要发，正文不丢）。
+    ToolCallDelta {
+        calls: Vec<ToolCallDeltaItem>,
+        content: Option<String>,
+    },
     /// 该行无产出（role delta、空行、注释、畸形行跳过）
     None,
     /// [DONE]
@@ -40,6 +47,15 @@ pub enum SseFeed {
     /// 聚合字节超限（MAX_STREAM_BYTES）：调用方应终止流并报错，
     /// 不落库半截消息。
     Overflow,
+}
+
+/// tool_calls 增量单条透传（一行可含多个 index 的增量；各字段单独出现才携带）。
+#[derive(Debug, Clone)]
+pub struct ToolCallDeltaItem {
+    pub index: usize,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 pub struct SseAggregator {
@@ -128,7 +144,9 @@ impl SseAggregator {
             return SseFeed::None;
         };
 
-        // tool_calls 增量：按 index 分桶，id/name/arguments 字符串拼接
+        // tool_calls 增量：按 index 分桶，id/name/arguments 字符串拼接，
+        // 同时收集每条增量的 per-line 透传结构（ToolCallDeltaItem）。
+        let mut tool_deltas: Vec<ToolCallDeltaItem> = Vec::new();
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in calls {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
@@ -139,32 +157,39 @@ impl SseAggregator {
                     self.calls
                         .resize(index + 1, (String::new(), String::new(), String::new()));
                 }
-                let slot = &mut self.calls[index];
-                // 字段级借用（slot 持有 self.calls，bytes/limit 是独立字段），
-                // 故内联检查而非调用 &mut self 方法，避免重复借用。
-                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                    if self.bytes.saturating_add(id.len()) > self.limit {
-                        return SseFeed::Overflow;
-                    }
-                    self.bytes += id.len();
-                    slot.0.push_str(id);
-                }
-                if let Some(f) = tc.get("function") {
-                    if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
-                        if self.bytes.saturating_add(name.len()) > self.limit {
+                let mut item = ToolCallDeltaItem { index, id: None, name: None, arguments: None };
+                {
+                    let slot = &mut self.calls[index];
+                    // 字段级借用（slot 持有 self.calls，bytes/limit 是独立字段），
+                    // 故内联检查而非调用 &mut self 方法，避免重复借用。
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        if self.bytes.saturating_add(id.len()) > self.limit {
                             return SseFeed::Overflow;
                         }
-                        self.bytes += name.len();
-                        slot.1.push_str(name);
+                        self.bytes += id.len();
+                        slot.0.push_str(id);
+                        item.id = Some(id.to_string());
                     }
-                    if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
-                        if self.bytes.saturating_add(args.len()) > self.limit {
-                            return SseFeed::Overflow;
+                    if let Some(f) = tc.get("function") {
+                        if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                            if self.bytes.saturating_add(name.len()) > self.limit {
+                                return SseFeed::Overflow;
+                            }
+                            self.bytes += name.len();
+                            slot.1.push_str(name);
+                            item.name = Some(name.to_string());
                         }
-                        self.bytes += args.len();
-                        slot.2.push_str(args);
+                        if let Some(args) = f.get("arguments").and_then(|v| v.as_str()) {
+                            if self.bytes.saturating_add(args.len()) > self.limit {
+                                return SseFeed::Overflow;
+                            }
+                            self.bytes += args.len();
+                            slot.2.push_str(args);
+                            item.arguments = Some(args.to_string());
+                        }
                     }
                 }
+                tool_deltas.push(item);
             }
         }
 
@@ -175,6 +200,14 @@ impl SseAggregator {
                 return SseFeed::Overflow;
             }
             self.text.push_str(s);
+        }
+
+        // tool_calls 增量透传优先：该行有工具增量时返回 ToolCallDelta（携带同行正文）
+        if !tool_deltas.is_empty() {
+            return SseFeed::ToolCallDelta {
+                calls: tool_deltas,
+                content: content_delta.map(|s| s.to_string()),
+            };
         }
 
         // reasoning_content 增量提取（DeepSeek thinking 模式）
@@ -238,6 +271,11 @@ mod tests {
                     SseFeed::Content(s) => out.push_str(&s),
                     SseFeed::Thought { reasoning, content } => {
                         out.push_str(&reasoning);
+                        if let Some(c) = content {
+                            out.push_str(&c);
+                        }
+                    }
+                    SseFeed::ToolCallDelta { content, .. } => {
                         if let Some(c) = content {
                             out.push_str(&c);
                         }
@@ -469,5 +507,59 @@ mod tests {
         }
         let turn = agg.finish().unwrap();
         assert!(turn.reasoning.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_delta_emitted_per_line() {
+        // tool_calls 增量应通过 ToolCallDelta 变体逐行透传 id/name/arguments
+        let mut agg = SseAggregator::new();
+        let feed1 = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"c"}}]},"index":0}]}"#,
+        );
+        match &feed1 {
+            SseFeed::ToolCallDelta { calls, content } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].index, 0);
+                assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+                assert_eq!(calls[0].name.as_deref(), Some("shell"));
+                assert_eq!(calls[0].arguments.as_deref(), Some("{\"c"));
+                assert!(content.is_none());
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        // 第二行只有 arguments 增量，无 id/name
+        let feed2 = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"md\":\"ls\"}"}}]},"index":0}]}"#,
+        );
+        match &feed2 {
+            SseFeed::ToolCallDelta { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert!(calls[0].id.is_none());
+                assert!(calls[0].name.is_none());
+                assert_eq!(calls[0].arguments.as_deref(), Some("md\":\"ls\"}"));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        // 聚合结果仍正确
+        let turn = agg.finish().unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "shell");
+        assert_eq!(turn.tool_calls[0].args, r#"{"cmd":"ls"}"#);
+    }
+
+    #[test]
+    fn test_tool_call_delta_with_content() {
+        // 同一行 tool_calls + content：返回 ToolCallDelta 并携带 content
+        let mut agg = SseAggregator::new();
+        let feed = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}],"content":"看这个文件"},"index":0}]}"#,
+        );
+        match feed {
+            SseFeed::ToolCallDelta { calls, content } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(content.as_deref(), Some("看这个文件"));
+            }
+            other => panic!("expected ToolCallDelta with content, got {other:?}"),
+        }
     }
 }

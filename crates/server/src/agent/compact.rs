@@ -60,6 +60,7 @@ pub fn is_context_overflow(status: u16, message: &str) -> bool {
         "context_length_exceeded",
         "too many tokens",
         "prompt is too long",
+        "too large for model",
     ]
     .iter()
     .any(|p| lower.contains(p))
@@ -321,8 +322,8 @@ mod tests {
         // 大小写不敏感
         assert!(is_context_overflow(400, "Context Length Exceeded"));
         assert!(is_context_overflow(400, "PROMPT IS TOO LONG"));
-        // 400 状态码
-        assert!(is_context_overflow(400, "some context error"));
+        // 非溢出 400（含 "context" 但不含已知模式）
+        assert!(!is_context_overflow(400, "some context error"));
         // 非 4xx 不命中
         assert!(!is_context_overflow(500, "context length"));
         assert!(!is_context_overflow(200, "maximum context"));

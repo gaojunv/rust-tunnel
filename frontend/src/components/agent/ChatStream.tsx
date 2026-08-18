@@ -33,11 +33,13 @@ import {
 } from './history';
 import {
   appendChildStream,
+  applyToolCallChunk,
   chunkKey,
   collectSubagents,
   mergePages,
   parseChunkKey,
   patchChildToolResult,
+  STREAM_TOOL_ID_PREFIX,
   upsertToolCard,
 } from './subagent';
 import type { SessionConfigOption } from '../../types';
@@ -51,6 +53,7 @@ const TURN_ACTIVITY_TYPES = new Set([
   'assistant_chunk',
   'stream_reset',
   'tool_call',
+  'tool_call_chunk',
   'tool_result',
   'plan',
   'usage',
@@ -650,13 +653,17 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks(); // 清缓冲后为 no-op，仅取消 pending flush 定时器
         breakStream();
         setItems((prev) => {
+          let next = prev;
           if (idx !== null) {
-            const k = prev[idx]?.kind;
+            const k = next[idx]?.kind;
             if (k === 'assistant' || k === 'thought') {
-              return prev.filter((_, i) => i !== idx); // 真正移除半截气泡
+              next = next.filter((_, i) => i !== idx); // 真正移除半截气泡
             }
           }
-          return prev;
+          // 清理残留的 tool_call_chunk 流式占位卡（重试后流式从头开始）
+          return next.filter(
+            (it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)),
+          );
         });
       } else if (msg.type === 'tool_call') {
         const parentToolId = msg.parent_tool_call_id;
@@ -706,6 +713,12 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         } else {
           breakStream();
           setItems((prev) => {
+            // 流式占位卡清理：tool_call_chunk 创建的 __stream_ 合成键占位卡
+            // 在正式 tool_call 帧到达后被 upsertToolCard 按真实 id 替换，
+            // 但合成键占位卡（无真实 id 匹配时）残留需清理。
+            const cleaned = prev.filter(
+              (it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)),
+            );
             // 去重：刷新/重连时 live tool_call 可能与 history 已渲染的卡片是同一
             // 工具（tool_call 已落库、tool_result 未到）。按 toolId 就地升级
             // （upsertToolCard：覆盖历史误判的 failed 状态、保留已收纳 children），
@@ -715,18 +728,24 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
             // 本卡 toolId），从主流移除并作为 children 挂载（「孤儿收纳」），保证
             // 先到子事件最终收纳进父卡、不重复、不丢失。
             const orphanKids = toolItem.toolId
-              ? prev.filter((it) => it.parentToolId === toolItem.toolId)
+              ? cleaned.filter((it) => it.parentToolId === toolItem.toolId)
               : [];
             const filtered =
               orphanKids.length > 0
-                ? prev.filter((it) => it.parentToolId !== toolItem.toolId)
-                : prev;
+                ? cleaned.filter((it) => it.parentToolId !== toolItem.toolId)
+                : cleaned;
             return upsertToolCard(filtered, {
               ...toolItem,
               ...(orphanKids.length > 0 ? { children: orphanKids } : {}),
             });
           });
         }
+      } else if (msg.type === 'tool_call_chunk') {
+        // runner 路径工具参数流式透出：占位卡就地更新（无 id 时用 index 合成键），
+        // 正式 tool_call 帧到达后经 upsertToolCard 就地替换为完整卡片。
+        armRunningTimeout(); // 重置不活动兜底（参数流式期间不算不活动）
+        flushChunks();
+        setItems((prev) => applyToolCallChunk(prev, msg));
       } else if (msg.type === 'tool_result') {
         const parentToolId = msg.parent_tool_call_id;
         if (parentToolId) {
@@ -871,6 +890,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
         flushChunks();
         breakStream();
         stopRunning();
+        // 清理残留的 tool_call_chunk 流式占位卡（安全网：正常流程中正式 tool_call
+        // 帧已替换占位卡，仅流中断时可能残留）
+        setItems((prev) => prev.filter(
+          (it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)),
+        ));
         // 回合成功结束：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17）；
         // 服务端 5 分钟审批超时按 deny、elicitation 超时按 Cancel 继续回合，仍
         // pending 的卡片必须置终态，否则 hasPendingInteraction 恒 true 锁死发送按钮

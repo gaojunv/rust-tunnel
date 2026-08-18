@@ -343,6 +343,32 @@ fn agent_result_to_text(result: &AgentResult) -> String {
 /// 只读工具并发执行上限。
 const READONLY_CONCURRENCY: usize = 4;
 
+/// 把 SseFeed::ToolCallDelta 的增量发送为 WS 帧（主循环与 flush 残留行共用）。
+async fn send_tool_call_delta(
+    ws_tx: &mpsc::Sender<serde_json::Value>,
+    calls: Vec<sse::ToolCallDeltaItem>,
+    content: Option<String>,
+) {
+    for item in calls {
+        let mut frame = serde_json::json!({"type": "tool_call_chunk", "index": item.index});
+        if let Some(id) = &item.id {
+            frame["id"] = serde_json::Value::String(id.clone());
+        }
+        if let Some(name) = &item.name {
+            frame["name"] = serde_json::Value::String(name.clone());
+        }
+        if let Some(arguments) = &item.arguments {
+            frame["arguments"] = serde_json::Value::String(arguments.clone());
+        }
+        let _ = ws_tx.send(frame).await;
+    }
+    if let Some(c) = content {
+        let _ = ws_tx
+            .send(serde_json::json!({"type": "assistant_chunk", "content": c, "final": false}))
+            .await;
+    }
+}
+
 /// 执行一轮工具调用：回填 assistant tool_calls 消息、执行并落库/回填 tool 结果。
 /// 连续的只读调用（ReadFile/ListDir/Search/GitStatus/GitDiff/GitExec-Read）
 /// 以 bounded 并发执行；写类/审批类保持串行语义。结果落库与 WS 帧发送严格
@@ -632,6 +658,7 @@ async fn exec_readonly_group(
 
 /// 执行单个只读工具调用并返回结果文本（不抢 workspace_lock）。
 /// 解析错误/版本不足/docker 未启动等失败折叠为错误文本（与串行路径一致）。
+#[allow(clippy::too_many_arguments)]
 async fn exec_readonly_one(
     agent: &AgentState,
     client_id: &str,
@@ -1135,6 +1162,9 @@ pub async fn run_agent_turn(
                                     .await;
                             }
                         }
+                        sse::SseFeed::ToolCallDelta { calls, content } => {
+                            send_tool_call_delta(&ws_tx, calls, content).await;
+                        }
                         sse::SseFeed::Done => break 'sse,
                         sse::SseFeed::Overflow => {
                             fatal = true;
@@ -1188,6 +1218,9 @@ pub async fn run_agent_turn(
                                 .send(serde_json::json!({"type": "assistant_chunk", "content": c, "final": false}))
                                 .await;
                         }
+                    }
+                    sse::SseFeed::ToolCallDelta { calls, content } => {
+                        send_tool_call_delta(&ws_tx, calls, content).await;
                     }
                     sse::SseFeed::Overflow => {
                         let _ = ws_tx
@@ -1548,6 +1581,7 @@ mod tests {
             sse::SseFeed::Done => panic!("expected Content delta, got Done"),
             sse::SseFeed::Overflow => panic!("expected Content delta, got Overflow"),
             sse::SseFeed::Thought { .. } => panic!("expected Content delta, got Thought"),
+            sse::SseFeed::ToolCallDelta { .. } => panic!("expected Content delta, got ToolCallDelta"),
         }
     }
 

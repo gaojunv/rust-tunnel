@@ -848,6 +848,16 @@ export type AgentWsEvent =
     }
   | { type: 'plan'; entries?: PlanEntryItem[] }
   | { type: 'usage'; used?: number; size?: number }
+  | {
+      /** runner 路径工具参数流式透出（模型写大文件时前端实时可见参数增量） */
+      type: 'tool_call_chunk';
+      /** OpenAI 流式增量按 index 归位 */
+      index?: number;
+      id?: string;
+      name?: string;
+      /** 参数增量片段（前端可累计长度或提取关键信息，不必全文渲染） */
+      arguments?: string;
+    }
   | { type: 'status'; message?: string }
   // 运行中提交消息被服务端 busy 入队的确认帧（队列在服务端，前端不做本地排队）
   | { type: 'queued' }

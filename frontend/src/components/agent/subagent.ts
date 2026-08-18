@@ -338,6 +338,50 @@ export function patchChildToolResult(
   ];
 }
 
+/** 流式 tool_call_chunk 占位卡的合成 toolId 前缀（无 id 时按 index 归位）。 */
+export const STREAM_TOOL_ID_PREFIX = '__stream_';
+
+/**
+ * tool_call_chunk 帧（runner 路径工具参数流式透出）→ 占位卡就地更新：
+ * 参数增量只累计不渲染全文（正式 tool_call 帧到达后经 upsertToolCard 替换）。
+ * 同一 index 的占位卡按真实 id（到达后迁移）或合成键 `__stream_{index}` 匹配；
+ * 新建占位卡用 in_progress 状态渲染「正在调用 <name>…」。
+ */
+export function applyToolCallChunk(
+  list: ChatItem[],
+  msg: { index?: number; id?: string; name?: string; arguments?: string },
+): ChatItem[] {
+  const index = msg.index ?? 0;
+  const synthetic = `${STREAM_TOOL_ID_PREFIX}${index}`;
+  const toolId = msg.id ?? synthetic;
+
+  // 优先按真实 id 找，找不到再按合成键找（id 后到达的迁移中间态）
+  let idx = list.findIndex((it) => it.kind === 'tool' && it.toolId === (msg.id ?? synthetic));
+  if (idx < 0 && msg.id) {
+    idx = list.findIndex((it) => it.kind === 'tool' && it.toolId === synthetic);
+  }
+  const next = [...list];
+  if (idx < 0) {
+    next.push({
+      kind: 'tool',
+      content: '',
+      toolId,
+      toolName: msg.name,
+      toolArgs: msg.arguments,
+      toolStatus: 'in_progress',
+    });
+    return next;
+  }
+  const cur = next[idx];
+  next[idx] = {
+    ...cur,
+    toolId,
+    toolName: msg.name ?? cur.toolName,
+    toolArgs: (cur.toolArgs ?? '') + (msg.arguments ?? ''),
+  };
+  return next;
+}
+
 /** 流式 chunk 攒批键分隔符（parentToolId 内不出现）。 */
 export const CHUNK_SEP = '\u0000';
 
