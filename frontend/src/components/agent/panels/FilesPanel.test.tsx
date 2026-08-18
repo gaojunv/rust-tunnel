@@ -1,15 +1,11 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import FilesPanel, { parsePorcelain } from './FilesPanel';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
-}));
-
-vi.mock('shiki', () => ({
-  codeToHtml: vi.fn().mockResolvedValue('<pre data-testid="highlight">highlighted-code</pre>'),
 }));
 
 vi.mock('../../../api/client', () => ({
@@ -20,20 +16,27 @@ vi.mock('../../../api/client', () => ({
   getApiErrorMessage: vi.fn((err: unknown) => String(err)),
 }));
 
-import { getAgentGitStatus, getFsFile, getFsTree } from '../../../api/client';
+import { getAgentGitStatus, getFsFile, getFsTree, putFsFile } from '../../../api/client';
+
+beforeEach(() => {
+  localStorage.clear();
+});
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
 });
 
-const renderPanel = () => {
+const renderPanel = (workspaceId = 'w1') => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <FilesPanel workspaceId="w1" />
-    </QueryClientProvider>
-  );
+  return {
+    qc,
+    ...render(
+      <QueryClientProvider client={qc}>
+        <FilesPanel workspaceId={workspaceId} />
+      </QueryClientProvider>
+    ),
+  };
 };
 
 describe('parsePorcelain', () => {
@@ -126,20 +129,21 @@ describe('FilesPanel', () => {
     expect(getFsTree).toHaveBeenCalledWith('w1', 'src');
   });
 
-  it('shows preview when a file is clicked', async () => {
+  it('opens a file tab on tree click and previews content', async () => {
     vi.mocked(getFsTree).mockResolvedValue([{ name: 'main.rs', is_dir: false }]);
     vi.mocked(getFsFile).mockResolvedValue({ content: 'fn main() {}', truncated: false });
     vi.mocked(getAgentGitStatus).mockResolvedValue({ status: '', stderr: '' });
 
     renderPanel();
-    const file = await screen.findByText('main.rs');
-    fireEvent.click(file);
+    fireEvent.click(await screen.findByText('main.rs'));
 
-    // 顶栏：返回按钮 + 路径 + 编辑按钮
+    // 顶栏：返回按钮 + 路径 + 编辑按钮；标签条出现该文件
     expect(await screen.findByLabelText('agent.edit')).toBeTruthy();
     expect(screen.getByLabelText('agent.backToTree')).toBeTruthy();
-    // shiki 高亮预览（vi.mock 返回的 HTML）
-    expect(await screen.findByText('highlighted-code')).toBeTruthy();
+    const tablist = await screen.findByRole('tablist');
+    expect(within(tablist).getByText('main.rs')).toBeTruthy();
+    // 只读预览：jsdom 下 CodeMirrorEditor 退化为纯文本 pre（替代原 shiki 高亮）
+    expect(await screen.findByText('fn main() {}')).toBeTruthy();
   });
 
   it('shows truncated banner when file content is truncated', async () => {
@@ -157,5 +161,131 @@ describe('FilesPanel', () => {
 
     renderPanel();
     expect(await screen.findByText('agent.clientOffline')).toBeTruthy();
+  });
+
+  it('renders multiple restored tabs and switches the active one', async () => {
+    localStorage.setItem(
+      'agent.files.w1',
+      JSON.stringify({ open: ['a.rs', 'b.rs'], active: 'a.rs' }),
+    );
+    vi.mocked(getFsTree).mockResolvedValue([
+      { name: 'a.rs', is_dir: false },
+      { name: 'b.rs', is_dir: false },
+    ]);
+    vi.mocked(getFsFile).mockImplementation(async (_ws, path) =>
+      path === 'a.rs'
+        ? { content: 'AAA', truncated: false }
+        : { content: 'BBB', truncated: false }
+    );
+    vi.mocked(getAgentGitStatus).mockResolvedValue({ status: '', stderr: '' });
+
+    renderPanel();
+
+    const tablist = await screen.findByRole('tablist');
+    expect(within(tablist).getByText('a.rs')).toBeTruthy();
+    expect(within(tablist).getByText('b.rs')).toBeTruthy();
+
+    // 初始 active = a.rs：内容可见，tab 高亮
+    const viewA = await screen.findByTestId('file-tab-view-a.rs');
+    expect(await within(viewA).findByText('AAA')).toBeTruthy();
+    expect(
+      within(tablist).getByText('a.rs').closest('[role="tab"]')!.getAttribute('aria-selected'),
+    ).toBe('true');
+
+    // 切换到 b.rs：active 翻转且内容出现
+    fireEvent.click(within(tablist).getByText('b.rs'));
+    expect(
+      within(tablist).getByText('b.rs').closest('[role="tab"]')!.getAttribute('aria-selected'),
+    ).toBe('true');
+    expect(await within(screen.getByTestId('file-tab-view-b.rs')).findByText('BBB')).toBeTruthy();
+  });
+
+  it('closes one tab and activates the right neighbor', async () => {
+    localStorage.setItem(
+      'agent.files.w1',
+      JSON.stringify({ open: ['a.rs', 'b.rs'], active: 'a.rs' }),
+    );
+    vi.mocked(getFsTree).mockResolvedValue([
+      { name: 'a.rs', is_dir: false },
+      { name: 'b.rs', is_dir: false },
+    ]);
+    vi.mocked(getFsFile).mockImplementation(async (_ws, path) => ({
+      content: `${path} content`,
+      truncated: false,
+    }));
+    vi.mocked(getAgentGitStatus).mockResolvedValue({ status: '', stderr: '' });
+
+    renderPanel();
+
+    const tablist = await screen.findByRole('tablist');
+    expect(within(tablist).getByText('b.rs')).toBeTruthy();
+
+    fireEvent.click(within(tablist).getAllByLabelText('agent.closeFile')[0]);
+
+    expect(within(tablist).queryByText('a.rs')).toBeNull();
+    expect(within(tablist).getByText('b.rs')).toBeTruthy();
+    expect(
+      within(tablist).getByText('b.rs').closest('[role="tab"]')!.getAttribute('aria-selected'),
+    ).toBe('true');
+    // 状态已持久化
+    expect(JSON.parse(localStorage.getItem('agent.files.w1')!)).toEqual({
+      open: ['b.rs'],
+      active: 'b.rs',
+    });
+  });
+
+  it('edits a file, shows the unsaved dot, and saves via putFsFile', async () => {
+    vi.mocked(getFsTree).mockResolvedValue([{ name: 'main.rs', is_dir: false }]);
+    vi.mocked(getFsFile).mockResolvedValue({ content: 'fn main() {}', truncated: false });
+    vi.mocked(getAgentGitStatus).mockResolvedValue({ status: '', stderr: '' });
+
+    renderPanel();
+    fireEvent.click(await screen.findByText('main.rs'));
+    // 等文件内容就绪（Edit 按钮在查询完成前是禁用态）
+    expect(await screen.findByText('fn main() {}')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('agent.edit'));
+
+    // jsdom 下编辑框退化为 textarea
+    const textarea = await screen.findByTestId('file-editor');
+    fireEvent.change(textarea, { target: { value: 'fn main() {}\n// edited' } });
+
+    // 未保存圆点出现在标签 title 上
+    expect(await screen.findByTitle('agent.unsavedChanges · main.rs')).toBeTruthy();
+
+    fireEvent.click(screen.getByLabelText('agent.save'));
+    await waitFor(() => {
+      expect(putFsFile).toHaveBeenCalledWith('w1', 'main.rs', 'fn main() {}\n// edited', false);
+    });
+    // 保存成功后退出编辑态（返回预览），未保存标记清除
+    expect(await screen.findByLabelText('agent.edit')).toBeTruthy();
+    expect(screen.queryByTitle('agent.unsavedChanges · main.rs')).toBeNull();
+  });
+
+  it('resets open tabs when the workspace changes', async () => {
+    localStorage.setItem('agent.files.w1', JSON.stringify({ open: ['a.rs'], active: 'a.rs' }));
+    localStorage.setItem('agent.files.w2', JSON.stringify({ open: ['b.rs'], active: 'b.rs' }));
+    vi.mocked(getFsTree).mockResolvedValue([
+      { name: 'a.rs', is_dir: false },
+      { name: 'b.rs', is_dir: false },
+    ]);
+    vi.mocked(getFsFile).mockImplementation(async (_ws, path) => ({
+      content: `${path} content`,
+      truncated: false,
+    }));
+    vi.mocked(getAgentGitStatus).mockResolvedValue({ status: '', stderr: '' });
+
+    const { qc, rerender } = renderPanel('w1');
+    expect(await screen.findByRole('tablist')).toBeTruthy();
+
+    rerender(
+      <QueryClientProvider client={qc}>
+        <FilesPanel workspaceId="w2" />
+      </QueryClientProvider>
+    );
+
+    // w2 的标签恢复，旧 workspace 的标签被清空
+    const tablist = await screen.findByRole('tablist');
+    expect(within(tablist).getByText('b.rs')).toBeTruthy();
+    expect(within(tablist).queryByText('a.rs')).toBeNull();
   });
 });
