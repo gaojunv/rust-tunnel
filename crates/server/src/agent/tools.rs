@@ -27,6 +27,8 @@ const PLAN_MODE_TOOLS: &[&str] = &[
     "git_log",
     "git_show",
     "git_branch",
+    "code_outline",
+    "read_symbol",
 ];
 
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
@@ -338,6 +340,35 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
                         }
                     },
                     "required": ["todos"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "code_outline",
+                "description": "Show the structure of a code file (functions, structs, classes, etc.) with line ranges. Use this BEFORE reading a large file to understand its structure and save tokens.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path of the source file"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_symbol",
+                "description": "Read the full source code of a specific named symbol (function, class, method, etc.) from a file. Use code_outline first to find symbol names, then use this to read the exact implementation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path of the source file"},
+                        "name": {"type": "string", "description": "Exact symbol name to extract (e.g. function/method/struct name)"}
+                    },
+                    "required": ["path", "name"]
                 }
             }
         }),
@@ -798,6 +829,25 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                 path: path.to_string(),
                 old_string: old_string.to_string(),
                 new_string: new_string.to_string(),
+            })
+        }
+        "code_outline" => {
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            Ok(AgentCommand::CodeOutline {
+                path: path.to_string(),
+            })
+        }
+        "read_symbol" => {
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            let sym_name = arg_str(&args, "name", name)?;
+            if sym_name.len() > MAX_PATH_LEN {
+                return Err("name too long".to_string());
+            }
+            Ok(AgentCommand::ReadSymbol {
+                path: path.to_string(),
+                name: sym_name.to_string(),
             })
         }
         other => Err(format!("unknown tool: {other}")),
@@ -1489,5 +1539,29 @@ mod tests {
     fn test_parse_read_file_without_range() {
         let cmd = parse_tool_call("read_file", r#"{"path":"src/main.rs"}"#).unwrap();
         assert!(matches!(cmd, AgentCommand::ReadFile { .. }));
+    }
+
+    #[test]
+    fn test_parse_code_outline() {
+        match parse_tool_call("code_outline", r#"{"path":"src/main.rs"}"#).unwrap() {
+            AgentCommand::CodeOutline { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected CodeOutline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_read_symbol() {
+        match parse_tool_call("read_symbol", r#"{"path":"src/main.rs","name":"main"}"#).unwrap() {
+            AgentCommand::ReadSymbol { path, name } => {
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(name, "main");
+            }
+            other => panic!("expected ReadSymbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_read_symbol_requires_name() {
+        assert!(parse_tool_call("read_symbol", r#"{"path":"a.rs"}"#).is_err());
     }
 }

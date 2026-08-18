@@ -226,6 +226,28 @@ describe('MessageBubble tool card collapsing', () => {
     expect(header.textContent).toContain('a.ts');
   });
 
+  it('code_outline 工具显示为 Read + 文件名摘要', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'code_outline', toolArgs: '{"path":"src/main.rs"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Read');
+    expect(header.textContent).toContain('main.rs');
+  });
+
+  it('read_symbol 工具显示为 Read + 文件名摘要', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'read_symbol', toolArgs: '{"path":"src/main.rs","name":"main"}' }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Read');
+    expect(header.textContent).toContain('main.rs');
+  });
+
   it('ACP 命令摘要显示 command，不显示原始 {} 对象', () => {
     render(
       <MessageBubble item={{ kind: 'tool', content: '', toolName: 'Bash', toolArgs: '{"command":"ls"}' }} />,

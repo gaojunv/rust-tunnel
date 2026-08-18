@@ -88,6 +88,15 @@ pub enum AgentCommand {
         offset: Option<u64>,
         limit: Option<u64>,
     },
+    /// 代码结构概览：tree-sitter 解析后输出函数/结构体/类等符号列表
+    CodeOutline {
+        path: String,
+    },
+    /// 按符号名精确提取：返回符号完整源码
+    ReadSymbol {
+        path: String,
+        name: String,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -921,6 +930,24 @@ mod tests {
             let bytes = bincode::serialize(&cmd).unwrap();
             let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
             assert_eq!(format!("{back:?}"), format!("{:?}", cmd));
+        }
+    }
+
+    #[test]
+    fn test_agent_command_code_outline_read_symbol_roundtrip() {
+        let cmds = vec![
+            AgentCommand::CodeOutline {
+                path: "src/main.rs".into(),
+            },
+            AgentCommand::ReadSymbol {
+                path: "src/main.rs".into(),
+                name: "main".into(),
+            },
+        ];
+        for cmd in cmds {
+            let bytes = bincode::serialize(&cmd).unwrap();
+            let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{cmd:?}"));
         }
     }
 

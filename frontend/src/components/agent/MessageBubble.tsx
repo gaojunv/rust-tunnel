@@ -117,6 +117,8 @@ const FILE_ALIASES = [
   'patch file', 'patch_file', 'patch',
   'delete', 'remove file', 'remove',
   'move file', 'move', 'rename',
+  'code outline', 'code_outline', 'outline',
+  'read symbol', 'read_symbol', 'symbol',
 ];
 
 /** 是否为文件类工具（摘要为文件/目录路径而非命令）。runner 旧格式认
@@ -126,7 +128,7 @@ const FILE_ALIASES = [
 function isFileTool(kind: ToolKind | undefined, name: string | undefined): boolean {
   if (kind === 'read' || kind === 'edit' || kind === 'delete' || kind === 'move') return true;
   const nm = (name ?? '').toLowerCase();
-  if (['read_file', 'write_file', 'patch_file', 'list_dir', 'read', 'write', 'edit', 'delete', 'move', 'glob'].includes(nm)) {
+  if (['read_file', 'write_file', 'patch_file', 'list_dir', 'read', 'write', 'edit', 'delete', 'move', 'glob', 'code_outline', 'read_symbol', 'outline', 'symbol'].includes(nm)) {
     return true;
   }
   // ACP title 风格：内嵌目标在标题末尾（"Edit src/a.ts"），按文件类别名前缀剥离识别
@@ -211,7 +213,7 @@ function KindChip({ kind }: { kind: ToolKind }) {
  *  `stripPrefix: false`（execute）时仅在 title 恰等于别名时归一——命令本体可能
  *  以 "run"/"bash" 等词开头，前缀剥离会截断真实命令。 */
 const KIND_META: Record<ToolKind, { label: string; aliases: string[]; stripPrefix: boolean }> = {
-  read: { label: 'Read', aliases: ['read file', 'read_file', 'read', 'list_dir', 'list directory'], stripPrefix: true },
+  read: { label: 'Read', aliases: ['read file', 'read_file', 'read', 'list_dir', 'list directory', 'code outline', 'code_outline', 'outline', 'read symbol', 'read_symbol', 'symbol'], stripPrefix: true },
   edit: { label: 'Edit', aliases: ['edit file', 'edit', 'write file', 'write_file', 'write', 'patch file', 'patch_file', 'patch'], stripPrefix: true },
   delete: { label: 'Delete', aliases: ['delete file', 'delete', 'remove file', 'remove'], stripPrefix: true },
   move: { label: 'Move', aliases: ['move file', 'move', 'rename'], stripPrefix: true },

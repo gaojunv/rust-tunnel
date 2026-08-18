@@ -253,7 +253,9 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
         | AgentCommand::ListDir { .. }
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
-        | AgentCommand::GitDiff { .. } => false,
+        | AgentCommand::GitDiff { .. }
+        | AgentCommand::CodeOutline { .. }
+        | AgentCommand::ReadSymbol { .. } => false,
         AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
             mode == "safe" || is_dangerous_shell(cmd)
         }
@@ -286,7 +288,9 @@ pub fn is_readonly_command(cmd: &AgentCommand) -> bool {
         | AgentCommand::ListDir { .. }
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
-        | AgentCommand::GitDiff { .. } => true,
+        | AgentCommand::GitDiff { .. }
+        | AgentCommand::CodeOutline { .. }
+        | AgentCommand::ReadSymbol { .. } => true,
         AgentCommand::GitExec { args } => matches!(
             git_plan::plan(args),
             Ok(planned) if planned.risk == GitRisk::Read
@@ -790,6 +794,14 @@ mod tests {
         assert!(is_readonly_command(&AgentCommand::ReadFileRange {
             path: "a.rs".into(), offset: Some(10), limit: Some(20)
         }));
+    }
+
+    #[test]
+    fn test_code_outline_read_symbol_readonly() {
+        assert!(!needs_approval("safe", &AgentCommand::CodeOutline { path: "a.rs".into() }));
+        assert!(!needs_approval("safe", &AgentCommand::ReadSymbol { path: "a.rs".into(), name: "main".into() }));
+        assert!(is_readonly_command(&AgentCommand::CodeOutline { path: "a.rs".into() }));
+        assert!(is_readonly_command(&AgentCommand::ReadSymbol { path: "a.rs".into(), name: "main".into() }));
     }
 
     #[test]

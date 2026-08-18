@@ -782,6 +782,10 @@ async fn handle_single_tool_call(
                     MIN_READ_RANGE_CLIENT_VERSION,
                     client_supports_read_range as fn(Option<&str>) -> bool,
                 )),
+                AgentCommand::CodeOutline { .. } | AgentCommand::ReadSymbol { .. } => Some((
+                    MIN_READ_RANGE_CLIENT_VERSION,
+                    client_supports_read_range as fn(Option<&str>) -> bool,
+                )),
                 _ => None,
             };
             if let Some((min_version, supports)) = gated {
@@ -1345,6 +1349,10 @@ async fn exec_readonly_one(
             client_supports_git_exec as fn(Option<&str>) -> bool,
         )),
         AgentCommand::ReadFileRange { .. } => Some((
+            MIN_READ_RANGE_CLIENT_VERSION,
+            client_supports_read_range as fn(Option<&str>) -> bool,
+        )),
+        AgentCommand::CodeOutline { .. } | AgentCommand::ReadSymbol { .. } => Some((
             MIN_READ_RANGE_CLIENT_VERSION,
             client_supports_read_range as fn(Option<&str>) -> bool,
         )),

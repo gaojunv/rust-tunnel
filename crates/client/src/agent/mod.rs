@@ -1,6 +1,8 @@
 //! Agent executor: executes `AgentCommand`s received over the control channel,
 //! sandboxed to the workspace root directory.
 
+pub(crate) mod code_outline;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -568,6 +570,43 @@ pub async fn handle_exec_request(
                     }
                 }
                 None => patch_file_host(&abs, old_string, new_string).await,
+            },
+            Err(e) => AgentResult::Error { message: e },
+        },
+        AgentCommand::CodeOutline { path } => match resolve_sandboxed(root_path, path) {
+            Ok(p) => match docker_container {
+                Some(c) => {
+                    // Docker 模式：先读文件，再本地解析
+                    let file_result = docker_read_file(c, &p, timeout).await;
+                    match file_result {
+                        AgentResult::FileContent { content } => code_outline::exec_outline(&content, path),
+                        other => other,
+                    }
+                }
+                None => match tokio::fs::read_to_string(&p).await {
+                    Ok(content) => code_outline::exec_outline(&content, path),
+                    Err(e) => AgentResult::Error {
+                        message: format!("read {} failed: {e}", p.display()),
+                    },
+                },
+            },
+            Err(e) => AgentResult::Error { message: e },
+        },
+        AgentCommand::ReadSymbol { path, name } => match resolve_sandboxed(root_path, path) {
+            Ok(p) => match docker_container {
+                Some(c) => {
+                    let file_result = docker_read_file(c, &p, timeout).await;
+                    match file_result {
+                        AgentResult::FileContent { content } => code_outline::exec_read_symbol(&content, path, name),
+                        other => other,
+                    }
+                }
+                None => match tokio::fs::read_to_string(&p).await {
+                    Ok(content) => code_outline::exec_read_symbol(&content, path, name),
+                    Err(e) => AgentResult::Error {
+                        message: format!("read {} failed: {e}", p.display()),
+                    },
+                },
             },
             Err(e) => AgentResult::Error { message: e },
         },
