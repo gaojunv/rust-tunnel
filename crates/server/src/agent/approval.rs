@@ -253,6 +253,44 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
     }
 }
 
+/// 命令是否只读（可并发执行、不涉审批、无需 workspace_lock）：
+/// 与 needs_approval 对 ReadFile/ListDir/Search/GitStatus/GitDiff/GitExec(Read)
+/// 恒返回 false 的集合一致（full_auto 的全局放行不参与——写命令仍须串行保序）。
+pub fn is_readonly_command(cmd: &AgentCommand) -> bool {
+    match cmd {
+        AgentCommand::ReadFile { .. }
+        | AgentCommand::ListDir { .. }
+        | AgentCommand::Search { .. }
+        | AgentCommand::GitStatus
+        | AgentCommand::GitDiff { .. } => true,
+        AgentCommand::GitExec { args } => matches!(
+            git_plan::plan(args),
+            Ok(planned) if planned.risk == GitRisk::Read
+        ),
+        _ => false,
+    }
+}
+
+/// 把工具调用标记数组划分为「连续只读段」与「串行单调用」交替段。
+/// 纯函数便于单测（并发/顺序分组逻辑不依赖 I/O）。
+pub fn partition_tool_calls(flags: &[bool]) -> Vec<(usize, usize, bool)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let start = i;
+        if flags[i] {
+            while i < flags.len() && flags[i] {
+                i += 1;
+            }
+            out.push((start, i, true));
+        } else {
+            i += 1;
+            out.push((start, i, false));
+        }
+    }
+    out
+}
+
 /// 审批卡片摘要（一行）：shell→cmd（截断）、文件类→path、git_commit→message、git_push→固定文案。
 pub fn approval_summary(cmd: &AgentCommand) -> String {
     const MAX: usize = 120;
@@ -688,6 +726,49 @@ mod tests {
             .chars()
             .count()
             <= 121);
+    }
+
+    #[test]
+    fn test_is_readonly_command() {
+        assert!(is_readonly_command(&AgentCommand::ReadFile { path: "a".into() }));
+        assert!(is_readonly_command(&AgentCommand::ListDir { path: ".".into() }));
+        assert!(is_readonly_command(&AgentCommand::Search {
+            pattern: "x".into(),
+            path: ".".into(),
+            include: None,
+        }));
+        assert!(is_readonly_command(&AgentCommand::GitStatus));
+        assert!(is_readonly_command(&AgentCommand::GitDiff { path: None }));
+        // GitExec Read 档
+        assert!(is_readonly_command(&git_exec(&["status"])));
+        assert!(is_readonly_command(&git_exec(&["log", "-n", "5"])));
+        assert!(is_readonly_command(&git_exec(&["diff"])));
+        // 写操作/危险操作
+        assert!(!is_readonly_command(&shell("ls")));
+        assert!(!is_readonly_command(&AgentCommand::WriteFile { path: "a".into(), content: "x".into() }));
+        assert!(!is_readonly_command(&AgentCommand::GitCommit { message: "m".into() }));
+        assert!(!is_readonly_command(&AgentCommand::GitPush));
+        // GitExec 写档
+        assert!(!is_readonly_command(&git_exec(&["add", "--", "a.rs"])));
+        assert!(!is_readonly_command(&git_exec(&["reset", "--hard"])));
+    }
+
+    #[test]
+    fn test_partition_tool_calls() {
+        let flags = [false, true, true, false, true];
+        let segs = partition_tool_calls(&flags);
+        assert_eq!(segs, vec![(0, 1, false), (1, 3, true), (3, 4, false), (4, 5, true)]);
+
+        let flags2 = [true, true, true];
+        let segs2 = partition_tool_calls(&flags2);
+        assert_eq!(segs2, vec![(0, 3, true)]);
+
+        let flags3 = [false, false];
+        let segs3 = partition_tool_calls(&flags3);
+        assert_eq!(segs3, vec![(0, 1, false), (1, 2, false)]);
+
+        let segs4 = partition_tool_calls(&[]);
+        assert!(segs4.is_empty());
     }
 
     use tokio::sync::mpsc;

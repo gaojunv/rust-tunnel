@@ -13,6 +13,33 @@ pub async fn exec_on_client(
     docker_container: Option<&str>,
     command: AgentCommand,
 ) -> AgentResult {
+    exec_on_client_impl(agent, workspace_id, client_id, root_path, docker_container, command, true).await
+}
+
+/// 只读命令的并发执行入口：跳过 workspace_lock（只读不触碰 git 状态/写盘，
+/// 并行互不干扰）；其余（ShellWithTimeout 版本降级、超时、inflight 追踪）与
+/// exec_on_client 完全一致。
+pub async fn exec_on_client_readonly(
+    agent: &AgentState,
+    workspace_id: &str,
+    client_id: &str,
+    root_path: &str,
+    docker_container: Option<&str>,
+    command: AgentCommand,
+) -> AgentResult {
+    exec_on_client_impl(agent, workspace_id, client_id, root_path, docker_container, command, false).await
+}
+
+/// 内部实现：`take_lock` 控制是否获取 workspace_lock（只读并发跳过锁）。
+async fn exec_on_client_impl(
+    agent: &AgentState,
+    workspace_id: &str,
+    client_id: &str,
+    root_path: &str,
+    docker_container: Option<&str>,
+    command: AgentCommand,
+    take_lock: bool,
+) -> AgentResult {
     // 版本门控：老客户端不支持 ShellWithTimeout → 降级为 Shell（120s 默认超时）
     let command = match &command {
         AgentCommand::ShellWithTimeout {
@@ -49,8 +76,18 @@ pub async fn exec_on_client(
         AgentCommand::Shell { .. } => std::time::Duration::from_secs(150),
         _ => std::time::Duration::from_secs(120),
     };
-    let lock = agent.workspace_lock(workspace_id).await;
-    let _guard = lock.lock().await;
+    // 只读命令跳过 workspace_lock（锁保护 git 状态安全与写互斥，只读并发无此需要）。
+    // 先获取 Mutex（保持存活），再 lock（Guard 取引用）：两层分离使
+    // Mutex 与 MutexGuard 同生命周期（Guard 通过引用借用 Mutex）。
+    let mut lock_holder = if take_lock {
+        Some(agent.workspace_lock(workspace_id).await)
+    } else {
+        None
+    };
+    let _guard = match lock_holder.as_mut() {
+        Some(m) => Some(m.lock().await),
+        None => None,
+    };
     let request_id = agent.inflight_begin(workspace_id).await;
     let result = agent
         .registry

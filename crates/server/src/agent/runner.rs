@@ -340,7 +340,13 @@ fn agent_result_to_text(result: &AgentResult) -> String {
     truncate_tool_result(text)
 }
 
-/// 执行一轮工具调用：回填 assistant tool_calls 消息、逐个执行并落库/回填 tool 结果。
+/// 只读工具并发执行上限。
+const READONLY_CONCURRENCY: usize = 4;
+
+/// 执行一轮工具调用：回填 assistant tool_calls 消息、执行并落库/回填 tool 结果。
+/// 连续的只读调用（ReadFile/ListDir/Search/GitStatus/GitDiff/GitExec-Read）
+/// 以 bounded 并发执行；写类/审批类保持串行语义。结果落库与 WS 帧发送严格
+/// 保持 tool_calls 原顺序。
 async fn handle_tool_calls(
     agent: &AgentState,
     rt: &mut SessionRuntime,
@@ -391,29 +397,40 @@ async fn handle_tool_calls(
     )
     .await;
 
-    for call in calls {
-        let _ = ws_tx
-            .send(serde_json::json!({
-                "type": "tool_call",
-                "id": &call.id,
-                "name": &call.name,
-                "args": &call.args,
-            }))
-            .await;
+    // 预分类：只读（可并发）或串行（remember/use_skill/审批/写操作/解析错误）
+    let parallel_flags: Vec<bool> = calls
+        .iter()
+        .map(|c| {
+            match tools::parse_tool_call(&c.name, &c.args) {
+                Ok(cmd) => super::approval::is_readonly_command(&cmd),
+                Err(_) => false,
+            }
+        })
+        .collect();
 
-        // remember 工具短路：服务端本地保存记忆，**不进 AgentCommand 协议**
-        // （bincode 索引反序列化会破坏协议）。无 rag 时该工具不出现在 schema，
-        // 模型不会调用；防御性兜底：未配置时错误文本喂回模型。不落审批。
-        #[cfg(feature = "rag")]
-        if call.name == "remember" {
-            let text = match crate::agent::memory::remember::remember_from_agent(
-                agent, rt, &call.args,
-            )
-            .await
-            {
-                Ok(msg) => msg,
-                Err(e) => format!("error: {e}"),
-            };
+    let segments = super::approval::partition_tool_calls(&parallel_flags);
+    for (start, end, parallel) in segments {
+        let group = &calls[start..end];
+        if !parallel {
+            // 串行路径：remember/use_skill 短路、审批、写操作、解析错误
+            for call in group {
+                handle_single_tool_call(agent, rt, ws_tx, call).await?;
+            }
+            continue;
+        }
+        // 只读并发段：先按序发 tool_call 帧，再并发执行，最后按序发 tool_result+落库
+        for call in group {
+            let _ = ws_tx
+                .send(serde_json::json!({
+                    "type": "tool_call",
+                    "id": &call.id,
+                    "name": &call.name,
+                    "args": &call.args,
+                }))
+                .await;
+        }
+        let results = exec_readonly_group(agent.clone(), rt, group).await;
+        for (call, text) in group.iter().zip(results) {
             let _ = ws_tx
                 .send(serde_json::json!({
                     "type": "tool_result",
@@ -423,157 +440,247 @@ async fn handle_tool_calls(
                 }))
                 .await;
             record_tool_result(agent, rt, &call.id, &call.name, text).await;
-            continue;
         }
-
-        // use_skill 工具短路：服务端本地加载 Skill 全文（**不进 AgentCommand 协议**、
-        // 不落审批）。未匹配/禁用/未开启 skill 库的错误文本喂回模型。同 remember
-        // 先例（无 rag 时该工具不出现在 schema，模型不会调用；此处防御性兜底）。
-        #[cfg(feature = "rag")]
-        if call.name == "use_skill" {
-            let text = match crate::agent::skill::use_skill_from_agent(agent, rt, &call.args)
-                .await
-            {
-                Ok(msg) => msg,
-                Err(e) => format!("error: {e}"),
-            };
-            let _ = ws_tx
-                .send(serde_json::json!({
-                    "type": "tool_result",
-                    "id": &call.id,
-                    "name": &call.name,
-                    "result": &text,
-                }))
-                .await;
-            record_tool_result(agent, rt, &call.id, &call.name, text).await;
-            continue;
-        }
-
-        let result_text = match tools::parse_tool_call(&call.name, &call.args) {
-            Ok(command) => {
-                // 审批：session 记忆集命中且命令非破坏性 → 放行；否则按 workspace
-                // approval_mode 判定，需确认时发 approval_request 挂起等待。拒绝落库
-                // [denied by user]，回合不中断（模型看到拒绝可自行换方案）。
-                // 破坏性命令（is_dangerous_shell / GitPush）即便被 allow_always 记住
-                // 也仍走审批——防"记住 shell"整条绕过安全网（rm -rf /、dd of=/dev/sda）。
-                let remembered = agent
-                    .is_allowed_for_session(&rt.session_id, &call.name)
-                    .await;
-                let needs_confirm = super::approval::needs_approval(&rt.approval_mode, &command);
-                if (super::approval::command_is_destructive(&command) || !remembered)
-                    && needs_confirm
-                {
-                    let summary = super::approval::approval_summary(&command);
-                    let args_preview: String = call.args.chars().take(500).collect();
-                    // runner 路径无 ACP 选项：透传空切片，审批卡片保持 approve/deny 二元。
-                    let approval = agent
-                        .request_approval(
-                            &rt.session_id,
-                            &call.name,
-                            &summary,
-                            &args_preview,
-                            &[],
-                            ws_tx,
-                        )
-                        .await;
-                    if !approval.approved() {
-                        let text = "[denied by user]".to_string();
-                        let _ = ws_tx
-                            .send(serde_json::json!({
-                                "type": "tool_result",
-                                "id": &call.id,
-                                "name": &call.name,
-                                "result": &text,
-                            }))
-                            .await;
-                        record_tool_result(agent, rt, &call.id, &call.name, text).await;
-                        continue;
-                    }
-                }
-                // 老客户端不认识 Search/PatchFile/GitExec 变体：bincode 按索引
-                // 反序列化，未知索引直接导致控制连接断开。版本不足时在服务端短路
-                // 为错误喂回模型（不触碰隧道）。各变体的最低版本见对应常量。
-                let gated = match &command {
-                    AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => Some((
-                        MIN_SEARCH_PATCH_CLIENT_VERSION,
-                        client_supports_search_patch as fn(Option<&str>) -> bool,
-                    )),
-                    AgentCommand::GitExec { .. } => Some((
-                        MIN_GIT_EXEC_CLIENT_VERSION,
-                        client_supports_git_exec as fn(Option<&str>) -> bool,
-                    )),
-                    _ => None,
-                };
-                if let Some((min_version, supports)) = gated {
-                    let version = agent
-                        .registry
-                        .get(&rt.client_id)
-                        .await
-                        .and_then(|e| e.client_version.clone());
-                    if !supports(version.as_deref()) {
-                        let text = format!(
-                            "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
-                            call.name,
-                            min_version.0,
-                            min_version.1,
-                            min_version.2,
-                        );
-                        let _ = ws_tx
-                            .send(serde_json::json!({
-                                "type": "tool_result",
-                                "id": &call.id,
-                                "name": &call.name,
-                                "result": &text,
-                            }))
-                            .await;
-                        record_tool_result(agent, rt, &call.id, &call.name, text).await;
-                        continue;
-                    }
-                }
-                // docker 运行时但容器未启动（container_id 为空）→ 直接报错，
-                // 避免静默回退到宿主机执行。
-                let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
-                    AgentResult::Error {
-                        message: "docker container not started".into(),
-                    }
-                } else {
-                    executor::exec_on_client(
-                        agent,
-                        &rt.workspace_id,
-                        &rt.client_id,
-                        &rt.root_path,
-                        rt.docker_container.as_deref(),
-                        command,
-                    )
-                    .await
-                };
-                let text = agent_result_to_text(&result);
-                let _ = ws_tx
-                    .send(serde_json::json!({
-                        "type": "tool_result",
-                        "id": &call.id,
-                        "name": &call.name,
-                        "result": &text,
-                    }))
-                    .await;
-                text
-            }
-            Err(e) => {
-                let _ = ws_tx
-                    .send(serde_json::json!({
-                        "type": "tool_result",
-                        "id": &call.id,
-                        "name": &call.name,
-                        "result": format!("error: {e}"),
-                    }))
-                    .await;
-                format!("error: {e}")
-            }
-        };
-
-        record_tool_result(agent, rt, &call.id, &call.name, result_text).await;
     }
     Ok(())
+}
+
+/// 串行执行单个工具调用并发送 WS 帧+落库（remember/use_skill 短路、审批、写操作）。
+async fn handle_single_tool_call(
+    agent: &AgentState,
+    rt: &mut SessionRuntime,
+    ws_tx: &mpsc::Sender<serde_json::Value>,
+    call: &ParsedToolCall,
+) -> Result<(), String> {
+    let _ = ws_tx
+        .send(serde_json::json!({
+            "type": "tool_call",
+            "id": &call.id,
+            "name": &call.name,
+            "args": &call.args,
+        }))
+        .await;
+
+    // remember 工具短路：服务端本地保存记忆，**不进 AgentCommand 协议**
+    #[cfg(feature = "rag")]
+    if call.name == "remember" {
+        let text = match crate::agent::memory::remember::remember_from_agent(agent, rt, &call.args).await {
+            Ok(msg) => msg,
+            Err(e) => format!("error: {e}"),
+        };
+        let _ = ws_tx
+            .send(serde_json::json!({
+                "type": "tool_result",
+                "id": &call.id,
+                "name": &call.name,
+                "result": &text,
+            }))
+            .await;
+        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+        return Ok(());
+    }
+
+    // use_skill 工具短路
+    #[cfg(feature = "rag")]
+    if call.name == "use_skill" {
+        let text = match crate::agent::skill::use_skill_from_agent(agent, rt, &call.args).await {
+            Ok(msg) => msg,
+            Err(e) => format!("error: {e}"),
+        };
+        let _ = ws_tx
+            .send(serde_json::json!({
+                "type": "tool_result",
+                "id": &call.id,
+                "name": &call.name,
+                "result": &text,
+            }))
+            .await;
+        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+        return Ok(());
+    }
+
+    let result_text = match tools::parse_tool_call(&call.name, &call.args) {
+        Ok(command) => {
+            // 审批：session 记忆集命中且命令非破坏性 → 放行
+            let remembered = agent
+                .is_allowed_for_session(&rt.session_id, &call.name)
+                .await;
+            let needs_confirm = super::approval::needs_approval(&rt.approval_mode, &command);
+            if (super::approval::command_is_destructive(&command) || !remembered) && needs_confirm {
+                let summary = super::approval::approval_summary(&command);
+                let args_preview: String = call.args.chars().take(500).collect();
+                let approval = agent
+                    .request_approval(&rt.session_id, &call.name, &summary, &args_preview, &[], ws_tx)
+                    .await;
+                if !approval.approved() {
+                    let text = "[denied by user]".to_string();
+                    let _ = ws_tx
+                        .send(serde_json::json!({
+                            "type": "tool_result",
+                            "id": &call.id,
+                            "name": &call.name,
+                            "result": &text,
+                        }))
+                        .await;
+                    record_tool_result(agent, rt, &call.id, &call.name, text).await;
+                    return Ok(());
+                }
+            }
+            // 版本门控：老客户端不认识 Search/PatchFile/GitExec
+            let gated = match &command {
+                AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => Some((
+                    MIN_SEARCH_PATCH_CLIENT_VERSION,
+                    client_supports_search_patch as fn(Option<&str>) -> bool,
+                )),
+                AgentCommand::GitExec { .. } => Some((
+                    MIN_GIT_EXEC_CLIENT_VERSION,
+                    client_supports_git_exec as fn(Option<&str>) -> bool,
+                )),
+                _ => None,
+            };
+            if let Some((min_version, supports)) = gated {
+                let version = agent.registry.get(&rt.client_id).await.and_then(|e| e.client_version.clone());
+                if !supports(version.as_deref()) {
+                    let text = format!(
+                        "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
+                        call.name, min_version.0, min_version.1, min_version.2,
+                    );
+                    let _ = ws_tx
+                        .send(serde_json::json!({
+                            "type": "tool_result",
+                            "id": &call.id,
+                            "name": &call.name,
+                            "result": &text,
+                        }))
+                        .await;
+                    record_tool_result(agent, rt, &call.id, &call.name, text).await;
+                    return Ok(());
+                }
+            }
+            // docker 运行时但容器未启动 → 报错
+            let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
+                AgentResult::Error { message: "docker container not started".into() }
+            } else {
+                executor::exec_on_client(agent, &rt.workspace_id, &rt.client_id, &rt.root_path, rt.docker_container.as_deref(), command).await
+            };
+            let text = agent_result_to_text(&result);
+            let _ = ws_tx
+                .send(serde_json::json!({
+                    "type": "tool_result",
+                    "id": &call.id,
+                    "name": &call.name,
+                    "result": &text,
+                }))
+                .await;
+            text
+        }
+        Err(e) => {
+            let _ = ws_tx
+                .send(serde_json::json!({
+                    "type": "tool_result",
+                    "id": &call.id,
+                    "name": &call.name,
+                    "result": format!("error: {e}"),
+                }))
+                .await;
+            format!("error: {e}")
+        }
+    };
+    record_tool_result(agent, rt, &call.id, &call.name, result_text).await;
+    Ok(())
+}
+
+/// 并发执行一组只读工具调用（有界并发、结果按原顺序收集）。
+/// 不发送 WS 帧、不落库——调用方负责按序发帧+落库（保证顺序一致）。
+/// 每个任务取 owned 副本（tokio::spawn 要求 'static），按窗口分批控制并发度。
+async fn exec_readonly_group(
+    agent: AgentState,
+    rt: &SessionRuntime,
+    group: &[ParsedToolCall],
+) -> Vec<String> {
+    let client_id = rt.client_id.clone();
+    let workspace_id = rt.workspace_id.clone();
+    let root_path = rt.root_path.clone();
+    let docker_container = rt.docker_container.clone();
+    let runtime_type = rt.runtime_type.clone();
+
+    let mut results = Vec::with_capacity(group.len());
+    for window in group.chunks(READONLY_CONCURRENCY) {
+        let mut handles = Vec::with_capacity(window.len());
+        for call in window {
+            let agent = agent.clone();
+            let cid = client_id.clone();
+            let wid = workspace_id.clone();
+            let rpath = root_path.clone();
+            let dc = docker_container.clone();
+            let rt_type = runtime_type.clone();
+            let c_name = call.name.clone();
+            let c_args = call.args.clone();
+            handles.push(tokio::spawn(async move {
+                exec_readonly_one(&agent, &cid, &wid, &rpath, dc.as_deref(), &rt_type, &c_name, &c_args).await
+            }));
+        }
+        for h in handles {
+            results.push(
+                h.await
+                    .unwrap_or_else(|e| format!("error: tool task panicked: {e}")),
+            );
+        }
+    }
+    results
+}
+
+/// 执行单个只读工具调用并返回结果文本（不抢 workspace_lock）。
+/// 解析错误/版本不足/docker 未启动等失败折叠为错误文本（与串行路径一致）。
+async fn exec_readonly_one(
+    agent: &AgentState,
+    client_id: &str,
+    workspace_id: &str,
+    root_path: &str,
+    docker_container: Option<&str>,
+    runtime_type: &str,
+    call_name: &str,
+    call_args: &str,
+) -> String {
+    let command = match tools::parse_tool_call(call_name, call_args) {
+        Ok(cmd) => cmd,
+        Err(e) => return format!("error: {e}"),
+    };
+    // 版本门控：Search/GitExec 需要客户端最低版本
+    let gated = match &command {
+        AgentCommand::Search { .. } => Some((
+            MIN_SEARCH_PATCH_CLIENT_VERSION,
+            client_supports_search_patch as fn(Option<&str>) -> bool,
+        )),
+        AgentCommand::GitExec { .. } => Some((
+            MIN_GIT_EXEC_CLIENT_VERSION,
+            client_supports_git_exec as fn(Option<&str>) -> bool,
+        )),
+        _ => None,
+    };
+    if let Some((min_version, supports)) = gated {
+        let version = agent.registry.get(client_id).await.and_then(|e| e.client_version.clone());
+        if !supports(version.as_deref()) {
+            return format!(
+                "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
+                call_name, min_version.0, min_version.1, min_version.2,
+            );
+        }
+    }
+    let result = if runtime_type == "docker" && docker_container.is_none() {
+        AgentResult::Error { message: "docker container not started".into() }
+    } else {
+        executor::exec_on_client_readonly(
+            agent,
+            workspace_id,
+            client_id,
+            root_path,
+            docker_container,
+            command,
+        )
+        .await
+    };
+    agent_result_to_text(&result)
 }
 
 /// 处理一个已解析的完整 LLM 响应（非 SSE 回退与 SSE 嗅探回退共用）。
