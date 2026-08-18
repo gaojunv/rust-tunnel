@@ -1,5 +1,6 @@
 //! SSE 增量解析：OpenAI 流式 chat.completion 的 delta 聚合。
 use super::runner::ParsedToolCall;
+use crate::llm::usage::UsageInfo;
 
 /// 单回合 tool_calls 上限：实践中 LLM 并行调用不超过数十；
 /// 无界 index 直接 resize 会被恶意上游用作 OOM/panic 向量。
@@ -18,6 +19,8 @@ pub struct AggregatedTurn {
     pub tool_calls: Vec<ParsedToolCall>,
     /// 重建的 OpenAI tool_calls JSON（rt.messages 回填与落库用）。
     pub raw_tool_calls: Vec<serde_json::Value>,
+    /// 上游 usage chunk 解析出的 token 用量（流式末尾 chunk 携带）；无 usage 为默认零值。
+    pub usage: UsageInfo,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,8 @@ pub struct SseAggregator {
     /// 是否收到过 data: 行（空流兜底判定用）。
     saw_data: bool,
     limit: usize,
+    /// 上游 usage chunk 聚合（流式末尾 chunk 携带）。
+    usage: UsageInfo,
 }
 
 impl Default for SseAggregator {
@@ -61,6 +66,7 @@ impl Default for SseAggregator {
             bytes: 0,
             saw_data: false,
             limit: MAX_STREAM_BYTES,
+            usage: UsageInfo::default(),
         }
     }
 }
@@ -106,6 +112,13 @@ impl SseAggregator {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
             return SseFeed::None; // 畸形行跳过，不中断流
         };
+        // usage chunk（choices 为空数组）：提取 token 用量，不走 delta 路径
+        if let Some(usage_val) = json.get("usage") {
+            let u = crate::llm::usage::extract_usage(usage_val);
+            if !u.is_empty() {
+                self.usage = u;
+            }
+        }
         let Some(delta) = json
             .get("choices")
             .and_then(|c| c.as_array())
@@ -207,6 +220,7 @@ impl SseAggregator {
             reasoning: self.reasoning,
             tool_calls,
             raw_tool_calls,
+            usage: self.usage,
         })
     }
 }

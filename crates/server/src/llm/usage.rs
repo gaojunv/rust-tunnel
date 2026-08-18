@@ -280,6 +280,26 @@ impl UsageContext {
         );
         spawn_record(db.clone(), insert);
     }
+
+    /// 记录一条成功请求（fire-and-forget，写入失败仅记日志）。
+    ///
+    /// 用于 runner 路径（直接调用 `execute_with_failover`，不经 HTTP 入口层）
+    /// 的用量落库，与 `wrap_and_record` 共享相同的 `into_insert` 逻辑。
+    pub fn record_success(
+        self,
+        db: &Database,
+        usage: UsageInfo,
+        started_at: std::time::Instant,
+    ) {
+        let insert = self.into_insert(
+            usage,
+            200,
+            true,
+            started_at.elapsed().as_millis() as i64,
+            None,
+        );
+        spawn_record(db.clone(), insert);
+    }
 }
 
 /// 包裹上游成功响应，解析 usage 并异步落库，返回可继续发给客户端的响应。

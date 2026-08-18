@@ -116,6 +116,7 @@ async fn generate_title_inner(
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
     let body = crate::llm::upstream::build_upstream_body(&request);
+    let started = std::time::Instant::now();
     let outcome = crate::llm::upstream::execute_with_failover(
         &llm.breakers,
         &llm.known_failures,
@@ -124,9 +125,20 @@ async fn generate_title_inner(
         false,
     )
     .await;
-    let crate::llm::upstream::FailoverOutcome::Success { resp, .. } = outcome else {
+    let crate::llm::upstream::FailoverOutcome::Success {
+        resp, candidate, failed_over, ..
+    } = outcome else {
         return Err("LLM unavailable for title generation".to_string());
     };
+    // 记录用量（fire-and-forget，db 为 None 时跳过）
+    if let Some(db) = llm.db.as_ref() {
+        let ctx = super::runner::runner_usage_ctx(
+            &candidate,
+            model,
+            if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+        );
+        ctx.record_success(db, crate::llm::usage::UsageInfo::default(), started);
+    }
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .map_err(|e| format!("read response failed: {e}"))?;

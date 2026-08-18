@@ -264,6 +264,28 @@ pub(crate) fn client_supports_git_exec(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_GIT_EXEC_CLIENT_VERSION)
 }
 
+/// 构造 runner 路径的用量记录上下文：从候选链出账方提取 provider/model 信息，
+/// 供四处复用（主流式、流中断重试、compact 摘要、title 生成）。
+pub(crate) fn runner_usage_ctx(
+    candidate: &crate::llm::router::Candidate,
+    requested_model: &str,
+    failover_from: Option<String>,
+) -> crate::llm::usage::UsageContext {
+    crate::llm::usage::UsageContext {
+        api_key_id: None,
+        api_key_name: String::new(),
+        provider_id: Some(candidate.provider.id.clone()),
+        provider_name: candidate.provider.name.clone(),
+        model_id: Some(candidate.model_id.clone()),
+        model_name: candidate.model_name.clone(),
+        requested_model: requested_model.to_string(),
+        protocol: "openai".to_string(),
+        stream: true,
+        rag_chunks_injected: None,
+        failover_from,
+    }
+}
+
 /// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
 const TOOL_RESULT_MAX_LINES: usize = 300;
 const TOOL_RESULT_MAX_BYTES: usize = 30 * 1024;
@@ -737,6 +759,10 @@ pub async fn run_agent_turn(
         };
     }
 
+    // 用量记录上下文（从出账候选构建）与请求开始时间，用于 usage 落库。
+    let mut usage_ctx: Option<crate::llm::usage::UsageContext> = None;
+    let mut usage_started: Option<std::time::Instant> = None;
+
     'round: for _round in 0..MAX_TOOL_ROUNDS {
         // 每轮 LLM 调用前检查上下文超限 → 压缩早期历史（失败降级截断，不阻断回合）
         compact::maybe_compact(&agent, &llm, rt, &ws_tx).await?;
@@ -766,8 +792,23 @@ pub async fn run_agent_turn(
         .await;
 
         let mut resp = match outcome {
-            crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
-            crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
+            crate::llm::upstream::FailoverOutcome::Success {
+                resp, candidate, failed_over, ..
+            } => {
+                // 构造用量记录上下文
+                usage_ctx = Some(runner_usage_ctx(
+                    &candidate,
+                    &rt.model,
+                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                ));
+                usage_started = Some(std::time::Instant::now());
+                resp
+            }
+            crate::llm::upstream::FailoverOutcome::Exhausted { status, message, .. } => {
+                // 记录 LLM 不可用失败
+                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                    ctx.record_failure(db, status.as_u16() as i32, "exhausted", started);
+                }
                 let _ = ws_tx
                     .send(serde_json::json!({"type": "error", "message": format!("LLM unavailable: {message}")}))
                     .await;
@@ -819,6 +860,10 @@ pub async fn run_agent_turn(
                                     "message": format!("上游连接中断，正在重试 ({retries}/{MAX_STREAM_RETRIES})")
                                 }))
                                 .await;
+                            // 记录流中断失败
+                            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                                ctx.record_failure(db, 502, "stream_interrupted", started);
+                            }
                             let retry = crate::llm::upstream::execute_with_failover(
                                 &llm.breakers,
                                 &llm.known_failures,
@@ -865,9 +910,12 @@ pub async fn run_agent_turn(
                                     continue 'sse;
                                 }
                                 crate::llm::upstream::FailoverOutcome::Exhausted {
-                                    message,
-                                    ..
+                                    status, message, ..
                                 } => {
+                                    // 记录重试耗尽失败
+                                    if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                                        ctx.record_failure(db, status.as_u16() as i32, "retry_exhausted", started);
+                                    }
                                     let _ = ws_tx.send(serde_json::json!({"type": "error", "message": format!("LLM unavailable: {message}")})).await;
                                     return Err(format!("LLM unavailable: {message}"));
                                 }
@@ -943,6 +991,10 @@ pub async fn run_agent_turn(
             }
 
             if fatal {
+                // 记录流致命错误
+                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                    ctx.record_failure(db, 502, "stream_fatal_error", started);
+                }
                 let _ = ws_tx
                     .send(serde_json::json!({"type": "error", "message": fatal_msg}))
                     .await;
@@ -1036,10 +1088,18 @@ pub async fn run_agent_turn(
                 )
                 .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
+                // 记录用量（streaming 路径：usage 从聚合器提取）
+                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                    ctx.record_success(db, turn.usage, started);
+                }
                 return Ok(());
             }
             // tool 回合：转成与 parse_llm_turn 相同的处理流（见下）
             handle_tool_calls(&agent, rt, &ws_tx, turn.tool_calls, turn.raw_tool_calls, &turn.reasoning).await?;
+            // 记录用量（streaming 路径：usage 从聚合器提取）
+            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                ctx.record_success(db, turn.usage, started);
+            }
             continue;
         }
 

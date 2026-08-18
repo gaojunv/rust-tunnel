@@ -203,6 +203,7 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         raw_body: None,
     };
     let req_body = crate::llm::upstream::build_upstream_body(&request);
+    let started = std::time::Instant::now();
     let outcome = crate::llm::upstream::execute_with_failover(
         &llm.breakers,
         &llm.known_failures,
@@ -212,7 +213,20 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
     )
     .await;
     let resp = match outcome {
-        crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
+        crate::llm::upstream::FailoverOutcome::Success {
+            resp, candidate, failed_over, ..
+        } => {
+            // 记录用量（fire-and-forget，db 为 None 时跳过）
+            if let Some(db) = llm.db.as_ref() {
+                let ctx = super::runner::runner_usage_ctx(
+                    &candidate,
+                    model,
+                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                );
+                ctx.record_success(db, crate::llm::usage::UsageInfo::default(), started);
+            }
+            resp
+        }
         crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
             return Err(format!("summary LLM unavailable: {message}"));
         }
