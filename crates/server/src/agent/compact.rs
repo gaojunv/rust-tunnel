@@ -45,6 +45,26 @@ pub fn find_cut_point(messages: &[ChatMessage], keep_recent: usize) -> usize {
     cut
 }
 
+/// 判定上游错误是否为「上下文超限」（case-insensitive 子串匹配常见 provider 模式）。
+/// status 用于粗筛（4xx），message 子串匹配用于确认——不同 provider 措辞不一，
+/// 命中任一已知模式即视为溢出。仅凭 status 不够（400 也可能是参数错误），
+/// 但 message 命中且 status 为 4xx 即成立。
+pub fn is_context_overflow(status: u16, message: &str) -> bool {
+    if !(400..=499).contains(&status) {
+        return false;
+    }
+    let lower = message.to_lowercase();
+    [
+        "context length",
+        "maximum context",
+        "context_length_exceeded",
+        "too many tokens",
+        "prompt is too long",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
 /// per-model 阈值：extra_config.agent_context_limit；未设置/解析失败回落默认。
 pub async fn context_limit_for(db: &crate::db::Database, model: &str) -> usize {
     let Ok(Some(record)) = db.llm_find_model_by_name_or_alias(model).await else {
@@ -99,9 +119,23 @@ pub async fn maybe_compact(
     if estimate_chars(&rt.messages) <= limit {
         return Ok(());
     }
+    force_compact(agent, llm, rt, ws_tx).await?;
+    Ok(())
+}
+
+/// 强制执行一次上下文压缩（无论是否超限）：用于上下文溢出（provider 返回 400
+/// context-length-exceeded）后的重试路径——可能低估了 token 阈值，需要主动压缩。
+/// 压缩失败降级为滑动截断，永不阻断回合。
+/// 返回 Ok(true) 表示真正执行了压缩；Ok(false) 表示历史太短无可压缩段。
+pub async fn force_compact(
+    agent: &AgentState,
+    llm: &Arc<LlmState>,
+    rt: &mut SessionRuntime,
+    ws_tx: &mpsc::Sender<serde_json::Value>,
+) -> Result<bool, String> {
     let cut = find_cut_point(&rt.messages, KEEP_RECENT_MESSAGES);
     if cut == 0 {
-        return Ok(()); // 历史太短，无可压缩段
+        return Ok(false); // 历史太短，无可压缩段
     }
 
     let _ = ws_tx
@@ -181,7 +215,7 @@ pub async fn maybe_compact(
     let _ = ws_tx
         .send(serde_json::json!({"type": "status", "message": "context compacted"}))
         .await;
-    Ok(())
+    Ok(true)
 }
 
 async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<String, String> {
@@ -272,6 +306,31 @@ mod tests {
                 name: Some("shell".into()),
             },
         ]
+    }
+
+    #[test]
+    fn test_is_context_overflow_matches_common_patterns() {
+        // OpenAI 风格
+        assert!(is_context_overflow(400, "maximum context length is 128000 tokens"));
+        assert!(is_context_overflow(400, "context_length_exceeded"));
+        // Anthropic 风格
+        assert!(is_context_overflow(400, "prompt is too long: 200000 tokens > 200000 maximum"));
+        // DeepSeek 风格
+        assert!(is_context_overflow(400, "Too many tokens in prompt: 16385"));
+        assert!(is_context_overflow(400, "Request too large for model: 16386 tokens"));
+        // 大小写不敏感
+        assert!(is_context_overflow(400, "Context Length Exceeded"));
+        assert!(is_context_overflow(400, "PROMPT IS TOO LONG"));
+        // 400 状态码
+        assert!(is_context_overflow(400, "some context error"));
+        // 非 4xx 不命中
+        assert!(!is_context_overflow(500, "context length"));
+        assert!(!is_context_overflow(200, "maximum context"));
+        // 非溢出 400 错误
+        assert!(!is_context_overflow(400, "invalid API key"));
+        assert!(!is_context_overflow(400, "model not found"));
+        // 空消息
+        assert!(!is_context_overflow(400, ""));
     }
 
     #[test]

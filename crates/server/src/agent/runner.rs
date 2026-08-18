@@ -822,6 +822,24 @@ pub async fn run_agent_turn(
                 resp
             }
             crate::llm::upstream::FailoverOutcome::Exhausted { status, message, .. } => {
+                // 上下文溢出自愈：token 估算（chars/4）可能低估，上游返回
+                // context-length-exceeded 时强制压缩后重试一次本回合。
+                // 压缩成功（find_cut_point 有空间）→ 重试；无可压缩段 → 报错。
+                // 无限循环被 find_cut_point 自然遏制：压缩后保留段 <= keep_recent+2，
+                // 切点必为 0，后续 force_compact 返回 false。
+                if compact::is_context_overflow(status.as_u16(), &message) {
+                    if let Ok(did_compact) = compact::force_compact(&agent, &llm, rt, &ws_tx).await {
+                        if did_compact {
+                            let _ = ws_tx
+                                .send(serde_json::json!({
+                                    "type": "status",
+                                    "message": "上下文超限，已压缩历史并重试"
+                                }))
+                                .await;
+                            continue 'round;
+                        }
+                    }
+                }
                 // 记录 LLM 不可用失败
                 if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
                     ctx.record_failure(db, status.as_u16() as i32, "exhausted", started);
@@ -929,6 +947,20 @@ pub async fn run_agent_turn(
                                 crate::llm::upstream::FailoverOutcome::Exhausted {
                                     status, message, ..
                                 } => {
+                                    // 上下文溢出自愈（同主路径逻辑）
+                                    if compact::is_context_overflow(status.as_u16(), &message) {
+                                        if let Ok(did_compact) = compact::force_compact(&agent, &llm, rt, &ws_tx).await {
+                                            if did_compact {
+                                                let _ = ws_tx
+                                                    .send(serde_json::json!({
+                                                        "type": "status",
+                                                        "message": "上下文超限，已压缩历史并重试"
+                                                    }))
+                                                    .await;
+                                                continue 'round;
+                                            }
+                                        }
+                                    }
                                     // 记录重试耗尽失败
                                     if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
                                         ctx.record_failure(db, status.as_u16() as i32, "retry_exhausted", started);
