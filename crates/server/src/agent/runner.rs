@@ -264,6 +264,17 @@ pub(crate) fn client_supports_git_exec(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_GIT_EXEC_CLIENT_VERSION)
 }
 
+/// 首个支持 `AgentCommand::ShellWithTimeout`（可配超时 shell）的客户端版本。
+const MIN_SHELL_TIMEOUT_CLIENT_VERSION: (u64, u64, u64) = (0, 6, 0);
+
+/// 客户端版本是否支持 ShellWithTimeout；缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_shell_timeout(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_SHELL_TIMEOUT_CLIENT_VERSION)
+}
+
 /// 构造 runner 路径的用量记录上下文：从候选链出账方提取 provider/model 信息，
 /// 供四处复用（主流式、流中断重试、compact 摘要、title 生成）。
 pub(crate) fn runner_usage_ctx(

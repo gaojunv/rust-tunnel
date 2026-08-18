@@ -76,6 +76,12 @@ pub enum AgentCommand {
     GitExec {
         args: Vec<String>,
     },
+    /// 带超时的 shell 命令：timeout_secs 由 LLM 工具调用指定（上限 3600s）。
+    ShellWithTimeout {
+        cmd: String,
+        cwd: Option<String>,
+        timeout_secs: u64,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -853,6 +859,11 @@ mod tests {
             AgentCommand::GitPush,
             AgentCommand::GitExec {
                 args: vec!["log".into(), "-n".into(), "5".into()],
+            },
+            AgentCommand::ShellWithTimeout {
+                cmd: "cargo test".into(),
+                cwd: Some("crates/server".into()),
+                timeout_secs: 600,
             },
         ];
         for command in commands {

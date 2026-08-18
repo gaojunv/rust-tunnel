@@ -208,7 +208,9 @@ pub fn is_dangerous_shell(cmd: &str) -> bool {
 /// 提交等）由审批矩阵单独覆盖，allow_always 记住后免审语义不受影响。
 pub fn command_is_destructive(cmd: &AgentCommand) -> bool {
     match cmd {
-        AgentCommand::Shell { cmd, .. } => is_dangerous_shell(cmd),
+        AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
+            is_dangerous_shell(cmd)
+        }
         AgentCommand::GitPush => true,
         _ => false,
     }
@@ -229,7 +231,9 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
         | AgentCommand::GitDiff { .. } => false,
-        AgentCommand::Shell { cmd, .. } => mode == "safe" || is_dangerous_shell(cmd),
+        AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
+            mode == "safe" || is_dangerous_shell(cmd)
+        }
         AgentCommand::WriteFile { .. }
         | AgentCommand::PatchFile { .. }
         | AgentCommand::GitCommit { .. } => mode == "safe",
@@ -260,7 +264,9 @@ pub fn approval_summary(cmd: &AgentCommand) -> String {
         }
     };
     match cmd {
-        AgentCommand::Shell { cmd, .. } => truncate(cmd),
+        AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
+            truncate(cmd)
+        }
         AgentCommand::WriteFile { path, .. } | AgentCommand::PatchFile { path, .. } => path.clone(),
         AgentCommand::GitCommit { message } => truncate(message),
         AgentCommand::GitPush => "git push".to_string(),

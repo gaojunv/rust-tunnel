@@ -398,6 +398,22 @@ pub async fn handle_exec_request(
             )
             .await
         }
+        AgentCommand::ShellWithTimeout {
+            cmd,
+            cwd,
+            timeout_secs,
+        } => {
+            let effective = Duration::from_secs((*timeout_secs).clamp(1, 3600));
+            shell_exec(
+                cmd,
+                cwd.as_deref(),
+                root_path,
+                docker_container,
+                effective,
+                cancel_rx,
+            )
+            .await
+        }
         AgentCommand::ReadFile { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => docker_read_file(c, &p, timeout).await,

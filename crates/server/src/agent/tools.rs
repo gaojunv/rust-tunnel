@@ -24,7 +24,8 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
                     "type": "object",
                     "properties": {
                         "cmd": {"type": "string", "description": "The shell command to run"},
-                        "cwd": {"type": "string", "description": "Optional subdirectory of the workspace to run in"}
+                        "cwd": {"type": "string", "description": "Optional subdirectory of the workspace to run in"},
+                        "timeout_secs": {"type": "integer", "description": "Command timeout in seconds (max 3600, default 120)"}
                     },
                     "required": ["cmd"]
                 }
@@ -412,7 +413,15 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
             if let Some(cwd) = &cwd {
                 check_path_len(cwd, "cwd")?;
             }
-            Ok(AgentCommand::Shell { cmd: cmd.to_string(), cwd })
+            // timeout_secs：有值时构造 ShellWithTimeout，无值时保持 Shell（120s 默认）
+            match args.get("timeout_secs").and_then(|v| v.as_u64()) {
+                Some(secs) if secs > 0 => Ok(AgentCommand::ShellWithTimeout {
+                    cmd: cmd.to_string(),
+                    cwd,
+                    timeout_secs: secs.clamp(1, 3600),
+                }),
+                _ => Ok(AgentCommand::Shell { cmd: cmd.to_string(), cwd }),
+            }
         }
         "read_file" => {
             let path = arg_str(&args, "path", name)?;

@@ -13,6 +13,42 @@ pub async fn exec_on_client(
     docker_container: Option<&str>,
     command: AgentCommand,
 ) -> AgentResult {
+    // 版本门控：老客户端不支持 ShellWithTimeout → 降级为 Shell（120s 默认超时）
+    let command = match &command {
+        AgentCommand::ShellWithTimeout {
+            cmd,
+            cwd,
+            timeout_secs,
+        } => {
+            let version = agent
+                .registry
+                .get(client_id)
+                .await
+                .and_then(|e| e.client_version.clone());
+            if super::runner::client_supports_shell_timeout(version.as_deref()) {
+                command
+            } else {
+                tracing::warn!(
+                    client_id,
+                    timeout_secs,
+                    "client too old for ShellWithTimeout, falling back to Shell (120s default)"
+                );
+                AgentCommand::Shell {
+                    cmd: cmd.clone(),
+                    cwd: cwd.clone(),
+                }
+            }
+        }
+        _ => command,
+    };
+    // 等待超时：Shell→150s、ShellWithTimeout→min(timeout_secs+30, 3630)、其他→120s
+    let wait_timeout = match &command {
+        AgentCommand::ShellWithTimeout { timeout_secs, .. } => {
+            std::time::Duration::from_secs((timeout_secs + 30).min(3630))
+        }
+        AgentCommand::Shell { .. } => std::time::Duration::from_secs(150),
+        _ => std::time::Duration::from_secs(120),
+    };
     let lock = agent.workspace_lock(workspace_id).await;
     let _guard = lock.lock().await;
     let request_id = agent.inflight_begin(workspace_id).await;
@@ -25,7 +61,7 @@ pub async fn exec_on_client(
             root_path,
             docker_container,
             command,
-            std::time::Duration::from_secs(120),
+            wait_timeout,
         )
         .await;
     // 无论成败都清 inflight，避免 stale 条目。
