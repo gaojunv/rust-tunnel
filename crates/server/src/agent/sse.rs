@@ -13,6 +13,8 @@ pub const MAX_STREAM_BYTES: usize = 10 * 1024 * 1024;
 /// 一个回合的聚合结果。
 pub struct AggregatedTurn {
     pub text: String,
+    /// reasoning_content 增量聚合（DeepSeek thinking 模式）；无思考输出为空串。
+    pub reasoning: String,
     pub tool_calls: Vec<ParsedToolCall>,
     /// 重建的 OpenAI tool_calls JSON（rt.messages 回填与落库用）。
     pub raw_tool_calls: Vec<serde_json::Value>,
@@ -22,6 +24,12 @@ pub struct AggregatedTurn {
 pub enum SseFeed {
     /// content 增量
     Content(String),
+    /// reasoning_content 增量；`content` 为同行 delta 携带的正文增量
+    /// （同帧同时含 reasoning + content 时两个 WS 帧都要发，正文不丢）。
+    Thought {
+        reasoning: String,
+        content: Option<String>,
+    },
     /// 该行无产出（role delta、空行、注释、畸形行跳过）
     None,
     /// [DONE]
@@ -33,9 +41,11 @@ pub enum SseFeed {
 
 pub struct SseAggregator {
     text: String,
+    /// reasoning_content 聚合桶（DeepSeek thinking 模式）。
+    reasoning: String,
     // (id, name, arguments) 按 index 分桶
     calls: Vec<(String, String, String)>,
-    /// 已累计的聚合字节（text + tool_calls 各字段拼接），超 limit 即 Overflow。
+    /// 已累计的聚合字节（text + reasoning + tool_calls 各字段拼接），超 limit 即 Overflow。
     bytes: usize,
     /// 是否收到过 data: 行（空流兜底判定用）。
     saw_data: bool,
@@ -46,6 +56,7 @@ impl Default for SseAggregator {
     fn default() -> Self {
         Self {
             text: String::new(),
+            reasoning: String::new(),
             calls: Vec::new(),
             bytes: 0,
             saw_data: false,
@@ -144,15 +155,31 @@ impl SseAggregator {
             }
         }
 
-        match delta.get("content").and_then(|c| c.as_str()) {
-            Some(s) if !s.is_empty() => {
-                if !self.reserve(s.len()) {
+        // content 增量提取（非空时暂存，供 Thought 同帧携带）
+        let content_delta = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty());
+        if let Some(s) = content_delta {
+            if !self.reserve(s.len()) {
+                return SseFeed::Overflow;
+            }
+            self.text.push_str(s);
+        }
+
+        // reasoning_content 增量提取（DeepSeek thinking 模式）
+        match delta.get("reasoning_content").and_then(|r| r.as_str()) {
+            Some(r) if !r.is_empty() => {
+                if !self.reserve(r.len()) {
                     return SseFeed::Overflow;
                 }
-                self.text.push_str(s);
-                SseFeed::Content(s.to_string())
+                self.reasoning.push_str(r);
+                SseFeed::Thought {
+                    reasoning: r.to_string(),
+                    content: content_delta.map(|s| s.to_string()),
+                }
             }
-            _ => SseFeed::None,
+            _ => match content_delta {
+                Some(s) => SseFeed::Content(s.to_string()),
+                _ => SseFeed::None,
+            },
         }
     }
 
@@ -177,6 +204,7 @@ impl SseAggregator {
         }
         Ok(AggregatedTurn {
             text: self.text,
+            reasoning: self.reasoning,
             tool_calls,
             raw_tool_calls,
         })
@@ -194,6 +222,12 @@ mod tests {
             for line in c.split('\n') {
                 match agg.feed_line(line) {
                     SseFeed::Content(s) => out.push_str(&s),
+                    SseFeed::Thought { reasoning, content } => {
+                        out.push_str(&reasoning);
+                        if let Some(c) = content {
+                            out.push_str(&c);
+                        }
+                    }
                     SseFeed::Done => done = true,
                     SseFeed::None => {}
                     SseFeed::Overflow => return (out, done),
@@ -369,5 +403,57 @@ mod tests {
             SseFeed::Content(_)
         ));
         assert!(agg.saw_data());
+    }
+
+    #[test]
+    fn test_reasoning_deltas_aggregated() {
+        let mut agg = SseAggregator::new();
+        feed_all(
+            &mut agg,
+            &[
+                r#"data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}"#,
+                r#"data: {"choices":[{"delta":{"reasoning_content":"让我想想"},"index":0}]}"#,
+                r#"data: {"choices":[{"delta":{"reasoning_content":"...\n"},"index":0}]}"#,
+                r#"data: {"choices":[{"delta":{"content":"答案"},"index":0}]}"#,
+                "data: [DONE]",
+            ],
+        );
+        let turn = agg.finish().unwrap();
+        assert_eq!(turn.reasoning, "让我想想...\n");
+        assert_eq!(turn.text, "答案");
+    }
+
+    #[test]
+    fn test_reasoning_and_content_same_delta() {
+        // DeepSeek 同一 delta 可同时携带 reasoning_content 与 content
+        let mut agg = SseAggregator::new();
+        let feed = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"thinking...","content":"answer"},"index":0}]}"#,
+        );
+        match feed {
+            SseFeed::Thought { reasoning, content } => {
+                assert_eq!(reasoning, "thinking...");
+                assert_eq!(content.as_deref(), Some("answer"));
+            }
+            other => panic!("expected Thought, got {other:?}"),
+        }
+        let turn = agg.finish().unwrap();
+        assert_eq!(turn.reasoning, "thinking...");
+        assert_eq!(turn.text, "answer");
+    }
+
+    #[test]
+    fn test_reasoning_overflow() {
+        let mut agg = SseAggregator::with_limit(100);
+        let big = "x".repeat(120);
+        let line = format!(
+            r#"data: {{"choices":[{{"delta":{{"reasoning_content":"{big}"}},"index":0}}]}}"#
+        );
+        match agg.feed_line(&line) {
+            SseFeed::Overflow => {}
+            other => panic!("expected Overflow, got {other:?}"),
+        }
+        let turn = agg.finish().unwrap();
+        assert!(turn.reasoning.is_empty());
     }
 }

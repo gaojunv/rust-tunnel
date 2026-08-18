@@ -238,6 +238,8 @@ impl SessionRuntime {
                     name: r.name.clone(),
                 }),
                 // message / summary：普通文本消息。
+                // thought 行是 DeepSeek reasoning_content 落库，不回传上游 LLM 上下文。
+                "message" if r.name.as_deref() == Some("thought") => continue,
                 _ => messages.push(ChatMessage::text(&r.role, &r.content)),
             }
         }

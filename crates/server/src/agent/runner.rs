@@ -308,7 +308,30 @@ async fn handle_tool_calls(
     ws_tx: &mpsc::Sender<serde_json::Value>,
     calls: Vec<ParsedToolCall>,
     raw_calls: Vec<serde_json::Value>,
+    reasoning: &str,
 ) -> Result<(), String> {
+    // reasoning 非空时先落库 thought 行（位于 tool_calls 之前）
+    if !reasoning.is_empty() {
+        let _ = ws_tx
+            .send(serde_json::json!({
+                "type": "assistant_chunk",
+                "content": reasoning,
+                "thought": true,
+                "final": false,
+            }))
+            .await;
+        persist_message(
+            agent,
+            &rt.session_id,
+            "assistant",
+            reasoning,
+            None,
+            None,
+            Some("thought"),
+            "message",
+        )
+        .await;
+    }
     rt.messages.push(ChatMessage {
         role: "assistant".into(),
         content: None,
@@ -525,6 +548,31 @@ async fn handle_llm_turn_json(
 ) -> Result<bool, String> {
     match parse_llm_turn(body)? {
         LlmTurn::Text(text) => {
+            // 非流式路径提取 reasoning_content 并落库/发 WS thought 帧
+            let reasoning = body["choices"][0]["message"]["reasoning_content"]
+                .as_str()
+                .unwrap_or("");
+            if !reasoning.is_empty() {
+                let _ = ws_tx
+                    .send(serde_json::json!({
+                        "type": "assistant_chunk",
+                        "content": reasoning,
+                        "thought": true,
+                        "final": false,
+                    }))
+                    .await;
+                persist_message(
+                    agent,
+                    &rt.session_id,
+                    "assistant",
+                    reasoning,
+                    None,
+                    None,
+                    Some("thought"),
+                    "message",
+                )
+                .await;
+            }
             let _ = ws_tx
                 .send(
                     serde_json::json!({"type": "assistant_chunk", "content": &text, "final": true}),
@@ -550,7 +598,32 @@ async fn handle_llm_turn_json(
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            handle_tool_calls(agent, rt, ws_tx, calls, raw_calls).await?;
+            // 非流式路径提取 reasoning_content 并落库/发 WS thought 帧
+            let reasoning = body["choices"][0]["message"]["reasoning_content"]
+                .as_str()
+                .unwrap_or("");
+            if !reasoning.is_empty() {
+                let _ = ws_tx
+                    .send(serde_json::json!({
+                        "type": "assistant_chunk",
+                        "content": reasoning,
+                        "thought": true,
+                        "final": false,
+                    }))
+                    .await;
+                persist_message(
+                    agent,
+                    &rt.session_id,
+                    "assistant",
+                    reasoning,
+                    None,
+                    None,
+                    Some("thought"),
+                    "message",
+                )
+                .await;
+            }
+            handle_tool_calls(agent, rt, ws_tx, calls, raw_calls, reasoning).await?;
             Ok(false)
         }
     }
@@ -848,6 +921,16 @@ pub async fn run_agent_turn(
                                 .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
                                 .await;
                         }
+                        sse::SseFeed::Thought { reasoning, content } => {
+                            let _ = ws_tx
+                                .send(serde_json::json!({"type": "assistant_chunk", "content": reasoning, "thought": true, "final": false}))
+                                .await;
+                            if let Some(c) = content {
+                                let _ = ws_tx
+                                    .send(serde_json::json!({"type": "assistant_chunk", "content": c, "final": false}))
+                                    .await;
+                            }
+                        }
                         sse::SseFeed::Done => break 'sse,
                         sse::SseFeed::Overflow => {
                             fatal = true;
@@ -888,6 +971,16 @@ pub async fn run_agent_turn(
                             .send(serde_json::json!({"type": "assistant_chunk", "content": delta, "final": false}))
                             .await;
                     }
+                    sse::SseFeed::Thought { reasoning, content } => {
+                        let _ = ws_tx
+                            .send(serde_json::json!({"type": "assistant_chunk", "content": reasoning, "thought": true, "final": false}))
+                            .await;
+                        if let Some(c) = content {
+                            let _ = ws_tx
+                                .send(serde_json::json!({"type": "assistant_chunk", "content": c, "final": false}))
+                                .await;
+                        }
+                    }
                     sse::SseFeed::Overflow => {
                         let _ = ws_tx
                             .send(serde_json::json!({"type": "error", "message": "stream size limit exceeded"}))
@@ -910,6 +1003,23 @@ pub async fn run_agent_turn(
             }
             if turn.tool_calls.is_empty() {
                 // 文本回合：收尾 final chunk + 落库 + done
+                // reasoning 落库 thought 行（位于正文之前）
+                if !turn.reasoning.is_empty() {
+                    let _ = ws_tx
+                        .send(serde_json::json!({"type": "assistant_chunk", "content": &turn.reasoning, "thought": true, "final": false}))
+                        .await;
+                    persist_message(
+                        &agent,
+                        &rt.session_id,
+                        "assistant",
+                        &turn.reasoning,
+                        None,
+                        None,
+                        Some("thought"),
+                        "message",
+                    )
+                    .await;
+                }
                 let _ = ws_tx
                     .send(serde_json::json!({"type": "assistant_chunk", "content": "", "final": true}))
                     .await;
@@ -929,7 +1039,7 @@ pub async fn run_agent_turn(
                 return Ok(());
             }
             // tool 回合：转成与 parse_llm_turn 相同的处理流（见下）
-            handle_tool_calls(&agent, rt, &ws_tx, turn.tool_calls, turn.raw_tool_calls).await?;
+            handle_tool_calls(&agent, rt, &ws_tx, turn.tool_calls, turn.raw_tool_calls, &turn.reasoning).await?;
             continue;
         }
 
@@ -1221,6 +1331,7 @@ mod tests {
             sse::SseFeed::None => panic!("expected Content delta, got None"),
             sse::SseFeed::Done => panic!("expected Content delta, got Done"),
             sse::SseFeed::Overflow => panic!("expected Content delta, got Overflow"),
+            sse::SseFeed::Thought { .. } => panic!("expected Content delta, got Thought"),
         }
     }
 
