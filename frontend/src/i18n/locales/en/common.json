@@ -1005,6 +1005,8 @@
     "approvalModeHint_auto_write": "File writes run automatically; dangerous shell and git push require confirmation",
     "approvalMode_full_auto": "Full auto",
     "approvalModeHint_full_auto": "All operations run automatically (not recommended)",
+    "approvalMode_plan": "Plan mode",
+    "approvalModeHint_plan": "Read-only investigation; model cannot modify files. Review plan, then switch to execute",
     "systemPrompt": "Custom system prompt",
     "systemPromptPlaceholder": "Appended after the built-in prompt for workspace-specific instructions (optional)",
     "noMatchingFiles": "No matching files",

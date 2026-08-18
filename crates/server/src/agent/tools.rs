@@ -1,8 +1,22 @@
 //! Tool definitions (JSON schema) and tool-call → AgentCommand conversion.
 use rust_tunnel_common::AgentCommand;
 
+/// Plan 模式下暴露的只读工具名集合（与 `is_readonly_command` 对齐）。
+const PLAN_MODE_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "search",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_branch",
+];
+
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
-pub fn agent_tools_schema() -> Vec<serde_json::Value> {
+/// `mode` 为 `"plan"` 时只暴露只读工具子集 + `todo_write`（辅助出方案），
+/// 写类工具对模型不可见（模型不会调用，parse 层再兜底拒绝）。
+pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     let file_props = |extra: &[(&str, serde_json::Value)]| {
         let mut props = serde_json::json!({
             "path": {"type": "string", "description": "Relative path within the workspace"}
@@ -312,6 +326,16 @@ pub fn agent_tools_schema() -> Vec<serde_json::Value> {
             }
         }));
     }
+
+    // Plan 模式：裁剪为只读子集（辅助出方案），写类工具不暴露给模型。
+    // todo_write 将在后续 commit 加入（不在此处引用，避免 feature 依赖）。
+    if mode == "plan" {
+        tools.retain(|t| {
+            let name = t["function"]["name"].as_str().unwrap_or("");
+            PLAN_MODE_TOOLS.contains(&name)
+        });
+    }
+
     tools
 }
 
@@ -375,6 +399,33 @@ fn git_paths_cmd(tool: &str, prefix: &[&str], paths: &[String]) -> Result<Vec<St
 fn plan_git_cmd(tool: &str, args: Vec<String>) -> Result<AgentCommand, String> {
     let planned = super::git_plan::plan(&args).map_err(|e| format!("tool '{tool}': {e}"))?;
     Ok(AgentCommand::GitExec { args: planned.args })
+}
+
+/// Plan 模式下被禁止的工具名集合（写类工具）。模型看不到这些工具的 schema，
+/// 但若模型幻觉出写工具名，parse 层通过此函数拒绝执行。
+const PLAN_BLOCKED_TOOLS: &[&str] = &[
+    "shell",
+    "write_file",
+    "patch_file",
+    "git_commit",
+    "git_push",
+    "git_stage",
+    "git_unstage",
+    "git_checkout",
+    "git_pull",
+    "git_revert",
+    "git_reset",
+    "git_stash",
+];
+
+/// Plan 模式下工具调用是否被禁止（写类工具）。返回 Ok(()) 表示允许，
+/// Err(msg) 表示被 plan 模式拦截。
+pub fn plan_mode_guard(tool_name: &str) -> Result<(), String> {
+    if PLAN_BLOCKED_TOOLS.contains(&tool_name) {
+        Err("plan mode: 写操作不可用，当前为只读调研模式。用户确认方案后切换到执行模式即可使用写工具。".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// Cap on a single tool input payload. The control-channel protocol cap is 1MB
@@ -630,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_schema_covers_all_commands() {
-        let schema = agent_tools_schema();
+        let schema = agent_tools_schema("safe");
         let names: Vec<&str> = schema
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -719,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_schema_covers_search_patch() {
-        let schema = agent_tools_schema();
+        let schema = agent_tools_schema("safe");
         let names: Vec<&str> = schema
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -817,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_schema_covers_git_exec_tools() {
-        let schema = agent_tools_schema();
+        let schema = agent_tools_schema("safe");
         let names: Vec<&str> = schema
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -1094,5 +1145,62 @@ mod tests {
             }
             other => panic!("expected GitCommit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_plan_mode_schema_only_readonly() {
+        let schema = agent_tools_schema("plan");
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        // plan 模式只暴露只读工具 + todo_write
+        for expected in [
+            "read_file",
+            "list_dir",
+            "search",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_show",
+            "git_branch",
+        ] {
+            assert!(names.contains(&expected), "plan mode missing tool: {expected}");
+        }
+        // plan 模式不暴露写工具
+        for blocked in [
+            "shell",
+            "write_file",
+            "patch_file",
+            "git_commit",
+            "git_push",
+            "git_stage",
+            "git_unstage",
+            "git_checkout",
+            "git_pull",
+            "git_revert",
+            "git_reset",
+            "git_stash",
+        ] {
+            assert!(!names.contains(&blocked), "plan mode should not expose: {blocked}");
+        }
+    }
+
+    #[test]
+    fn test_plan_mode_guard_blocks_write_tools() {
+        assert!(plan_mode_guard("shell").is_err());
+        assert!(plan_mode_guard("write_file").is_err());
+        assert!(plan_mode_guard("patch_file").is_err());
+        assert!(plan_mode_guard("git_commit").is_err());
+        assert!(plan_mode_guard("git_push").is_err());
+        assert!(plan_mode_guard("git_stage").is_err());
+        assert!(plan_mode_guard("git_checkout").is_err());
+        // 只读工具不受限
+        assert!(plan_mode_guard("read_file").is_ok());
+        assert!(plan_mode_guard("list_dir").is_ok());
+        assert!(plan_mode_guard("search").is_ok());
+        assert!(plan_mode_guard("git_status").is_ok());
+        assert!(plan_mode_guard("git_diff").is_ok());
+        assert!(plan_mode_guard("git_log").is_ok());
     }
 }

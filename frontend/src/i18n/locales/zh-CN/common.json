@@ -1002,6 +1002,8 @@
     "approvalModeHint_auto_write": "写文件自动执行，危险 shell 与 git push 需确认",
     "approvalMode_full_auto": "全自动",
     "approvalModeHint_full_auto": "所有操作自动执行（不推荐）",
+    "approvalMode_plan": "计划模式",
+    "approvalModeHint_plan": "只读调研，模型无法修改文件。调研完成后由用户确认方案再切换执行",
     "systemPrompt": "自定义提示词",
     "systemPromptPlaceholder": "追加到内置提示词之后，用于该工作区的定制指令（可选）",
     "noMatchingFiles": "无匹配文件",

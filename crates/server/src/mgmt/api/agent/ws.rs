@@ -321,6 +321,20 @@ async fn refresh_session_model(db: &crate::db::Database, session_id: &str, rt_mo
     }
 }
 
+/// 会话审批模式「下一条消息生效」：每轮从 DB 重读 workspace.approval_mode，
+/// 若与运行时当前值不同则覆盖（set_mode 中途切换后下一轮自动生效）。
+async fn refresh_approval_mode(db: &crate::db::Database, session_id: &str, rt_mode: &mut String) {
+    let Ok(Some(session)) = db.agent_get_session(session_id).await else {
+        return;
+    };
+    let Ok(Some(workspace)) = db.agent_get_workspace(&session.workspace_id).await else {
+        return;
+    };
+    if workspace.approval_mode != *rt_mode {
+        *rt_mode = workspace.approval_mode;
+    }
+}
+
 /// `WS` 客户端帧分类：`user_message` / `cancel` / `approval_response` / 其他（忽略）。
 enum WsFrame {
     /// 用户消息：content + 可选 @引用文件路径列表
@@ -348,6 +362,11 @@ enum WsFrame {
     SetConfigOption {
         config_id: String,
         value: String,
+    },
+    /// Runner 路径审批模式切换（plan/execute）：更新 workspace.approval_mode
+    /// 并同步当前连接的 SessionRuntime。
+    SetMode {
+        mode: String,
     },
     Other,
 }
@@ -444,6 +463,18 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                 return WsFrame::Other;
             }
             WsFrame::SetConfigOption { config_id, value }
+        }
+        Some("set_mode") => {
+            let mode = body
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // 只接受已知的 approval_mode 值
+            if !matches!(mode.as_str(), "safe" | "auto_write" | "full_auto" | "plan") {
+                return WsFrame::Other;
+            }
+            WsFrame::SetMode { mode }
         }
         _ => WsFrame::Other,
     }
@@ -799,6 +830,32 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     }
                     continue;
                 }
+                WsFrame::SetMode { mode } => {
+                    // Runner 路径审批模式切换：更新 workspace.approval_mode（DB）+ 当前连接 rt（内存态）。
+                    // rt 在首次 user_message 时才创建；若尚无 rt，仅更新 DB（下一条消息时 load 读取）。
+                    if let Some(agent) = state.server_state.agent_state.as_ref() {
+                        let ws = match load_workspace_for_session(&agent.db, &session_id).await {
+                            Ok(Some(ws)) => ws,
+                            _ => {
+                                let _ = event_tx.send(serde_json::json!({"type": "error", "message": "workspace not found"})).await;
+                                continue;
+                            }
+                        };
+                        if let Err(e) = agent.db.agent_update_workspace(
+                            &ws.id, &ws.name, &ws.root_path,
+                            None, Some(&mode), None, None, None, None,
+                        ).await {
+                            let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set mode failed: {e}")})).await;
+                            continue;
+                        }
+                    }
+                    // 同步当前连接的 rt（若已创建）
+                    if let Some(rt) = rt_cache.as_mut() {
+                        rt.approval_mode = mode.clone();
+                    }
+                    let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
+                    continue;
+                }
                 WsFrame::Other => continue,
             }
         };
@@ -946,6 +1003,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
                 // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
                 refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
+                refresh_approval_mode(&agent.db, &session_id, &mut rt.approval_mode).await;
                 rt
             }
             None => {
@@ -1078,6 +1136,20 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             // 配置切换是 ACP 会话概念：本内层循环只跑自研 runner
                             // 路径（ACP 回合在外层循环处理），无会话配置可切换，忽略。
                             WsFrame::SetConfigOption { .. } => {}
+                            // Runner 审批模式切换：回合内仅持久化 DB（rt 被 turn future 借用，
+                            // 不可修改）；下一轮 LLM 调用从 rt.approval_mode 读取最新值
+                            // （ws.rs 外层 loop 下一帧处理时 rt_cache 已更新）。
+                            WsFrame::SetMode { mode } => {
+                                if let Some(agent) = state.server_state.agent_state.as_ref() {
+                                    if let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await {
+                                        let _ = agent.db.agent_update_workspace(
+                                            &ws.id, &ws.name, &ws.root_path,
+                                            None, Some(&mode), None, None, None, None,
+                                        ).await;
+                                    }
+                                }
+                                let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
+                            }
                             // elicitation 仅 ACP 路径产生：runner 回合内不可能有
                             // pending 表单，忽略（resolve_elicitation 对未知 id
                             // 是 no-op，ACP 帧只在外层处理，保持最小改动）。

@@ -101,7 +101,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
   const [rootPath, setRootPath] = useState(editing?.root_path ?? '');
   const [dockerImage, setDockerImage] = useState(editing?.docker_image ?? '');
   const [dockerContainerId, setDockerContainerId] = useState(editing?.docker_container_id ?? '');
-  const [approvalMode, setApprovalMode] = useState<'safe' | 'auto_write' | 'full_auto'>(
+  const [approvalMode, setApprovalMode] = useState<'safe' | 'auto_write' | 'full_auto' | 'plan'>(
     editing?.approval_mode ?? 'safe',
   );
   const [systemPrompt, setSystemPrompt] = useState(editing?.system_prompt ?? '');
@@ -503,7 +503,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
             <div className="space-y-2">
               <Label>{t('agent.approvalMode')}</Label>
               <div className="space-y-1.5">
-                {(['safe', 'auto_write', 'full_auto'] as const).map((m) => (
+                {(['safe', 'auto_write', 'full_auto', 'plan'] as const).map((m) => (
                   <label key={m} className="flex items-start gap-2 text-sm">
                     <input type="radio" checked={approvalMode === m} onChange={() => setApprovalMode(m)} className="mt-1" />
                     <span>

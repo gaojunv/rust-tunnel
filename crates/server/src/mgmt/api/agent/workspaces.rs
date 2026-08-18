@@ -162,10 +162,10 @@ pub async fn update_workspace(
 ) -> impl IntoResponse {
     // approval_mode 校验：非法值拒绝（而不是静默落库）
     if let Some(m) = body.approval_mode.as_deref() {
-        if !matches!(m, "safe" | "auto_write" | "full_auto") {
+        if !matches!(m, "safe" | "auto_write" | "full_auto" | "plan") {
             return (
                 StatusCode::BAD_REQUEST,
-                "approval_mode must be safe|auto_write|full_auto",
+                "approval_mode must be safe|auto_write|full_auto|plan",
             )
                 .into_response();
         }

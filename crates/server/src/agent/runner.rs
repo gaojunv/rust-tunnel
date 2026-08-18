@@ -527,6 +527,22 @@ async fn handle_single_tool_call(
 
     let result_text = match tools::parse_tool_call(&call.name, &call.args) {
         Ok(command) => {
+            // Plan 模式防御：模型理论上看不到写工具 schema，若幻觉出写工具名，
+            // parse 层拒绝执行（与 schema 裁剪双保险）。
+            if rt.approval_mode == "plan" {
+                if let Err(e) = tools::plan_mode_guard(&call.name) {
+                    let _ = ws_tx
+                        .send(serde_json::json!({
+                            "type": "tool_result",
+                            "id": &call.id,
+                            "name": &call.name,
+                            "result": &e,
+                        }))
+                        .await;
+                    record_tool_result(agent, rt, &call.id, &call.name, e).await;
+                    return Ok(());
+                }
+            }
             // 审批：session 记忆集命中且命令非破坏性 → 放行
             let remembered = agent
                 .is_allowed_for_session(&rt.session_id, &call.name)
@@ -910,6 +926,28 @@ pub async fn run_agent_turn(
         };
     }
 
+    // Plan 模式系统提示注入/移除：模式切换时动态更新 system 消息（内存态，不落库）。
+    // 追加 `\n\n---\n\n` 分隔的 plan 模式说明块；退出 plan 模式时移除该块。
+    const PLAN_MODE_BLOCK_TAG: &str = "\n\n---\n\n# Plan Mode\n";
+    const PLAN_MODE_BLOCK: &str = "\n\n---\n\n# Plan Mode\nYou are in **plan mode** (只读调研模式). In this mode:\n- You can ONLY use read-only tools: read_file, list_dir, search, git_status, git_diff, git_log, git_show, git_branch, todo_write.\n- You CANNOT write files, run shell commands, or modify the repository.\n- Your goal is to investigate the codebase and produce a detailed execution plan.\n- Use todo_write to track your investigation progress and plan items.\n- When your plan is ready, present it clearly to the user.\n- The user will confirm the plan and switch to execution mode for implementation.\n";
+    let current_has_plan = rt.messages[0]
+        .content
+        .as_deref()
+        .is_some_and(|s| s.contains(PLAN_MODE_BLOCK_TAG));
+    if rt.approval_mode == "plan" && !current_has_plan {
+        let base = rt.messages[0].content.as_deref().unwrap_or_default();
+        rt.messages[0] = ChatMessage::text("system", format!("{base}{PLAN_MODE_BLOCK}"));
+    } else if rt.approval_mode != "plan" && current_has_plan {
+        if let Some(content) = rt.messages[0].content.take() {
+            if let Some(pos) = content.find(PLAN_MODE_BLOCK_TAG) {
+                let trimmed = content[..pos].trim_end().to_string();
+                rt.messages[0] = ChatMessage::text("system", trimmed);
+            } else {
+                rt.messages[0].content = Some(content);
+            }
+        }
+    }
+
     // 用量记录上下文（从出账候选构建）与请求开始时间，用于 usage 落库。
     let mut usage_ctx: Option<crate::llm::usage::UsageContext> = None;
     let mut usage_started: Option<std::time::Instant> = None;
@@ -928,7 +966,7 @@ pub async fn run_agent_turn(
             max_tokens: None,
             temperature: None,
             top_p: None,
-            tools: Some(tools::agent_tools_schema()),
+            tools: Some(tools::agent_tools_schema(&rt.approval_mode)),
             tool_choice: None,
             raw_body: None,
         };

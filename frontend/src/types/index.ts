@@ -689,7 +689,7 @@ export interface AgentWorkspace {
   root_path: string;
   docker_image?: string;
   docker_container_id?: string;
-  approval_mode: 'safe' | 'auto_write' | 'full_auto';
+  approval_mode: 'safe' | 'auto_write' | 'full_auto' | 'plan';
   system_prompt: string | null;
   /** ACP 远程 agent 引擎：空串（缺省）= 内置 runner；非空 = gemini/claude-code/opencode */
   agent_type?: '' | 'gemini' | 'claude-code' | 'opencode';
@@ -889,7 +889,8 @@ export type AgentWsEvent =
   | { type: 'heartbeat'; ts?: number }
   | { type: 'session_state'; options?: SessionConfigOption[] }
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
-  | { type: 'current_mode_update'; mode_id?: string };
+  | { type: 'current_mode_update'; mode_id?: string }
+  | { type: 'mode_updated'; mode?: string };
 
 /** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
  *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */

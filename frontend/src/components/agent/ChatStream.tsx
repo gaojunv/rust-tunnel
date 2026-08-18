@@ -97,12 +97,13 @@ interface Props {
   sessionId: string;
   workspaceId: string;
   model: string;
+  approvalMode?: string;
   onModelChange: (id: string) => void;
   /** 多标签页模式下当前是否激活（hidden → 可见切换时对齐底部）。缺省视为激活。 */
   active?: boolean;
 }
 
-export default function ChatStream({ sessionId, workspaceId, model, onModelChange, active }: Props) {
+export default function ChatStream({ sessionId, workspaceId, model, approvalMode: initialApprovalMode, onModelChange, active }: Props) {
   const { t } = useTranslation();
   // t 的身份随语言切换变化，把它放进 WS effect 的依赖会导致切语言时拆断
   // 进行中的回合（onclose 追加"连接中断"气泡、过期所有 pending 审批、
@@ -133,6 +134,8 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
   const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
   // ACP 会话配置快照（session_state/config_option_update 全量帧；空数组 = 非 ACP 或未就绪）
   const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
+  // Runner 路径审批模式（safe/auto_write/full_auto/plan）：初始值来自 prop，mode_updated 帧实时更新
+  const [approvalMode, setApprovalMode] = useState(initialApprovalMode ?? 'safe');
   // config option 乐观更新的回滚快照：按 config_id 分键（prev=发送前值，opt=乐观值），
   // 并发点击不同选项互不覆盖（旧实现单槽快照互相覆盖，M19）。发送后保留，等
   // 服务端权威确认帧（session_state/config_option_update，已确认项移除）或「设置失败」
@@ -935,6 +938,11 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               : o,
           ),
         );
+      } else if (msg.type === 'mode_updated') {
+        // Runner 路径审批模式切换确认：同步本地 plan/execute 状态
+        if (msg.mode) setApprovalMode(msg.mode);
+        // 同步 workspace 缓存（下一次 React Query refetch 前保持一致）
+        void queryClient.invalidateQueries({ queryKey: ['agent-workspaces'] });
       } else if (msg.type === 'approval_request') {
         // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）。
         // 有 options 时卡片渲染 agent 给的选项（ACP 透传），无则保持 approve/deny 二元。
@@ -1356,6 +1364,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
     (o) => o.category !== 'mode' && o.category !== 'thought_level',
   );
 
+  // Runner 路径审批模式切换：发送 set_mode 帧（plan ↔ execute），乐观更新本地状态
+  const sendSetMode = useCallback((newMode: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'set_mode', mode: newMode }));
+      setApprovalMode(newMode);
+    } catch { /* ws closed */ }
+  }, []);
+
+  // 外部 prop 变化时同步本地 approvalMode（workspace 切换/页面刷新）
+  useEffect(() => {
+    if (initialApprovalMode) setApprovalMode(initialApprovalMode);
+  }, [initialApprovalMode]);
+
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
   // （assistant/thought），MessageBubble 据此用 `<Markdown streaming />` 渲染
   // （保留 md 结构、去掉 code 插件避免 Shiki 每帧全量重高亮，见 Markdown.tsx）。
@@ -1585,6 +1608,21 @@ export default function ChatStream({ sessionId, workspaceId, model, onModelChang
               onConfigChange={sendConfigOption}
             />
             <div className="flex items-center gap-0.5">
+              {/* Plan 模式切换按钮（runner 路径）：ACP 路径走 ConfigOptionButton，runner 路径走 set_mode */}
+              {approvalMode === 'plan' && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                  {t('agent.approvalMode_plan')}
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant={approvalMode === 'plan' ? 'default' : 'ghost'}
+                className="h-7 rounded-full px-2 text-xs"
+                onClick={() => sendSetMode(approvalMode === 'plan' ? 'safe' : 'plan')}
+                title={approvalMode === 'plan' ? t('agent.approvalModeHint_plan') : t('agent.approvalModeHint_safe')}
+              >
+                {approvalMode === 'plan' ? t('agent.approvalMode_plan') : 'Plan'}
+              </Button>
               <ConfigOptionButton
                 option={modeOption}
                 label="agent.configMode"

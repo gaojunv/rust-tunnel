@@ -282,6 +282,7 @@ export default function AgentPage() {
                   sessionId={id}
                   workspaceId={workspaceId}
                   model={modelFor(id)}
+                  approvalMode={workspaces?.find(w => w.id === workspaceId)?.approval_mode ?? 'safe'}
                   active={id === tabs.active}
                   onModelChange={(m) => setModelOverrides((o) => ({ ...o, [id]: m }))}
                 />

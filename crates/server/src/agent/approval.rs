@@ -217,9 +217,11 @@ pub fn command_is_destructive(cmd: &AgentCommand) -> bool {
 }
 
 /// 按审批模式判定工具调用是否需用户确认。非法 mode 按 "safe" 处理（保守）。
+/// `"plan"` 模式下：只读工具免审，写操作/危险 shell 一律需确认（模型理论上
+/// 看不到写工具 schema，此分支为防御性兜底）。
 pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
     let mode = match mode {
-        "safe" | "auto_write" | "full_auto" => mode,
+        "safe" | "auto_write" | "full_auto" | "plan" => mode,
         _ => "safe",
     };
     if mode == "full_auto" {
@@ -987,5 +989,41 @@ mod tests {
         );
         // pending 条目已清理，无泄漏
         assert_eq!(state.pending_approvals_count().await, 0);
+    }
+
+    #[test]
+    fn test_plan_mode_readonly_free() {
+        // plan 模式下只读工具免审
+        assert!(!needs_approval("plan", &AgentCommand::ReadFile { path: "a".into() }));
+        assert!(!needs_approval("plan", &AgentCommand::ListDir { path: ".".into() }));
+        assert!(!needs_approval("plan", &AgentCommand::Search {
+            pattern: "x".into(),
+            path: ".".into(),
+            include: None
+        }));
+        assert!(!needs_approval("plan", &AgentCommand::GitStatus));
+        assert!(!needs_approval("plan", &AgentCommand::GitDiff { path: None }));
+        assert!(!needs_approval("plan", &git_exec(&["status"])));
+        assert!(!needs_approval("plan", &git_exec(&["log", "-n", "5"])));
+    }
+
+    #[test]
+    fn test_plan_mode_writes_need_approval() {
+        // plan 模式下写工具一律需确认（防御性——模型理论上看不到写工具 schema）
+        assert!(needs_approval("plan", &shell("ls")));
+        assert!(needs_approval("plan", &AgentCommand::WriteFile {
+            path: "a".into(),
+            content: "x".into()
+        }));
+        assert!(needs_approval("plan", &AgentCommand::PatchFile {
+            path: "a".into(),
+            old_string: "o".into(),
+            new_string: "n".into()
+        }));
+        assert!(needs_approval("plan", &AgentCommand::GitCommit {
+            message: "m".into()
+        }));
+        assert!(needs_approval("plan", &AgentCommand::GitPush));
+        assert!(needs_approval("plan", &shell("rm -rf /")));
     }
 }
