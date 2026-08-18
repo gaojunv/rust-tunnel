@@ -151,8 +151,11 @@ pub struct SessionRuntime {
     /// workspace is docker-typed but has no container yet (or host runtime).
     pub docker_container: Option<String>,
     pub model: String,
-    /// `workspace` 审批模式（`safe`/`auto_write`/`full_auto`），`load` 时从 workspace `record` 读取。
+    /// `workspace` 审批模式（`safe`/`auto_write`/`full_auto`/`plan`），`load` 时从 workspace `record` 读取。
     pub approval_mode: String,
+    /// 任务清单（todo_write 工具维护）：内存态，全量替换语义。
+    /// 会话恢复不持久化（重连/刷新后清空），复杂度与收益权衡。
+    pub todos: Vec<super::tools::TodoItem>,
     /// AGENTS.md 内容缓存：None = 尚未尝试读取；Some("") = 已读但不存在/为空；
     /// Some(非空) = 已注入。runner 据此决定是否发起首次读取。
     pub agents_md: Option<String>,
@@ -275,6 +278,7 @@ impl SessionRuntime {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            todos: vec![],
             messages,
         })
     }

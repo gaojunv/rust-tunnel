@@ -13,7 +13,7 @@ import {
   updateAgentSessionModel,
 } from '../../api/client';
 import type { AgentMessagesPage } from '../../api/client';
-import type { AgentMessage, AgentWsEvent } from '../../types';
+import type { AgentMessage, AgentWsEvent, TodoItem } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
 import ElicitationCard from './ElicitationCard';
@@ -136,6 +136,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
   // Runner 路径审批模式（safe/auto_write/full_auto/plan）：初始值来自 prop，mode_updated 帧实时更新
   const [approvalMode, setApprovalMode] = useState(initialApprovalMode ?? 'safe');
+  // 任务清单（todo_write 工具维护）：全量替换语义，todo_update 帧实时更新
+  const [todos, setTodos] = useState<TodoItem[]>([]);
   // config option 乐观更新的回滚快照：按 config_id 分键（prev=发送前值，opt=乐观值），
   // 并发点击不同选项互不覆盖（旧实现单槽快照互相覆盖，M19）。发送后保留，等
   // 服务端权威确认帧（session_state/config_option_update，已确认项移除）或「设置失败」
@@ -943,6 +945,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         if (msg.mode) setApprovalMode(msg.mode);
         // 同步 workspace 缓存（下一次 React Query refetch 前保持一致）
         void queryClient.invalidateQueries({ queryKey: ['agent-workspaces'] });
+      } else if (msg.type === 'todo_update') {
+        // 任务清单全量替换：模型维护进度面板
+        setTodos(msg.todos ?? []);
       } else if (msg.type === 'approval_request') {
         // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）。
         // 有 options 时卡片渲染 agent 给的选项（ACP 透传），无则保持 approve/deny 二元。
@@ -1521,6 +1526,24 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             <div className="mb-1 flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive md:mb-1.5">
               <Loader2 className="h-3 w-3 animate-spin" />
               {t('agent.reconnecting')}
+            </div>
+          )}
+          {/* 任务清单面板：todo_write 工具维护，全量替换语义 */}
+          {todos.length > 0 && (
+            <div className="mb-2 rounded-xl border border-border/60 bg-muted/30 px-3 py-2">
+              <div className="mb-1 text-xs font-medium text-muted-foreground">Tasks</div>
+              <ul className="space-y-0.5">
+                {todos.map((t, i) => (
+                  <li key={i} className="flex items-start gap-1.5 text-xs">
+                    <span className="mt-0.5 shrink-0">
+                      {t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬜'}
+                    </span>
+                    <span className={t.status === 'completed' ? 'text-muted-foreground line-through' : t.status === 'in_progress' ? 'font-medium' : ''}>
+                      {t.activeForm && t.status === 'in_progress' ? `${t.activeForm}: ` : ''}{t.content}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
           {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边 */}

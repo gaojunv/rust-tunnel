@@ -227,6 +227,26 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
     if mode == "full_auto" {
         return false;
     }
+    // Plan 模式：只读工具免审，写工具/危险 shell 一律需确认（与 safe 模式行为一致）。
+    // Shell 不在 plan schema 中，但保留防御：非危险 shell 免审，危险 shell 需确认。
+    if mode == "plan" {
+        let result = match cmd {
+            AgentCommand::ReadFile { .. }
+            | AgentCommand::ListDir { .. }
+            | AgentCommand::Search { .. }
+            | AgentCommand::GitStatus
+            | AgentCommand::GitDiff { .. } => false,
+            AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
+                is_dangerous_shell(cmd)
+            }
+            AgentCommand::GitExec { args } => {
+                // Read 免审，其余需确认：Err 按保守需审
+                !matches!(git_plan::plan(args), Ok(p) if p.risk == GitRisk::Read)
+            }
+            _ => true, // WriteFile/PatchFile/GitCommit/GitPush 一律需确认
+        };
+        return result;
+    }
     match cmd {
         AgentCommand::ReadFile { .. }
         | AgentCommand::ListDir { .. }
@@ -1010,7 +1030,15 @@ mod tests {
     #[test]
     fn test_plan_mode_writes_need_approval() {
         // plan 模式下写工具一律需确认（防御性——模型理论上看不到写工具 schema）
-        assert!(needs_approval("plan", &shell("ls")));
+        // 注意：只读 shell（如 ls）在 plan 模式下免审（与 safe 模式行为一致）；
+        // 非危险 shell 在 plan 模式下也不需确认——模型看不到 shell schema，此
+        // 分支仅为 parse 层防御性兜底（plan_mode_guard 拦截 shell 工具名）。
+        assert!(!needs_approval("plan", &shell("ls")));
+        assert!(!needs_approval("plan", &shell("git status")));
+        assert!(!needs_approval("plan", &shell("echo x > file.txt"))); // 非危险 shell
+        // 危险 shell 需确认
+        assert!(needs_approval("plan", &shell("rm -rf /")));
+        // 写工具需确认
         assert!(needs_approval("plan", &AgentCommand::WriteFile {
             path: "a".into(),
             content: "x".into()
@@ -1024,6 +1052,5 @@ mod tests {
             message: "m".into()
         }));
         assert!(needs_approval("plan", &AgentCommand::GitPush));
-        assert!(needs_approval("plan", &shell("rm -rf /")));
     }
 }

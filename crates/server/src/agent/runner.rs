@@ -525,6 +525,34 @@ async fn handle_single_tool_call(
         return Ok(());
     }
 
+    // todo_write 工具短路：全量替换任务清单，发送 todo_update 帧，不进 AgentCommand 协议
+    if call.name == "todo_write" {
+        let text = match tools::parse_todo_write(&call.args) {
+            Ok(todos) => {
+                rt.todos = todos.clone();
+                // 发送 todo_update 帧
+                let _ = ws_tx
+                    .send(serde_json::json!({
+                        "type": "todo_update",
+                        "todos": &todos,
+                    }))
+                    .await;
+                format!("todo list updated: {} items", todos.len())
+            }
+            Err(e) => format!("error: {e}"),
+        };
+        let _ = ws_tx
+            .send(serde_json::json!({
+                "type": "tool_result",
+                "id": &call.id,
+                "name": &call.name,
+                "result": &text,
+            }))
+            .await;
+        record_tool_result(agent, rt, &call.id, &call.name, text).await;
+        return Ok(());
+    }
+
     let result_text = match tools::parse_tool_call(&call.name, &call.args) {
         Ok(command) => {
             // Plan 模式防御：模型理论上看不到写工具 schema，若幻觉出写工具名，

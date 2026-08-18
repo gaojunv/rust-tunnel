@@ -719,6 +719,12 @@ export interface AgentSession {
   updated_at: string;
 }
 
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  activeForm?: string;
+}
+
 export interface AgentMessage {
   id: string;
   session_id: string;
@@ -890,7 +896,8 @@ export type AgentWsEvent =
   | { type: 'session_state'; options?: SessionConfigOption[] }
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
   | { type: 'current_mode_update'; mode_id?: string }
-  | { type: 'mode_updated'; mode?: string };
+  | { type: 'mode_updated'; mode?: string }
+  | { type: 'todo_update'; todos?: TodoItem[] };
 
 /** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
  *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */

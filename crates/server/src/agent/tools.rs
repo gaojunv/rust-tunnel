@@ -1,6 +1,22 @@
 //! Tool definitions (JSON schema) and tool-call → AgentCommand conversion.
 use rust_tunnel_common::AgentCommand;
 
+/// 任务清单项（todo_write 工具参数）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String, // "pending" | "in_progress" | "completed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+}
+
+impl TodoItem {
+    /// 校验 status 值是否合法。
+    pub fn is_valid_status(s: &str) -> bool {
+        matches!(s, "pending" | "in_progress" | "completed")
+    }
+}
+
 /// Plan 模式下暴露的只读工具名集合（与 `is_readonly_command` 对齐）。
 const PLAN_MODE_TOOLS: &[&str] = &[
     "read_file",
@@ -293,6 +309,35 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
                 }
             }
         }),
+        // todo_write：任务清单维护工具（服务端短路，不进 AgentCommand 协议）。
+        // 全量替换语义：每次调用提交完整清单。执行模式和 plan 模式都可用
+        // （写清单不算写操作，有助于出方案和跟踪进度）。
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "todo_write",
+                "description": "Replace the full task list. Use this to track your progress and plan. Each call replaces the entire list.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {"type": "string", "description": "Task description"},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Task status"},
+                                    "activeForm": {"type": "string", "description": "Optional present-tense label shown while in progress"}
+                                },
+                                "required": ["content", "status"]
+                            },
+                            "description": "Full task list (replaces previous)"
+                        }
+                    },
+                    "required": ["todos"]
+                }
+            }
+        }),
     ];
     // AI 记忆体 remember 工具：服务端本地短路（runner.rs handle_tool_calls 提前
     // 拦截，不进 AgentCommand 协议）。description/parameters 与 MCP 端点共用
@@ -327,12 +372,11 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
         }));
     }
 
-    // Plan 模式：裁剪为只读子集（辅助出方案），写类工具不暴露给模型。
-    // todo_write 将在后续 commit 加入（不在此处引用，避免 feature 依赖）。
+    // Plan 模式：裁剪为只读子集 + todo_write（辅助出方案），写类工具不暴露给模型。
     if mode == "plan" {
         tools.retain(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
-            PLAN_MODE_TOOLS.contains(&name)
+            PLAN_MODE_TOOLS.contains(&name) || name == "todo_write"
         });
     }
 
@@ -426,6 +470,48 @@ pub fn plan_mode_guard(tool_name: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// 解析 todo_write 工具调用参数，返回验证后的 TodoItem 列表。
+/// 校验：todos 必须为数组、每项必须有 content 和合法 status。
+pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|e| format!("invalid todo_write arguments: {e}"))?;
+    let todos = args
+        .get("todos")
+        .and_then(|v| v.as_array())
+        .ok_or("tool 'todo_write' requires array argument 'todos'")?;
+    let items: Vec<TodoItem> = todos
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let content = v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| format!("todo[{i}]: missing 'content'"))?
+                .to_string();
+            let status = v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| format!("todo[{i}]: missing 'status'"))?
+                .to_string();
+            if !TodoItem::is_valid_status(&status) {
+                return Err(format!(
+                    "todo[{i}]: invalid status '{status}' (must be pending|in_progress|completed)"
+                ));
+            }
+            let active_form = v
+                .get("activeForm")
+                .and_then(|a| a.as_str())
+                .map(str::to_string);
+            Ok(TodoItem {
+                content,
+                status,
+                active_form,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(items)
 }
 
 /// Cap on a single tool input payload. The control-channel protocol cap is 1MB
@@ -1164,6 +1250,7 @@ mod tests {
             "git_log",
             "git_show",
             "git_branch",
+            "todo_write",
         ] {
             assert!(names.contains(&expected), "plan mode missing tool: {expected}");
         }
@@ -1202,5 +1289,85 @@ mod tests {
         assert!(plan_mode_guard("git_status").is_ok());
         assert!(plan_mode_guard("git_diff").is_ok());
         assert!(plan_mode_guard("git_log").is_ok());
+    }
+
+    #[test]
+    fn test_todo_write_schema_in_all_modes() {
+        // todo_write 在执行模式和 plan 模式下都可用
+        for mode in ["safe", "auto_write", "full_auto", "plan"] {
+            let schema = agent_tools_schema(mode);
+            let names: Vec<&str> = schema
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap())
+                .collect();
+            assert!(names.contains(&"todo_write"), "todo_write missing in mode: {mode}");
+        }
+    }
+
+    #[test]
+    fn test_parse_todo_write_valid() {
+        let args = r#"{"todos":[{"content":"Build feature X","status":"in_progress","activeForm":"Building feature X"},{"content":"Write tests","status":"pending"}]}"#;
+        let items = parse_todo_write(args).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content, "Build feature X");
+        assert_eq!(items[0].status, "in_progress");
+        assert_eq!(items[0].active_form.as_deref(), Some("Building feature X"));
+        assert_eq!(items[1].content, "Write tests");
+        assert_eq!(items[1].status, "pending");
+        assert!(items[1].active_form.is_none());
+    }
+
+    #[test]
+    fn test_parse_todo_write_empty_list() {
+        let items = parse_todo_write(r#"{"todos":[]}"#).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_parse_todo_write_invalid_status() {
+        let err = parse_todo_write(r#"{"todos":[{"content":"x","status":"invalid"}]}"#).unwrap_err();
+        assert!(err.contains("invalid status"));
+    }
+
+    #[test]
+    fn test_parse_todo_write_missing_content() {
+        let err = parse_todo_write(r#"{"todos":[{"status":"pending"}]}"#).unwrap_err();
+        assert!(err.contains("missing 'content'"));
+    }
+
+    #[test]
+    fn test_parse_todo_write_missing_status() {
+        let err = parse_todo_write(r#"{"todos":[{"content":"x"}]}"#).unwrap_err();
+        assert!(err.contains("missing 'status'"));
+    }
+
+    #[test]
+    fn test_parse_todo_write_missing_todos() {
+        let err = parse_todo_write(r#"{}"#).unwrap_err();
+        assert!(err.contains("requires array argument 'todos'"));
+    }
+
+    #[test]
+    fn test_parse_todo_write_invalid_json() {
+        let err = parse_todo_write("not json").unwrap_err();
+        assert!(err.contains("invalid todo_write arguments"));
+    }
+
+    #[test]
+    fn test_parse_todo_write_all_statuses() {
+        let args = r#"{"todos":[{"content":"a","status":"pending"},{"content":"b","status":"in_progress"},{"content":"c","status":"completed"}]}"#;
+        let items = parse_todo_write(args).unwrap();
+        assert_eq!(items[0].status, "pending");
+        assert_eq!(items[1].status, "in_progress");
+        assert_eq!(items[2].status, "completed");
+    }
+
+    #[test]
+    fn test_todo_item_valid_status() {
+        assert!(TodoItem::is_valid_status("pending"));
+        assert!(TodoItem::is_valid_status("in_progress"));
+        assert!(TodoItem::is_valid_status("completed"));
+        assert!(!TodoItem::is_valid_status("done"));
+        assert!(!TodoItem::is_valid_status(""));
     }
 }
