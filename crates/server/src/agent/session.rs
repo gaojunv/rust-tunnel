@@ -167,6 +167,10 @@ pub struct SessionRuntime {
     /// 同模式：每会话只检索一次（纯 SQL，零 embedding 依赖）。
     pub skill_list_block: Option<String>,
     pub messages: Vec<ChatMessage>,
+    /// 子 agent 深度：0 = 主循环，1 = 子 agent（防止递归委托）。
+    pub depth: u8,
+    /// 子 agent 的父 tool_call_id（WS 帧 parent 注入用；主 rt 为 None）。
+    pub parent_tool_call_id: Option<String>,
 }
 
 impl SessionRuntime {
@@ -280,11 +284,43 @@ impl SessionRuntime {
             skill_list_block: None,
             todos: vec![],
             messages,
+            depth: 0,
+            parent_tool_call_id: None,
         })
+    }
+
+    /// 构造子 agent 运行时：复制父会话关键字段，messages 只含 system + user(prompt)，
+    /// 不注入 AGENTS.md / memory / skill（子循环独立上下文）。
+    pub fn subagent(
+        parent: &SessionRuntime,
+        system_prompt: String,
+        task_prompt: &str,
+        parent_tool_call_id: &str,
+    ) -> Self {
+        Self {
+            session_id: parent.session_id.clone(),
+            workspace_id: parent.workspace_id.clone(),
+            client_id: parent.client_id.clone(),
+            runtime_type: parent.runtime_type.clone(),
+            root_path: parent.root_path.clone(),
+            docker_container: parent.docker_container.clone(),
+            model: parent.model.clone(),
+            approval_mode: parent.approval_mode.clone(),
+            todos: vec![],
+            agents_md: Some(String::new()),
+            memory_block: Some(String::new()),
+            skill_list_block: Some(String::new()),
+            messages: vec![
+                ChatMessage::text("system", system_prompt),
+                ChatMessage::text("user", task_prompt),
+            ],
+            depth: parent.depth + 1,
+            parent_tool_call_id: Some(parent_tool_call_id.to_string()),
+        }
     }
 }
 
-const SYSTEM_PROMPT: &str = "You are an AI programming assistant running inside a workspace on a remote machine. Use the provided tools (shell/read_file/write_file/list_dir/git_*) to inspect and modify the project. Prefer small, verifiable steps: read before write, run tests after changes. All paths are relative to the workspace root.";
+const SYSTEM_PROMPT: &str = "You are an AI programming assistant running inside a workspace on a remote machine. Use the provided tools (shell/read_file/write_file/list_dir/git_*) to inspect and modify the project. Prefer small, verifiable steps: read before write, run tests after changes. All paths are relative to the workspace root.\n\n## Delegation\nUse the `task` tool to delegate exploration/research subtasks (code searches, multi-file reading, investigations) to a sub-agent with isolated context. It returns only a summary, keeping the main context clean. Prefer task for open-ended questions that would require many tool calls.";
 
 /// AGENTS.md 注入上限（字节），超出截断。
 const AGENTS_MD_MAX_BYTES: usize = 20 * 1024;

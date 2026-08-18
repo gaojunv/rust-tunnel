@@ -185,11 +185,40 @@ export function historyToChatItemsWithSkip(
         /* ignore malformed tool_calls */
       }
     } else if (m.kind === 'tool_calls') {
-      // kind='tool_calls' 行有配对 tool_result 时跳过（args 已由 tool_result 卡片
-      // 携带，重复渲染会产生孤儿 failed 卡）。无配对（回合中断在工具执行中：
-      // ToolCall 已落库，ToolCallUpdate/tool_result 永不到达）渲染 failed 占位卡，
-      // 否则该工具从聊天区彻底消失（现象：卡片无标题无内容、或凭空少一段）。
-      if (m.tool_call_id && !m.content && !resultById.has(m.tool_call_id)) {
+      // Subagent 父卡（is_subagent: true）始终渲染父卡，即使有配对 tool_result：
+      // 父卡与 tool_result 卡平级渲染在主流，tool_result 卡的 parentToolId 为空
+      // 不会被 groupByParent 嵌套进父卡 children（保持语义：tool_result 是子项的结果
+      // 而非父卡自身的结果）。非 subagent 工具：有配对 tool_result 时跳过，无配对
+      // 渲染 failed 占位卡（回合中断兜底，否则工具从聊天区彻底消失）。
+      const hasSubagent =
+        m.tool_call_id &&
+        (() => {
+          try {
+            const arr = JSON.parse(m.tool_calls!) as { is_subagent?: boolean }[];
+            return Array.isArray(arr) && arr.some((e) => e.is_subagent === true);
+          } catch {
+            return false;
+          }
+        })();
+      if (hasSubagent && m.tool_call_id) {
+        const call = callArgs.get(m.tool_call_id);
+        if (call) {
+          loaded.push({
+            kind: 'tool',
+            content: '',
+            id: m.id,
+            toolName: call.name,
+            toolId: m.tool_call_id,
+            toolArgs: call.args,
+            toolResult: undefined,
+            toolStatus: 'completed',
+            toolKind: call.toolKind,
+            toolDiffs: call.toolDiffs,
+            toolLocations: call.toolLocations,
+            isSubagent: true,
+          });
+        }
+      } else if (m.tool_call_id && !m.content && !resultById.has(m.tool_call_id)) {
         const call = callArgs.get(m.tool_call_id);
         if (call) {
           loaded.push({

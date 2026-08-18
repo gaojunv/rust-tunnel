@@ -339,6 +339,21 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
             }
         }),
     ];
+    // task：子 agent 委托工具（服务端短路 spawn 子循环，不进 AgentCommand 协议）。
+    tools.push(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Delegate an exploration/research subtask to an independent sub-agent with its own context. The sub-agent runs a full tool loop and returns only a summary. Use for investigative tasks (code exploration, searches, multi-file reading) whose intermediate output would pollute the main context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The task description for the sub-agent to execute"}
+                },
+                "required": ["prompt"]
+            }
+        }
+    }));
     // AI 记忆体 remember 工具：服务端本地短路（runner.rs handle_tool_calls 提前
     // 拦截，不进 AgentCommand 协议）。description/parameters 与 MCP 端点共用
     // memory 模块的共享 schema，避免两处漂移。仅 rag feature 下出现在 schema——
@@ -376,7 +391,7 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     if mode == "plan" {
         tools.retain(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
-            PLAN_MODE_TOOLS.contains(&name) || name == "todo_write"
+            PLAN_MODE_TOOLS.contains(&name) || name == "todo_write" || name == "task"
         });
     }
 
@@ -512,6 +527,21 @@ pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(items)
+}
+
+/// 解析 task 工具调用参数，返回 prompt 字符串。
+/// 校验：prompt 必须存在、非空。
+pub fn parse_task_args(args_json: &str) -> Result<String, String> {
+    let args: serde_json::Value =
+        serde_json::from_str(args_json).map_err(|e| format!("invalid task arguments: {e}"))?;
+    let prompt = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or("tool 'task' requires string argument 'prompt'")?;
+    if prompt.trim().is_empty() {
+        return Err("tool 'task': prompt must not be empty".to_string());
+    }
+    Ok(prompt.to_string())
 }
 
 /// Cap on a single tool input payload. The control-channel protocol cap is 1MB
@@ -1369,5 +1399,63 @@ mod tests {
         assert!(TodoItem::is_valid_status("completed"));
         assert!(!TodoItem::is_valid_status("done"));
         assert!(!TodoItem::is_valid_status(""));
+    }
+
+    // ── task 工具 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_task_schema_in_safe_mode() {
+        let schema = agent_tools_schema("safe");
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"task"), "task missing in safe mode");
+    }
+
+    #[test]
+    fn test_task_schema_in_plan_mode() {
+        let schema = agent_tools_schema("plan");
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"task"), "task missing in plan mode");
+    }
+
+    #[test]
+    fn test_parse_task_args_valid() {
+        let prompt = parse_task_args(r#"{"prompt":"find all callers of foo"}"#).unwrap();
+        assert_eq!(prompt, "find all callers of foo");
+    }
+
+    #[test]
+    fn test_parse_task_args_empty_prompt() {
+        let err = parse_task_args(r#"{"prompt":""}"#).unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_parse_task_args_whitespace_prompt() {
+        let err = parse_task_args(r#"{"prompt":"   "}"#).unwrap_err();
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_parse_task_args_missing_prompt() {
+        let err = parse_task_args(r#"{}"#).unwrap_err();
+        assert!(err.contains("requires string argument 'prompt'"));
+    }
+
+    #[test]
+    fn test_parse_task_args_invalid_json() {
+        let err = parse_task_args("not json").unwrap_err();
+        assert!(err.contains("invalid task arguments"));
+    }
+
+    #[test]
+    fn test_parse_task_args_prompt_not_string() {
+        let err = parse_task_args(r#"{"prompt":123}"#).unwrap_err();
+        assert!(err.contains("requires string argument 'prompt'"));
     }
 }

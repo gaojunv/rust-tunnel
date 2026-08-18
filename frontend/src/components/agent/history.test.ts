@@ -282,6 +282,40 @@ describe('historyToChatItems', () => {
     expect(items).toHaveLength(2);
   });
 
+  it('renders subagent parent card even when paired tool_result exists (is_subagent: true)', () => {
+    // runner 路径 task 工具：tool_calls JSON 元素带 is_subagent: true。
+    // 有配对 tool_result 时，父卡（isSubagent: true）与结果卡都渲染在主流，
+    // groupByParent 不嵌套结果卡（无 parentToolId）。
+    const calls = JSON.stringify([
+      { id: 'task1', name: 'Task', arguments: '{"description":"调研 bug"}', is_subagent: true },
+    ]);
+    const items = historyToChatItems([
+      row({ id: 'm1', role: 'user', content: '去调研' }),
+      row({ id: 'm2', kind: 'tool_calls', tool_calls: calls, tool_call_id: 'task1', name: 'Task' }),
+      row({ id: 'm3', kind: 'tool_result', tool_call_id: 'task1', role: 'tool', name: 'Task', content: '调研完成' }),
+      row({ id: 'm4', content: '主 agent 收尾' }),
+    ]);
+    // 父卡（isSubagent）渲染在主流
+    const parent = items.find(
+      (it) => it.kind === 'tool' && it.toolId === 'task1',
+    );
+    expect(parent).toBeTruthy();
+    expect(parent!.isSubagent).toBe(true);
+    expect(parent!.toolStatus).toBe('completed');
+    // 结果卡也渲染（平级，parentToolId 为空 → groupByParent 不嵌套）
+    const resultCards = items.filter(
+      (it) => it.kind === 'tool' && it.toolId === 'task1',
+    );
+    // 两张卡：父卡 + 结果卡
+    expect(resultCards).toHaveLength(2);
+    expect(resultCards[1]).toMatchObject({
+      toolResult: '调研完成',
+      toolStatus: 'completed',
+    });
+    // 主 agent 正文仍在
+    expect(items.some((it) => it.kind === 'assistant' && it.content === '主 agent 收尾')).toBe(true);
+  });
+
   it('dedups re-inserted kept segment after compaction (M3)', () => {
     // DB 物理顺序：[旧消息..., 原kept..., summary, 重插kept...]——压缩修复（801c9a6）
     // 使 kept 段以相同内容出现两次，前端必须只渲染一份。summary 后的重插段是 kept

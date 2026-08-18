@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatItem } from './types';
 import {
+  applyToolCallChunk,
   appendChildStream,
   chunkKey,
   collectSubagents,
@@ -416,5 +417,84 @@ describe('collectSubagents', () => {
     expect(out).toHaveLength(1);
     expect(out[0].toolId).toBe('task1');
     expect(out[0].toolCount).toBe(1);
+  });
+});
+
+describe('applyToolCallChunk', () => {
+  it('routes chunk into parent card children when parent_tool_call_id is present', () => {
+    const list: ChatItem[] = [
+      tool({ toolId: 'task1', toolName: 'Task', isSubagent: true, children: [] }),
+    ];
+    const next = applyToolCallChunk(list, {
+      parent_tool_call_id: 'task1',
+      index: 0,
+      name: 'read_file',
+      arguments: '{"path":',
+    });
+    // Parent card still exists at top level
+    expect(next).toHaveLength(1);
+    expect(next[0].toolId).toBe('task1');
+    // Child chunk routed into parent's children
+    expect(next[0].children).toHaveLength(1);
+    expect(next[0].children![0]).toMatchObject({
+      kind: 'tool',
+      toolName: 'read_file',
+      toolArgs: '{"path":',
+      toolStatus: 'in_progress',
+    });
+  });
+
+  it('accumulates argument increments in the same child card', () => {
+    const list: ChatItem[] = [
+      tool({ toolId: 'task1', toolName: 'Task', isSubagent: true, children: [] }),
+    ];
+    const s1 = applyToolCallChunk(list, {
+      parent_tool_call_id: 'task1',
+      index: 0,
+      name: 'read_file',
+      arguments: '{"path":',
+    });
+    const s2 = applyToolCallChunk(s1, {
+      parent_tool_call_id: 'task1',
+      index: 0,
+      arguments: '"a.rs"}',
+    });
+    expect(s2[0].children![0].toolArgs).toBe('{"path":"a.rs"}');
+  });
+
+  it('falls to main stream when parent_tool_call_id references a missing parent', () => {
+    const list: ChatItem[] = [
+      { kind: 'user', content: 'hi' },
+    ];
+    const next = applyToolCallChunk(list, {
+      parent_tool_call_id: 'ghost',
+      index: 0,
+      name: 'read_file',
+      arguments: '{"path":"x"}',
+    });
+    // Chunk lands in main stream as a standalone tool card (orphan, will be
+    // grouped by groupByParent later when the parent card arrives)
+    expect(next).toHaveLength(2);
+    expect(next[1]).toMatchObject({
+      kind: 'tool',
+      toolName: 'read_file',
+      toolArgs: '{"path":"x"}',
+    });
+  });
+
+  it('does not mutate the original list (pure function)', () => {
+    const list: ChatItem[] = [
+      tool({ toolId: 'task1', toolName: 'Task', isSubagent: true, children: [] }),
+    ];
+    const next = applyToolCallChunk(list, {
+      parent_tool_call_id: 'task1',
+      index: 0,
+      name: 'Bash',
+      arguments: '{"cmd":"ls"}',
+    });
+    // Original list unchanged
+    expect(list[0].children).toHaveLength(0);
+    // New list has children
+    expect(next[0].children).toHaveLength(1);
   });
 });

@@ -349,8 +349,35 @@ export const STREAM_TOOL_ID_PREFIX = '__stream_';
  */
 export function applyToolCallChunk(
   list: ChatItem[],
-  msg: { index?: number; id?: string; name?: string; arguments?: string },
+  msg: {
+    index?: number;
+    id?: string;
+    name?: string;
+    arguments?: string;
+    parent_tool_call_id?: string;
+  },
 ): ChatItem[] {
+  // 有 parent_tool_call_id 时：路由进父卡 children 递归处理
+  if (msg.parent_tool_call_id) {
+    const parentIdx = list.findIndex(
+      (it) => it.kind === 'tool' && it.toolId === msg.parent_tool_call_id,
+    );
+    if (parentIdx >= 0) {
+      const parent = list[parentIdx];
+      const childChunk = {
+        index: msg.index,
+        id: msg.id,
+        name: msg.name,
+        arguments: msg.arguments,
+      };
+      const nextChildren = applyToolCallChunk(parent.children ?? [], childChunk);
+      const next = [...list];
+      next[parentIdx] = { ...parent, children: nextChildren };
+      return next;
+    }
+    // 找不到父卡：帧先于父卡到达，降级到主流（后续 groupByParent 会归位）
+  }
+
   const index = msg.index ?? 0;
   const synthetic = `${STREAM_TOOL_ID_PREFIX}${index}`;
   const toolId = msg.id ?? synthetic;

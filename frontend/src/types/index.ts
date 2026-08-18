@@ -863,6 +863,8 @@ export type AgentWsEvent =
       name?: string;
       /** 参数增量片段（前端可累计长度或提取关键信息，不必全文渲染） */
       arguments?: string;
+      /** 子 agent 归属：该 chunk 属于某个 Task 子 agent（值为父卡的 toolId） */
+      parent_tool_call_id?: string;
     }
   | { type: 'status'; message?: string }
   // 运行中提交消息被服务端 busy 入队的确认帧（队列在服务端，前端不做本地排队）
