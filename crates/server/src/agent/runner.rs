@@ -289,24 +289,30 @@ pub(crate) fn runner_usage_ctx(
 /// 工具结果落库/回填上限：300 行或 30KB（先到者），保护 DB 体积与 LLM 上下文。
 const TOOL_RESULT_MAX_LINES: usize = 300;
 const TOOL_RESULT_MAX_BYTES: usize = 30 * 1024;
+/// head+tail 各保留的行数（300 行总量 = 前 150 + 后 150）。
+const TOOL_RESULT_HEAD_LINES: usize = 150;
+const TOOL_RESULT_TAIL_LINES: usize = 150;
 
 fn truncate_tool_result(text: String) -> String {
     let total_lines = text.lines().count();
     if total_lines <= TOOL_RESULT_MAX_LINES && text.len() <= TOOL_RESULT_MAX_BYTES {
         return text;
     }
-    // 先按字节截断到安全边界，再按行数截断（两者取更严）
-    let mut cut = TOOL_RESULT_MAX_BYTES.min(text.len());
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
+    // 字节级截断（优先）
+    if text.len() > TOOL_RESULT_MAX_BYTES {
+        let mut cut = TOOL_RESULT_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return format!("{}\n[... truncated, total {} bytes ...]", &text[..cut], text.len());
     }
-    let byte_cut = &text[..cut];
-    let line_cut: String = byte_cut
-        .lines()
-        .take(TOOL_RESULT_MAX_LINES)
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{line_cut}\n[truncated, total {total_lines} lines]")
+    // 行级 head+tail 截断
+    let lines: Vec<&str> = text.lines().collect();
+    let head: String = lines[..TOOL_RESULT_HEAD_LINES.min(lines.len())].join("\n");
+    let omitted = total_lines.saturating_sub(TOOL_RESULT_HEAD_LINES + TOOL_RESULT_TAIL_LINES);
+    let tail_start = lines.len().saturating_sub(TOOL_RESULT_TAIL_LINES);
+    let tail: String = lines[tail_start..].join("\n");
+    format!("{head}\n[... truncated {omitted} lines ...]\n{tail}")
 }
 
 fn agent_result_to_text(result: &AgentResult) -> String {
@@ -1446,9 +1452,12 @@ mod tests {
             .join("\n");
         let out = truncate_tool_result(text);
         let lines: Vec<&str> = out.lines().collect();
+        // head+tail: 前 150 + 标记行 + 后 150 = 301 行
         assert!(lines.len() <= TOOL_RESULT_MAX_LINES + 1); // +1 为 truncated 标记行
-        assert!(out.contains("[truncated"));
-        assert!(out.contains("400")); // 总行数写入标记
+        assert!(out.contains("[... truncated"));
+        assert!(out.contains("100")); // 省略 100 行
+        // 尾部保留：最后一行应为 "line 399"
+        assert!(out.contains("line 399"));
     }
 
     #[test]
@@ -1456,7 +1465,7 @@ mod tests {
         let text = "x".repeat(40 * 1024);
         let out = truncate_tool_result(text);
         assert!(out.len() < 35 * 1024);
-        assert!(out.contains("[truncated"));
+        assert!(out.contains("[... truncated"));
     }
 
     #[test]
@@ -1470,7 +1479,7 @@ mod tests {
         // 截断点落在 UTF-8 多字节序列中间不得 panic
         let text = "汉".repeat(15 * 1024); // ~45KB
         let out = truncate_tool_result(text);
-        assert!(out.contains("[truncated"));
+        assert!(out.contains("[... truncated"));
     }
 
     #[test]
