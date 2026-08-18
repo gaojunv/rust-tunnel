@@ -4,17 +4,18 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
 } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Tree, type NodeRendererProps } from 'react-arborist';
-import { codeToHtml, type BundledLanguage } from 'shiki';
 import {
   ArrowLeft,
   ChevronDown,
   ChevronRight,
+  FileDiff,
   FileText,
   Folder,
   Pencil,
@@ -40,6 +41,20 @@ import {
   putFsFile,
 } from '../../../api/client';
 import type { FsEntry, FsFileContent, GitStatusResult } from '../../../types';
+import CodeMirrorEditor, { isEditorSupported } from '../CodeMirrorEditor';
+import FileDiffView from './FileDiffView';
+import {
+  clearDraft,
+  closePath,
+  isDirty,
+  loadOpenFiles,
+  onDraftsChanged,
+  openOrActivate,
+  readDraft,
+  saveOpenFiles,
+  writeDraft,
+  type FileTabsState,
+} from '../fileTabsStore';
 
 /** 懒加载文件树的受控数据节点。id 使用相对工作区根目录的完整路径（与 git status 路径一致）。 */
 interface FsNode {
@@ -152,48 +167,6 @@ function buildDirStatus(map: Map<string, string>): Map<string, string> {
     }
   }
   return dirStatus;
-}
-
-// ── shiki 语言映射 ─────────────────────────────────────────────
-
-const LANG_BY_EXT: Record<string, BundledLanguage> = {
-  rs: 'rust',
-  ts: 'typescript',
-  tsx: 'tsx',
-  js: 'javascript',
-  jsx: 'jsx',
-  py: 'python',
-  go: 'go',
-  md: 'markdown',
-  json: 'json',
-  toml: 'toml',
-  yaml: 'yaml',
-  yml: 'yaml',
-  sh: 'bash',
-  css: 'css',
-  html: 'html',
-  vue: 'vue',
-  java: 'java',
-  c: 'c',
-  cpp: 'cpp',
-  h: 'c',
-  sql: 'sql',
-  xml: 'xml',
-};
-
-function languageForPath(path: string): BundledLanguage {
-  const ext = path.split('.').pop()?.toLowerCase() ?? '';
-  // 'text' 是 shiki 的内置特殊语言（无语法高亮），但不在 BundledLanguage 联合类型里
-  return LANG_BY_EXT[ext] ?? ('text' as BundledLanguage);
-}
-
-/** 轻量内容指纹：shiki 查询 key 里放全文太长，用 长度+哈希 足够区分内容变化。 */
-function contentHash(content: string): string {
-  let h = 5381;
-  for (let i = 0; i < content.length; i++) {
-    h = ((h << 5) + h + content.charCodeAt(i)) | 0;
-  }
-  return `${content.length}:${h.toString(36)}`;
 }
 
 // ── 容器尺寸测量（react-window 需要确定的高宽） ─────────────────
@@ -313,25 +286,31 @@ function TreeNode({ node, style }: NodeRendererProps<FsNode>) {
   );
 }
 
-// ── 文件预览 / 编辑 ───────────────────────────────────────────
+// ── 文件预览 / 编辑（多标签中的一个文件） ─────────────────────
 
 function FileView({
   workspaceId,
   path,
-  onBack,
+  isActive,
+  onClose,
+  isDark,
 }: {
   workspaceId: string;
   path: string;
-  onBack: () => void;
+  isActive: boolean;
+  onClose: (path: string) => void;
+  isDark: boolean;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const isDark = useIsDark();
 
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
+  const [diffMode, setDiffMode] = useState(false);
+  // 草稿恢复：store 有上次未保存内容则用之，否则等远端内容首次到达时 seed
+  const [draft, setDraft] = useState<string>(() => readDraft(workspaceId, path)?.draft ?? '');
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const seededRef = useRef(false);
 
   const fileQuery = useQuery<FsFileContent>({
     queryKey: ['agent-fs-file', workspaceId, path],
@@ -341,21 +320,31 @@ function FileView({
 
   const content = fileQuery.data?.content ?? '';
 
-  const highlightQuery = useQuery({
-    queryKey: ['shiki', path, contentHash(content), isDark],
-    queryFn: () =>
-      codeToHtml(content, {
-        lang: languageForPath(path),
-        theme: isDark ? 'dark-plus' : 'light-plus',
-      }),
-    enabled: fileQuery.isSuccess && !editing,
-  });
+  // 首次数据到达且 store 无草稿时，以远端内容初始化（seed 一次；保存后刷新不覆盖草稿）
+  useEffect(() => {
+    if (fileQuery.data && !seededRef.current) {
+      seededRef.current = true;
+      if (readDraft(workspaceId, path) == null) {
+        setDraft(fileQuery.data.content);
+      }
+    }
+  }, [fileQuery.data, workspaceId, path]);
+
+  // 草稿同步：内容偏离已保存版本 → 写入 store（未保存圆点）；回到已保存 → 清除
+  useEffect(() => {
+    if (draft !== content) {
+      writeDraft(workspaceId, path, draft);
+    } else {
+      clearDraft(workspaceId, path);
+    }
+  }, [draft, content, workspaceId, path]);
 
   const saveMutation = useMutation({
     mutationFn: (approved: boolean) => putFsFile(workspaceId, path, draft, approved),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['agent-fs-file', workspaceId, path] });
       queryClient.invalidateQueries({ queryKey: ['agent-git-status', workspaceId] });
+      clearDraft(workspaceId, path);
       setEditing(false);
       setConfirmOpen(false);
       setSaveError(null);
@@ -372,7 +361,7 @@ function FileView({
   });
 
   const startEditing = () => {
-    setDraft(content);
+    // 草稿已持久化在 store：保留上次未保存内容，不重置为远端快照
     setSaveError(null);
     setEditing(true);
   };
@@ -390,13 +379,13 @@ function FileView({
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      {/* 顶栏：返回 + 路径 + 操作按钮 */}
+    <div className="flex h-full min-h-0 flex-col" aria-hidden={!isActive}>
+      {/* 顶栏：返回(关闭当前标签) + 路径 + 操作按钮 */}
       <div className="flex items-center gap-1 border-b border-border/60 px-1 pb-1.5">
         <Button
           variant="ghost"
           size="sm"
-          onClick={onBack}
+          onClick={() => onClose(path)}
           aria-label={t('agent.backToTree')}
           title={t('agent.backToTree')}
           className="h-6 shrink-0 px-1.5"
@@ -421,6 +410,18 @@ function FileView({
           </Button>
         ) : (
           <>
+            <Button
+              variant={diffMode ? 'default' : 'ghost'}
+              size="sm"
+              onClick={() => setDiffMode((v) => !v)}
+              aria-pressed={diffMode}
+              aria-label={t('agent.compare')}
+              title={t('agent.compareSaved')}
+              className="h-6 shrink-0 gap-1 px-2 text-xs"
+            >
+              <FileDiff className="h-3 w-3" />
+              {t('agent.compare')}
+            </Button>
             <Button
               variant="default"
               size="sm"
@@ -456,25 +457,35 @@ function FileView({
           {t('agent.clientOffline')}
         </div>
       ) : editing ? (
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          spellCheck={false}
-          data-testid="file-editor"
-          className="min-h-0 flex-1 resize-none bg-transparent p-2 font-mono text-xs leading-5 outline-none"
-        />
+        diffMode ? (
+          // 并排对比：左=已保存（只读），右=草稿（可编辑）；jsdom 下走 fallback pre
+          <FileDiffView
+            saved={content}
+            draft={draft}
+            onDraftChange={setDraft}
+            path={path}
+            isDark={isDark}
+          />
+        ) : isEditorSupported() ? (
+          <CodeMirrorEditor value={draft} onChange={setDraft} path={path} isDark={isDark} />
+        ) : (
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            spellCheck={false}
+            data-testid="file-editor"
+            className="min-h-0 flex-1 resize-none bg-transparent p-2 font-mono text-xs leading-5 outline-none"
+          />
+        )
       ) : (
-        <div className="min-h-0 flex-1 overflow-auto" data-testid="file-preview">
+        <div className="min-h-0 flex-1 overflow-hidden" data-testid="file-preview">
           {fileQuery.data?.truncated && (
-            <div className="sticky top-0 z-10 border-b border-border/60 bg-muted/80 px-2 py-1 text-[11px] text-muted-foreground">
+            <div className="border-b border-border/60 bg-muted/80 px-2 py-1 text-[11px] text-muted-foreground">
               {t('agent.fileTruncated')}
             </div>
           )}
-          {highlightQuery.data ? (
-            <div dangerouslySetInnerHTML={{ __html: highlightQuery.data }} />
-          ) : (
-            <pre className="whitespace-pre-wrap p-2 font-mono text-xs leading-5">{content}</pre>
-          )}
+          {/* 只读 CodeMirror 预览（jsdom 退化纯文本）替代原 shiki HTML */}
+          <CodeMirrorEditor readOnly value={content} path={path} isDark={isDark} />
         </div>
       )}
 
@@ -509,12 +520,18 @@ function FileView({
 export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const isDark = useIsDark();
 
   const [data, setData] = useState<FsNode[]>([]);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [fileTabs, setFileTabs] = useState<FileTabsState>(
+    () => loadOpenFiles(workspaceId) ?? { open: [], active: '' }
+  );
   const [treeKey, setTreeKey] = useState(0);
   const loadingRef = useRef(new Set<string>());
   const [sizeRef, size] = useElementSize();
+  // 草稿变化订阅 → 刷新标签条「● 未保存」圆点（store 不是响应式，靠事件驱动重渲染）
+  const [, forceUpdate] = useReducer((x: number) => x + 1, 0);
+  useEffect(() => onDraftsChanged(forceUpdate), [forceUpdate]);
 
   const rootQuery = useQuery<FsEntry[]>({
     queryKey: ['agent-fs', workspaceId, ''],
@@ -532,6 +549,25 @@ export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
     }
   }, [rootQuery.data]);
 
+  // 切 workspace 时重置打开的标签（修复残留旧 workspace 路径的隐患）
+  useEffect(() => {
+    setFileTabs(loadOpenFiles(workspaceId) ?? { open: [], active: '' });
+  }, [workspaceId]);
+
+  // 标签变更统一入口：更新 state 并持久化。在 functional updater 内写 localStorage
+  // 虽非纯函数惯例，但 safeStorage 写失败静默、重复执行幂等，换取「不用 effect
+  // 追踪持久化」从而避免 workspace 切换瞬间把旧标签误写进新 key。
+  const updateTabs = useCallback(
+    (updater: (s: FileTabsState) => FileTabsState) => {
+      setFileTabs((prev) => {
+        const next = updater(prev);
+        saveOpenFiles(workspaceId, next);
+        return next;
+      });
+    },
+    [workspaceId]
+  );
+
   const gitQuery = useQuery<GitStatusResult>({
     queryKey: ['agent-git-status', workspaceId],
     queryFn: () => getAgentGitStatus(workspaceId),
@@ -543,8 +579,12 @@ export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
     [gitQuery.data]
   );
   const contextValue = useMemo(
-    () => ({ gitMap, dirStatus: buildDirStatus(gitMap), onOpenFile: setSelectedPath }),
-    [gitMap]
+    () => ({
+      gitMap,
+      dirStatus: buildDirStatus(gitMap),
+      onOpenFile: (path: string) => updateTabs((s) => openOrActivate(s, path)),
+    }),
+    [gitMap, updateTabs]
   );
 
   const handleToggle = async (id: string) => {
@@ -574,16 +614,6 @@ export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
   };
 
   if (!workspaceId) return null;
-  if (selectedPath) {
-    return (
-      <FileView
-        key={selectedPath}
-        workspaceId={workspaceId}
-        path={selectedPath}
-        onBack={() => setSelectedPath(null)}
-      />
-    );
-  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -603,7 +633,75 @@ export default function FilesPanel({ workspaceId }: { workspaceId: string }) {
         </button>
       </div>
 
-      {rootQuery.isError ? (
+      {/* 文件标签条：多文件打开时显示；未保存前置圆点（amber）；激活高亮 */}
+      {fileTabs.open.length > 0 && (
+        <div
+          role="tablist"
+          aria-label={t('agent.files')}
+          className="mb-1 flex items-center gap-0.5 overflow-x-auto px-1"
+        >
+          {fileTabs.open.map((path) => {
+            const active = path === fileTabs.active;
+            const dirty = isDirty(workspaceId, path);
+            const base = path.split('/').pop() || path;
+            return (
+              <div
+                key={path}
+                role="tab"
+                aria-selected={active}
+                title={dirty ? `${t('agent.unsavedChanges')} · ${path}` : path}
+                onClick={() => updateTabs((s) => ({ ...s, active: path }))}
+                className={cn(
+                  'group flex max-w-[10rem] shrink-0 cursor-pointer items-center gap-1 rounded border border-border/60 px-1.5 py-0.5 text-[11px] font-mono',
+                  active
+                    ? 'border-accent bg-accent text-foreground'
+                    : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground'
+                )}
+              >
+                {dirty && (
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" aria-hidden />
+                )}
+                <span className="min-w-0 flex-1 truncate">{base}</span>
+                <button
+                  type="button"
+                  aria-label={t('agent.closeFile')}
+                  title={t('agent.closeFile')}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    updateTabs((s) => closePath(s, path));
+                  }}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {fileTabs.open.length > 0 ? (
+        /* 打开文件视图：所有标签常驻挂载，仅激活者可见（切标签不丢草稿状态）。
+           优先于树错误分支：已打开的文件在树加载失败时仍可访问，与单文件时代的语义一致。 */
+        <div className="relative min-h-0 flex-1">
+          {fileTabs.open.map((path) => (
+            <div
+              key={path}
+              data-testid={`file-tab-view-${path}`}
+              className={path === fileTabs.active ? 'h-full min-h-0' : 'hidden'}
+            >
+              <FileView
+                key={`${workspaceId}:${path}`}
+                workspaceId={workspaceId}
+                path={path}
+                isActive={path === fileTabs.active}
+                isDark={isDark}
+                onClose={(p) => updateTabs((s) => closePath(s, p))}
+              />
+            </div>
+          ))}
+        </div>
+      ) : rootQuery.isError ? (
         <div className="flex flex-1 items-center justify-center p-4 text-center text-xs text-muted-foreground">
           {t('agent.clientOffline')}
         </div>
