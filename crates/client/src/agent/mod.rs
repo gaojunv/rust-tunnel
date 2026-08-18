@@ -576,18 +576,19 @@ pub async fn handle_exec_request(
         AgentCommand::CodeOutline { path } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => {
-                    // Docker 模式：先读文件，再本地解析
+                    // Docker 模式：先读文件（docker_read_file 有 100KB 回传上限），再本地解析
                     let file_result = docker_read_file(c, &p, timeout).await;
                     match file_result {
-                        AgentResult::FileContent { content } => code_outline::exec_outline(&content, path),
+                        AgentResult::FileContent { content } => {
+                            let truncated = content.len() >= MAX_OUTPUT;
+                            code_outline::exec_outline(&content, path, truncated)
+                        }
                         other => other,
                     }
                 }
-                None => match tokio::fs::read_to_string(&p).await {
-                    Ok(content) => code_outline::exec_outline(&content, path),
-                    Err(e) => AgentResult::Error {
-                        message: format!("read {} failed: {e}", p.display()),
-                    },
+                None => match read_file_capped(&p, MAX_PARSE_FILE_BYTES).await {
+                    Ok((content, truncated)) => code_outline::exec_outline(&content, path, truncated),
+                    Err(message) => AgentResult::Error { message },
                 },
             },
             Err(e) => AgentResult::Error { message: e },
@@ -597,15 +598,18 @@ pub async fn handle_exec_request(
                 Some(c) => {
                     let file_result = docker_read_file(c, &p, timeout).await;
                     match file_result {
-                        AgentResult::FileContent { content } => code_outline::exec_read_symbol(&content, path, name),
+                        AgentResult::FileContent { content } => {
+                            let truncated = content.len() >= MAX_OUTPUT;
+                            code_outline::exec_read_symbol(&content, path, name, truncated)
+                        }
                         other => other,
                     }
                 }
-                None => match tokio::fs::read_to_string(&p).await {
-                    Ok(content) => code_outline::exec_read_symbol(&content, path, name),
-                    Err(e) => AgentResult::Error {
-                        message: format!("read {} failed: {e}", p.display()),
-                    },
+                None => match read_file_capped(&p, MAX_PARSE_FILE_BYTES).await {
+                    Ok((content, truncated)) => {
+                        code_outline::exec_read_symbol(&content, path, name, truncated)
+                    }
+                    Err(message) => AgentResult::Error { message },
                 },
             },
             Err(e) => AgentResult::Error { message: e },
@@ -712,9 +716,34 @@ async fn read_file_host(abs: &Path) -> AgentResult {
 /// 默认返回行数上限
 const DEFAULT_READ_LIMIT: u64 = 2000;
 
-/// 宿主模式读取文件行区间（offset 1-based，limit 最大行数）。
-async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64>) -> AgentResult {
+/// code_outline/read_symbol 宿主模式读文件的大小上限：结构解析不需要整读巨型
+/// 文件，超限截断并在结果中标注（符号可能不完整）。
+const MAX_PARSE_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// 宿主模式限额读文件（返回 lossy 内容 + 是否截断），供 tree-sitter 解析使用。
+async fn read_file_capped(abs: &Path, cap: usize) -> Result<(String, bool), String> {
     use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(abs)
+        .await
+        .map_err(|e| format!("read {} failed: {e}", abs.display()))?;
+    let mut buf = Vec::with_capacity(cap + 1);
+    let n = file
+        .take((cap + 1) as u64)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read {} failed: {e}", abs.display()))?;
+    Ok((
+        String::from_utf8_lossy(&buf[..n.min(cap)]).into_owned(),
+        n > cap,
+    ))
+}
+
+/// 宿主模式读取文件行区间（offset 1-based，limit 最大行数）。
+/// 流式扫全文件：内存恒定（收集受 MAX_OUTPUT 字节预算约束），任意 offset 都能
+/// 服务（区别于 read_file_host 的 100KB 读窗），total 为真实总行数。
+/// 无效 UTF-8 按 lossy 替换（与 read_file_host 语义一致）。
+async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64>) -> AgentResult {
+    use tokio::io::{AsyncBufReadExt, BufReader};
     let file = match tokio::fs::File::open(abs).await {
         Ok(f) => f,
         Err(e) => {
@@ -723,51 +752,62 @@ async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64
             };
         }
     };
-    let mut buf = Vec::with_capacity(MAX_OUTPUT + 1);
-    let n = match file
-        .take((MAX_OUTPUT + 1) as u64)
-        .read_to_end(&mut buf)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            return AgentResult::Error {
-                message: format!("read {} failed: {e}", abs.display()),
-            };
-        }
-    };
-    let content = String::from_utf8_lossy(&buf).into_owned();
-    let total_lines = content.lines().count() as u64;
-    // 1-based offset
     let start = offset.unwrap_or(1).max(1);
     let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
-    if start > total_lines && total_lines > 0 {
+    let mut reader = BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut selected: Vec<String> = Vec::new();
+    let mut total: u64 = 0;
+    let mut byte_budget = MAX_OUTPUT;
+    // 窗口内字节超预算后停止收集（继续扫完以统计真实总行数）
+    let mut collect_truncated = false;
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                total += 1;
+                if total >= start && selected.len() < max_lines as usize && !collect_truncated {
+                    if buf.len() <= byte_budget {
+                        byte_budget -= buf.len();
+                        let line = String::from_utf8_lossy(&buf);
+                        selected.push(line.trim_end_matches(['\n', '\r']).to_string());
+                    } else {
+                        collect_truncated = true;
+                    }
+                }
+            }
+            Err(e) => {
+                return AgentResult::Error {
+                    message: format!("read {} failed: {e}", abs.display()),
+                };
+            }
+        }
+    }
+    if start > total && total > 0 {
         return AgentResult::Error {
-            message: format!(
-                "offset {start} exceeds total lines ({total_lines})"
-            ),
+            message: format!("offset {start} exceeds total lines ({total})"),
         };
     }
-    let lines: Vec<&str> = content.lines().collect();
-    let start_idx = ((start - 1) as usize).min(lines.len());
-    let end_idx = (start_idx + max_lines as usize).min(lines.len());
-    let selected = &lines[start_idx..end_idx];
+    let end_line = if selected.is_empty() {
+        start
+    } else {
+        start + selected.len() as u64 - 1
+    };
     let mut result = selected.join("\n");
-    // 追加截断标记
-    let end_line = start_idx as u64 + selected.len() as u64;
-    if n > MAX_OUTPUT || end_line < total_lines || start_idx > 0 {
-        result.push_str(&format!(
-            "\n[showing lines {}-{} of {}]",
-            start, end_line, total_lines
-        ));
+    if collect_truncated {
+        result.push_str("\n[... window exceeded 100KB output budget, truncated ...]");
     }
-    if result.len() > MAX_OUTPUT {
-        result = truncate_output(result);
+    if end_line < total || start > 1 || collect_truncated {
+        result.push_str(&format!("\n[showing lines {start}-{end_line} of {total}]"));
     }
     AgentResult::FileContent { content: result }
 }
 
-/// Docker 模式读取文件行区间：先 docker_read_file 拿内容，再在客户端进程内切片。
+/// Docker 模式读取文件行区间：容器内一次 exec 完成 `wc -l` 总行数 + `sed -n` 窗口
+/// （stdout 首行是总行数，其余为窗口内容）。sed 直取任意 offset，不受
+/// docker_read_file 的 100KB 回传窗口限制。
+/// 注意：`wc -l` 计换行符数，文件末尾无换行时总行数少计 1（可接受的近似）。
 async fn docker_read_file_range(
     container: &str,
     abs: &Path,
@@ -775,36 +815,38 @@ async fn docker_read_file_range(
     limit: Option<u64>,
     timeout: Duration,
 ) -> AgentResult {
-    match docker_read_file(container, abs, timeout).await {
-        AgentResult::FileContent { content } => {
-            let total_lines = content.lines().count() as u64;
-            let start = offset.unwrap_or(1).max(1);
-            let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
-            if start > total_lines && total_lines > 0 {
+    let start = offset.unwrap_or(1).max(1);
+    let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    let end = start + max_lines.saturating_sub(1);
+    let path = abs.to_string_lossy();
+    let inner = format!("wc -l < {p}; sed -n '{start},{end}p' -- {p}", p = sh_quote(&path));
+    let cmd = format!(
+        "docker exec {} sh -c {}",
+        sh_quote(container),
+        sh_quote(&inner),
+    );
+    match run_host(&cmd, None, None, timeout, None).await {
+        Ok(out) if out.exit_code == 0 => {
+            let mut sections = out.stdout.splitn(2, '\n');
+            let total: u64 = sections.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            let content = sections.next().unwrap_or("");
+            if start > total && total > 0 {
                 return AgentResult::Error {
-                    message: format!(
-                        "offset {start} exceeds total lines ({total_lines})"
-                    ),
+                    message: format!("offset {start} exceeds total lines ({total})"),
                 };
             }
-            let lines: Vec<&str> = content.lines().collect();
-            let start_idx = ((start - 1) as usize).min(lines.len());
-            let end_idx = (start_idx + max_lines as usize).min(lines.len());
-            let selected = &lines[start_idx..end_idx];
-            let mut result = selected.join("\n");
-            let end_line = start_idx as u64 + selected.len() as u64;
-            if end_line < total_lines || start_idx > 0 {
-                result.push_str(&format!(
-                    "\n[showing lines {}-{} of {}]",
-                    start, end_line, total_lines
-                ));
-            }
-            if result.len() > MAX_OUTPUT {
-                result = truncate_output(result);
+            let shown = content.lines().count() as u64;
+            let end_line = if shown == 0 { start } else { start + shown - 1 };
+            let mut result = content.trim_end_matches('\n').to_string();
+            if end_line < total || start > 1 {
+                result.push_str(&format!("\n[showing lines {start}-{end_line} of {total}]"));
             }
             AgentResult::FileContent { content: result }
         }
-        other => other,
+        Ok(out) => AgentResult::Error {
+            message: format!("read {} failed: {}", abs.display(), out.stderr.trim()),
+        },
+        Err(message) => AgentResult::Error { message },
     }
 }
 

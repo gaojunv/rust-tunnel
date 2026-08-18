@@ -14,7 +14,9 @@ fn language_for_ext(ext: &str) -> Result<tree_sitter::Language, String> {
     match ext.to_lowercase().as_str() {
         "rs" => Ok(tree_sitter_rust::LANGUAGE.into()),
         "py" => Ok(tree_sitter_python::LANGUAGE.into()),
-        "ts" | "tsx" => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        // tsx 必须用 TSX 语法（含 JSX），误用 TS 语法会产生满树 ERROR 节点
+        "ts" => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "tsx" => Ok(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "js" | "jsx" | "mjs" | "cjs" => Ok(tree_sitter_javascript::LANGUAGE.into()),
         "go" => Ok(tree_sitter_go::LANGUAGE.into()),
         other => Err(format!(
@@ -166,8 +168,9 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
-/// 执行 code_outline：解析文件并输出符号列表
-pub fn exec_outline(content: &str, path: &str) -> AgentResult {
+/// 执行 code_outline：解析文件并输出符号列表。
+/// `file_truncated`：调用方读文件时触达大小上限（符号可能不完整，结果中标注）。
+pub fn exec_outline(content: &str, path: &str, file_truncated: bool) -> AgentResult {
     let ext = path.rsplit('.').next().unwrap_or("");
     let lang = match language_for_ext(ext) {
         Ok(l) => l,
@@ -180,12 +183,16 @@ pub fn exec_outline(content: &str, path: &str) -> AgentResult {
             message: format!("failed to set language for .{ext}"),
         };
     }
-    let tree = parser.parse(content.as_bytes(), None).unwrap();
+    let Some(tree) = parser.parse(content.as_bytes(), None) else {
+        return AgentResult::Error {
+            message: format!("failed to parse {path}"),
+        };
+    };
     let root = tree.root_node();
     let symbols = collect_symbols(&root, content.as_bytes(), 0);
 
-    let truncated = symbols.len() > MAX_OUTLINE_SYMBOLS;
-    let display_symbols = if truncated {
+    let over_symbol_cap = symbols.len() > MAX_OUTLINE_SYMBOLS;
+    let display_symbols = if over_symbol_cap {
         &symbols[..MAX_OUTLINE_SYMBOLS]
     } else {
         &symbols
@@ -200,20 +207,25 @@ pub fn exec_outline(content: &str, path: &str) -> AgentResult {
             sym.name, sym.start_line, sym.end_line
         ));
     }
-    if truncated {
+    if over_symbol_cap {
         output.push_str(&format!(
             "[truncated at {} symbols, total {}]\n",
             MAX_OUTLINE_SYMBOLS,
             symbols.len()
         ));
     }
+    if file_truncated {
+        output.push_str("[file truncated at read size cap; symbols beyond this point are not shown]\n");
+    }
     AgentResult::FileContent {
         content: truncate_output_str(&output),
     }
 }
 
-/// 执行 read_symbol：按名称精确匹配符号并返回源码
-pub fn exec_read_symbol(content: &str, path: &str, name: &str) -> AgentResult {
+/// 执行 read_symbol：按名称精确匹配符号并返回源码。
+/// `file_truncated`：调用方读文件时触达大小上限（未命中提示中标注，符号可能在
+/// 截断区域之外）。
+pub fn exec_read_symbol(content: &str, path: &str, name: &str, file_truncated: bool) -> AgentResult {
     let ext = path.rsplit('.').next().unwrap_or("");
     let lang = match language_for_ext(ext) {
         Ok(l) => l,
@@ -226,7 +238,11 @@ pub fn exec_read_symbol(content: &str, path: &str, name: &str) -> AgentResult {
             message: format!("failed to set language for .{ext}"),
         };
     }
-    let tree = parser.parse(content.as_bytes(), None).unwrap();
+    let Some(tree) = parser.parse(content.as_bytes(), None) else {
+        return AgentResult::Error {
+            message: format!("failed to parse {path}"),
+        };
+    };
     let root = tree.root_node();
     let symbols = collect_symbols(&root, content.as_bytes(), 0);
 
@@ -240,14 +256,20 @@ pub fn exec_read_symbol(content: &str, path: &str, name: &str) -> AgentResult {
                 .filter(|s| s.indent == 0)
                 .map(|s| s.name.as_str())
                 .collect();
+            let truncation_note = if file_truncated {
+                " (note: file was truncated at read size cap — the symbol may exist beyond the truncated region)"
+            } else {
+                ""
+            };
             AgentResult::Error {
                 message: format!(
-                    "symbol '{name}' not found in {path}. Top-level symbols: {}",
+                    "symbol '{name}' not found in {path}. Top-level symbols: {}{}",
                     if top_names.is_empty() {
                         "(none)".to_string()
                     } else {
                         top_names.join(", ")
-                    }
+                    },
+                    truncation_note
                 ),
             }
         }
@@ -343,7 +365,7 @@ trait Drawable {
     fn draw(&self);
 }
 "#;
-        let result = exec_outline(source, "src/main.rs");
+        let result = exec_outline(source, "src/main.rs", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("[fn] main"));
@@ -360,14 +382,14 @@ trait Drawable {
 
     #[test]
     fn test_outline_unsupported_extension() {
-        let result = exec_outline("hello", "file.xyz");
+        let result = exec_outline("hello", "file.xyz", false);
         assert!(matches!(result, AgentResult::Error { .. }));
     }
 
     #[test]
     fn test_read_symbol_hit() {
         let source = "fn main() {\n    println!(\"hi\");\n}\n\nfn helper() {\n    let x = 1;\n}\n";
-        let result = exec_read_symbol(source, "main.rs", "helper");
+        let result = exec_read_symbol(source, "main.rs", "helper", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("fn helper()"));
@@ -380,14 +402,14 @@ trait Drawable {
     #[test]
     fn test_read_symbol_not_found() {
         let source = "fn main() {}\n";
-        let result = exec_read_symbol(source, "main.rs", "nonexistent");
+        let result = exec_read_symbol(source, "main.rs", "nonexistent", false);
         assert!(matches!(result, AgentResult::Error { .. }));
     }
 
     #[test]
     fn test_outline_python() {
         let source = "def main():\n    pass\n\nclass Foo:\n    def bar(self):\n        pass\n";
-        let result = exec_outline(source, "app.py");
+        let result = exec_outline(source, "app.py", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("main") || content.contains("Foo"));
@@ -399,7 +421,7 @@ trait Drawable {
     #[test]
     fn test_outline_typescript() {
         let source = "function greet(name: string) {\n    console.log(name);\n}\n\nclass User {\n    constructor(public name: string) {}\n}\n";
-        let result = exec_outline(source, "app.ts");
+        let result = exec_outline(source, "app.ts", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("greet") || content.contains("User"));
@@ -409,9 +431,22 @@ trait Drawable {
     }
 
     #[test]
+    fn test_outline_tsx_uses_tsx_grammar() {
+        // .tsx 含 JSX 语法，必须用 LANGUAGE_TSX 解析，否则组件函数会因 ERROR 节点丢失
+        let source = "export function Button({ label }: { label: string }) {\n    return <button>{label}</button>;\n}\n";
+        let result = exec_outline(source, "Button.tsx", false);
+        match result {
+            AgentResult::FileContent { content } => {
+                assert!(content.contains("Button"), "outline: {content}");
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_outline_javascript() {
         let source = "function greet(name) {\n    console.log(name);\n}\n";
-        let result = exec_outline(source, "app.js");
+        let result = exec_outline(source, "app.js", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("greet"));
@@ -423,7 +458,7 @@ trait Drawable {
     #[test]
     fn test_outline_go() {
         let source = "package main\n\nfunc main() {\n}\n\ntype Config struct {\n    Name string\n}\n";
-        let result = exec_outline(source, "main.go");
+        let result = exec_outline(source, "main.go", false);
         match result {
             AgentResult::FileContent { content } => {
                 assert!(content.contains("main") || content.contains("Config"));
@@ -436,10 +471,10 @@ trait Drawable {
     fn test_read_symbol_multiple_candidates() {
         let source = "fn process() { }\nfn process_data() { }\n";
         // 'process' matches exactly once, 'process_data' once
-        let r1 = exec_read_symbol(source, "main.rs", "process");
+        let r1 = exec_read_symbol(source, "main.rs", "process", false);
         assert!(matches!(r1, AgentResult::FileContent { .. }));
         // 'process_' prefix won't match anything
-        let r2 = exec_read_symbol(source, "main.rs", "process_x");
+        let r2 = exec_read_symbol(source, "main.rs", "process_x", false);
         assert!(matches!(r2, AgentResult::Error { .. }));
     }
 }
