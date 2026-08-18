@@ -65,10 +65,13 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file's content from the workspace.",
+                "description": "Read a file's content from the workspace. For large files, use offset (1-based line) and limit (max lines, default server max ~2000) to read in chunks. Results include [showing lines X-Y of N] markers — use them to continue reading.",
                 "parameters": {
                     "type": "object",
-                    "properties": file_props(&[]),
+                    "properties": file_props(&[
+                        ("offset", serde_json::json!({"type": "integer", "description": "1-based starting line (default 1)"})),
+                        ("limit", serde_json::json!({"type": "integer", "description": "Max lines to return (default ~2000)"}))
+                    ]),
                     "required": ["path"]
                 }
             }
@@ -593,9 +596,19 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         "read_file" => {
             let path = arg_str(&args, "path", name)?;
             check_path_len(path, "path")?;
-            Ok(AgentCommand::ReadFile {
-                path: path.to_string(),
-            })
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            let limit = args.get("limit").and_then(|v| v.as_u64());
+            if offset.is_some() || limit.is_some() {
+                Ok(AgentCommand::ReadFileRange {
+                    path: path.to_string(),
+                    offset,
+                    limit,
+                })
+            } else {
+                Ok(AgentCommand::ReadFile {
+                    path: path.to_string(),
+                })
+            }
         }
         "write_file" => {
             let path = arg_str(&args, "path", name)?;
@@ -1304,6 +1317,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_read_file_with_range() {
+        let cmd = parse_tool_call("read_file", r#"{"path":"src/main.rs","offset":10,"limit":50}"#).unwrap();
+        match cmd {
+            AgentCommand::ReadFileRange { path, offset, limit } => {
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(offset, Some(10));
+                assert_eq!(limit, Some(50));
+            }
+            other => panic!("expected ReadFileRange, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_plan_mode_guard_blocks_write_tools() {
         assert!(plan_mode_guard("shell").is_err());
         assert!(plan_mode_guard("write_file").is_err());
@@ -1457,5 +1483,11 @@ mod tests {
     fn test_parse_task_args_prompt_not_string() {
         let err = parse_task_args(r#"{"prompt":123}"#).unwrap_err();
         assert!(err.contains("requires string argument 'prompt'"));
+    }
+
+    #[test]
+    fn test_parse_read_file_without_range() {
+        let cmd = parse_tool_call("read_file", r#"{"path":"src/main.rs"}"#).unwrap();
+        assert!(matches!(cmd, AgentCommand::ReadFile { .. }));
     }
 }

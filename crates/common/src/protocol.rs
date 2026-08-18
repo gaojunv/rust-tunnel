@@ -82,6 +82,12 @@ pub enum AgentCommand {
         cwd: Option<String>,
         timeout_secs: u64,
     },
+    /// read_file 行区间变体：offset 1-based 起始行（缺省 1），limit 最大行数（缺省服务端默认）
+    ReadFileRange {
+        path: String,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -894,6 +900,27 @@ mod tests {
         match back {
             AgentCommand::GitExec { args: got } => assert_eq!(got, args),
             other => panic!("expected GitExec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agent_command_read_file_range_roundtrip() {
+        let cmds = vec![
+            AgentCommand::ReadFileRange {
+                path: "src/main.rs".into(),
+                offset: Some(100),
+                limit: Some(2000),
+            },
+            AgentCommand::ReadFileRange {
+                path: "src/main.rs".into(),
+                offset: None,
+                limit: None,
+            },
+        ];
+        for cmd in cmds {
+            let bytes = bincode::serialize(&cmd).unwrap();
+            let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{:?}", cmd));
         }
     }
 

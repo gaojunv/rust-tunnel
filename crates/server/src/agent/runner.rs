@@ -275,6 +275,17 @@ pub(crate) fn client_supports_shell_timeout(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_SHELL_TIMEOUT_CLIENT_VERSION)
 }
 
+/// 首个支持 `AgentCommand::ReadFileRange`（read_file 行区间）的客户端版本。
+const MIN_READ_RANGE_CLIENT_VERSION: (u64, u64, u64) = (0, 7, 0);
+
+/// 客户端版本是否支持 ReadFileRange；缺失/非法视为不支持（保守，避免老客户端
+/// 收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_read_range(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_READ_RANGE_CLIENT_VERSION)
+}
+
 /// 构造 runner 路径的用量记录上下文：从候选链出账方提取 provider/model 信息，
 /// 供四处复用（主流式、流中断重试、compact 摘要、title 生成）。
 pub(crate) fn runner_usage_ctx(
@@ -766,6 +777,10 @@ async fn handle_single_tool_call(
                 AgentCommand::GitExec { .. } => Some((
                     MIN_GIT_EXEC_CLIENT_VERSION,
                     client_supports_git_exec as fn(Option<&str>) -> bool,
+                )),
+                AgentCommand::ReadFileRange { .. } => Some((
+                    MIN_READ_RANGE_CLIENT_VERSION,
+                    client_supports_read_range as fn(Option<&str>) -> bool,
                 )),
                 _ => None,
             };
@@ -1328,6 +1343,10 @@ async fn exec_readonly_one(
         AgentCommand::GitExec { .. } => Some((
             MIN_GIT_EXEC_CLIENT_VERSION,
             client_supports_git_exec as fn(Option<&str>) -> bool,
+        )),
+        AgentCommand::ReadFileRange { .. } => Some((
+            MIN_READ_RANGE_CLIENT_VERSION,
+            client_supports_read_range as fn(Option<&str>) -> bool,
         )),
         _ => None,
     };
@@ -2172,6 +2191,20 @@ mod tests {
         // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
         assert!(client_supports_git_exec(Some("0.5.0+agent")));
         assert!(!client_supports_git_exec(Some("0.4.0")));
+    }
+
+    #[test]
+    fn test_client_supports_read_range() {
+        assert!(client_supports_read_range(Some("0.7.0")));
+        assert!(client_supports_read_range(Some("v0.7.1")));
+        assert!(client_supports_read_range(Some("1.0.0")));
+        assert!(!client_supports_read_range(Some("0.6.9")));
+        assert!(!client_supports_read_range(Some("0.6.0+agent")));
+        assert!(!client_supports_read_range(None));
+        assert!(!client_supports_read_range(Some("garbage")));
+        // 回归：agent 模式版本后缀 +agent 不得破坏版本门控
+        assert!(client_supports_read_range(Some("0.7.0+agent")));
+        assert!(!client_supports_read_range(Some("0.6.0+agent")));
     }
 
     #[test]

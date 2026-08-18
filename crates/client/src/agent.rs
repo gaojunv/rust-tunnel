@@ -421,6 +421,13 @@ pub async fn handle_exec_request(
             },
             Err(e) => AgentResult::Error { message: e },
         },
+        AgentCommand::ReadFileRange { path, offset, limit } => match resolve_sandboxed(root_path, path) {
+            Ok(p) => match docker_container {
+                Some(c) => docker_read_file_range(c, &p, *offset, *limit, timeout).await,
+                None => read_file_range_host(&p, *offset, *limit).await,
+            },
+            Err(e) => AgentResult::Error { message: e },
+        },
         AgentCommand::WriteFile { path, content } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => docker_write_file(c, &p, content, timeout).await,
@@ -661,6 +668,105 @@ async fn read_file_host(abs: &Path) -> AgentResult {
         content = truncate_output(content);
     }
     AgentResult::FileContent { content }
+}
+
+/// 默认返回行数上限
+const DEFAULT_READ_LIMIT: u64 = 2000;
+
+/// 宿主模式读取文件行区间（offset 1-based，limit 最大行数）。
+async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64>) -> AgentResult {
+    use tokio::io::AsyncReadExt;
+    let file = match tokio::fs::File::open(abs).await {
+        Ok(f) => f,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    let mut buf = Vec::with_capacity(MAX_OUTPUT + 1);
+    let n = match file
+        .take((MAX_OUTPUT + 1) as u64)
+        .read_to_end(&mut buf)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    let content = String::from_utf8_lossy(&buf).into_owned();
+    let total_lines = content.lines().count() as u64;
+    // 1-based offset
+    let start = offset.unwrap_or(1).max(1);
+    let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    if start > total_lines && total_lines > 0 {
+        return AgentResult::Error {
+            message: format!(
+                "offset {start} exceeds total lines ({total_lines})"
+            ),
+        };
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = ((start - 1) as usize).min(lines.len());
+    let end_idx = (start_idx + max_lines as usize).min(lines.len());
+    let selected = &lines[start_idx..end_idx];
+    let mut result = selected.join("\n");
+    // 追加截断标记
+    let end_line = start_idx as u64 + selected.len() as u64;
+    if n > MAX_OUTPUT || end_line < total_lines || start_idx > 0 {
+        result.push_str(&format!(
+            "\n[showing lines {}-{} of {}]",
+            start, end_line, total_lines
+        ));
+    }
+    if result.len() > MAX_OUTPUT {
+        result = truncate_output(result);
+    }
+    AgentResult::FileContent { content: result }
+}
+
+/// Docker 模式读取文件行区间：先 docker_read_file 拿内容，再在客户端进程内切片。
+async fn docker_read_file_range(
+    container: &str,
+    abs: &Path,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    timeout: Duration,
+) -> AgentResult {
+    match docker_read_file(container, abs, timeout).await {
+        AgentResult::FileContent { content } => {
+            let total_lines = content.lines().count() as u64;
+            let start = offset.unwrap_or(1).max(1);
+            let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
+            if start > total_lines && total_lines > 0 {
+                return AgentResult::Error {
+                    message: format!(
+                        "offset {start} exceeds total lines ({total_lines})"
+                    ),
+                };
+            }
+            let lines: Vec<&str> = content.lines().collect();
+            let start_idx = ((start - 1) as usize).min(lines.len());
+            let end_idx = (start_idx + max_lines as usize).min(lines.len());
+            let selected = &lines[start_idx..end_idx];
+            let mut result = selected.join("\n");
+            let end_line = start_idx as u64 + selected.len() as u64;
+            if end_line < total_lines || start_idx > 0 {
+                result.push_str(&format!(
+                    "\n[showing lines {}-{} of {}]",
+                    start, end_line, total_lines
+                ));
+            }
+            if result.len() > MAX_OUTPUT {
+                result = truncate_output(result);
+            }
+            AgentResult::FileContent { content: result }
+        }
+        other => other,
+    }
 }
 
 /// 在容器内执行 `cat -- <abs_path>`；非零退出码（如文件不存在）归一为 Error。
@@ -913,6 +1019,102 @@ mod tests {
         )
         .await;
         assert!(matches!(rd, AgentResult::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_range_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
+        let result = handle_exec_request(
+            &AgentCommand::ReadFileRange {
+                path: "lines.txt".into(),
+                offset: Some(10),
+                limit: Some(5),
+            },
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            AgentResult::FileContent { content } => {
+                assert!(content.contains("line 9"));
+                assert!(content.contains("line 13"));
+                assert!(!content.contains("line 14"));
+                assert!(content.contains("[showing lines 10-14 of 100]"));
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_range_offset_exceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("short.txt"), "a\nb\n").unwrap();
+        let result = handle_exec_request(
+            &AgentCommand::ReadFileRange {
+                path: "short.txt".into(),
+                offset: Some(100),
+                limit: Some(10),
+            },
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, AgentResult::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_range_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let result = handle_exec_request(
+            &AgentCommand::ReadFileRange {
+                path: "empty.txt".into(),
+                offset: Some(1),
+                limit: Some(10),
+            },
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            AgentResult::FileContent { content } => assert!(content.is_empty()),
+            other => panic!("expected FileContent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_range_default_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
+        // 无 offset/limit → 读全部（受 DEFAULT_READ_LIMIT 限制）
+        let result = handle_exec_request(
+            &AgentCommand::ReadFileRange {
+                path: "lines.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            dir.path(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            AgentResult::FileContent { content } => {
+                assert!(content.contains("line 0"));
+                assert!(content.contains("line 9"));
+            }
+            other => panic!("expected FileContent, got {other:?}"),
+        }
     }
 
     #[tokio::test]

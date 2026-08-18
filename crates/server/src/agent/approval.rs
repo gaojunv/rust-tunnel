@@ -249,6 +249,7 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
     }
     match cmd {
         AgentCommand::ReadFile { .. }
+        | AgentCommand::ReadFileRange { .. }
         | AgentCommand::ListDir { .. }
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
@@ -281,6 +282,7 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
 pub fn is_readonly_command(cmd: &AgentCommand) -> bool {
     match cmd {
         AgentCommand::ReadFile { .. }
+        | AgentCommand::ReadFileRange { .. }
         | AgentCommand::ListDir { .. }
         | AgentCommand::Search { .. }
         | AgentCommand::GitStatus
@@ -773,6 +775,21 @@ mod tests {
         // GitExec 写档
         assert!(!is_readonly_command(&git_exec(&["add", "--", "a.rs"])));
         assert!(!is_readonly_command(&git_exec(&["reset", "--hard"])));
+    }
+
+    #[test]
+    fn test_read_file_range_readonly_free() {
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::ReadFileRange { path: "a.rs".into(), offset: Some(1), limit: Some(100) }
+        ));
+    }
+
+    #[test]
+    fn test_read_file_range_is_readonly() {
+        assert!(is_readonly_command(&AgentCommand::ReadFileRange {
+            path: "a.rs".into(), offset: Some(10), limit: Some(20)
+        }));
     }
 
     #[test]
