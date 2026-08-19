@@ -341,6 +341,15 @@ export function patchChildToolResult(
 /** 流式 tool_call_chunk 占位卡的合成 toolId 前缀（无 id 时按 index 归位）。 */
 export const STREAM_TOOL_ID_PREFIX = '__stream_';
 
+/** 递归清理 tool 卡 children 内残留的流式占位卡（toolId 以 STREAM_TOOL_ID_PREFIX
+ *  开头的卡）。顶层及所有嵌套 children 均处理，保证 done/stream_reset/tool_call 子
+ *  agent 分支只需一次调用即可清除所有层级的合成卡。 */
+export function dropStreamPlaceholders(list: ChatItem[]): ChatItem[] {
+  return list
+    .filter((it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)))
+    .map((it) => (it.children ? { ...it, children: dropStreamPlaceholders(it.children) } : it));
+}
+
 /**
  * tool_call_chunk 帧（runner 路径工具参数流式透出）→ 占位卡就地更新：
  * 参数增量只累计不渲染全文（正式 tool_call 帧到达后经 upsertToolCard 替换）。

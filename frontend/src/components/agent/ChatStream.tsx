@@ -36,6 +36,7 @@ import {
   applyToolCallChunk,
   chunkKey,
   collectSubagents,
+  dropStreamPlaceholders,
   mergePages,
   parseChunkKey,
   patchChildToolResult,
@@ -665,10 +666,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               next = next.filter((_, i) => i !== idx); // 真正移除半截气泡
             }
           }
-          // 清理残留的 tool_call_chunk 流式占位卡（重试后流式从头开始）
-          return next.filter(
-            (it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)),
-          );
+          // 递归清理所有层级的 tool_call_chunk 流式占位卡（重试后流式从头开始）
+          return dropStreamPlaceholders(next);
         });
       } else if (msg.type === 'tool_call') {
         const parentToolId = msg.parent_tool_call_id;
@@ -709,9 +708,12 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               return upsertToolCard(prev, toolItem);
             }
             const next = [...prev];
+            // 清理子 agent children 内残留的流式占位卡（__stream_ 合成键卡
+            // 在正式 tool_call 帧到达后应被替换/清除）
+            const cleanedChildren = dropStreamPlaceholders(next[parentIdx].children ?? []);
             next[parentIdx] = {
               ...next[parentIdx],
-              children: upsertToolCard(next[parentIdx].children ?? [], toolItem),
+              children: upsertToolCard(cleanedChildren, toolItem),
             };
             return next;
           });
@@ -895,11 +897,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         flushChunks();
         breakStream();
         stopRunning();
-        // 清理残留的 tool_call_chunk 流式占位卡（安全网：正常流程中正式 tool_call
-        // 帧已替换占位卡，仅流中断时可能残留）
-        setItems((prev) => prev.filter(
-          (it) => !(it.kind === 'tool' && it.toolId && it.toolId.startsWith(STREAM_TOOL_ID_PREFIX)),
-        ));
+        // 递归清理所有层级的 tool_call_chunk 流式占位卡（安全网：正常流程中正式
+        // tool_call 帧已替换占位卡，仅流中断时可能残留；递归清理含 children 内的）
+        setItems((prev) => dropStreamPlaceholders(prev));
         // 回合成功结束：plan 归属随回合终结（下一回合首个 plan 新建气泡，M17）；
         // 服务端 5 分钟审批超时按 deny、elicitation 超时按 Cancel 继续回合，仍
         // pending 的卡片必须置终态，否则 hasPendingInteraction 恒 true 锁死发送按钮

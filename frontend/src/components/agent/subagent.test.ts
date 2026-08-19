@@ -5,11 +5,13 @@ import {
   appendChildStream,
   chunkKey,
   collectSubagents,
+  dropStreamPlaceholders,
   extractSubagentMeta,
   groupByParent,
   mergePages,
   parseChunkKey,
   patchChildToolResult,
+  STREAM_TOOL_ID_PREFIX,
   subagentTypeMeta,
   upsertToolCard,
 } from './subagent';
@@ -496,5 +498,88 @@ describe('applyToolCallChunk', () => {
     expect(list[0].children).toHaveLength(0);
     // New list has children
     expect(next[0].children).toHaveLength(1);
+  });
+
+  it('carries accumulated id/name from first chunk on subsequent chunks (standard OpenAI pattern)', () => {
+    // 标准 OpenAI 流：首 chunk 带 id+name，后续仅 arguments。
+    // 服务端修复后（sse.rs），每条 ToolCallDeltaItem 都携带累计 id/name，
+    // 前端 applyToolCallChunk 用真实 id 匹配已有占位卡，不再重复创建。
+    const list: ChatItem[] = [];
+    // 首 chunk：id + name → 创建占位卡（id = call_abc）
+    const s1 = applyToolCallChunk(list, {
+      index: 0,
+      id: 'call_abc',
+      name: 'read_file',
+      arguments: '{"pa',
+    });
+    expect(s1).toHaveLength(1);
+    expect(s1[0].toolId).toBe('call_abc');
+    expect(s1[0].toolName).toBe('read_file');
+    expect(s1[0].toolArgs).toBe('{"pa');
+    // 后续 chunk：id + name（累计）+ arguments → 按 id 命中已有卡，就地更新
+    const s2 = applyToolCallChunk(s1, {
+      index: 0,
+      id: 'call_abc',
+      name: 'read_file',
+      arguments: 'th":"x"}',
+    });
+    // 不再创建第二张卡（不会出现重复占位卡）
+    expect(s2).toHaveLength(1);
+    expect(s2[0].toolId).toBe('call_abc');
+    expect(s2[0].toolName).toBe('read_file');
+    expect(s2[0].toolArgs).toBe('{"path":"x"}');
+  });
+});
+
+describe('dropStreamPlaceholders', () => {
+  it('removes top-level stream placeholder cards (__stream_ prefix)', () => {
+    const list: ChatItem[] = [
+      { kind: 'user', content: 'hi' },
+      tool({ toolId: `${STREAM_TOOL_ID_PREFIX}0`, toolName: 'read_file', toolStatus: 'in_progress' }),
+      tool({ toolId: 'real_card', toolName: 'shell', toolResult: 'ok' }),
+    ];
+    const result = dropStreamPlaceholders(list);
+    expect(result).toHaveLength(2);
+    expect(result.map((it) => it.toolId ?? it.content)).toEqual(['hi', 'real_card']);
+  });
+
+  it('recursively removes stream placeholders inside children', () => {
+    const list: ChatItem[] = [
+      tool({
+        toolId: 'task1',
+        toolName: 'Task',
+        isSubagent: true,
+        children: [
+          tool({ toolId: `${STREAM_TOOL_ID_PREFIX}0`, toolName: 'read_file', toolStatus: 'in_progress' }),
+          tool({ toolId: 'real_child', toolName: 'shell', toolResult: 'ok' }),
+          { kind: 'assistant', content: 'text' },
+        ],
+      }),
+    ];
+    const result = dropStreamPlaceholders(list);
+    expect(result).toHaveLength(1);
+    expect(result[0].children).toHaveLength(2);
+    expect(result[0].children!.map((c) => c.toolId ?? c.content)).toEqual(['real_child', 'text']);
+  });
+
+  it('preserves non-stream placeholders and non-tool items', () => {
+    const list: ChatItem[] = [
+      tool({ toolId: 'real', toolName: 'shell' }),
+      { kind: 'assistant', content: 'hello' },
+      { kind: 'thought', content: 'thinking' },
+    ];
+    expect(dropStreamPlaceholders(list)).toEqual(list);
+  });
+
+  it('returns empty array for empty input', () => {
+    expect(dropStreamPlaceholders([])).toEqual([]);
+  });
+
+  it('does not mutate the original list (pure function)', () => {
+    const child = tool({ toolId: `${STREAM_TOOL_ID_PREFIX}0`, toolName: 'x' });
+    const parent = tool({ toolId: 'task1', children: [child] });
+    const list = [parent];
+    dropStreamPlaceholders(list);
+    expect(list[0].children).toHaveLength(1);
   });
 });
