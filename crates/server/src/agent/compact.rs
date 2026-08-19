@@ -5,8 +5,8 @@ use tokio::sync::mpsc;
 use super::{session::SessionRuntime, AgentState};
 use crate::llm::{ChatMessage, LlmState};
 
-/// 全局默认上下文上限（输入字符估算，chars/4 ≈ tokens）。
-pub const DEFAULT_CONTEXT_LIMIT_CHARS: usize = 100_000;
+/// 全局默认上下文上限（输入字符估算；256K tokens × 4 chars/token = 1_048_576 chars）。
+pub const DEFAULT_CONTEXT_LIMIT_CHARS: usize = 1_048_576;
 /// 压缩时保留的最近消息条数（原文不动）。
 pub const KEEP_RECENT_MESSAGES: usize = 6;
 

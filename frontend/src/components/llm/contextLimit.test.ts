@@ -2,58 +2,66 @@ import { describe, expect, it } from 'vitest';
 import { parseContextLimit, mergeContextLimit } from './contextLimit';
 
 describe('parseContextLimit', () => {
-  it('returns empty for missing or null extra_config', () => {
-    expect(parseContextLimit()).toBe('');
-    expect(parseContextLimit(null)).toBe('');
-    expect(parseContextLimit(undefined)).toBe('');
+  it('returns 256k for missing or null extra_config', () => {
+    expect(parseContextLimit()).toBe('256k');
+    expect(parseContextLimit(null)).toBe('256k');
+    expect(parseContextLimit(undefined)).toBe('256k');
   });
 
-  it('reads the numeric agent_context_limit from extra_config JSON', () => {
-    expect(parseContextLimit('{"agent_context_limit":4096}')).toBe('4096');
-    expect(parseContextLimit('{"agent_context_limit":0}')).toBe('0');
-    expect(parseContextLimit('{"compat_tool_history":true,"agent_context_limit":8192}')).toBe('8192');
+  it('returns 1m when agent_context_limit >= 4_194_304', () => {
+    expect(parseContextLimit('{"agent_context_limit":4194304}')).toBe('1m');
+    expect(parseContextLimit('{"agent_context_limit":5000000}')).toBe('1m');
+    expect(parseContextLimit('{"agent_context_limit":10000000}')).toBe('1m');
   });
 
-  it('returns empty for invalid JSON or non-numeric limit', () => {
-    expect(parseContextLimit('not-json')).toBe('');
-    expect(parseContextLimit('{"agent_context_limit":"4096"}')).toBe('');
-    expect(parseContextLimit('{"agent_context_limit":true}')).toBe('');
-    expect(parseContextLimit('{"agent_context_limit":null}')).toBe('');
-    expect(parseContextLimit('{}')).toBe('');
+  it('returns 256k when agent_context_limit < 4_194_304', () => {
+    expect(parseContextLimit('{"agent_context_limit":4194303}')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":200000}')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":0}')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":100000}')).toBe('256k');
+  });
+
+  it('returns 256k for invalid JSON or non-numeric limit', () => {
+    expect(parseContextLimit('not-json')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":"4096"}')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":true}')).toBe('256k');
+    expect(parseContextLimit('{"agent_context_limit":null}')).toBe('256k');
+    expect(parseContextLimit('{}')).toBe('256k');
+  });
+
+  it('ignores other keys in extra_config', () => {
+    expect(parseContextLimit('{"compat_tool_history":true,"agent_context_limit":4194304}')).toBe('1m');
+    expect(parseContextLimit('{"compat_tool_history":true}')).toBe('256k');
   });
 });
 
 describe('mergeContextLimit', () => {
-  it('adds agent_context_limit and keeps other keys', () => {
-    expect(mergeContextLimit('{"compat_tool_history":true}', '4096')).toBe('{"compat_tool_history":true,"agent_context_limit":4096}');
-    expect(mergeContextLimit(null, '4096')).toBe('{"agent_context_limit":4096}');
-    expect(mergeContextLimit(undefined, '4096')).toBe('{"agent_context_limit":4096}');
+  it('writes agent_context_limit=4194304 for 1m tier', () => {
+    expect(mergeContextLimit(null, '1m')).toBe('{"agent_context_limit":4194304}');
+    expect(mergeContextLimit(undefined, '1m')).toBe('{"agent_context_limit":4194304}');
+    expect(mergeContextLimit('{"compat_tool_history":true}', '1m')).toBe(
+      '{"compat_tool_history":true,"agent_context_limit":4194304}'
+    );
   });
 
-  it('floors fractional input and trims whitespace', () => {
-    expect(mergeContextLimit(null, '4096.7')).toBe('{"agent_context_limit":4096}');
-    expect(mergeContextLimit(null, '  4096  ')).toBe('{"agent_context_limit":4096}');
+  it('deletes the key for 256k tier (default)', () => {
+    expect(mergeContextLimit('{"agent_context_limit":4194304}', '256k')).toBe(null);
+    expect(mergeContextLimit('{"agent_context_limit":4194304}', '256k')).toBe(null);
   });
 
-  it('deletes the key for empty or invalid input', () => {
-    expect(mergeContextLimit('{"agent_context_limit":4096}', '')).toBe(null);
-    expect(mergeContextLimit('{"agent_context_limit":4096}', '  ')).toBe(null);
-    expect(mergeContextLimit('{"agent_context_limit":4096}', 'abc')).toBe(null);
-    expect(mergeContextLimit('{"agent_context_limit":4096}', '0')).toBe(null);
-    expect(mergeContextLimit('{"agent_context_limit":4096}', '-5')).toBe(null);
-  });
-
-  it('preserves other keys when deleting the limit', () => {
-    expect(mergeContextLimit('{"compat_tool_history":true,"agent_context_limit":4096}', '')).toBe('{"compat_tool_history":true}');
+  it('preserves other keys when removing limit for 256k', () => {
+    expect(mergeContextLimit('{"compat_tool_history":true,"agent_context_limit":4194304}', '256k')).toBe(
+      '{"compat_tool_history":true}'
+    );
   });
 
   it('returns null when the merged object is empty', () => {
-    expect(mergeContextLimit(null, '')).toBe(null);
-    expect(mergeContextLimit('{}', '')).toBe(null);
+    expect(mergeContextLimit(null, '256k')).toBe(null);
+    expect(mergeContextLimit('{}', '256k')).toBe(null);
   });
 
   it('tolerates invalid existing JSON', () => {
-    expect(mergeContextLimit('not-json', '4096')).toBe('{"agent_context_limit":4096}');
-    expect(mergeContextLimit('not-json', '')).toBe(null);
+    expect(mergeContextLimit('not-json', '1m')).toBe('{"agent_context_limit":4194304}');
+    expect(mergeContextLimit('not-json', '256k')).toBe(null);
   });
 });
