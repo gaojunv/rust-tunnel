@@ -134,7 +134,13 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: Vec::new(),
+            todos: Vec::new(),
+            depth: 0,
+            parent_tool_call_id: None,
+            file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         }
     }
 

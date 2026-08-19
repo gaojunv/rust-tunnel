@@ -85,6 +85,12 @@ import {
   updateSkill,
   deleteSkill,
   toggleSkill,
+  listRoles,
+  createRole,
+  updateRole,
+  deleteRole,
+  toggleRole,
+  updateAgentSessionRole,
   type MemoryListParams,
   type SkillListParams,
 } from './client';
@@ -107,6 +113,9 @@ import type {
   UpdateMemoryRequest,
   CreateSkillRequest,
   UpdateSkillRequest,
+  CreateRoleRequest,
+  UpdateRoleRequest,
+  RoleListParams,
 } from '../types';
 
 // Shadowsocks hooks
@@ -912,6 +921,65 @@ export function useToggleSkill() {
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: ['agent-skills'] });
       qc.invalidateQueries({ queryKey: ['agent-skill', id] });
+    },
+  });
+}
+
+// ── Agent Role ──────────────────────────────────────────────────
+
+/** 角色列表查询参数（含 UI 过滤映射后的空值剔除）。queryKey `['agent-roles', params]`。 */
+export function useRoles(params: RoleListParams = {}) {
+  return useQuery({
+    queryKey: ['agent-roles', params],
+    queryFn: () => listRoles(params),
+  });
+}
+
+export function useCreateRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: CreateRoleRequest) => createRole(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-roles'] }),
+  });
+}
+
+export function useUpdateRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & UpdateRoleRequest) => updateRole(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-roles'] });
+      qc.invalidateQueries({ queryKey: ['agent-role', vars.id] });
+    },
+  });
+}
+
+export function useDeleteRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => deleteRole(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-roles'] }),
+  });
+}
+
+export function useToggleRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => toggleRole(id),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ['agent-roles'] });
+      qc.invalidateQueries({ queryKey: ['agent-role', id] });
+    },
+  });
+}
+
+export function useUpdateSessionRole() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ sessionId, roleId }: { sessionId: string; roleId: string | null }) =>
+      updateAgentSessionRole(sessionId, roleId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['agent-roles'] });
     },
   });
 }

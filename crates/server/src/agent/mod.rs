@@ -15,6 +15,7 @@ pub mod memory;
 #[cfg(feature = "rag")]
 pub mod skill;
 pub mod notify;
+pub mod roles;
 pub mod runner;
 pub mod session;
 pub mod spawner;

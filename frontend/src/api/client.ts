@@ -55,6 +55,11 @@ import type {
   AgentSkillsResponse,
   CreateSkillRequest,
   UpdateSkillRequest,
+  AgentRole,
+  AgentRolesResponse,
+  RoleListParams,
+  CreateRoleRequest,
+  UpdateRoleRequest,
   FsEntry,
   FsFileContent,
   GitStatusResult,
@@ -793,6 +798,50 @@ export async function deleteSkill(id: string): Promise<void> {
 export async function toggleSkill(id: string): Promise<AgentSkill> {
   const { data } = await api.post(`/agent/skills/${encodeURIComponent(id)}/toggle`);
   return data;
+}
+
+// ── Agent Role（多角色子代理系统） ────────────────────────────────
+
+export async function listRoles(params: RoleListParams = {}): Promise<AgentRolesResponse> {
+  const clean: Record<string, string | number> = {};
+  if (params.scope) clean.scope = params.scope;
+  if (params.client_id) clean.client_id = params.client_id;
+  if (params.workspace_id) clean.workspace_id = params.workspace_id;
+  if (params.q) clean.q = params.q;
+  if (params.enabled !== undefined) clean.enabled = params.enabled ? 'true' : 'false';
+  const { data } = await api.get('/agent/roles', { params: clean });
+  return { roles: data.roles ?? [], total: data.total ?? 0 };
+}
+
+export async function getRole(id: string): Promise<AgentRole> {
+  const { data } = await api.get(`/agent/roles/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function createRole(req: CreateRoleRequest): Promise<AgentRole> {
+  const { data } = await api.post('/agent/roles', req);
+  return data;
+}
+
+export async function updateRole(id: string, req: UpdateRoleRequest): Promise<AgentRole> {
+  const { data } = await api.put(`/agent/roles/${encodeURIComponent(id)}`, req);
+  return data;
+}
+
+export async function deleteRole(id: string): Promise<void> {
+  await api.delete(`/agent/roles/${encodeURIComponent(id)}`);
+}
+
+export async function toggleRole(id: string): Promise<AgentRole> {
+  const { data } = await api.patch(`/agent/roles/${encodeURIComponent(id)}/toggle`);
+  return data;
+}
+
+export async function updateAgentSessionRole(
+  sessionId: string,
+  roleId: string | null,
+): Promise<void> {
+  await api.patch(`/agent/sessions/${encodeURIComponent(sessionId)}/role`, { role_id: roleId });
 }
 
 export function agentWsUrl(sessionId: string): string {

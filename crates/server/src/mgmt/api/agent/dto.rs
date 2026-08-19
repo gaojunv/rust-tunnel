@@ -255,3 +255,82 @@ pub struct GithubApprovedBody {
     #[serde(default)]
     pub approved: Option<bool>,
 }
+
+// ── Agent Roles ─────────────────────────────────────────────────
+
+/// POST /api/agent/roles 请求体。
+#[derive(Debug, Deserialize)]
+pub struct CreateRoleRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub tools_allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub tools_deny: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub scope_type: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+}
+
+/// PUT /api/agent/roles/:id 请求体（部分更新）。
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateRoleRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub tools_allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub tools_deny: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub scope_type: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+}
+
+/// PATCH /api/agent/sessions/:id/role 请求体。
+#[derive(Debug, Deserialize)]
+pub struct UpdateSessionRoleRequest {
+    /// 角色 id；null/空串表示清除会话角色绑定。
+    pub role_id: Option<String>,
+}
+
+/// GET /api/agent/roles 的 query 参数。
+#[derive(Debug, Default, Deserialize)]
+pub struct ListRolesParams {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}

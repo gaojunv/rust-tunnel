@@ -774,6 +774,13 @@ impl Database {
         Self::migrate_agent_messages_v3(pool).await?;
         Self::migrate_agent_messages_v4(pool).await?;
 
+        // ============================================================
+        // Agent roles table
+        // ============================================================
+        Self::migrate_agent_roles(pool).await?;
+        Self::migrate_agent_sessions_add_role(pool).await?;
+        Self::seed_builtin_roles(pool).await?;
+
         Ok(())
     }
 
@@ -1079,6 +1086,114 @@ impl Database {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// 建 `agent_roles` 表：可配置角色定义（系统提示词/工具过滤/模型覆盖/scope）。
+    /// 幂等：CREATE IF NOT EXISTS。
+    async fn migrate_agent_roles(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_roles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                tools_allow TEXT,
+                tools_deny TEXT,
+                model_override TEXT,
+                mode TEXT NOT NULL DEFAULT 'all',
+                scope_type TEXT NOT NULL DEFAULT 'global',
+                client_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                is_builtin INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // scope 内唯一索引
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_roles_name_scope \
+             ON agent_roles(name, scope_type, client_id, workspace_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_roles_enabled ON agent_roles(enabled)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_roles_mode ON agent_roles(mode)",
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// agent_sessions 补列 `role_id TEXT`（引用 agent_roles.id，应用层校验无 FK）。
+    /// 幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_sessions_add_role(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN role_id TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_sessions migration: role_id column already exists");
+            }
+        }
+        Ok(())
+    }
+
+    /// 插入内置角色（INSERT OR IGNORE 幂等）。general（全工具 subagent）、
+    /// explore（只读 subagent）。
+    async fn seed_builtin_roles(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        // general：现有 SUBAGENT_SYSTEM_PROMPT 内容，全工具
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO agent_roles
+               (id, name, description, system_prompt, mode, scope_type, is_builtin, enabled)
+               VALUES (?, 'general', '通用子代理：全工具访问，适用于大多数任务',
+                       'You are a helpful general-purpose AI assistant. Complete the user''s task thoroughly and accurately. Use the available tools to read, write, and modify files, run commands, and search the codebase as needed.',
+                       'subagent', 'global', 1, 1)"#,
+        )
+        .bind("role-builtin-general-0000000000000000")
+        .execute(pool)
+        .await?;
+
+        // explore：只读白名单（read_file 已含行区间参数，无需 read_file_range——
+        // 后者是协议变体不是独立工具名）
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO agent_roles
+               (id, name, description, system_prompt, tools_allow, mode, scope_type, is_builtin, enabled)
+               VALUES (?, 'explore', '只读探索代理：仅查看文件和搜索，不修改任何内容',
+                       'You are a code exploration assistant. Analyze, read, and search code to answer questions. Do NOT modify any files. Report your findings clearly and concisely.',
+                       '["read_file","list_dir","search","git_status","git_diff","git_log","git_show","git_branch","code_outline","read_symbol"]',
+                       'subagent', 'global', 1, 1)"#,
+        )
+        .bind("role-builtin-explore-0000000000000000")
+        .execute(pool)
+        .await?;
+
+        // 存量修正：早期 seed 的 explore 白名单含 read_file_range（协议变体而非
+        // 独立工具名，schema 过滤永不命中），按 id 定点清除（用户可编辑过 prompt
+        // 等字段，只规范 tools_allow）。
+        sqlx::query(
+            r#"UPDATE agent_roles
+               SET tools_allow = '["read_file","list_dir","search","git_status","git_diff","git_log","git_show","git_branch","code_outline","read_symbol"]'
+               WHERE id = 'role-builtin-explore-0000000000000000'
+                 AND tools_allow LIKE '%read_file_range%'"#,
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -1579,6 +1694,98 @@ mod tests {
 
         // 三索引存在
         for idx in ["idx_skills_scope", "idx_skills_source", "idx_skills_enabled"] {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(idx)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(exists, 1, "索引 {idx} 应存在");
+        }
+    }
+
+    /// agent_roles schema：建表 + 内置角色 seed + 幂等迁移 + 唯一索引 + role_id 列。
+    #[tokio::test]
+    async fn test_agent_roles_schema_and_seed() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // 幂等：再次初始化不报错
+        super::Database::initialize_schema(&pool).await.unwrap();
+
+        // 内置角色 seed：general 和 explore
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_roles WHERE is_builtin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "应有 2 个内置角色");
+
+        let general: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT name, mode, tools_allow FROM agent_roles WHERE name = 'general'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(general.0, "general");
+        assert_eq!(general.1, "subagent");
+        assert!(general.2.is_none(), "general 无工具白名单（全工具）");
+
+        let explore: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT name, mode, tools_allow FROM agent_roles WHERE name = 'explore'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(explore.1, "subagent");
+        assert!(
+            explore.2.as_deref().unwrap_or("").contains("read_file"),
+            "explore 应有只读白名单"
+        );
+
+        // agent_sessions.role_id 列存在（默认 NULL）
+        sqlx::query(
+            "INSERT INTO agent_workspaces (id, name, client_id, runtime_type, root_path) \
+             VALUES ('w1', 'w', 'c1', 'host', '/p')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_sessions (id, workspace_id) VALUES ('s1', 'w1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let role_id: Option<String> =
+            sqlx::query_scalar("SELECT role_id FROM agent_sessions WHERE id = 's1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(role_id.is_none(), "role_id 默认 NULL");
+
+        // 唯一索引：同名同 scope 插入第二个应失败
+        let err = sqlx::query(
+            "INSERT INTO agent_roles (id, name, scope_type, client_id, workspace_id) \
+             VALUES ('dup', 'general', 'global', '', '')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(err.is_err(), "同名同 scope 应违反唯一索引");
+
+        // 不同 scope 可以同名
+        sqlx::query(
+            "INSERT INTO agent_roles (id, name, scope_type, client_id, workspace_id) \
+             VALUES ('custom', 'general', 'client', 'c1', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 索引存在
+        for idx in [
+            "idx_roles_name_scope",
+            "idx_roles_enabled",
+            "idx_roles_mode",
+        ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
             )

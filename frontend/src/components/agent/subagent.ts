@@ -20,6 +20,8 @@ export interface SubagentMeta {
   description?: string;
   /** subagent_type（general-purpose/plan 等），渲染为次要徽标 */
   subagentType?: string;
+  /** 角色名（task 工具 args.agent 字段，multi-role subagent 系统） */
+  role?: string;
 }
 
 export function extractSubagentMeta(toolArgs?: string, toolName?: string): SubagentMeta {
@@ -44,11 +46,12 @@ export function extractSubagentMeta(toolArgs?: string, toolName?: string): Subag
   };
   const description = str('description');
   const subagentType = str('subagent_type', 'subagentType');
+  const role = str('agent');
   const label =
     description ??
     str('name', 'task') ??
     (toolName && toolName.trim() ? toolName.trim() : undefined);
-  return { label, description, subagentType };
+  return { label, description, subagentType, role };
 }
 
 /** subagent 类型徽标的展示元信息。 */
@@ -75,6 +78,11 @@ const SUBAGENT_TYPE_STYLE = {
     textClass: 'text-teal-600 dark:text-teal-400',
   },
   'general-purpose': {
+    labelKey: 'agent.subagentTypeGeneral',
+    chipClass: 'bg-slate-500/10',
+    textClass: 'text-slate-600 dark:text-slate-400',
+  },
+  general: {
     labelKey: 'agent.subagentTypeGeneral',
     chipClass: 'bg-slate-500/10',
     textClass: 'text-slate-600 dark:text-slate-400',

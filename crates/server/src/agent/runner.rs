@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::{compact, executor, session::SessionRuntime, sse, tools, AgentState};
+use super::{compact, executor, roles, session::SessionRuntime, sse, tools, AgentState};
 use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 use rust_tunnel_common::{AgentCommand, AgentResult};
 
@@ -391,16 +391,37 @@ const TASK_SUMMARY_MAX_CHARS: usize = 4096;
 /// 子 agent future 类型（join_all 并发 poll，需 Send 以满足 WS handler 约束）。
 type SubagentFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>;
 
-/// 子 agent 系统提示词后缀（追加到主 SYSTEM_PROMPT 之后）。
-const SUBAGENT_SYSTEM_PROMPT_SUFFIX: &str = "\n\n---\n\n## Delegation\nUse the `task` tool to delegate exploration/research subtasks (code searches, multi-file reading, investigations) to a sub-agent with isolated context. It returns only a summary, keeping the main context clean. Prefer task for open-ended questions that would require many tool calls.";
-
-/// 子 agent 独立系统提示词（不包含主循环的 AGENTS.md / memory / skill 注入逻辑）。
-const SUBAGENT_SYSTEM_PROMPT: &str = "You are a sub-agent delegated a specific task. Work autonomously using tools, then output a concise final summary of findings/actions. All paths are relative to the workspace root.";
-
 /// 若 WS 帧需要 parent_tool_call_id，注入到帧 JSON 中。
 fn with_parent(frame: &mut serde_json::Value, rt: &SessionRuntime) {
     if let Some(ref id) = rt.parent_tool_call_id {
         frame["parent_tool_call_id"] = serde_json::Value::String(id.clone());
+    }
+}
+
+/// 主会话角色系统提示块的 tag（块以该前缀开始）。
+const ROLE_BLOCK_TAG: &str = "\n\n---\n\n# Role: ";
+
+/// 按 tag 移除 system 消息中的一个动态块：tag 起点截到下一个块分隔符
+/// （`\n\n---\n\n`）之前；自身 tag 含分隔符前缀，搜索后续分隔符必须从
+/// tag 结束之后开始，否则匹配到自身导致移除失效。块后无其他块时截到结尾。
+fn remove_tagged_block(content: &str, tag: &str) -> String {
+    let Some(pos) = content.find(tag) else {
+        return content.to_string();
+    };
+    let before = content[..pos].trim_end().to_string();
+    let rest_start = pos + tag.len();
+    match content[rest_start..].find("\n\n---\n\n") {
+        Some(p) => format!("{before}{}", &content[rest_start + p..]),
+        None => before,
+    }
+}
+
+/// 把块插到锚点 tag 之前（锚点不存在则追加到末尾）。
+fn insert_block_before(content: &str, anchor_tag: &str, block: &str) -> String {
+    if let Some(pos) = content.find(anchor_tag) {
+        format!("{}{}{}", content[..pos].trim_end(), block, &content[pos..])
+    } else {
+        format!("{content}{block}")
     }
 }
 
@@ -552,14 +573,33 @@ async fn handle_tool_calls(
                     }
                     // 并发执行子 agent 循环：join_all 在同一 task 内并发 poll，
                     // 无需 Send；外层 turn future 被 drop 时子 future 随之中止。
-                    // 先收集 owned 数据（prompt、sub_rt、call_id），再创建借用它们的 future。
-                    let mut sub_owned: Vec<(String, SessionRuntime, String)> = Vec::new();
+                    // 先收集 owned 数据（prompt、sub_rt、call_id、role），再创建借用它们的 future。
+                    let mut sub_owned: Vec<(String, SessionRuntime, String, Option<crate::persistence::db::roles::AgentRoleRecord>)> = Vec::new();
                     let mut error_indices: Vec<(usize, String)> = Vec::new();
+
+                    // 批处理前一次性查可见角色列表（避免每个 task 调用都查库）
+                    let visible_roles = agent.db.role_list_visible(
+                        &rt.client_id,
+                        &rt.workspace_id,
+                        Some("subagent"),
+                    ).await.unwrap_or_default();
+
                     for (bi, call) in batch.iter().enumerate() {
                         match tools::parse_task_args(&call.args) {
-                            Ok(prompt) => {
+                            Ok((agent_name, prompt)) => {
+                                // 按 agent 名解析角色：None → 默认（不传角色）
+                                let role = agent_name.as_deref().and_then(|name| {
+                                    visible_roles.iter().find(|r| r.name == name).cloned()
+                                });
+                                // 未命中/禁用一律报错（明确告知模型无效角色）
+                                if let Some(ref name) = agent_name {
+                                    if role.is_none() {
+                                        error_indices.push((bi, format!("unknown sub-agent role '{name}'")));
+                                        continue;
+                                    }
+                                }
                                 let sub_rt = clone_sub_rt(rt);
-                                sub_owned.push((prompt, sub_rt, call.id.clone()));
+                                sub_owned.push((prompt, sub_rt, call.id.clone(), role));
                             }
                             Err(e) => {
                                 error_indices.push((bi, e));
@@ -567,7 +607,7 @@ async fn handle_tool_calls(
                         }
                     }
                     let mut futures: Vec<SubagentFuture<'_>> = Vec::new();
-                    for (prompt, sub_rt, call_id) in &sub_owned {
+                    for (prompt, sub_rt, call_id, role) in &sub_owned {
                         let fut = run_subagent_loop(
                             agent,
                             llm,
@@ -575,6 +615,7 @@ async fn handle_tool_calls(
                             prompt,
                             call_id,
                             ws_tx,
+                            role.as_ref(),
                         );
                         futures.push(Box::pin(fut));
                     }
@@ -746,6 +787,35 @@ async fn handle_single_tool_call(
         let _ = ws_tx.send(result_frame).await;
         record_tool_result(agent, rt, &call.id, "todo_write", text, persist).await;
         return Ok(());
+    }
+
+    // 角色工具白名单纵深防御：schema 层已裁剪，此处为运行时兜底。
+    // rt.active_role 有 allow/deny → 工具不在允许集（allow 白名单或 deny 排除）→ 拒绝执行。
+    if let Some(ref role) = rt.active_role {
+        let tool_name = &call.name;
+        let allowed = if let Some(allow) = roles::parse_tools_list(role.tools_allow.as_deref()) {
+            allow.iter().any(|a| a == tool_name)
+        } else {
+            true // allow None/空 = 不限制
+        };
+        let denied = if let Some(deny) = roles::parse_tools_list(role.tools_deny.as_deref()) {
+            deny.iter().any(|d| d == tool_name)
+        } else {
+            false
+        };
+        if !allowed || denied {
+            let text = format!("error: tool '{}' is not allowed by the current role '{}'", tool_name, role.name);
+            let mut result_frame = serde_json::json!({
+                "type": "tool_result",
+                "id": &call.id,
+                "name": tool_name,
+                "result": &text,
+            });
+            with_parent(&mut result_frame, rt);
+            let _ = ws_tx.send(result_frame).await;
+            record_tool_result(agent, rt, &call.id, tool_name, text, persist).await;
+            return Ok(());
+        }
     }
 
     let mut call_frame = serde_json::json!({
@@ -1016,10 +1086,12 @@ fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
         agents_md: rt.agents_md.clone(),
         memory_block: rt.memory_block.clone(),
         skill_list_block: rt.skill_list_block.clone(),
+        roles_block: rt.roles_block.clone(),
         messages: rt.messages.clone(),
         depth: rt.depth,
         parent_tool_call_id: rt.parent_tool_call_id.clone(),
         file_hashes: rt.file_hashes.clone(),
+        active_role: rt.active_role.clone(),
     }
 }
 
@@ -1110,6 +1182,7 @@ async fn handle_subagent_tool_calls(
 
 /// 跑完只把摘要回填主上下文。子循环可用全量工具（除 task/todo_write，schema 裁剪）、
 /// 继承主会话 approval_mode 审批、执行过程通过 WS 帧带 parent_tool_call_id 透出。
+/// `role`：子 agent 角色（含 allow/deny/model_override/system_prompt），None 用默认。
 async fn run_subagent_loop(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -1117,14 +1190,18 @@ async fn run_subagent_loop(
     task_prompt: &str,
     parent_tool_call_id: &str,
     ws_tx: &mpsc::Sender<serde_json::Value>,
+    role: Option<&crate::persistence::db::roles::AgentRoleRecord>,
 ) -> Result<String, String> {
-    let system_prompt = format!("{SUBAGENT_SYSTEM_PROMPT}\n\n{SUBAGENT_SYSTEM_PROMPT_SUFFIX}");
-    let mut sub_rt = SessionRuntime::subagent(parent_rt, system_prompt, task_prompt, parent_tool_call_id);
+    let system_prompt = roles::subagent_system_prompt(role);
+    let model_override = role.and_then(|r| r.model_override.as_deref());
+    let mut sub_rt = SessionRuntime::subagent(parent_rt, system_prompt, task_prompt, parent_tool_call_id, model_override);
 
-    // 工具 schema：裁剪 task 与 todo_write（子循环不需要）+ 版本过滤
+    // 工具 schema：角色过滤 → 客户端版本过滤 → 裁剪 task 与 todo_write（子循环不需要）
+    let allow = role.and_then(|r| roles::parse_tools_list(r.tools_allow.as_deref()));
+    let deny = role.and_then(|r| roles::parse_tools_list(r.tools_deny.as_deref()));
     let client_ver = agent.registry.get(&sub_rt.client_id).await.and_then(|e| e.client_version.clone());
     let all_tools = tools::filter_tools_for_client_version(
-        tools::agent_tools_schema(&sub_rt.approval_mode),
+        tools::agent_tools_schema_filtered(&sub_rt.approval_mode, allow.as_deref(), deny.as_deref()),
         client_ver.as_deref(),
     );
     let filtered_tools: Vec<serde_json::Value> = all_tools
@@ -1753,6 +1830,56 @@ pub async fn run_agent_turn(
     // 追加 `\n\n---\n\n` 分隔的 plan 模式说明块；退出 plan 模式时移除该块。
     const PLAN_MODE_BLOCK_TAG: &str = "\n\n---\n\n# Plan Mode\n";
     const PLAN_MODE_BLOCK: &str = "\n\n---\n\n# Plan Mode\nYou are in **plan mode** (只读调研模式). In this mode:\n- You can ONLY use read-only tools: read_file, list_dir, search, git_status, git_diff, git_log, git_show, git_branch, todo_write.\n- You CANNOT write files, run shell commands, or modify the repository.\n- Your goal is to investigate the codebase and produce a detailed execution plan.\n- Use todo_write to track your investigation progress and plan items.\n- When your plan is ready, present it clearly to the user.\n- The user will confirm the plan and switch to execution mode for implementation.\n";
+
+    // 主会话角色系统提示块：tag `# Role: `。每回合无条件重建（先按 tag 移除旧块，
+    // 再按 rt.active_role 插入新块到 plan 块之前），角色 A→B 切换、清除、提示词
+    // 在 DB 被编辑（refresh_session_state 每消息重读角色记录）都即时生效。内存态，不落库。
+    if let Some(content) = rt.messages[0].content.take() {
+        rt.messages[0] = ChatMessage::text("system", remove_tagged_block(&content, ROLE_BLOCK_TAG));
+    }
+    if let Some(ref role) = rt.active_role {
+        let mut segs = vec![format!("# Role: {}", role.name)];
+        if !role.description.is_empty() {
+            segs.push(role.description.clone());
+        }
+        let prompt = role.system_prompt.trim();
+        if !prompt.is_empty() {
+            segs.push(prompt.to_string());
+        }
+        // 仅名称一行时没有信息量，不注入
+        if segs.len() > 1 {
+            let role_block = format!("\n\n---\n\n{}", segs.join("\n"));
+            let content = rt.messages[0].content.take().unwrap_or_default();
+            rt.messages[0] = ChatMessage::text(
+                "system",
+                insert_block_before(&content, PLAN_MODE_BLOCK_TAG, &role_block),
+            );
+        }
+    }
+
+    // task 工具角色清单注入：主会话首回合（roles_block 为 None）查可见角色，
+    // 把 task_schema_roles_block() 追加到 task 工具 description（system 块独立 tag）。
+    const ROLES_BLOCK_TAG: &str = "\n\n---\n\n### Available Sub-Agent Roles";
+    if rt.roles_block.is_none() && rt.depth == 0 {
+        let visible = agent.db.role_list_visible(
+            &rt.client_id,
+            &rt.workspace_id,
+            Some("subagent"),
+        ).await.unwrap_or_default();
+        let block = roles::task_schema_roles_block(&visible);
+        rt.roles_block = Some(block.clone());
+        // 注入到 system 块（独立 tag，便于更新）
+        if !block.is_empty() {
+            let base = rt.messages[0].content.as_deref().unwrap_or_default();
+            // 去掉旧角色清单块（如有）再追加
+            let base_clean = if let Some(pos) = base.find(ROLES_BLOCK_TAG) {
+                base[..pos].trim_end().to_string()
+            } else {
+                base.to_string()
+            };
+            rt.messages[0] = ChatMessage::text("system", format!("{base_clean}\n\n---\n\n{block}"));
+        }
+    }
     let current_has_plan = rt.messages[0]
         .content
         .as_deref()
@@ -1792,7 +1919,11 @@ pub async fn run_agent_turn(
             tools: {
                 let client_ver = agent.registry.get(&rt.client_id).await.and_then(|e| e.client_version.clone());
                 Some(tools::filter_tools_for_client_version(
-                    tools::agent_tools_schema(&rt.approval_mode),
+                    tools::agent_tools_schema_filtered(
+                        &rt.approval_mode,
+                        rt.active_role.as_ref().and_then(|r| roles::parse_tools_list(r.tools_allow.as_deref())).as_deref(),
+                        rt.active_role.as_ref().and_then(|r| roles::parse_tools_list(r.tools_deny.as_deref())).as_deref(),
+                    ),
                     client_ver.as_deref(),
                 ))
             },
@@ -2255,6 +2386,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_remove_tagged_block_middle() {
+        // 角色块在中间：前后块都保留，tag 自身的分隔符前缀不得被误判为下一个块。
+        let content = "base\n\n---\n\n# Role: explore\n只读\n提示词\n\n---\n\n# Plan Mode\nplan 内容";
+        let out = remove_tagged_block(content, ROLE_BLOCK_TAG);
+        assert_eq!(out, "base\n\n---\n\n# Plan Mode\nplan 内容");
+    }
+
+    #[test]
+    fn test_remove_tagged_block_at_end_and_absent() {
+        let content = "base\n\n---\n\n# Role: a\n提示词";
+        assert_eq!(remove_tagged_block(content, ROLE_BLOCK_TAG), "base");
+        // tag 不存在：原样返回
+        assert_eq!(remove_tagged_block("base", ROLE_BLOCK_TAG), "base");
+    }
+
+    #[test]
+    fn test_remove_tagged_block_self_match_trap() {
+        // 回归：在 tag 起点处搜索分隔符会匹配到 tag 自身前缀（tag 以分隔符开头），
+        // 必须从 tag 结束之后开始搜，否则移除失效（原样返回）。
+        let content = "base\n\n---\n\n# Role: a\n提示词\n\n---\n\n### Available Sub-Agent Roles\n- x";
+        let out = remove_tagged_block(content, ROLE_BLOCK_TAG);
+        assert!(!out.contains("# Role:"), "角色块应被移除: {out}");
+        assert!(out.contains("### Available Sub-Agent Roles"));
+    }
+
+    #[test]
+    fn test_insert_block_before_anchor() {
+        let content = "base\n\n---\n\n# Plan Mode\nplan";
+        let out = insert_block_before(content, "\n\n---\n\n# Plan Mode\n", "\n\n---\n\n# Role: r\n提示词");
+        assert_eq!(out, "base\n\n---\n\n# Role: r\n提示词\n\n---\n\n# Plan Mode\nplan");
+        // 锚点不存在 → 追加
+        assert_eq!(insert_block_before("base", "\n\n---\n\n# Plan Mode\n", "\n\n---\n\n# Role: r\n提示词"), "base\n\n---\n\n# Role: r\n提示词");
+    }
+
+    #[test]
     fn test_extract_text_response() {
         let body = serde_json::json!({
             "choices": [{
@@ -2643,10 +2809,12 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: vec![],
             depth: 0,
             parent_tool_call_id: Some("parent_call_123".into()),
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         };
         with_parent(&mut frame, &rt);
         assert_eq!(
@@ -2671,10 +2839,12 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: vec![],
             depth: 0,
             parent_tool_call_id: None,
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         };
         with_parent(&mut frame, &rt);
         assert!(frame.get("parent_tool_call_id").is_none());
@@ -2695,10 +2865,12 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: vec![],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         };
         // 添加 8 条 tool 消息
         for i in 0..8 {
@@ -2741,10 +2913,12 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: vec![],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         };
         for i in 0..3 {
             rt.messages.push(ChatMessage {
@@ -2786,10 +2960,12 @@ mod tests {
             agents_md: Some("agents".into()),
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             messages: vec![ChatMessage::text("user", "hello")],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         };
         let cloned = clone_sub_rt(&rt);
         assert_eq!(cloned.session_id, "s1");

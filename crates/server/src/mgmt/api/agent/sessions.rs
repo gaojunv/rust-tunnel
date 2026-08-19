@@ -11,7 +11,7 @@ use crate::mgmt::api::ApiState;
 
 use super::dto::{
     CreateSessionRequest, DefaultModelResponse, ListMessagesParams, ListMessagesResponse,
-    UpdateSessionModelRequest, UpdateSessionRequest,
+    UpdateSessionModelRequest, UpdateSessionRequest, UpdateSessionRoleRequest,
 };
 use super::new_id;
 
@@ -233,6 +233,59 @@ pub async fn list_messages(
     {
         Ok((messages, has_more)) => Json(ListMessagesResponse { messages, has_more }).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// PATCH /api/agent/sessions/:id/role — 绑定/清除会话角色。
+/// role_id 为空串或 null 表示清除绑定；否则校验角色存在且 mode 含 primary/all。
+pub async fn update_session_role(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateSessionRoleRequest>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // 会话不存在 → 404
+    match agent.db.agent_get_session(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let role_id_str = body.role_id.as_deref().unwrap_or("").trim();
+    if role_id_str.is_empty() {
+        // 清除绑定
+        match agent.db.agent_update_session_role(&id, None).await {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    } else {
+        // 校验角色存在且 mode 含 primary/all
+        match agent.db.role_get_by_id(role_id_str).await {
+            Ok(Some(role)) => {
+                if role.enabled == 0 {
+                    return (StatusCode::BAD_REQUEST, "role is disabled".to_string())
+                        .into_response();
+                }
+                if role.mode != "primary" && role.mode != "all" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "role mode must be 'primary' or 'all' for session binding",
+                    )
+                        .into_response();
+                }
+            }
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+        match agent
+            .db
+            .agent_update_session_role(&id, Some(role_id_str))
+            .await
+        {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
     }
 }
 

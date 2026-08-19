@@ -204,6 +204,20 @@ describe('extractSubagentMeta', () => {
       label: '调研登录 bug',
       description: '调研登录 bug',
       subagentType: 'general-purpose',
+      role: undefined,
+    });
+  });
+
+  it('extracts agent field as role from Task args', () => {
+    const meta = extractSubagentMeta(
+      JSON.stringify({ description: 'Review PR', agent: 'code-reviewer', prompt: '...' }),
+      'Task',
+    );
+    expect(meta).toEqual({
+      label: 'Review PR',
+      description: 'Review PR',
+      subagentType: undefined,
+      role: 'code-reviewer',
     });
   });
 
@@ -243,6 +257,14 @@ describe('subagentTypeMeta', () => {
 
   it('is case/whitespace tolerant for known types', () => {
     expect(subagentTypeMeta('  Explore ')).toEqual(subagentTypeMeta('explore'));
+  });
+
+  it('maps general role to general-purpose chip color', () => {
+    expect(subagentTypeMeta('general')).toEqual({
+      labelKey: 'agent.subagentTypeGeneral',
+      chipClass: 'bg-slate-500/10',
+      textClass: 'text-slate-600 dark:text-slate-400',
+    });
   });
 
   it('falls back to muted style with no labelKey for unknown types (raw value shown)', () => {

@@ -305,20 +305,66 @@ async fn bridge_terminal(
     }
 }
 
-/// 会话模型「下一条消息生效」：每轮从 DB 重读 `session.model`，若已设置（非空）
-/// 且与运行时当前模型不同则覆盖。`session.model` 为 `None` 表示回退默认——保持
-/// `SessionRuntime::load` 的加载路径语义（此时 `rt.model` 已在 load/首轮解析为
-/// 默认或第一个可用模型），不据此覆盖，避免把已解析的模型改写为空串。
-async fn refresh_session_model(db: &crate::db::Database, session_id: &str, rt_model: &mut String) {
+/// 会话角色/模型「下一条消息生效」：每条消息从 DB 重读 `session.role_id` 与
+/// `session.model`，刷新 `rt.active_role` 并按 `SessionRuntime::load` 的优先级链
+/// 重算 `rt.model`（session.model → 角色 model_override → workspace.llm_model_id →
+/// 全局默认 → 保持现状）。同时兼作 `@role` 临时角色的复位点：`@role` 只改内存态
+/// 不落库，下一条消息在此被重置回 DB 基线，不会泄漏到后续回合。
+/// 返回值：`session.model` 是否显式设置（`@role` 的 model_override 仅在其为空时生效）。
+async fn refresh_session_state(
+    db: &crate::db::Database,
+    session_id: &str,
+    rt_model: &mut String,
+    active_role: &mut Option<crate::persistence::db::roles::AgentRoleRecord>,
+) -> bool {
     let Ok(Some(session)) = db.agent_get_session(session_id).await else {
-        return;
+        return false;
     };
-    if let Some(model) = session.model {
-        let model = model.trim();
-        if !model.is_empty() && model != rt_model {
-            *rt_model = model.to_string();
+    *active_role = match session.role_id.as_deref() {
+        Some(role_id) => db
+            .role_get_by_id(role_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|r| r.enabled == 1 && (r.mode == "primary" || r.mode == "all")),
+        None => None,
+    };
+    if let Some(m) = session.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if m != rt_model {
+            *rt_model = m.to_string();
+        }
+        return true;
+    }
+    if let Some(rm) = active_role
+        .as_ref()
+        .and_then(|r| r.model_override.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if rm != rt_model {
+            *rt_model = rm.to_string();
+        }
+        return false;
+    }
+    if let Ok(Some(ws)) = db.agent_get_workspace(&session.workspace_id).await {
+        if let Ok(Some(r)) =
+            crate::agent::session::resolve_workspace_model_ref(db, ws.llm_model_id.as_deref()).await
+        {
+            if r != *rt_model {
+                *rt_model = r;
+            }
+            return false;
         }
     }
+    // 全链路皆空 → 回退全局默认（load 时的「第一个可用模型」兜底在此无法复现，
+    // 默认设置也为空则保持现状）。
+    if let Ok(Some(d)) = db.load_server_setting(DEFAULT_MODEL_KEY).await {
+        let d = d.trim();
+        if !d.is_empty() && d != rt_model {
+            *rt_model = d.to_string();
+        }
+    }
+    false
 }
 
 /// 会话审批模式「下一条消息生效」：每轮从 DB 重读 workspace.approval_mode，
@@ -367,6 +413,11 @@ enum WsFrame {
     /// 并同步当前连接的 SessionRuntime。
     SetMode {
         mode: String,
+    },
+    /// 主会话角色切换：更新 session.role_id（DB）+ rt.active_role。
+    /// role_id 为空串 = 清除角色。
+    SetRole {
+        role_id: String,
     },
     Other,
 }
@@ -475,6 +526,14 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                 return WsFrame::Other;
             }
             WsFrame::SetMode { mode }
+        }
+        Some("set_role") => {
+            let role_id = body
+                .get("role_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            WsFrame::SetRole { role_id }
         }
         _ => WsFrame::Other,
     }
@@ -856,6 +915,31 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
                     continue;
                 }
+                WsFrame::SetRole { role_id } => {
+                    // 角色切换：更新 session.role_id（DB）+ rt.active_role（内存态）。
+                    // role_id 空串 = 清除角色。
+                    if let Some(agent) = state.server_state.agent_state.as_ref() {
+                        // 更新 DB（空串 → None）
+                        let db_role_id = if role_id.is_empty() { None } else { Some(role_id.as_str()) };
+                        if let Err(e) = agent.db.agent_update_session_role(&session_id, db_role_id).await {
+                            let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set role failed: {e}")})).await;
+                            continue;
+                        }
+                        // 同步 rt.active_role（若已创建）
+                        if let Some(rt) = rt_cache.as_mut() {
+                            rt.active_role = if role_id.is_empty() {
+                                None
+                            } else {
+                                match agent.db.role_get_by_id(&role_id).await {
+                                    Ok(Some(r)) if r.enabled == 1 && (r.mode == "primary" || r.mode == "all") => Some(r),
+                                    _ => None,
+                                }
+                            };
+                        }
+                        let _ = event_tx.send(serde_json::json!({"type": "role_updated", "role_id": &role_id})).await;
+                    }
+                    continue;
+                }
                 WsFrame::Other => continue,
             }
         };
@@ -1000,9 +1084,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
         // 不再写库——先落原始 content 再注入会造成 DB 与内存内容不一致。
         let rt = match rt_cache.as_mut() {
             Some(rt) => {
-                // 会话模型「下一条消息生效」：PATCH 仅落库，每轮从 DB 重读
-                // session.model 并覆盖 rt.model（非空时），无需重连 WS 即生效。
-                refresh_session_model(&agent.db, &session_id, &mut rt.model).await;
+                // 会话角色/模型「下一条消息生效」：PATCH/SetRole 仅落库，每条消息
+                // 从 DB 重读并覆盖 rt（含 @role 临时角色复位），无需重连 WS 即生效。
+                refresh_session_state(&agent.db, &session_id, &mut rt.model, &mut rt.active_role)
+                    .await;
                 refresh_approval_mode(&agent.db, &session_id, &mut rt.approval_mode).await;
                 rt
             }
@@ -1044,6 +1129,50 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                 rt_cache = Some(loaded);
                 rt_cache.as_mut().expect("rt_cache just assigned")
             }
+        };
+
+        // @role 前缀解析：content 以 @<name> 开头且 name 匹配可见角色（mode 含 primary/all）
+        // → 设置 rt.active_role（本回合生效）+ 剥离前缀；未命中走原 @文件引用逻辑。
+        let visible_roles = agent.db.role_list_visible(
+            &rt.client_id,
+            &rt.workspace_id,
+            Some("primary"),
+        ).await.unwrap_or_default();
+        let content = if let Some((role_name, stripped)) = crate::agent::roles::parse_at_role_prefix(&content, &visible_roles) {
+            // 直接在可见角色列表中取记录（含 client/workspace 作用域）——不可按
+            // global 作用域重查，否则非全局角色匹配上前缀却取不到记录。
+            // parse_at_role_prefix 的名字来自同一列表，find 必然命中。
+            let role = visible_roles
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(&role_name))
+                .cloned();
+            // @role 的 model_override 本回合生效，仅在 session.model 未显式设置时
+            // （同 load 的优先级链）；下一条消息由 refresh_session_state 复位。
+            if let Some(ref r) = role {
+                let session_model_set = agent
+                    .db
+                    .agent_get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.model)
+                    .is_some_and(|m| !m.trim().is_empty());
+                if !session_model_set {
+                    if let Some(rm) = r
+                        .model_override
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        rt.model = rm.to_string();
+                    }
+                }
+            }
+            rt.active_role = role;
+            tracing::debug!(session_id = %session_id, role = %role_name, "@role prefix matched");
+            stripped.to_string()
+        } else {
+            content
         };
 
         // @引用注入：逐个经隧道 ReadFile，合成完整 user 消息后落库 + 进上下文。
@@ -1149,6 +1278,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                     }
                                 }
                                 let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
+                            }
+                            // 角色切换：回合内仅持久化 DB；下一条消息时 rt_cache 重建时加载。
+                            WsFrame::SetRole { role_id } => {
+                                if let Some(agent) = state.server_state.agent_state.as_ref() {
+                                    let db_role_id = if role_id.is_empty() { None } else { Some(role_id.as_str()) };
+                                    let _ = agent.db.agent_update_session_role(&session_id, db_role_id).await;
+                                }
+                                let _ = event_tx.send(serde_json::json!({"type": "role_updated", "role_id": &role_id})).await;
                             }
                             // elicitation 仅 ACP 路径产生：runner 回合内不可能有
                             // pending 表单，忽略（resolve_elicitation 对未知 id
@@ -1462,6 +1599,25 @@ mod tests {
         assert!(matches!(frame, WsFrame::Other));
     }
 
+    #[test]
+    fn test_parse_set_role() {
+        let frame = parse_ws_frame(Message::Text(
+            r#"{"type":"set_role","role_id":"r1"}"#.into(),
+        ));
+        match frame {
+            WsFrame::SetRole { role_id } => assert_eq!(role_id, "r1"),
+            _ => panic!("expected SetRole"),
+        }
+        // 空 role_id = 清除角色
+        let clear = parse_ws_frame(Message::Text(
+            r#"{"type":"set_role","role_id":""}"#.into(),
+        ));
+        match clear {
+            WsFrame::SetRole { role_id } => assert!(role_id.is_empty()),
+            _ => panic!("expected SetRole with empty role_id"),
+        }
+    }
+
     async fn test_state() -> (ApiState, Database) {
         let db = Database::new(":memory:").await.unwrap();
         let server_state = ServerState::with_db(db.clone());
@@ -1545,7 +1701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_session_model_applies_patched_model() {
+    async fn test_refresh_session_state_applies_patched_model() {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
             "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
@@ -1558,25 +1714,85 @@ mod tests {
 
         // 会话模型已在 load 时解析为 gpt-4o；PATCH 落库新模型后，下一轮重读应覆盖。
         let mut rt_model = "gpt-4o".to_string();
+        let mut role = None;
         db.agent_update_session_model("s1", Some("claude-opus-5"))
             .await
             .unwrap();
-        refresh_session_model(&db, "s1", &mut rt_model).await;
+        let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
         assert_eq!(rt_model, "claude-opus-5");
+        assert!(explicit);
 
         // 模型值相同 → 保持原值，无多余写。
-        refresh_session_model(&db, "s1", &mut rt_model).await;
+        refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
         assert_eq!(rt_model, "claude-opus-5");
 
-        // 清除（None）→ 回退默认语义：保持加载路径已解析的模型，不覆盖为空串。
+        // 清除（None）→ 无角色/无 workspace 覆盖时回退全局默认；默认也为空则保持现状。
         db.agent_update_session_model("s1", None).await.unwrap();
-        refresh_session_model(&db, "s1", &mut rt_model).await;
+        let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
+        assert!(!explicit);
         assert_eq!(rt_model, "claude-opus-5");
 
         // 不存在的会话 → 静默保持原模型。
         let mut other = "keep".to_string();
-        refresh_session_model(&db, "ghost", &mut other).await;
+        let mut other_role = None;
+        refresh_session_state(&db, "ghost", &mut other, &mut other_role).await;
         assert_eq!(other, "keep");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_session_state_role_and_model_override() {
+        let (_state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.role_insert(
+            "r1",
+            "reviewer",
+            "代码评审",
+            "prompt",
+            None,
+            None,
+            Some("role-model-x"),
+            "primary",
+            "global",
+            "",
+            "",
+        )
+        .await
+        .unwrap();
+
+        // 绑定角色 + session.model 为空 → active_role 同步、角色 model_override 生效。
+        db.agent_update_session_role("s1", Some("r1")).await.unwrap();
+        let mut rt_model = "default-model".to_string();
+        let mut role = None;
+        let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
+        assert!(!explicit);
+        assert_eq!(rt_model, "role-model-x");
+        assert_eq!(role.as_ref().map(|r| r.name.as_str()), Some("reviewer"));
+
+        // session.model 显式设置 → 优先于角色 model_override。
+        db.agent_update_session_model("s1", Some("gpt-4o")).await.unwrap();
+        let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
+        assert!(explicit);
+        assert_eq!(rt_model, "gpt-4o");
+
+        // 解绑角色 → active_role 清空、模型回退（session.model 仍显式）。
+        db.agent_update_session_role("s1", None).await.unwrap();
+        refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
+        assert!(role.is_none());
+
+        // 禁用角色 → 视为无角色。
+        db.agent_update_session_role("s1", Some("r1")).await.unwrap();
+        db.role_toggle_enabled("r1").await.unwrap();
+        db.agent_update_session_model("s1", None).await.unwrap();
+        let mut rt_model2 = "default-model".to_string();
+        let mut role2 = None;
+        refresh_session_state(&db, "s1", &mut rt_model2, &mut role2).await;
+        assert!(role2.is_none());
+        assert_eq!(rt_model2, "default-model");
     }
 
     #[test]

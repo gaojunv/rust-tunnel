@@ -17,6 +17,7 @@ import SkillSettings from '@/components/knowledge/SkillSettings';
 import KbSection from '@/components/knowledge/KbSection';
 import MemorySection from '@/components/knowledge/MemorySection';
 import SkillSection from '@/components/knowledge/SkillSection';
+import RoleSection from '@/components/agent/role/RoleSection';
 
 /** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出统一设置弹窗
  *  （共享 Embedding / 记忆设置 / 技能设置 三个子 Tab）。 */
@@ -33,6 +34,7 @@ export default function KnowledgePage() {
             <TabsTrigger value="kb">{t('nav.knowledgeBase')}</TabsTrigger>
             <TabsTrigger value="memory">{t('nav.memory')}</TabsTrigger>
             <TabsTrigger value="skill">{t('nav.skill')}</TabsTrigger>
+            <TabsTrigger value="roles">{t('nav.roles')}</TabsTrigger>
           </TabsList>
           <Button variant="outline" size="sm" onClick={() => setSettingsOpen(true)}>
             <Settings className="mr-1 h-4 w-4" />
@@ -47,6 +49,9 @@ export default function KnowledgePage() {
         </TabsContent>
         <TabsContent value="skill" className="mt-4">
           <SkillSection />
+        </TabsContent>
+        <TabsContent value="roles" className="mt-4">
+          <RoleSection />
         </TabsContent>
       </Tabs>
 

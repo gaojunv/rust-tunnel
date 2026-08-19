@@ -166,6 +166,9 @@ pub struct SessionRuntime {
     /// 未开启）；Some(非空) = 已注入 `<skills>` 块到 `messages[0]`。与 memory_block
     /// 同模式：每会话只检索一次（纯 SQL，零 embedding 依赖）。
     pub skill_list_block: Option<String>,
+    /// 可用子代理角色清单块缓存：None = 尚未检索；Some("") = 无可用角色；
+    /// Some(非空) = 已注入 `roles_block` 到 task 工具 description。
+    pub roles_block: Option<String>,
     pub messages: Vec<ChatMessage>,
     /// 子 agent 深度：0 = 主循环，1 = 子 agent（防止递归委托）。
     pub depth: u8,
@@ -174,6 +177,10 @@ pub struct SessionRuntime {
     /// 文件内容 SHA-256 哈希缓存（path → hex），用于 stale 检测：
     /// read_file 完整读取后记录，WriteOutcome.file_hash 刷新，stale 错误时清除。
     pub file_hashes: std::collections::HashMap<String, String>,
+    /// 当前主会话活跃角色（`@role` 显式指定或 session.role_id 持久化）。
+    /// None = 使用默认行为（无角色过滤）。含 role.tools_allow/tools_deny
+    /// 用于工具过滤；含 role.model_override 用于子 agent 模型覆盖。
+    pub active_role: Option<crate::persistence::db::roles::AgentRoleRecord>,
 }
 
 impl SessionRuntime {
@@ -199,6 +206,17 @@ impl SessionRuntime {
             .agent_list_messages(session_id)
             .await
             .map_err(|e| format!("db error: {e}"))?;
+
+        // 加载角色：session.role_id 非空 → 查角色（角色被删则 role_id 已置空，
+        // 查不到视为无角色不报错）。角色含 model_override / tools_allow / tools_deny。
+        let active_role = if let Some(role_id) = session.role_id.as_deref() {
+            db.role_get_by_id(role_id)
+                .await
+                .map_err(|e| format!("db error reading role: {e}"))?
+                .filter(|r| r.enabled == 1 && (r.mode == "primary" || r.mode == "all"))
+        } else {
+            None
+        };
 
         // 上下文压缩：只重放最后一个 summary 行及之后的消息（LLM 视角）。
         // 被压缩的原始消息保留在 DB，UI 历史仍可见完整记录。
@@ -258,11 +276,11 @@ impl SessionRuntime {
         Ok(Self {
             session_id: session_id.to_string(),
             workspace_id: session.workspace_id,
-            client_id: workspace.client_id,
+            client_id: workspace.client_id.clone(),
             runtime_type: workspace.runtime_type,
             root_path: workspace.root_path,
             docker_container: workspace.docker_container_id,
-            // 模型优先级：session.model → workspace.llm_model_id → 全局默认。
+            // 模型优先级：session.model → 角色 model_override → workspace.llm_model_id → 全局默认。
             // workspace 引用解析失败（model/group 不存在或禁用）→ 整个 load 报错，
             // 不静默回退默认（显式配置了就必须可用）。
             model: {
@@ -273,6 +291,13 @@ impl SessionRuntime {
                     .filter(|s| !s.is_empty())
                 {
                     m.to_string()
+                } else if let Some(role_model) = active_role
+                    .as_ref()
+                    .and_then(|r| r.model_override.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    role_model.to_string()
                 } else if let Some(r) =
                     resolve_workspace_model_ref(db, workspace.llm_model_id.as_deref()).await?
                 {
@@ -285,22 +310,32 @@ impl SessionRuntime {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            roles_block: None,
             todos: vec![],
             messages,
             depth: 0,
             parent_tool_call_id: None,
             file_hashes: std::collections::HashMap::new(),
+            active_role,
         })
     }
 
     /// 构造子 agent 运行时：复制父会话关键字段，messages 只含 system + user(prompt)，
     /// 不注入 AGENTS.md / memory / skill（子循环独立上下文）。
+    /// `model_override`：角色有自定义模型时传入，覆盖父 model。
     pub fn subagent(
         parent: &SessionRuntime,
         system_prompt: String,
         task_prompt: &str,
         parent_tool_call_id: &str,
+        model_override: Option<&str>,
     ) -> Self {
+        let model = model_override
+            .and_then(|m| {
+                let m = m.trim();
+                if m.is_empty() { None } else { Some(m.to_string()) }
+            })
+            .unwrap_or_else(|| parent.model.clone());
         Self {
             session_id: parent.session_id.clone(),
             workspace_id: parent.workspace_id.clone(),
@@ -308,12 +343,13 @@ impl SessionRuntime {
             runtime_type: parent.runtime_type.clone(),
             root_path: parent.root_path.clone(),
             docker_container: parent.docker_container.clone(),
-            model: parent.model.clone(),
+            model,
             approval_mode: parent.approval_mode.clone(),
             todos: vec![],
             agents_md: Some(String::new()),
             memory_block: Some(String::new()),
             skill_list_block: Some(String::new()),
+            roles_block: Some(String::new()),
             messages: vec![
                 ChatMessage::text("system", system_prompt),
                 ChatMessage::text("user", task_prompt),
@@ -321,6 +357,7 @@ impl SessionRuntime {
             depth: parent.depth + 1,
             parent_tool_call_id: Some(parent_tool_call_id.to_string()),
             file_hashes: std::collections::HashMap::new(),
+            active_role: None,
         }
     }
 }

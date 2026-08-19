@@ -418,7 +418,8 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string", "description": "The task description for the sub-agent to execute"}
+                    "prompt": {"type": "string", "description": "The task description for the sub-agent to execute"},
+                    "agent": {"type": "string", "description": "Optional sub-agent role name (default: general). Available roles are listed in the system prompt."}
                 },
                 "required": ["prompt"]
             }
@@ -478,6 +479,35 @@ pub fn filter_tools_for_client_version(
         tools.retain(|t| t["function"]["name"].as_str() != Some("patch_file"));
     } else {
         tools.retain(|t| t["function"]["name"].as_str() != Some("edit_file"));
+    }
+    tools
+}
+
+/// 角色级工具过滤：在现有 `agent_tools_schema(mode)` 基础上叠加 allow 白名单
+/// 与 deny 黑名单。allow 非空 → 只保留白名单内工具；deny 非空 → 剔除。
+/// plan 模式裁剪由底层 `agent_tools_schema(mode)` 完成，角色过滤叠加其上。
+pub fn agent_tools_schema_filtered(
+    mode: &str,
+    allow: Option<&[String]>,
+    deny: Option<&[String]>,
+) -> Vec<serde_json::Value> {
+    let mut tools = agent_tools_schema(mode);
+    // allow 白名单语义：空数组视为不限制（与 API 校验一致）
+    if let Some(allow_list) = allow {
+        if !allow_list.is_empty() {
+            tools.retain(|t| {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                allow_list.iter().any(|a| a == name)
+            });
+        }
+    }
+    if let Some(deny_list) = deny {
+        if !deny_list.is_empty() {
+            tools.retain(|t| {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                !deny_list.iter().any(|d| d == name)
+            });
+        }
     }
     tools
 }
@@ -614,9 +644,10 @@ pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
     Ok(items)
 }
 
-/// 解析 task 工具调用参数，返回 prompt 字符串。
+/// 解析 task 工具调用参数，返回 (agent_name, prompt)。
+/// `agent` 缺失/空串 → None（调用方解析为 "general" 默认角色）。
 /// 校验：prompt 必须存在、非空。
-pub fn parse_task_args(args_json: &str) -> Result<String, String> {
+pub fn parse_task_args(args_json: &str) -> Result<(Option<String>, String), String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid task arguments: {e}"))?;
     let prompt = args
@@ -626,7 +657,12 @@ pub fn parse_task_args(args_json: &str) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("tool 'task': prompt must not be empty".to_string());
     }
-    Ok(prompt.to_string())
+    let agent = args
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    Ok((agent, prompt.to_string()))
 }
 
 /// Cap on a single tool input payload. The control-channel protocol cap is 1MB
@@ -1594,8 +1630,31 @@ mod tests {
 
     #[test]
     fn test_parse_task_args_valid() {
-        let prompt = parse_task_args(r#"{"prompt":"find all callers of foo"}"#).unwrap();
+        let (agent, prompt) = parse_task_args(r#"{"prompt":"find all callers of foo"}"#).unwrap();
+        assert!(agent.is_none());
         assert_eq!(prompt, "find all callers of foo");
+    }
+
+    #[test]
+    fn test_parse_task_args_with_agent() {
+        let (agent, prompt) = parse_task_args(
+            r#"{"prompt":"review code","agent":"explore"}"#,
+        )
+        .unwrap();
+        assert_eq!(agent.as_deref(), Some("explore"));
+        assert_eq!(prompt, "review code");
+    }
+
+    #[test]
+    fn test_parse_task_args_empty_agent_is_none() {
+        let (agent, _) = parse_task_args(r#"{"prompt":"hi","agent":""}"#).unwrap();
+        assert!(agent.is_none(), "空 agent 应解析为 None");
+    }
+
+    #[test]
+    fn test_parse_task_args_whitespace_agent_is_none() {
+        let (agent, _) = parse_task_args(r#"{"prompt":"hi","agent":"  "}"#).unwrap();
+        assert!(agent.is_none(), "空白 agent 应解析为 None");
     }
 
     #[test]
@@ -1760,5 +1819,92 @@ mod tests {
         assert!(plan_mode_guard("write_file").is_err());
         assert!(plan_mode_guard("patch_file").is_err());
         assert!(plan_mode_guard("read_file").is_ok());
+    }
+
+    // ── agent_tools_schema_filtered ────────────────────────────
+
+    fn tool_names(tools: &[serde_json::Value]) -> Vec<&str> {
+        tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_filtered_no_filters_same_as_base() {
+        let base = agent_tools_schema("safe");
+        let filtered = agent_tools_schema_filtered("safe", None, None);
+        assert_eq!(tool_names(&base), tool_names(&filtered));
+    }
+
+    #[test]
+    fn test_filtered_allow_whitelist() {
+        let allow = vec!["read_file".to_string(), "search".to_string()];
+        let filtered = agent_tools_schema_filtered("safe", Some(&allow), None);
+        let names = tool_names(&filtered);
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"write_file"));
+    }
+
+    #[test]
+    fn test_filtered_deny_blacklist() {
+        let deny = vec!["shell".to_string(), "write_file".to_string()];
+        let filtered = agent_tools_schema_filtered("safe", None, Some(&deny));
+        let names = tool_names(&filtered);
+        assert!(!names.contains(&"shell"));
+        assert!(!names.contains(&"write_file"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+    }
+
+    #[test]
+    fn test_filtered_allow_then_deny_overlay() {
+        // allow 只留 3 个，deny 再剔除 1 个
+        let allow = vec![
+            "read_file".to_string(),
+            "shell".to_string(),
+            "search".to_string(),
+        ];
+        let deny = vec!["shell".to_string()];
+        let filtered = agent_tools_schema_filtered("safe", Some(&allow), Some(&deny));
+        let names = tool_names(&filtered);
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        assert!(!names.contains(&"shell"));
+    }
+
+    #[test]
+    fn test_filtered_with_plan_mode_intersects() {
+        // plan 模式已裁剪为只读子集 + todo_write + task；再叠加 allow 白名单
+        let allow = vec!["read_file".to_string(), "search".to_string()];
+        let filtered = agent_tools_schema_filtered("plan", Some(&allow), None);
+        let names = tool_names(&filtered);
+        // 白名单里的 plan-allowed 工具应保留
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"search"));
+        // 白名单不含的 plan 工具应被剔除
+        assert!(!names.contains(&"list_dir"));
+        assert!(!names.contains(&"todo_write"));
+        // 写工具本就不在 plan 模式
+        assert!(!names.contains(&"shell"));
+    }
+
+    #[test]
+    fn test_filtered_empty_allow_no_restriction() {
+        // 空 allow 数组 = 不限制（与 API 校验语义一致）
+        let allow: Vec<String> = vec![];
+        let base = agent_tools_schema("safe");
+        let filtered = agent_tools_schema_filtered("safe", Some(&allow), None);
+        assert_eq!(tool_names(&base), tool_names(&filtered));
+    }
+
+    #[test]
+    fn test_filtered_empty_deny_no_removal() {
+        let deny: Vec<String> = vec![];
+        let base = agent_tools_schema("safe");
+        let filtered = agent_tools_schema_filtered("safe", None, Some(&deny));
+        assert_eq!(tool_names(&base), tool_names(&filtered));
     }
 }

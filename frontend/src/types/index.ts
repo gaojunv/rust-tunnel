@@ -715,8 +715,83 @@ export interface AgentSession {
   title?: string;
   status: 'active' | 'archived';
   model?: string;
+  role_id?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// === Agent Role（多角色子代理系统） ===
+
+/** 合法工具名常量（与后端一致）。 */
+// 合法工具名（与后端 VALID_TOOL_NAMES 保持一致）。read_file_range 不是独立工具
+// （是 read_file 的行区间参数变体），不在此列。
+export const AGENT_TOOL_NAMES = [
+  'shell', 'read_file', 'write_file', 'patch_file', 'edit_file',
+  'list_dir', 'search', 'git_status', 'git_diff', 'git_log', 'git_show',
+  'git_branch', 'git_commit', 'git_push', 'git_stage', 'git_unstage',
+  'git_checkout', 'git_pull', 'git_revert', 'git_reset', 'git_stash',
+  'code_outline', 'read_symbol', 'task', 'todo_write',
+] as const;
+
+export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
+
+export type AgentRoleMode = 'subagent' | 'primary' | 'all';
+
+export type AgentRoleScope = 'global' | 'client' | 'workspace';
+
+export interface AgentRole {
+  id: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  tools_allow: string[] | null;
+  tools_deny: string[] | null;
+  model_override: string | null;
+  mode: AgentRoleMode;
+  scope_type: AgentRoleScope;
+  client_id: string;
+  workspace_id: string;
+  is_builtin: boolean;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentRolesResponse {
+  roles: AgentRole[];
+  total: number;
+}
+
+export interface RoleListParams {
+  scope?: string;
+  client_id?: string;
+  workspace_id?: string;
+  q?: string;
+  enabled?: boolean;
+}
+
+export interface CreateRoleRequest {
+  name: string;
+  description?: string;
+  system_prompt?: string;
+  tools_allow?: string[] | null;
+  tools_deny?: string[] | null;
+  model_override?: string | null;
+  mode?: AgentRoleMode;
+  scope_type?: AgentRoleScope;
+  client_id?: string;
+  workspace_id?: string;
+}
+
+export interface UpdateRoleRequest {
+  name?: string;
+  description?: string;
+  system_prompt?: string;
+  tools_allow?: string[] | null;
+  tools_deny?: string[] | null;
+  model_override?: string | null;
+  mode?: AgentRoleMode;
+  scope_type?: AgentRoleScope;
 }
 
 export interface TodoItem {

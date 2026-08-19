@@ -121,6 +121,12 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub distilled: i32,
+    /// 关联角色 id（引用 agent_roles.id，应用层校验无 FK）。列由
+    /// `migrate_agent_sessions_add_role`（schema.rs）落地；`#[sqlx(default)]` 保证
+    /// 旧库未跑迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub role_id: Option<String>,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
@@ -355,6 +361,22 @@ impl Database {
             "UPDATE agent_sessions SET model = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(model)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 写入/清除 session 的角色绑定。role_id=None 清除（主会话回退默认行为）。
+    pub async fn agent_update_session_role(
+        &self,
+        id: &str,
+        role_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET role_id = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(role_id)
         .bind(id)
         .execute(&self.pool)
         .await?;

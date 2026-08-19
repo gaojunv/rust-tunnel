@@ -504,6 +504,10 @@ pub async fn run_api_server(
             axum::routing::patch(agent::update_session_model),
         )
         .route(
+            "/api/agent/sessions/:id/role",
+            axum::routing::patch(agent::update_session_role),
+        )
+        .route(
             "/api/agent/sessions/:id/archive",
             post(agent::archive_session),
         )
@@ -528,6 +532,9 @@ pub async fn run_api_server(
             "/api/settings/dns",
             get(dns::get_dns_config).put(dns::update_dns_config),
         );
+
+    // Agent roles CRUD 路由（无 rag feature 依赖，无条件编译）。
+    protected_routes = protected_routes.merge(agent::roles::protected_router());
 
     // RAG 知识库路由（仅 rag feature 启用时挂载）。必须在 auth middleware 应用
     // 之前 merge 进 protected_routes——axum 的 `.layer()` 只包裹调用时已存在的
