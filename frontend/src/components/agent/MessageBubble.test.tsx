@@ -620,6 +620,19 @@ describe('toolSummary enhanced for runner tools', () => {
     expect(header.textContent).not.toContain(':');
   });
 
+  it('read_file accepts numeric string offset/limit (LLM 有时传 "120")', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs","offset":"10","limit":"20"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs:10-29');
+  });
+
   it('read_symbol shows path › name summary', () => {
     render(
       <MessageBubble

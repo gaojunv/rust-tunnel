@@ -167,10 +167,19 @@ function toolSummary(
   if (isExec) return str('cmd', 'command');
   // runner 规范工具名特殊摘要（须在通用 isFileTool 之前，否则被 path 覆盖）
   // read_file 行区间读取：offset/limit 参数时摘要为 basename:offset-end
+  // 兼容 number 与可解析为有限正整数的字符串（LLM 有时传 "120"）
   if (nm === 'read_file') {
     const path = str('path', 'file_path');
-    const offset = typeof parsed.offset === 'number' ? parsed.offset : undefined;
-    const limit = typeof parsed.limit === 'number' ? parsed.limit : undefined;
+    const asInt = (v: unknown): number | undefined => {
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) return Math.floor(v);
+      if (typeof v === 'string') {
+        const n = Number(v);
+        if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+      }
+      return undefined;
+    };
+    const offset = asInt(parsed.offset);
+    const limit = asInt(parsed.limit);
     if (offset !== undefined || limit !== undefined) {
       const start = offset ?? 1;
       const end = limit !== undefined ? start + limit - 1 : undefined;

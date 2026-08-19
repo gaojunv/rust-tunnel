@@ -189,9 +189,12 @@ impl SseAggregator {
                 }
                 // 透传该 index 桶内累计的 id/name（标准 OpenAI 流仅首 delta 带
                 // id/name，后续 delta 仅 arguments；前端据此匹配占位卡避免重复卡）。
+                // 空串视同 None：某些 provider 首 delta 只有 arguments，id/name
+                // 尚未到达时桶内为空串，不能产出 Some("")（前端 "" 非 nullish
+                // 会拿空串当 toolId，导致多个无 id 调用撞同一张卡）。
                 let accumulated = &self.calls[index];
-                item.id = Option::from(accumulated.0.clone());
-                item.name = Option::from(accumulated.1.clone());
+                item.id = (!accumulated.0.is_empty()).then(|| accumulated.0.clone());
+                item.name = (!accumulated.1.is_empty()).then(|| accumulated.1.clone());
                 tool_deltas.push(item);
             }
         }
@@ -615,5 +618,50 @@ mod tests {
         assert_eq!(turn.tool_calls[0].id, "call_abc");
         assert_eq!(turn.tool_calls[0].name, "read_file");
         assert_eq!(turn.tool_calls[0].args, r#"{"path":"x"}}"#);
+    }
+
+    #[test]
+    fn test_tool_call_delta_empty_id_name_yields_none() {
+        // 首 delta 仅 arguments（无 id/name）：item.id/name 为空串时应产出
+        // None 而非 Some("")——前端 "" 非 nullish 会拿空串当 toolId，导致多
+        // 个无 id 调用撞同一张卡。
+        let mut agg = SseAggregator::new();
+        let d1 = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"c"}}]},"index":0}]}"#,
+        );
+        match &d1 {
+            SseFeed::ToolCallDelta { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                // 首 delta 无 id/name → None（不是 Some("")）
+                assert!(calls[0].id.is_none());
+                assert!(calls[0].name.is_none());
+                assert_eq!(calls[0].arguments.as_deref(), Some("{\"c"));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        // 第二行到达 id+name：累计后非空 → 携带累计值
+        let d2 = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"md\":\"ls\"}"}}]},"index":0}]}"#,
+        );
+        match &d2 {
+            SseFeed::ToolCallDelta { calls, .. } => {
+                assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+                assert_eq!(calls[0].name.as_deref(), Some("shell"));
+                assert_eq!(calls[0].arguments.as_deref(), Some("md\":\"ls\"}"));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        // 第三行仅 arguments：累计 id/name 仍携带
+        let d3 = agg.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"extra"}}]},"index":0}]}"#,
+        );
+        match &d3 {
+            SseFeed::ToolCallDelta { calls, .. } => {
+                assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+                assert_eq!(calls[0].name.as_deref(), Some("shell"));
+                assert_eq!(calls[0].arguments.as_deref(), Some("extra"));
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
     }
 }
