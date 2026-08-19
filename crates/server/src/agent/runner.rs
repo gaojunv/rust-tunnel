@@ -294,8 +294,10 @@ pub(crate) fn runner_usage_ctx(
     failover_from: Option<String>,
 ) -> crate::llm::usage::UsageContext {
     crate::llm::usage::UsageContext {
+        // runner 不经网关 API Key 认证，无 key 可记；填入标识名让调用统计里
+        // agent 工作台的调用可辨识（否则按 API Key 分组显示"未知"、明细为 "—"）。
         api_key_id: None,
-        api_key_name: String::new(),
+        api_key_name: "Agent".to_string(),
         provider_id: Some(candidate.provider.id.clone()),
         provider_name: candidate.provider.name.clone(),
         model_id: Some(candidate.model_id.clone()),
@@ -2627,5 +2629,34 @@ mod tests {
         assert_eq!(cloned.parent_tool_call_id.as_deref(), Some("p1"));
         assert_eq!(cloned.todos.len(), 1);
         assert_eq!(cloned.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_runner_usage_ctx_identifiable() {
+        // runner 路径无网关 API Key，但必须填标识名，否则调用统计里无法辨识来源
+        let candidate = crate::llm::router::Candidate {
+            provider: crate::llm::ProviderConfig {
+                id: "p1".into(),
+                name: "P1".into(),
+                provider_type: "deepseek".into(),
+                base_url: "https://example.com".into(),
+                api_key: "k".into(),
+                extra_config: None,
+                anthropic_base_url: None,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            model_name: "deepseek-chat".into(),
+            model_id: "m1".into(),
+            priority: 0,
+        };
+        let ctx = runner_usage_ctx(&candidate, "my-alias", None);
+        assert_eq!(ctx.api_key_id, None);
+        assert_eq!(ctx.api_key_name, "Agent");
+        assert_eq!(ctx.provider_id.as_deref(), Some("p1"));
+        assert_eq!(ctx.model_id.as_deref(), Some("m1"));
+        assert_eq!(ctx.requested_model, "my-alias");
+        assert!(ctx.failover_from.is_none());
     }
 }
