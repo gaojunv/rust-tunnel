@@ -261,6 +261,8 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
         }
         AgentCommand::WriteFile { .. }
         | AgentCommand::PatchFile { .. }
+        | AgentCommand::EditFile { .. }
+        | AgentCommand::WriteFile2 { .. }
         | AgentCommand::GitCommit { .. } => mode == "safe",
         AgentCommand::GitPush => true, // safe 与 auto_write 都需确认
         AgentCommand::GitExec { args } => match git_plan::plan(args) {
@@ -333,7 +335,10 @@ pub fn approval_summary(cmd: &AgentCommand) -> String {
         AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
             truncate(cmd)
         }
-        AgentCommand::WriteFile { path, .. } | AgentCommand::PatchFile { path, .. } => path.clone(),
+        AgentCommand::WriteFile { path, .. }
+        | AgentCommand::PatchFile { path, .. }
+        | AgentCommand::EditFile { path, .. }
+        | AgentCommand::WriteFile2 { path, .. } => path.clone(),
         AgentCommand::GitCommit { message } => truncate(message),
         AgentCommand::GitPush => "git push".to_string(),
         AgentCommand::GitExec { args } => {
@@ -1081,5 +1086,71 @@ mod tests {
             message: "m".into()
         }));
         assert!(needs_approval("plan", &AgentCommand::GitPush));
+    }
+
+    // ── EditFile / WriteFile2 审批矩阵 ──────────────────────
+
+    #[test]
+    fn test_edit_file_write_file2_approval_matrix() {
+        // EditFile: safe 档需审，auto_write 免审，full_auto 免审
+        assert!(needs_approval("safe", &AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        assert!(!needs_approval("auto_write", &AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        assert!(!needs_approval("full_auto", &AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        // WriteFile2: 同 WriteFile 矩阵
+        assert!(needs_approval("safe", &AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+        assert!(!needs_approval("auto_write", &AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+        assert!(!needs_approval("full_auto", &AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+    }
+
+    #[test]
+    fn test_edit_file_write_file2_plan_mode_needs_approval() {
+        assert!(needs_approval("plan", &AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        assert!(needs_approval("plan", &AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+    }
+
+    #[test]
+    fn test_edit_file_write_file2_not_readonly() {
+        assert!(!is_readonly_command(&AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        assert!(!is_readonly_command(&AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+    }
+
+    #[test]
+    fn test_edit_file_write_file2_not_destructive() {
+        assert!(!command_is_destructive(&AgentCommand::EditFile {
+            path: "a.rs".into(), edits: vec![], expected_hash: None,
+        }));
+        assert!(!command_is_destructive(&AgentCommand::WriteFile2 {
+            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+        }));
+    }
+
+    #[test]
+    fn test_approval_summary_new_variants() {
+        assert_eq!(approval_summary(&AgentCommand::EditFile {
+            path: "src/main.rs".into(), edits: vec![], expected_hash: None,
+        }), "src/main.rs");
+        assert_eq!(approval_summary(&AgentCommand::WriteFile2 {
+            path: "out.txt".into(), content: "x".into(), expected_hash: None,
+        }), "out.txt");
     }
 }

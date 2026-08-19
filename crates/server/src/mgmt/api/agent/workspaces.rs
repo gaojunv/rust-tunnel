@@ -463,6 +463,18 @@ async fn run_git_write(
             Json(serde_json::json!({ "error": message })),
         )
             .into_response(),
+        AgentResult::WriteOutcome {
+            bytes_written,
+            lines_added,
+            lines_removed,
+            ..
+        } => Json(serde_json::json!({
+            "output": format!("wrote: +{lines_added}/-{lines_removed} lines, {bytes_written} bytes"),
+            "bytes_written": bytes_written,
+            "lines_added": lines_added,
+            "lines_removed": lines_removed,
+        }))
+        .into_response(),
     }
 }
 

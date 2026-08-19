@@ -31,6 +31,14 @@ const PLAN_MODE_TOOLS: &[&str] = &[
     "read_symbol",
 ];
 
+/// 客户端版本是否支持 edit_file（0.8.0+）。版本缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_edit_file(client_version: Option<&str>) -> bool {
+    client_version
+        .and_then(super::runner::parse_version)
+        .is_some_and(|v| v >= (0, 8, 0))
+}
+
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
 /// `mode` 为 `"plan"` 时只暴露只读工具子集 + `todo_write`（辅助出方案），
 /// 写类工具对模型不可见（模型不会调用，parse 层再兜底拒绝）。
@@ -314,6 +322,34 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Make multiple edits to ONE file in a single call. Edits apply sequentially, each to the result of the previous. All-or-nothing: if any edit fails, the file is not modified. old_string must match EXACTLY ONCE unless replace_all=true. Prefer this over write_file for modifying existing files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path within the workspace"},
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_string": {"type": "string", "description": "Exact text to find"},
+                                    "new_string": {"type": "string", "description": "Replacement text"},
+                                    "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"}
+                                },
+                                "required": ["old_string", "new_string"]
+                            },
+                            "description": "Non-empty list of sequential edits"
+                        }
+                    },
+                    "required": ["path", "edits"]
+                }
+            }
+        }),
         // todo_write：任务清单维护工具（服务端短路，不进 AgentCommand 协议）。
         // 全量替换语义：每次调用提交完整清单。执行模式和 plan 模式都可用
         // （写清单不算写操作，有助于出方案和跟踪进度）。
@@ -432,6 +468,20 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     tools
 }
 
+/// 按客户端版本裁剪工具列表：≥0.8.0 用 edit_file 替换 patch_file，
+/// <0.8.0 保持 patch_file（edit_file 不暴露）。write_file 两档都保留。
+pub fn filter_tools_for_client_version(
+    mut tools: Vec<serde_json::Value>,
+    client_version: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if client_supports_edit_file(client_version) {
+        tools.retain(|t| t["function"]["name"].as_str() != Some("patch_file"));
+    } else {
+        tools.retain(|t| t["function"]["name"].as_str() != Some("edit_file"));
+    }
+    tools
+}
+
 fn arg_str<'a>(args: &'a serde_json::Value, key: &str, tool: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -500,6 +550,7 @@ const PLAN_BLOCKED_TOOLS: &[&str] = &[
     "shell",
     "write_file",
     "patch_file",
+    "edit_file",
     "git_commit",
     "git_push",
     "git_stage",
@@ -829,6 +880,48 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                 path: path.to_string(),
                 old_string: old_string.to_string(),
                 new_string: new_string.to_string(),
+            })
+        }
+        "edit_file" => {
+            let path = arg_str(&args, "path", name)?;
+            check_path_len(path, "path")?;
+            let edits_arr = args
+                .get("edits")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| format!("tool '{name}' requires array argument 'edits'"))?;
+            if edits_arr.is_empty() {
+                return Err("tool 'edit_file': edits must not be empty".to_string());
+            }
+            if args.to_string().len() > MAX_TOOL_INPUT {
+                return Err("edit_file payload too large (>900KB); use fewer/smaller edits".to_string());
+            }
+            let mut edits = Vec::with_capacity(edits_arr.len());
+            for (i, e) in edits_arr.iter().enumerate() {
+                let old_string = e
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("tool '{name}': edits[{i}] missing 'old_string'"))?;
+                let new_string = e
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("tool '{name}': edits[{i}] missing 'new_string'"))?;
+                if old_string.is_empty() {
+                    return Err(format!("tool '{name}': edits[{i}] old_string must not be empty"));
+                }
+                let replace_all = e
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                edits.push(rust_tunnel_common::FileEdit {
+                    old_string: old_string.to_string(),
+                    new_string: new_string.to_string(),
+                    replace_all,
+                });
+            }
+            Ok(AgentCommand::EditFile {
+                path: path.to_string(),
+                edits,
+                expected_hash: None,
             })
         }
         "code_outline" => {
@@ -1563,5 +1656,109 @@ mod tests {
     #[test]
     fn test_parse_read_symbol_requires_name() {
         assert!(parse_tool_call("read_symbol", r#"{"path":"a.rs"}"#).is_err());
+    }
+
+    // ── edit_file 工具 ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_edit_file_valid() {
+        let args = r#"{"path":"src/a.rs","edits":[{"old_string":"fn old","new_string":"fn new"}]}"#;
+        match parse_tool_call("edit_file", args).unwrap() {
+            AgentCommand::EditFile { path, edits, expected_hash } => {
+                assert_eq!(path, "src/a.rs");
+                assert_eq!(edits.len(), 1);
+                assert_eq!(edits[0].old_string, "fn old");
+                assert_eq!(edits[0].new_string, "fn new");
+                assert!(!edits[0].replace_all);
+                assert!(expected_hash.is_none());
+            }
+            other => panic!("expected EditFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edit_file_multiple_edits() {
+        let args = r#"{"path":"x.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d","replace_all":true}]}"#;
+        match parse_tool_call("edit_file", args).unwrap() {
+            AgentCommand::EditFile { edits, .. } => {
+                assert_eq!(edits.len(), 2);
+                assert!(!edits[0].replace_all);
+                assert!(edits[1].replace_all);
+            }
+            other => panic!("expected EditFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edit_file_empty_edits_rejected() {
+        let args = r#"{"path":"a.rs","edits":[]}"#;
+        assert!(parse_tool_call("edit_file", args).unwrap_err().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_parse_edit_file_empty_old_string_rejected() {
+        let args = r#"{"path":"a.rs","edits":[{"old_string":"","new_string":"n"}]}"#;
+        assert!(parse_tool_call("edit_file", args).unwrap_err().contains("old_string must not be empty"));
+    }
+
+    #[test]
+    fn test_parse_edit_file_oversized_rejected() {
+        let big = "x".repeat(901 * 1024);
+        let args = serde_json::json!({"path":"a.rs","edits":[{"old_string":big,"new_string":"n"}]}).to_string();
+        assert!(parse_tool_call("edit_file", &args).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn test_parse_edit_file_missing_path() {
+        assert!(parse_tool_call("edit_file", r#"{"edits":[{"old_string":"a","new_string":"b"}]}"#).is_err());
+    }
+
+    #[test]
+    fn test_parse_edit_file_missing_edits() {
+        assert!(parse_tool_call("edit_file", r#"{"path":"a.rs"}"#).is_err());
+    }
+
+    #[test]
+    fn test_edit_file_schema_in_safe_mode() {
+        let schema = agent_tools_schema("safe");
+        let names: Vec<&str> = schema.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"edit_file"), "edit_file missing in safe mode");
+        assert!(names.contains(&"patch_file"), "patch_file still present in base schema");
+    }
+
+    #[test]
+    fn test_filter_tools_version_ge_080() {
+        let tools = agent_tools_schema("safe");
+        let filtered = filter_tools_for_client_version(tools, Some("0.8.0"));
+        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"edit_file"), "edit_file should be present for 0.8.0+");
+        assert!(!names.contains(&"patch_file"), "patch_file should be removed for 0.8.0+");
+        assert!(names.contains(&"write_file"), "write_file always present");
+    }
+
+    #[test]
+    fn test_filter_tools_version_lt_080() {
+        let tools = agent_tools_schema("safe");
+        let filtered = filter_tools_for_client_version(tools, Some("0.7.0"));
+        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"edit_file"), "edit_file should not be present for <0.8.0");
+        assert!(names.contains(&"patch_file"), "patch_file should be present for <0.8.0");
+    }
+
+    #[test]
+    fn test_filter_tools_version_none() {
+        let tools = agent_tools_schema("safe");
+        let filtered = filter_tools_for_client_version(tools, None);
+        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert!(!names.contains(&"edit_file"), "edit_file should not be present when version unknown");
+        assert!(names.contains(&"patch_file"), "patch_file should be present when version unknown");
+    }
+
+    #[test]
+    fn test_plan_mode_guard_blocks_edit_file() {
+        assert!(plan_mode_guard("edit_file").is_err());
+        assert!(plan_mode_guard("write_file").is_err());
+        assert!(plan_mode_guard("patch_file").is_err());
+        assert!(plan_mode_guard("read_file").is_ok());
     }
 }

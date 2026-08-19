@@ -286,6 +286,17 @@ pub(crate) fn client_supports_read_range(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_READ_RANGE_CLIENT_VERSION)
 }
 
+/// 首个支持 `AgentCommand::EditFile` / `WriteFile2` 的客户端版本。
+const MIN_EDIT_CLIENT_VERSION: (u64, u64, u64) = (0, 8, 0);
+
+/// 客户端版本是否支持 EditFile / WriteFile2；缺失/非法视为不支持（保守，
+/// 避免老客户端收到未知 bincode 变体断开控制连接）。
+pub(crate) fn client_supports_edit(version: Option<&str>) -> bool {
+    version
+        .and_then(parse_version)
+        .is_some_and(|v| v >= MIN_EDIT_CLIENT_VERSION)
+}
+
 /// 构造 runner 路径的用量记录上下文：从候选链出账方提取 provider/model 信息，
 /// 供四处复用（主流式、流中断重试、compact 摘要、title 生成）。
 pub(crate) fn runner_usage_ctx(
@@ -349,6 +360,23 @@ fn agent_result_to_text(result: &AgentResult) -> String {
         AgentResult::FileContent { content } => content.clone(),
         AgentResult::Success => "ok".to_string(),
         AgentResult::Error { message } => format!("error: {message}"),
+        AgentResult::WriteOutcome {
+            bytes_written,
+            lines_added,
+            lines_removed,
+            diff,
+            ..
+        } => {
+            let base = format!(
+                "wrote: +{lines_added}/-{lines_removed} lines, {bytes_written} bytes"
+            );
+            if diff.len() <= 4096 {
+                format!("{base}\n{diff}")
+            } else {
+                let changed = diff.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).count();
+                format!("{base}\n(diff omitted, {changed} changed lines)")
+            }
+        }
     };
     truncate_tool_result(text)
 }
@@ -612,6 +640,74 @@ async fn handle_tool_calls(
     Ok(())
 }
 
+/// 为审批弹窗构建结构化预览文本：patch_file/edit_file 展示编辑内容，
+/// write_file 展示新内容前 20 行，其他工具回退到原始 JSON 截断。
+const PREVIEW_MAX_LINES: usize = 10;
+const PREVIEW_MAX_TOTAL: usize = 2000;
+
+fn build_args_preview(tool_name: &str, command: &AgentCommand) -> String {
+    let truncate_lines = |text: &str, max_lines: usize| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() <= max_lines {
+            text.to_string()
+        } else {
+            format!(
+                "{}\n[... truncated, {} total lines]",
+                lines[..max_lines].join("\n"),
+                lines.len()
+            )
+        }
+    };
+    let mut preview = match command {
+        AgentCommand::PatchFile { path, old_string, new_string } => {
+            format!("{path}\n--- old\n{}\n+++ new\n{}", truncate_lines(old_string, PREVIEW_MAX_LINES), truncate_lines(new_string, PREVIEW_MAX_LINES))
+        }
+        AgentCommand::EditFile { path, edits, .. } => {
+            let mut parts = vec![path.clone()];
+            for edit in edits.iter().take(5) {
+                parts.push(format!("--- old\n{}", truncate_lines(&edit.old_string, PREVIEW_MAX_LINES)));
+                parts.push(format!("+++ new\n{}", truncate_lines(&edit.new_string, PREVIEW_MAX_LINES)));
+            }
+            if edits.len() > 5 {
+                parts.push(format!("... ({} more edits)", edits.len() - 5));
+            }
+            parts.join("\n")
+        }
+        AgentCommand::WriteFile { path, content } | AgentCommand::WriteFile2 { path, content, .. } => {
+            let total = content.lines().count();
+            format!("{path}\n--- new content ({} lines shown / {total} total)\n{}", PREVIEW_MAX_LINES.min(total), truncate_lines(content, PREVIEW_MAX_LINES))
+        }
+        _ => return tool_name.to_string(),
+    };
+    preview.truncate(PREVIEW_MAX_TOTAL);
+    preview
+}
+
+/// 为文件编辑工具从命令参数合成 diffs 数组（WS 帧落库用）。
+/// 成功时调用方已确认结果为 WriteOutcome 或 Success。
+fn synthesize_tool_diffs(tool_name: &str, command: &AgentCommand) -> Option<serde_json::Value> {
+    let diffs = match command {
+        AgentCommand::PatchFile { path, old_string, new_string } => {
+            serde_json::json!([{"path": path, "old_text": old_string, "new_text": new_string}])
+        }
+        AgentCommand::EditFile { path, edits, .. } => {
+            let old_text = edits.iter().map(|e| e.old_string.as_str()).collect::<Vec<_>>().join("\n...\n");
+            let new_text = edits.iter().map(|e| e.new_string.as_str()).collect::<Vec<_>>().join("\n...\n");
+            serde_json::json!([{"path": path, "old_text": old_text, "new_text": new_text}])
+        }
+        AgentCommand::WriteFile { path, content } | AgentCommand::WriteFile2 { path, content, .. } => {
+            let truncated: String = content.lines().take(500).collect::<Vec<_>>().join("\n");
+            serde_json::json!([{"path": path, "old_text": "", "new_text": truncated}])
+        }
+        _ => return None,
+    };
+    if diffs.as_array().is_some_and(|a| !a.is_empty()) && tool_name != "todo_write" {
+        Some(diffs)
+    } else {
+        None
+    }
+}
+
 /// 串行执行单个工具调用并发送 WS 帧+落库（remember/use_skill 短路、审批、写操作）。
 /// `persist`：false 时跳过 DB 落库（子 agent 内存态）。
 #[allow(clippy::too_many_arguments)]
@@ -728,7 +824,7 @@ async fn handle_single_tool_call(
     }
 
     let result_text = match tools::parse_tool_call(&call.name, &call.args) {
-        Ok(command) => {
+        Ok(mut command) => {
             // Plan 模式防御：模型理论上看不到写工具 schema，若幻觉出写工具名，
             // parse 层拒绝执行（与 schema 裁剪双保险）。
             if rt.approval_mode == "plan" {
@@ -745,6 +841,24 @@ async fn handle_single_tool_call(
                     return Ok(());
                 }
             }
+            // write_file 升级映射：客户端 >=0.8.0 时映射为 WriteFile2（带 expected_hash）
+            let client_version = agent.registry.get(&rt.client_id).await.and_then(|e| e.client_version.clone());
+            if matches!(&command, AgentCommand::WriteFile { .. }) && client_supports_edit(client_version.as_deref()) {
+                if let AgentCommand::WriteFile { path, content } = command {
+                    let expected_hash = rt.file_hashes.get(&path).cloned();
+                    command = AgentCommand::WriteFile2 { path, content, expected_hash };
+                }
+            }
+            // stale hash 注入：EditFile/WriteFile2 发送前填入 expected_hash
+            match &mut command {
+                AgentCommand::EditFile { path, expected_hash, .. }
+                | AgentCommand::WriteFile2 { path, expected_hash, .. }
+                    if expected_hash.is_none() =>
+                {
+                    *expected_hash = rt.file_hashes.get(path).cloned();
+                }
+                _ => {}
+            }
             // 审批：session 记忆集命中且命令非破坏性 → 放行
             let remembered = agent
                 .is_allowed_for_session(&rt.session_id, &call.name)
@@ -752,7 +866,7 @@ async fn handle_single_tool_call(
             let needs_confirm = super::approval::needs_approval(&rt.approval_mode, &command);
             if (super::approval::command_is_destructive(&command) || !remembered) && needs_confirm {
                 let summary = super::approval::approval_summary(&command);
-                let args_preview: String = call.args.chars().take(500).collect();
+                let args_preview = build_args_preview(&call.name, &command);
                 let approval = agent
                     .request_approval(&rt.session_id, &call.name, &summary, &args_preview, &[], ws_tx)
                     .await;
@@ -770,11 +884,15 @@ async fn handle_single_tool_call(
                     return Ok(());
                 }
             }
-            // 版本门控：老客户端不认识 Search/PatchFile/GitExec
+            // 版本门控：老客户端不认识 Search/PatchFile/EditFile/WriteFile2/GitExec
             let gated = match &command {
                 AgentCommand::Search { .. } | AgentCommand::PatchFile { .. } => Some((
                     MIN_SEARCH_PATCH_CLIENT_VERSION,
                     client_supports_search_patch as fn(Option<&str>) -> bool,
+                )),
+                AgentCommand::EditFile { .. } | AgentCommand::WriteFile2 { .. } => Some((
+                    MIN_EDIT_CLIENT_VERSION,
+                    client_supports_edit as fn(Option<&str>) -> bool,
                 )),
                 AgentCommand::GitExec { .. } => Some((
                     MIN_GIT_EXEC_CLIENT_VERSION,
@@ -813,15 +931,55 @@ async fn handle_single_tool_call(
             let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
                 AgentResult::Error { message: "docker container not started".into() }
             } else {
-                executor::exec_on_client(agent, &rt.workspace_id, &rt.client_id, &rt.root_path, rt.docker_container.as_deref(), command).await
+                executor::exec_on_client(agent, &rt.workspace_id, &rt.client_id, &rt.root_path, rt.docker_container.as_deref(), command.clone()).await
             };
+            // stale hash 错误处理：客户端回 stale 错误时清除该 path 的记录
+            if let AgentResult::Error { ref message } = result {
+                if message.contains("stale") || message.contains("hash mismatch") {
+                    if let AgentCommand::EditFile { ref path, .. }
+                    | AgentCommand::WriteFile2 { ref path, .. } = command
+                    {
+                        rt.file_hashes.remove(path);
+                    }
+                }
+            }
+            // hash 追踪：WriteOutcome.file_hash → file_hashes；read_file 完整读取记录 hash
+            if let AgentResult::WriteOutcome { ref file_hash, .. } = result {
+                if let AgentCommand::EditFile { ref path, .. }
+                | AgentCommand::WriteFile2 { ref path, .. } = command
+                {
+                    if !file_hash.is_empty() {
+                        rt.file_hashes.insert(path.clone(), file_hash.clone());
+                    }
+                }
+            }
+            // read_file / read_file_range 完整读取记录 hash（无截断标记时）
+            if let AgentResult::FileContent { ref content } = result {
+                if let AgentCommand::ReadFile { ref path } = command {
+                    if !content.contains("[truncated") {
+                        use sha2::{Digest, Sha256};
+                        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+                        rt.file_hashes.insert(path.clone(), hash);
+                    }
+                }
+                // read_file_range 不记录 hash（部分读取，非全文件）
+            }
             let text = agent_result_to_text(&result);
+            // diffs 合成：文件编辑工具成功时附带 diffs 到 WS 帧
+            let diffs_value = if matches!(&result, AgentResult::WriteOutcome { .. } | AgentResult::Success) {
+                synthesize_tool_diffs(&call.name, &command)
+            } else {
+                None
+            };
             let mut result_frame = serde_json::json!({
                 "type": "tool_result",
                 "id": &call.id,
                 "name": &call.name,
                 "result": &text,
             });
+            if let Some(ref diffs) = diffs_value {
+                result_frame["diffs"] = diffs.clone();
+            }
             with_parent(&mut result_frame, rt);
             let _ = ws_tx.send(result_frame).await;
             text
@@ -861,6 +1019,7 @@ fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
         messages: rt.messages.clone(),
         depth: rt.depth,
         parent_tool_call_id: rt.parent_tool_call_id.clone(),
+        file_hashes: rt.file_hashes.clone(),
     }
 }
 
@@ -962,8 +1121,12 @@ async fn run_subagent_loop(
     let system_prompt = format!("{SUBAGENT_SYSTEM_PROMPT}\n\n{SUBAGENT_SYSTEM_PROMPT_SUFFIX}");
     let mut sub_rt = SessionRuntime::subagent(parent_rt, system_prompt, task_prompt, parent_tool_call_id);
 
-    // 工具 schema：裁剪 task 与 todo_write（子循环不需要）
-    let all_tools = tools::agent_tools_schema(&sub_rt.approval_mode);
+    // 工具 schema：裁剪 task 与 todo_write（子循环不需要）+ 版本过滤
+    let client_ver = agent.registry.get(&sub_rt.client_id).await.and_then(|e| e.client_version.clone());
+    let all_tools = tools::filter_tools_for_client_version(
+        tools::agent_tools_schema(&sub_rt.approval_mode),
+        client_ver.as_deref(),
+    );
     let filtered_tools: Vec<serde_json::Value> = all_tools
         .into_iter()
         .filter(|t| {
@@ -1626,7 +1789,13 @@ pub async fn run_agent_turn(
             max_tokens: None,
             temperature: None,
             top_p: None,
-            tools: Some(tools::agent_tools_schema(&rt.approval_mode)),
+            tools: {
+                let client_ver = agent.registry.get(&rt.client_id).await.and_then(|e| e.client_version.clone());
+                Some(tools::filter_tools_for_client_version(
+                    tools::agent_tools_schema(&rt.approval_mode),
+                    client_ver.as_deref(),
+                ))
+            },
             tool_choice: None,
             raw_body: None,
         };
@@ -2477,6 +2646,7 @@ mod tests {
             messages: vec![],
             depth: 0,
             parent_tool_call_id: Some("parent_call_123".into()),
+            file_hashes: std::collections::HashMap::new(),
         };
         with_parent(&mut frame, &rt);
         assert_eq!(
@@ -2504,6 +2674,7 @@ mod tests {
             messages: vec![],
             depth: 0,
             parent_tool_call_id: None,
+            file_hashes: std::collections::HashMap::new(),
         };
         with_parent(&mut frame, &rt);
         assert!(frame.get("parent_tool_call_id").is_none());
@@ -2527,6 +2698,7 @@ mod tests {
             messages: vec![],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
         };
         // 添加 8 条 tool 消息
         for i in 0..8 {
@@ -2572,6 +2744,7 @@ mod tests {
             messages: vec![],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
         };
         for i in 0..3 {
             rt.messages.push(ChatMessage {
@@ -2616,6 +2789,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hello")],
             depth: 1,
             parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
         };
         let cloned = clone_sub_rt(&rt);
         assert_eq!(cloned.session_id, "s1");
@@ -2658,5 +2832,178 @@ mod tests {
         assert_eq!(ctx.model_id.as_deref(), Some("m1"));
         assert_eq!(ctx.requested_model, "my-alias");
         assert!(ctx.failover_from.is_none());
+    }
+
+    // ── client_supports_edit 版本门控 ──────────────────────
+
+    #[test]
+    fn test_client_supports_edit_version_boundaries() {
+        assert!(!client_supports_edit(Some("0.7.9")));
+        assert!(client_supports_edit(Some("0.8.0")));
+        assert!(client_supports_edit(Some("1.0.0")));
+        assert!(!client_supports_edit(None));
+        assert!(!client_supports_edit(Some("abc")));
+    }
+
+    // ── agent_result_to_text WriteOutcome ───────────────────
+
+    #[test]
+    fn test_write_outcome_short_diff() {
+        let result = AgentResult::WriteOutcome {
+            bytes_written: 42,
+            lines_added: 3,
+            lines_removed: 1,
+            diff: "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new".to_string(),
+            file_hash: "abc".to_string(),
+        };
+        let text = agent_result_to_text(&result);
+        assert!(text.contains("+3/-1 lines"));
+        assert!(text.contains("42 bytes"));
+        assert!(text.contains("--- a"));
+    }
+
+    #[test]
+    fn test_write_outcome_long_diff_omitted() {
+        let diff = "x\n".repeat(5000);
+        let result = AgentResult::WriteOutcome {
+            bytes_written: 100,
+            lines_added: 2500,
+            lines_removed: 2500,
+            diff,
+            file_hash: "abc".to_string(),
+        };
+        let text = agent_result_to_text(&result);
+        assert!(text.contains("diff omitted"));
+        assert!(text.contains("changed lines"));
+    }
+
+    // ── stale hash 记录/清除 ──────────────────────────────
+
+    #[test]
+    fn test_stale_hash_lifecycle() {
+        use std::collections::HashMap;
+        let mut hashes: HashMap<String, String> = HashMap::new();
+        // read_file 完整读取记录 hash
+        hashes.insert("a.rs".to_string(), "abc123".to_string());
+        assert_eq!(hashes.get("a.rs").map(String::as_str), Some("abc123"));
+        // WriteOutcome 刷新
+        hashes.insert("a.rs".to_string(), "def456".to_string());
+        assert_eq!(hashes.get("a.rs").map(String::as_str), Some("def456"));
+        // stale 错误清除
+        hashes.remove("a.rs");
+        assert!(hashes.get("a.rs").is_none());
+    }
+
+    // ── diffs 合成 ─────────────────────────────────────────
+
+    #[test]
+    fn test_synthesize_diffs_patch_file() {
+        let cmd = AgentCommand::PatchFile {
+            path: "a.rs".into(),
+            old_string: "old".into(),
+            new_string: "new".into(),
+        };
+        let diffs = synthesize_tool_diffs("patch_file", &cmd).unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "a.rs");
+        assert_eq!(arr[0]["old_text"], "old");
+        assert_eq!(arr[0]["new_text"], "new");
+    }
+
+    #[test]
+    fn test_synthesize_diffs_edit_file() {
+        let cmd = AgentCommand::EditFile {
+            path: "b.rs".into(),
+            edits: vec![
+                rust_tunnel_common::FileEdit {
+                    old_string: "aaa".into(),
+                    new_string: "bbb".into(),
+                    replace_all: false,
+                },
+                rust_tunnel_common::FileEdit {
+                    old_string: "ccc".into(),
+                    new_string: "ddd".into(),
+                    replace_all: false,
+                },
+            ],
+            expected_hash: None,
+        };
+        let diffs = synthesize_tool_diffs("edit_file", &cmd).unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["old_text"].as_str().unwrap().contains("aaa"));
+        assert!(arr[0]["new_text"].as_str().unwrap().contains("ddd"));
+    }
+
+    #[test]
+    fn test_synthesize_diffs_write_file() {
+        let cmd = AgentCommand::WriteFile {
+            path: "c.rs".into(),
+            content: "line1\nline2\n".into(),
+        };
+        let diffs = synthesize_tool_diffs("write_file", &cmd).unwrap();
+        let arr = diffs.as_array().unwrap();
+        assert_eq!(arr[0]["old_text"], "");
+        assert!(arr[0]["new_text"].as_str().unwrap().contains("line1"));
+    }
+
+    #[test]
+    fn test_synthesize_diffs_non_file_tool_returns_none() {
+        let cmd = AgentCommand::Shell { cmd: "ls".into(), cwd: None };
+        assert!(synthesize_tool_diffs("shell", &cmd).is_none());
+    }
+
+    // ── 审批预览格式 ──────────────────────────────────────
+
+    #[test]
+    fn test_build_args_preview_patch_file() {
+        let cmd = AgentCommand::PatchFile {
+            path: "a.rs".into(),
+            old_string: "fn old() {}".into(),
+            new_string: "fn new() {}".into(),
+        };
+        let preview = build_args_preview("patch_file", &cmd);
+        assert!(preview.contains("a.rs"));
+        assert!(preview.contains("--- old"));
+        assert!(preview.contains("+++ new"));
+        assert!(preview.contains("fn old() {}"));
+    }
+
+    #[test]
+    fn test_build_args_preview_edit_file() {
+        let cmd = AgentCommand::EditFile {
+            path: "b.rs".into(),
+            edits: vec![
+                rust_tunnel_common::FileEdit {
+                    old_string: "aaa".into(),
+                    new_string: "bbb".into(),
+                    replace_all: false,
+                },
+            ],
+            expected_hash: None,
+        };
+        let preview = build_args_preview("edit_file", &cmd);
+        assert!(preview.contains("b.rs"));
+        assert!(preview.contains("--- old"));
+        assert!(preview.contains("+++ new"));
+    }
+
+    #[test]
+    fn test_build_args_preview_write_file() {
+        let cmd = AgentCommand::WriteFile {
+            path: "c.txt".into(),
+            content: "hello\nworld".into(),
+        };
+        let preview = build_args_preview("write_file", &cmd);
+        assert!(preview.contains("c.txt"));
+        assert!(preview.contains("new content"));
+    }
+
+    #[test]
+    fn test_build_args_preview_non_file_tool() {
+        let cmd = AgentCommand::Shell { cmd: "ls".into(), cwd: None };
+        let preview = build_args_preview("shell", &cmd);
+        assert_eq!(preview, "shell");
     }
 }

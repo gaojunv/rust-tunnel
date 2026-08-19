@@ -171,6 +171,9 @@ pub struct SessionRuntime {
     pub depth: u8,
     /// 子 agent 的父 tool_call_id（WS 帧 parent 注入用；主 rt 为 None）。
     pub parent_tool_call_id: Option<String>,
+    /// 文件内容 SHA-256 哈希缓存（path → hex），用于 stale 检测：
+    /// read_file 完整读取后记录，WriteOutcome.file_hash 刷新，stale 错误时清除。
+    pub file_hashes: std::collections::HashMap<String, String>,
 }
 
 impl SessionRuntime {
@@ -286,6 +289,7 @@ impl SessionRuntime {
             messages,
             depth: 0,
             parent_tool_call_id: None,
+            file_hashes: std::collections::HashMap::new(),
         })
     }
 
@@ -316,6 +320,7 @@ impl SessionRuntime {
             ],
             depth: parent.depth + 1,
             parent_tool_call_id: Some(parent_tool_call_id.to_string()),
+            file_hashes: std::collections::HashMap::new(),
         }
     }
 }
