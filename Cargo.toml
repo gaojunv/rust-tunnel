@@ -61,6 +61,7 @@ lopdf = { version = "0.32", default-features = false, features = ["nom_parser"] 
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 # OOXML XML 部件解析；escape-html 提供文本实体的 unescape
 quick-xml = { version = "0.31", features = ["escape-html"] }
+similar = "2"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

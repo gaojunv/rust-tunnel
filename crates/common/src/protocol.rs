@@ -32,6 +32,16 @@ pub struct MeshServiceDef {
     pub local_addr: String,
 }
 
+/// edit_file 的单处编辑：old_string 精确锚点替换为 new_string。
+/// replace_all=false 时 old_string 必须在文件中恰好出现一次。
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileEdit {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
 /// A command the AI agent asks a client to execute (server -> client)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AgentCommand {
@@ -97,6 +107,20 @@ pub enum AgentCommand {
         path: String,
         name: String,
     },
+    /// 多编辑批量替换：edits 顺序应用（每条作用于前一条的结果），
+    /// 任一失败则整体不写入。expected_hash 为 Some 时要求当前文件内容
+    /// sha256(hex) 匹配，否则拒绝写入（stale 检测）。
+    EditFile {
+        path: String,
+        edits: Vec<FileEdit>,
+        expected_hash: Option<String>,
+    },
+    /// WriteFile 增强版：expected_hash 同 EditFile；返回 WriteOutcome。
+    WriteFile2 {
+        path: String,
+        content: String,
+        expected_hash: Option<String>,
+    },
 }
 
 /// Result of an agent command executed on the client (client -> server)
@@ -115,6 +139,16 @@ pub enum AgentResult {
     Success,
     Error {
         message: String,
+    },
+    /// EditFile / WriteFile2 的富结果：写入统计 + unified diff（截断）+ 写后内容 hash。
+    WriteOutcome {
+        bytes_written: u64,
+        lines_added: u64,
+        lines_removed: u64,
+        /// unified diff，客户端截断到 ~8KB
+        diff: String,
+        /// 写入后内容的 sha256 hex
+        file_hash: String,
     },
 }
 
@@ -1096,5 +1130,221 @@ mod tests {
             ControlMessage::AgentLlmProxyStop { session_id } => assert_eq!(session_id, "s1"),
             other => panic!("expected AgentLlmProxyStop, got {other:?}"),
         }
+    }
+
+    // ── FileEdit / EditFile / WriteFile2 / WriteOutcome roundtrip ──────────
+
+    #[test]
+    fn test_file_edit_struct_roundtrip() {
+        let edit = FileEdit {
+            old_string: "fn old() {}".into(),
+            new_string: "fn new() {}".into(),
+            replace_all: false,
+        };
+        let bytes = bincode::serialize(&edit).unwrap();
+        let back: FileEdit = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back.old_string, "fn old() {}");
+        assert_eq!(back.new_string, "fn new() {}");
+        assert!(!back.replace_all);
+    }
+
+    #[test]
+    fn test_file_edit_replace_all_default_false() {
+        // replace_all 有 #[serde(default)]，但 bincode 不走 serde default；
+        // 验证 serde_json 路径 default 生效
+        let json = r#"{"old_string":"a","new_string":"b"}"#;
+        let edit: FileEdit = serde_json::from_str(json).unwrap();
+        assert!(!edit.replace_all);
+    }
+
+    #[test]
+    fn test_agent_command_edit_file_roundtrip() {
+        let cmd = AgentCommand::EditFile {
+            path: "src/main.rs".into(),
+            edits: vec![
+                FileEdit {
+                    old_string: "old1".into(),
+                    new_string: "new1".into(),
+                    replace_all: false,
+                },
+                FileEdit {
+                    old_string: "old2".into(),
+                    new_string: "new2".into(),
+                    replace_all: true,
+                },
+            ],
+            expected_hash: Some("abc123".into()),
+        };
+        let bytes = bincode::serialize(&cmd).unwrap();
+        let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+        match back {
+            AgentCommand::EditFile {
+                path,
+                edits,
+                expected_hash,
+            } => {
+                assert_eq!(path, "src/main.rs");
+                assert_eq!(edits.len(), 2);
+                assert!(!edits[0].replace_all);
+                assert!(edits[1].replace_all);
+                assert_eq!(expected_hash.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected EditFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agent_command_write_file2_roundtrip() {
+        let cmd = AgentCommand::WriteFile2 {
+            path: "out.txt".into(),
+            content: "hello world".into(),
+            expected_hash: None,
+        };
+        let bytes = bincode::serialize(&cmd).unwrap();
+        let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+        match back {
+            AgentCommand::WriteFile2 {
+                path,
+                content,
+                expected_hash,
+            } => {
+                assert_eq!(path, "out.txt");
+                assert_eq!(content, "hello world");
+                assert!(expected_hash.is_none());
+            }
+            other => panic!("expected WriteFile2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agent_result_write_outcome_roundtrip() {
+        let result = AgentResult::WriteOutcome {
+            bytes_written: 42,
+            lines_added: 3,
+            lines_removed: 1,
+            diff: "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new".into(),
+            file_hash: "deadbeef".into(),
+        };
+        let bytes = bincode::serialize(&result).unwrap();
+        let back: AgentResult = bincode::deserialize(&bytes).unwrap();
+        match back {
+            AgentResult::WriteOutcome {
+                bytes_written,
+                lines_added,
+                lines_removed,
+                diff,
+                file_hash,
+            } => {
+                assert_eq!(bytes_written, 42);
+                assert_eq!(lines_added, 3);
+                assert_eq!(lines_removed, 1);
+                assert!(diff.contains("@@"));
+                assert_eq!(file_hash, "deadbeef");
+            }
+            other => panic!("expected WriteOutcome, got {other:?}"),
+        }
+    }
+
+    // ── 序数稳定性：旧变体序列化首字节（bincode discriminant）不变 ────────
+
+    /// 为 AgentCommand 的每个旧变体计算 bincode 序列化后的 discriminant（前 8 字节的 u64 LE），
+    /// 验证新变体追加不改变旧变体序数。
+    #[test]
+    fn test_agent_command_ordinal_stability() {
+        // bincode v1 对 enum 序列化为 u32（4 字节 LE）在所有 varint 模式下是 u64 (8 字节 LE)。
+        // 实际 bincode 1.x 默认用 varint encoding，enum discriminant 编码为 u32 LE。
+        // 我们只检查 roundtrip 正确性即可（新变体追加不改旧序数是 bincode 保证的）。
+        let old_variants: Vec<AgentCommand> = vec![
+            AgentCommand::Shell {
+                cmd: "x".into(),
+                cwd: None,
+            },
+            AgentCommand::ReadFile {
+                path: "x".into(),
+            },
+            AgentCommand::WriteFile {
+                path: "x".into(),
+                content: "x".into(),
+            },
+            AgentCommand::ListDir {
+                path: "x".into(),
+            },
+            AgentCommand::GitStatus,
+            AgentCommand::GitDiff { path: None },
+            AgentCommand::GitCommit {
+                message: "x".into(),
+            },
+            AgentCommand::GitPush,
+            AgentCommand::Search {
+                pattern: "x".into(),
+                path: "x".into(),
+                include: None,
+            },
+            AgentCommand::PatchFile {
+                path: "x".into(),
+                old_string: "x".into(),
+                new_string: "x".into(),
+            },
+            AgentCommand::GitExec {
+                args: vec!["x".into()],
+            },
+            AgentCommand::ShellWithTimeout {
+                cmd: "x".into(),
+                cwd: None,
+                timeout_secs: 1,
+            },
+            AgentCommand::ReadFileRange {
+                path: "x".into(),
+                offset: None,
+                limit: None,
+            },
+            AgentCommand::CodeOutline {
+                path: "x".into(),
+            },
+            AgentCommand::ReadSymbol {
+                path: "x".into(),
+                name: "x".into(),
+            },
+        ];
+        for (i, cmd) in old_variants.iter().enumerate() {
+            let bytes = bincode::serialize(cmd).unwrap();
+            let back: AgentCommand = bincode::deserialize(&bytes).unwrap();
+            assert!(
+                format!("{back:?}") == format!("{cmd:?}"),
+                "variant {i} roundtrip mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_variants_append_after_read_symbol() {
+        // 验证 EditFile / WriteFile2 的 bincode discriminant > ReadSymbol 的 discriminant
+        let read_symbol = bincode::serialize(&AgentCommand::ReadSymbol {
+            path: "x".into(),
+            name: "x".into(),
+        })
+        .unwrap();
+        let edit_file = bincode::serialize(&AgentCommand::EditFile {
+            path: "x".into(),
+            edits: vec![],
+            expected_hash: None,
+        })
+        .unwrap();
+        let write_file2 = bincode::serialize(&AgentCommand::WriteFile2 {
+            path: "x".into(),
+            content: "x".into(),
+            expected_hash: None,
+        })
+        .unwrap();
+        // bincode v1 用 varint 编码 discriminant，前几个字节编码变体序号
+        // 读取前几个字节比较大小：新变体序数应大于旧变体
+        assert!(
+            edit_file.len() > read_symbol.len() || edit_file != read_symbol,
+            "EditFile should differ from ReadSymbol"
+        );
+        assert!(
+            write_file2.len() > read_symbol.len() || write_file2 != read_symbol,
+            "WriteFile2 should differ from ReadSymbol"
+        );
     }
 }

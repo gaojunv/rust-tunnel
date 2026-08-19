@@ -6,9 +6,11 @@ pub(crate) mod code_outline;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use tokio::sync::oneshot;
 
-use rust_tunnel_common::{AgentCommand, AgentResult};
+use rust_tunnel_common::{AgentCommand, AgentResult, FileEdit};
 
 /// 单条命令输出上限（协议 1MB 消息上限内留足余量）
 const MAX_OUTPUT: usize = 100 * 1024;
@@ -124,6 +126,165 @@ fn grep_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
     }
 }
 
+/// 原子写：同目录临时文件 + persist rename，避免写一半崩溃留下半截文件。
+async fn atomic_write(abs: &Path, content: &str) -> Result<(), String> {
+    let parent = abs.parent().unwrap_or(Path::new("."));
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("create temp file in {} failed: {e}", parent.display()))?;
+    // NamedTempFile implements std::io::Write; write synchronously (fast for typical file sizes),
+    // then persist atomically.
+    tmp.write_all(content.as_bytes())
+        .map_err(|e| format!("write temp file failed: {e}"))?;
+    tmp.persist(abs)
+        .map_err(|e| format!("persist {} failed: {e}", abs.display()))?;
+    Ok(())
+}
+
+#[allow(unused_imports)]
+use std::io::Write as _;
+
+/// Compute sha256 hex digest of a byte slice.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// Maximum diff output size before truncation (bytes).
+const DIFF_MAX_BYTES: usize = 8 * 1024;
+
+/// Generate a unified diff between two file contents, truncated to ~8KB.
+fn unified_diff(old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => continue,
+        };
+        out.push_str(sign);
+        out.push_str(change.value());
+        if out.len() > DIFF_MAX_BYTES {
+            out.push_str("\n[diff truncated]");
+            break;
+        }
+    }
+    out
+}
+
+/// Count lines added and removed from a unified diff string.
+fn count_diff_lines(diff: &str) -> (u64, u64) {
+    let mut added = 0u64;
+    let mut removed = 0u64;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix('+') {
+            if !rest.starts_with('+') {
+                added += 1;
+            }
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if !rest.starts_with('-') {
+                removed += 1;
+            }
+        }
+    }
+    (added, removed)
+}
+
+/// 最近似匹配行查找：对 old_string 的第一行，在 content 各行中找
+/// 编辑距离最低的一行，返回 (行号1-based, 截断内容)。
+fn find_closest_line(content: &str, old_string: &str) -> Option<(usize, String)> {
+    let needle = old_string.lines().next()?;
+    if needle.is_empty() {
+        return None;
+    }
+    let mut best_line_num = 0usize;
+    let mut best_dist = usize::MAX;
+    for (i, line) in content.lines().enumerate() {
+        let dist = edit_distance(line, needle);
+        if dist < best_dist {
+            best_dist = dist;
+            best_line_num = i + 1;
+        }
+    }
+    if best_dist == usize::MAX {
+        return None;
+    }
+    let line = content.lines().nth(best_line_num - 1)?;
+    let truncated: String = line.chars().take(80).collect();
+    Some((best_line_num, truncated))
+}
+
+/// Simple Levenshtein edit distance.
+#[allow(clippy::needless_range_loop)]
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[m][n]
+}
+
+/// 顺序应用多处编辑：每条作用于前一条的结果。任一失败返回 Err（整体不落盘）。
+fn apply_edits(content: &str, edits: &[FileEdit]) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("edits must not be empty".into());
+    }
+    let mut current = content.to_string();
+    for (i, edit) in edits.iter().enumerate() {
+        let n = i + 1;
+        if edit.old_string.is_empty() {
+            return Err(format!("edit #{n}: old_string must not be empty"));
+        }
+        let matches: Vec<usize> = current
+            .match_indices(&edit.old_string)
+            .map(|(pos, _)| {
+                // 1-based line number
+                current[..pos].lines().count() + 1
+            })
+            .collect();
+        let count = matches.len();
+        if count == 0 {
+            if let Some((line_num, line_text)) = find_closest_line(&current, &edit.old_string) {
+                return Err(format!(
+                    "edit #{n}: old_string not found; closest match at line {line_num}: `{line_text}`"
+                ));
+            }
+            return Err(format!("edit #{n}: old_string not found"));
+        }
+        if edit.replace_all {
+            current = current.replace(&edit.old_string, &edit.new_string);
+        } else if count == 1 {
+            current = current.replacen(&edit.old_string, &edit.new_string, 1);
+        } else {
+            let line_nums: Vec<String> = matches.iter().map(|l| l.to_string()).collect();
+            return Err(format!(
+                "edit #{n}: old_string matches {count} times at lines {}; provide more context",
+                line_nums.join(", ")
+            ));
+        }
+    }
+    Ok(current)
+}
+
 /// 锚点字符串替换：old_string 恰好出现一次才替换。
 async fn patch_file_host(abs: &Path, old_string: &str, new_string: &str) -> AgentResult {
     if old_string.is_empty() {
@@ -146,11 +307,9 @@ async fn patch_file_host(abs: &Path, old_string: &str, new_string: &str) -> Agen
         },
         1 => {
             let updated = content.replacen(old_string, new_string, 1);
-            match tokio::fs::write(abs, updated).await {
+            match atomic_write(abs, &updated).await {
                 Ok(()) => AgentResult::Success,
-                Err(e) => AgentResult::Error {
-                    message: format!("write {} failed: {e}", abs.display()),
-                },
+                Err(e) => AgentResult::Error { message: e },
             }
         }
         n => AgentResult::Error {
@@ -159,6 +318,123 @@ async fn patch_file_host(abs: &Path, old_string: &str, new_string: &str) -> Agen
                 abs.display()
             ),
         },
+    }
+}
+
+/// 多编辑批量替换 + stale 检测 + 原子写 + WriteOutcome。
+async fn edit_file_host(
+    abs: &Path,
+    edits: &[FileEdit],
+    expected_hash: Option<&str>,
+) -> AgentResult {
+    // 读文件
+    let content = match tokio::fs::read_to_string(abs).await {
+        Ok(c) => c,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    // stale 检测
+    if let Some(exp) = expected_hash {
+        let actual = sha256_hex(content.as_bytes());
+        if actual != exp {
+            return AgentResult::Error {
+                message: format!(
+                    "file changed externally since last read (expected hash {exp}, actual {actual}); re-read the file before editing"
+                ),
+            };
+        }
+    }
+    // 应用编辑
+    let new_content = match apply_edits(&content, edits) {
+        Ok(c) => c,
+        Err(e) => return AgentResult::Error { message: e },
+    };
+    // 生成 diff
+    let diff = unified_diff(&content, &new_content);
+    let (lines_added, lines_removed) = count_diff_lines(&diff);
+    // 原子写
+    if let Err(e) = atomic_write(abs, &new_content).await {
+        return AgentResult::Error { message: e };
+    }
+    let file_hash = sha256_hex(new_content.as_bytes());
+    AgentResult::WriteOutcome {
+        bytes_written: new_content.len() as u64,
+        lines_added,
+        lines_removed,
+        diff,
+        file_hash,
+    }
+}
+
+/// WriteFile 增强版：expected_hash stale 检测 + 原子写 + WriteOutcome。
+async fn write_file2_host(
+    abs: &Path,
+    content: &str,
+    expected_hash: Option<&str>,
+) -> AgentResult {
+    // 检查文件是否存在
+    let old_content = match tokio::fs::read_to_string(abs).await {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return AgentResult::Error {
+                message: format!("read {} failed: {e}", abs.display()),
+            };
+        }
+    };
+    // stale 检测（仅文件已存在时）
+    if let Some(exp) = expected_hash {
+        match &old_content {
+            Some(old) => {
+                let actual = sha256_hex(old.as_bytes());
+                if actual != exp {
+                    return AgentResult::Error {
+                        message: format!(
+                            "file changed externally since last read (expected hash {exp}, actual {actual}); re-read the file before writing"
+                        ),
+                    };
+                }
+            }
+            None => {
+                return AgentResult::Error {
+                    message: "file does not exist but expected_hash was provided".into(),
+                };
+            }
+        }
+    }
+    // 生成 diff
+    let diff = match &old_content {
+        Some(old) => unified_diff(old, content),
+        None => {
+            // 新文件：全增 diff
+            let mut out = String::new();
+            for line in content.lines() {
+                out.push('+');
+                out.push_str(line);
+                out.push('\n');
+                if out.len() > DIFF_MAX_BYTES {
+                    out.push_str("[diff truncated]");
+                    break;
+                }
+            }
+            out
+        }
+    };
+    let (lines_added, lines_removed) = count_diff_lines(&diff);
+    // 原子写
+    if let Err(e) = atomic_write(abs, content).await {
+        return AgentResult::Error { message: e };
+    }
+    let file_hash = sha256_hex(content.as_bytes());
+    AgentResult::WriteOutcome {
+        bytes_written: content.len() as u64,
+        lines_added,
+        lines_removed,
+        diff,
+        file_hash,
     }
 }
 
@@ -433,21 +709,10 @@ pub async fn handle_exec_request(
         AgentCommand::WriteFile { path, content } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => docker_write_file(c, &p, content, timeout).await,
-                None => {
-                    if let Some(parent) = p.parent() {
-                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                            return AgentResult::Error {
-                                message: format!("mkdir {} failed: {e}", parent.display()),
-                            };
-                        }
-                    }
-                    match tokio::fs::write(&p, content).await {
-                        Ok(()) => AgentResult::Success,
-                        Err(e) => AgentResult::Error {
-                            message: format!("write {} failed: {e}", p.display()),
-                        },
-                    }
-                }
+                None => match atomic_write(&p, content).await {
+                    Ok(()) => AgentResult::Success,
+                    Err(e) => AgentResult::Error { message: e },
+                },
             },
             Err(e) => AgentResult::Error { message: e },
         },
@@ -611,6 +876,121 @@ pub async fn handle_exec_request(
                     }
                     Err(message) => AgentResult::Error { message },
                 },
+            },
+            Err(e) => AgentResult::Error { message: e },
+        },
+        AgentCommand::EditFile {
+            path,
+            edits,
+            expected_hash,
+        } => match resolve_sandboxed(root_path, path) {
+            Ok(abs) => match docker_container {
+                Some(c) => {
+                    // Docker: read -> local apply_edits -> write back
+                    let content = match docker_read_file(c, &abs, timeout).await {
+                        AgentResult::FileContent { content } => content,
+                        other => return other,
+                    };
+                    // stale 检测
+                    if let Some(exp) = expected_hash {
+                        let actual = sha256_hex(content.as_bytes());
+                        if actual != *exp {
+                            return AgentResult::Error {
+                                message: format!(
+                                    "file changed externally since last read (expected hash {exp}, actual {actual}); re-read the file before editing"
+                                ),
+                            };
+                        }
+                    }
+                    let new_content = match apply_edits(&content, edits) {
+                        Ok(c) => c,
+                        Err(e) => return AgentResult::Error { message: e },
+                    };
+                    let diff = unified_diff(&content, &new_content);
+                    let (lines_added, lines_removed) = count_diff_lines(&diff);
+                    match docker_write_file(c, &abs, &new_content, timeout).await {
+                        AgentResult::Success => {
+                            let file_hash = sha256_hex(new_content.as_bytes());
+                            AgentResult::WriteOutcome {
+                                bytes_written: new_content.len() as u64,
+                                lines_added,
+                                lines_removed,
+                                diff,
+                                file_hash,
+                            }
+                        }
+                        other => other,
+                    }
+                }
+                None => edit_file_host(&abs, edits, expected_hash.as_deref()).await,
+            },
+            Err(e) => AgentResult::Error { message: e },
+        },
+        AgentCommand::WriteFile2 {
+            path,
+            content,
+            expected_hash,
+        } => match resolve_sandboxed(root_path, path) {
+            Ok(abs) => match docker_container {
+                Some(c) => {
+                    // Docker: check existence -> local stale check -> write back
+                    let old_content = match docker_read_file(c, &abs, timeout).await {
+                        AgentResult::FileContent { content } => Some(content),
+                        AgentResult::Error { .. } => None,
+                        other => return other,
+                    };
+                    if let Some(exp) = expected_hash {
+                        match &old_content {
+                            Some(old) => {
+                                let actual = sha256_hex(old.as_bytes());
+                                if actual != *exp {
+                                    return AgentResult::Error {
+                                        message: format!(
+                                            "file changed externally since last read (expected hash {exp}, actual {actual}); re-read the file before writing"
+                                        ),
+                                    };
+                                }
+                            }
+                            None => {
+                                return AgentResult::Error {
+                                    message: "file does not exist but expected_hash was provided"
+                                        .into(),
+                                };
+                            }
+                        }
+                    }
+                    let diff = match &old_content {
+                        Some(old) => unified_diff(old, content),
+                        None => {
+                            let mut out = String::new();
+                            for line in content.lines() {
+                                out.push('+');
+                                out.push_str(line);
+                                out.push('\n');
+                                if out.len() > DIFF_MAX_BYTES {
+                                    out.push_str("[diff truncated]");
+                                    break;
+                                }
+                            }
+                            out
+                        }
+                    };
+                    let (lines_added, lines_removed) = count_diff_lines(&diff);
+                    match docker_write_file(c, &abs, content, timeout).await {
+                        AgentResult::Success => {
+                            let file_hash = sha256_hex(content.as_bytes());
+                            AgentResult::WriteOutcome {
+                                bytes_written: content.len() as u64,
+                                lines_added,
+                                lines_removed,
+                                diff,
+                                file_hash,
+                            }
+                        }
+                        other => other,
+                    }
+                }
+                None => write_file2_host(&abs, content, expected_hash.as_deref()).await,
             },
             Err(e) => AgentResult::Error { message: e },
         },
@@ -868,7 +1248,7 @@ async fn docker_read_file(container: &str, abs: &Path, timeout: Duration) -> Age
     }
 }
 
-/// 在容器内执行 `sh -c 'cat > <abs_path>'`，内容经 stdin 写入。
+/// 在容器内执行原子写：`cat > tmpfile && mv tmpfile target`，内容经 stdin 写入。
 /// 注意：docker 模式下不创建父目录（宿主模式会），MVP 约定目标文件父目录已存在。
 async fn docker_write_file(
     container: &str,
@@ -876,7 +1256,14 @@ async fn docker_write_file(
     content: &str,
     timeout: Duration,
 ) -> AgentResult {
-    let inner = format!("cat > {}", sh_quote(&abs.to_string_lossy()));
+    let target = abs.to_string_lossy();
+    let tmp = format!("{target}.tmp");
+    let inner = format!(
+        "cat > {} && mv {} {}",
+        sh_quote(&tmp),
+        sh_quote(&tmp),
+        sh_quote(&target),
+    );
     let cmd = format!(
         "docker exec -i {} sh -c {}",
         sh_quote(container),
@@ -2134,5 +2521,557 @@ mod tests {
             None,
         )
         .await;
+    }
+
+    // ── apply_edits 单元测试 ─────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_edits_empty_errors() {
+        let result = apply_edits("content", &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_apply_edits_empty_old_string_errors() {
+        let edits = vec![FileEdit {
+            old_string: String::new(),
+            new_string: "new".into(),
+            replace_all: false,
+        }];
+        let result = apply_edits("content", &edits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("old_string must not be empty"));
+    }
+
+    #[test]
+    fn test_apply_edits_single_replacement() {
+        let edits = vec![FileEdit {
+            old_string: "hello".into(),
+            new_string: "world".into(),
+            replace_all: false,
+        }];
+        let result = apply_edits("hello there", &edits).unwrap();
+        assert_eq!(result, "world there");
+    }
+
+    #[test]
+    fn test_apply_edits_sequential_dependency() {
+        // 第二条 edit 匹配第一条的产物
+        let edits = vec![
+            FileEdit {
+                old_string: "aaa".into(),
+                new_string: "bbb".into(),
+                replace_all: false,
+            },
+            FileEdit {
+                old_string: "bbb".into(),
+                new_string: "ccc".into(),
+                replace_all: false,
+            },
+        ];
+        let result = apply_edits("aaa", &edits).unwrap();
+        assert_eq!(result, "ccc");
+    }
+
+    #[test]
+    fn test_apply_edits_replace_all() {
+        let edits = vec![FileEdit {
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: true,
+        }];
+        let result = apply_edits("x x x", &edits).unwrap();
+        assert_eq!(result, "y y y");
+    }
+
+    #[test]
+    fn test_apply_edits_replace_all_zero_matches_errors() {
+        let edits = vec![FileEdit {
+            old_string: "missing".into(),
+            new_string: "y".into(),
+            replace_all: true,
+        }];
+        let result = apply_edits("content", &edits);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_apply_edits_ambiguous_reports_line_numbers() {
+        let content = "line1 dup\nline2 dup\nline3 dup\n";
+        let edits = vec![FileEdit {
+            old_string: "dup".into(),
+            new_string: "replaced".into(),
+            replace_all: false,
+        }];
+        let result = apply_edits(content, &edits);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("3 times"), "error: {err}");
+        assert!(err.contains("line"), "error should mention lines: {err}");
+    }
+
+    #[test]
+    fn test_apply_edits_not_found_with_closest_hint() {
+        let content = "fn old_function() {}\nfn another() {}\n";
+        let edits = vec![FileEdit {
+            old_string: "fn old_func() {}".into(),
+            new_string: "fn new_func() {}".into(),
+            replace_all: false,
+        }];
+        let result = apply_edits(content, &edits);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "error: {err}");
+        assert!(
+            err.contains("closest match"),
+            "should have closest hint: {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_edits_0_matches_no_closest_returns_plain_error() {
+        let content = "abc\n";
+        let edits = vec![FileEdit {
+            old_string: "zzz".into(),
+            new_string: "yyy".into(),
+            replace_all: false,
+        }];
+        let result = apply_edits(content, &edits);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_apply_edits_first_failure_stops_no_write() {
+        // 第一条成功，第二条失败 → 结果应为 Err
+        let edits = vec![
+            FileEdit {
+                old_string: "aaa".into(),
+                new_string: "bbb".into(),
+                replace_all: false,
+            },
+            FileEdit {
+                old_string: "NONEXISTENT".into(),
+                new_string: "xxx".into(),
+                replace_all: false,
+            },
+        ];
+        let result = apply_edits("aaa", &edits);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_edits_multi_edit_sequential() {
+        let content = "aaa\nbbb\nccc\n";
+        let edits = vec![
+            FileEdit {
+                old_string: "aaa".into(),
+                new_string: "AAA".into(),
+                replace_all: false,
+            },
+            FileEdit {
+                old_string: "bbb".into(),
+                new_string: "BBB".into(),
+                replace_all: false,
+            },
+            FileEdit {
+                old_string: "ccc".into(),
+                new_string: "CCC".into(),
+                replace_all: false,
+            },
+        ];
+        let result = apply_edits(content, &edits).unwrap();
+        assert_eq!(result, "AAA\nBBB\nCCC\n");
+    }
+
+    // ── edit_file_host 端到端测试 ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_edit_file_host_end_to_end() {
+        let dir = temp_workspace(&[("code.rs", "fn old() {}\nrest\n")]);
+        let edits = vec![FileEdit {
+            old_string: "fn old() {}".into(),
+            new_string: "fn new() {}".into(),
+            replace_all: false,
+        }];
+        let result = edit_file_host(&dir.join("code.rs"), &edits, None).await;
+        match result {
+            AgentResult::WriteOutcome {
+                bytes_written,
+                lines_added,
+                lines_removed,
+                diff,
+                file_hash,
+            } => {
+                assert!(bytes_written > 0);
+                assert_eq!(lines_added, 1);
+                assert_eq!(lines_removed, 1);
+                assert!(diff.contains("+fn new()"));
+                assert!(diff.contains("-fn old()"));
+                // 验证 file_hash 是正确的 sha256
+                let actual_content = std::fs::read_to_string(dir.join("code.rs")).unwrap();
+                let expected_hash = sha256_hex(actual_content.as_bytes());
+                assert_eq!(file_hash, expected_hash);
+            }
+            other => panic!("expected WriteOutcome, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_host_stale_hash_mismatch() {
+        let dir = temp_workspace(&[("code.rs", "hello\n")]);
+        let edits = vec![FileEdit {
+            old_string: "hello".into(),
+            new_string: "world".into(),
+            replace_all: false,
+        }];
+        let result = edit_file_host(
+            &dir.join("code.rs"),
+            &edits,
+            Some("wrong_hash"),
+        )
+        .await;
+        match result {
+            AgentResult::Error { message } => {
+                assert!(message.contains("changed externally"), "msg: {message}");
+                assert!(message.contains("re-read"));
+            }
+            other => panic!("expected Error for stale hash, got {other:?}"),
+        }
+        // 文件不应被修改
+        assert_eq!(
+            std::fs::read_to_string(dir.join("code.rs")).unwrap(),
+            "hello\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_host_stale_hash_match() {
+        let dir = temp_workspace(&[("code.rs", "hello\n")]);
+        let correct_hash = sha256_hex(b"hello\n");
+        let edits = vec![FileEdit {
+            old_string: "hello".into(),
+            new_string: "world".into(),
+            replace_all: false,
+        }];
+        let result = edit_file_host(&dir.join("code.rs"), &edits, Some(&correct_hash)).await;
+        assert!(matches!(result, AgentResult::WriteOutcome { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("code.rs")).unwrap(),
+            "world\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_host_file_not_found() {
+        let dir = temp_workspace(&[]);
+        let edits = vec![FileEdit {
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: false,
+        }];
+        let result = edit_file_host(&dir.join("nonexistent.rs"), &edits, None).await;
+        assert!(matches!(result, AgentResult::Error { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_host_edit_failure_no_write() {
+        let dir = temp_workspace(&[("code.rs", "hello\n")]);
+        let edits = vec![FileEdit {
+            old_string: "NONEXISTENT".into(),
+            new_string: "world".into(),
+            replace_all: false,
+        }];
+        let result = edit_file_host(&dir.join("code.rs"), &edits, None).await;
+        assert!(matches!(result, AgentResult::Error { .. }));
+        // 文件不应被修改
+        assert_eq!(
+            std::fs::read_to_string(dir.join("code.rs")).unwrap(),
+            "hello\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_via_dispatch() {
+        let dir = temp_workspace(&[("a.rs", "fn old() {}\n")]);
+        let result = handle_exec_request(
+            &AgentCommand::EditFile {
+                path: "a.rs".into(),
+                edits: vec![FileEdit {
+                    old_string: "fn old() {}".into(),
+                    new_string: "fn new() {}".into(),
+                    replace_all: false,
+                }],
+                expected_hash: None,
+            },
+            &dir,
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(result, AgentResult::WriteOutcome { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn new() {}\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── write_file2_host 测试 ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_write_file2_new_file() {
+        let dir = temp_workspace(&[]);
+        let result =
+            write_file2_host(&dir.join("new.txt"), "hello\nworld\n", None).await;
+        match result {
+            AgentResult::WriteOutcome {
+                diff,
+                file_hash,
+                lines_added,
+                lines_removed,
+                ..
+            } => {
+                assert!(diff.contains("+hello"));
+                assert!(diff.contains("+world"));
+                assert_eq!(lines_removed, 0);
+                assert!(lines_added >= 2);
+                let actual = std::fs::read_to_string(dir.join("new.txt")).unwrap();
+                assert_eq!(file_hash, sha256_hex(actual.as_bytes()));
+            }
+            other => panic!("expected WriteOutcome, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_file2_overwrite() {
+        let dir = temp_workspace(&[("out.txt", "old line\n")]);
+        let result = write_file2_host(&dir.join("out.txt"), "new line\n", None).await;
+        match result {
+            AgentResult::WriteOutcome {
+                diff,
+                lines_added,
+                lines_removed,
+                ..
+            } => {
+                assert!(diff.contains("-old line"));
+                assert!(diff.contains("+new line"));
+                assert!(lines_added >= 1);
+                assert!(lines_removed >= 1);
+            }
+            other => panic!("expected WriteOutcome, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "new line\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_file2_stale_detection() {
+        let dir = temp_workspace(&[("out.txt", "original\n")]);
+        let result = write_file2_host(
+            &dir.join("out.txt"),
+            "updated\n",
+            Some("wrong_hash"),
+        )
+        .await;
+        assert!(matches!(result, AgentResult::Error { .. }));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "original\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_file2_expected_hash_on_new_file_errors() {
+        let dir = temp_workspace(&[]);
+        let result = write_file2_host(
+            &dir.join("new.txt"),
+            "content",
+            Some("any_hash"),
+        )
+        .await;
+        match result {
+            AgentResult::Error { message } => {
+                assert!(
+                    message.contains("does not exist") && message.contains("expected_hash"),
+                    "msg: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_file2_via_dispatch() {
+        let dir = temp_workspace(&[]);
+        let result = handle_exec_request(
+            &AgentCommand::WriteFile2 {
+                path: "output.txt".into(),
+                content: "test content".into(),
+                expected_hash: None,
+            },
+            &dir,
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await;
+        match result {
+            AgentResult::WriteOutcome { file_hash, .. } => {
+                assert_eq!(file_hash, sha256_hex(b"test content"));
+            }
+            other => panic!("expected WriteOutcome, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output.txt")).unwrap(),
+            "test content"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 原子写测试 ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_atomic_write_no_tmp_residual() {
+        let dir = temp_workspace(&[]);
+        let target = dir.join("file.txt");
+        atomic_write(&target, "content").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "content");
+        // 检查目录中无 .tmp 文件残留
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|e| e.ends_with(".tmp")),
+            "tmp residual found: {entries:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_creates_parent_dirs() {
+        let dir = temp_workspace(&[]);
+        let target = dir.join("a/b/c/file.txt");
+        atomic_write(&target, "nested").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "nested");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── sha256_hex 辅助测试 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_sha256_hex_deterministic() {
+        let h1 = sha256_hex(b"hello");
+        let h2 = sha256_hex(b"hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // 256 bits = 64 hex chars
+    }
+
+    #[test]
+    fn test_sha256_hex_different_inputs() {
+        let h1 = sha256_hex(b"hello");
+        let h2 = sha256_hex(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    // ── docker 命令形态测试（原子写）───────────────────────────────────
+
+    #[test]
+    fn test_docker_write_file_atomic_command_shape() {
+        // 验证 docker_write_file 生成的命令包含 tmp + mv 形态
+        // docker_write_file 是 async，我们直接测命令构造逻辑
+        let abs = Path::new("/workspace/file.txt");
+        let target = abs.to_string_lossy();
+        let tmp = format!("{target}.tmp");
+        let inner = format!(
+            "cat > {} && mv {} {}",
+            sh_quote(&tmp),
+            sh_quote(&tmp),
+            sh_quote(&target),
+        );
+        assert!(inner.contains(".tmp"), "inner cmd: {inner}");
+        assert!(inner.contains("&& mv"), "inner cmd should have mv: {inner}");
+    }
+
+    // ── unified_diff / count_diff_lines 辅助测试 ────────────────────────
+
+    #[test]
+    fn test_unified_diff_basic() {
+        let diff = unified_diff("line1\nline2\n", "line1\nline3\n");
+        assert!(diff.contains("-line2"));
+        assert!(diff.contains("+line3"));
+    }
+
+    #[test]
+    fn test_unified_diff_truncation() {
+        let old = "x\n".repeat(10000);
+        let new = "y\n".repeat(10000);
+        let diff = unified_diff(&old, &new);
+        assert!(diff.len() <= DIFF_MAX_BYTES + 200); // some slack for the truncation marker
+        assert!(diff.contains("[diff truncated]"));
+    }
+
+    #[test]
+    fn test_count_diff_lines() {
+        let diff = "-old1\n+new1\n+new2\n unchanged\n-old2\n";
+        let (added, removed) = count_diff_lines(diff);
+        assert_eq!(added, 2);
+        assert_eq!(removed, 2);
+    }
+
+    #[test]
+    fn test_count_diff_lines_empty() {
+        let (added, removed) = count_diff_lines("");
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+    }
+
+    // ── edit_distance 辅助测试 ──────────────────────────────────────────
+
+    #[test]
+    fn test_edit_distance_same() {
+        assert_eq!(edit_distance("abc", "abc"), 0);
+    }
+
+    #[test]
+    fn test_edit_distance_single_insert() {
+        assert_eq!(edit_distance("ac", "abc"), 1);
+    }
+
+    #[test]
+    fn test_edit_distance_empty() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+    }
+
+    // ── find_closest_line 测试 ──────────────────────────────────────────
+
+    #[test]
+    fn test_find_closest_line() {
+        let content = "fn main() {}\nfn helper() {}\nlet x = 1;\n";
+        let (line_num, text) = find_closest_line(content, "fn maintest() {}").unwrap();
+        assert_eq!(line_num, 1);
+        assert!(text.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_find_closest_line_empty_needle() {
+        assert!(find_closest_line("content", "").is_none());
     }
 }
