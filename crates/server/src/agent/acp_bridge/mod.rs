@@ -204,6 +204,10 @@ struct SpawnedAgent {
     /// refs 的记录保留语义）。
     #[allow(dead_code)]
     mcp_token: Option<String>,
+    /// 文件内容 SHA-256 哈希缓存（绝对路径 → hex），用于 WriteFile2 stale 检测。
+    /// `exec_fs_read` 成功返回时记录；`exec_fs_write` 发 WriteFile2 时读取作
+    /// `expected_hash`；写入成功（WriteOutcome.file_hash）刷新；stale 错误清除。
+    file_hashes: HashMap<String, String>,
 }
 
 /// ACP `session/request_permission` → 审批回调。
@@ -441,6 +445,7 @@ mod tests {
             spawn_ready: watch::channel(false).0,
             pending_prompts: VecDeque::new(),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            file_hashes: HashMap::new(),
         }
     }
 

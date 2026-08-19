@@ -36,6 +36,8 @@ export interface ChatItem {
   approvalOptions?: ApprovalOption[];
   /** pending=等待用户响应；approved/denied=用户主动处理；expired=回合终态被动过期 */
   approvalStatus?: 'pending' | 'approved' | 'denied' | 'expired';
+  /** 审批预览原始文本（edit/write 格式可解析为 diff 展示） */
+  approvalArgsPreview?: string;
   /** kind='elicitation'：用户表单卡（AskUserQuestion / MCP elicitation / refusal-fallback） */
   elicitationId?: string;
   elicitationMessage?: string;

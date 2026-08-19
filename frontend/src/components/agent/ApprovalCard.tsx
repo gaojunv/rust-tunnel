@@ -2,6 +2,8 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { ShieldAlert, Check, CheckCheck, X, Ban } from 'lucide-react';
 import type { ChatItem } from './types';
+import { parseEditPreview } from './parseEditPreview';
+import ToolDiffView from './ToolDiffView';
 
 interface Props {
   item: ChatItem;
@@ -68,13 +70,27 @@ export default function ApprovalCard({ item, onRespond }: Props) {
           </span>
         )}
       </div>
-      {/* 命令摘要单行截断：长命令不换行撑开卡片；悬停 title 查看全文 */}
-      <pre
-        className="mb-2 truncate rounded bg-background/60 px-2 py-1.5 text-xs"
-        title={item.approvalSummary}
-      >
-        {item.approvalSummary}
-      </pre>
+      {/* 编辑预览 → diff 视图；非编辑格式 → 纯文本摘要 */}
+      {(() => {
+        const diffs = item.approvalArgsPreview
+          ? parseEditPreview(item.approvalArgsPreview)
+          : null;
+        if (diffs) {
+          return (
+            <div className="mb-2 max-h-48 overflow-auto rounded bg-background/60 px-2 py-1.5">
+              <ToolDiffView diffs={diffs} />
+            </div>
+          );
+        }
+        return (
+          <pre
+            className="mb-2 truncate rounded bg-background/60 px-2 py-1.5 text-xs"
+            title={item.approvalSummary}
+          >
+            {item.approvalSummary}
+          </pre>
+        );
+      })()}
       {pending && (
         options && options.length > 0 ? (
           // ACP 选项透传：每个选项一个按钮，用户点选回传 option_id

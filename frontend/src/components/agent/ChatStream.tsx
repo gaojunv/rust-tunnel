@@ -961,6 +961,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
           approvalSummary: msg.summary,
           approvalOptions: msg.options,
           approvalStatus: 'pending',
+          approvalArgsPreview: msg.args_preview,
         }]);
       } else if (msg.type === 'elicitation_request') {
         // ACP AskUserQuestion / MCP elicitation / refusal-fallback 表单：先冲掉缓冲

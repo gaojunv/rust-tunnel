@@ -156,6 +156,7 @@ impl AcpBridge {
                     memory_block: None,
                     skill_list_block: None,
                     mcp_token: mcp_token.clone(),
+                    file_hashes: HashMap::new(),
                 },
             );
             Some((pump_io, stdout_rx))
@@ -2189,7 +2190,7 @@ async fn fs_context(
     })
 }
 /// 执行 `fs/read_text_file`：绝对路径 → 工作区相对路径 → 经隧道转发到客户端
-/// 沙箱读取，返回文本内容。
+/// 沙箱读取，返回文本内容。成功且无截断时记录 SHA-256 用于 stale 检测。
 pub(super) async fn exec_fs_read(
     db: &Database,
     spawner: &AgentSpawner,
@@ -2213,12 +2214,24 @@ pub(super) async fn exec_fs_read(
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;
     match result {
-        rust_tunnel_common::AgentResult::FileContent { content } => Ok(content),
+        rust_tunnel_common::AgentResult::FileContent { content } => {
+            // 无截断标记时记录 hash 供后续 WriteFile2 stale 检测
+            if !content.contains("[truncated") {
+                use sha2::{Digest, Sha256};
+                let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+                let mut sessions = sessions.lock().await;
+                if let Some(agent) = sessions.get_mut(sid) {
+                    agent.file_hashes.insert(abs_path.to_string(), hash);
+                }
+            }
+            Ok(content)
+        }
         rust_tunnel_common::AgentResult::Error { message } => Err(message),
         other => Err(format!("unexpected read result: {other:?}")),
     }
 }
 /// 执行 `fs/write_text_file`：同 read，写文件到客户端沙箱。
+/// 客户端 ≥0.8.0 时使用 WriteFile2（支持 stale 检测 + WriteOutcome）。
 pub(super) async fn exec_fs_write(
     db: &Database,
     spawner: &AgentSpawner,
@@ -2229,6 +2242,33 @@ pub(super) async fn exec_fs_write(
 ) -> Result<(), String> {
     let ctx = fs_context(db, sessions, sid).await?;
     let rel = to_workspace_relative(&ctx.root_path, abs_path)?;
+
+    // 提前查版本号 + expected_hash（短锁，无 await）
+    let (client_version, expected_hash) = {
+        let sessions_guard = sessions.lock().await;
+        let ver = spawner.client_version(&ctx.client_id).await;
+        let hash = sessions_guard
+            .get(sid)
+            .and_then(|a| a.file_hashes.get(abs_path).cloned());
+        (ver, hash)
+    };
+
+    let use_write_file2 =
+        crate::agent::runner::client_supports_edit(client_version.as_deref());
+
+    let command = if use_write_file2 {
+        rust_tunnel_common::AgentCommand::WriteFile2 {
+            path: rel,
+            content: content.to_string(),
+            expected_hash,
+        }
+    } else {
+        rust_tunnel_common::AgentCommand::WriteFile {
+            path: rel,
+            content: content.to_string(),
+        }
+    };
+
     let request_id = format!("{:032x}", rand::random::<u128>());
     let result = spawner
         .agent_exec(
@@ -2237,17 +2277,33 @@ pub(super) async fn exec_fs_write(
             sid,
             &ctx.root_path,
             ctx.docker_container.as_deref(),
-            rust_tunnel_common::AgentCommand::WriteFile {
-                path: rel,
-                content: content.to_string(),
-            },
+            command,
             Duration::from_secs(120),
         )
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;
     match result {
+        rust_tunnel_common::AgentResult::WriteOutcome { file_hash, .. } => {
+            // WriteFile2 成功：刷新 hash
+            if !file_hash.is_empty() {
+                let mut sessions = sessions.lock().await;
+                if let Some(agent) = sessions.get_mut(sid) {
+                    agent.file_hashes.insert(abs_path.to_string(), file_hash);
+                }
+            }
+            Ok(())
+        }
         rust_tunnel_common::AgentResult::Success => Ok(()),
-        rust_tunnel_common::AgentResult::Error { message } => Err(message),
+        rust_tunnel_common::AgentResult::Error { message } => {
+            // stale 写入失败：清除该路径的 hash 缓存
+            if message.contains("file changed externally") {
+                let mut sessions = sessions.lock().await;
+                if let Some(agent) = sessions.get_mut(sid) {
+                    agent.file_hashes.remove(abs_path);
+                }
+            }
+            Err(message)
+        }
         other => Err(format!("unexpected write result: {other:?}")),
     }
 }

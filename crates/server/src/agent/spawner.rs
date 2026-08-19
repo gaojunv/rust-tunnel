@@ -146,6 +146,14 @@ impl AgentSpawner {
         Self { registry }
     }
 
+    /// 查询客户端版本号（用于 WriteFile2/EditFile 等功能门控）。
+    pub async fn client_version(&self, client_id: &str) -> Option<String> {
+        self.registry
+            .get(client_id)
+            .await
+            .and_then(|e| e.client_version.clone())
+    }
+
     /// 启动客户端内嵌 LLM 代理，返回回环端口。
     pub async fn start_llm_proxy(
         &self,
