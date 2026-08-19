@@ -165,6 +165,34 @@ function toolSummary(
   const nm = (name ?? '').toLowerCase();
   const isExec = kind === 'execute' || ['shell', 'bash', 'execute', 'run', 'sh', 'cmd'].includes(nm);
   if (isExec) return str('cmd', 'command');
+  // runner 规范工具名特殊摘要（须在通用 isFileTool 之前，否则被 path 覆盖）
+  // read_file 行区间读取：offset/limit 参数时摘要为 basename:offset-end
+  if (nm === 'read_file') {
+    const path = str('path', 'file_path');
+    const offset = typeof parsed.offset === 'number' ? parsed.offset : undefined;
+    const limit = typeof parsed.limit === 'number' ? parsed.limit : undefined;
+    if (offset !== undefined || limit !== undefined) {
+      const start = offset ?? 1;
+      const end = limit !== undefined ? start + limit - 1 : undefined;
+      const file = path ? basename(path) : null;
+      return file ? (end !== undefined ? `${file}:${start}-${end}` : `${file}:${start}-`) : null;
+    }
+    return path ?? null;
+  }
+  // read_symbol：摘要 basename › name
+  if (nm === 'read_symbol') {
+    const path = str('path', 'file_path');
+    const symName = str('name');
+    if (path && symName) return `${basename(path)} › ${symName}`;
+    return path ?? null;
+  }
+  // git_* 工具摘要：提取 name/rev/file_path 字段
+  if (nm.startsWith('git_')) {
+    if (nm === 'git_diff') return str('file_path', 'path');
+    if (nm === 'git_show') return str('rev', 'name');
+    if (nm === 'git_branch' || nm === 'git_checkout') return str('name');
+    return null;
+  }
   if (isFileTool(kind, name)) return str('path', 'file_path');
   if (kind === 'search' || ['search', 'grep', 'find'].includes(nm)) {
     const path = str('path', 'file_path') ?? '.';
@@ -225,6 +253,47 @@ const KIND_META: Record<ToolKind, { label: string; aliases: string[]; stripPrefi
   other: { label: '', aliases: [], stripPrefix: true },
 };
 
+/** runner 规范工具名 → { kind, label } 映射表。kind 缺省/other 时 splitToolTitle
+ *  按精确名匹配返回更精确的 label（如 read_file→Read、code_outline→Outline），
+ *  KindChip 据此推断语义色（而非 all-gray other）。ACP 路径带显式 toolKind，此表不
+ *  干预。 */
+const RUNNER_TOOL_META: Record<string, { kind: ToolKind; label: string }> = {
+  read_file: { kind: 'read', label: 'Read' },
+  list_dir: { kind: 'read', label: 'List' },
+  code_outline: { kind: 'read', label: 'Outline' },
+  read_symbol: { kind: 'read', label: 'Symbol' },
+  write_file: { kind: 'edit', label: 'Write' },
+  patch_file: { kind: 'edit', label: 'Patch' },
+  shell: { kind: 'execute', label: 'Terminal' },
+  search: { kind: 'search', label: 'Search' },
+  git_status: { kind: 'other', label: 'Git' },
+  git_diff: { kind: 'other', label: 'Git' },
+  git_log: { kind: 'other', label: 'Git' },
+  git_show: { kind: 'other', label: 'Git' },
+  git_branch: { kind: 'other', label: 'Git' },
+  git_commit: { kind: 'other', label: 'Git' },
+  git_push: { kind: 'other', label: 'Git' },
+  git_stage: { kind: 'other', label: 'Git' },
+  git_unstage: { kind: 'other', label: 'Git' },
+  git_checkout: { kind: 'other', label: 'Git' },
+  git_pull: { kind: 'other', label: 'Git' },
+  git_revert: { kind: 'other', label: 'Git' },
+  git_reset: { kind: 'other', label: 'Git' },
+  git_stash: { kind: 'other', label: 'Git' },
+  todo_write: { kind: 'think', label: 'Todo' },
+  remember: { kind: 'think', label: 'Remember' },
+  use_skill: { kind: 'think', label: 'Skill' },
+  task: { kind: 'other', label: 'Task' },
+};
+
+/** 工具 kind 推断：显式 toolKind 优先；缺省时按 RUNNER_TOOL_META 精确名推断，
+ *  仍不命中则回退 'other'。供 KindChip / collectSubagents 等需要语义色的场景。 */
+export function effectiveToolKind(name: string | undefined, kind: ToolKind | undefined): ToolKind {
+  if (kind && kind !== 'other') return kind;
+  const meta = RUNNER_TOOL_META[(name ?? '').toLowerCase()];
+  return meta?.kind ?? 'other';
+}
+
 /** 归一化工具标题：返回规范显示名 label 与 title 内嵌目标 extra（可能为 null）。
  *  显式 toolKind（非 other）优先匹配；kind 缺省/other（runner 旧数据）时按别名
  *  全表反查推断类别；均不命中且 kind 有效时，title 整体视为 extra（如命令本体）。
@@ -235,13 +304,9 @@ export function splitToolTitle(
 ): { label: string; extra: string | null } {
   const raw = (name ?? '').trim();
   const lower = raw.toLowerCase();
-  const candidates: ToolKind[] =
-    kind && kind !== 'other'
-      ? [kind]
-      : (Object.keys(KIND_META) as ToolKind[]).filter((k) => k !== 'other');
-  for (const k of candidates) {
-    const meta = KIND_META[k];
-    // 长别名优先（"read file" 先于 "read"）
+  // 显式 toolKind（非 other）优先：ACP 路径带 kind 时直接用 KIND_META
+  if (kind && kind !== 'other') {
+    const meta = KIND_META[kind];
     for (const alias of [...meta.aliases].sort((a, b) => b.length - a.length)) {
       if (lower === alias) return { label: meta.label, extra: null };
       if (meta.stripPrefix && lower.startsWith(`${alias} `)) {
@@ -249,9 +314,23 @@ export function splitToolTitle(
         return { label: meta.label, extra: extra || null };
       }
     }
+    return { label: meta.label, extra: raw || null };
   }
-  if (kind && kind !== 'other') {
-    return { label: KIND_META[kind].label, extra: raw || null };
+  // kind 缺省/other：先查 RUNNER_TOOL_META（runner 规范工具名精确匹配，
+  // 比 KIND_META 更细粒度，如 list_dir→List 而非 Read）
+  if (RUNNER_TOOL_META[lower]) {
+    return { label: RUNNER_TOOL_META[lower].label, extra: null };
+  }
+  // 回退 KIND_META 别名推断（非 RUNNER_TOOL_META 覆盖的旧别名，如 "read file"）
+  for (const k of (Object.keys(KIND_META) as ToolKind[]).filter((k) => k !== 'other')) {
+    const meta = KIND_META[k];
+    for (const alias of [...meta.aliases].sort((a, b) => b.length - a.length)) {
+      if (lower === alias) return { label: meta.label, extra: null };
+      if (meta.stripPrefix && lower.startsWith(`${alias} `)) {
+        const extra = raw.slice(alias.length + 1).trim();
+        return { label: meta.label, extra: extra || null };
+      }
+    }
   }
   return { label: raw || 'Tool', extra: null };
 }
@@ -416,7 +495,7 @@ export function ToolCard({ item }: { item: ChatItem }) {
         className="flex w-full items-center gap-2 text-left text-xs"
         aria-expanded={open}
       >
-        <KindChip kind={item.toolKind ?? 'other'} />
+        <KindChip kind={effectiveToolKind(item.toolName, item.toolKind)} />
         <span className="font-medium text-foreground/90">{label}</span>
         {displaySummary && (
           isFile ? (

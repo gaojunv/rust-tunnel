@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import MessageBubble, { CollapsiblePre, resolveToolStatus } from './MessageBubble';
+import MessageBubble, { CollapsiblePre, effectiveToolKind, resolveToolStatus, splitToolTitle } from './MessageBubble';
 import type { ChatItem } from './types';
 
 vi.mock('react-i18next', () => ({
@@ -226,26 +226,26 @@ describe('MessageBubble tool card collapsing', () => {
     expect(header.textContent).toContain('a.ts');
   });
 
-  it('code_outline 工具显示为 Read + 文件名摘要', () => {
+  it('code_outline 工具显示为 Outline + 文件名摘要', () => {
     render(
       <MessageBubble
         item={{ kind: 'tool', content: '', toolName: 'code_outline', toolArgs: '{"path":"src/main.rs"}' }}
       />,
     );
     const header = screen.getByRole('button', { expanded: false });
-    expect(header.textContent).toContain('Read');
+    expect(header.textContent).toContain('Outline');
     expect(header.textContent).toContain('main.rs');
   });
 
-  it('read_symbol 工具显示为 Read + 文件名摘要', () => {
+  it('read_symbol 工具显示为 Symbol + basename › name 摘要', () => {
     render(
       <MessageBubble
         item={{ kind: 'tool', content: '', toolName: 'read_symbol', toolArgs: '{"path":"src/main.rs","name":"main"}' }}
       />,
     );
     const header = screen.getByRole('button', { expanded: false });
-    expect(header.textContent).toContain('Read');
-    expect(header.textContent).toContain('main.rs');
+    expect(header.textContent).toContain('Symbol');
+    expect(header.textContent).toContain('main.rs › main');
   });
 
   it('ACP 命令摘要显示 command，不显示原始 {} 对象', () => {
@@ -500,6 +500,214 @@ describe('MessageBubble tool card status badges, plan and thought bubbles', () =
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('用 方案A 实现 foo 函数');
     expect(header.textContent).not.toContain('**');
+  });
+});
+
+describe('splitToolTitle runner tool name mapping', () => {
+  it('maps read_file to Read, list_dir to List, code_outline to Outline, read_symbol to Symbol', () => {
+    expect(splitToolTitle('read_file', undefined)).toEqual({ label: 'Read', extra: null });
+    expect(splitToolTitle('list_dir', undefined)).toEqual({ label: 'List', extra: null });
+    expect(splitToolTitle('code_outline', undefined)).toEqual({ label: 'Outline', extra: null });
+    expect(splitToolTitle('read_symbol', undefined)).toEqual({ label: 'Symbol', extra: null });
+  });
+
+  it('maps git_* tools to Git label', () => {
+    expect(splitToolTitle('git_status', undefined)).toEqual({ label: 'Git', extra: null });
+    expect(splitToolTitle('git_diff', undefined)).toEqual({ label: 'Git', extra: null });
+    expect(splitToolTitle('git_commit', undefined)).toEqual({ label: 'Git', extra: null });
+  });
+
+  it('maps write_file to Write, patch_file to Patch', () => {
+    expect(splitToolTitle('write_file', undefined)).toEqual({ label: 'Write', extra: null });
+    expect(splitToolTitle('patch_file', undefined)).toEqual({ label: 'Patch', extra: null });
+  });
+
+  it('maps shell to Terminal, search to Search', () => {
+    expect(splitToolTitle('shell', undefined)).toEqual({ label: 'Terminal', extra: null });
+    expect(splitToolTitle('search', undefined)).toEqual({ label: 'Search', extra: null });
+  });
+
+  it('maps todo_write to Todo, remember to Remember, use_skill to Skill, task to Task', () => {
+    expect(splitToolTitle('todo_write', undefined)).toEqual({ label: 'Todo', extra: null });
+    expect(splitToolTitle('remember', undefined)).toEqual({ label: 'Remember', extra: null });
+    expect(splitToolTitle('use_skill', undefined)).toEqual({ label: 'Skill', extra: null });
+    expect(splitToolTitle('task', undefined)).toEqual({ label: 'Task', extra: null });
+  });
+
+  it('explicit toolKind takes precedence over RUNNER_TOOL_META', () => {
+    // ACP 路径带显式 kind：优先匹配 KIND_META，不受 RUNNER_TOOL_META 影响
+    expect(splitToolTitle('read_file', 'read')).toEqual({ label: 'Read', extra: null });
+    expect(splitToolTitle('git_diff', 'read')).toEqual({ label: 'Read', extra: 'git_diff' });
+  });
+
+  it('unknown tool name returns raw name', () => {
+    expect(splitToolTitle('custom_tool_xyz', undefined)).toEqual({ label: 'custom_tool_xyz', extra: null });
+  });
+});
+
+describe('effectiveToolKind', () => {
+  it('returns explicit toolKind when not other', () => {
+    expect(effectiveToolKind('read_file', 'read')).toBe('read');
+    expect(effectiveToolKind('shell', 'execute')).toBe('execute');
+  });
+
+  it('infers kind from RUNNER_TOOL_META when kind is undefined', () => {
+    expect(effectiveToolKind('read_file', undefined)).toBe('read');
+    expect(effectiveToolKind('shell', undefined)).toBe('execute');
+    expect(effectiveToolKind('git_status', undefined)).toBe('other');
+    expect(effectiveToolKind('todo_write', undefined)).toBe('think');
+  });
+
+  it('falls back to other for unknown tools', () => {
+    expect(effectiveToolKind('unknown_tool', undefined)).toBe('other');
+    expect(effectiveToolKind('unknown_tool', 'other')).toBe('other');
+  });
+});
+
+describe('toolSummary enhanced for runner tools', () => {
+  afterEach(cleanup);
+
+  it('read_file with offset and limit shows path:offset-end', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs","offset":10,"limit":20}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs:10-29');
+  });
+
+  it('read_file with offset only shows path:offset-', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs","offset":5}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs:5-');
+  });
+
+  it('read_file with limit only shows path:1-end (offset defaults to 1)', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs","limit":10}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs:1-10');
+  });
+
+  it('read_file without offset/limit shows path only (basename)', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_file',
+          toolArgs: '{"path":"src/main.rs"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs');
+    expect(header.textContent).not.toContain(':');
+  });
+
+  it('read_symbol shows path › name summary', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'read_symbol',
+          toolArgs: '{"path":"src/main.rs","name":"main"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    // 摘要是 "src/main.rs › main"，文件工具只显示 basename
+    expect(header.textContent).toContain('main.rs › main');
+  });
+
+  it('git_diff shows file_path summary', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'git_diff',
+          toolArgs: '{"file_path":"src/main.rs"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main.rs');
+  });
+
+  it('git_checkout shows name summary', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'git_checkout',
+          toolArgs: '{"name":"feature-branch"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('feature-branch');
+  });
+
+  it('git_branch shows name summary', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'git_branch',
+          toolArgs: '{"name":"main"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('main');
+  });
+
+  it('git_show shows rev summary', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'git_show',
+          toolArgs: '{"rev":"abc123"}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('abc123');
+  });
+
+  it('git_* unknown subcommand returns null summary (header shows label only)', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool', content: '', toolName: 'git_status',
+          toolArgs: '{}',
+        }}
+      />,
+    );
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Git');
+  });
+
+  it('toolKind inferred by effectiveToolKind for git_* shows Git chip', () => {
+    render(
+      <MessageBubble
+        item={{ kind: 'tool', content: '', toolName: 'git_commit', toolArgs: '{}' }}
+      />,
+    );
+    // git_* 工具 kind=other，但 effectiveToolKind 返回 other（Git label 来自 RUNNER_TOOL_META）
+    const header = screen.getByRole('button', { expanded: false });
+    expect(header.textContent).toContain('Git');
   });
 });
 

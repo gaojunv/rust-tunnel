@@ -379,8 +379,8 @@ describe('ChatStream running state', () => {
       { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 孤儿 tool_calls 行渲染为 failed 卡片：工具名可见（list_dir 归一化为 Read）、状态徽章 ✗
-    expect(await screen.findByText('Read')).toBeTruthy();
+    // 孤儿 tool_calls 行渲染为 failed 卡片：工具名可见（list_dir 归一化为 List）、状态徽章 ✗
+    expect(await screen.findByText('List')).toBeTruthy();
     // StatusBadge 对 failed 渲染 ✗（折叠卡片头部可见，无需展开）
     expect(screen.getByText('✗')).toBeTruthy();
     // 重载时末尾是 tool_calls 行 → running 兜底置 true（回合可能仍在服务端跑）
@@ -396,10 +396,10 @@ describe('ChatStream running state', () => {
       { id: 'm3', session_id: 's1', role: 'tool', content: 'src/ tests/', tool_calls: null, tool_call_id: 'c1', name: 'list_dir', kind: 'tool_result', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 工具名归一化为 Read（list_dir 为 read 类别别名）
-    expect(await screen.findByText('Read')).toBeTruthy();
+    // 工具名归一化为 List（RUNNER_TOOL_META list_dir → List）
+    expect(await screen.findByText('List')).toBeTruthy();
     // 只有一张卡片（tool_result 渲染的），孤儿兜底不触发
-    expect(screen.getAllByText('Read')).toHaveLength(1);
+    expect(screen.getAllByText('List')).toHaveLength(1);
     // 卡片状态 ✓（completed）
     expect(screen.getByText('✓')).toBeTruthy();
   });
@@ -414,7 +414,7 @@ describe('ChatStream running state', () => {
       { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: null, name: null, kind: 'tool_calls', created_at: '2026-08-05' },
     ]);
     renderChat();
-    expect(await screen.findByText('Read')).toBeTruthy();
+    expect(await screen.findByText('List')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
   });
 
@@ -427,10 +427,11 @@ describe('ChatStream running state', () => {
       { id: 'm2', session_id: 's1', role: 'assistant', content: '', tool_calls: JSON.stringify([{ id: 'c1', name: 'list_dir', arguments: '{"path":"."}' }]), tool_call_id: 'c1', name: 'list_dir', kind: 'tool_calls', created_at: '2026-08-05' },
     ]);
     renderChat();
-    // 半截装载：孤儿卡（failed ✗）已渲染
-    expect(await screen.findByText('Read')).toBeTruthy();
+    // 半截装载：孤儿卡（failed ✗）已渲染（history 无 toolKind → List）
+    expect(await screen.findByText('List')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
-    // live tool_call 同 id 到达：就地升级为运行中，不新增卡片
+    // live tool_call 同 id 到达（tool_kind=read）：就地升级为运行中，不新增卡片；
+    // label 从 List 变为 Read（显式 toolKind 优先 KIND_META）
     act(() => {
       wsInstance!.emit({ type: 'tool_call', id: 'c1', name: 'list_dir', tool_kind: 'read', status: 'in_progress' });
     });
@@ -461,7 +462,7 @@ describe('ChatStream running state', () => {
     (listAgentMessages as Mock).mockResolvedValueOnce(partial).mockResolvedValue(complete);
     renderChat();
     // 半截装载：孤儿卡 failed + running 兜底
-    expect(await screen.findByText('Read')).toBeTruthy();
+    expect(await screen.findByText('List')).toBeTruthy();
     expect(screen.getByText('✗')).toBeTruthy();
     expect(screen.getByRole('status', { name: 'agent.running' })).toBeTruthy();
     // done → invalidate → refetch 返回完整历史 → 对账重载
