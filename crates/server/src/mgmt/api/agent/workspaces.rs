@@ -180,7 +180,9 @@ pub async fn update_workspace(
                 .into_response();
         }
     }
-    if let Some(raw) = body.agent_config_overrides.as_deref() {
+    // agent_config_overrides 三态校验：None（省略）跳过；Some(None)（null）= 清空，
+    // 无需校验；Some(Some(raw)) = 写入新值，须是 JSON object 且 value 为 string。
+    if let Some(Some(raw)) = &body.agent_config_overrides {
         if !validate_config_overrides(raw) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -199,14 +201,18 @@ pub async fn update_workspace(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     // ACP 字段 COALESCE 语义：None 保持原值；agent_type 空串合法（回到内置 runner）；
-    // agent_path/llm_model_id 空串归一化为 None（本迭代不支持清空，见 Task 8 brief）；
-    // agent_config_overrides 空串归一化 None（保持），`"{}"` 非空原样传入 db → 清空。
+    // agent_path/llm_model_id 空串归一化为 None（本迭代不支持清空）；
+    // agent_config_overrides 三态：None=保留、Some(None)=清空、Some(Some(s))=写入。
     let agent_path = body.agent_path.as_deref().filter(|s| !s.is_empty());
     let llm_model_id = body.llm_model_id.as_deref().filter(|s| !s.is_empty());
-    let agent_config_overrides = body
-        .agent_config_overrides
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    // 三态解析：None → (None, false)；Some(None) → (None, true)；
+    // Some(Some(s)) → (Some(s), false)（空串归一化为清空，向后兼容旧前端惯例）。
+    let (agent_config_overrides, clear_overrides) = match &body.agent_config_overrides {
+        None => (None, false),
+        Some(None) => (None, true),
+        Some(Some(s)) if s.is_empty() => (None, true),  // 空串归一化为清空
+        Some(Some(s)) => (Some(s.as_str()), false),
+    };
     // GitHub 字段：token 空串/缺省 → None（DB COALESCE 保持已存密文）；非空 →
     // 加密后更新。owner/repo 同语义。写入走独立的 `agent_set_workspace_github`。
     let cipher = super::agent_cipher(&state).await;
@@ -227,6 +233,7 @@ pub async fn update_workspace(
             agent_path,
             llm_model_id,
             agent_config_overrides,
+            clear_overrides,
         )
         .await
     {
@@ -1651,7 +1658,7 @@ mod tests {
                 agent_type: None,
                 agent_path: None,
                 llm_model_id: None,
-                agent_config_overrides: Some("{}".into()),
+                agent_config_overrides: Some(Some("{}".into())),
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1675,7 +1682,7 @@ mod tests {
                 agent_type: None,
                 agent_path: None,
                 llm_model_id: None,
-                agent_config_overrides: Some("not-json".into()),
+                agent_config_overrides: Some(Some("not-json".into())),
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1686,6 +1693,79 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
+    }
+
+    /// 显式 JSON null 清空语义：前端传 null 将 agent_config_overrides 设为 NULL。
+    #[tokio::test]
+    async fn test_update_workspace_config_overrides_null_clears() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1",
+            "p",
+            "nas",
+            "host",
+            "/p",
+            None,
+            None,
+            "gemini",
+            None,
+            None,
+            Some(r#"{"mode":"plan"}"#),
+        )
+        .await
+        .unwrap();
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.agent_config_overrides.as_deref(),
+            Some(r#"{"mode":"plan"}"#)
+        );
+        // 显式 null → 清空（DB 列设为 NULL）
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some(None),
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_config_overrides, None, "null should clear overrides");
+
+        // 省略字段（None）→ 保持已清空的 NULL
+        let resp = update_workspace(
+            State(state),
+            Path("w1".to_string()),
+            Json(UpdateWorkspaceRequest {
+                name: "p".into(),
+                root_path: "/p".into(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                github_token: None,
+                github_owner: None,
+                github_repo: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.agent_config_overrides, None);
     }
 
     /// create 空串归一化：agent_path/llm_model_id/agent_config_overrides 传
@@ -1721,8 +1801,9 @@ mod tests {
         assert_eq!(ws[0].agent_config_overrides, None, "空串应归一化为 NULL");
     }
 
-    /// update 空串归一化：传 `Some("")` → filter 归一化为 None → DB COALESCE 保持
-    /// 原值（空串 update 不得把已有配置抹成空串）。
+    /// update 空串归一化：agent_path/llm_model_id 空串 → filter 归一化为 None →
+    /// DB COALESCE 保持原值。agent_config_overrides 空串归一化为清空（向后兼容旧前端
+    /// 惯例：空串 = 清空；新前端用 null 显式清空）。
     #[tokio::test]
     async fn test_update_workspace_empty_string_keeps_existing_value() {
         let (state, db) = test_state().await;
@@ -1752,7 +1833,7 @@ mod tests {
                 agent_type: None,
                 agent_path: Some(String::new()),
                 llm_model_id: Some(String::new()),
-                agent_config_overrides: Some(String::new()),
+                agent_config_overrides: Some(Some(String::new())),
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1768,10 +1849,8 @@ mod tests {
             "空串 update 应保持原值: {ws:?}"
         );
         assert_eq!(ws.llm_model_id.as_deref(), Some("model-1"));
-        assert_eq!(
-            ws.agent_config_overrides.as_deref(),
-            Some(r#"{"mode":"plan"}"#)
-        );
+        // agent_config_overrides 空串 = 清空（向后兼容旧前端惯例）
+        assert_eq!(ws.agent_config_overrides, None);
     }
 
     #[tokio::test]
@@ -2054,6 +2133,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -2209,6 +2289,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();

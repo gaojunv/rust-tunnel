@@ -13,11 +13,14 @@ import {
   updateAgentSessionModel,
 } from '../../api/client';
 import type { AgentMessagesPage } from '../../api/client';
-import type { AgentMessage, AgentWsEvent, TodoItem } from '../../types';
+import { useRoles } from '../../api/hooks';
+import type { AgentMessage, AgentRole, AgentWsEvent, TodoItem } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
 import ElicitationCard from './ElicitationCard';
 import MentionPopup from './MentionPopup';
+import type { SlashCommand } from './SlashCommandPopup';
+import SlashCommandPopup from './SlashCommandPopup';
 import MessageBubble from './MessageBubble';
 import SessionSettingsMenu from './SessionSettingsMenu';
 import SubagentTaskCard from './SubagentTaskCard';
@@ -133,6 +136,11 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   // 通过 onFilesChange 上报可选中列表、列表变化时经 onActiveIdxChange 回卷首项
   const [mentionFiles, setMentionFiles] = useState<string[]>([]);
   const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
+  // 斜杠命令自动补全状态
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [slashMention, setSlashMention] = useState<{ start: number; query: string } | null>(null);
+  const [slashActiveIdx, setSlashActiveIdx] = useState(0);
+  const [slashFilteredCommands, setSlashFilteredCommands] = useState<SlashCommand[]>([]);
   // ACP 会话配置快照（session_state/config_option_update 全量帧；空数组 = 非 ACP 或未就绪）
   const [configOptions, setConfigOptions] = useState<SessionConfigOption[]>([]);
   // Runner 路径审批模式（safe/auto_write/full_auto/plan）：初始值来自 prop，mode_updated 帧实时更新
@@ -146,6 +154,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const configRollbackRef = useRef<
     Record<string, { prev: string | boolean; opt: string | boolean }> | null
   >(null);
+  // @ 角色补全候选：enabled 角色列表传给 MentionPopup，选中时替换 @query 为 @role-name
+  const { data: rolesData } = useRoles({ enabled: true });
+  const roles: AgentRole[] = useMemo(() => rolesData?.roles ?? [], [rolesData]);
   // 弹层点击外部关闭：textarea onBlur 延迟 150ms 关闭，让弹层项 click 先生效（onFocus 取消）
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // IME 组词守卫：回车在组词中是「确认候选」而非发送（详见 useImeGuard）
@@ -928,6 +939,10 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         // 全量配置快照（session_state=初始，config_option_update=变更后）：归一化覆盖
         const serverOptions = normalizeConfigOptions(msg.options);
         setConfigOptions(serverOptions);
+        // session_state 帧内嵌 available_commands（重连补发路径）：同步斜杠命令缓存
+        if (msg.type === 'session_state' && Array.isArray(msg.available_commands)) {
+          setSlashCommands(msg.available_commands);
+        }
         // 服务端权威状态到达：确认生效的项从回滚快照移除（M19）——并发点击下旧
         // 实现直接清空整份快照，会让后点的选项（尚未确认）丢失回滚能力。
         reconcileConfigRollback(serverOptions);
@@ -948,6 +963,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
       } else if (msg.type === 'todo_update') {
         // 任务清单全量替换：模型维护进度面板
         setTodos(msg.todos ?? []);
+      } else if (msg.type === 'available_commands') {
+        // 斜杠命令全量快照（可能多次推送；空列表也要覆盖，agent 可清空命令）
+        setSlashCommands(msg.commands ?? []);
       } else if (msg.type === 'approval_request') {
         // 危险操作审批：先冲掉缓冲里的文本增量，再追加审批卡片（等待用户响应）。
         // 有 options 时卡片渲染 agent 给的选项（ACP 透传），无则保持 approve/deny 二元。
@@ -1180,20 +1198,29 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
 
   // @ 弹层触发检测：光标前找最近的 @（前面是空格/行首），其后到光标为 query。
   // 命中则打开弹层；query 含空白（@ 后直接空格）或光标前无 @ 则关闭。
+  // / 斜杠命令：行首 / 开头的文本段（不含空白）触发命令补全浮层。
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const v = e.target.value;
     setInput(v);
     const pos = e.target.selectionStart ?? v.length;
     const before = v.slice(0, pos);
+    // 优先检测 @ 提及（@ 可出现在任何位置）
     const at = before.lastIndexOf('@');
     if (at >= 0 && (at === 0 || /\s/.test(before[at - 1]))) {
       const q = before.slice(at + 1);
       if (!/\s/.test(q)) {
+        closeSlashMention();
         setMention({ start: at, query: q });
         return;
       }
     }
     closeMention();
+    // 行首 / 斜杠命令检测（仅当命令列表非空时启用）
+    if (slashCommands.length > 0 && (before === '/' || (before.startsWith('/') && !before.slice(1).includes(' ')))) {
+      setSlashMention({ start: 0, query: before.slice(1) });
+      return;
+    }
+    closeSlashMention();
   };
 
   // 关闭 @ 弹层并清空受控高亮/列表状态：避免重开弹层时选中上一次的陈旧结果
@@ -1203,13 +1230,27 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     setMentionActiveIdx(0);
   }, []);
 
-  // 选中文件：把 @query 段从文本移除，路径进 refs chip（chip 独立展示，不占 textarea）
+  // 关闭 / 斜杠命令弹层
+  const closeSlashMention = useCallback(() => {
+    setSlashMention(null);
+    setSlashFilteredCommands([]);
+    setSlashActiveIdx(0);
+  }, []);
+
+  // 选中 @ 提及项：角色（@name）→ 把 @query 替换为 @role-name 文本（服务端支持 @role-name
+  // 前缀切换角色）；文件路径 → 把 @query 段移除，路径进 refs chip。
   const selectMention = (path: string) => {
     if (!mention) return;
     const before = input.slice(0, mention.start);
     const after = input.slice(mention.start + 1 + mention.query.length);
-    setInput(before + after);
-    setRefs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    if (path.startsWith('@')) {
+      // 角色选择：替换为 @role-name 文本（带尾部空格便于继续输入）
+      setInput(before + path + ' ' + after);
+    } else {
+      // 文件选择：移除 @query，路径进 refs chip
+      setInput(before + after);
+      setRefs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    }
     closeMention();
     if (blurTimerRef.current) {
       clearTimeout(blurTimerRef.current);
@@ -1218,12 +1259,32 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     textareaRef.current?.focus();
   };
 
-  // 稳定回调（供 MentionPopup 的 effect 依赖）：setState 函数恒等，避免触发渲染循环
+  // 选中斜杠命令：把 /query 替换为 /command-name（尾部空格便于输入参数）
+  const selectSlashCommand = (name: string) => {
+    if (!slashMention) return;
+    const before = input.slice(0, slashMention.start);
+    const after = input.slice(slashMention.start + 1 + slashMention.query.length);
+    setInput(before + '/' + name + ' ' + after);
+    closeSlashMention();
+    if (blurTimerRef.current) {
+      clearTimeout(blurTimerRef.current);
+      blurTimerRef.current = null;
+    }
+    textareaRef.current?.focus();
+  };
+
+  // 稳定回调（供 MentionPopup / SlashCommandPopup 的 effect 依赖）：setState 函数恒等，避免触发渲染循环
   const handleMentionFilesChange = useCallback((files: string[]) => {
     setMentionFiles(files);
   }, []);
   const handleMentionActiveIdxChange = useCallback((idx: number) => {
     setMentionActiveIdx(idx);
+  }, []);
+  const handleSlashCommandsChange = useCallback((cmds: SlashCommand[]) => {
+    setSlashFilteredCommands(cmds);
+  }, []);
+  const handleSlashActiveIdxChange = useCallback((idx: number) => {
+    setSlashActiveIdx(idx);
   }, []);
 
   const send = () => {
@@ -1567,6 +1628,17 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onActiveIdxChange={handleMentionActiveIdxChange}
               onFilesChange={handleMentionFilesChange}
               onSelect={selectMention}
+              roles={roles}
+            />
+          )}
+          {slashMention && slashCommands.length > 0 && (
+            <SlashCommandPopup
+              commands={slashCommands}
+              query={slashMention.query}
+              activeIdx={slashActiveIdx}
+              onActiveIdxChange={handleSlashActiveIdxChange}
+              onCommandsChange={handleSlashCommandsChange}
+              onSelect={selectSlashCommand}
             />
           )}
           <textarea
@@ -1579,10 +1651,11 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               if (ime.isComposing(e)) return;
               if (e.key === 'Escape') {
                 closeMention();
+                closeSlashMention();
                 return;
               }
               if (mention) {
-                // 弹层打开时键盘操作：↑↓ 循环移动高亮、Enter/Tab 选中、Shift+Enter 放行换行
+                // @ 弹层打开时键盘操作：↑↓ 循环移动高亮、Enter/Tab 选中、Shift+Enter 放行换行
                 if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                   e.preventDefault();
                   const n = mentionFiles.length;
@@ -1600,6 +1673,24 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                   return;
                 }
                 // Shift+Enter 或其它键：不拦截，交给下方 Enter/默认行为
+              } else if (slashMention) {
+                // / 斜杠命令弹层键盘操作
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const n = slashFilteredCommands.length;
+                  if (n > 0) {
+                    setSlashActiveIdx((prev) =>
+                      e.key === 'ArrowDown' ? (prev + 1) % n : (prev - 1 + n) % n,
+                    );
+                  }
+                  return;
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                  e.preventDefault();
+                  const target = slashFilteredCommands[slashActiveIdx];
+                  if (target) selectSlashCommand(target.name);
+                  return;
+                }
               }
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
@@ -1610,6 +1701,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               // 点击弹层项会先触发 textarea blur：延迟 150ms 关闭，让 click 先选中
               if (mention) {
                 blurTimerRef.current = globalThis.setTimeout(closeMention, 150);
+              }
+              if (slashMention) {
+                blurTimerRef.current = globalThis.setTimeout(closeSlashMention, 150);
               }
             }}
             onFocus={() => {

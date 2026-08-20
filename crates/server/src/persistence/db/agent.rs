@@ -221,7 +221,8 @@ impl Database {
     /// 更新 agent workspace 的可变字段。ACP 字段（agent_type/agent_path/llm_model_id/
     /// agent_config_overrides）采用 COALESCE 语义：`None` 保持原值，`Some` 写入新值，
     /// 与 `approval_mode` 一致。`agent_config_overrides` 为 ACP 引擎选项覆盖（JSON
-    /// map：config_id → value）；`Some("{}")` 显式清空，`None` 保持原值。
+    /// map：config_id → value）；`clear_overrides=true` 时强制清空（设为 NULL），
+    /// 否则按 COALESCE 语义处理。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_update_workspace(
         &self,
@@ -234,27 +235,50 @@ impl Database {
         agent_path: Option<&str>,
         llm_model_id: Option<&str>,
         agent_config_overrides: Option<&str>,
+        clear_overrides: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
-             approval_mode = COALESCE(?, approval_mode), \
-             agent_type = COALESCE(?, agent_type), \
-             agent_path = COALESCE(?, agent_path), \
-             llm_model_id = COALESCE(?, llm_model_id), \
-             agent_config_overrides = COALESCE(?, agent_config_overrides), \
-             updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(name)
-        .bind(root_path)
-        .bind(system_prompt)
-        .bind(approval_mode)
-        .bind(agent_type)
-        .bind(agent_path)
-        .bind(llm_model_id)
-        .bind(agent_config_overrides)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        if clear_overrides {
+            sqlx::query(
+                "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+                 approval_mode = COALESCE(?, approval_mode), \
+                 agent_type = COALESCE(?, agent_type), \
+                 agent_path = COALESCE(?, agent_path), \
+                 llm_model_id = COALESCE(?, llm_model_id), \
+                 agent_config_overrides = NULL, \
+                 updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(name)
+            .bind(root_path)
+            .bind(system_prompt)
+            .bind(approval_mode)
+            .bind(agent_type)
+            .bind(agent_path)
+            .bind(llm_model_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+                 approval_mode = COALESCE(?, approval_mode), \
+                 agent_type = COALESCE(?, agent_type), \
+                 agent_path = COALESCE(?, agent_path), \
+                 llm_model_id = COALESCE(?, llm_model_id), \
+                 agent_config_overrides = COALESCE(?, agent_config_overrides), \
+                 updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(name)
+            .bind(root_path)
+            .bind(system_prompt)
+            .bind(approval_mode)
+            .bind(agent_type)
+            .bind(agent_path)
+            .bind(llm_model_id)
+            .bind(agent_config_overrides)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -898,6 +922,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -955,6 +980,7 @@ mod tests {
             Some("/opt/acp-claude"),
             Some("m2"),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -974,6 +1000,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -993,6 +1020,7 @@ mod tests {
             None,
             Some("m3"),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1855,6 +1883,7 @@ mod tests {
             None,
             None,
             Some(r#"{"model":"sonnet","fast":"haiku"}"#),
+            false,
         )
         .await
         .unwrap();
@@ -1875,6 +1904,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1896,6 +1926,7 @@ mod tests {
             None,
             None,
             Some("{}"),
+            false,
         )
         .await
         .unwrap();

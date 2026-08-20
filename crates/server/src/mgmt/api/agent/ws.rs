@@ -134,12 +134,23 @@ fn terminal_ws_auth_status(auth_config: &AuthConfig, token: Option<&str>) -> Opt
 
 /// PTY 协商帧：首行 JSON，`\n` 结尾（`client::pty` 服务端协议约定）。shell 为
 /// None（host runtime）时不带该字段，客户端回退系统默认 shell。
+/// `id` 为终端会话唯一标识（UUID v4），用于后续 resize 重协商定位 PTY 实例。
+/// 旧客户端无 `id` 字段时 serde 默认忽略（Negotiation 无 deny_unknown_fields）。
 #[derive(serde::Serialize)]
 struct PtyNegotiation<'a> {
     rows: u16,
     cols: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     shell: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+}
+
+/// 前端 resize 帧：`{"type":"resize","cols":N,"rows":M}`。
+#[derive(serde::Deserialize)]
+struct ResizeFrame {
+    cols: u16,
+    rows: u16,
 }
 
 /// 向 WebSocket 下发一个文本错误帧（终端协议错误上报方式：握手完成后无 HTTP
@@ -232,10 +243,13 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
 
     // 6. 写首行协商帧（JSON + '\n'）。写失败说明隧道已断，直接返回；
     //    tunnel drop 会自动向客户端发 Close 释放对端 PTY 连接。
+    //    生成 UUID 作为终端会话 id：后续 resize 帧经此 id 定位客户端 PTY 实例。
+    let terminal_id = uuid::Uuid::new_v4().to_string();
     let negotiation = PtyNegotiation {
         rows,
         cols,
         shell: shell.as_deref(),
+        id: Some(&terminal_id),
     };
     let mut frame = serde_json::to_vec(&negotiation)
         .expect("serde_json::to_vec on a flat struct is infallible");
@@ -245,17 +259,24 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
         return;
     }
 
-    // 7. 双向桥接：WS binary ↔ 隧道字节流。
-    bridge_terminal(ws_sink, ws_stream, tunnel).await;
+    // 7. 双向桥接：WS binary ↔ 隧道字节流（含 resize 帧处理）。
+    bridge_terminal(ws_sink, ws_stream, tunnel, &agent, &ws, &terminal_id).await;
 }
 
 /// 双向桥接：WS binary ↔ 隧道字节流。任一方向结束即整体退出（tunnel drop 发
 /// Close 给客户端，WS 连接随之关闭）。`tokio::io::split` 把隧道拆成读/写两半，
 /// 供 select! 两个分支同时借用。
+///
+/// WS Text 帧中的 resize 消息 `{"type":"resize","cols":N,"rows":M}` 触发重协商：
+/// 新开一条到客户端 PTY 端口的隧道，发送 resize_for 协商帧后关闭，不影响现有
+/// 数据通道。
 async fn bridge_terminal(
     mut ws_sink: futures_util::stream::SplitSink<WebSocket, Message>,
     mut ws_stream: futures_util::stream::SplitStream<WebSocket>,
     tunnel: crate::tunnel_stream::ClientTunnelStream,
+    agent: &crate::agent::AgentState,
+    workspace: &crate::persistence::db::agent::AgentWorkspaceRecord,
+    terminal_id: &str,
 ) {
     let (mut tunnel_rd, mut tunnel_wr) = tokio::io::split(tunnel);
     let mut buf = vec![0u8; 4096];
@@ -279,8 +300,8 @@ async fn bridge_terminal(
                 Err(e) => tracing::warn!("terminal ws: tunnel→ws ended: {e}"),
             }
         }
-        // 方向二：WebSocket → 隧道。Close/EOF/错误即结束；Text/Ping/Pong 忽略
-        // （协议只用 Binary；浏览器对服务端 ping 自动回 pong，且自身从不发 ping）。
+        // 方向二：WebSocket → 隧道。Binary 转发到隧道；Text 帧解析 resize 指令；
+        // Close/EOF/错误即结束。
         res = async {
             loop {
                 match ws_stream.next().await {
@@ -289,9 +310,36 @@ async fn bridge_terminal(
                             break Err("tunnel write failed".to_string());
                         }
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        // resize 帧：新开隧道发 resize_for 协商帧，不影响数据通道。
+                        if let Ok(frame) = serde_json::from_str::<ResizeFrame>(&text) {
+                            let cols = frame.cols.clamp(1, 500);
+                            let rows = frame.rows.clamp(1, 500);
+                            let target = format!(
+                                "127.0.0.1:{}",
+                                rust_tunnel_common::pty::DEFAULT_PTY_PORT
+                            );
+                            match agent.registry.open_tunnel(&workspace.client_id, &target).await {
+                                Ok(mut resize_tunnel) => {
+                                    let resize_frame = format!(
+                                        "{{\"resize_for\":\"{}\",\"rows\":{},\"cols\":{}}}\n",
+                                        terminal_id, rows, cols
+                                    );
+                                    if let Err(e) = resize_tunnel.write_all(resize_frame.as_bytes()).await {
+                                        tracing::warn!("terminal ws: resize tunnel write failed: {e}");
+                                    }
+                                    // resize_tunnel drop 自动 Close 释放连接
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "terminal ws: resize tunnel open failed: {e} (id={terminal_id})"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => break Ok(()),
-                    // Text/Ping/Pong 忽略：协议只用 Binary。浏览器对服务端 ping 自动
-                    // 回 pong、且自身从不发 ping，服务端无需处理。
+                    // Ping/Pong 忽略：浏览器对服务端 ping 自动回 pong。
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break Err("ws stream error".to_string()),
                 }
@@ -902,7 +950,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         };
                         if let Err(e) = agent.db.agent_update_workspace(
                             &ws.id, &ws.name, &ws.root_path,
-                            None, Some(&mode), None, None, None, None,
+                            None, Some(&mode), None, None, None, None, false,
                         ).await {
                             let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set mode failed: {e}")})).await;
                             continue;
@@ -1273,7 +1321,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                     if let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await {
                                         let _ = agent.db.agent_update_workspace(
                                             &ws.id, &ws.name, &ws.root_path,
-                                            None, Some(&mode), None, None, None, None,
+                                            None, Some(&mode), None, None, None, None, false,
                                         ).await;
                                     }
                                 }
@@ -1831,18 +1879,21 @@ mod tests {
             rows: 24,
             cols: 80,
             shell: None,
+            id: None,
         })
         .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();
         assert_eq!(json["rows"], 24);
         assert_eq!(json["cols"], 80);
         assert!(json.get("shell").is_none());
+        assert!(json.get("id").is_none());
 
         // docker runtime：shell 原样透传
         let frame = serde_json::to_vec(&PtyNegotiation {
             rows: 40,
             cols: 120,
             shell: Some("docker exec -it dev-ctr sh"),
+            id: None,
         })
         .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&frame).unwrap();

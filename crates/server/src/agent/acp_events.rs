@@ -6,8 +6,8 @@
 //! ACP crate 的 fixture，避免手写嵌套结构）。
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, Meta, Plan, SessionUpdate, ToolCallContent, ToolCallLocation, ToolCallStatus,
-    ToolKind,
+    AvailableCommandsUpdate, ContentBlock, Meta, Plan, SessionUpdate, ToolCallContent,
+    ToolCallLocation, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 
@@ -160,6 +160,9 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             "type": "config_option_update",
             "options": upd.config_options,
         })),
+        SessionUpdate::AvailableCommandsUpdate(upd) => {
+            Some(map_available_commands_update(upd))
+        }
         _ => None,
     }
 }
@@ -305,10 +308,10 @@ fn extract_raw_edit_diff(raw: &serde_json::Value) -> Vec<serde_json::Value> {
     vec![serde_json::json!({"path": path, "old_text": old, "new_text": new})]
 }
 
-/// ACP Plan → 前端条目 JSON（priority 不展示，丢弃）。
+/// ACP Plan → 前端条目 JSON（含 priority 透传）。
 ///
-/// 状态字符串通过 serde 序列化取 snake_case 名（`InProgress` → `in_progress`），
-/// 与前端既有 plan 渲染保持一致。
+/// 状态/优先级字符串通过 serde 序列化取 snake_case 名（`InProgress` → `in_progress`、
+/// `High` → `high`），与前端既有 plan 渲染保持一致。
 fn plan_entries_json(plan: &Plan) -> Vec<serde_json::Value> {
     plan.entries
         .iter()
@@ -317,12 +320,38 @@ fn plan_entries_json(plan: &Plan) -> Vec<serde_json::Value> {
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default();
+            let priority = serde_json::to_value(&e.priority)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
             serde_json::json!({
                 "content": e.content,
+                "priority": priority,
                 "status": status,
             })
         })
         .collect()
+}
+
+/// 把 ACP AvailableCommandsUpdate 映射为 WS 帧：`{"type":"available_commands","commands":[...]}`。
+///
+/// 命令列表在 `SpawnedAgent` 中缓存，新 WS 连接建立时补发一次（后加入的标签页也能
+/// 拿到）。
+fn map_available_commands_update(upd: &AvailableCommandsUpdate) -> serde_json::Value {
+    let commands: Vec<serde_json::Value> = upd
+        .available_commands
+        .iter()
+        .map(|cmd| {
+            serde_json::json!({
+                "name": cmd.name,
+                "description": cmd.description,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "type": "available_commands",
+        "commands": commands,
+    })
 }
 
 /// ACP `ToolCallStatus` → WS 帧里的字符串状态。
@@ -691,11 +720,39 @@ mod tests {
         assert_eq!(
             frame["entries"],
             serde_json::json!([
-                {"content": "读代码", "status": "completed"},
-                {"content": "改实现", "status": "in_progress"},
-                {"content": "跑测试", "status": "pending"}
+                {"content": "读代码", "priority": "high", "status": "completed"},
+                {"content": "改实现", "priority": "medium", "status": "in_progress"},
+                {"content": "跑测试", "priority": "low", "status": "pending"}
             ])
         );
+    }
+
+    #[test]
+    fn test_map_available_commands_update() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [
+                {"name": "create_plan", "description": "Create a plan"},
+                {"name": "research_codebase", "description": ""}
+            ]
+        }));
+        let frame = map_update(&u).expect("available_commands_update should map");
+        assert_eq!(frame["type"], "available_commands");
+        assert_eq!(frame["commands"][0]["name"], "create_plan");
+        assert_eq!(frame["commands"][0]["description"], "Create a plan");
+        assert_eq!(frame["commands"][1]["name"], "research_codebase");
+        assert_eq!(frame["commands"][1]["description"], "");
+    }
+
+    #[test]
+    fn test_map_available_commands_update_empty_list() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": []
+        }));
+        let frame = map_update(&u).expect("empty available_commands_update should map");
+        assert_eq!(frame["type"], "available_commands");
+        assert_eq!(frame["commands"], serde_json::json!([]));
     }
 
     #[test]
