@@ -973,10 +973,10 @@ pub fn chat_body_to_responses_body(chat: &Value) -> Value {
         json!(instructions_parts.join("\n"))
     };
 
-    // 消息 → input 数组
+    // 消息 → input 数组（带 tool_calls 的 assistant 消息会拆成多个顶层 item）
     let input: Vec<Value> = other_messages
         .iter()
-        .filter_map(|msg| chat_message_to_input_item(msg))
+        .flat_map(|msg| chat_message_to_input_items(msg))
         .collect();
 
     let mut resp = json!({
@@ -1041,29 +1041,36 @@ fn extract_chat_message_text(msg: &Value) -> Option<String> {
     }
 }
 
-/// 将 chat message 转换为 Responses input item。
-fn chat_message_to_input_item(msg: &Value) -> Option<Value> {
+/// 将 chat message 转换为 Responses input items（一条消息可能拆出多个顶层 item）。
+///
+/// 注意：Responses API 中 `function_call` / `function_call_output` 是 input 数组的
+/// 顶层 item，不能嵌套在 message 的 `content` 里——content 只接受内容部件
+/// （user 侧 `input_text`、assistant 侧 `output_text`）。把 function_call 塞进
+/// content 会被严格校验的上游拒绝（`input[N].content did not match any
+/// supported type`）。
+fn chat_message_to_input_items(msg: &Value) -> Vec<Value> {
     let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
     match role {
         "user" => {
             let text = extract_chat_message_text(msg).unwrap_or_default();
-            Some(json!({
+            vec![json!({
                 "type": "message",
                 "role": "user",
                 "content": [{ "type": "input_text", "text": text }],
-            }))
+            })]
         }
         "assistant" => {
-            // text content
-            let content_text = extract_chat_message_text(msg).unwrap_or_default();
             let mut items: Vec<Value> = Vec::new();
+            // text content → 独立 message item
+            let content_text = extract_chat_message_text(msg).unwrap_or_default();
             if !content_text.is_empty() {
                 items.push(json!({
-                    "type": "output_text",
-                    "text": content_text,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": content_text }],
                 }));
             }
-            // tool_calls
+            // tool_calls → 独立顶层 function_call items
             if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
                     let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1085,31 +1092,27 @@ fn chat_message_to_input_item(msg: &Value) -> Option<Value> {
                     }));
                 }
             }
-            if items.is_empty() {
-                return None;
-            }
-            Some(json!({
-                "type": "message",
-                "role": "assistant",
-                "content": items,
-            }))
+            items
         }
         "tool" => {
             let call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
-            let output = msg.get("content").map(|c| {
-                if c.is_string() {
-                    c.as_str().unwrap_or("").to_string()
-                } else {
-                    c.to_string()
-                }
-            });
-            Some(json!({
+            let output = msg
+                .get("content")
+                .map(|c| {
+                    if c.is_string() {
+                        c.as_str().unwrap_or("").to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .unwrap_or_default();
+            vec![json!({
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": output,
-            }))
+            })]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -2160,12 +2163,55 @@ mod tests {
         });
         let resp = chat_body_to_responses_body(&chat);
         let input = resp["input"].as_array().unwrap();
+        // 无文本 → 不产生 message item；function_call 为顶层独立 item
         assert_eq!(input.len(), 1);
-        let content = input[0]["content"].as_array().unwrap();
-        // content should have function_call (no text since content is null)
-        let fc = content.iter().find(|c| c["type"] == "function_call").unwrap();
-        assert_eq!(fc["call_id"], "c1");
-        assert_eq!(fc["name"], "f");
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "c1");
+        assert_eq!(input[0]["name"], "f");
+    }
+
+    #[test]
+    fn d_assistant_text_and_tool_calls_split_into_top_level_items() {
+        // 回归测试：function_call 不得嵌套在 message.content 里
+        // （上游严格校验会报 `input[N].content did not match any supported type`）
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "user", "content": "weather?" },
+                {
+                    "role": "assistant",
+                    "content": "Let me check.",
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{\"city\":\"sh\"}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "c1", "content": "sunny" }
+            ]
+        });
+        let resp = chat_body_to_responses_body(&chat);
+        let input = resp["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+
+        // input[1]：assistant 文本 → message item，content 只含 output_text
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        let content = input[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "output_text");
+        assert_eq!(content[0]["text"], "Let me check.");
+
+        // input[2]：function_call 顶层 item
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
+        assert_eq!(input[2]["name"], "get_weather");
+        assert_eq!(input[2]["arguments"], "{\"city\":\"sh\"}");
+
+        // input[3]：function_call_output 顶层 item
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "c1");
+        assert_eq!(input[3]["output"], "sunny");
     }
 
     #[test]
