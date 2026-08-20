@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod provider;
 #[cfg(feature = "rag")]
 pub mod rag;
+pub mod responses;
 pub mod route_cache;
 pub mod router;
 pub mod upstream;
