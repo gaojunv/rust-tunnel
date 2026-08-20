@@ -761,7 +761,8 @@ export function useReindexKbDoc() {
 
 export function useTestEmbedding() {
   return useMutation({
-    mutationFn: (req: { base_url: string; api_key: string; model: string }) => testEmbedding(req),
+    mutationFn: (req: { base_url: string; api_key: string; model: string; kb_id?: string }) =>
+      testEmbedding(req),
   });
 }
 

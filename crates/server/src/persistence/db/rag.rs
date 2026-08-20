@@ -145,6 +145,50 @@ impl Database {
         Ok(())
     }
 
+    /// 更新知识库的「名称 + 检索/分块参数 + emb 配置」。emb_api_key 入参为已加密密文
+    /// （调用方用 `encrypt_field` 处理），本层只存取原始字符串。用于编辑 KB 时全量保存
+    /// （含可选的 emb 配置变更，与建库时同口径）。区别于 `rag_update_kb_params`——后者
+    /// 不碰 emb 列（历史锁定语义），本方法提供可编辑 emb 的能力。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rag_update_kb_full(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+        top_k: i64,
+        chunk_size: i64,
+        chunk_overlap: i64,
+        score_threshold: f64,
+        emb_base_url: &str,
+        emb_api_key: &str, // 入参为已加密密文
+        emb_model: &str,
+        emb_dimension: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE rag_knowledge_bases
+            SET name = ?, description = ?, top_k = ?, chunk_size = ?, chunk_overlap = ?,
+                score_threshold = ?, emb_base_url = ?, emb_api_key = ?, emb_model = ?,
+                emb_dimension = ?, updated_at = datetime('now')
+            WHERE id = ?
+            "#,
+        )
+        .bind(name)
+        .bind(description)
+        .bind(top_k)
+        .bind(chunk_size)
+        .bind(chunk_overlap)
+        .bind(score_threshold)
+        .bind(emb_base_url)
+        .bind(emb_api_key)
+        .bind(emb_model)
+        .bind(emb_dimension)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn rag_toggle_kb(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE rag_knowledge_bases SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
@@ -355,6 +399,16 @@ impl Database {
     pub async fn rag_delete_chunks_by_doc(&self, doc_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM rag_chunks WHERE doc_id = ?")
             .bind(doc_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 删除某知识库的全部分块（全量重建前清空旧索引时调用）。文档/向量本体在别处清理，
+    /// 本方法只清 SQLite 的 chunk 元数据行（按 `kb_id` 列聚合删除，不触碰文档行）。
+    pub async fn rag_delete_chunks_by_kb(&self, kb_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM rag_chunks WHERE kb_id = ?")
+            .bind(kb_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -769,6 +823,100 @@ mod tests {
         db.backfill_rag_document_file_type().await.unwrap();
         let doc = db.rag_get_document("legacy").await.unwrap().unwrap();
         assert_eq!(doc.file_type, "md");
+    }
+
+    #[tokio::test]
+    async fn rag_update_kb_full_updates_emb_columns() {
+        let db = test_db().await;
+        create_sample_kb(&db, "kb-full").await;
+
+        // 初始 emb 配置
+        let kb = db.rag_get_kb("kb-full").await.unwrap().unwrap();
+        assert_eq!(kb.emb_base_url, "https://api.example.com");
+        assert_eq!(kb.emb_model, "text-embedding-3-small");
+        assert_eq!(kb.emb_dimension, 1536);
+
+        // 全量更新（含改名 + 改 emb 配置；api_key 已是密文形式）
+        db.rag_update_kb_full(
+            "kb-full",
+            "改名库",
+            "新描述",
+            8,
+            256,
+            32,
+            0.5,
+            "https://new.example.com",
+            "enc:v1:newcipher",
+            "new-model",
+            768,
+        )
+        .await
+        .unwrap();
+
+        let kb = db.rag_get_kb("kb-full").await.unwrap().unwrap();
+        // emb 列被正确更新
+        assert_eq!(kb.emb_base_url, "https://new.example.com");
+        assert_eq!(kb.emb_api_key, "enc:v1:newcipher", "api key 应是入参密文原样落库");
+        assert_eq!(kb.emb_model, "new-model");
+        assert_eq!(kb.emb_dimension, 768);
+        // 普通检索参数也同步更新（rag_update_kb_params 同口径）
+        assert_eq!(kb.name, "改名库");
+        assert_eq!(kb.description, "新描述");
+        assert_eq!(kb.top_k, 8);
+        assert_eq!(kb.chunk_size, 256);
+        assert_eq!(kb.chunk_overlap, 32);
+        assert!((kb.score_threshold - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn rag_delete_chunks_by_kb_clears_chunks_but_keeps_docs() {
+        let db = test_db().await;
+        create_sample_kb(&db, "kb-dck").await;
+        db.rag_create_document("d1", "kb-dck", "a.md", "sha256:a", "md")
+            .await
+            .unwrap();
+        db.rag_create_document("d2", "kb-dck", "b.md", "sha256:b", "md")
+            .await
+            .unwrap();
+
+        // 插入 d1 的分块
+        db.rag_insert_chunks(&[(
+            "c1".to_string(),
+            "d1".to_string(),
+            "kb-dck".to_string(),
+            0,
+            "## 概述".to_string(),
+            "第一段".to_string(),
+            12,
+        )])
+        .await
+        .unwrap();
+        assert_eq!(db.rag_count_kb_chunks("kb-dck").await.unwrap(), 1);
+
+        // 按 kb 清空分块：分块归零，但文档行保留
+        db.rag_delete_chunks_by_kb("kb-dck").await.unwrap();
+        assert_eq!(db.rag_count_kb_chunks("kb-dck").await.unwrap(), 0);
+        assert_eq!(db.rag_count_kb_docs("kb-dck").await.unwrap(), 2);
+        assert_eq!(db.rag_list_documents("kb-dck").await.unwrap().len(), 2);
+
+        // 其它库不串扰
+        create_sample_kb(&db, "kb-other2").await;
+        db.rag_create_document("d3", "kb-other2", "c.md", "sha256:c", "md")
+            .await
+            .unwrap();
+        db.rag_insert_chunks(&[(
+            "c2".to_string(),
+            "d3".to_string(),
+            "kb-other2".to_string(),
+            0,
+            "## 概述".to_string(),
+            "其它库".to_string(),
+            12,
+        )])
+        .await
+        .unwrap();
+        db.rag_delete_chunks_by_kb("kb-dck").await.unwrap();
+        assert_eq!(db.rag_count_kb_chunks("kb-other2").await.unwrap(), 1);
     }
 
     #[tokio::test]

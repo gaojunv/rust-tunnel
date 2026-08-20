@@ -510,6 +510,12 @@ export interface CreateLlmKbRequest {
 export interface UpdateLlmKbRequest {
   name: string;
   description: string;
+  /** 任一 base_url/model/dimension 变化会触发全量重建所有文档索引；缺省=保持不变。 */
+  emb_base_url?: string;
+  /** 空=保留旧密钥。 */
+  emb_api_key?: string;
+  emb_model?: string;
+  emb_dimension?: number;
   top_k?: number;
   chunk_size?: number;
   chunk_overlap?: number;

@@ -10,6 +10,7 @@ use crate::db::rag::RagKnowledgeBaseRecord;
 use crate::db::Database;
 use crate::llm::crypto::{decrypt_field, LlmCipher};
 use futures_util::FutureExt;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// 文档状态变更事件（SSE 推送给前端）。
@@ -31,6 +32,9 @@ pub struct KbEvent {
 ///
 /// `source_path` 为已落盘的原始文件路径（`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`，
 /// 见 mgmt/api/rag.rs `doc_source_path`），`file_type` 决定解析方式。
+///
+/// `sem` 为可选并发信号量：全量重建时由调用方注入 `Some(Arc<Semaphore(4)>)`，任务持有
+/// permit 直到结束，避免对远端 embedding 服务瞬时打满；`None` 表示不限（单文档上传/reindex）。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_ingest(
     db: Database,
@@ -41,8 +45,17 @@ pub fn spawn_ingest(
     source_path: std::path::PathBuf,
     file_type: FileType,
     tx: broadcast::Sender<KbEvent>,
+    sem: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     tokio::spawn(async move {
+        // 限并发：全量重建时持有 permit 到任务结束（释放后下一个任务才能获取）；
+        // None 表示不限制（单文档路径）。acquire_owned 拿到 OwnedSemaphorePermit，
+        // 任务结束随 `_guard` 析构自动释放，无需借用语义。
+        let _guard = match sem {
+            Some(s) => Some(s.acquire_owned().await.ok()),
+            None => None,
+        };
+
         let emit = |status: &str, count: i64, err: Option<String>| {
             let _ = tx.send(KbEvent {
                 doc_id: doc_id.clone(),
@@ -353,6 +366,7 @@ mod tests {
             src,
             FileType::Markdown,
             tx,
+            None,
         );
 
         // 事件序列：processing → ready
@@ -405,6 +419,7 @@ mod tests {
             src,
             FileType::Markdown,
             tx,
+            None,
         );
 
         // 事件序列：processing → failed
@@ -446,6 +461,7 @@ mod tests {
             src,
             FileType::Markdown,
             tx,
+            None,
         );
 
         // 事件序列：processing → failed，error 含 count mismatch
@@ -524,6 +540,7 @@ mod tests {
             src,
             FileType::Pdf,
             tx,
+            None,
         );
 
         // 事件序列：processing → failed，error 含 no text layer

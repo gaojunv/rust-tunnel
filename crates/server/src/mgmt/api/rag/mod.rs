@@ -79,7 +79,8 @@ async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
 }
 
 /// RAG handler 需要的运行时组件（从 `LlmState` 克隆，避免长持锁）。
-struct RagRuntime {
+/// `pub(crate)`：`docs::reindex_kb_doc` 的签名对外暴露本类型。
+pub(crate) struct RagRuntime {
     db: Database,
     store: VectorStore,
     cipher: Option<LlmCipher>,
@@ -404,7 +405,7 @@ mod tests {
         assert_eq!(body["name"], json!("测试知识库"));
         assert_eq!(body["emb_api_key"], json!(""), "api key must not be echoed");
 
-        // PUT 更新参数（emb 配置不可改）
+        // PUT 更新参数（未携带 emb 字段 → emb 配置保持不变）
         let (status, body) = call(
             &app,
             json_request(
@@ -419,7 +420,7 @@ mod tests {
         assert_eq!(updated.top_k, 8);
         assert_eq!(
             updated.emb_base_url, stored.emb_base_url,
-            "emb config locked"
+            "PUT 不带 emb 字段时配置不变"
         );
 
         // PATCH 启停
@@ -1166,5 +1167,202 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::CONFLICT);
+    }
+
+    /// 上传一篇 guide.md 并等待 ready，返回 (doc_id, chunk_count)。
+    async fn upload_guide_and_wait(app: &Router, kb_id: &str) -> (String, i64) {
+        let content =
+            "# 使用指南\n\n## 安装\n\n运行 rust-tunnel-server。\n\n## 配置\n\n编辑 config.toml。\n";
+        let boundary = "b-emb";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/llm/kb/{kb_id}/docs"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(multipart_body(boundary, "guide.md", content)))
+            .expect("build multipart request");
+        let (status, body) = call(app, req).await;
+        assert_eq!(status, HttpStatus::CREATED, "upload: {body}");
+        let doc_id = body["id"].as_str().expect("doc id").to_string();
+        let chunks = wait_doc_ready(app, kb_id, &doc_id).await;
+        assert!(chunks > 0, "doc should ingest to >0 chunks");
+        (doc_id, chunks)
+    }
+
+    #[tokio::test]
+    async fn update_kb_emb_change_triggers_full_rebuild() {
+        let base8 = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base8).await;
+        let (doc_id, first) = upload_guide_and_wait(&app, &kb_id).await;
+        let before = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+
+        // PUT 新 embedding（换 base_url 到 16 维 mock + 新 model + 新维度），api_key 留空
+        let base16 = mock_embedding_server(16).await;
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({
+                    "name": "测试知识库",
+                    "emb_base_url": base16,
+                    "emb_model": "new-model",
+                    "emb_dimension": 16,
+                    "emb_api_key": "",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "update emb: {body}");
+        assert_eq!(body["reindexed"].as_i64(), Some(1), "应重建 1 篇文档");
+        assert_eq!(body["missing_source"].as_i64(), Some(0));
+
+        // emb 已更新、密钥保留（留空 = 保持旧密文）、重建后恢复启用
+        let after = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        assert_eq!(after.emb_base_url, base16);
+        assert_eq!(after.emb_model, "new-model");
+        assert_eq!(after.emb_dimension, 16);
+        assert_eq!(
+            after.emb_api_key, before.emb_api_key,
+            "api_key 留空应保留旧密文"
+        );
+        assert_eq!(after.enabled, 1, "重建完成后应恢复启用");
+
+        // 文档重建完成 → ready，chunk 数恢复（分块与维度无关）
+        let second = wait_doc_ready(&app, &kb_id, &doc_id).await;
+        assert_eq!(second, first, "重建后 chunk 数应一致");
+
+        // 新维度 shard 可检索
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                format!("/api/llm/kb/{kb_id}/query"),
+                &json!({ "text": "怎么安装?" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "query after rebuild: {body}");
+        assert!(
+            !body["chunks"].as_array().unwrap().is_empty(),
+            "rebuilt index should be searchable"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_kb_api_key_only_does_not_rebuild() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let db = state.server_state.db().unwrap().clone();
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+        let (doc_id, chunks) = upload_guide_and_wait(&app, &kb_id).await;
+        let before = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+
+        // 仅换 api_key → 只替换密文，不触发重建（无 reindexed 字段）
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "name": "测试知识库", "emb_api_key": "sk-rotated" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "rotate key: {body}");
+        assert!(
+            body.get("reindexed").is_none(),
+            "仅换密钥不应触发重建: {body}"
+        );
+
+        let after = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        assert_ne!(
+            after.emb_api_key, before.emb_api_key,
+            "密钥密文应已替换"
+        );
+        assert_eq!(after.emb_base_url, before.emb_base_url);
+        assert_eq!(after.emb_model, before.emb_model);
+        assert_eq!(after.emb_dimension, before.emb_dimension);
+
+        // 文档保持 ready、分块未被清
+        let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
+        assert_eq!(doc.status, "ready");
+        assert_eq!(db.rag_count_kb_chunks(&kb_id).await.unwrap(), chunks);
+    }
+
+    #[tokio::test]
+    async fn update_kb_validates_emb_fields() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // 显式空 base_url → 400（显式空串只可能是误清空，好过静默保留）
+        let (status, body_text) = call_raw(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "name": "n", "emb_base_url": "" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(body_text.contains("emb_base_url"), "got: {body_text}");
+
+        // dimension < 1 → 400
+        let (status, body_text) = call_raw(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/kb/{kb_id}"),
+                &json!({ "name": "n", "emb_dimension": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::BAD_REQUEST);
+        assert!(body_text.contains("emb_dimension"), "got: {body_text}");
+    }
+
+    #[tokio::test]
+    async fn test_embedding_with_kb_id_uses_stored_key() {
+        let base = mock_embedding_server(8).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_api_state(dir.path()).await;
+        let app = test_router(state);
+        let kb_id = create_kb(&app, &base).await;
+
+        // api_key 留空 + kb_id → 用 KB 已存密钥探测（编辑态拿不到旧密钥的场景）
+        let (status, body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/llm/kb/test-embedding".to_string(),
+                &json!({ "base_url": base, "api_key": "", "model": "test-model", "kb_id": kb_id }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "test with kb_id: {body}");
+        assert_eq!(body["dimension"].as_i64(), Some(8));
+
+        // 未知 kb_id → 404
+        let (status, _body) = call(
+            &app,
+            json_request(
+                Method::POST,
+                "/api/llm/kb/test-embedding".to_string(),
+                &json!({ "base_url": base, "api_key": "", "model": "m", "kb_id": "no-such-kb" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::NOT_FOUND);
     }
 }

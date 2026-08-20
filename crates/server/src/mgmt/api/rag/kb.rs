@@ -220,7 +220,7 @@ pub async fn update_kb(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(_existing) = (match rt.db.rag_get_kb(&id).await {
+    let Some(existing) = (match rt.db.rag_get_kb(&id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -238,9 +238,82 @@ pub async fn update_kb(
     if let Some(err) = validate_kb_params(top_k, chunk_size, chunk_overlap, score_threshold) {
         return (StatusCode::BAD_REQUEST, err).into_response();
     }
+
+    // ── emb 配置合并（编辑态 merge 语义）──
+    // 未提供（None）= 沿用当前值；显式空字符串 = 非法（前端始终预填完整值，空串
+    // 只可能是误清空，直接 400 好过静默保留）。api_key 例外：空 = 保留旧密钥
+    // （后端不回显密钥，前端拿不到旧值，留空必须合法）。
+    let new_base = match body.emb_base_url.as_deref() {
+        None => existing.emb_base_url.clone(),
+        Some(s) if s.trim().is_empty() => {
+            return (StatusCode::BAD_REQUEST, "emb_base_url must not be empty").into_response();
+        }
+        Some(s) => s.trim().to_string(),
+    };
+    let new_model = match body.emb_model.as_deref() {
+        None => existing.emb_model.clone(),
+        Some(s) if s.trim().is_empty() => {
+            return (StatusCode::BAD_REQUEST, "emb_model must not be empty").into_response();
+        }
+        Some(s) => s.trim().to_string(),
+    };
+    let new_dim = match body.emb_dimension {
+        None => existing.emb_dimension,
+        Some(d) if d < 1 => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "emb_dimension must be >= 1 (probe it via /test-embedding)",
+            )
+                .into_response();
+        }
+        Some(d) => d,
+    };
+    let new_api_key_raw = body
+        .emb_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let emb_touched = body.emb_base_url.is_some()
+        || body.emb_model.is_some()
+        || body.emb_dimension.is_some()
+        || new_api_key_raw.is_some();
+
+    // 未携带任何 emb 字段：保持既有行为，只更新名称/描述/检索参数。
+    if !emb_touched {
+        if let Err(e) = rt
+            .db
+            .rag_update_kb_params(
+                &id,
+                &body.name,
+                &body.description,
+                top_k,
+                chunk_size,
+                chunk_overlap,
+                score_threshold,
+            )
+            .await
+        {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+        }
+        return Json(serde_json::json!({ "status": "ok" })).into_response();
+    }
+
+    // 向量只取决于 (base_url, model, dimension)：三者任一变化 → 全量重建；
+    // 仅 api_key 变化（密钥轮换）只替换密文，不触发昂贵的重建。
+    let rebuild_needed = new_base != existing.emb_base_url
+        || new_model != existing.emb_model
+        || new_dim != existing.emb_dimension;
+
+    let cipher = llm_state(&state).await.and_then(|l| l.cipher.clone());
+    let new_api_key_enc = new_api_key_raw.map_or_else(
+        || existing.emb_api_key.clone(),
+        |k| encrypt_field(cipher.as_ref(), k),
+    );
+
     if let Err(e) = rt
         .db
-        .rag_update_kb_params(
+        .rag_update_kb_full(
             &id,
             &body.name,
             &body.description,
@@ -248,12 +321,74 @@ pub async fn update_kb(
             chunk_size,
             chunk_overlap,
             score_threshold,
+            &new_base,
+            &new_api_key_enc,
+            &new_model,
+            new_dim,
         )
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
-    Json(serde_json::json!({ "status": "ok" })).into_response()
+
+    if !rebuild_needed {
+        return Json(serde_json::json!({ "status": "ok" })).into_response();
+    }
+
+    // ── 全量重建：emb 配置已变，旧向量（维度固化在 shard）全部失效 ──
+    // 顺序：软关挡新上传/检索 → 擦 shard（含缓存移除）→ 清 SQLite 分块 →
+    // 逐文档 reindex（复用单文档流程，原文在 rag_docs/ 无需重传）→ 恢复启停。
+    // 并发取舍与 delete_kb 同源：擦 shard 瞬间若有编辑前已在途的摄入任务持有旧
+    // EdgeShard，其 Drop flush 可能任务级 panic（管理面低频操作，可接受）。
+    let was_enabled = existing.enabled != 0;
+    let _ = rt.db.rag_toggle_kb(&id, false).await;
+    if let Err(e) = rt.store.delete_kb(&id).await {
+        tracing::warn!(kb_id = %id, error = %e, "rag: store delete_kb (rebuild) failed");
+    }
+    if let Err(e) = rt.db.rag_delete_chunks_by_kb(&id).await {
+        let _ = rt.db.rag_toggle_kb(&id, was_enabled).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+    }
+    let kb_new = match rt.db.rag_get_kb(&id).await {
+        Ok(Some(k)) => k,
+        Ok(None) => return (StatusCode::NOT_FOUND, "knowledge base not found").into_response(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
+    };
+    let docs = match rt.db.rag_list_documents(&id).await {
+        Ok(d) => d,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
+        }
+    };
+
+    // 限并发 4：大库一次 spawn 全部摄入会瞬时打满远端 embedding 服务。
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let mut reindexed = 0i64;
+    let mut skipped = 0i64;
+    let mut missing_source = 0i64;
+    for doc in &docs {
+        match super::docs::reindex_kb_doc(&rt, &kb_new, doc, Some(sem.clone())).await {
+            Ok(super::docs::ReindexOutcome::Spawned) => reindexed += 1,
+            Ok(super::docs::ReindexOutcome::Skipped) => skipped += 1,
+            Ok(super::docs::ReindexOutcome::MissingSource) => missing_source += 1,
+            Err(e) => {
+                let _ = rt.db.rag_toggle_kb(&id, was_enabled).await;
+                return e.into_response();
+            }
+        }
+    }
+    // 恢复原来的启停状态（不能硬置 true：编辑前可能就是禁用态）。
+    let _ = rt.db.rag_toggle_kb(&id, was_enabled).await;
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "reindexed": reindexed,
+        "skipped": skipped,
+        "missing_source": missing_source,
+    }))
+    .into_response()
 }
 
 pub async fn patch_kb(

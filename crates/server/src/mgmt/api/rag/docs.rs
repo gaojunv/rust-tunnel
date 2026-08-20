@@ -1,4 +1,6 @@
 //! RAG 文档 handlers：列表 / 详情 / multipart 上传 / 删除 / reindex。
+use std::sync::Arc;
+
 use axum::{
     extract::{Multipart, Path, State},
     http::StatusCode,
@@ -6,17 +8,18 @@ use axum::{
     Json,
 };
 
+use crate::db::rag::{RagDocumentRecord, RagKnowledgeBaseRecord};
 use crate::llm::rag::extractor::FileType;
 use crate::llm::rag::ingest::spawn_ingest;
 use crate::llm::rag::store::VectorStore;
 use crate::mgmt::api::ApiState;
 use sha2::Digest;
 
-use super::rag_rt;
+use super::{rag_rt, RagRuntime};
 
 /// 文档原文落盘路径：`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`（保留真实扩展名，
-/// 二进制原文 reindex 时按 file_type 重新解析）。
-fn doc_source_path(
+/// 二进制原文 reindex 时按 file_type 重新解析）。`pub(crate)` 供 `kb.rs` 全量重建路径引用。
+pub(crate) fn doc_source_path(
     store: &VectorStore,
     kb_id: &str,
     doc_id: &str,
@@ -27,6 +30,89 @@ fn doc_source_path(
         .join("rag_docs")
         .join(kb_id)
         .join(format!("{doc_id}.{ext}"))
+}
+
+/// `reindex_kb_doc` 的结果：全量重建路径据此统计，单文档端点据此映射 409。
+pub(crate) enum ReindexOutcome {
+    /// 已抢占并 spawn 摄入任务。
+    Spawned,
+    /// 文档在途（pending/processing），CAS 未抢到，跳过。
+    Skipped,
+    /// 原文缺失：文档已置 failed（提示删除重传），未 spawn。
+    MissingSource,
+}
+
+/// 重建单文档索引的完整流程：原子 CAS 置 pending（防与在途摄入双写）→ 校验原文
+/// 存在（缺失回滚为 failed）→ 清旧索引（向量 + SQLite 分块）→ `spawn_ingest` 走完整
+/// 摄入。单文档端点（`reindex_doc`）与全量重建（`kb.rs update_kb` 的 emb 变更分支）
+/// 共用本函数，保证每文档的原子性语义一致。
+///
+/// `sem` 为可选并发信号量（全量重建时限流用，见 `spawn_ingest`）。
+pub(crate) async fn reindex_kb_doc(
+    rt: &RagRuntime,
+    kb: &RagKnowledgeBaseRecord,
+    doc: &RagDocumentRecord,
+    sem: Option<Arc<tokio::sync::Semaphore>>,
+) -> Result<ReindexOutcome, (StatusCode, String)> {
+    // 并发防护：pending/processing 表示原始摄入或上一次 reindex 仍在途，
+    // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。
+    // 用原子 CAS 抢占（check-then-act 会让两个并发请求双双通过守卫），
+    // 只有一个请求能把状态从 ready/failed 置回 pending。
+    match rt.db.rag_mark_document_pending_if_idle(&doc.id).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(ReindexOutcome::Skipped),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))),
+    }
+
+    // 定位原文（摄入时已按 file_type 落盘，二进制原文也按同类型重新解析）。
+    // 老数据 file_type 可能为 ""（迁移前落库），回退 Markdown 保持旧路径兼容。
+    let file_type = FileType::from_extension(&doc.file_type).unwrap_or(FileType::Markdown);
+    let source_path = doc_source_path(&rt.store, &kb.id, &doc.id, file_type.as_str());
+    // 存在性检查（读字节太贵，先 metadata 探测）：缺失 → 无法无损重建，提示删除重传。
+    // CAS 已把状态置为 pending，此处失败需回滚，否则文档永远卡在 pending。
+    if tokio::fs::metadata(&source_path).await.is_err() {
+        tracing::warn!(kb_id = %kb.id, doc_id = %doc.id, path = %source_path.display(), "rag reindex: source file missing");
+        if let Err(e) = rt
+            .db
+            .rag_update_document_status(
+                &doc.id,
+                "failed",
+                0,
+                Some("original document missing; delete and re-upload it"),
+            )
+            .await
+        {
+            tracing::warn!(doc_id = %doc.id, error = %e, "rag reindex: rollback status failed");
+        }
+        return Ok(ReindexOutcome::MissingSource);
+    }
+
+    // 清旧索引：先向量后 SQLite（向量删除失败仅 warn，DB 是源）。
+    if let Err(e) = rt
+        .store
+        .delete_by_doc(&kb.id, kb.emb_dimension as usize, &doc.id)
+        .await
+    {
+        tracing::warn!(kb_id = %kb.id, doc_id = %doc.id, error = %e, "rag reindex: store delete_by_doc failed");
+    }
+    if let Err(e) = rt.db.rag_delete_chunks_by_doc(&doc.id).await {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")));
+    }
+
+    // 状态已是 pending（CAS 时置位），直接 spawn_ingest 走完整摄入
+    // （与 upload 同路径：processing → ready/failed + SSE 事件）。
+    spawn_ingest(
+        rt.db.clone(),
+        rt.store.clone(),
+        rt.cipher.clone(),
+        kb.clone(),
+        doc.id.clone(),
+        source_path,
+        file_type,
+        rt.tx.clone(),
+        sem,
+    );
+    Ok(ReindexOutcome::Spawned)
 }
 
 pub async fn list_docs(
@@ -234,6 +320,7 @@ pub async fn upload_doc(
         source_path.clone(),
         file_type,
         rt.tx.clone(),
+        None,
     );
 
     match rt.db.rag_get_document(&doc_id).await {
@@ -347,75 +434,26 @@ pub async fn reindex_doc(
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     }
 
-    // 并发防护：pending/processing 表示原始摄入或上一次 reindex 仍在途，
-    // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。
-    // 用原子 CAS 抢占（check-then-act 会让两个并发请求双双通过守卫），
-    // 只有一个请求能把状态从 ready/failed 置回 pending，另一个收到 409。
-    match rt.db.rag_mark_document_pending_if_idle(&doc_id).await {
-        Ok(true) => {}
-        Ok(false) => {
+    // 并发防护/原文校验/清旧索引/spawn 摄入的完整流程抽到 `reindex_kb_doc`
+    // （全量重建路径复用，见 kb.rs `update_kb` 的 emb 变更分支）。
+    match reindex_kb_doc(&rt, &kb, &doc, None).await {
+        Ok(ReindexOutcome::Spawned) => {}
+        Ok(ReindexOutcome::Skipped) => {
             return (
                 StatusCode::CONFLICT,
                 "document is being processed, retry later".to_string(),
             )
                 .into_response();
         }
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
-        }
-    }
-
-    // 定位原文（摄入时已按 file_type 落盘，二进制原文也按同类型重新解析）。
-    // 老数据 file_type 可能为 ""（迁移前落库），回退 Markdown 保持旧路径兼容。
-    let file_type = FileType::from_extension(&doc.file_type).unwrap_or(FileType::Markdown);
-    let source_path = doc_source_path(&rt.store, &kb_id, &doc_id, file_type.as_str());
-    // 存在性检查（读字节太贵，先 metadata 探测）：缺失 → 无法无损重建，提示删除重传。
-    // CAS 已把状态置为 pending，此处失败需回滚，否则文档永远卡在 pending。
-    if tokio::fs::metadata(&source_path).await.is_err() {
-        tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, path = %source_path.display(), "rag reindex: source file missing");
-        if let Err(e) = rt
-            .db
-            .rag_update_document_status(
-                &doc_id,
-                "failed",
-                0,
-                Some("original document missing; delete and re-upload it"),
+        Ok(ReindexOutcome::MissingSource) => {
+            return (
+                StatusCode::CONFLICT,
+                "original document missing; delete and re-upload it",
             )
-            .await
-        {
-            tracing::warn!(doc_id = %doc_id, error = %e, "rag reindex: rollback status failed");
+                .into_response();
         }
-        return (
-            StatusCode::CONFLICT,
-            "original document missing; delete and re-upload it",
-        )
-            .into_response();
+        Err(e) => return e.into_response(),
     }
-
-    // 清旧索引：先向量后 SQLite（向量删除失败仅 warn，DB 是源）。
-    if let Err(e) = rt
-        .store
-        .delete_by_doc(&kb_id, kb.emb_dimension as usize, &doc_id)
-        .await
-    {
-        tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, error = %e, "rag reindex: store delete_by_doc failed");
-    }
-    if let Err(e) = rt.db.rag_delete_chunks_by_doc(&doc_id).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
-    }
-
-    // 状态已是 pending（CAS 时置位），直接 spawn_ingest 走完整摄入
-    // （与 upload 同路径：processing → ready/failed + SSE 事件）。
-    spawn_ingest(
-        rt.db.clone(),
-        rt.store.clone(),
-        rt.cipher.clone(),
-        kb,
-        doc_id.clone(),
-        source_path,
-        file_type,
-        rt.tx.clone(),
-    );
 
     match rt.db.rag_get_document(&doc_id).await {
         Ok(Some(d)) => (

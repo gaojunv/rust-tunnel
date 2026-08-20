@@ -24,8 +24,12 @@ use super::{llm_state, rag_rt};
 
 /// 探测 embedding 服务：向 `POST {base_url}/embeddings` 发一条探针文本，返回维度与耗时。
 /// 前端据此填写 KB 的 `emb_dimension`。
+///
+/// `kb_id` 可选（编辑 KB 场景）：提供时若请求 `api_key` 为空，则用该 KB 已存的密钥
+/// （后端不回显密钥，前端编辑态拿不到旧值，留空测试必须能复用已存密钥）；
+/// 请求带新密钥则以请求为准。`base_url`/`model` 始终以请求体为准（测的就是新值）。
 pub async fn test_embedding(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(body): Json<TestEmbeddingRequest>,
 ) -> impl IntoResponse {
     if body.base_url.trim().is_empty() {
@@ -34,8 +38,28 @@ pub async fn test_embedding(
     if body.model.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "model is required").into_response();
     }
+    let mut api_key = body.api_key.clone();
+    if let Some(kb_id) = body.kb_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        let rt = match rag_rt(&state).await {
+            Ok(rt) => rt,
+            Err(e) => return e.into_response(),
+        };
+        let Some(kb) = (match rt.db.rag_get_kb(kb_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
+                    .into_response()
+            }
+        }) else {
+            return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
+        };
+        if api_key.trim().is_empty() {
+            api_key = crate::llm::crypto::decrypt_field(rt.cipher.as_ref(), &kb.emb_api_key)
+                .unwrap_or_default();
+        }
+    }
     let started = Instant::now();
-    let embedder = Embedder::new(&body.base_url, &body.api_key, &body.model);
+    let embedder = Embedder::new(&body.base_url, &api_key, &body.model);
     match embedder.embed_one("dimension probe").await {
         Ok(v) => {
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);

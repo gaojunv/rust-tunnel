@@ -510,6 +510,8 @@ export async function testEmbedding(req: {
   base_url: string;
   api_key: string;
   model: string;
+  /** 编辑已有 KB 时传入：api_key 留空则用该 KB 已存密钥测试。 */
+  kb_id?: string;
 }): Promise<TestEmbeddingResult> {
   const { data } = await api.post('/llm/kb/test-embedding', req);
   return data;
