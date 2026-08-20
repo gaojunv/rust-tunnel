@@ -575,6 +575,9 @@
       "aliasPlaceholder": "Alias",
       "tagsPlaceholder": "Tags (comma separated)",
       "contextLimitLabel": "Context limit",
+      "upstreamProtocolLabel": "Upstream protocol",
+      "protocolChatCompletions": "Chat Completions",
+      "protocolResponses": "Responses",
       "deleteProviderConfirm": "Delete this provider and all its models?",
       "deleteModelConfirm": "Delete model \"{{name}}\"?",
       "addModel": "Add"

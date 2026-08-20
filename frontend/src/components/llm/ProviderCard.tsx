@@ -10,6 +10,8 @@ import { useProviderModels, useAddModel, useUpdateModel, useDeleteModel, useTogg
 import type { LlmProvider, LlmModel } from '@/types';
 import { CONTEXT_LIMIT_OPTIONS, parseContextLimit, mergeContextLimit } from './contextLimit';
 import type { ContextLimitTier } from './contextLimit';
+import { parseUpstreamProtocol, mergeUpstreamProtocol } from './upstreamProtocol';
+import type { UpstreamProtocol } from './upstreamProtocol';
 import { Trash2, Plus, Edit3, ChevronDown, ChevronRight, Check, X } from 'lucide-react';
 
 interface Props { provider: LlmProvider; onEdit: () => void; }
@@ -23,15 +25,20 @@ function ModelRow({ model }: { model: LlmModel }) {
   const [alias, setAlias] = useState(model.alias);
   const [tags, setTags] = useState(model.tags?.join(', ') ?? '');
   const [contextLimitTier, setContextLimitTier] = useState<ContextLimitTier>(parseContextLimit(model.extra_config));
+  const [upstreamProtocol, setUpstreamProtocol] = useState<UpstreamProtocol>(parseUpstreamProtocol(model.extra_config));
 
   const save = () => {
+    const merged = mergeUpstreamProtocol(
+      mergeContextLimit(model.extra_config, contextLimitTier),
+      upstreamProtocol,
+    );
     updateModelMutation.mutate(
       {
         id: model.id,
         model_name: model.model_name,
         alias: alias.trim(),
         tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
-        extra_config: mergeContextLimit(model.extra_config, contextLimitTier),
+        extra_config: merged,
       },
       { onSuccess: () => setEditing(false) },
     );
@@ -55,10 +62,19 @@ function ModelRow({ model }: { model: LlmModel }) {
             ))}
           </SelectContent>
         </Select>
+        <Select value={upstreamProtocol} onValueChange={(v) => setUpstreamProtocol(v as UpstreamProtocol)}>
+          <SelectTrigger className="h-7 w-36" aria-label={t('llm.providerCard.upstreamProtocolLabel')}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="chat_completions">{t('llm.providerCard.protocolChatCompletions')}</SelectItem>
+            <SelectItem value="responses">{t('llm.providerCard.protocolResponses')}</SelectItem>
+          </SelectContent>
+        </Select>
         <Button variant="ghost" size="icon" onClick={save} disabled={updateModelMutation.isPending}>
           <Check className="w-3 h-3" />
         </Button>
-        <Button variant="ghost" size="icon" onClick={() => { setContextLimitTier(parseContextLimit(model.extra_config)); setEditing(false); }}>
+        <Button variant="ghost" size="icon" onClick={() => { setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(false); }}>
           <X className="w-3 h-3" />
         </Button>
       </div>
@@ -71,9 +87,10 @@ function ModelRow({ model }: { model: LlmModel }) {
         <span className="truncate font-mono">{model.model_name}</span>
         {model.alias && <span className="text-muted-foreground ml-2">({model.alias})</span>}
         {model.tags?.map((t) => <Badge key={t} variant="outline" className="ml-1 text-xs">{t}</Badge>)}
+        {parseUpstreamProtocol(model.extra_config) === 'responses' && <Badge variant="secondary" className="ml-1 text-xs">Responses</Badge>}
       </div>
       <div className="flex items-center">
-        <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setContextLimitTier(parseContextLimit(model.extra_config)); setEditing(true); }}>
+        <Button variant="ghost" size="icon" onClick={() => { setAlias(model.alias); setTags(model.tags?.join(', ') ?? ''); setContextLimitTier(parseContextLimit(model.extra_config)); setUpstreamProtocol(parseUpstreamProtocol(model.extra_config)); setEditing(true); }}>
           <Edit3 className="w-3 h-3" />
         </Button>
         <Button variant="ghost" size="icon" onClick={() => { if (confirm(t('llm.providerCard.deleteModelConfirm', { name: model.model_name }))) deleteModelMutation.mutate(model.id); }}>

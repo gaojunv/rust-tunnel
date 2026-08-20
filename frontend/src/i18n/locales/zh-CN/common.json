@@ -575,6 +575,9 @@
       "aliasPlaceholder": "别名",
       "tagsPlaceholder": "标签（逗号分隔）",
       "contextLimitLabel": "上下文上限",
+      "upstreamProtocolLabel": "上游协议",
+      "protocolChatCompletions": "Chat Completions",
+      "protocolResponses": "Responses",
       "deleteProviderConfirm": "删除此供应商及其所有模型？",
       "deleteModelConfirm": "删除模型「{{name}}」？",
       "addModel": "添加"
