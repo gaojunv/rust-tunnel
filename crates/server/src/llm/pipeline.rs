@@ -157,13 +157,15 @@ fn write_back_messages(request: &mut ChatCompletionRequest) {
     }
 }
 
-/// 上游成功响应后处理（协议特有：Anthropic 回退路径需要把 OpenAI 格式转回）。
+/// 上游成功响应后处理（协议特有：不同入口需要不同的响应格式转换）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsePostProcess {
     /// OpenAI 入口：响应原样透传。
     None,
     /// Anthropic 入口：把上游 OpenAI 格式转成 Anthropic Messages 格式。
     ToAnthropic,
+    /// Responses 入口：把上游 OpenAI chat 格式转成 Responses API 格式。
+    ToResponses,
 }
 
 /// 构造上行请求体 → 写请求日志 → 候选链故障转移执行 → 结果处理（成功/全部失败）。
@@ -258,6 +260,12 @@ pub async fn run_execution(
                 }
                 ResponsePostProcess::ToAnthropic => {
                     super::format::convert_openai_to_anthropic_response(resp).await
+                }
+                ResponsePostProcess::ToResponses if request.stream => {
+                    super::responses::convert_openai_stream_to_responses(resp)
+                }
+                ResponsePostProcess::ToResponses => {
+                    super::responses::convert_openai_to_responses_response(resp).await
                 }
             };
             super::usage::wrap_and_record(resp, ctx, db, started).await

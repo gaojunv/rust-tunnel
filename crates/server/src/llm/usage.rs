@@ -33,14 +33,24 @@ impl UsageInfo {
 
 /// 从上游响应 JSON 的 `usage` 对象提取用量。
 ///
-/// 同时兼容 OpenAI 风格（`prompt_tokens`/`completion_tokens`）与 Anthropic 原生
-/// （`input_tokens`/`output_tokens`）。缓存字段按以下优先级兜底：
+/// 同时兼容 OpenAI 风格（`prompt_tokens`/`completion_tokens`）、Anthropic 原生
+/// （`input_tokens`/`output_tokens`）与 Responses API（`input_tokens`/`output_tokens`
+/// + `input_tokens_details`/`output_tokens_details`）。缓存字段按以下优先级兜底：
 /// 1. DeepSeek：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
 /// 2. OpenAI 新口径：`prompt_tokens_details.cached_tokens`
 /// 3. Kimi/Moonshot：`usage.cached_tokens`（顶层扁平字段，见 Kimi 官方 API 文档）
 /// 4. Anthropic：`cache_read_input_tokens` / `cache_creation_input_tokens`
+/// 5. Responses API：`input_tokens_details.cached_tokens`（input_tokens 即总量）
 ///
 /// 恒等关系：`cache_hit + cache_miss == prompt`（无缓存信息时全记为 miss）。
+///
+/// Responses API 与 Anthropic 都用 `input_tokens`/`output_tokens` 字段名，但语义不同：
+/// - Anthropic：`input_tokens` 是未缓存部分，需加回 `cache_read_input_tokens + cache_creation_input_tokens`
+/// - Responses API：`input_tokens` 是总量（含缓存），缓存细节在 `input_tokens_details.cached_tokens`
+///
+/// 判别条件：Responses 使用 `input_tokens_details`（Anthropic 不用此字段），有则走
+/// Responses 路径（input_tokens 即总量，缓存从 details 取）；无 `input_tokens_details`
+/// 但有 `cache_read_input_tokens` 则走 Anthropic 路径。
 pub fn extract_usage(usage: &Value) -> UsageInfo {
     if !usage.is_object() {
         return UsageInfo::default();
@@ -48,10 +58,15 @@ pub fn extract_usage(usage: &Value) -> UsageInfo {
 
     let get = |k: &str| usage.get(k).and_then(Value::as_i64);
 
-    // 输入 token：OpenAI 用 prompt_tokens，Anthropic 用 input_tokens。
-    // Anthropic 的 input_tokens 不含缓存部分，需加回 cache_read + cache_creation。
+    // 输入 token：OpenAI 用 prompt_tokens，Anthropic/Responses 用 input_tokens。
+    // 两者的 input_tokens 语义不同，用 input_tokens_details 判别。
     let anthropic_cache_read = get("cache_read_input_tokens");
     let anthropic_cache_creation = get("cache_creation_input_tokens");
+    // Responses API 有 input_tokens_details（Anthropic 没有）
+    let responses_cached = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_i64);
 
     let (prompt_tokens, mut cache_hit) = if let Some(pt) = get("prompt_tokens") {
         // ── OpenAI 系 ──
@@ -66,11 +81,18 @@ pub fn extract_usage(usage: &Value) -> UsageInfo {
             .unwrap_or(0);
         (pt, hit)
     } else if let Some(it) = get("input_tokens") {
-        // ── Anthropic 原生 ──
-        // input_tokens 是未缓存的新增输入；总输入 = it + cache_read + cache_creation。
-        let hit = anthropic_cache_read.unwrap_or(0);
-        let creation = anthropic_cache_creation.unwrap_or(0);
-        (it + hit + creation, hit)
+        if responses_cached.is_some() {
+            // ── Responses API ──
+            // input_tokens 是总量（含缓存）；缓存从 input_tokens_details.cached_tokens 取。
+            let hit = responses_cached.unwrap_or(0);
+            (it, hit)
+        } else {
+            // ── Anthropic 原生 ──
+            // input_tokens 是未缓存的新增输入；总输入 = it + cache_read + cache_creation。
+            let hit = anthropic_cache_read.unwrap_or(0);
+            let creation = anthropic_cache_creation.unwrap_or(0);
+            (it + hit + creation, hit)
+        }
     } else {
         (0, 0)
     };
@@ -186,6 +208,25 @@ impl UsageSseScanner {
                     self.latest = u;
                 }
             }
+        }
+
+        // ── Responses API 流式事件（response.completed / response.incomplete）──
+        // data JSON 的 type 字段标识事件类型；response.completed 和 response.incomplete
+        // 的 response 对象内含 usage，提取方式同非流式（openai_usage 兼容 responses 格式）。
+        match chunk.get("type").and_then(Value::as_str) {
+            Some("response.completed") | Some("response.incomplete") => {
+                if let Some(resp_usage) = chunk
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .filter(|u| u.is_object())
+                {
+                    let u = extract_usage(resp_usage);
+                    if !u.is_empty() {
+                        self.latest = u;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -558,5 +599,78 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].failover_from.as_deref(), Some("model-a"));
+    }
+
+    // ── Responses API 用量提取测试 ──────────────────────────────
+
+    /// Responses API 非流式 usage：input_tokens 是总量（含缓存），cached 在 details 中。
+    #[test]
+    fn extract_responses_nonstream_usage() {
+        let u = extract_usage(&json!({
+            "input_tokens": 150,
+            "output_tokens": 40,
+            "total_tokens": 190,
+            "input_tokens_details": { "cached_tokens": 50 },
+            "output_tokens_details": { "reasoning_tokens": 10 }
+        }));
+        assert_eq!(u.prompt_tokens, 150);
+        assert_eq!(u.completion_tokens, 40);
+        assert_eq!(u.total_tokens, 190);
+        assert_eq!(u.cache_hit_tokens, 50);
+        assert_eq!(u.cache_miss_tokens, 100);
+    }
+
+    /// Responses API 非流式 usage：无缓存细节时全记为 miss。
+    #[test]
+    fn extract_responses_nonstream_no_cache() {
+        let u = extract_usage(&json!({
+            "input_tokens": 80,
+            "output_tokens": 20,
+            "total_tokens": 100
+        }));
+        assert_eq!(u.prompt_tokens, 80);
+        assert_eq!(u.completion_tokens, 20);
+        assert_eq!(u.cache_hit_tokens, 0);
+        assert_eq!(u.cache_miss_tokens, 80);
+    }
+
+    /// Responses API 流式：response.completed 事件含 usage（含 cached/reasoning 细分）。
+    #[test]
+    fn scanner_responses_stream_completed_with_usage() {
+        let mut s = UsageSseScanner::new();
+        s.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n");
+        s.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n");
+        s.push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":30,\"total_tokens\":130,\"input_tokens_details\":{\"cached_tokens\":25},\"output_tokens_details\":{\"reasoning_tokens\":8}}}}\n\n");
+        s.push(b"data: [DONE]\n\n");
+        let u = s.finish();
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 30);
+        assert_eq!(u.total_tokens, 130);
+        assert_eq!(u.cache_hit_tokens, 25);
+        assert_eq!(u.cache_miss_tokens, 75);
+    }
+
+    /// Responses API 流式：response.incomplete 事件也应提取 usage。
+    #[test]
+    fn scanner_responses_stream_incomplete_with_usage() {
+        let mut s = UsageSseScanner::new();
+        s.push(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n\n");
+        s.push(b"data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_2\",\"status\":\"incomplete\",\"usage\":{\"input_tokens\":60,\"output_tokens\":15,\"total_tokens\":75,\"input_tokens_details\":{\"cached_tokens\":10}}}}\n\n");
+        let u = s.finish();
+        assert_eq!(u.prompt_tokens, 60);
+        assert_eq!(u.completion_tokens, 15);
+        assert_eq!(u.cache_hit_tokens, 10);
+        assert_eq!(u.cache_miss_tokens, 50);
+    }
+
+    /// Responses API 流式：response.completed 无 usage（上游未注入）→ 保持空。
+    #[test]
+    fn scanner_responses_stream_completed_no_usage() {
+        let mut s = UsageSseScanner::new();
+        s.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n");
+        s.push(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_3\",\"status\":\"completed\"}}\n\n");
+        s.push(b"data: [DONE]\n\n");
+        let u = s.finish();
+        assert!(u.is_empty());
     }
 }

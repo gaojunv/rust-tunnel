@@ -297,7 +297,7 @@ async fn llm_handle(
     req: Request<Body>,
 ) -> Response {
     use crate::llm::LlmProtocol;
-    use crate::llm::{anthropic_handler, openai_handler, upstream};
+    use crate::llm::{anthropic_handler, openai_handler, responses_handler, upstream};
 
     let state = openai_handler::LlmHandlerState {
         llm,
@@ -308,6 +308,7 @@ async fn llm_handle(
     let is_models = method == Method::GET && path == "/v1/models";
     let is_messages = method == Method::POST && path == "/v1/messages";
     let is_chat_completions = method == Method::POST && path == "/v1/chat/completions";
+    let is_responses = method == Method::POST && path == "/v1/responses";
     let (parts, body) = req.into_parts();
     let mut headers = parts.headers;
 
@@ -323,7 +324,7 @@ async fn llm_handle(
 
     // 严格协议隔离：按入口协议判定允许的路径
     let allowed = match protocol {
-        LlmProtocol::OpenAI => is_models || is_chat_completions,
+        LlmProtocol::OpenAI => is_models || is_chat_completions || is_responses,
         LlmProtocol::Anthropic => is_models || is_messages,
     };
 
@@ -390,6 +391,8 @@ async fn llm_handle(
 
     if is_messages {
         anthropic_handler::handle_messages(State(state), headers, Json(json)).await
+    } else if is_responses {
+        responses_handler::handle_responses(State(state), headers, Json(json)).await
     } else {
         openai_handler::handle_chat_completions(State(state), headers, Json(json)).await
     }

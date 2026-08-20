@@ -1615,6 +1615,100 @@ fn push_chat_chunk(out: &mut String, chunk: &Value) {
     out.push('\n');
 }
 
+// ── G. pipeline 后处理包装函数 ──────────────────────────────────
+
+/// 流式：把上游 OpenAI SSE 字节流逐 chunk 翻译成 Responses SSE 事件流。
+///
+/// 结构与 [`super::format::convert_openai_stream_to_anthropic`] 一致：
+/// 用 [`ChatToResponsesSseTranslator`] 包装字节流，每个上游字节块喂入翻译器，
+/// 返回的字节直接发给客户端。
+pub fn convert_openai_stream_to_responses(openai_resp: axum::response::Response) -> axum::response::Response {
+    use futures_util::StreamExt;
+
+    let byte_stream = openai_resp.into_body().into_data_stream();
+    let translator = std::sync::Arc::new(std::sync::Mutex::new(
+        ChatToResponsesSseTranslator::new(),
+    ));
+    let out = byte_stream.filter_map(move |chunk| {
+        let translator = translator.clone();
+        async move {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = translator.lock().unwrap().push(&bytes);
+                    if converted.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(converted))
+                    }
+                }
+                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+            }
+        }
+    });
+
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(axum::body::Body::from_stream(out))
+        .unwrap()
+}
+
+/// 非流式：把 OpenAI chat completion 响应 JSON 转成 Responses API 响应。
+///
+/// 有界读 body（`upstream::MAX_UPSTREAM_BODY_BYTES`，超限 502），
+/// parse JSON 后调用 [`chat_response_to_responses`]；parse 失败原样透传 body+status。
+/// 结构与 [`super::format::convert_openai_to_anthropic_response`] 一致。
+pub async fn convert_openai_to_responses_response(
+    openai_resp: axum::response::Response,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use serde_json::Value;
+
+    let status = openai_resp.status();
+    let body_bytes = match axum::body::to_bytes(
+        openai_resp.into_body(),
+        super::upstream::MAX_UPSTREAM_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Body::from(format!(
+                    "failed to read upstream response (too large or read error): {e}"
+                )))
+                .unwrap();
+        }
+    };
+
+    let openai: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_bytes))
+                .unwrap();
+        }
+    };
+
+    let responses_resp = chat_response_to_responses(&openai);
+
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&responses_resp).unwrap_or_else(|_| body_bytes.to_vec()),
+        ))
+        .unwrap()
+}
+
 // ── 测试 ────────────────────────────────────────────────────────
 
 #[cfg(test)]

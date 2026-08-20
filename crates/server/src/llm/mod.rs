@@ -11,6 +11,7 @@ pub mod provider;
 #[cfg(feature = "rag")]
 pub mod rag;
 pub mod responses;
+pub mod responses_handler;
 pub mod route_cache;
 pub mod router;
 pub mod upstream;
