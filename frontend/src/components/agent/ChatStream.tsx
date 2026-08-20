@@ -1512,7 +1512,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区，
             滚动内容从输入框底下经过时被 bg-card 遮挡。顶部 absolute 渐隐让内容
             淡出到输入框，不占文档流高度。 */}
-        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[max(env(safe-area-inset-bottom),var(--sat-bottom,0px),0.75rem)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
           <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
           <div className="mx-auto w-full max-w-3xl">
           {running && (
