@@ -4,8 +4,8 @@
 //! 客户端内嵌 LLM 回环代理把 agent 进程的 LLM API 请求经控制通道转交服务端，
 //! 本模块按 workspace 的 `llm_model_id` 解析 model_name，改写请求体 `model`
 //! 字段后**直接函数调用** LLM 网关 handler（`handle_messages` /
-//! `handle_chat_completions`），让网关的模型组故障转移、格式转换、用量统计、
-//! RAG 注入等管线全部生效——与外部 HTTP 流量共享同一条代码路径。
+//! `handle_chat_completions` / `handle_responses`），让网关的模型组故障转移、
+//! 格式转换、用量统计、RAG 注入等管线全部生效——与外部 HTTP 流量共享同一条代码路径。
 //! **LLM secret 只在服务端接触，客户端永不持有。**
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::db::Database;
 use crate::llm::openai_handler::LlmHandlerState;
-use crate::llm::{anthropic_handler, openai_handler, LlmProtocol, LlmState};
+use crate::llm::{anthropic_handler, openai_handler, responses_handler, LlmProtocol, LlmState};
 
 /// LLM 网关入口（直接函数调用 handler 时用）。
 #[derive(Debug, Clone)]
@@ -50,8 +50,8 @@ pub struct AgentLlmProxyChunk {
 /// 解析链路：`resolve_effective_model`（session.model → workspace.llm_model_id →
 /// 全局默认 → 第一个可用）得到网关可解析的模型引用，改写请求体 `model` 字段后
 /// 按路径分发到网关 handler（`/v1/messages` → Anthropic 入口；
-/// `/v1/chat/completions` → OpenAI 入口）。网关自动完成模型组故障转移、
-/// 格式转换、用量统计、RAG 注入等管线。
+/// `/v1/chat/completions` → OpenAI 入口；`/v1/responses` → Responses 入口）。
+/// 网关自动完成模型组故障转移、格式转换、用量统计、RAG 注入等管线。
 ///
 /// # 契约
 /// 无论成功/失败，流总是以 `done=true` 的 chunk 结束（见 [`AgentLlmProxyChunk`]）。
@@ -116,7 +116,8 @@ pub fn forward(
         let is_messages = clean_path == "/v1/messages";
         let is_chat_completions = clean_path == "/v1/chat/completions";
         let is_models = clean_path == "/v1/models";
-        if !is_messages && !is_chat_completions && !is_models {
+        let is_responses = clean_path == "/v1/responses";
+        if !is_messages && !is_chat_completions && !is_models && !is_responses {
             yield AgentLlmProxyChunk {
                 request_id,
                 data: format!("unsupported llm proxy path: {clean_path}").into_bytes(),
@@ -141,6 +142,8 @@ pub fn forward(
             openai_handler::handle_list_models(State(handler_state), headers).await
         } else if is_messages {
             anthropic_handler::handle_messages(State(handler_state), headers, Json(body_json)).await
+        } else if is_responses {
+            responses_handler::handle_responses(State(handler_state), headers, Json(body_json)).await
         } else {
             openai_handler::handle_chat_completions(State(handler_state), headers, Json(body_json)).await
         };
@@ -450,6 +453,38 @@ mod tests {
         assert!(
             body.contains("\"type\":\"error\""),
             "anthropic error format expected, body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_responses_path_reaches_responses_handler() {
+        // `/v1/responses` 应路由到 Responses handler（Codex 等客户端）。
+        // 上游不可达 → 网关回 OpenAI 格式错误（`"error": { "message": ..., "type": ... }`）。
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/responses".into(),
+            br#"{"model":"gpt-test","input":"hi","stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done, "must end with done=true");
+        assert!(last.status >= 400, "upstream failure → error status, got {}", last.status);
+        let body: String = chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        // Responses handler 走 OpenAI 错误格式（不是 Anthropic `"type":"error"`）
+        assert!(
+            body.contains("\"error\""),
+            "openai error format expected for responses path, body: {body}"
         );
     }
 
