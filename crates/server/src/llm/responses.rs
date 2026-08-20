@@ -382,6 +382,11 @@ pub struct ChatToResponsesSseTranslator {
     tool_args: std::collections::HashMap<u64, String>,
     /// upstream tool_call index → output_index 映射
     tool_output_indices: std::collections::HashMap<u64, u32>,
+    /// upstream tool_call index → 上游真实 call_id（done/completed 事件必须回带，
+    /// 客户端靠它把 function_call_output 关联回 function_call）
+    tool_call_ids: std::collections::HashMap<u64, String>,
+    /// upstream tool_call index → 函数名（同上，done/completed 事件必须回带）
+    tool_names: std::collections::HashMap<u64, String>,
     /// 下一个可分配的 output_index
     next_output_index: u32,
     /// 收尾 chunk 的 usage（供 response.completed 使用）
@@ -414,6 +419,8 @@ impl ChatToResponsesSseTranslator {
             content_text: String::new(),
             tool_args: std::collections::HashMap::new(),
             tool_output_indices: std::collections::HashMap::new(),
+            tool_call_ids: std::collections::HashMap::new(),
+            tool_names: std::collections::HashMap::new(),
             next_output_index: 0,
             usage: None,
             reasoning_started: false,
@@ -479,7 +486,8 @@ impl ChatToResponsesSseTranslator {
                 "status": "in_progress",
                 "output": [],
             });
-            push_sse_event(out, "response.created", &created);
+            // 官方格式：response.created/completed 的响应对象嵌套在 data.response 下
+            push_sse_event(out, "response.created", &json!({ "response": created }));
         }
 
         let delta = &chunk["choices"][0]["delta"];
@@ -592,6 +600,8 @@ impl ChatToResponsesSseTranslator {
                         .and_then(|f| f.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
+                    self.tool_call_ids.insert(up_idx, call_id.to_string());
+                    self.tool_names.insert(up_idx, name.to_string());
                     let item = json!({
                         "type": "function_call",
                         "id": format!("{}_fc_{oidx}", self.resp_id),
@@ -642,12 +652,36 @@ impl ChatToResponsesSseTranslator {
 
     /// 收尾：对每个已开启 item 发 done 事件，再发 response.completed。幂等。
     fn close(&mut self, out: &mut String) {
-        if self.closed || !self.started {
+        if self.closed {
             return;
+        }
+        // 空流（上游只发 [DONE] 或连接直接结束）：补发最小 response.created，
+        // 否则客户端连 response.created 都没收到就一直等 response.completed 直到 TCP 超时。
+        if !self.started {
+            self.started = true;
+            if self.resp_id.is_empty() {
+                self.resp_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+            }
+            let created = json!({
+                "id": self.resp_id,
+                "object": "response",
+                "created_at": self.created_at,
+                "model": self.model,
+                "status": "in_progress",
+                "output": [],
+            });
+            push_sse_event(out, "response.created", &json!({ "response": created }));
         }
         self.closed = true;
 
         let reason = self.finish_reason.as_deref().unwrap_or("stop");
+
+        // output_index → upstream index 反查表（取累计 arguments/call_id/name 用）
+        let rev_indices: std::collections::HashMap<u32, u64> = self
+            .tool_output_indices
+            .iter()
+            .map(|(up, oidx)| (*oidx, *up))
+            .collect();
 
         // 逐个关闭已开启的 items
         for (i, kind) in self.open_items.iter().enumerate() {
@@ -732,14 +766,11 @@ impl ChatToResponsesSseTranslator {
                     );
                 }
                 OutputItemKind::FunctionCall(oidx) => {
-                    // 查找对应 upstream index 的累计 arguments
-                    let accumulated = self
-                        .tool_output_indices
-                        .iter()
-                        .find(|(_, &v)| v == *oidx)
-                        .map(|(k, _)| self.tool_args.get(k).cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                    // 找对应的 call_id 和 name（从 open_items 追溯）
+                    // 反查 upstream index，取累计 arguments 与真实 call_id/name
+                    let up_idx = rev_indices.get(oidx).copied().unwrap_or(0);
+                    let accumulated = self.tool_args.get(&up_idx).cloned().unwrap_or_default();
+                    let call_id = self.tool_call_ids.get(&up_idx).cloned().unwrap_or_default();
+                    let name = self.tool_names.get(&up_idx).cloned().unwrap_or_default();
                     let item_id = format!("{}_fc_{oidx}", self.resp_id);
                     push_sse_event(
                         out,
@@ -757,6 +788,9 @@ impl ChatToResponsesSseTranslator {
                             "item": {
                                 "type": "function_call",
                                 "id": item_id,
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": accumulated,
                                 "status": "completed",
                             },
                         }),
@@ -793,12 +827,24 @@ impl ChatToResponsesSseTranslator {
             completed["usage"] = map_usage_chat_to_responses(usage);
         }
 
-        push_sse_event(out, "response.completed", &completed);
+        // 官方规范：incomplete 状态对应 response.incomplete 事件（客户端按事件名区分）
+        let event_name = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        push_sse_event(out, event_name, &json!({ "response": completed }));
         out.push_str("data: [DONE]\n\n");
     }
 
     /// 构建 response.completed 中的 output 数组（所有 item 的完成态）。
     fn build_completed_output(&self) -> Value {
+        // output_index → upstream index 反查表
+        let rev_indices: std::collections::HashMap<u32, u64> = self
+            .tool_output_indices
+            .iter()
+            .map(|(up, oidx)| (*oidx, *up))
+            .collect();
         let mut output: Vec<Value> = Vec::new();
         for kind in &self.open_items {
             match kind {
@@ -825,19 +871,17 @@ impl ChatToResponsesSseTranslator {
                     }));
                 }
                 OutputItemKind::FunctionCall(oidx) => {
-                    let accumulated = self
-                        .tool_output_indices
-                        .iter()
-                        .find(|(_, &v)| v == *oidx)
-                        .map(|(k, _)| self.tool_args.get(k).cloned().unwrap_or_default())
-                        .unwrap_or_default();
-                    // call_id 在 added 时已写入 item，此处用 resp_id + index 拼接
-                    let call_id = format!("{}_fc_{oidx}", self.resp_id);
+                    let up_idx = rev_indices.get(oidx).copied().unwrap_or(0);
+                    let accumulated = self.tool_args.get(&up_idx).cloned().unwrap_or_default();
+                    // call_id/name 必须回带上游真实值：客户端靠 call_id 关联
+                    // function_call_output，靠 name 识别要执行的函数。
+                    let call_id = self.tool_call_ids.get(&up_idx).cloned().unwrap_or_default();
+                    let name = self.tool_names.get(&up_idx).cloned().unwrap_or_default();
                     output.push(json!({
                         "type": "function_call",
                         "id": format!("{}_fc_{oidx}", self.resp_id),
                         "call_id": call_id,
-                        "name": "",
+                        "name": name,
                         "arguments": accumulated,
                         "status": "completed",
                     }));
@@ -878,8 +922,16 @@ fn map_usage_chat_to_responses(usage: &Value) -> Value {
 
 /// 写入一条 Responses SSE 事件到输出缓冲。
 fn push_sse_event(out: &mut String, event_type: &str, data: &Value) {
-    // Responses API SSE 同时有 event: 行和 data: 行；客户端以 data JSON 的 type 字段为准，
-    // 但 event: 行遵循 SSE 规范保留，便于调试和日志追踪。
+    // Responses API SSE 同时有 event: 行和 data: 行；官方客户端（OpenAI SDK/Codex）
+    // 以 data JSON 的 type 字段分发事件，因此必须把 type 注入 data 本体——
+    // 本网关自己的 UsageSseScanner 也依赖 data.type 识别 response.completed。
+    let data = if let Value::Object(map) = data {
+        let mut m = map.clone();
+        m.insert("type".to_string(), Value::String(event_type.to_string()));
+        Value::Object(m)
+    } else {
+        data.clone()
+    };
     out.push_str("event: ");
     out.push_str(event_type);
     out.push('\n');
@@ -1558,18 +1610,21 @@ impl ResponsesToChatSseTranslator {
             return;
         }
         self.closed = true;
-        // 补发一个 finish_reason:stop 的 chunk + [DONE]
-        let chunk = json!({
-            "id": self.resp_id,
-            "object": "chat.completion.chunk",
-            "model": self.model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
-        });
-        push_chat_chunk(out, &chunk);
+        // 未收到过 response.created 的空流：只发 [DONE]，不补 id/model 为空的非法 chunk。
+        if self.started {
+            // 补发一个 finish_reason:stop 的 chunk + [DONE]
+            let chunk = json!({
+                "id": self.resp_id,
+                "object": "chat.completion.chunk",
+                "model": self.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            });
+            push_chat_chunk(out, &chunk);
+        }
         out.push_str("data: [DONE]\n\n");
     }
 }
@@ -2644,6 +2699,103 @@ mod tests {
         assert!(text.contains("response.function_call_arguments.done"), "missing arguments done:\n{text}");
     }
 
+    /// 解析 SSE 文本为 (event名, data JSON) 列表。
+    fn parse_responses_sse(text: &str) -> Vec<(String, Value)> {
+        let mut events = Vec::new();
+        let mut event_name = String::new();
+        for line in text.lines() {
+            if let Some(name) = line.strip_prefix("event: ") {
+                event_name = name.to_string();
+            } else if let Some(data) = line.strip_prefix("data: ") {
+                if data != "[DONE]" {
+                    if let Ok(v) = serde_json::from_str(data) {
+                        events.push((event_name.clone(), v));
+                    }
+                }
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn c_tool_call_done_and_completed_carry_real_call_id_and_name() {
+        // 回归：done/completed 事件的 function_call item 必须回带上游真实
+        // call_id/name——客户端靠 call_id 关联 function_call_output、靠 name
+        // 识别要执行的函数；此前被错误地写成 resp 级 id 和空串。
+        let mut t = ChatToResponsesSseTranslator::new();
+        let tool_chunk = "data: {\"id\":\"chatcmpl-c1\",\"model\":\"m\",\"created\":1000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]},\"finish_reason\":null}]}\n\n";
+        let mut all = Vec::new();
+        all.extend(t.push(tool_chunk.as_bytes()));
+        all.extend(t.push(chat_sse_chunk("", Some("tool_calls")).as_bytes()));
+        let text = String::from_utf8(all).unwrap();
+        let events = parse_responses_sse(&text);
+
+        let done = events
+            .iter()
+            .find(|(name, d)| name == "response.output_item.done" && d["item"]["type"] == "function_call")
+            .expect("missing function_call output_item.done");
+        assert_eq!(done.1["item"]["call_id"], "call_123", "{text}");
+        assert_eq!(done.1["item"]["name"], "get_weather", "{text}");
+
+        let completed = events
+            .iter()
+            .find(|(name, _)| name == "response.completed")
+            .expect("missing response.completed");
+        let item = &completed.1["response"]["output"][0];
+        assert_eq!(item["call_id"], "call_123", "{text}");
+        assert_eq!(item["name"], "get_weather", "{text}");
+        assert_eq!(item["arguments"], "{\"city\":\"SF\"}", "{text}");
+        // id 是 item 级标识，call_id 是工具关联键，二者不得相同
+        assert_ne!(item["id"], item["call_id"], "{text}");
+    }
+
+    #[test]
+    fn c_empty_stream_done_emits_created_and_completed() {
+        // 回归：空流（只收到 [DONE]）也必须发 response.created + response.completed，
+        // 否则严格客户端一直等 completed 直到 TCP 超时。
+        let mut t = ChatToResponsesSseTranslator::new();
+        let out = String::from_utf8(t.push(b"data: [DONE]\n\n")).unwrap();
+        assert!(out.contains("response.created"), "{out}");
+        assert!(out.contains("response.completed"), "{out}");
+        assert!(out.contains("data: [DONE]"), "{out}");
+        // 幂等：再 push 不重复
+        let out2 = t.push(b"data: [DONE]\n\n");
+        assert!(out2.is_empty());
+    }
+
+    #[test]
+    fn c_completed_event_is_scanner_compatible() {
+        // 回归：入口翻译器输出的 response.completed 必须能被本网关 UsageSseScanner
+        // 解析出用量（官方格式：data.type + data.response.usage 嵌套）。
+        let mut t = ChatToResponsesSseTranslator::new();
+        let chunk_with_usage = "data: {\"id\":\"chatcmpl-c1\",\"model\":\"m\",\"created\":1000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":87,\"completion_tokens\":16,\"total_tokens\":103,\"prompt_cache_hit_tokens\":60}}\n\n";
+        let out = t.push(chunk_with_usage.as_bytes());
+        let text = String::from_utf8(out).unwrap();
+        // data JSON 必须带 type 字段（官方客户端按 data.type 分发）
+        let events = parse_responses_sse(&text);
+        let completed = events
+            .iter()
+            .find(|(name, _)| name == "response.completed")
+            .expect("missing response.completed");
+        assert_eq!(completed.1["type"], "response.completed", "{text}");
+
+        let mut scanner = crate::llm::usage::UsageSseScanner::new();
+        scanner.push(text.as_bytes());
+        let u = scanner.finish();
+        assert_eq!(u.prompt_tokens, 87, "{text}");
+        assert_eq!(u.cache_hit_tokens, 60, "{text}");
+        assert_eq!(u.completion_tokens, 16, "{text}");
+    }
+
+    #[test]
+    fn f_done_without_created_emits_only_done() {
+        // 空的上游 Responses 流（只收 [DONE]）：只补发 [DONE]，
+        // 不发 id/model 为空的非法 chat chunk。
+        let mut t = ResponsesToChatSseTranslator::new();
+        let out = String::from_utf8(t.push(b"data: [DONE]\n\n")).unwrap();
+        assert_eq!(out, "data: [DONE]\n\n", "{out}");
+    }
+
     #[test]
     fn c_parallel_tool_calls_index_mapping() {
         let mut t = ChatToResponsesSseTranslator::new();
@@ -2655,8 +2807,8 @@ mod tests {
         all.extend(t.push(chat_sse_chunk("", Some("tool_calls")).as_bytes()));
         let text = String::from_utf8(all).unwrap();
 
-        // 两个 output_item.added 事件
-        assert_eq!(text.matches("response.output_item.added").count(), 2);
+        // 两个 output_item.added 事件（只数 event: 行，data JSON 里的 type 字段不算）
+        assert_eq!(text.matches("event: response.output_item.added").count(), 2);
     }
 
     #[test]
@@ -2665,7 +2817,7 @@ mod tests {
         let chunk_with_usage = "data: {\"id\":\"chatcmpl-c1\",\"model\":\"m\",\"created\":1000,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n";
         let out = String::from_utf8(t.push(chunk_with_usage.as_bytes())).unwrap();
         assert!(out.contains("response.completed"));
-        let completed_pos = out.rfind("response.completed").unwrap();
+        let completed_pos = out.find("event: response.completed").unwrap();
         let completed_section = &out[completed_pos..];
         assert!(completed_section.contains("\"input_tokens\":10"));
         assert!(completed_section.contains("\"output_tokens\":5"));
