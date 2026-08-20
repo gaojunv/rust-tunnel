@@ -111,22 +111,9 @@ pub async fn handle_responses(
     // 覆盖为上游真实模型名（同 openai_handler）
     request.model = actual_model.clone();
 
-    // raw_body 以原始请求为基底，同步覆写转换后的 messages/model/stream/tools/tool_choice，
-    // 供 build_upstream_body 透传基底使用（与 openai_handler 一致）。
-    let mut raw = body.clone();
-    raw["model"] = serde_json::json!(&actual_model);
-    raw["stream"] = serde_json::json!(stream);
-    if let Ok(msgs_val) = serde_json::to_value(&request.messages) {
-        raw["messages"] = msgs_val;
-    }
-    // tools/tool_choice 已从 Responses 格式转为 chat 格式，同步回写 raw_body
-    if let Some(ref tools) = request.tools {
-        raw["tools"] = serde_json::json!(tools);
-    }
-    if let Some(ref tc) = request.tool_choice {
-        raw["tool_choice"] = tc.clone();
-    }
-    request.raw_body = Some(raw);
+    // raw_body 保持 None（重建模式）：Responses 请求的 input/instructions/max_output_tokens
+    // 等字段对 chat completions 上游是非法字段，透传会被严格校验的上游 400；
+    // 重建模式由 build_upstream_body 按 request 字段重新组装，max_tokens 等映射自然生效。
 
     // 用量采集上下文
     let mut ctx = UsageContext {
@@ -342,6 +329,7 @@ mod tests {
                 "model": "deepseek-chat",
                 "instructions": "You are helpful",
                 "input": "Hello",
+                "max_output_tokens": 512,
                 "tools": [{
                     "type": "function",
                     "name": "get_weather",
@@ -369,6 +357,15 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+        // 重建模式：Responses 专有字段不得泄漏到 chat 上游（严格校验的上游会 400）
+        assert!(upstream_body.get("input").is_none(), "{upstream_body}");
+        assert!(upstream_body.get("instructions").is_none(), "{upstream_body}");
+        assert!(
+            upstream_body.get("max_output_tokens").is_none(),
+            "{upstream_body}"
+        );
+        // max_output_tokens 映射为 max_tokens
+        assert_eq!(upstream_body["max_tokens"], 512, "{upstream_body}");
 
         // 断言响应是 Responses 格式
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
