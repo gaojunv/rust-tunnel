@@ -134,7 +134,8 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
                 aria-pressed={active === kind}
                 onClick={() => toggle(kind)}
                 className={cn(
-                  'flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                  // 44px 触控目标（Apple HIG）：移动端图标按钮比桌面大一号
+                  'flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
                   active === kind && 'bg-accent text-primary'
                 )}
               >
@@ -150,7 +151,8 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             open={active === kind}
             onOpenChange={(open) => setActive(open ? kind : null)}
           >
-            <SheetContent side="bottom" className="flex h-[60vh] flex-col gap-0 p-0">
+            {/* 60dvh 动态视口高度：地址栏伸缩时 Sheet 高度不跳变（60vh 会跳） */}
+            <SheetContent side="bottom" className="flex h-[60dvh] flex-col gap-0 p-0">
               <div className="flex items-center justify-between border-b border-border/60 py-3 pl-4 pr-10">
                 <SheetTitle className="text-sm font-medium">{t(labelKey)}</SheetTitle>
               </div>

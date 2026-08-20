@@ -235,7 +235,8 @@ export default function AgentPage() {
       {/* 顶栏：logo + WorkspaceBar + SessionBar + 多会话标签（同一行，省空间；
           标签区 flex-1 横向滚动，全关时隐藏，引导页提供新建入口） */}
       <div className="flex items-center gap-1.5 border-b border-border/60 p-1.5 md:gap-2 md:p-2">
-        <Sparkles className="h-4 w-4 shrink-0 text-primary" />
+        {/* 移动端 393px 宽度寸土寸金：装饰图标让位给标签栏，仅桌面端显示 */}
+        <Sparkles className="hidden h-4 w-4 shrink-0 text-primary md:block" />
         <WorkspaceBar
           workspaceId={workspaceId}
           onSelect={handleSelectWorkspace}

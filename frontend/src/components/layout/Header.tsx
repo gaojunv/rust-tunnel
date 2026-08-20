@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useLocation } from 'react-router-dom';
 import { cn } from '@/lib/utils';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { usePreferences } from '@/preferences/PreferencesProvider';
 import { Button } from '@/components/ui/button';
 import {
@@ -107,15 +108,21 @@ export function Header({ onLogout }: HeaderProps) {
   const { t } = useTranslation();
   const location = useLocation();
   const { prefs } = usePreferences();
+  // 移动端跳过 three.js（~600KB）装饰背景：省流量/省电，且小屏上几乎不可见。
+  // lazy() 组件不渲染就不会触发 chunk 加载，所以条件渲染即可阻止下载。
+  // jsdom/SSR 无 matchMedia 时 useMediaQuery 返回 false（移动端行为，不加载）。
+  const isDesktop = useMediaQuery('(min-width: 768px)');
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    <header className="sticky top-0 z-40 border-b border-border/70 bg-card/60 backdrop-blur-xl shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04),0_10px_30px_-12px_hsl(var(--primary)/0.22),0_2px_8px_-4px_hsl(var(--foreground)/0.08)]">
+    // PWA 全屏/刘海屏：pt-[env(safe-area-inset-top)] 让 header 背景延伸覆盖状态栏
+    // 区域（避免内容被刘海遮挡），内部 h-14 container 高度不变。
+    <header className="sticky top-0 z-40 border-b border-border/70 bg-card/60 backdrop-blur-xl shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04),0_10px_30px_-12px_hsl(var(--primary)/0.22),0_2px_8px_-4px_hsl(var(--foreground)/0.08)] pt-[env(safe-area-inset-top)]">
       {/* 装饰层（数据流光效 + 底部流光渐变线）。
           overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
           弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击。
-          titleEffect === 'none' 时跳过数据流背景（WebGL），保留底线渐变。 */}
-      {prefs.titleEffect !== 'none' && (
+          titleEffect === 'none' 或移动端时跳过数据流背景（WebGL），保留底线渐变。 */}
+      {prefs.titleEffect !== 'none' && isDesktop && (
         <Suspense fallback={null}>
           <DataFlowBackground />
         </Suspense>

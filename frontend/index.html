@@ -9,8 +9,12 @@
     />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="theme-color" content="hsl(var(--background))" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="hsl(var(--background))" media="(prefers-color-scheme: dark)" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <!-- theme-color 的 content 不支持 CSS 变量（hsl(var(--background)) 是无效值），
+         须写具体 hex：light #f8fafc（= hsl 210 40% 98%），dark #050813（= hsl 224 47% 5%） -->
+    <meta name="theme-color" content="#f8fafc" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#050813" media="(prefers-color-scheme: dark)" />
     <title>Aurora Tunnel Admin</title>
   </head>
   <body>

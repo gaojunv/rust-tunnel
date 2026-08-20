@@ -1569,6 +1569,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onSelect={selectMention}
             />
           )}
+          {/* iOS 上 <16px 的输入框聚焦会触发自动页面缩放：移动端用 16px（text-base）、桌面保持 14px */}
           <textarea
             ref={textareaRef}
             value={input}
@@ -1620,7 +1621,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               }
             }}
             placeholder={t('agent.inputPlaceholder')}
-            className="w-full min-h-[2.25rem] resize-none rounded-t-2xl border-0 bg-transparent px-3 pb-1 pt-2 text-sm leading-5 focus:outline-none"
+            className="w-full min-h-[2.25rem] resize-none rounded-t-2xl border-0 bg-transparent px-3 pb-1 pt-2 text-base leading-5 focus:outline-none md:text-sm"
             rows={1}
           />
           {/* 底部操作行：上边框与输入区分隔（模型/模式/effort 按钮 vs 文本输入） */}

@@ -63,6 +63,9 @@
 
   html {
     color-scheme: light;
+    /* 防 iOS 橡皮筋滚动/下拉刷新干扰 h-dvh 非滚动布局（/agent 页外层永不滚动，
+       橡皮筋只会让布局抖动） */
+    overscroll-behavior-y: none;
     /* 细滚动条样式：供 ScrollArea 内部或其他局部滚动容器使用。
        主滚动已迁移到 AppLayout 的 ScrollArea，html 不再强制 overflow-y: scroll。 */
     scrollbar-width: thin;
@@ -104,6 +107,8 @@
       sans-serif;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* 去掉 iOS 点击灰闪（tap 高亮） */
+    -webkit-tap-highlight-color: transparent;
   }
 
   /* 深色模式下的环境辉光背景：顶部青色 + 底部紫色，营造监控台氛围 */
