@@ -582,7 +582,7 @@ export async function createAgentWorkspace(body: {
   agent_type?: string;
   agent_path?: string;
   llm_model_id?: string;
-  agent_config_overrides?: string;
+  agent_config_overrides?: string | null;
   /** GitHub Actions 面板：owner/repo 空串=不设置；token 仅在非空时发送（服务端加密落库） */
   github_owner?: string;
   github_repo?: string;
@@ -606,7 +606,7 @@ export const updateAgentWorkspace = (
     agent_type?: string;
     agent_path?: string;
     llm_model_id?: string;
-    agent_config_overrides?: string;
+    agent_config_overrides?: string | null;
     /** GitHub 字段：空串=保持不变（服务端 COALESCE）；token 仅在非空时发送 */
     github_owner?: string;
     github_repo?: string;

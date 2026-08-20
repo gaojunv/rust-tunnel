@@ -1060,6 +1060,7 @@
     "systemPrompt": "自定义提示词",
     "systemPromptPlaceholder": "追加到内置提示词之后，用于该工作区的定制指令（可选）",
     "noMatchingFiles": "无匹配文件",
+    "noMatchingCommands": "无匹配命令",
     "stagedChanges": "已暂存改动",
     "changes": "改动",
     "untracked": "未跟踪",

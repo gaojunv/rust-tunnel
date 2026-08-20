@@ -1063,6 +1063,7 @@
     "systemPrompt": "Custom system prompt",
     "systemPromptPlaceholder": "Appended after the built-in prompt for workspace-specific instructions (optional)",
     "noMatchingFiles": "No matching files",
+    "noMatchingCommands": "No matching commands",
     "stagedChanges": "Staged Changes",
     "changes": "Changes",
     "untracked": "Untracked",

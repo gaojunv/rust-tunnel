@@ -368,7 +368,8 @@ describe('WorkspaceDialog config overrides UI', () => {
     });
     const body = api.updateAgentWorkspace.mock.calls[0][1];
     expect(body.agent_type).toBe('');
-    expect(body).not.toHaveProperty('agent_config_overrides');
+    // 切回内置引擎时显式清零（null=后端清除，省略=保留原值）
+    expect(body.agent_config_overrides).toBeNull();
   });
 });
 

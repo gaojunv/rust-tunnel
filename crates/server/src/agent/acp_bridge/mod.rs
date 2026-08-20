@@ -176,6 +176,9 @@ struct SpawnedAgent {
     /// ACP 会话配置选项快照（handshake 捕获 + config_option_update 全量替换）。
     /// 空 Vec 且 handshake 未完成 = 尚无状态；agent 不上报时保持空。
     config_options: Vec<SessionConfigOption>,
+    /// ACP 可用命令列表快照（available_commands_update 全量替换）。
+    /// 空 Vec = agent 未上报命令；新 WS 连接建立时补发一次。
+    available_commands: Vec<agent_client_protocol::schema::v1::AvailableCommand>,
     /// 握手 + 配置注入完成信号（false → true）。连接预 spawn（后台任务）仍在
     /// 握手/注入 overrides 时，首条 user_message 的 `wait_ready` 经 `subscribe`
     /// 与 `wait_for` 等待它，避免 `prompt` 报 "ACP handshake not complete" 或在
@@ -363,6 +366,19 @@ impl AcpBridge {
         }
     }
 
+    /// 当前会话的可用命令快照（WS 连接建立后主动推送用）；未就绪返回 None。
+    pub async fn session_available_commands(
+        &self,
+        session_id: &str,
+    ) -> Option<Vec<agent_client_protocol::schema::v1::AvailableCommand>> {
+        let sessions = self.sessions.lock().await;
+        let agent = sessions.get(session_id)?;
+        if agent.acp_session_id.is_none() || agent.available_commands.is_empty() {
+            return None;
+        }
+        Some(agent.available_commands.clone())
+    }
+
     /// 读会话的 Skill 清单注入缓存（None = 尚未检索）。WS handler 在首条消息检索后
     /// 经 [`Self::set_skill_list_block`] 写入；`prompt_inner` 发送前与 memory_block
     /// 一并 prepend。
@@ -442,6 +458,7 @@ mod tests {
             exited: false,
             turn_segments: Vec::new(),
             config_options: Vec::new(),
+            available_commands: Vec::new(),
             spawn_ready: watch::channel(false).0,
             pending_prompts: VecDeque::new(),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),

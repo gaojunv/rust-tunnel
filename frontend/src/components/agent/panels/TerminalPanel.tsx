@@ -81,8 +81,9 @@ export default function TerminalPanel({ workspaceId }: { workspaceId: string }) 
       setStatus('error');
     };
 
-    // 容器尺寸变化 → 重新 fit（resize 不重协商 PTY 尺寸，MVP 接受）
+    // 容器尺寸变化 → 重新 fit + 防抖上报 PTY resize（~200ms 避免拖拽期间刷屏）
     let ro: ResizeObserver | null = null;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     if (typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(() => {
         try {
@@ -90,12 +91,22 @@ export default function TerminalPanel({ workspaceId }: { workspaceId: string }) 
         } catch {
           // 面板隐藏/容器无尺寸时忽略
         }
+        // 防抖上报 PTY 尺寸：仅 WS OPEN 时发送
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+            } catch { /* ws closed between check and send */ }
+          }
+        }, 200);
       });
       ro.observe(containerRef.current!);
     }
 
     return () => {
       ro?.disconnect();
+      if (resizeTimer) clearTimeout(resizeTimer);
       dataSub.dispose();
       ws.onopen = null;
       ws.onmessage = null;

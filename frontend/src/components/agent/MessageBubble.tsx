@@ -658,6 +658,13 @@ const PLAN_MARK: Record<string, { mark: string; cls: string }> = {
   pending: { mark: '○', cls: 'text-muted-foreground' },
 };
 
+/** plan 条目优先级 → 语义色徽标（参照 KindChip 配色风格）。 */
+const PRIORITY_BADGE: Record<string, { label: string; cls: string }> = {
+  high: { label: 'H', cls: 'bg-red-500/15 text-red-600 dark:text-red-400' },
+  medium: { label: 'M', cls: 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400' },
+  low: { label: 'L', cls: 'bg-muted text-muted-foreground' },
+};
+
 /** 计划气泡：checklist 样式；新 plan 帧由 ChatStream 就地更新本气泡内容。 */
 function PlanBubble({ entries }: { entries: PlanEntryItem[] }) {
   const { t } = useTranslation();
@@ -670,12 +677,18 @@ function PlanBubble({ entries }: { entries: PlanEntryItem[] }) {
       <ul className="space-y-0.5">
         {entries.map((e, i) => {
           const mark = PLAN_MARK[e.status] ?? PLAN_MARK.pending;
+          const prio = e.priority ? PRIORITY_BADGE[e.priority] : null;
           return (
             <li key={i} className="flex items-baseline gap-2 text-xs">
               <span className={mark.cls}>{mark.mark}</span>
               <span className={e.status === 'completed' ? 'text-muted-foreground line-through' : ''}>
                 {e.content}
               </span>
+              {prio && (
+                <span className={`inline-flex h-4 shrink-0 items-center rounded px-1 text-[10px] font-medium leading-none ${prio.cls}`}>
+                  {prio.label}
+                </span>
+              )}
             </li>
           );
         })}

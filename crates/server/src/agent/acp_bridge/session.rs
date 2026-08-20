@@ -150,6 +150,7 @@ impl AcpBridge {
                     exited: false,
                     turn_segments: Vec::new(),
                     config_options: Vec::new(),
+                    available_commands: Vec::new(),
                     spawn_ready: watch::channel(false).0,
                     pending_prompts: migrated_prompts,
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
@@ -463,6 +464,13 @@ impl AcpBridge {
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                agent_client_protocol::schema::v1::SessionUpdate::AvailableCommandsUpdate(
+                                    upd,
+                                ) => {
+                                    if let Some(a) = sessions.lock().await.get_mut(&sid) {
+                                        a.available_commands = upd.available_commands.clone();
                                     }
                                 }
                                 _ => {}
@@ -1461,16 +1469,31 @@ impl AcpBridge {
     }
 
     /// 构造全量 session_state 帧；无状态（未握手/agent 不上报）返回 None。
+    /// 同时包含 available_commands（若有），确保新连接的标签页能拿到最新命令列表。
     async fn session_state_frame(&self, session_id: &str) -> Option<serde_json::Value> {
         let sessions = self.sessions.lock().await;
         let agent = sessions.get(session_id)?;
         if agent.acp_session_id.is_none() || agent.config_options.is_empty() {
             return None;
         }
-        Some(serde_json::json!({
+        let mut frame = serde_json::json!({
             "type": "session_state",
             "options": agent.config_options,
-        }))
+        });
+        if !agent.available_commands.is_empty() {
+            let commands: Vec<serde_json::Value> = agent
+                .available_commands
+                .iter()
+                .map(|cmd| {
+                    serde_json::json!({
+                        "name": cmd.name,
+                        "description": cmd.description,
+                    })
+                })
+                .collect();
+            frame["available_commands"] = serde_json::Value::Array(commands);
+        }
+        Some(frame)
     }
 
     /// 握手成功后注入 workspace 级 ACP 引擎选项覆盖（`agent_config_overrides`，

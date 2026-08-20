@@ -703,8 +703,9 @@ export interface AgentWorkspace {
   agent_path?: string;
   /** workspace 默认 LLM 模型 id（llm_models.id） */
   llm_model_id?: string;
-  /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent */
-  agent_config_overrides?: string;
+  /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent。
+   *  null = 显式清零（PATCH 时发 null 后端清除）；undefined = 省略（保持原值） */
+  agent_config_overrides?: string | null;
   /** 是否已配置 GitHub token（仅布尔位，token 明文永不回传） */
   github_token_set?: boolean;
   /** 手填 GitHub owner（组织/用户名）；为 null 时经隧道从 git remote 探测 */
@@ -976,11 +977,20 @@ export type AgentWsEvent =
   | { type: 'stream_reset' }
   // 应用层心跳：看门狗探活 + 重置 running 不活动兜底，不渲染
   | { type: 'heartbeat'; ts?: number }
-  | { type: 'session_state'; options?: SessionConfigOption[] }
+  | {
+      type: 'session_state';
+      options?: SessionConfigOption[];
+      // 重连补发的斜杠命令快照（嵌于 session_state，后端 acp_bridge 补发）
+      available_commands?: { name: string; description?: string }[];
+    }
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
   | { type: 'current_mode_update'; mode_id?: string }
   | { type: 'mode_updated'; mode?: string }
-  | { type: 'todo_update'; todos?: TodoItem[] };
+  | { type: 'todo_update'; todos?: TodoItem[] }
+  | {
+      type: 'available_commands';
+      commands?: { name: string; description?: string }[];
+    };
 
 /** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
  *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */
