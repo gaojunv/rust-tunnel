@@ -193,21 +193,27 @@ pub async fn call_upstream(
     request: &ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let req_body = build_upstream_body(request);
-    call_upstream_with_body(base_url, api_key, &req_body).await
+    call_upstream_with_body(base_url, api_key, &req_body, "v1/chat/completions").await
 }
 
 /// 用已构造好的请求体调用上游。
 ///
+/// `path` 为上游 API 路径（如 `"v1/chat/completions"` 或 `"v1/responses"`）。
 /// 调用方（handler）先用 `build_upstream_body` 构造 body、写入完整请求日志，
 /// 再走这里发送——保证日志内容与实际发送的请求体一致。
 pub async fn call_upstream_with_body(
     base_url: &str,
     api_key: &str,
     req_body: &serde_json::Value,
+    path: &str,
 ) -> Result<Response, (StatusCode, String)> {
     let client = &*UPSTREAM_CLIENT;
 
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
 
     let req = client
         .post(&url)
@@ -364,6 +370,7 @@ pub fn set_body_model(body: &mut serde_json::Value, model: &str) {
 
 /// 流式上游调用的首字节守卫。
 ///
+/// `path` 为上游 API 路径（如 `"v1/chat/completions"` 或 `"v1/responses"`）。
 /// 与 `call_upstream_with_body` 的差别：拿到 2xx 响应后不直接 relay，
 /// 而是先缓冲到第一个 SSE `data:` 事件（30s 首字节超时），成功再把
 /// "已缓冲前缀 + 剩余流"拼成响应体返回；失败按 `(status, msg)` 返回，
@@ -374,11 +381,16 @@ pub async fn call_upstream_stream_guarded(
     base_url: &str,
     api_key: &str,
     req_body: &serde_json::Value,
+    path: &str,
 ) -> Result<Response, (StatusCode, String)> {
     use futures_util::StreamExt;
 
     let client = &*UPSTREAM_CLIENT;
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -551,14 +563,63 @@ pub async fn execute_with_failover(
         let mut body = req_body.clone();
         set_body_model(&mut body, &cand.model_name);
 
-        // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
-        // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
-        // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
-        let result = if stream && chain.candidates.len() > 1 {
-            call_upstream_stream_guarded(&cand.provider.base_url, &cand.provider.api_key, &body)
-                .await
-        } else {
-            call_upstream_with_body(&cand.provider.base_url, &cand.provider.api_key, &body).await
+        // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
+        let result = match cand.upstream_protocol {
+            crate::llm::router::UpstreamProtocol::ChatCompletions => {
+                // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
+                // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
+                // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
+                if stream && chain.candidates.len() > 1 {
+                    call_upstream_stream_guarded(
+                        &cand.provider.base_url,
+                        &cand.provider.api_key,
+                        &body,
+                        "v1/chat/completions",
+                    )
+                    .await
+                } else {
+                    call_upstream_with_body(
+                        &cand.provider.base_url,
+                        &cand.provider.api_key,
+                        &body,
+                        "v1/chat/completions",
+                    )
+                    .await
+                }
+            }
+            crate::llm::router::UpstreamProtocol::Responses => {
+                // 转换请求体：chat → Responses 格式
+                body = super::responses::chat_body_to_responses_body(&body);
+                // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
+                let upstream_resp = if stream && chain.candidates.len() > 1 {
+                    call_upstream_stream_guarded(
+                        &cand.provider.base_url,
+                        &cand.provider.api_key,
+                        &body,
+                        "v1/responses",
+                    )
+                    .await
+                } else {
+                    call_upstream_with_body(
+                        &cand.provider.base_url,
+                        &cand.provider.api_key,
+                        &body,
+                        "v1/responses",
+                    )
+                    .await
+                };
+                // 响应转换：Responses → Chat Completions 格式
+                match upstream_resp {
+                    Ok(resp) => {
+                        if stream {
+                            super::responses::convert_responses_stream_to_chat(resp)
+                        } else {
+                            super::responses::convert_responses_to_chat_response(resp).await
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
 
         match result {
@@ -1203,7 +1264,7 @@ mod tests {
         });
 
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1225,7 +1286,7 @@ mod tests {
             l.local_addr().unwrap()
         };
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
@@ -1250,7 +1311,7 @@ mod tests {
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1285,7 +1346,7 @@ mod tests {
 
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let started = std::time::Instant::now();
-        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap();
         let ttfb = started.elapsed();
@@ -1328,6 +1389,14 @@ mod tests {
 
     /// 快速构造 CandidateChain（测试用）。
     fn test_chain(specs: &[(&str, &str, &str)]) -> crate::llm::router::CandidateChain {
+        test_chain_with_protocol(specs, crate::llm::router::UpstreamProtocol::ChatCompletions)
+    }
+
+    /// 快速构造 CandidateChain，指定上游协议（测试用）。
+    fn test_chain_with_protocol(
+        specs: &[(&str, &str, &str)],
+        protocol: crate::llm::router::UpstreamProtocol,
+    ) -> crate::llm::router::CandidateChain {
         use crate::llm::router::{Candidate, CandidateChain};
         use crate::llm::ProviderConfig;
         CandidateChain {
@@ -1350,6 +1419,38 @@ mod tests {
                     model_name: model_name.to_string(),
                     model_id: model_id.to_string(),
                     priority: i as i64,
+                    upstream_protocol: protocol,
+                })
+                .collect(),
+            group_name: Some("g".into()),
+        }
+    }
+
+    /// 快速构造混合协议 CandidateChain（测试用）。
+    fn test_chain_mixed(specs: &[(&str, &str, &str, crate::llm::router::UpstreamProtocol)]) -> crate::llm::router::CandidateChain {
+        use crate::llm::router::{Candidate, CandidateChain};
+        use crate::llm::ProviderConfig;
+        CandidateChain {
+            candidates: specs
+                .iter()
+                .enumerate()
+                .map(|(i, (base, model_name, model_id, proto))| Candidate {
+                    provider: ProviderConfig {
+                        id: format!("p{}", i),
+                        name: format!("P{}", i),
+                        provider_type: "deepseek".into(),
+                        base_url: base.to_string(),
+                        api_key: "k".into(),
+                        extra_config: None,
+                        anthropic_base_url: None,
+                        enabled: true,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                    },
+                    model_name: model_name.to_string(),
+                    model_id: model_id.to_string(),
+                    priority: i as i64,
+                    upstream_protocol: *proto,
                 })
                 .collect(),
             group_name: Some("g".into()),
@@ -1694,7 +1795,7 @@ mod tests {
         });
 
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body)
+        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
@@ -1900,5 +2001,306 @@ mod tests {
             2,
             "400 不缓存：每次都重新请求首选"
         );
+    }
+
+    // ── Responses 上游协议集成测试 ─────────────────────────────────
+
+    /// Responses 候选非流式：断言上游收到 Responses 格式请求体（input 数组、store:false、
+    /// 无 messages 字段），URL 是 /v1/responses；上游返回 Responses JSON，
+    /// 网关得到 chat completion JSON。
+    #[tokio::test]
+    async fn test_failover_responses_candidate_non_streaming() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let received_responses_format = Arc::new(AtomicBool::new(false));
+        let rrf = received_responses_format.clone();
+
+        let upstream = start_behavior_upstream(move |mut s| {
+            let rrf = rrf.clone();
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap();
+                let req_text = String::from_utf8_lossy(&buf[..n]);
+
+                // 验证：URL 包含 /v1/responses
+                let first_line = req_text.lines().next().unwrap_or("");
+                assert!(
+                    first_line.contains("/v1/responses"),
+                    "upstream should receive /v1/responses URL, got: {first_line}"
+                );
+
+                // 验证：请求体是 Responses 格式（有 input 数组、store:false、无 messages）
+                if let Some(body_start) = req_text.find("\r\n\r\n") {
+                    let body = &req_text[body_start + 4..];
+                    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                    assert!(
+                        v.get("input").is_some(),
+                        "should have 'input' field (Responses format): {body}"
+                    );
+                    assert_eq!(v["store"], false, "should have store:false");
+                    assert!(
+                        v.get("messages").is_none(),
+                        "should NOT have 'messages' field: {body}"
+                    );
+                    rrf.store(true, Ordering::SeqCst);
+                }
+
+                // 返回 Responses 格式响应
+                let responses_json = serde_json::json!({
+                    "id": "resp_abc",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "model": "gpt-5-codex",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Hello from Responses" }]
+                    }],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15
+                    }
+                });
+                let resp_body = responses_json.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain_with_protocol(
+            &[(&upstream, "gpt-5-codex", "id-resp")],
+            crate::llm::router::UpstreamProtocol::Responses,
+        );
+        let body = serde_json::json!({
+            "model": "router",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+        } = out
+        else {
+            panic!("expected success");
+        };
+        assert!(!failed_over);
+        assert_eq!(candidate.model_id, "id-resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            received_responses_format.load(Ordering::SeqCst),
+            "upstream should have received Responses format request"
+        );
+
+        // 验证：响应体是 chat completion 格式
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let chat_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(chat_resp["object"], "chat.completion");
+        assert_eq!(
+            chat_resp["choices"][0]["message"]["content"],
+            "Hello from Responses"
+        );
+        assert_eq!(chat_resp["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chat_resp["usage"]["prompt_tokens"], 10);
+        assert_eq!(chat_resp["usage"]["completion_tokens"], 5);
+    }
+
+    /// Responses 候选流式：上游发 Responses SSE（response.created / output_text.delta /
+    /// response.completed 带 usage），断言客户端收到 chat chunk SSE
+    ///（delta.content、收尾 finish_reason+usage、[DONE]）。
+    #[tokio::test]
+    async fn test_failover_responses_candidate_streaming() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let received_responses_format = Arc::new(AtomicBool::new(false));
+        let rrf = received_responses_format.clone();
+
+        let upstream = start_behavior_upstream(move |mut s| {
+            let rrf = rrf.clone();
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap();
+                let req_text = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req_text.lines().next().unwrap_or("");
+                assert!(
+                    first_line.contains("/v1/responses"),
+                    "upstream should receive /v1/responses URL, got: {first_line}"
+                );
+                rrf.store(true, Ordering::SeqCst);
+
+                // 返回 Responses SSE 流
+                let sse = concat!(
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_s1\",\"model\":\"gpt-5\",\"created_at\":1700000000,\"output\":[],\"status\":\"in_progress\"}}\n\n",
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n",
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n",
+                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_s1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello world\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":3,\"total_tokens\":11}}}\n\n",
+                    "data: [DONE]\n\n",
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain_with_protocol(
+            &[(&upstream, "gpt-5", "id-sresp")],
+            crate::llm::router::UpstreamProtocol::Responses,
+        );
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let FailoverOutcome::Success { resp, .. } = out else {
+            panic!("expected success");
+        };
+        assert!(received_responses_format.load(Ordering::SeqCst));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 读取完整 SSE 流
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // 验证 chat chunk SSE 格式
+        assert!(
+            text.contains("chat.completion.chunk"),
+            "should have chat.completion.chunk objects:\n{text}"
+        );
+        assert!(
+            text.contains("\"content\":\"Hello \""),
+            "should have content delta:\n{text}"
+        );
+        assert!(
+            text.contains("\"content\":\"world\""),
+            "should have second content delta:\n{text}"
+        );
+        assert!(
+            text.contains("\"finish_reason\":\"stop\""),
+            "should have finish_reason stop:\n{text}"
+        );
+        assert!(
+            text.contains("\"prompt_tokens\":8"),
+            "should have usage:\n{text}"
+        );
+        assert!(
+            text.contains("data: [DONE]"),
+            "should end with [DONE]:\n{text}"
+        );
+    }
+
+    /// 混合候选链故障转移：首选 Responses 候选 500，次选 chat 候选成功——
+    /// 断言两次上游调用格式各自正确、最终响应正常。
+    #[tokio::test]
+    async fn test_failover_mixed_chain_responses_500_then_chat_success() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let rh = responses_hits.clone();
+        let ch = chat_hits.clone();
+
+        // 首选：Responses 候选，返回 500
+        let responses_up = {
+            let rh = rh.clone();
+            start_behavior_upstream(move |mut s| {
+                let rh = rh.clone();
+                Box::pin(async move {
+                    rh.fetch_add(1, Ordering::SeqCst);
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let _ = s.read(&mut buf).await;
+                    let err_body = r#"{"error":{"message":"internal","type":"server_error"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        err_body.len(),
+                        err_body
+                    );
+                    s.write_all(resp.as_bytes()).await.unwrap();
+                })
+            })
+            .await
+        };
+
+        // 次选：Chat Completions 候选，成功
+        let chat_up = {
+            let ch = ch.clone();
+            start_behavior_upstream(move |mut s| {
+                let ch = ch.clone();
+                Box::pin(async move {
+                    ch.fetch_add(1, Ordering::SeqCst);
+                    drain_request(&mut s).await;
+                    write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+                })
+            })
+            .await
+        };
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain_mixed(&[
+            (
+                &responses_up,
+                "gpt-5-codex",
+                "id-resp",
+                crate::llm::router::UpstreamProtocol::Responses,
+            ),
+            (
+                &chat_up,
+                "gpt-4o",
+                "id-chat",
+                crate::llm::router::UpstreamProtocol::ChatCompletions,
+            ),
+        ]);
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+        } = out
+        else {
+            panic!("expected success via chat fallback");
+        };
+        assert!(failed_over, "should have failed over from Responses to Chat");
+        assert_eq!(candidate.model_id, "id-chat");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1, "responses candidate hit once");
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 1, "chat candidate hit once");
+
+        // 验证最终响应是 chat completion 格式
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("hi"), "should contain upstream content: {text}");
+        assert!(text.contains("[DONE]"), "should have [DONE] terminator: {text}");
     }
 }

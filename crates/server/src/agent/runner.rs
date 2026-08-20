@@ -3000,6 +3000,7 @@ mod tests {
             model_name: "deepseek-chat".into(),
             model_id: "m1".into(),
             priority: 0,
+            upstream_protocol: crate::llm::router::UpstreamProtocol::default(),
         };
         let ctx = runner_usage_ctx(&candidate, "my-alias", None);
         assert_eq!(ctx.api_key_id, None);

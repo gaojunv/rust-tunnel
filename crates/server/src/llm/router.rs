@@ -1,5 +1,38 @@
 use crate::llm::{LlmState, ProviderConfig};
 
+/// 模型上游协议类型。
+///
+/// 与 [`agent::compact::context_limit_for`] 同为 per-model `extra_config` JSON 键；
+/// 本枚举读取 `upstream_protocol` 键，默认 `ChatCompletions`（零迁移成本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpstreamProtocol {
+    /// 标准 Chat Completions API（`/v1/chat/completions`），默认值。
+    #[default]
+    ChatCompletions,
+    /// OpenAI Responses API（`/v1/responses`）。
+    Responses,
+}
+
+/// 从 model `extra_config` JSON 读取 `upstream_protocol` 键，返回协议类型。
+///
+/// - `"responses"` → [`UpstreamProtocol::Responses`]
+/// - 其余值 / 缺失 / JSON 解析失败 → [`UpstreamProtocol::ChatCompletions`]（默认）
+pub fn parse_upstream_protocol(extra_config: Option<&str>) -> UpstreamProtocol {
+    let Some(ec) = extra_config else {
+        return UpstreamProtocol::ChatCompletions;
+    };
+    serde_json::from_str::<serde_json::Value>(ec)
+        .ok()
+        .and_then(|v| v.get("upstream_protocol")?.as_str().map(str::to_lowercase))
+        .map_or(UpstreamProtocol::ChatCompletions, |s| {
+            if s == "responses" {
+                UpstreamProtocol::Responses
+            } else {
+                UpstreamProtocol::ChatCompletions
+            }
+        })
+}
+
 /// 模型路由解析失败的类别。
 #[derive(Debug)]
 pub enum ResolveError {
@@ -34,6 +67,8 @@ pub struct Candidate {
     pub model_id: String,
     /// 组内尝试顺序（小者优先）；单模型链为 0。
     pub priority: i64,
+    /// 模型上游协议（从 `extra_config` 解析）。
+    pub upstream_protocol: UpstreamProtocol,
 }
 
 /// 一次请求的有序候选链。
@@ -79,6 +114,7 @@ pub async fn resolve_with_failover(
                 model_name: m.model_name.clone(),
                 model_id: m.id.clone(),
                 priority: 0,
+                upstream_protocol: parse_upstream_protocol(m.extra_config.as_deref()),
             }],
             group_name: None,
         });
@@ -108,6 +144,7 @@ pub async fn resolve_with_failover(
             model_name: m.model_name.clone(),
             model_id: m.id.clone(),
             priority: *priority as i64,
+            upstream_protocol: parse_upstream_protocol(m.extra_config.as_deref()),
         });
     }
 
@@ -488,5 +525,127 @@ mod tests {
         let chain = resolve_with_failover(&state, "router").await.unwrap();
         assert_eq!(chain.candidates.len(), 1);
         assert_eq!(chain.candidates[0].model_id, "m1");
+    }
+
+    // ── UpstreamProtocol 测试 ─────────────────────────────────────
+
+    #[test]
+    fn parse_upstream_protocol_missing_returns_default() {
+        assert_eq!(parse_upstream_protocol(None), UpstreamProtocol::ChatCompletions);
+        assert_eq!(parse_upstream_protocol(Some("{}")), UpstreamProtocol::ChatCompletions);
+    }
+
+    #[test]
+    fn parse_upstream_protocol_invalid_json_returns_default() {
+        assert_eq!(
+            parse_upstream_protocol(Some("not-json")),
+            UpstreamProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn parse_upstream_protocol_other_value_returns_default() {
+        assert_eq!(
+            parse_upstream_protocol(Some(r#"{"upstream_protocol":"chat"}"#)),
+            UpstreamProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn parse_upstream_protocol_responses() {
+        assert_eq!(
+            parse_upstream_protocol(Some(r#"{"upstream_protocol":"responses"}"#)),
+            UpstreamProtocol::Responses
+        );
+    }
+
+    #[test]
+    fn parse_upstream_protocol_case_insensitive() {
+        assert_eq!(
+            parse_upstream_protocol(Some(r#"{"upstream_protocol":"Responses"}"#)),
+            UpstreamProtocol::Responses
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_single_model_with_extra_config_protocol() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        let extra = r#"{"upstream_protocol":"responses"}"#;
+        db.llm_save_model("m1", "p1", "gpt-5-codex", "", "[]", true, Some(extra))
+            .await
+            .unwrap();
+
+        let state = LlmState::new(Some(db), None);
+        let chain = resolve_with_failover(&state, "gpt-5-codex")
+            .await
+            .unwrap();
+        assert_eq!(chain.candidates.len(), 1);
+        assert_eq!(
+            chain.candidates[0].upstream_protocol,
+            UpstreamProtocol::Responses
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_group_mixes_protocols() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        db.llm_save_provider(
+            "p1",
+            "DS",
+            "deepseek",
+            "https://api.deepseek.com",
+            "k",
+            None::<&str>,
+            None::<&str>,
+            true,
+        )
+        .await
+        .unwrap();
+        // m1: chat completions（无 extra_config）
+        db.llm_save_model("m1", "p1", "gpt-4o", "", "[]", true, None)
+            .await
+            .unwrap();
+        // m2: responses 协议
+        let extra = r#"{"upstream_protocol":"responses"}"#;
+        db.llm_save_model("m2", "p1", "gpt-5-codex", "", "[]", true, Some(extra))
+            .await
+            .unwrap();
+
+        db.llm_create_model_group("g1", "mixed", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m1".into(), 1), ("m2".into(), 2)])
+            .await
+            .unwrap();
+
+        let state = LlmState::new(Some(db), None);
+        let chain = resolve_with_failover(&state, "mixed").await.unwrap();
+        assert_eq!(chain.candidates.len(), 2);
+        assert_eq!(
+            chain.candidates[0].upstream_protocol,
+            UpstreamProtocol::ChatCompletions
+        );
+        assert_eq!(
+            chain.candidates[1].upstream_protocol,
+            UpstreamProtocol::Responses
+        );
     }
 }

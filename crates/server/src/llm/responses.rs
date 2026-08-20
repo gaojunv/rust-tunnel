@@ -1709,6 +1709,93 @@ pub async fn convert_openai_to_responses_response(
         .unwrap()
 }
 
+// ── H. 上游 Responses → Chat 响应转换（failover 用） ──────────────
+
+/// 非流式：把上游 Responses API 响应 JSON 转成 Chat Completions 格式。
+///
+/// 有界读 body（`upstream::MAX_UPSTREAM_BODY_BYTES`，超限 502），
+/// parse JSON 后调用 [`responses_response_to_chat`]；parse 失败返回 502。
+pub async fn convert_responses_to_chat_response(
+    responses_resp: axum::response::Response,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use serde_json::Value;
+
+    let status = responses_resp.status();
+    let body_bytes = axum::body::to_bytes(
+        responses_resp.into_body(),
+        super::upstream::MAX_UPSTREAM_BODY_BYTES,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to read upstream responses body (too large or read error): {e}"),
+        )
+    })?;
+
+    let responses_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("invalid responses-format upstream body: {e}"),
+        )
+    })?;
+
+    let chat_json = responses_response_to_chat(&responses_json);
+
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&chat_json).unwrap_or_else(|_| body_bytes.to_vec()),
+        ))
+        .unwrap())
+}
+
+/// 流式：把上游 Responses SSE 字节流逐事件翻译成 Chat chunk SSE。
+///
+/// 用 [`ResponsesToChatSseTranslator`] 包装字节流，每个上游字节块喂入翻译器，
+/// 返回的字节直接发给客户端。
+pub fn convert_responses_stream_to_chat(
+    responses_resp: axum::response::Response,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+    use futures_util::StreamExt;
+
+    let byte_stream = responses_resp.into_body().into_data_stream();
+    let translator = std::sync::Arc::new(std::sync::Mutex::new(
+        ResponsesToChatSseTranslator::new(),
+    ));
+    let out = byte_stream.filter_map(move |chunk| {
+        let translator = translator.clone();
+        async move {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = translator.lock().unwrap().push(&bytes);
+                    if converted.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(converted))
+                    }
+                }
+                Err(e) => Some(Err(std::io::Error::other(e.to_string()))),
+            }
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(Body::from_stream(out))
+        .unwrap())
+}
+
 // ── 测试 ────────────────────────────────────────────────────────
 
 #[cfg(test)]
