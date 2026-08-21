@@ -3,16 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <!-- PWA 全面屏：viewport-fit=cover 让内容延伸到屏幕物理边缘（状态栏/刘海/
-         Home 指示条区），是页头贴顶、底部按钮贴底的唯一开关；apple-mobile-web-app-capable
-         是老 web-app 模式开关，standalone 生效必需；black-translucent 让状态栏透明、
-         内容画到其后面。三者缺一，内容就被限制在系统预留的安全区内、四周露色带。 -->
+    <!-- 直接照抄 Kimi 的字面值（实测为准，不做推断）：
+         viewport 无 viewport-fit=cover（默认 contain）；
+         mobile-web-app-capable（iOS 16.4+ 通用，Kimi 用此而非 apple- 前缀）；
+         status-bar-style = black（Kimi 字面值）。 -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <!-- theme-color 的 content 不支持 CSS 变量（hsl(var(--background)) 是无效值），

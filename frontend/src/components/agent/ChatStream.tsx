@@ -1630,10 +1630,10 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             时都与消息流左/右边缘精确对齐。sticky 在文档流中占位，滚动到底时输入框
             落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区，
             滚动内容从输入框底下经过时被 bg-card 遮挡。顶部 absolute 渐隐让内容
-            淡出到输入框，不占文档流高度。pb-[34px] 写死垫高让输入框背景延伸
-            到屏幕物理底部（Home 指示条区），输入框本体抬到其上方。iOS 26+
-            standalone 下 env(safe-area-inset-bottom) 恒为 0，故写死不依赖 env。 */}
-        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[34px] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+            淡出到输入框，不占文档流高度。底部垫高用 env(safe-area-inset-bottom)
+            自适应（对标 Kimi：全面屏 iPhone 垫满 Home 指示条区、home 键机型垫 0
+            不悬空），+12px 最小值兜底保证输入框不贴屏幕物理边缘。 */}
+        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[calc(env(safe-area-inset-bottom,0px)+12px)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
           <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
           <div className="mx-auto w-full max-w-3xl">
           {running && (
