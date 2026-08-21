@@ -1662,6 +1662,33 @@ describe('ChatStream running state', () => {
     // 不注入 session_state：configOptions 为空 → 快捷按钮不渲染
     expect(screen.queryByRole('button', { name: 'agent.configMode' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'agent.configEffort' })).toBeNull();
+    // runner 审批模式切换按钮（set_mode）在非 ACP 会话照常渲染
+    expect(screen.getByRole('button', { name: 'Plan' })).toBeTruthy();
+  });
+
+  it('hides runner Plan button for ACP sessions (mode switches via configMode instead)', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    // 注入 session_state：mode 项 → ACP 会话
+    act(() => {
+      wsInstance!.emit({
+        type: 'session_state',
+        options: [
+          {
+            id: 'mode',
+            name: 'Mode',
+            category: 'mode',
+            type: 'select',
+            currentValue: 'plan',
+            options: [{ value: 'plan', name: 'Plan' }],
+          },
+        ],
+      });
+    });
+    // ACP 上报 config options 后：runner 的 Plan 按钮（set_mode）隐藏，
+    // mode 切换走 configMode 快捷按钮（set_config_option 帧）
+    expect(screen.queryByRole('button', { name: 'Plan' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'agent.configMode' }).textContent).toContain('Plan');
   });
 
   it('shows disabled Effort placeholder when agent reported options without effort', () => {

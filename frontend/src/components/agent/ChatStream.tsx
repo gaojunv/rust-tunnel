@@ -1823,21 +1823,27 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onConfigChange={sendConfigOption}
             />
             <div className="flex items-center gap-0.5">
-              {/* Plan 模式切换按钮（runner 路径）：ACP 路径走 ConfigOptionButton，runner 路径走 set_mode */}
-              {approvalMode === 'plan' && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-                  {t('agent.approvalMode_plan')}
-                </span>
+              {/* Plan 模式切换按钮（runner 路径）：ACP 会话（已上报 config_options）隐藏——
+                  ACP 的 mode 切换走右侧 ConfigOptionButton（set_config_option 帧），
+                  set_mode 帧只改 workspace.approval_mode（runner 审批语义），ACP 下无意义。 */}
+              {configOptions.length === 0 && (
+                <>
+                  {approvalMode === 'plan' && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                      {t('agent.approvalMode_plan')}
+                    </span>
+                  )}
+                  <Button
+                    size="sm"
+                    variant={approvalMode === 'plan' ? 'default' : 'ghost'}
+                    className="h-7 rounded-full px-2 text-xs"
+                    onClick={() => sendSetMode(approvalMode === 'plan' ? 'safe' : 'plan')}
+                    title={approvalMode === 'plan' ? t('agent.approvalModeHint_plan') : t('agent.approvalModeHint_safe')}
+                  >
+                    {approvalMode === 'plan' ? t('agent.approvalMode_plan') : 'Plan'}
+                  </Button>
+                </>
               )}
-              <Button
-                size="sm"
-                variant={approvalMode === 'plan' ? 'default' : 'ghost'}
-                className="h-7 rounded-full px-2 text-xs"
-                onClick={() => sendSetMode(approvalMode === 'plan' ? 'safe' : 'plan')}
-                title={approvalMode === 'plan' ? t('agent.approvalModeHint_plan') : t('agent.approvalModeHint_safe')}
-              >
-                {approvalMode === 'plan' ? t('agent.approvalMode_plan') : 'Plan'}
-              </Button>
               <ConfigOptionButton
                 option={modeOption}
                 label="agent.configMode"
