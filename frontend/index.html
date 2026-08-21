@@ -3,17 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <!-- 对标 Kimi：不设 viewport-fit=cover（默认 contain）。
-         cover 会让 iOS PWA 把页面渲染进刘海/Home 指示条安全区，触发 WebKit
-         bug 254861（键盘 dismiss 后视口不恢复 → 底部留白），且键盘弹出时
-         压缩布局视口导致整页内容上移。contain 下视口行为保守稳定。
-         安全区适配改由 env(safe-area-inset-bottom) 在需要的元素上精确处理。 -->
+    <!-- 直接照抄 Kimi 的字面值（实测为准，不做推断）：
+         viewport 无 viewport-fit=cover（默认 contain）；
+         mobile-web-app-capable（iOS 16.4+ 通用，Kimi 用此而非 apple- 前缀）；
+         status-bar-style = black（Kimi 字面值）。 -->
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <!-- theme-color 的 content 不支持 CSS 变量（hsl(var(--background)) 是无效值），
