@@ -12,10 +12,10 @@ export default function AppLayout() {
 
   // AI 工作台是唯一「整页自管理滚动」的路由：消息区/面板在页面内部各自滚动，
   // 外层再包一个整页滚动容器会叠出双重滚动条（历史：5ad703a 修过一次仍复发）。
-  // 对它走非滚动分支：外层 h-vvh（= window.innerHeight，对标 Kimi 的 --vh 方案）
-  // 替代 h-dvh——innerHeight 在 iOS PWA 键盘弹收时跟随可视视口，不像 dvh 会触发
-  // 布局视口压缩导致整页内容上移。AgentPage 用 h-full 精确填满 Header 以下空间，
-  // 外层永不产生滚动条。
+  // 对它走非滚动分支：外层 h-dvh 动态视口高度，AgentPage 用 h-full 精确填满
+  // Header 以下空间，外层永不产生滚动条。
+  // （iOS 键盘三问题由 index.html 的 contain 视口根治，与高度单位无关；
+  //   曾改用 --vh(innerHeight) 反而因 iOS 取值不准导致页头空白，已回退 dvh。）
   const isAgentRoute = location.pathname === '/agent';
 
   const handleLogout = useCallback(async () => {
@@ -45,7 +45,7 @@ export default function AppLayout() {
   );
 
   return (
-    <div className={cn('flex flex-col', isAgentRoute ? 'h-vvh' : 'h-screen')}>
+    <div className={cn('flex flex-col', isAgentRoute ? 'h-dvh' : 'h-screen')}>
       <Header onLogout={handleLogout} />
       {isAgentRoute ? (
         <main className="min-h-0 flex-1 overflow-hidden">
