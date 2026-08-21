@@ -125,9 +125,10 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             此前在横向 flex 里放 h-12 spacer 宽度为 0，不产生占位，导致输入框卡片
             底部被本栏遮挡（发送/停止按钮不可见）。
             垫高用 env(safe-area-inset-bottom) 自适应（对标 Kimi）：全面屏 iPhone
-            垫满 Home 指示条区，home 键机型 safe-area=0 时 h-12 本身已是触控高度、
-            无需额外垫高。 */}
-        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[env(safe-area-inset-bottom,0px)] md:hidden">
+            垫满 Home 指示条区；iOS 26+ standalone 下 env 可能恒 0（bug 301994），
+            用 max(..., 12px) 兜底防栏背景贴死屏幕物理底边。home 键机型 h-12 本身
+            已是触控高度。 */}
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[max(env(safe-area-inset-bottom,0px),12px)] md:hidden">
           <div className="flex h-12 items-center justify-around">
             {ICONS.map(({ kind, Icon, labelKey }) => (
               <button
