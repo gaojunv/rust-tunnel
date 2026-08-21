@@ -150,6 +150,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   // ACP 上下文用量快照（usage 帧实时更新；初始值从 sessions 缓存的
   // context_used/context_size 恢复——usage 已落库，刷新后用量条不丢）
   const [contextUsage, setContextUsage] = useState<{ used?: number; size?: number } | null>(null);
+  // 上一回合耗时（ACP done 帧 duration_ms）；running 时隐藏，回合结束显示
+  const [lastTurnDurationMs, setLastTurnDurationMs] = useState<number | null>(null);
   // config option 乐观更新的回滚快照：按 config_id 分键（prev=发送前值，opt=乐观值），
   // 并发点击不同选项互不覆盖（旧实现单槽快照互相覆盖，M19）。发送后保留，等
   // 服务端权威确认帧（session_state/config_option_update，已确认项移除）或「设置失败」
@@ -946,6 +948,10 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         flushChunks();
         breakStream();
         stopRunning();
+        // 回合耗时（ACP 路径 done 帧携带；排队连续回合的中间帧无此字段）
+        if (typeof msg.duration_ms === 'number') {
+          setLastTurnDurationMs(msg.duration_ms);
+        }
         // 递归清理所有层级的 tool_call_chunk 流式占位卡（安全网：正常流程中正式
         // tool_call 帧已替换占位卡，仅流中断时可能残留；递归清理含 children 内的）
         setItems((prev) => dropStreamPlaceholders(prev));
@@ -1494,6 +1500,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         ? { used: s.context_used ?? undefined, size: s.context_size ?? undefined }
         : null,
     );
+    // 耗时为回合内瞬态展示，切会话即失效
+    setLastTurnDurationMs(null);
   }, [queryClient, workspaceId, sessionId]);
 
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
@@ -1683,6 +1691,18 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 </div>
               );
             })()
+          )}
+          {/* 上一回合耗时（ACP done 帧 duration_ms；running 时隐藏，切会话清除） */}
+          {lastTurnDurationMs != null && !running && (
+            <div
+              className="mb-2 px-1 text-[10px] tabular-nums text-muted-foreground"
+              data-testid="turn-duration"
+            >
+              {t('agent.turnDuration')}{' '}
+              {lastTurnDurationMs < 1000
+                ? `${lastTurnDurationMs}ms`
+                : `${(lastTurnDurationMs / 1000).toFixed(1)}s`}
+            </div>
           )}
           {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边 */}
           <div className={`relative rounded-2xl border bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring ${running ? 'agent-input-running' : 'border-input'}`}>

@@ -640,6 +640,14 @@ export async function updateAgentSessionTitle(id: string, title: string): Promis
   await api.put(`/agent/sessions/${id}`, { title });
 }
 
+/** 导出会话为 Markdown：返回 Blob（调用方负责触发下载与 revokeObjectURL）。 */
+export async function exportAgentSession(id: string): Promise<Blob> {
+  const { data } = await api.get(`/agent/sessions/${id}/export`, {
+    responseType: 'blob',
+  });
+  return data as Blob;
+}
+
 /** 会话消息分页响应：`messages` 为升序的最近一页，`has_more` 表示是否还有更早。 */
 export interface AgentMessagesPage {
   messages: AgentMessage[];

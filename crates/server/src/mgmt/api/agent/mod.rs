@@ -24,8 +24,8 @@ pub use roles::{
     create_role, delete_role, get_role, list_roles, toggle_role, update_role,
 };
 pub use sessions::{
-    archive_session, create_session, delete_session, get_default_model, list_messages,
-    list_sessions, put_default_model, update_session, update_session_model,
+    archive_session, create_session, delete_session, export_session, get_default_model,
+    list_messages, list_sessions, put_default_model, update_session, update_session_model,
     update_session_role,
 };
 pub use workspaces::{

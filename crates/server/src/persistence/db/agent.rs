@@ -136,6 +136,11 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub context_size: Option<i64>,
+    /// 最近一次 ACP spawn 失败的归因描述（带 stage 前缀；spawn 成功时清空）。
+    /// 列由 `migrate_agent_sessions_add_spawn_error`（schema.rs）落地。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub last_spawn_error: Option<String>,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
@@ -452,6 +457,75 @@ impl Database {
         Ok(())
     }
 
+    /// 写入/清空 session 的最近 spawn 失败归因（Some=失败描述带 stage 前缀，
+    /// None=spawn 成功清空）。会话行不存在时静默无影响（预 spawn 可能先于
+    /// session 行创建？否——session 行由 API 先建；防御性写法不校验行数）。
+    pub async fn agent_update_session_spawn_error(
+        &self,
+        id: &str,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE agent_sessions SET last_spawn_error = ? WHERE id = ?")
+            .bind(error)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ── ACP 排队 prompt 持久化（agent_pending_prompts） ─────────────
+
+    /// 入队一条等待执行的 prompt（busy 时）。返回行 id（供取出执行后删除）。
+    pub async fn agent_pending_enqueue(
+        &self,
+        id: &str,
+        session_id: &str,
+        content: &str,
+        refs_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO agent_pending_prompts (id, session_id, content, refs) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(refs_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按 FIFO（rowid 升序 = 入队顺序）列出 session 的排队 prompt。
+    pub async fn agent_pending_list(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, content, refs FROM agent_pending_prompts WHERE session_id = ? ORDER BY rowid",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// 取出执行后删除对应行（best-effort 调用地不阻塞主流程）。
+    pub async fn agent_pending_delete(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM agent_pending_prompts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 清空 session 的全部排队 prompt（会话删除时级联清理）。
+    pub async fn agent_pending_clear_session(&self, session_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM agent_pending_prompts WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// upsert/删除 session 的 ACP 配置项：value=Some 写入该 key，None 删除；
     /// map 为空时列置 NULL。config_state 非 JSON（历史脏数据）时视为空 map 重建。
     pub async fn agent_update_session_config_state(
@@ -507,6 +581,8 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        // 级联清理排队 prompt（表无 FK，应用层级联；会话已删，残留行无意义）
+        self.agent_pending_clear_session(id).await?;
         Ok(())
     }
 

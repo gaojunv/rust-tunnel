@@ -13,12 +13,14 @@ const api = vi.hoisted(() => ({
   listAgentSessions: vi.fn(),
   deleteAgentSession: vi.fn(),
   updateAgentSessionTitle: vi.fn(),
+  exportAgentSession: vi.fn(),
 }));
 
 vi.mock('../../api/client', () => ({
   listAgentSessions: api.listAgentSessions,
   deleteAgentSession: api.deleteAgentSession,
   updateAgentSessionTitle: api.updateAgentSessionTitle,
+  exportAgentSession: api.exportAgentSession,
   getApiErrorMessage: (err: unknown) => (err as Error)?.message ?? String(err),
 }));
 
@@ -154,6 +156,27 @@ describe('SessionBar', () => {
       expect(api.deleteAgentSession).toHaveBeenCalledWith('s2');
     });
     expect(handlers.onSessionDeleted).toHaveBeenCalledWith('s2');
+  });
+
+  it('exports a session as Markdown via blob download', async () => {
+    api.exportAgentSession.mockResolvedValue(new Blob(['# md'], { type: 'text/markdown' }));
+    // jsdom 无 createObjectURL/revokeObjectURL，stub 之
+    const createUrl = vi.fn(() => 'blob:mock');
+    const revokeUrl = vi.fn();
+    Object.assign(URL, { createObjectURL: createUrl, revokeObjectURL: revokeUrl });
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    renderBar('s1');
+    await openMenu();
+    const exportButtons = await screen.findAllByLabelText('agent.exportSession');
+    fireEvent.click(exportButtons[0]);
+    await waitFor(() => {
+      expect(api.exportAgentSession).toHaveBeenCalledWith('s1');
+    });
+    expect(createUrl).toHaveBeenCalled();
+    expect(clickSpy).toHaveBeenCalled();
+    expect(revokeUrl).toHaveBeenCalledWith('blob:mock');
+    clickSpy.mockRestore();
   });
 });
 

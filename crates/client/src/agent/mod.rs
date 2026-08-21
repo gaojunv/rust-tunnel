@@ -15,10 +15,13 @@ use rust_tunnel_common::{AgentCommand, AgentResult, FileEdit};
 /// 单条命令输出上限（协议 1MB 消息上限内留足余量）
 const MAX_OUTPUT: usize = 100 * 1024;
 
-/// 将用户提供的相对路径解析到沙箱根目录内；拒绝逃逸（`..` 上溢、绝对路径）。
+/// 将用户提供的相对路径解析到沙箱根目录内；拒绝逃逸（`..` 上溢、绝对路径、
+/// 符号链接指向工作区外）。
 ///
-/// 不做符号链接检查：root_path 本身由服务器侧工作区配置指定（可信），
-/// 这里防的是 LLM 生成的路径意外逃逸。
+/// 词法校验之后追加 canonicalize 校验：工作区内的 symlink（或路径中间组件是
+/// symlink）指向 root 外时拒绝——否则 `read_file link_to_etc_passwd` 可越界读。
+/// 目标不存在（待写入的新文件）时 canonicalize 最近存在的祖先再拼接校验。
+/// root canonicalize 失败（root 本身不存在等异常）时退回词法结果，不阻断既有行为。
 pub fn resolve_sandboxed(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -35,6 +38,24 @@ pub fn resolve_sandboxed(root: &Path, rel: &str) -> Result<PathBuf, String> {
                 }
             }
             _ => return Err(format!("unsupported path component in: {rel}")),
+        }
+    }
+    // symlink 防护：root 规范化失败时降级为纯词法校验（保持旧行为）
+    let Ok(canon_root) = root.canonicalize() else {
+        return Ok(out);
+    };
+    // 从目标向上找最近存在的祖先（新文件写入场景目标本身不存在）
+    let mut ancestor = out.as_path();
+    while !ancestor.exists() {
+        let Some(parent) = ancestor.parent() else {
+            // 连 root 都不存在：词法校验已过，放行（后续 IO 自会报错）
+            return Ok(out);
+        };
+        ancestor = parent;
+    }
+    if let Ok(canon) = ancestor.canonicalize() {
+        if !canon.starts_with(&canon_root) {
+            return Err(format!("path escapes workspace root via symlink: {rel}"));
         }
     }
     Ok(out)
@@ -1386,6 +1407,47 @@ mod tests {
         let root = Path::new("/workspace");
         assert!(resolve_sandboxed(root, ".").is_ok());
         assert!(resolve_sandboxed(root, "a/./b").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        // root 外目标 + root 内 symlink 指向它
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, "top secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link.txt")).unwrap();
+        assert!(resolve_sandboxed(&root, "link.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_rejects_symlinked_dir_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir(&outside_dir).unwrap();
+        // 路径中间组件是指向 root 外的 symlink 目录
+        std::os::unix::fs::symlink(&outside_dir, root.join("linkdir")).unwrap();
+        assert!(resolve_sandboxed(&root, "linkdir/new_file.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_allows_inner_symlink_and_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir(&root).unwrap();
+        let real = root.join("real.txt");
+        std::fs::write(&real, "ok").unwrap();
+        // 指向 root 内部的 symlink：允许
+        std::os::unix::fs::symlink(&real, root.join("inner_link.txt")).unwrap();
+        assert!(resolve_sandboxed(&root, "inner_link.txt").is_ok());
+        // 不存在的新文件（写入场景）：允许
+        assert!(resolve_sandboxed(&root, "new_dir/new_file.txt").is_ok());
     }
 
     #[tokio::test]

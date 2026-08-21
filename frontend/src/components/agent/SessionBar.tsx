@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
+import { ChevronDown, Download, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useImeGuard } from '@/hooks/useImeGuard';
 import {
@@ -21,6 +21,7 @@ import {
 import {
   listAgentSessions,
   deleteAgentSession,
+  exportAgentSession,
   updateAgentSessionTitle,
   getApiErrorMessage,
 } from '../../api/client';
@@ -66,6 +67,23 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
       setError(null);
       refresh();
       onSessionDeleted(session.id); // 任意会话被删 → 关掉对应标签页（AgentPage 据此关闭 tab）
+    } catch (err) {
+      setError(getApiErrorMessage(err));
+    }
+  };
+
+  /** 导出会话 Markdown：fetch blob → 临时 a[download] 触发浏览器下载。 */
+  const handleExport = async (session: AgentSession) => {
+    try {
+      const blob = await exportAgentSession(session.id);
+      setError(null);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const safeTitle = (session.title ?? '').trim().replace(/[\\/:*?"<>|\s]+/g, '_');
+      a.href = url;
+      a.download = safeTitle ? `${safeTitle}.md` : `agent-session-${session.id.slice(0, 8)}.md`;
+      a.click();
+      URL.revokeObjectURL(url);
     } catch (err) {
       setError(getApiErrorMessage(err));
     }
@@ -174,6 +192,19 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
                           <div className="truncate text-xs text-muted-foreground">{meta}</div>
                         </div>
                       </DropdownMenuItem>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        aria-label={t('agent.exportSession')}
+                        title={t('agent.exportSession')}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          void handleExport(s);
+                        }}
+                      >
+                        <Download className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="sm"

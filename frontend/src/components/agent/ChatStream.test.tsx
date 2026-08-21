@@ -96,6 +96,25 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
+  it('shows turn duration from done frame duration_ms', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '完成' });
+      wsInstance!.emit({ type: 'done', duration_ms: 2300 });
+    });
+    // 回合耗时行：2.3s（i18n mock 原样拼插值）
+    const el = await screen.findByTestId('turn-duration');
+    expect(el.textContent).toContain('2.3s');
+  });
+
+  it('hides turn duration for done frames without duration_ms', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByTestId('turn-duration')).toBeNull();
+  });
+
   it('clears running on error even with pending tools', async () => {
     renderChat();
     act(() => {
