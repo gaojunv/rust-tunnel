@@ -123,6 +123,7 @@ async fn generate_title_inner(
         &chain,
         &body,
         false,
+        None,
     )
     .await;
     let crate::llm::upstream::FailoverOutcome::Success {

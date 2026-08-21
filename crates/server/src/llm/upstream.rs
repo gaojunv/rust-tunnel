@@ -486,6 +486,10 @@ pub enum FailoverOutcome {
         candidate: crate::llm::router::Candidate,
         /// 是否发生过转移（首选不是出账候选）。
         failed_over: bool,
+        /// 本次成功调用是否走了 Anthropic 直通（`call_upstream_raw` /v1/messages）。
+        /// 直通成功 → true（响应已是 Anthropic 格式，调用方跳过二次格式转换）；
+        /// 转换路径（ChatCompletions/Responses）成功 → false。
+        upstream_anthropic: bool,
     },
     /// 全部候选失败：返回最后一个被尝试候选的错误。
     Exhausted {
@@ -516,12 +520,19 @@ fn deterministic_failure(status: StatusCode) -> Option<crate::llm::down::Failure
 ///
 /// 调用方负责 RAG/compat 改写与 `req_body` 构造；本函数循环内仅
 /// clone body + 定点改 `model`。中途失败尝试不记 usage（仅 warn 日志）。
+///
+/// `anthropic_body`：Anthropic 入口携带的原始请求体（OpenAI/Responses 入口为 None）。
+/// 当候选 provider 配了 `anthropic_base_url` 且 `anthropic_body` 存在时，该候选走
+/// `/v1/messages` 直通（原始 Anthropic body，model 替换为候选名）；否则走下方
+/// ChatCompletions / Responses 转换分支。直通失败的处理（retryable/确定性/4xx）
+/// 与转换分支完全一致——组内可混合直通与转换候选并互相故障转移。
 pub async fn execute_with_failover(
     breakers: &crate::llm::breaker::ModelBreakers,
     known: &crate::llm::down::KnownFailures,
     chain: &crate::llm::router::CandidateChain,
     req_body: &serde_json::Value,
     stream: bool,
+    anthropic_body: Option<&serde_json::Value>,
 ) -> FailoverOutcome {
     let mut attempts = 0usize;
     let mut last_err: Option<(StatusCode, String)> = None;
@@ -563,63 +574,79 @@ pub async fn execute_with_failover(
         let mut body = req_body.clone();
         set_body_model(&mut body, &cand.model_name);
 
-        // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
-        let result = match cand.upstream_protocol {
-            crate::llm::router::UpstreamProtocol::ChatCompletions => {
-                // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
-                // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
-                // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
-                if stream && chain.candidates.len() > 1 {
-                    call_upstream_stream_guarded(
-                        &cand.provider.base_url,
-                        &cand.provider.api_key,
-                        &body,
-                        "v1/chat/completions",
-                    )
-                    .await
-                } else {
-                    call_upstream_with_body(
-                        &cand.provider.base_url,
-                        &cand.provider.api_key,
-                        &body,
-                        "v1/chat/completions",
-                    )
-                    .await
-                }
-            }
-            crate::llm::router::UpstreamProtocol::Responses => {
-                // 转换请求体：chat → Responses 格式
-                body = super::responses::chat_body_to_responses_body(&body);
-                // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
-                let upstream_resp = if stream && chain.candidates.len() > 1 {
-                    call_upstream_stream_guarded(
-                        &cand.provider.base_url,
-                        &cand.provider.api_key,
-                        &body,
-                        "v1/responses",
-                    )
-                    .await
-                } else {
-                    call_upstream_with_body(
-                        &cand.provider.base_url,
-                        &cand.provider.api_key,
-                        &body,
-                        "v1/responses",
-                    )
-                    .await
-                };
-                // 响应转换：Responses → Chat Completions 格式
-                match upstream_resp {
-                    Ok(resp) => {
-                        if stream {
-                            super::responses::convert_responses_stream_to_chat(resp)
-                        } else {
-                            super::responses::convert_responses_to_chat_response(resp).await
-                        }
+        // ── Anthropic 直通分支：候选 provider 配了 anthropic_base_url 且入口携带原始
+        //    Anthropic body 时，原始请求体（仅替换 model 为候选真实名）直发 /v1/messages。
+        //    每候选独立判定：组内可混合"直通候选"与"转换候选"并互相故障转移。
+        //    失败路径与转换分支共用（retryable / 确定性 4xx / 不可转移 4xx 不区分直通与否）。
+        let (result, upstream_anthropic) = if let (Some(url), Some(raw)) =
+            (&cand.provider.anthropic_base_url, anthropic_body)
+        {
+            let mut raw = raw.clone();
+            set_body_model(&mut raw, &cand.model_name);
+            (
+                call_upstream_raw(url, &cand.provider.api_key, "/v1/messages", &raw, stream).await,
+                true,
+            )
+        } else {
+            // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
+            let result = match cand.upstream_protocol {
+                crate::llm::router::UpstreamProtocol::ChatCompletions => {
+                    // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
+                    // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
+                    // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
+                    if stream && chain.candidates.len() > 1 {
+                        call_upstream_stream_guarded(
+                            &cand.provider.base_url,
+                            &cand.provider.api_key,
+                            &body,
+                            "v1/chat/completions",
+                        )
+                        .await
+                    } else {
+                        call_upstream_with_body(
+                            &cand.provider.base_url,
+                            &cand.provider.api_key,
+                            &body,
+                            "v1/chat/completions",
+                        )
+                        .await
                     }
-                    Err(e) => Err(e),
                 }
-            }
+                crate::llm::router::UpstreamProtocol::Responses => {
+                    // 转换请求体：chat → Responses 格式
+                    body = super::responses::chat_body_to_responses_body(&body);
+                    // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
+                    let upstream_resp = if stream && chain.candidates.len() > 1 {
+                        call_upstream_stream_guarded(
+                            &cand.provider.base_url,
+                            &cand.provider.api_key,
+                            &body,
+                            "v1/responses",
+                        )
+                        .await
+                    } else {
+                        call_upstream_with_body(
+                            &cand.provider.base_url,
+                            &cand.provider.api_key,
+                            &body,
+                            "v1/responses",
+                        )
+                        .await
+                    };
+                    // 响应转换：Responses → Chat Completions 格式
+                    match upstream_resp {
+                        Ok(resp) => {
+                            if stream {
+                                super::responses::convert_responses_stream_to_chat(resp)
+                            } else {
+                                super::responses::convert_responses_to_chat_response(resp).await
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+            (result, false)
         };
 
         match result {
@@ -635,6 +662,7 @@ pub async fn execute_with_failover(
                     resp,
                     candidate: cand.clone(),
                     failed_over,
+                    upstream_anthropic,
                 };
             }
             Err((status, msg)) => {
@@ -1499,16 +1527,21 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
             failed_over,
+            upstream_anthropic,
         } = out
         else {
             panic!("expected success");
         };
         assert!(failed_over);
+        assert!(
+            !upstream_anthropic,
+            "无 anthropic_body 的候选走转换路径，upstream_anthropic 应为 false"
+        );
         assert_eq!(candidate.model_id, "id-good");
         assert_eq!(resp.status(), StatusCode::OK);
         // 坏候选被记一次失败
@@ -1538,7 +1571,7 @@ mod tests {
         let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1587,7 +1620,7 @@ mod tests {
         let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1634,7 +1667,7 @@ mod tests {
 
         // 连续 5 次请求把 id-bad 打到熔断
         for _ in 0..5 {
-            let _ = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+            let _ = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         }
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5);
         assert_eq!(
@@ -1642,7 +1675,7 @@ mod tests {
             crate::llm::breaker::BreakerStateView::Open
         );
         // 第 6 次：坏候选被跳过，直接打好候选
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
     }
@@ -1660,7 +1693,7 @@ mod tests {
             breakers.record_failure("id2");
         }
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             message,
@@ -1704,7 +1737,7 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let started = std::time::Instant::now();
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let ttfb = started.elapsed();
         let FailoverOutcome::Success {
             resp, failed_over, ..
@@ -1752,7 +1785,7 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1884,7 +1917,7 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         // 第一次：A 401 → 记录并转移 → B 成功
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -1899,7 +1932,7 @@ mod tests {
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
 
         // 第二次：A 被跳过（known 失败），B 再次成功
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(
             a_hits.load(Ordering::SeqCst),
@@ -1933,7 +1966,7 @@ mod tests {
         let body = serde_json::json!({"model": "single", "stream": false, "messages": []});
 
         // 第一次：网络调用 → 401
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted { status, .. } = out else {
             panic!("expected exhausted");
         };
@@ -1941,7 +1974,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // 第二次：known 命中，不发起网络调用，仍返回 401 错误
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status, message, ..
         } = out
@@ -1961,7 +1994,7 @@ mod tests {
 
         // 手动清除后立即恢复探测
         known.clear_all();
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Exhausted { .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
@@ -1990,7 +2023,7 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         for _ in 0..2 {
-            let out = execute_with_failover(&breakers, &known, &chain, &body, false).await;
+            let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
             let FailoverOutcome::Exhausted { status, .. } = out else {
                 panic!("expected exhausted");
             };
@@ -2089,16 +2122,21 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
             failed_over,
+            upstream_anthropic,
         } = out
         else {
             panic!("expected success");
         };
         assert!(!failed_over);
+        assert!(
+            !upstream_anthropic,
+            "Responses 候选走转换路径，upstream_anthropic 应为 false"
+        );
         assert_eq!(candidate.model_id, "id-resp");
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
@@ -2173,7 +2211,7 @@ mod tests {
         );
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success { resp, .. } = out else {
             panic!("expected success");
         };
@@ -2280,27 +2318,328 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true).await;
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
             failed_over,
+            upstream_anthropic,
         } = out
         else {
             panic!("expected success via chat fallback");
         };
-        assert!(failed_over, "should have failed over from Responses to Chat");
+        assert!(
+            failed_over,
+            "should have failed over from Responses to Chat"
+        );
+        assert!(
+            !upstream_anthropic,
+            "chat 候选走转换路径，upstream_anthropic 应为 false"
+        );
         assert_eq!(candidate.model_id, "id-chat");
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(responses_hits.load(Ordering::SeqCst), 1, "responses candidate hit once");
-        assert_eq!(chat_hits.load(Ordering::SeqCst), 1, "chat candidate hit once");
+        assert_eq!(
+            responses_hits.load(Ordering::SeqCst),
+            1,
+            "responses candidate hit once"
+        );
+        assert_eq!(
+            chat_hits.load(Ordering::SeqCst),
+            1,
+            "chat candidate hit once"
+        );
 
         // 验证最终响应是 chat completion 格式
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(text.contains("hi"), "should contain upstream content: {text}");
-        assert!(text.contains("[DONE]"), "should have [DONE] terminator: {text}");
+        assert!(
+            text.contains("hi"),
+            "should contain upstream content: {text}"
+        );
+        assert!(
+            text.contains("[DONE]"),
+            "should have [DONE] terminator: {text}"
+        );
+    }
+
+    // ── Anthropic 直通（anthropic_base_url）分支 ──────────────────────────
+
+    /// 快速构造带 anthropic_base_url 的 CandidateChain（测试用）。
+    /// 每个 spec 为 `(base_url, model_name, model_id, anthropic_base_url)`。
+    fn test_chain_anthropic(
+        specs: &[(&str, &str, &str, Option<&str>)],
+    ) -> crate::llm::router::CandidateChain {
+        use crate::llm::router::{Candidate, CandidateChain};
+        use crate::llm::ProviderConfig;
+        CandidateChain {
+            candidates: specs
+                .iter()
+                .enumerate()
+                .map(|(i, (base, model_name, model_id, anthro))| Candidate {
+                    provider: ProviderConfig {
+                        id: format!("p{}", i),
+                        name: format!("P{}", i),
+                        provider_type: "deepseek".into(),
+                        base_url: base.to_string(),
+                        api_key: "k".into(),
+                        extra_config: None,
+                        anthropic_base_url: anthro.map(str::to_string),
+                        enabled: true,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                    },
+                    model_name: model_name.to_string(),
+                    model_id: model_id.to_string(),
+                    priority: i as i64,
+                    upstream_protocol: crate::llm::router::UpstreamProtocol::ChatCompletions,
+                })
+                .collect(),
+            group_name: Some("g".into()),
+        }
+    }
+
+    /// 解析 mock 收到的原始 HTTP 请求 → (请求行, JSON body)。
+    async fn parse_mock_request(buf: &[u8]) -> (String, serde_json::Value) {
+        let text = String::from_utf8_lossy(buf);
+        let first_line = text.lines().next().unwrap_or("").to_string();
+        let body = if let Some(pos) = text.find("\r\n\r\n") {
+            serde_json::from_str(&text[pos + 4..]).unwrap_or_default()
+        } else {
+            serde_json::Value::Null
+        };
+        (first_line, body)
+    }
+
+    /// 纯函数级：单候选配 anthropic_base_url + 入口带 anthropic_body → 直发 /v1/messages，
+    /// 发送体 = 原始 Anthropic body（仅 model 替换为候选真实名），成功返回
+    /// `upstream_anthropic=true` 且响应为 Anthropic 格式（不被二次转换）。
+    #[tokio::test]
+    async fn test_failover_anthropic_passthrough_single_candidate() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let hit_path = Arc::new(AtomicBool::new(false));
+        let hp = hit_path.clone();
+        let captured = Arc::new(tokio::sync::Mutex::new(serde_json::Value::Null));
+        let cap = captured.clone();
+        let upstream = start_behavior_upstream(move |mut s| {
+            let hp = hp.clone();
+            let cap = cap.clone();
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).await.unwrap();
+                let (first_line, body) = parse_mock_request(&buf[..n]).await;
+                assert!(
+                    first_line.contains("/v1/messages"),
+                    "直通候选应请求 /v1/messages: {first_line}"
+                );
+                hp.store(true, Ordering::SeqCst);
+                *cap.lock().await = body;
+                let resp_body = serde_json::json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "m-a",
+                    "content": [{"type":"text","text":"hi from anthropic"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain_anthropic(&[("http://127.0.0.1:1", "m-a", "id-a", Some(&upstream))]);
+        let req_body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+        let anthropic_body = serde_json::json!({
+            "model": "router",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let out = execute_with_failover(
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &req_body,
+            false,
+            Some(&anthropic_body),
+        )
+        .await;
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+            upstream_anthropic,
+        } = out
+        else {
+            panic!("expected success");
+        };
+        assert!(!failed_over);
+        assert_eq!(candidate.model_id, "id-a");
+        assert!(upstream_anthropic, "直通成功应标记 upstream_anthropic=true");
+        assert!(hit_path.load(Ordering::SeqCst), "应命中 /v1/messages");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // 发送体 = 原始 Anthropic body，仅 model 替换为候选真实名
+        let sent = captured.lock().await.clone();
+        assert_eq!(
+            sent["model"], "m-a",
+            "直通 body 的 model 应替换为候选名: {sent}"
+        );
+        assert_eq!(sent["max_tokens"], 8);
+        assert_eq!(sent["messages"][0]["role"], "user");
+        // 响应体原样透传（Anthropic 格式，未被二次转换）
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "hi from anthropic");
+    }
+
+    /// 纯函数级：组 [A(直通), B(直通)]，首选直通 404（确定性失败 → 记 known-failures）
+    /// 自动尝试备选直通成功；第二次请求首选被跳过（TTL 内）直达备选。
+    #[tokio::test]
+    async fn test_failover_anthropic_passthrough_404_then_backup() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let a_hits = Arc::new(AtomicUsize::new(0));
+        let ah = a_hits.clone();
+        let a = start_behavior_upstream(move |mut s| {
+            let ah = ah.clone();
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).await.unwrap();
+                let (first_line, _) = parse_mock_request(&buf[..n]).await;
+                assert!(
+                    first_line.contains("/v1/messages"),
+                    "首选直通应请求 /v1/messages: {first_line}"
+                );
+                ah.fetch_add(1, Ordering::SeqCst);
+                let err_body =
+                    r#"{"type":"error","error":{"type":"not_found_error","message":"model not found"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    err_body.len(),
+                    err_body
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let bh = b_hits.clone();
+        let b = start_behavior_upstream(move |mut s| {
+            let bh = bh.clone();
+            Box::pin(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 16384];
+                let n = s.read(&mut buf).await.unwrap();
+                let (first_line, body) = parse_mock_request(&buf[..n]).await;
+                assert!(
+                    first_line.contains("/v1/messages"),
+                    "备选直通应请求 /v1/messages: {first_line}"
+                );
+                assert_eq!(body["model"], "m-b", "备选直通 body 的 model 应为其真实名: {body}");
+                bh.fetch_add(1, Ordering::SeqCst);
+                let resp_body = serde_json::json!({
+                    "id": "msg_b",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "m-b",
+                    "content": [{"type":"text","text":"ok from backup"}],
+                    "stop_reason": "end_turn"
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                s.write_all(resp.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let known = crate::llm::down::KnownFailures::new();
+        let chain = test_chain_anthropic(&[
+            ("http://127.0.0.1:1", "m-a", "id-a", Some(&a)),
+            ("http://127.0.0.1:1", "m-b", "id-b", Some(&b)),
+        ]);
+        let req_body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+        let anthropic_body = serde_json::json!({
+            "model": "router",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        // 第一次：首选直通 404 → 记录并转移 → 备选直通成功
+        let out = execute_with_failover(
+            &breakers,
+            &known,
+            &chain,
+            &req_body,
+            false,
+            Some(&anthropic_body),
+        )
+        .await;
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+            upstream_anthropic,
+        } = out
+        else {
+            panic!("expected success via backup");
+        };
+        assert_eq!(candidate.model_id, "id-b");
+        assert!(failed_over, "首选 404 转移到备选应记为 failed_over");
+        assert!(
+            upstream_anthropic,
+            "备选直通成功也应标记 upstream_anthropic=true"
+        );
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["content"][0]["text"], "ok from backup");
+
+        // 第二次：首选被跳过（known 命中），备选再次成功
+        let out = execute_with_failover(
+            &breakers,
+            &known,
+            &chain,
+            &req_body,
+            false,
+            Some(&anthropic_body),
+        )
+        .await;
+        assert!(matches!(out, FailoverOutcome::Success { .. }));
+        assert_eq!(
+            a_hits.load(Ordering::SeqCst),
+            1,
+            "确定性失败后首选不再被请求"
+        );
+        assert_eq!(b_hits.load(Ordering::SeqCst), 2);
     }
 }

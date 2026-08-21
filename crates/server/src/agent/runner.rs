@@ -1235,6 +1235,7 @@ async fn run_subagent_loop(
             &chain,
             &req_body,
             true,
+            None,
         )
         .await;
 
@@ -1464,6 +1465,7 @@ async fn run_subagent_loop(
         &chain,
         &req_body,
         false,
+        None,
     )
     .await;
     match outcome {
@@ -1937,6 +1939,7 @@ pub async fn run_agent_turn(
             &chain,
             &req_body,
             true,
+            None,
         )
         .await;
 
@@ -2037,6 +2040,7 @@ pub async fn run_agent_turn(
                                 &chain,
                                 &req_body,
                                 true,
+                                None,
                             )
                             .await;
                             match retry {

@@ -28,6 +28,9 @@ pub struct PreparedRequest {
     pub has_tools: bool,
     /// compat 开关（provider extra_config 决定）。
     pub compat_enabled: bool,
+    /// 原始 Anthropic 请求体（仅 anthropic 入口设置；openai/responses 入口为 None）。
+    /// 配了 `anthropic_base_url` 的候选用它直发 `/v1/messages`（model 替换为候选名）。
+    pub anthropic_body: Option<serde_json::Value>,
 }
 
 /// 认证网关 API key；失败时记录用量日志并返回 401 响应。
@@ -191,7 +194,22 @@ pub async fn run_execution(
 
     // 构造完整上游请求体（协议解析 + RAG/compat 改写后的最终内容），
     // 写入请求日志后发送，保证日志与实际发送内容一致。
-    let req_body = super::upstream::build_upstream_body(request);
+    //
+    // Anthropic 直通（至少一个候选配 anthropic_base_url 且入口带原始 body）：
+    // 日志记录原始 Anthropic body（实际发送给 /v1/messages 的内容，model 覆盖为
+    // 首选候选真实名）；否则记录转换路径的 build_upstream_body 结果。
+    let direct_anthropic = prepared.anthropic_body.is_some()
+        && chain
+            .candidates
+            .iter()
+            .any(|c| c.provider.anthropic_base_url.is_some());
+    let req_body = if direct_anthropic {
+        let mut raw = prepared.anthropic_body.clone().unwrap();
+        raw["model"] = request.model.clone().into();
+        raw
+    } else {
+        super::upstream::build_upstream_body(request)
+    };
     super::log_llm_request(
         &state.llm,
         protocol,
@@ -211,6 +229,7 @@ pub async fn run_execution(
         chain,
         &req_body,
         request.stream,
+        prepared.anthropic_body.as_ref(),
     )
     .await;
     match outcome {
@@ -218,6 +237,7 @@ pub async fn run_execution(
             resp,
             candidate,
             failed_over,
+            upstream_anthropic,
         } => {
             // 出账候选与首选不同：改写 ctx 为实际出账方，并记录转移来源
             if failed_over {
@@ -242,6 +262,11 @@ pub async fn run_execution(
                 &serde_json::Value::Null,
             )
             .await;
+            // 直通成功：响应已是 Anthropic 格式，跳过 compat 伪工具重写与
+            // OpenAI→Anthropic 转换（post_process），直接出账。
+            if upstream_anthropic {
+                return super::usage::wrap_and_record(resp, ctx, db, started).await;
+            }
             // compat 模式：先解析伪工具调用还原为结构化 tool_calls，再做协议后处理。
             let resp = if compat_enabled {
                 if request.stream {

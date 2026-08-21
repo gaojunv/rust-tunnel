@@ -338,10 +338,11 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
     })
 }
 
-/// POST /v1/messages — Anthropic Messages API.
+/// POST /v1/messages — Anthropic Messages API。
 ///
-/// 当 provider 配置了 `anthropic_base_url` 时，直接透传原始 Anthropic 请求到上游，
-/// 不做任何格式转换；否则回退到 OpenAI 格式转换路径。
+/// 候选链内每候选独立判定发送策略：候选 provider 配置了 `anthropic_base_url` 时，
+/// 直接透传原始 Anthropic 请求到上游（/v1/messages，不做格式转换）；否则回退到
+/// OpenAI 格式转换路径。直通失败计入 breaker/known-failures 并继续 failover 下一候选。
 pub async fn handle_messages(
     State(state): State<LlmHandlerState>,
     headers: HeaderMap,
@@ -381,8 +382,9 @@ pub async fn handle_messages(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    // 首选候选：provider 级配置（compat 开关 / anthropic_base_url 直通判定）以首选为准——
-    // RAG/compat 改写在循环外只做一次，`execute_with_failover` 循环内仅 clone body + 改 model。
+    // 首选候选：provider 级配置（compat 开关）以首选为准——RAG/compat 改写在循环外只做
+    // 一次（作用于转换路径的 OpenAI 请求体）；`execute_with_failover` 循环内每候选独立
+    // 判定：配了 anthropic_base_url 的候选直发原始 Anthropic body，否则走转换分支。
     let first_candidate = chain.candidates[0].clone();
     let provider = first_candidate.provider.clone();
     let actual_model = first_candidate.model_name.clone();
@@ -413,85 +415,9 @@ pub async fn handle_messages(
     let started = std::time::Instant::now();
     let db = state.llm.db.clone();
 
-    // ── 直通路径：provider 配置了 anthropic_base_url，且为单候选时直接透传 ──
-    if let Some(ref anthropic_url) = provider.anthropic_base_url {
-        // 组链守卫：组链（>1 候选）跳过直通、走下方转换路径——直通（call_upstream_raw）
-        // 不做故障转移，组语义应优先保证可用性；首选候选的直通配置仅在单候选时生效。
-        if chain.candidates.len() == 1 {
-            // 替换 model 为实际上游名称
-            let mut body = body;
-            let log_model = actual_model.clone();
-            body["model"] = serde_json::Value::String(actual_model);
-
-            let message_count = body["messages"].as_array().map_or(0, Vec::len);
-            let has_tools = body.get("tools").is_some();
-
-            // 完整记录发往上游的原始请求体（替换 model 后），不做任何简化。
-            super::log_llm_request(
-                &state.llm,
-                "anthropic",
-                &log_model,
-                message_count,
-                has_tools,
-                is_stream,
-                None,
-                None,
-                0,
-                &body,
-            )
-            .await;
-
-            return match super::upstream::call_upstream_raw(
-                anthropic_url,
-                &provider.api_key,
-                "/v1/messages",
-                &body,
-                is_stream,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let elapsed_ms = started.elapsed().as_millis();
-                    super::log_llm_request(
-                        &state.llm,
-                        "anthropic",
-                        &log_model,
-                        message_count,
-                        has_tools,
-                        is_stream,
-                        Some(200),
-                        None,
-                        elapsed_ms,
-                        // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
-                        &serde_json::Value::Null,
-                    )
-                    .await;
-                    super::usage::wrap_and_record(resp, ctx, db, started).await
-                }
-                Err((status, msg)) => {
-                    let elapsed_ms = started.elapsed().as_millis();
-                    super::log_llm_request(
-                        &state.llm,
-                        "anthropic",
-                        &log_model,
-                        message_count,
-                        has_tools,
-                        is_stream,
-                        Some(status.as_u16()),
-                        Some(&msg),
-                        elapsed_ms,
-                        // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
-                        &serde_json::Value::Null,
-                    )
-                    .await;
-                    if let Some(ref db) = db {
-                        ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
-                    }
-                    state.error_for_protocol(status, msg, "upstream_error")
-                }
-            };
-        }
-    }
+    // ── 执行：候选链故障转移。直通（anthropic_base_url）判定下沉为循环内 per-candidate
+    // 发送策略：原始 body 存入 PreparedRequest.anthropic_body，`execute_with_failover`
+    // 内每候选独立选择直通 /v1/messages 或转换路径，失败互相 failover。 ──
 
     // ── 回退路径：转成 OpenAI 格式发到 base_url ──
     let request = match anthropic_to_openai(&body) {
@@ -508,7 +434,8 @@ pub async fn handle_messages(
         super::compat::compat_tool_history_enabled(provider.extra_config.as_deref());
 
     // RAG：API key 绑定知识库时，检索背景资料注入 messages[0]（compat 之前）。
-    // 直通路径（anthropic_base_url 分支）不注入 —— 规格边界。
+    // 注入作用于转换路径的 OpenAI 请求体；直通候选发送的原始 Anthropic body
+    // （PreparedRequest.anthropic_body）不含注入内容 —— 规格边界，保持现状。
     let kb_id_for_rag: Option<String> = {
         #[cfg(feature = "rag")]
         {
@@ -543,6 +470,9 @@ pub async fn handle_messages(
         message_count,
         has_tools,
         compat_enabled,
+        // 原始 Anthropic 请求体：配了 anthropic_base_url 的候选用它直发 /v1/messages
+        // （循环内替换 model 为候选真实名），其余候选仍走下方转换分支。
+        anthropic_body: Some(body),
     };
     super::pipeline::run_execution(
         &state,
@@ -1706,5 +1636,489 @@ mod tests {
             .unwrap();
         assert_eq!(logs.len(), 1, "应有一条成功的 usage log");
         assert_eq!(logs[0].rag_chunks_injected, Some(1));
+    }
+
+    // ── Anthropic 直通（anthropic_base_url）集成测试 ────────────────────────
+
+    /// 起一个裸 TCP mock，每次连接返回固定响应；捕获完整请求文本（请求行/头/体）与调用次数。
+    async fn start_tcp_mock(
+        status: &'static str,
+        content_type: &'static str,
+        resp_body: serde_json::Value,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<String>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c1 = captured.clone();
+        let h1 = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured = c1.clone();
+                let hits = h1.clone();
+                let resp_body = resp_body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n > 0 {
+                        *captured.lock().await = String::from_utf8_lossy(&buf[..n]).to_string();
+                    }
+                    let body = resp_body.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{}", addr), captured, hits)
+    }
+
+    /// 从捕获的原始 HTTP 请求文本提取 JSON body。
+    fn mock_body_from(req: &str) -> serde_json::Value {
+        req.split("\r\n\r\n")
+            .nth(1)
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default()
+    }
+
+    /// 单候选直通：provider 配 anthropic_base_url → 请求直发 /v1/messages（原始 Anthropic body，
+    /// 带 anthropic-version/x-api-key 头），返回 Anthropic 格式响应，且不被二次转换为 OpenAI 格式。
+    #[tokio::test]
+    async fn test_anthropic_passthrough_single_candidate() {
+        use std::sync::atomic::Ordering;
+
+        let (mock_url, captured, hits) = start_tcp_mock(
+            "200 OK",
+            "application/json",
+            serde_json::json!({
+                "id": "msg_direct_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "deepseek-chat",
+                "content": [{"type":"text","text":"直通回答"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            }),
+        )
+        .await;
+
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        // provider 配 anthropic_base_url 指向 mock；base_url 不可达（不应被转换路径使用）
+        let providers = db.llm_list_providers().await.unwrap();
+        db.llm_save_provider(
+            &providers[0].id,
+            "DS",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "sk-upstream",
+            None::<&str>,
+            Some(&mock_url),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "deepseek-chat",
+                "max_tokens": 8,
+                "metadata": {"user_id": "t1"},
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "应恰好一次直通调用");
+        // 请求行命中 /v1/messages；带 Anthropic 原生头
+        let req = captured.lock().await.clone();
+        let first_line = req.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("/v1/messages"),
+            "应直发 /v1/messages: {first_line}"
+        );
+        assert!(
+            req.contains("anthropic-version: 2023-06-01"),
+            "缺 anthropic-version: {req}"
+        );
+        assert!(
+            req.to_lowercase().contains("x-api-key"),
+            "缺 x-api-key: {req}"
+        );
+        // 发送体 = 原始 Anthropic body：metadata 保留、model 替换为真实模型名（未被转成 OpenAI 格式）
+        let body = mock_body_from(&req);
+        assert_eq!(
+            body["model"], "deepseek-chat",
+            "直通 body model 应为真实模型名: {body}"
+        );
+        assert_eq!(
+            body["metadata"]["user_id"], "t1",
+            "metadata 应原样保留（未走转换）: {body}"
+        );
+        assert_eq!(body["max_tokens"], 8);
+        // 响应为 Anthropic 格式，未被二次转换
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message", "响应应为 Anthropic message 格式: {v}");
+        assert_eq!(v["content"][0]["text"], "直通回答");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert!(
+            v.get("choices").is_none(),
+            "不应有 choices（未二次转换）: {v}"
+        );
+    }
+
+    /// 多候选直通：组 [A(直通), B(直通)]，首选 A 被直通调用（/v1/messages + 原始 Anthropic body +
+    /// Anthropic 格式响应），响应不二次转换；首选成功时备选不被调用。
+    #[tokio::test]
+    async fn test_anthropic_passthrough_group_both_direct_first_success() {
+        use std::sync::atomic::Ordering;
+
+        let (a_url, a_captured, a_hits) = start_tcp_mock(
+            "200 OK",
+            "application/json",
+            serde_json::json!({
+                "id": "msg_a",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"直通 A"}],
+                "stop_reason": "end_turn"
+            }),
+        )
+        .await;
+        let (b_url, _b_captured, b_hits) = start_tcp_mock(
+            "200 OK",
+            "application/json",
+            serde_json::json!({"type": "message", "content": []}),
+        )
+        .await;
+
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        // 两个 provider 各一个模型，都配 anthropic_base_url（base_url 不可达）
+        db.llm_save_provider(
+            "p-a",
+            "A",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "k",
+            None::<&str>,
+            Some(&a_url),
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_provider(
+            "p-b",
+            "B",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "k",
+            None::<&str>,
+            Some(&b_url),
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model("m-a", "p-a", "model-a", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_save_model("m-b", "p-b", "model-b", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m-a".into(), 1), ("m-b".into(), 2)])
+            .await
+            .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "router",
+                "max_tokens": 8,
+                "metadata": {"user_id": "t1"},
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1, "首选应被直通调用一次");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 0, "首选成功时备选不应被调用");
+        // 首选收到原始 Anthropic body，model 替换为候选真实名 model-a
+        let req = a_captured.lock().await.clone();
+        let first_line = req.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("/v1/messages"),
+            "首选应直发 /v1/messages: {first_line}"
+        );
+        let body = mock_body_from(&req);
+        assert_eq!(
+            body["model"], "model-a",
+            "直通 body model 应为候选名: {body}"
+        );
+        assert_eq!(body["metadata"]["user_id"], "t1");
+        assert_eq!(body["max_tokens"], 8);
+        // 响应为 Anthropic 格式（未被二次转换）
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "直通 A");
+        assert!(
+            v.get("choices").is_none(),
+            "不应二次转换为 OpenAI 格式: {v}"
+        );
+    }
+
+    /// 多候选直通 failover：首选直通 404（确定性失败 → 记 known-failures）自动尝试第二候选
+    /// （同为直通）并成功返回 Anthropic 格式。
+    #[tokio::test]
+    async fn test_anthropic_passthrough_group_first_404_failover() {
+        use std::sync::atomic::Ordering;
+
+        let (a_url, _a_captured, a_hits) = start_tcp_mock(
+            "404 Not Found",
+            "application/json",
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "not_found_error", "message": "model not found"}
+            }),
+        )
+        .await;
+        let (b_url, b_captured, b_hits) = start_tcp_mock(
+            "200 OK",
+            "application/json",
+            serde_json::json!({
+                "id": "msg_b",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"text","text":"备选直通"}],
+                "stop_reason": "end_turn"
+            }),
+        )
+        .await;
+
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        db.llm_save_provider(
+            "p-a",
+            "A",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "k",
+            None::<&str>,
+            Some(&a_url),
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_provider(
+            "p-b",
+            "B",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "k",
+            None::<&str>,
+            Some(&b_url),
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model("m-a", "p-a", "model-a", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_save_model("m-b", "p-b", "model-b", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m-a".into(), 1), ("m-b".into(), 2)])
+            .await
+            .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "router",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1, "首选直通被调用一次后 404");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1, "404 后自动转移到备选直通");
+        // 备选也走 /v1/messages 直通，body model 替换为候选名 model-b
+        let req = b_captured.lock().await.clone();
+        let first_line = req.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("/v1/messages"),
+            "备选也应直发 /v1/messages: {first_line}"
+        );
+        let body = mock_body_from(&req);
+        assert_eq!(
+            body["model"], "model-b",
+            "备选直通 body model 应为候选名: {body}"
+        );
+        // 最终响应 Anthropic 格式
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "备选直通");
+        assert!(
+            v.get("choices").is_none(),
+            "不应二次转换为 OpenAI 格式: {v}"
+        );
+    }
+
+    /// 混合链：首选直通（anthropic_base_url）404，备选无 anthropic_base_url 走转换路径成功。
+    /// 最终响应为 Anthropic 格式（转换路径 post_process ToAnthropic），usage 记 failover_from。
+    #[tokio::test]
+    async fn test_anthropic_mixed_chain_passthrough_404_then_convert() {
+        use std::sync::atomic::Ordering;
+
+        let (a_url, _a_captured, a_hits) = start_tcp_mock(
+            "404 Not Found",
+            "application/json",
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "not_found_error", "message": "nf"}
+            }),
+        )
+        .await;
+        let (b_url, b_captured, b_hits) = start_tcp_mock(
+            "200 OK",
+            "application/json",
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "转换回答"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }),
+        )
+        .await;
+
+        let (state, key, _tmp) = state_with_db().await;
+        let db = state.db.clone().unwrap();
+        // p-a：anthropic_base_url → 直通 mock（404）；p-b：无 anthropic_base_url，base_url → 转换 mock
+        db.llm_save_provider(
+            "p-a",
+            "A",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "k",
+            None::<&str>,
+            Some(&a_url),
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_provider(
+            "p-b",
+            "B",
+            "deepseek",
+            &b_url,
+            "k",
+            None::<&str>,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model("m-a", "p-a", "model-a", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_save_model("m-b", "p-b", "model-b", "", "[]", true, None)
+            .await
+            .unwrap();
+        db.llm_create_model_group("g1", "router", true)
+            .await
+            .unwrap();
+        db.llm_replace_group_members("g1", &[("m-a".into(), 1), ("m-b".into(), 2)])
+            .await
+            .unwrap();
+
+        let resp = handle_messages(
+            State(LlmHandlerState {
+                llm: std::sync::Arc::new(state),
+                protocol: Some(LlmProtocol::Anthropic),
+            }),
+            authed_headers(&key),
+            Json(serde_json::json!({
+                "model": "router",
+                "max_tokens": 8,
+                "metadata": {"user_id": "t1"},
+                "messages": [{"role": "user", "content": "hi"}]
+            })),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1, "首选直通被调用并 404");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1, "404 后转移到转换路径备选");
+        // 备选收到 OpenAI 格式请求（/v1/chat/completions）
+        let req = b_captured.lock().await.clone();
+        let first_line = req.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("/v1/chat/completions"),
+            "备选应走转换路径: {first_line}"
+        );
+        // 最终响应为 Anthropic 格式（转换路径 post_process ToAnthropic）
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "转换回答");
+        assert_eq!(v["stop_reason"], "end_turn");
+        // usage 归因：failover_from = 首选直通模型，model_name = 实际出账转换模型
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let logs = db
+            .llm_query_usage_logs("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z", 10, 0)
+            .await
+            .unwrap();
+        let last = logs.first().expect("usage log");
+        assert_eq!(last.failover_from.as_deref(), Some("model-a"));
+        assert_eq!(last.model_name, "model-b");
     }
 }

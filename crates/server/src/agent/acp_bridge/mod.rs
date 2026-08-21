@@ -3602,7 +3602,8 @@ mod tests {
         let base = crate::agent::memory::mock_embedding_server(8).await;
         let (_mdb, memory) = crate::agent::memory::test_memory_with_embedding(&base).await;
         let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone())
-            .with_memory(memory);
+            .with_memory(memory)
+            .with_llm_gateway(test_gateway(&db));
         // e2e mock 声明 mcp http 能力并记录收到的 mcpServers。
         spawn_e2e_client(
             &registry,

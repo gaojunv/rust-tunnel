@@ -151,6 +151,8 @@ pub async fn handle_responses(
         message_count,
         has_tools,
         compat_enabled,
+        // Responses 入口无原始 Anthropic body，直通分支永不触发。
+        anthropic_body: None,
     };
 
     pipeline::run_execution(

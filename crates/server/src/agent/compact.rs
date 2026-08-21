@@ -245,6 +245,7 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         &chain,
         &req_body,
         false,
+        None,
     )
     .await;
     let resp = match outcome {

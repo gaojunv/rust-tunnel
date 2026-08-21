@@ -1496,7 +1496,7 @@ mod tests {
         let state = test_api_state(dir.path()).await;
         let db = state.server_state.db().unwrap().clone();
         // 先建 workspace + session（agent_sessions 有到 agent_workspaces 的 FK）
-        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None)
+        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None)
             .await
             .unwrap();
         db.agent_create_session("s1", "w1", None, None).await.unwrap();

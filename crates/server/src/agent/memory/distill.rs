@@ -318,6 +318,7 @@ async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result
         &chain,
         &req_body,
         false,
+        None,
     )
     .await;
     let resp = match outcome {
