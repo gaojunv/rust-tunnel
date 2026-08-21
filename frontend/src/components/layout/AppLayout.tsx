@@ -1,14 +1,18 @@
 import { Suspense, useCallback } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { Header } from './Header';
+import { Header, MobileMenuFab } from './Header';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { logout as apiLogout } from '@/api/client';
 import { AgentNotificationsProvider } from '@/notifications/NotificationProvider';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 
 export default function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
+  // 移动端（< md）不渲染页头：菜单按钮由 MobileMenuFab 悬浮在右上角，
+  // 腾出整段页头高度给内容。SSR/jsdom 无 matchMedia 时返回 false（按移动端处理）。
+  const isDesktop = useMediaQuery('(min-width: 768px)');
 
   // AI 工作台是唯一「整页自管理滚动」的路由：消息区/面板在页面内部各自滚动，
   // 外层再包一个整页滚动容器会叠出双重滚动条（历史：5ad703a 修过一次仍复发）。
@@ -46,7 +50,7 @@ export default function AppLayout() {
 
   return (
     <div className={cn('flex flex-col', isAgentRoute ? 'h-dvh' : 'h-screen')}>
-      <Header onLogout={handleLogout} />
+      {isDesktop ? <Header onLogout={handleLogout} /> : <MobileMenuFab onLogout={handleLogout} />}
       {isAgentRoute ? (
         <main className="min-h-0 flex-1 overflow-hidden">
           <div className="mx-auto h-full w-full max-w-[1400px] overflow-hidden px-2 py-3 md:px-6 md:py-6">

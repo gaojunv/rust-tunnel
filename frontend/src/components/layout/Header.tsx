@@ -104,6 +104,21 @@ interface HeaderProps {
   onLogout: () => void;
 }
 
+/** 移动端（< md）隐藏页头后，悬浮在右上角的菜单按钮。
+ *  独立组件：AppLayout 不再渲染 <header> 时仍需要它挂在布局层（fixed 定位）。
+ *  定位基准用 fixed 而非 absolute——滚动页面（ScrollArea 分支）里 absolute 会随内容滚走。 */
+export function MobileMenuFab({ onLogout }: HeaderProps) {
+  const { t } = useTranslation();
+  const location = useLocation();
+  const isActive = (href: string) => location.pathname === href;
+
+  return (
+    <div className="fixed right-3 top-[max(env(safe-area-inset-top,0px),0.75rem)] z-50 md:hidden">
+      <MobileNavSheet onLogout={onLogout} t={t} isActive={isActive} />
+    </div>
+  );
+}
+
 export function Header({ onLogout }: HeaderProps) {
   const { t } = useTranslation();
   const location = useLocation();
@@ -190,59 +205,76 @@ export function Header({ onLogout }: HeaderProps) {
           <LogOut className="h-4 w-4" />
         </Button>
 
-        {/* Mobile navigation */}
-        <Sheet>
-          <SheetTrigger asChild>
-            <Button variant="ghost" size="icon" aria-label={t('nav.openMenu')} className="md:hidden">
-              <Menu className="h-5 w-5" />
-            </Button>
-          </SheetTrigger>
-          <SheetContent side="right" className="flex w-72 flex-col p-0">
-            <SheetHeader className="border-b p-4">
-              <SheetTitle className="flex items-center gap-2 text-left">
-                <Logo className="logo-glow-breathe h-7 w-7 rounded-lg shadow-glow" />
-                <span className="text-aurora">Aurora Tunnel</span>
-              </SheetTitle>
-            </SheetHeader>
-            <nav className="flex-1 space-y-4 overflow-y-auto p-4">
-              <div className="space-y-1">
-                <SheetClose asChild>
-                  <Link to={dashboardItem.href} className={navLinkClass(isActive(dashboardItem.href))}>
-                    {dashboardItem.icon}
-                    <span>{t(dashboardItem.labelKey)}</span>
-                  </Link>
-                </SheetClose>
-              </div>
-              {navGroups.map((group) => (
-                <div key={group.labelKey} className="space-y-1">
-                  <p className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                    {t(group.labelKey)}
-                  </p>
-                  {group.items.map((item) => (
-                    <SheetClose asChild key={item.href}>
-                      <Link to={item.href} className={navLinkClass(isActive(item.href))}>
-                        {item.icon}
-                        <span>{t(item.labelKey)}</span>
-                      </Link>
-                    </SheetClose>
-                  ))}
-                </div>
-              ))}
-            </nav>
-            <Separator />
-            <div className="p-4">
-              <Button
-                variant="ghost"
-                className="w-full justify-start text-destructive hover:text-destructive"
-                onClick={onLogout}
-              >
-                <LogOut className="mr-2 h-4 w-4" />
-                {t('nav.logout')}
-              </Button>
-            </div>
-          </SheetContent>
-        </Sheet>
+        {/* Mobile navigation（页头内副本；md 以下整页头隐藏时由 MobileMenuFab 接管） */}
+        <div className="md:hidden">
+          <MobileNavSheet onLogout={onLogout} t={t} isActive={isActive} />
+        </div>
       </div>
     </header>
+  );
+}
+
+/** 移动端侧边抽屉导航（Sheet），页头内按钮与 MobileMenuFab 共用。 */
+function MobileNavSheet({
+  onLogout,
+  t,
+  isActive,
+}: {
+  onLogout: () => void;
+  t: (key: NavItem['labelKey'] | NavGroup['labelKey'] | 'nav.openMenu' | 'nav.logout') => string;
+  isActive: (href: string) => boolean;
+}) {
+  return (
+    <Sheet>
+      <SheetTrigger asChild>
+        <Button variant="ghost" size="icon" aria-label={t('nav.openMenu')}>
+          <Menu className="h-5 w-5" />
+        </Button>
+      </SheetTrigger>
+      <SheetContent side="right" className="flex w-72 flex-col p-0">
+        <SheetHeader className="border-b p-4">
+          <SheetTitle className="flex items-center gap-2 text-left">
+            <Logo className="logo-glow-breathe h-7 w-7 rounded-lg shadow-glow" />
+            <span className="text-aurora">Aurora Tunnel</span>
+          </SheetTitle>
+        </SheetHeader>
+        <nav className="flex-1 space-y-4 overflow-y-auto p-4">
+          <div className="space-y-1">
+            <SheetClose asChild>
+              <Link to={dashboardItem.href} className={navLinkClass(isActive(dashboardItem.href))}>
+                {dashboardItem.icon}
+                <span>{t(dashboardItem.labelKey)}</span>
+              </Link>
+            </SheetClose>
+          </div>
+          {navGroups.map((group) => (
+            <div key={group.labelKey} className="space-y-1">
+              <p className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                {t(group.labelKey)}
+              </p>
+              {group.items.map((item) => (
+                <SheetClose asChild key={item.href}>
+                  <Link to={item.href} className={navLinkClass(isActive(item.href))}>
+                    {item.icon}
+                    <span>{t(item.labelKey)}</span>
+                  </Link>
+                </SheetClose>
+              ))}
+            </div>
+          ))}
+        </nav>
+        <Separator />
+        <div className="p-4">
+          <Button
+            variant="ghost"
+            className="w-full justify-start text-destructive hover:text-destructive"
+            onClick={onLogout}
+          >
+            <LogOut className="mr-2 h-4 w-4" />
+            {t('nav.logout')}
+          </Button>
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 }
