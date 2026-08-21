@@ -62,6 +62,12 @@ describe('useVisualViewportHeight', () => {
   });
 
   it('模拟 iOS 键盘弹出（visualViewport 明显矮于布局视口）：--vvh 钉到可视高度', () => {
+    // iOS ≤25 UA：键盘适配仍走 --vvh 兜底
+    Object.defineProperty(window.navigator, 'userAgent', {
+      configurable: true,
+      value:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+    });
     stubClientHeight(800);
     const vv = stubVisualViewport(800);
     renderHook(() => useVisualViewportHeight());
@@ -73,6 +79,23 @@ describe('useVisualViewportHeight', () => {
     expect(vvh()).toBe('400px');
     act(() => {
       vv.height = 800; // 键盘收起 → 回退 100dvh
+      vv.dispatchEvent(new Event('resize'));
+    });
+    expect(vvh()).toBe('');
+  });
+
+  it('iOS 26+ 键盘弹出：不做任何干预，不写 --vvh（浏览器自身处理键盘滚动）', () => {
+    // iPhone iOS 26.1 UA：--vvh 钉高会与浏览器滚动叠加造成页面整体上移（实测反馈）
+    Object.defineProperty(window.navigator, 'userAgent', {
+      configurable: true,
+      value:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1',
+    });
+    stubClientHeight(800);
+    const vv = stubVisualViewport(800);
+    renderHook(() => useVisualViewportHeight());
+    act(() => {
+      vv.height = 400; // 键盘弹出
       vv.dispatchEvent(new Event('resize'));
     });
     expect(vvh()).toBe('');

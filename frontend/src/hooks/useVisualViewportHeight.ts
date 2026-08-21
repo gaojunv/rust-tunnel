@@ -9,11 +9,11 @@ import { isIos26Plus } from '../lib/ios';
  * visualViewport.height 会随键盘弹出收缩，此时把布局高度钉到可视高度
  * （h-[var(--vvh,100dvh)]），输入框贴键盘上沿。
  *
- * 与 interactive-widget=resizes-content 的配合：iOS 26+ 入口（main.tsx）会给
- * viewport meta 追加 interactive-widget=resizes-content——键盘弹起时布局视口
- * 自身收缩，浏览器接管布局与滚动，visual≈layout，下面的 100px 阈值条件不再
- * 触发，--vvh 自动退居幕后。iOS ≤25 与不支持的浏览器仍靠本机制兜底，两者
- * 不冲突。
+ * iOS 26+ 不做任何键盘干预（update() 直接 return，不写 --vvh）：iOS 26 浏览器
+ * 自身已能把聚焦的输入框滚动到键盘上方，--vvh 钉高会改变 /agent 根容器
+ * （h-[var(--vvh,100dvh)]）高度、引发整个 flex 页面重排上移，与浏览器的滚动
+ * 叠加后表现为「点输入框整个页面往上跑」（iPhone 16 Pro PWA 实测反馈）。
+ * iOS ≤25 与其他浏览器仍靠本机制兜底。
  *
  * 平时（无键盘）主动移除 --vvh 而非写入当前值：iOS PWA 冷启动时
  * visualViewport/innerHeight 会经历过渡态、报告非最终值，且 standalone
@@ -34,6 +34,9 @@ export function useVisualViewportHeight() {
     const vv = window.visualViewport;
 
     const update = () => {
+      // iOS 26+ 不做键盘干预：浏览器自身会把聚焦输入框滚动到键盘上方，
+      // 这里再钉 --vvh 会改根容器高度、与之叠加造成页面整体上移（实测反馈）
+      if (isIos26Plus()) return;
       const visual = vv?.height ?? window.innerHeight;
       // 布局视口高度：键盘弹出时不变（iOS），PWA 全屏下 = 屏幕高
       const layout = document.documentElement.clientHeight;
