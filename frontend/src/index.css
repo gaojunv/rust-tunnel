@@ -63,7 +63,7 @@
 
   html {
     color-scheme: light;
-    /* 防 iOS 橡皮筋滚动/下拉刷新干扰 h-dvh 非滚动布局（/agent 页外层永不滚动，
+    /* 防 iOS 橡皮筋滚动/下拉刷新干扰 h-vvh 非滚动布局（/agent 页外层永不滚动，
        橡皮筋只会让布局抖动） */
     overscroll-behavior-y: none;
     /* 细滚动条样式：供 ScrollArea 内部或其他局部滚动容器使用。
@@ -154,6 +154,13 @@ html body[data-scroll-locked] {
 }
 
 @layer utilities {
+  /* 视口实高（对标 Kimi）：height = window.innerHeight，键盘弹收时跟随可视视口，
+     不踩 visualViewport 停滞的 WebKit bug。--vh 由 main.tsx 的 setVhUnit 维护，
+     缺省 1vh 回退。/agent 等需精确填满可视区的整页布局用 h-vvh 替代 h-dvh。 */
+  .h-vvh {
+    height: calc(var(--vh, 1vh) * 100);
+  }
+
   /* 玻璃拟态卡片表面（配合 Card 的 border-border 使用，明暗主题均安全） */
   .glass-card {
     @apply bg-card/70 backdrop-blur-xl;

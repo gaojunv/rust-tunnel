@@ -124,9 +124,10 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             聊天区/输入框的垂直占位（避开本栏）由 AgentPage 主区域 pb-12 承担——
             此前在横向 flex 里放 h-12 spacer 宽度为 0，不产生占位，导致输入框卡片
             底部被本栏遮挡（发送/停止按钮不可见）。
-            写死 34px 垫高让栏背景延伸到屏幕物理底部（Home 指示条区），图标按钮
-            抬到其上方。 */}
-        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[34px] md:hidden">
+            垫高用 env(safe-area-inset-bottom) 自适应（对标 Kimi）：全面屏 iPhone
+            垫满 Home 指示条区，home 键机型 safe-area=0 时 h-12 本身已是触控高度、
+            无需额外垫高。 */}
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[env(safe-area-inset-bottom,0px)] md:hidden">
           <div className="flex h-12 items-center justify-around">
             {ICONS.map(({ kind, Icon, labelKey }) => (
               <button

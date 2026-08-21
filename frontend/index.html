@@ -3,9 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <!-- 对标 Kimi：不设 viewport-fit=cover（默认 contain）。
+         cover 会让 iOS PWA 把页面渲染进刘海/Home 指示条安全区，触发 WebKit
+         bug 254861（键盘 dismiss 后视口不恢复 → 底部留白），且键盘弹出时
+         压缩布局视口导致整页内容上移。contain 下视口行为保守稳定。
+         安全区适配改由 env(safe-area-inset-bottom) 在需要的元素上精确处理。 -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
