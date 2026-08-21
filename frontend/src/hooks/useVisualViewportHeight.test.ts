@@ -41,8 +41,12 @@ function stubStandalone(standalone: boolean) {
 describe('useVisualViewportHeight', () => {
   afterEach(() => {
     cleanup();
-    // 每个用例独立：清掉 stub 与残留的 CSS 变量
+    // 每个用例独立：清掉 stub 与残留的 CSS 变量、还原 UA
     Object.defineProperty(window, 'visualViewport', { value: undefined, configurable: true });
+    Object.defineProperty(window.navigator, 'userAgent', {
+      configurable: true,
+      value: 'Mozilla/5.0 (jsdom) AppleWebKit/537.36 (KHTML, like Gecko) jsdom/22.1.0',
+    });
     stubClientHeight(0);
     ['--vvh', '--sat-top', '--sat-bottom'].forEach((p) =>
       document.documentElement.style.removeProperty(p),
@@ -98,6 +102,22 @@ describe('useVisualViewportHeight', () => {
     // jsdom 不解析 env() → 探针读出 0，走兜底：全面屏 47px + Home 指示条 34px
     expect(satTop()).toBe('47px');
     expect(satBottom()).toBe('34px');
+  });
+
+  it('iOS 26+ standalone：env=0 是系统已预留安全区的新语义（WebKit bug 301994），跳过兜底不写 --sat-*', () => {
+    // iPhone iOS 26.1 UA（动态岛机 innerHeight≈screen.height 且 env=0，老逻辑必误触发）
+    Object.defineProperty(window.navigator, 'userAgent', {
+      configurable: true,
+      value:
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 26_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1',
+    });
+    stubStandalone(true);
+    stubClientHeight(852);
+    Object.defineProperty(window, 'innerHeight', { value: 852, configurable: true });
+    Object.defineProperty(window.screen, 'height', { value: 852, configurable: true });
+    renderHook(() => useVisualViewportHeight());
+    expect(satTop()).toBe('');
+    expect(satBottom()).toBe('');
   });
 
   it('非 standalone（浏览器模式）：不写兜底变量', () => {
