@@ -76,9 +76,6 @@ describe('ChatStream running state', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
-    // 键盘用例 stub 的 visualViewport / clientHeight / scrollIntoView 还原，避免串扰
-    Object.defineProperty(window, 'visualViewport', { value: undefined, configurable: true });
-    Object.defineProperty(document.documentElement, 'clientHeight', { value: 0, configurable: true });
     delete (Element.prototype as unknown as Record<string, unknown>).scrollIntoView;
   });
 
@@ -2094,57 +2091,12 @@ describe('ChatStream running state', () => {
     expect(screen.queryByText('agent.loadEarlierMessages')).toBeNull();
   });
 
-  it('keyboard visible: items change does NOT scrollIntoView (iOS 26 浏览器已自行滚动)', () => {
-    // 键盘弹起期间跳过贴底自动滚动：iOS 26 起 Safari/PWA 聚焦输入框时浏览器
-    // 已自行滚动使焦点可见；打字 → textarea 自适应高度 → virtualizer totalSize 变 →
-    // 触发 [items, totalSize] effect 的 scrollIntoView，与浏览器滚动打架会让页面
-    // 向上跳。模拟 visualViewport 明显矮于布局视口（键盘弹起），断言滚动被跳过。
+  it('items change scrolls to bottom (stickToBottom)', () => {
+    // 贴底滚动：新消息到达时 scrollIntoView 被调用。
     (listAgentMessages as Mock).mockResolvedValue([]);
-    // jsdom 无 visualViewport：用带 height 的 EventTarget 顶替（与
-    // useVisualViewportHeight.test.ts 同款手法），并 stub 布局高度 800
-    const vv = Object.assign(new EventTarget(), { height: 800 });
-    Object.defineProperty(window, 'visualViewport', { value: vv, configurable: true });
-    Object.defineProperty(document.documentElement, 'clientHeight', {
-      value: 800,
-      configurable: true,
-    });
     const scrollSpy = vi.fn();
     // ChatStream 用 bottomRef.current?.scrollIntoView?.() 兜底 jsdom 未实现——
     // 在原型上补实现以便断言调用与否
-    Object.defineProperty(Element.prototype, 'scrollIntoView', {
-      value: scrollSpy,
-      configurable: true,
-    });
-    renderChat();
-    // 键盘弹起：可视高度收缩到 400（差值 > 100px 阈值 → keyboardVisible=true）
-    act(() => {
-      vv.height = 400;
-      vv.dispatchEvent(new Event('resize'));
-    });
-    scrollSpy.mockClear();
-    // 打字期间 items/totalSize 变化（流式增量）→ 不得触发贴底滚动
-    act(() => {
-      wsInstance!.emit({ type: 'assistant_chunk', content: '回复内容', final: true });
-      wsInstance!.emit({ type: 'done' });
-    });
-    expect(scrollSpy).not.toHaveBeenCalled();
-    // 键盘收起后恢复贴底滚动（对照：同一组件内新消息到达照常滚动）
-    act(() => {
-      vv.height = 800;
-      vv.dispatchEvent(new Event('resize'));
-    });
-    act(() => {
-      wsInstance!.emit({ type: 'assistant_chunk', content: '第二条', final: true });
-      wsInstance!.emit({ type: 'done' });
-    });
-    expect(scrollSpy).toHaveBeenCalled();
-  });
-
-  it('keyboard hidden: items change still scrollIntoView (对照组)', () => {
-    // 无 visualViewport（jsdom 默认）：useKeyboardVisible 恒 false，不阻塞既有
-    // 贴底滚动行为。
-    (listAgentMessages as Mock).mockResolvedValue([]);
-    const scrollSpy = vi.fn();
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
       value: scrollSpy,
       configurable: true,

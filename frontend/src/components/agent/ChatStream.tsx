@@ -6,7 +6,6 @@ import { Button } from '@/components/ui/button';
 import { Loader2, SendHorizontal, Square } from 'lucide-react';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { useImeGuard } from '@/hooks/useImeGuard';
-import { useKeyboardVisible } from '@/hooks/useKeyboardVisible';
 import {
   agentWsUrl,
   getApiErrorMessage,
@@ -167,9 +166,6 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // IME 组词守卫：回车在组词中是「确认候选」而非发送（详见 useImeGuard）
   const ime = useImeGuard();
-  // 软键盘弹起标记：键盘弹起期间跳过贴底自动滚动（iOS 26 起浏览器已自行滚动
-  // 使焦点可见，程序化 scrollIntoView 与之打架会造成「输入时页面向上跳」）
-  const keyboardVisibleRef = useKeyboardVisible();
   const wsRef = useRef<WebSocket | null>(null);
   // 最近一帧到达时间（含应用层心跳）：看门狗据此判定连接假死（半开 TCP）。
   // 用组件级 ref——重连的 connect() 闭包都要读写它；effect 内局部变量会在 effect
@@ -1138,14 +1134,10 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   useEffect(() => {
     // 仅当用户接近底部时才自动滚动（上翻读历史不被拽回）；直接滚动到底，
     // 避免逐 token smooth 动画互相堆积。jsdom 未实现 scrollIntoView，?.() 保底。
-    // 键盘弹起期间跳过：打字时 textarea 自适应高度变化 → totalSize 变 → 触发本
-    // effect，而 iOS 26 起浏览器聚焦时已自行滚动使焦点可见，两者打架会让页面
-    // 向上跳。
-    if (keyboardVisibleRef.current) return;
     if (stickToBottomRef.current) {
       bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
-  }, [items, totalSize, keyboardVisibleRef]);
+  }, [items, totalSize]);
 
   // 多标签页模式：后台 tab 用 hidden 保持挂载（不卸载），尺寸/滚动位置不因切换
   // 而变。从隐藏变为可见（active false→true）且用户此前接近底部时，把视口重新
@@ -1155,13 +1147,11 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   useEffect(() => {
     const wasInactive = prevActiveRef.current !== true;
     prevActiveRef.current = active;
-    // 键盘弹起期间同样跳过：理由同上方 [items, totalSize] effect。
-    if (keyboardVisibleRef.current) return;
     if (active && wasInactive && stickToBottomRef.current) {
       virtualizer.measure();
       bottomRef.current?.scrollIntoView?.({ behavior: 'auto' });
     }
-  }, [active, virtualizer, keyboardVisibleRef]);
+  }, [active, virtualizer]);
 
   // 输入框自适应高度：内容驱动向上长高（输入框锚定底部悬浮），超 10 行才出滚动条
   const autoresizeInput = useCallback(() => {
@@ -1640,8 +1630,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             时都与消息流左/右边缘精确对齐。sticky 在文档流中占位，滚动到底时输入框
             落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区，
             滚动内容从输入框底下经过时被 bg-card 遮挡。顶部 absolute 渐隐让内容
-            淡出到输入框，不占文档流高度。 */}
-        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+            淡出到输入框，不占文档流高度。pb-[34px] 写死垫高让输入框背景延伸
+            到屏幕物理底部（Home 指示条区），输入框本体抬到其上方。 */}
+        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[34px] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
           <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
           <div className="mx-auto w-full max-w-3xl">
           {running && (

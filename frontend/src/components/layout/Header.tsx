@@ -115,11 +115,9 @@ export function Header({ onLogout }: HeaderProps) {
   const isActive = (href: string) => location.pathname === href;
 
   return (
-    // PWA 全屏/刘海屏：pt-[env(safe-area-inset-top)] 让 header 背景延伸覆盖状态栏
-    // 区域（避免内容被刘海遮挡），内部 h-14 container 高度不变。
-    // var(--sat-top) 兜底：部分 iOS 版本 standalone 下 env() 恒为 0，
-    // 由 useVisualViewportHeight 探针检测后按机型写入估算值。
-    <header className="sticky top-0 z-40 border-b border-border/70 bg-card/60 backdrop-blur-xl shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04),0_10px_30px_-12px_hsl(var(--primary)/0.22),0_2px_8px_-4px_hsl(var(--foreground)/0.08)] pt-[max(env(safe-area-inset-top),var(--sat-top,0px))]">
+    // PWA 全屏：iPhone 动态岛机状态栏区 59px，写死 padding-top 让 header 背景
+    // 延伸覆盖状态栏区（避免内容被刘海遮挡），内部 h-14 container 高度不变。
+    <header className="sticky top-0 z-40 border-b border-border/70 bg-card/60 backdrop-blur-xl shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04),0_10px_30px_-12px_hsl(var(--primary)/0.22),0_2px_8px_-4px_hsl(var(--foreground)/0.08)] pt-[59px]">
       {/* 装饰层（数据流光效 + 底部流光渐变线）。
           overflow-hidden 只加在装饰层上：若加在 header 上会把 ThemeToggle
           弹出到 header 外的下拉菜单一起裁掉，导致主题切换无法点击。
