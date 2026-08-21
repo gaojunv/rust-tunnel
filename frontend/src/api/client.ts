@@ -582,9 +582,9 @@ export async function createAgentWorkspace(body: {
   agent_type?: string;
   agent_path?: string;
   llm_model_id?: string;
-  agent_config_overrides?: string;
+  agent_config_overrides?: string | null;
   /** Claude Code 三档位模型映射（JSON object：{opus,sonnet,haiku} → `model:<id>`/`group:<id>`） */
-  claude_tier_models?: string;
+  claude_tier_models?: string | null;
   /** GitHub Actions 面板：owner/repo 空串=不设置；token 仅在非空时发送（服务端加密落库） */
   github_owner?: string;
   github_repo?: string;
@@ -608,9 +608,9 @@ export const updateAgentWorkspace = (
     agent_type?: string;
     agent_path?: string;
     llm_model_id?: string;
-    agent_config_overrides?: string;
-    /** Claude Code 三档位模型映射（JSON object；`"{}"` 显式清空，缺省保持原值） */
-    claude_tier_models?: string;
+    agent_config_overrides?: string | null;
+    /** Claude Code 三档位模型映射（JSON object；显式 null 清空，缺省保持原值） */
+    claude_tier_models?: string | null;
     /** GitHub 字段：空串=保持不变（服务端 COALESCE）；token 仅在非空时发送 */
     github_owner?: string;
     github_repo?: string;
@@ -642,6 +642,14 @@ export async function deleteAgentSession(id: string): Promise<void> {
 
 export async function updateAgentSessionTitle(id: string, title: string): Promise<void> {
   await api.put(`/agent/sessions/${id}`, { title });
+}
+
+/** 导出会话为 Markdown：返回 Blob（调用方负责触发下载与 revokeObjectURL）。 */
+export async function exportAgentSession(id: string): Promise<Blob> {
+  const { data } = await api.get(`/agent/sessions/${id}/export`, {
+    responseType: 'blob',
+  });
+  return data as Blob;
 }
 
 /** 会话消息分页响应：`messages` 为升序的最近一页，`has_more` 表示是否还有更早。 */

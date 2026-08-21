@@ -703,8 +703,9 @@ export interface AgentWorkspace {
   agent_path?: string;
   /** workspace 默认 LLM 模型 id（llm_models.id） */
   llm_model_id?: string;
-  /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent */
-  agent_config_overrides?: string;
+  /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent。
+   *  null = 显式清零（PATCH 时发 null 后端清除）；undefined = 省略（保持原值） */
+  agent_config_overrides?: string | null;
   /** Claude Code 三档位模型映射（JSON object：{opus,sonnet,haiku} → `model:<id>`/`group:<id>`）；空档位落空 */
   claude_tier_models?: string | null;
   /** 是否已配置 GitHub token（仅布尔位，token 明文永不回传） */
@@ -724,6 +725,10 @@ export interface AgentSession {
   status: 'active' | 'archived';
   model?: string;
   role_id?: string | null;
+  /** ACP usage_update 快照：最近一次上下文用量（tokens），刷新后恢复用量条 */
+  context_used?: number | null;
+  /** 上下文窗口大小（tokens），与 context_used 成对出现 */
+  context_size?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -938,6 +943,16 @@ export type AgentWsEvent =
   | { type: 'plan'; entries?: PlanEntryItem[] }
   | { type: 'usage'; used?: number; size?: number }
   | {
+      /** ACP 多模态内容块占位帧（image/audio/resource）：只携带元信息，
+       *  不透传 base64 数据——渲染为附件占位卡 */
+      type: 'attachment';
+      media_kind?: 'image' | 'audio' | 'resource' | string;
+      name?: string;
+      uri?: string;
+      mime?: string;
+      parent_tool_call_id?: string;
+    }
+  | {
       /** runner 路径工具参数流式透出（模型写大文件时前端实时可见参数增量） */
       type: 'tool_call_chunk';
       /** OpenAI 流式增量按 index 归位 */
@@ -954,7 +969,8 @@ export type AgentWsEvent =
   | { type: 'queued' }
   // 停止超时兜底：agent 未在时限内响应停止，服务端强制杀进程并重启
   | { type: 'cancel_fallback' }
-  | { type: 'done' }
+  // duration_ms：ACP 路径回合耗时（排队连续回合的中间 done 不携带）
+  | { type: 'done'; duration_ms?: number }
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }
   | {
@@ -978,11 +994,20 @@ export type AgentWsEvent =
   | { type: 'stream_reset' }
   // 应用层心跳：看门狗探活 + 重置 running 不活动兜底，不渲染
   | { type: 'heartbeat'; ts?: number }
-  | { type: 'session_state'; options?: SessionConfigOption[] }
+  | {
+      type: 'session_state';
+      options?: SessionConfigOption[];
+      // 重连补发的斜杠命令快照（嵌于 session_state，后端 acp_bridge 补发）
+      available_commands?: { name: string; description?: string }[];
+    }
   | { type: 'config_option_update'; options?: SessionConfigOption[] }
   | { type: 'current_mode_update'; mode_id?: string }
   | { type: 'mode_updated'; mode?: string }
-  | { type: 'todo_update'; todos?: TodoItem[] };
+  | { type: 'todo_update'; todos?: TodoItem[] }
+  | {
+      type: 'available_commands';
+      commands?: { name: string; description?: string }[];
+    };
 
 /** 工作台全局通知（浏览器标签闪动/系统通知）。经 `/api/agent/notifications/ws`
  *  推送；与后端 `agent::notify::AgentNotification` 字段一一对应。 */

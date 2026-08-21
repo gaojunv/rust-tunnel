@@ -5,15 +5,21 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
 import { logout as apiLogout } from '@/api/client';
 import { AgentNotificationsProvider } from '@/notifications/NotificationProvider';
+import { useVisualViewportHeight } from '@/hooks/useVisualViewportHeight';
 
 export default function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
 
+  // iOS 软键盘适配：把 visualViewport 高度写入 --vvh（见 hook 注释）。
+  // 键盘弹出时 --vvh 收缩，让 /agent 布局底部 sticky 输入框贴键盘上沿。
+  useVisualViewportHeight();
+
   // AI 工作台是唯一「整页自管理滚动」的路由：消息区/面板在页面内部各自滚动，
   // 外层再包一个整页滚动容器会叠出双重滚动条（历史：5ad703a 修过一次仍复发）。
-  // 对它走非滚动分支：外层高度链用 h-dvh（动态视口，地址栏展开/收起时输入框
-  // 不被遮挡），AgentPage 用 h-full 精确填满 Header 以下空间，外层永不产生滚动条。
+  // 对它走非滚动分支：外层高度链用 --vvh（visualViewport 可视高度，键盘弹出时
+  // 收缩让输入框不被遮挡；fallback 100dvh 保证 hook 未运行/SSR 时按动态视口
+  // 正常布局），AgentPage 用 h-full 精确填满 Header 以下空间，外层永不产生滚动条。
   const isAgentRoute = location.pathname === '/agent';
 
   const handleLogout = useCallback(async () => {
@@ -43,7 +49,7 @@ export default function AppLayout() {
   );
 
   return (
-    <div className={cn('flex flex-col', isAgentRoute ? 'h-dvh' : 'h-screen')}>
+    <div className={cn('flex flex-col', isAgentRoute ? 'h-[var(--vvh,100dvh)]' : 'h-screen')}>
       <Header onLogout={handleLogout} />
       {isAgentRoute ? (
         <main className="min-h-0 flex-1 overflow-hidden">

@@ -146,10 +146,12 @@ impl AcpBridge {
                     busy: false,
                     cancelled_turns: std::collections::HashSet::new(),
                     turn_generation: 0,
+                    turn_started_at: None,
                     last_activity: std::time::Instant::now(),
                     exited: false,
                     turn_segments: Vec::new(),
                     config_options: Vec::new(),
+                    available_commands: Vec::new(),
                     spawn_ready: watch::channel(false).0,
                     pending_prompts: migrated_prompts,
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
@@ -165,6 +167,7 @@ impl AcpBridge {
             // 新一轮 spawn 尝试：清除上一次的失败缓存，避免 wait_ready 在新
             // 尝试在途时消费到陈旧错误（见 spawn_failure 的消费条件）。
             self.spawn_errors.lock().await.remove(session_id);
+            self.restore_pending_prompts(session_id).await;
         }
 
         // 拿锁期不 spawn（避免长时间持锁阻塞 prompt/cancel）。先解析客户端
@@ -186,24 +189,35 @@ impl AcpBridge {
         // vs agent 不响应 set_config_option）的关键证据。
         let pipeline_start = std::time::Instant::now();
         let outcome: Result<(), String> = async {
-            // 0) 模型配置门禁：session.model / workspace.llm_model_id / 全局默认
-            //    任一即可。实际 LLM 请求按 session 从 DB 解析（resolve_effective_model，
-            //    含「第一个可用」兜底），此处只防 spawn 后才发现无模型。校验失败走
-            //    通用错误路径（outcome Err → 占位被移除，允许重试）。
+            // 0a) LLM 网关门禁：网关未注入（启动时无 provider → llm_state 为空）
+            //     时 spawn 出的 agent 每个 LLM 请求都会 502——前置拦截，错误直接
+            //     指向配置入口，而非等用户发消息后看到莫名其妙的 502。
+            if self.gateway.is_none() {
+                return Err(
+                    "gateway: LLM 网关未配置（无可用 provider），请先在 LLM 网关页添加 provider 与模型"
+                        .into(),
+                );
+            }
+            // 0b) 模型配置门禁：session.model / workspace.llm_model_id / 全局默认
+            //     任一即可。实际 LLM 请求按 session 从 DB 解析（resolve_effective_model，
+            //     含「第一个可用」兜底），此处只防 spawn 后才发现无模型。校验失败走
+            //     通用错误路径（outcome Err → 占位被移除，允许重试）。
             if !crate::agent::session::has_any_model_config(
                 &self.db,
                 session_id,
                 workspace.llm_model_id.as_deref(),
             )
-            .await?
+            .await
+            .map_err(|e| format!("model_gate: {e}"))?
             {
-                return Err("workspace 与 session 均未配置 LLM 模型".into());
+                return Err("model_gate: workspace 与 session 均未配置 LLM 模型".into());
             }
             // 1) 客户端内嵌 LLM 回环代理
             let port = self
                 .spawner
                 .start_llm_proxy(&client_id, session_id, SPAWN_TIMEOUT)
-                .await?;
+                .await
+                .map_err(|e| format!("llm_proxy: {e}"))?;
             tracing::info!(
                 session_id,
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
@@ -317,7 +331,8 @@ impl AcpBridge {
                     &available_models,
                     &tier_envs,
                 )
-                .await?;
+                .await
+                .map_err(|e| format!("spawn_agent: {e}"))?;
             tracing::info!(
                 session_id,
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
@@ -343,7 +358,8 @@ impl AcpBridge {
                 port,
                 mcp_token,
             )
-            .await?;
+            .await
+            .map_err(|e| format!("handshake: {e}"))?;
             tracing::info!(
                 session_id,
                 elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
@@ -364,7 +380,25 @@ impl AcpBridge {
                 .lock()
                 .await
                 .insert(session_id.to_string(), e.clone());
+            // 持久化归因（best-effort）：重启后/会话列表仍可追溯最近一次失败
+            // 阶段（内存 spawn_errors 重启即丢）。
+            if let Err(db_err) = self
+                .db
+                .agent_update_session_spawn_error(session_id, Some(e))
+                .await
+            {
+                tracing::warn!(session_id, "persist spawn error failed: {db_err}");
+            }
             return outcome;
+        }
+        // spawn 成功：清空持久化的失败归因（新一轮尝试的错误已被上面覆盖；
+        // 此处清掉历史残留，DTO 不再误报旧错误）。
+        if let Err(db_err) = self
+            .db
+            .agent_update_session_spawn_error(session_id, None)
+            .await
+        {
+            tracing::warn!(session_id, "clear spawn error failed: {db_err}");
         }
         // 握手成功：workspace 级 overrides 注入先于 session 级 config_state 回放
         // ——用户显式选择（config_state）覆盖 workspace 默认值。在 acp_handshake
@@ -529,6 +563,13 @@ impl AcpBridge {
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                                agent_client_protocol::schema::v1::SessionUpdate::AvailableCommandsUpdate(
+                                    upd,
+                                ) => {
+                                    if let Some(a) = sessions.lock().await.get_mut(&sid) {
+                                        a.available_commands = upd.available_commands.clone();
                                     }
                                 }
                                 _ => {}
@@ -1107,6 +1148,7 @@ impl AcpBridge {
                 .ok_or_else(|| "ACP handshake not complete".to_string())?;
             agent.busy = true;
             agent.last_activity = std::time::Instant::now();
+            agent.turn_started_at = Some(std::time::Instant::now());
             // 为本回合分配递增代数：cancel 时记录，终态回调据此判断是否抑制。
             // 解决单布尔跨回合共享导致 cancel 后立即重发 prompt 时误吞 done/
             // 误发 error 的竞态（cancelled 布尔无法区分"哪个回合被取消"）。
@@ -1152,7 +1194,7 @@ impl AcpBridge {
                 // （若会话存活）。取消/杀进程后的终态帧抑制按代数匹配而非全局
                 // 布尔：cancel 后立即重发 prompt 时，新回合的终态回调不会被旧回合
                 // 的取消标记误吞（评审 Finding）。
-                let (next, cancelled, alive) = {
+                let (next, cancelled, alive, duration_ms) = {
                     let mut map = sessions.lock().await;
                     match map.get_mut(&sid) {
                         Some(a) => {
@@ -1182,7 +1224,16 @@ impl AcpBridge {
                             if next.is_some() {
                                 a.busy = true;
                             }
-                            (next, cancelled, alive)
+                            // 回合耗时：仅在本回合真正收尾（无排队下一条）时取出
+                            // 计时——连续回合的下一条由 prompt_inner 重设起点。
+                            let duration_ms = if next.is_none() {
+                                a.turn_started_at
+                                    .take()
+                                    .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+                            } else {
+                                None
+                            };
+                            (next, cancelled, alive, duration_ms)
                         }
                         // 会话已 kill/回收：条目移除，不再发终态帧。
                         None => return Ok(()),
@@ -1192,6 +1243,10 @@ impl AcpBridge {
                 // 持锁状态 send_request（prompt 内部自己取锁）；spawn 避免同步
                 // 递归 async 的深度风险（20 条排队 = 至多 20 层同步调用栈）。
                 if let Some(next) = next {
+                    // 取出即删持久行（best-effort）：本条已交执行，不再需要恢复。
+                    if let Some(pid) = &next.persist_id {
+                        let _ = db.agent_pending_delete(pid).await;
+                    }
                     // 抽成独立 sync fn 发起下一条（不在 async 闭包里直接
                     // tokio::spawn(bridge.prompt(...))——闭包捕获环境会让 prompt
                     // future 被判定非 Send；独立函数里是普通 owned 数据，编译通过）。
@@ -1227,10 +1282,16 @@ impl AcpBridge {
                 // 与旧「无 ws_tx 直接返回」等价）。
                 match result {
                     Ok(_resp) => {
+                        // done 帧携带回合耗时（毫秒）：前端展示「x.xs」；排队
+                        // 连续回合的中间 done 不发，只有收尾帧带耗时。
+                        let done_frame = match duration_ms {
+                            Some(ms) => serde_json::json!({"type": "done", "duration_ms": ms}),
+                            None => serde_json::json!({"type": "done"}),
+                        };
                         broadcast_ws_frame(
                             &sessions,
                             &sid,
-                            &serde_json::json!({"type": "done"}),
+                            &done_frame,
                             true,
                         )
                         .await;
@@ -1276,9 +1337,14 @@ impl AcpBridge {
         content: &str,
         refs: Vec<String>,
     ) -> Result<(), String> {
-        // 锁内决策：busy 入队；空闲跑现有 prompt()。队列非空但空闲（兜底杀进程后
-        // 重拉迁移的旧消息）时，本条排到队尾、先跑队首——保持 FIFO 顺序。
-        let run_content = {
+        // 第一段锁内快判：空闲直跑（最常见路径，零 DB 开销）；busy/队列非空走
+        // 入队路径。队列非空但空闲（兜底杀进程后重拉迁移/恢复的旧消息）时，本条
+        // 排到队尾、先跑队首——保持 FIFO 顺序。
+        enum Act {
+            Run(String),
+            Enqueue,
+        }
+        let act = {
             let mut sessions = self.sessions.lock().await;
             let Some(a) = sessions.get_mut(session_id) else {
                 return Err("session not spawned".to_string());
@@ -1290,36 +1356,76 @@ impl AcpBridge {
                 if a.pending_prompts.len() >= MAX_PENDING_PROMPTS {
                     return Err(format!("排队消息已达上限（{MAX_PENDING_PROMPTS} 条）"));
                 }
-                a.pending_prompts.push_back(PendingPrompt {
-                    content: content.to_string(),
-                    refs,
-                });
-                // queued 帧：状态提示，广播到所有连接（多标签页都看到排队提示）；
-                // try_send 无 await、持锁安全，丢帧可接受（与通知处理器同语义）。
-                for (_, tx) in &a.ws_conns {
-                    let _ = tx.try_send(serde_json::json!({"type": "queued"}));
-                }
-                return Ok(());
-            }
-            if a.pending_prompts.is_empty() {
-                Some(content.to_string())
+                Act::Enqueue
+            } else if a.pending_prompts.is_empty() {
+                Act::Run(content.to_string())
             } else {
-                // 空闲但队列非空：本条排到队尾（FIFO），先跑队首旧消息。
-                a.pending_prompts.push_back(PendingPrompt {
-                    content: content.to_string(),
-                    refs,
-                });
-                // queued 帧：广播到所有连接（同 busy 分支语义）。
-                for (_, tx) in &a.ws_conns {
-                    let _ = tx.try_send(serde_json::json!({"type": "queued"}));
+                Act::Enqueue
+            }
+        };
+        let Act::Enqueue = act else {
+            let Act::Run(c) = act else { unreachable!() };
+            return self.prompt(session_id, &c).await;
+        };
+
+        // 入队路径：先落库（best-effort）再入内存队——INSERT 必先于 push 完成，
+        // 否则 drain 取出后的 DELETE 可能先于 INSERT 执行，留下残留行导致重启后
+        // 重复执行。落库失败降级为纯内存项（persist_id=None，重启后丢失，与旧
+        // 行为一致）。
+        let persist_id = format!("{:032x}", rand::random::<u128>());
+        let refs_json = serde_json::to_string(&refs).unwrap_or_else(|_| "[]".into());
+        let persisted = self
+            .db
+            .agent_pending_enqueue(&persist_id, session_id, content, &refs_json)
+            .await
+            .map_err(|e| {
+                tracing::warn!(session_id, "persist pending prompt failed: {e}");
+            })
+            .is_ok();
+        let item = PendingPrompt {
+            content: content.to_string(),
+            refs,
+            persist_id: persisted.then_some(persist_id.clone()),
+        };
+        // 第二段锁内按最新状态落定：INSERT 期间回合可能恰好结束（busy→空闲），
+        // 需重检——否则消息滞留队列无人 drain。
+        let run_content = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(a) = sessions.get_mut(session_id) else {
+                // 条目被 kill/reaper 回收：回滚刚落的库行，报会话不存在
+                drop(sessions);
+                let _ = self.db.agent_pending_delete(&persist_id).await;
+                return Err("session not spawned".to_string());
+            };
+            a.pending_prompts.push_back(item);
+            // queued 帧：状态提示，广播到所有连接（多标签页都看到排队提示）；
+            // try_send 无 await、持锁安全，丢帧可接受（与通知处理器同语义）。
+            for (_, tx) in &a.ws_conns {
+                let _ = tx.try_send(serde_json::json!({"type": "queued"}));
+            }
+            if a.busy {
+                None
+            } else {
+                // INSERT 期间回合已结束（或本就空闲但队列有旧消息）：FIFO 跑队首。
+                // busy 置位防抢跑（与终态 drain 的 M1 竞态同理）。
+                let front = a.pending_prompts.pop_front();
+                if front.is_some() {
+                    a.busy = true;
                 }
-                a.pending_prompts
-                    .pop_front()
-                    .map(|p| p.content)
+                front
             }
         };
         match run_content {
-            Some(c) => self.prompt(session_id, &c).await,
+            Some(front) => {
+                // 取出即删持久行（消息已被执行，不再需要恢复）；被回滚的直行路径
+                // 同样在此删除（front 可能就是本条）。
+                if let Some(fid) = &front.persist_id {
+                    let _ = self.db.agent_pending_delete(fid).await;
+                }
+                // drain=true：busy 已在上面锁内为本条置位，跳过 prompt_inner 的
+                // busy 检查（与终态回调的 drain 路径同语义）。
+                self.prompt_inner(session_id, &front.content, true).await
+            }
             None => Ok(()),
         }
     }
@@ -1527,16 +1633,31 @@ impl AcpBridge {
     }
 
     /// 构造全量 session_state 帧；无状态（未握手/agent 不上报）返回 None。
+    /// 同时包含 available_commands（若有），确保新连接的标签页能拿到最新命令列表。
     async fn session_state_frame(&self, session_id: &str) -> Option<serde_json::Value> {
         let sessions = self.sessions.lock().await;
         let agent = sessions.get(session_id)?;
         if agent.acp_session_id.is_none() || agent.config_options.is_empty() {
             return None;
         }
-        Some(serde_json::json!({
+        let mut frame = serde_json::json!({
             "type": "session_state",
             "options": agent.config_options,
-        }))
+        });
+        if !agent.available_commands.is_empty() {
+            let commands: Vec<serde_json::Value> = agent
+                .available_commands
+                .iter()
+                .map(|cmd| {
+                    serde_json::json!({
+                        "name": cmd.name,
+                        "description": cmd.description,
+                    })
+                })
+                .collect();
+            frame["available_commands"] = serde_json::Value::Array(commands);
+        }
+        Some(frame)
     }
 
     /// 握手成功后注入 workspace 级 ACP 引擎选项覆盖（`agent_config_overrides`，
@@ -1660,11 +1781,43 @@ impl AcpBridge {
         )
         .await
         {
-            Err(_) => Err(format!("set_config_option timed out: {config_id}")),
+            Err(_) => {
+                // 超时对账：agent 可能实际已生效但响应丢失，也可能未生效——
+                // 无论哪种，都把内存中的权威快照广播给前端，让其收敛回真实
+                // 状态（前端 optimistic UI 得以回滚）。
+                self.broadcast_config_snapshot(session_id).await;
+                Err(format!("set_config_option timed out: {config_id}"))
+            }
             Ok(inner) => {
-                inner.map_err(|e| format!("set_config_option failed: {e}"))?;
+                if let Err(e) = inner {
+                    // 错误路径同样对账（agent 显式拒绝时快照即旧值）。
+                    self.broadcast_config_snapshot(session_id).await;
+                    return Err(format!("set_config_option failed: {e}"));
+                }
                 Ok(())
             }
+        }
+    }
+
+    /// 把会话内存中的 config_options 快照以 `config_option_update` 帧广播给
+    /// 当前 WS 连接（best-effort）——用于 set_config_option 超时/失败后的对账。
+    async fn broadcast_config_snapshot(&self, session_id: &str) {
+        let options = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .map(|a| a.config_options.clone())
+        };
+        let Some(options) = options else { return };
+        if options.is_empty() {
+            return;
+        }
+        let frame = serde_json::json!({
+            "type": "config_option_update",
+            "options": options,
+        });
+        if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
+            let _ = ws_tx.try_send(frame);
         }
     }
 
@@ -1744,6 +1897,37 @@ impl AcpBridge {
         match self.spawn_errors.lock().await.get(session_id) {
             Some(e) => format!("agent spawn failed: {e}"),
             None => "session not spawned".to_string(),
+        }
+    }
+
+    /// 恢复持久化的排队 prompt（服务端重启/reaper 回收后首次 spawn 时调用）。
+    ///
+    /// DB 为权威队列：占位条目里 migrated 的旧内存拷贝与 DB 行是同一批
+    /// 消息——以 DB 版为准，仅补 `persist_id=None` 的落库失败降级项。
+    pub(super) async fn restore_pending_prompts(&self, session_id: &str) {
+        let rows = self
+            .db
+            .agent_pending_list(session_id)
+            .await
+            .unwrap_or_default();
+        if rows.is_empty() {
+            return;
+        }
+        let mut restored: VecDeque<PendingPrompt> = rows
+            .into_iter()
+            .map(|(id, content, refs)| PendingPrompt {
+                content,
+                refs: serde_json::from_str(&refs).unwrap_or_default(),
+                persist_id: Some(id),
+            })
+            .collect();
+        let mut sessions = self.sessions.lock().await;
+        if let Some(a) = sessions.get_mut(session_id) {
+            let memory_only = std::mem::take(&mut a.pending_prompts)
+                .into_iter()
+                .filter(|p| p.persist_id.is_none());
+            restored.extend(memory_only);
+            a.pending_prompts = restored;
         }
     }
 

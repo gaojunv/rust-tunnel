@@ -151,7 +151,37 @@ pub(super) async fn persist_acp_frame(
                 }
             }
         }
-        _ => {} // usage 等：仅实时推送，不落库
+        "usage" => {
+            // 上下文用量快照：覆盖式写入 sessions 表（仅保留最近一次，不做历史累计），
+            // 刷新后前端从 session DTO 恢复用量条。
+            let used = frame["used"].as_i64();
+            let size = frame["size"].as_i64();
+            if let Err(e) = db.agent_update_session_context_usage(sid, used, size).await {
+                tracing::warn!(session_id = %sid, "persist context usage failed: {e}");
+            }
+        }
+        "attachment" => {
+            // 多模态占位帧（image/audio/resource）：只落元信息（不透传 base64 数据），
+            // 刷新后历史里以附件卡片回放。
+            let msg_id = format!("{:032x}", rand::random::<u128>());
+            if let Err(e) = db
+                .agent_add_message_v2(
+                    &msg_id,
+                    sid,
+                    "assistant",
+                    &frame.to_string(),
+                    None,
+                    None,
+                    Some("attachment"),
+                    "message",
+                    frame["parent_tool_call_id"].as_str(),
+                )
+                .await
+            {
+                tracing::warn!(session_id = %sid, "persist attachment failed: {e}");
+            }
+        }
+        _ => {}
     }
 }
 

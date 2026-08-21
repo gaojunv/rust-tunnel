@@ -289,6 +289,173 @@ pub async fn update_session_role(
     }
 }
 
+/// GET /api/agent/sessions/:id/export — 导出会话为 Markdown 附件下载。
+///
+/// 消息按 rowid（对话顺序）全量导出：用户/助手正文、思考、工具调用与结果、
+/// 计划、附件占位、压缩摘要各按种类渲染为 Markdown 结构。
+pub async fn export_session(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(agent) = &state.server_state.agent_state else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let session = match agent.db.agent_get_session(&session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let messages = match agent.db.agent_list_messages(&session_id).await {
+        Ok(m) => m,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let md = session_to_markdown(&session, &messages);
+    let short: String = session.id.chars().take(8).collect();
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"agent-session-{short}.md\""),
+            ),
+        ],
+        md,
+    )
+        .into_response()
+}
+
+/// 会话 → Markdown（导出 handler 与单测共用的纯函数）。
+fn session_to_markdown(
+    session: &crate::persistence::db::agent::AgentSessionRecord,
+    messages: &[crate::persistence::db::agent::AgentMessageRecord],
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let title = session
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("未命名会话");
+    let _ = writeln!(out, "# {title}\n");
+    let _ = writeln!(out, "- 会话 ID：`{}`", session.id);
+    if let Some(m) = session.model.as_deref().filter(|m| !m.is_empty()) {
+        let _ = writeln!(out, "- 模型：`{m}`");
+    }
+    let _ = writeln!(out, "- 创建时间：{}", session.created_at);
+    let _ = writeln!(out, "\n---");
+    for m in messages {
+        // 子 agent 归属消息缩进为引用块，标注来源
+        let sub = m.parent_tool_call_id.is_some();
+        match m.kind.as_str() {
+            "message" => match m.name.as_deref() {
+                Some("thought") => {
+                    let _ = writeln!(out, "\n> 💭 **思考**\n>\n{}", blockquote(&m.content));
+                }
+                Some("attachment") => {
+                    let f: serde_json::Value =
+                        serde_json::from_str(&m.content).unwrap_or_default();
+                    let name = f["name"].as_str().unwrap_or("附件");
+                    let uri = f["uri"].as_str().unwrap_or("");
+                    let mime = f["mime"].as_str().unwrap_or("");
+                    if uri.is_empty() {
+                        let _ = writeln!(out, "\n📎 **附件**：{name}（{mime}）");
+                    } else {
+                        let _ = writeln!(out, "\n📎 **附件**：[{name}]({uri})（{mime}）");
+                    }
+                }
+                Some("plan") => {
+                    let _ = writeln!(out, "\n**📋 计划**\n");
+                    if let Ok(entries) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
+                    {
+                        for e in entries {
+                            let status = e["status"].as_str().unwrap_or("pending");
+                            let mark = if status == "completed" { "x" } else { " " };
+                            let content = e["content"].as_str().unwrap_or("");
+                            let _ = writeln!(out, "- [{mark}] {content}");
+                        }
+                    }
+                }
+                _ => {
+                    let who = if m.role == "user" {
+                        "👤 用户"
+                    } else {
+                        "🤖 助手"
+                    };
+                    let suffix = if sub { "（子 agent）" } else { "" };
+                    let _ = writeln!(out, "\n## {who}{suffix}\n\n{}", m.content);
+                }
+            },
+            "tool_calls" => {
+                let name = m.name.as_deref().unwrap_or("tool");
+                let suffix = if sub { "（子 agent）" } else { "" };
+                let _ = writeln!(out, "\n### 🔧 `{name}`{suffix}\n");
+                let args = m
+                    .tool_calls
+                    .as_deref()
+                    .and_then(|tc| serde_json::from_str::<serde_json::Value>(tc).ok())
+                    .and_then(|v| v.get(0).cloned())
+                    .map(|call| call["arguments"].clone())
+                    .unwrap_or(serde_json::Value::Null);
+                let body = match &args {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                };
+                if !body.is_empty() && body != "null" {
+                    let _ = writeln!(out, "```json\n{body}\n```");
+                }
+            }
+            "tool_result" => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&m.content).unwrap_or_default();
+                let (text, status) = if parsed.is_object() {
+                    (
+                        parsed["text"].as_str().unwrap_or("").to_string(),
+                        parsed["status"].as_str().unwrap_or("").to_string(),
+                    )
+                } else {
+                    (m.content.clone(), String::new())
+                };
+                let icon = if status == "failed" { "❌" } else { "✅" };
+                let _ = writeln!(out, "\n**{icon} 结果**\n");
+                if !text.is_empty() {
+                    let _ = writeln!(out, "```\n{}\n```", truncate_chars(&text, 4000));
+                }
+            }
+            "summary" => {
+                let _ = writeln!(
+                    out,
+                    "\n> 📝 **上下文压缩摘要**\n>\n{}",
+                    blockquote(&m.content)
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 每行加 `> ` 前缀（思考/摘要渲染为引用块）。
+fn blockquote(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 按字符数截断（工具结果可能极长），截断处标注省略。
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{cut}\n…（已截断，共 {} 字符）", text.chars().count())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +715,102 @@ mod tests {
         )
         .await
         .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_export_session_markdown() {
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s-export", "w1", Some("导出测试"), Some("m1"))
+            .await
+            .unwrap();
+        // 用户正文
+        db.agent_add_message("m1", "s-export", "user", "帮我看下 README", None)
+            .await
+            .unwrap();
+        // 助手正文
+        db.agent_add_message("m2", "s-export", "assistant", "好的，先看下文件", None)
+            .await
+            .unwrap();
+        // 思考（name=thought）
+        db.agent_add_message_v2(
+            "m3", "s-export", "assistant", "先列目录", None, None, Some("thought"),
+            "message", None,
+        )
+        .await
+        .unwrap();
+        // 工具调用
+        db.agent_upsert_tool_call(
+            "m4", "s-export", "tc1", Some("shell"),
+            r#"[{"id":"tc1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}]"#,
+            None,
+        )
+        .await
+        .unwrap();
+        // 工具结果（结构化 content）
+        db.agent_upsert_tool_result(
+            "m5", "s-export", "tc1", Some("shell"),
+            r#"{"text":"README.md\nsrc","status":"completed"}"#,
+            None,
+        )
+        .await
+        .unwrap();
+        // 计划
+        db.agent_add_message_v2(
+            "m6", "s-export", "assistant",
+            r#"[{"content":"第一步","status":"completed"},{"content":"第二步","status":"pending"}]"#,
+            None, None, Some("plan"), "message", None,
+        )
+        .await
+        .unwrap();
+        // 附件
+        db.agent_add_message_v2(
+            "m7", "s-export", "assistant",
+            r#"{"type":"attachment","media_kind":"image","name":"shot.png","uri":"file:///tmp/shot.png","mime":"image/png"}"#,
+            None, None, Some("attachment"), "message", None,
+        )
+        .await
+        .unwrap();
+
+        let resp = export_session(State(state), Path("s-export".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cd = resp
+            .headers()
+            .get(axum::http::header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cd.contains("attachment"), "Content-Disposition: {cd}");
+        assert!(cd.contains(".md"), "Content-Disposition: {cd}");
+        let body = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let md = String::from_utf8(body.to_vec()).unwrap();
+        assert!(md.contains("# 导出测试"), "标题缺失");
+        assert!(md.contains("## 👤 用户"), "用户段缺失");
+        assert!(md.contains("帮我看下 README"));
+        assert!(md.contains("## 🤖 助手"));
+        assert!(md.contains("> 💭 **思考**"), "思考引用缺失");
+        assert!(md.contains("### 🔧 `shell`"), "工具调用缺失");
+        assert!(md.contains("**✅ 结果**"), "工具结果缺失");
+        assert!(md.contains("README.md\nsrc"), "结果正文缺失");
+        assert!(md.contains("- [x] 第一步"), "计划勾选缺失");
+        assert!(md.contains("- [ ] 第二步"));
+        assert!(md.contains("[shot.png](file:///tmp/shot.png)"), "附件链接缺失");
+
+        // 不存在的会话 → 404
+        let (state2, _db2) = test_state().await;
+        let resp = export_session(State(state2), Path("nope".to_string()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

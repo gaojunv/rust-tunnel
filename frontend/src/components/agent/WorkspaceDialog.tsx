@@ -42,8 +42,8 @@ export interface OverrideRow {
   value: string;
 }
 
-/** 解析存储的 overrides JSON 为编辑行；非法/空 → []。 */
-export const parseOverrides = (raw?: string): OverrideRow[] => {
+/** 解析存储的 overrides JSON 为编辑行；非法/空/null → []。 */
+export const parseOverrides = (raw?: string | null): OverrideRow[] => {
   if (!raw) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -88,7 +88,7 @@ export const parseTierModels = (raw?: string | null): Partial<Record<ClaudeTierK
   }
 };
 
-/** 将三档位序列化为 JSON；有任一非空 → JSON object，无有效项 → undefined（调用方决定省略或 "" 清空）。 */
+/** 将三档位序列化为 JSON；有任一非空 → JSON object，无有效项 → undefined（调用方决定省略或 null 清空）。 */
 export const serializeTierModels = (tiers: Partial<Record<ClaudeTierKey, string>>): string | undefined => {
   const obj: Record<string, string> = {};
   for (const k of CLAUDE_TIERS) {
@@ -173,25 +173,29 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
 
   // 序列化 overrides：有有效行 → JSON；无有效行且原记录有值（编辑模式）→ "{}" 清空；
   // 否则 undefined（不发送该字段，后端保持原值）。
-  // 非 ACP 引擎（agent_type 为空 = 内置 runner）不提交 overrides：overrideRows 在
-  // UI 上随引擎切换被隐藏，仍随表单提交会带着旧值「复活」到后端（切回 ACP 时旧配置
-  // 重现）；内置 runner 不用 overrides，省略字段由后端按其 agent_type 语义处理。
-  const overridesPayload = (): string | undefined => {
-    if (agentType === '') return undefined;
+  // 非 ACP 引擎（agent_type 为空 = 内置 runner）时：若原记录有 overrides，显式返回
+  // null 让 PATCH 发送 `agent_config_overrides: null`（后端 null=清空），防止旧配置
+  // 随表单提交「复活」；原记录无 overrides 则返回 undefined（省略字段，后端无需操作）。
+  const overridesPayload = (): string | undefined | null => {
+    if (agentType === '') {
+      // 切回内置 runner：若编辑记录原先有 overrides 则显式清零
+      return editing?.agent_config_overrides ? null : undefined;
+    }
     return (
       serializeOverrides(overrideRows) ?? (editing?.agent_config_overrides ? '{}' : undefined)
     );
   };
 
   // 序列化 Claude Code 三档位 tier 模型；仅 claude-code 引擎提交。
-  // 有任一非空 → JSON object；三档全空且原记录有值（编辑模式）→ "{}" 显式清空；
-  // 三档全空且无原值 → undefined（不发送，后端保持原值）。与 overridesPayload 约定一致。
-  const tierModelsPayload = (): string | undefined => {
+  // 有任一非空 → JSON object；三档全空且原记录有值（编辑模式）→ null 显式清空
+  // （后端 null=清空为 NULL）；三档全空且无原值 → undefined（不发送，后端保持原值）。
+  // 与 overridesPayload 的三态约定一致。
+  const tierModelsPayload = (): string | null | undefined => {
     if (agentType !== 'claude-code') return undefined;
     const serialized = serializeTierModels(tierModels);
     if (serialized !== undefined) return serialized;
-    // 三档全空：编辑模式下有原值 → 发 "{}" 清空（后端空串归一 None=保持，"{}" 才清空）
-    return editing?.claude_tier_models ? '{}' : undefined;
+    // 三档全空：编辑模式下有原值 → 发 null 清空
+    return editing?.claude_tier_models ? null : undefined;
   };
 
   const submit = async () => {
@@ -234,7 +238,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_path: agentPath.trim() !== '' ? agentPath.trim() : undefined,
           llm_model_id: llmModelId !== '' ? llmModelId : undefined,
           agent_config_overrides: overridesPayload(),
-          claude_tier_models: tierModelsPayload() !== undefined ? tierModelsPayload()! : editing.claude_tier_models,
+          claude_tier_models: tierModelsPayload() !== undefined ? tierModelsPayload() : editing.claude_tier_models,
           github_owner: githubOwner.trim() !== '' ? githubOwner.trim() : editing.github_owner,
           github_repo: githubRepo.trim() !== '' ? githubRepo.trim() : editing.github_repo,
           github_token_set: githubToken.trim() !== ''

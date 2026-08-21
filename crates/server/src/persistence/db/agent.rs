@@ -134,6 +134,20 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub role_id: Option<String>,
+    /// ACP UsageUpdate 最近一次上下文用量快照（tokens）。列由
+    /// `migrate_agent_sessions_add_context_usage`（schema.rs）落地。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub context_used: Option<i64>,
+    /// 上下文窗口大小（tokens），与 `context_used` 成对出现。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub context_size: Option<i64>,
+    /// 最近一次 ACP spawn 失败的归因描述（带 stage 前缀；spawn 成功时清空）。
+    /// 列由 `migrate_agent_sessions_add_spawn_error`（schema.rs）落地。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub last_spawn_error: Option<String>,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
@@ -230,7 +244,9 @@ impl Database {
     /// 更新 agent workspace 的可变字段。ACP 字段（agent_type/agent_path/llm_model_id/
     /// agent_config_overrides）采用 COALESCE 语义：`None` 保持原值，`Some` 写入新值，
     /// 与 `approval_mode` 一致。`agent_config_overrides` 为 ACP 引擎选项覆盖（JSON
-    /// map：config_id → value）；`Some("{}")` 显式清空，`None` 保持原值。
+    /// map：config_id → value）；`clear_overrides=true` 时强制清空（设为 NULL），
+    /// 否则按 COALESCE 语义处理。`claude_tier_models` 为 Claude Code tier 模型映射
+    ///（JSON object），`clear_tier_models=true` 时强制清空（设为 NULL）。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_update_workspace(
         &self,
@@ -244,29 +260,61 @@ impl Database {
         llm_model_id: Option<&str>,
         agent_config_overrides: Option<&str>,
         claude_tier_models: Option<&str>,
+        clear_overrides: bool,
+        clear_tier_models: bool,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
-             approval_mode = COALESCE(?, approval_mode), \
-             agent_type = COALESCE(?, agent_type), \
-             agent_path = COALESCE(?, agent_path), \
-             llm_model_id = COALESCE(?, llm_model_id), \
-             agent_config_overrides = COALESCE(?, agent_config_overrides), \
-             claude_tier_models = COALESCE(?, claude_tier_models), \
-             updated_at = datetime('now') WHERE id = ?",
-        )
-        .bind(name)
-        .bind(root_path)
-        .bind(system_prompt)
-        .bind(approval_mode)
-        .bind(agent_type)
-        .bind(agent_path)
-        .bind(llm_model_id)
-        .bind(agent_config_overrides)
-        .bind(claude_tier_models)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        // tier 三态经 CASE WHEN 内联表达（clear=true → NULL；否则 COALESCE 保持/写入），
+        // 避免与 clear_overrides 的组合再翻倍 SQL 分支。
+        if clear_overrides {
+            sqlx::query(
+                "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+                 approval_mode = COALESCE(?, approval_mode), \
+                 agent_type = COALESCE(?, agent_type), \
+                 agent_path = COALESCE(?, agent_path), \
+                 llm_model_id = COALESCE(?, llm_model_id), \
+                 agent_config_overrides = NULL, \
+                 claude_tier_models = CASE WHEN ? THEN NULL \
+                 ELSE COALESCE(?, claude_tier_models) END, \
+                 updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(name)
+            .bind(root_path)
+            .bind(system_prompt)
+            .bind(approval_mode)
+            .bind(agent_type)
+            .bind(agent_path)
+            .bind(llm_model_id)
+            .bind(clear_tier_models)
+            .bind(claude_tier_models)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
+                 approval_mode = COALESCE(?, approval_mode), \
+                 agent_type = COALESCE(?, agent_type), \
+                 agent_path = COALESCE(?, agent_path), \
+                 llm_model_id = COALESCE(?, llm_model_id), \
+                 agent_config_overrides = COALESCE(?, agent_config_overrides), \
+                 claude_tier_models = CASE WHEN ? THEN NULL \
+                 ELSE COALESCE(?, claude_tier_models) END, \
+                 updated_at = datetime('now') WHERE id = ?",
+            )
+            .bind(name)
+            .bind(root_path)
+            .bind(system_prompt)
+            .bind(approval_mode)
+            .bind(agent_type)
+            .bind(agent_path)
+            .bind(llm_model_id)
+            .bind(agent_config_overrides)
+            .bind(clear_tier_models)
+            .bind(claude_tier_models)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -412,6 +460,94 @@ impl Database {
         Ok(())
     }
 
+    /// 写入 session 的上下文用量快照（ACP UsageUpdate 每次推送覆盖；用于
+    /// 刷新/重连后恢复前端用量条，不做历史累计）。
+    pub async fn agent_update_session_context_usage(
+        &self,
+        id: &str,
+        used: Option<i64>,
+        size: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET context_used = ?, context_size = ? WHERE id = ?",
+        )
+        .bind(used)
+        .bind(size)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 写入/清空 session 的最近 spawn 失败归因（Some=失败描述带 stage 前缀，
+    /// None=spawn 成功清空）。会话行不存在时静默无影响（预 spawn 可能先于
+    /// session 行创建？否——session 行由 API 先建；防御性写法不校验行数）。
+    pub async fn agent_update_session_spawn_error(
+        &self,
+        id: &str,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE agent_sessions SET last_spawn_error = ? WHERE id = ?")
+            .bind(error)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ── ACP 排队 prompt 持久化（agent_pending_prompts） ─────────────
+
+    /// 入队一条等待执行的 prompt（busy 时）。返回行 id（供取出执行后删除）。
+    pub async fn agent_pending_enqueue(
+        &self,
+        id: &str,
+        session_id: &str,
+        content: &str,
+        refs_json: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO agent_pending_prompts (id, session_id, content, refs) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(content)
+        .bind(refs_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 按 FIFO（rowid 升序 = 入队顺序）列出 session 的排队 prompt。
+    pub async fn agent_pending_list(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT id, content, refs FROM agent_pending_prompts WHERE session_id = ? ORDER BY rowid",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// 取出执行后删除对应行（best-effort 调用地不阻塞主流程）。
+    pub async fn agent_pending_delete(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM agent_pending_prompts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 清空 session 的全部排队 prompt（会话删除时级联清理）。
+    pub async fn agent_pending_clear_session(&self, session_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM agent_pending_prompts WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// upsert/删除 session 的 ACP 配置项：value=Some 写入该 key，None 删除；
     /// map 为空时列置 NULL。config_state 非 JSON（历史脏数据）时视为空 map 重建。
     pub async fn agent_update_session_config_state(
@@ -467,6 +603,8 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        // 级联清理排队 prompt（表无 FK，应用层级联；会话已删，残留行无意义）
+        self.agent_pending_clear_session(id).await?;
         Ok(())
     }
 
@@ -913,6 +1051,8 @@ mod tests {
             None,
             None,
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -972,6 +1112,8 @@ mod tests {
             Some("m2"),
             None,
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -992,6 +1134,8 @@ mod tests {
             None,
             None,
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -1012,6 +1156,8 @@ mod tests {
             Some("m3"),
             None,
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -1837,6 +1983,41 @@ mod tests {
         assert!(s.config_state.is_none());
     }
 
+    /// context_used/context_size（ACP usage_update 快照列）覆盖式写入往返：
+    /// 初始 NULL → 写入 → 覆盖为最新值（不累计）。
+    #[tokio::test]
+    async fn test_session_context_usage_snapshot() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 初始为空
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert!(s.context_used.is_none());
+        assert!(s.context_size.is_none());
+
+        // 写入快照
+        db.agent_update_session_context_usage("s1", Some(1234), Some(200_000))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.context_used, Some(1234));
+        assert_eq!(s.context_size, Some(200_000));
+
+        // 覆盖为最新快照（不累计）
+        db.agent_update_session_context_usage("s1", Some(5678), Some(200_000))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.context_used, Some(5678));
+    }
+
     /// agent_config_overrides（v4 列）的创建→读取→更新→清空完整往返。
     /// update 语义：None 保持原值；Some("{}") 显式清空（与 llm_model_id 的
     /// 「不支持清空」不同，见 spec 决策表）。
@@ -1876,6 +2057,8 @@ mod tests {
             None,
             Some(r#"{"model":"sonnet","fast":"haiku"}"#),
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -1897,6 +2080,8 @@ mod tests {
             None,
             None,
             None,
+            false,
+            false,
         )
         .await
         .unwrap();
@@ -1919,6 +2104,8 @@ mod tests {
             None,
             Some("{}"),
             None,
+            false,
+            false,
         )
         .await
         .unwrap();

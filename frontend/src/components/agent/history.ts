@@ -271,6 +271,23 @@ export function historyToChatItemsWithSkip(
         id: m.id,
         parentToolId: m.parent_tool_call_id ?? undefined,
       });
+    } else if (m.kind === 'message' && m.name === 'attachment') {
+      // ACP 多模态占位帧（content 为帧 JSON）：还原附件占位卡，坏 JSON 跳过
+      try {
+        const f = JSON.parse(m.content) as Record<string, unknown>;
+        loaded.push({
+          kind: 'attachment',
+          content: '',
+          id: m.id,
+          attachmentKind: typeof f.media_kind === 'string' ? f.media_kind : 'resource',
+          attachmentName: typeof f.name === 'string' ? f.name : '',
+          attachmentUri: typeof f.uri === 'string' ? f.uri : undefined,
+          attachmentMime: typeof f.mime === 'string' ? f.mime : undefined,
+          parentToolId: m.parent_tool_call_id ?? undefined,
+        });
+      } catch {
+        /* ignore malformed attachment frame */
+      }
     } else if (m.kind === 'message' && m.name === 'plan') {
       // 只保留最后一条 plan（ACP plan 全量替换语义）：先记录索引，循环后处理
       lastPlanIdx = loaded.length;

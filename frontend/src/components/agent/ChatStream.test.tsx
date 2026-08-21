@@ -96,6 +96,25 @@ describe('ChatStream running state', () => {
     expect(screen.queryByRole('status', { name: 'agent.running' })).toBeNull();
   });
 
+  it('shows turn duration from done frame duration_ms', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'assistant_chunk', content: '完成' });
+      wsInstance!.emit({ type: 'done', duration_ms: 2300 });
+    });
+    // 回合耗时行：2.3s（i18n mock 原样拼插值）
+    const el = await screen.findByTestId('turn-duration');
+    expect(el.textContent).toContain('2.3s');
+  });
+
+  it('hides turn duration for done frames without duration_ms', async () => {
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.queryByTestId('turn-duration')).toBeNull();
+  });
+
   it('clears running on error even with pending tools', async () => {
     renderChat();
     act(() => {
@@ -1430,14 +1449,47 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('✓')).toBeTruthy();
   });
 
-  it('usage frame does not render or crash', async () => {
+  it('usage frame renders context usage bar', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
     act(() => {
       wsInstance!.emit({ type: 'usage', used: 100, size: 200000 });
       wsInstance!.emit({ type: 'done' });
     });
-    expect(screen.queryByText(/100/)).not.toBeTruthy();
+    // 用量条出现，显示 used/size 与百分比
+    const bar = screen.getByTestId('context-usage-bar');
+    expect(bar.textContent).toContain('100');
+    expect(bar.textContent).toContain('200k');
+    expect(bar.textContent).toContain('0%');
+  });
+
+  it('usage frame over 80% renders warning tone', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'usage', used: 190000, size: 200000 });
+      wsInstance!.emit({ type: 'done' });
+    });
+    const bar = screen.getByTestId('context-usage-bar');
+    expect(bar.textContent).toContain('95%');
+    expect(bar.querySelector('.bg-yellow-500')).toBeTruthy();
+  });
+
+  it('attachment frame renders placeholder card', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'attachment',
+        media_kind: 'image',
+        name: 'pic.png',
+        uri: 'https://example.com/pic.png',
+        mime: 'image/png',
+      });
+      wsInstance!.emit({ type: 'done' });
+    });
+    expect(screen.getByText('pic.png')).toBeTruthy();
+    expect(screen.getByText('image/png')).toBeTruthy();
   });
 
   it('restores acp history: tool diff card, thought, plan (last only)', async () => {

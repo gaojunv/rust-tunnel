@@ -124,7 +124,7 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             聊天区/输入框的垂直占位（避开本栏）由 AgentPage 主区域 pb-12 承担——
             此前在横向 flex 里放 h-12 spacer 宽度为 0，不产生占位，导致输入框卡片
             底部被本栏遮挡（发送/停止按钮不可见）。 */}
-        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[env(safe-area-inset-bottom,0px)] md:hidden">
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[max(env(safe-area-inset-bottom,0px),var(--sat-bottom,0px))] md:hidden">
           <div className="flex h-12 items-center justify-around">
             {ICONS.map(({ kind, Icon, labelKey }) => (
               <button
@@ -134,7 +134,8 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
                 aria-pressed={active === kind}
                 onClick={() => toggle(kind)}
                 className={cn(
-                  'flex h-10 w-10 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                  // 44px 触控目标（Apple HIG）：移动端图标按钮比桌面大一号
+                  'flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
                   active === kind && 'bg-accent text-primary'
                 )}
               >
@@ -150,7 +151,8 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             open={active === kind}
             onOpenChange={(open) => setActive(open ? kind : null)}
           >
-            <SheetContent side="bottom" className="flex h-[60vh] flex-col gap-0 p-0">
+            {/* 60dvh 动态视口高度：地址栏伸缩时 Sheet 高度不跳变（60vh 会跳） */}
+            <SheetContent side="bottom" className="flex h-[60dvh] flex-col gap-0 p-0">
               <div className="flex items-center justify-between border-b border-border/60 py-3 pl-4 pr-10">
                 <SheetTitle className="text-sm font-medium">{t(labelKey)}</SheetTitle>
               </div>

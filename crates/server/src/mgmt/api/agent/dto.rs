@@ -27,7 +27,7 @@ pub struct CreateWorkspaceRequest {
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
     /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值为
-    /// 模型引用 `model:<id>`/`group:<id>`/裸别名）；空串归一化为 None，`"{}"` 显式清空。
+    /// 模型引用 `model:<id>`/`group:<id>`/裸别名）；空串归一化为 None。
     #[serde(default)]
     pub claude_tier_models: Option<String>,
     /// GitHub Actions 集成：token（API 层加密后落库；空串视为未配置）。
@@ -48,20 +48,24 @@ pub struct UpdateWorkspaceRequest {
     pub approval_mode: Option<String>,
     /// ACP 字段，COALESCE 语义：缺省 None 保持原值。`agent_type` 空串表示切回内置
     /// runner；`agent_path`/`llm_model_id` 空串视为忽略（本迭代不支持清空）；
-    /// `agent_config_overrides` 显式 `"{}"` 清空、空串视为忽略。
+    /// `agent_config_overrides`：缺省(None)保留、显式 null 清空、非空字符串写入。
     #[serde(default)]
     pub agent_type: Option<String>,
     #[serde(default)]
     pub agent_path: Option<String>,
     #[serde(default)]
     pub llm_model_id: Option<String>,
-    /// ACP 引擎选项覆盖（JSON map：config_id → value）；None 保持原值，`"{}"` 清空。
+    /// ACP 引擎选项覆盖（JSON map：config_id → value）。
+    /// 三态语义：`None`（字段省略）= 保留原值；`Some(None)`（显式 JSON null）=
+    /// 清空（设为 NULL）；`Some(Some(s))`（非空字符串）= 写入新值。
+    /// 空串 `""` 在 handler 层归一化为清空（向后兼容旧前端传空串=清空的惯例）。
     #[serde(default)]
-    pub agent_config_overrides: Option<String>,
-    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值
-    /// 为模型引用）；None 保持原值，`"{}"` 清空。
+    pub agent_config_overrides: Option<Option<String>>,
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值为
+    /// 模型引用）。三态语义同 `agent_config_overrides`：省略=保持、显式 null
+    ///（或空串）= 清空、非空字符串=写入。
     #[serde(default)]
-    pub claude_tier_models: Option<String>,
+    pub claude_tier_models: Option<Option<String>>,
     /// GitHub Actions 集成字段，COALESCE 语义：缺省（None）/ 空串保持原值，
     /// 非空更新。token 由 API 层加密后落库。
     #[serde(default)]

@@ -8,9 +8,12 @@ import {
   ChevronDown,
   ChevronUp,
   FileText,
+  FileAudio,
   Globe,
+  Image as ImageIcon,
   ListChecks,
   Loader2,
+  Paperclip,
   Pencil,
   Search,
   TerminalSquare,
@@ -578,6 +581,8 @@ export default memo(function MessageBubble({ item, streaming }: { item: ChatItem
           ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
           : item.kind === 'plan'
             ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
+            : item.kind === 'attachment'
+              ? 'w-full rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm'
             // tool 卡片：relative 供底部边缘进度条定位；overflow-hidden 让进度条
             // 在圆角内被裁剪，不超出卡片边框
             : 'relative w-full overflow-hidden rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-sm';
@@ -592,12 +597,55 @@ export default memo(function MessageBubble({ item, streaming }: { item: ChatItem
         <ThoughtBubble content={item.content} streaming={streaming} />
       ) : item.kind === 'plan' ? (
         <PlanBubble entries={item.planEntries ?? []} />
+      ) : item.kind === 'attachment' ? (
+        <AttachmentBubble item={item} />
       ) : (
         <div className="whitespace-pre-wrap break-words">{item.content}</div>
       )}
     </div>
   );
 });
+
+/** ACP 多模态占位卡（image/audio/resource）：只带元信息（不透传 base64 数据），
+ *  表达「agent 在此输出了一份附件」。有 uri 时渲染为链接（新标签页打开）。 */
+function AttachmentBubble({ item }: { item: ChatItem }) {
+  const { t } = useTranslation();
+  const kind = item.attachmentKind ?? 'resource';
+  const Icon =
+    kind === 'image' ? ImageIcon : kind === 'audio' ? FileAudio : Paperclip;
+  const label =
+    kind === 'image'
+      ? t('agent.attachmentImage')
+      : kind === 'audio'
+        ? t('agent.attachmentAudio')
+        : t('agent.attachmentResource');
+  const name = item.attachmentName || label;
+  const body = (
+    <>
+      <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <span className="shrink-0 text-xs font-medium text-foreground/90">{label}</span>
+      <span className="min-w-0 truncate text-xs text-muted-foreground">{name}</span>
+      {item.attachmentMime && (
+        <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/70">
+          {item.attachmentMime}
+        </span>
+      )}
+    </>
+  );
+  if (item.attachmentUri) {
+    return (
+      <a
+        href={item.attachmentUri}
+        target="_blank"
+        rel="noreferrer"
+        className="flex items-center gap-2 hover:underline"
+      >
+        {body}
+      </a>
+    );
+  }
+  return <div className="flex items-center gap-2">{body}</div>;
+}
 
 /** 思考内容通常是 Markdown：取首个非空行（剥掉标题/列表/引用前缀与行内强调
  *  符号）作折叠态预览——预览是纯文本，残留 `**` 等标记会显得 noisy。 */
@@ -658,6 +706,13 @@ const PLAN_MARK: Record<string, { mark: string; cls: string }> = {
   pending: { mark: '○', cls: 'text-muted-foreground' },
 };
 
+/** plan 条目优先级 → 语义色徽标（参照 KindChip 配色风格）。 */
+const PRIORITY_BADGE: Record<string, { label: string; cls: string }> = {
+  high: { label: 'H', cls: 'bg-red-500/15 text-red-600 dark:text-red-400' },
+  medium: { label: 'M', cls: 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400' },
+  low: { label: 'L', cls: 'bg-muted text-muted-foreground' },
+};
+
 /** 计划气泡：checklist 样式；新 plan 帧由 ChatStream 就地更新本气泡内容。 */
 function PlanBubble({ entries }: { entries: PlanEntryItem[] }) {
   const { t } = useTranslation();
@@ -670,12 +725,18 @@ function PlanBubble({ entries }: { entries: PlanEntryItem[] }) {
       <ul className="space-y-0.5">
         {entries.map((e, i) => {
           const mark = PLAN_MARK[e.status] ?? PLAN_MARK.pending;
+          const prio = e.priority ? PRIORITY_BADGE[e.priority] : null;
           return (
             <li key={i} className="flex items-baseline gap-2 text-xs">
               <span className={mark.cls}>{mark.mark}</span>
               <span className={e.status === 'completed' ? 'text-muted-foreground line-through' : ''}>
                 {e.content}
               </span>
+              {prio && (
+                <span className={`inline-flex h-4 shrink-0 items-center rounded px-1 text-[10px] font-medium leading-none ${prio.cls}`}>
+                  {prio.label}
+                </span>
+              )}
             </li>
           );
         })}
