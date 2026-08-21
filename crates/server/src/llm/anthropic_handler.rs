@@ -182,6 +182,14 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         }
     }
 
+    // 中段 system 降级标记：出现非 system 消息后，再出现的 system 消息
+    // （如 Claude Code 每轮追加的 system-reminder）改按 user 角色发出。
+    // DeepSeek 等上游会把 system 消息汇聚到 prompt 开头处理，中段 system
+    // 每轮新增等于往 prompt 头部插入内容，前缀缓存从 system 块结尾就断掉
+    // （实测 cache hit 只剩 system 块大小且长期固定）。降级为 user 后
+    // 整段 prompt 保持纯追加，前缀缓存才能逐轮累积。
+    let mut seen_non_system = false;
+
     for msg in raw_arr {
         let role = msg
             .get("role")
@@ -200,6 +208,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
 
         match role.as_str() {
             "assistant" => {
+                seen_non_system = true;
                 // assistant 消息：文本与 tool_use 可共存，映射到同一条 message。
                 let content = if parsed.text.is_empty() {
                     None
@@ -237,6 +246,16 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                 // 如果 text 先输出会插入一条 user 消息打断这个序列，
                 // 导致上游返回 400（"insufficient tool messages following
                 // tool_calls message"）。
+                //
+                // 中段 system（seen_non_system 之后）降级为 user，见上方注释。
+                let effective_role = if role == "system" && seen_non_system {
+                    "user"
+                } else {
+                    role.as_str()
+                };
+                if role != "system" {
+                    seen_non_system = true;
+                }
                 for tr in parsed.tool_results {
                     all_messages.push(ChatMessage {
                         role: "tool".to_string(),
@@ -248,7 +267,7 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
                     });
                 }
                 if !parsed.text.is_empty() {
-                    all_messages.push(ChatMessage::text(&role, parsed.text));
+                    all_messages.push(ChatMessage::text(effective_role, parsed.text));
                 }
             }
         }
@@ -591,6 +610,48 @@ mod tests {
         assert_eq!(result.messages[0].role, "user");
         assert!(result.stream);
         assert_eq!(result.max_tokens, None);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_mid_conversation_system_demoted_to_user() {
+        // Claude Code（claude-vscode 入口）每轮会往 messages 里追加 role=system
+        // 的 reminder。中段 system 若原样发给上游，DeepSeek 等会把 system 汇聚到
+        // prompt 开头处理——每轮新增等于往头部插内容，前缀缓存全断。
+        // 必须降级为 user（开头连续的 system 保持 system 不变）。
+        let input = serde_json::json!({
+            "model": "claude-3-opus",
+            "messages": [
+                {"role": "system", "content": "leading-sys"},
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "system", "content": "<total_tokens>100 left</total_tokens>"},
+                {"role": "user", "content": "q2"}
+            ],
+        });
+
+        let result = anthropic_to_openai(&input).unwrap();
+        let roles: Vec<&str> = result.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "user", "user"]);
+        assert_eq!(
+            result.messages[3].content.as_deref(),
+            Some("<total_tokens>100 left</total_tokens>")
+        );
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_leading_systems_keep_role() {
+        // 顶层 system 字段 + messages 开头连续的 system 都保持 system 角色
+        let input = serde_json::json!({
+            "model": "m",
+            "system": "top-sys",
+            "messages": [
+                {"role": "system", "content": "second-sys"},
+                {"role": "user", "content": "hi"}
+            ],
+        });
+        let result = anthropic_to_openai(&input).unwrap();
+        let roles: Vec<&str> = result.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "system", "user"]);
     }
 
     #[test]

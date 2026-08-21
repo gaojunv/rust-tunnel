@@ -945,24 +945,39 @@ fn push_sse_event(out: &mut String, event_type: &str, data: &Value) {
 
 /// Chat Completions 请求体 → Responses API 请求体。
 ///
-/// 把 messages 中的 system/developer role 提取为顶层 `instructions`，
+/// 把 messages 开头的连续 system/developer role 提取为顶层 `instructions`，
 /// 其余消息按 role 映射为 Responses 输入 item。
+///
+/// 注意：**只有开头连续**的 system/developer 才提升进 `instructions`。
+/// 对话中段的 system 消息（如 Claude Code 每轮追加的 system-reminder）若也被
+/// 提升，等于每轮往 prompt 头部插入新内容，前缀缓存从 instructions 结束处
+/// 就断掉（实测 DeepSeek 等上游命中只剩 system 块大小、长期固定不变）。
+/// 中段 system 一律按 user 角色原位输出，保持整段 prompt 纯追加。
 pub fn chat_body_to_responses_body(chat: &Value) -> Value {
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("");
     let stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    // 提取 system/developer → instructions
+    // 提取开头连续的 system/developer → instructions；中段 system → user（原位）
     let mut instructions_parts: Vec<String> = Vec::new();
-    let mut other_messages: Vec<&Value> = Vec::new();
+    let mut other_messages: Vec<Value> = Vec::new();
     if let Some(msgs) = chat.get("messages").and_then(Value::as_array) {
+        let mut seen_non_system = false;
         for msg in msgs {
             let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
             if role == "system" || role == "developer" {
-                if let Some(text) = extract_chat_message_text(msg) {
+                if seen_non_system {
+                    // 无文本的中段 system 丢弃（与旧行为一致）；有文本则降级为 user
+                    if extract_chat_message_text(msg).is_some_and(|t| !t.is_empty()) {
+                        let mut m = msg.clone();
+                        m["role"] = json!("user");
+                        other_messages.push(m);
+                    }
+                } else if let Some(text) = extract_chat_message_text(msg) {
                     instructions_parts.push(text);
                 }
             } else {
-                other_messages.push(msg);
+                seen_non_system = true;
+                other_messages.push(msg.clone());
             }
         }
     }
@@ -976,7 +991,7 @@ pub fn chat_body_to_responses_body(chat: &Value) -> Value {
     // 消息 → input 数组（带 tool_calls 的 assistant 消息会拆成多个顶层 item）
     let input: Vec<Value> = other_messages
         .iter()
-        .flat_map(|msg| chat_message_to_input_items(msg))
+        .flat_map(chat_message_to_input_items)
         .collect();
 
     let mut resp = json!({
@@ -2145,6 +2160,99 @@ mod tests {
         });
         let resp = chat_body_to_responses_body(&chat);
         assert_eq!(resp["instructions"], "sys1\ndev1");
+    }
+
+    #[test]
+    fn d_leading_systems_all_hoisted() {
+        // 开头连续多条 system/developer 全部进 instructions
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "sys1" },
+                { "role": "system", "content": "sys2" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let resp = chat_body_to_responses_body(&chat);
+        assert_eq!(resp["instructions"], "sys1\nsys2");
+        assert_eq!(resp["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn d_mid_conversation_system_becomes_user_item() {
+        // 中段 system（如 Claude Code 每轮追加的 reminder）必须原位降级为 user，
+        // 不能提升进 instructions——否则每轮往 prompt 头部插内容，前缀缓存全断。
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "q1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "system", "content": "<total_tokens>100 left</total_tokens>" },
+                { "role": "user", "content": "q2" }
+            ]
+        });
+        let resp = chat_body_to_responses_body(&chat);
+        assert_eq!(resp["instructions"], "sys");
+        let input = resp["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        // 中段 system 原位变成 user message item，内容不变
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(
+            input[2]["content"][0]["text"],
+            "<total_tokens>100 left</total_tokens>"
+        );
+        assert_eq!(input[3]["role"], "user");
+    }
+
+    #[test]
+    fn d_mid_conversation_system_append_only_prefix() {
+        // 端到端前缀稳定性：第二轮在第一轮尾部追加 [assistant, user, system] 后，
+        // 转换结果的 instructions 不变，input 为纯追加（缓存友好）。
+        let base = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": "q1" }),
+            json!({ "role": "system", "content": "reminder-1" }),
+        ];
+        let chat1 = json!({ "model": "m", "messages": base });
+        let chat2 = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "q1" },
+                { "role": "system", "content": "reminder-1" },
+                { "role": "assistant", "content": "a1" },
+                { "role": "user", "content": "q2" },
+                { "role": "system", "content": "reminder-2" }
+            ]
+        });
+        let r1 = chat_body_to_responses_body(&chat1);
+        let r2 = chat_body_to_responses_body(&chat2);
+        assert_eq!(r1["instructions"], r2["instructions"]);
+        let i1 = r1["input"].as_array().unwrap();
+        let i2 = r2["input"].as_array().unwrap();
+        assert!(i2.len() > i1.len());
+        for (a, b) in i1.iter().zip(i2.iter()) {
+            assert_eq!(a, b, "前轮 input item 必须在后轮中逐字节一致");
+        }
+    }
+
+    #[test]
+    fn d_empty_mid_conversation_system_dropped() {
+        // 无文本的中段 system 直接丢弃，不产出空 user item
+        let chat = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "sys" },
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": "" }
+            ]
+        });
+        let resp = chat_body_to_responses_body(&chat);
+        assert_eq!(resp["instructions"], "sys");
+        assert_eq!(resp["input"].as_array().unwrap().len(), 1);
     }
 
     #[test]
