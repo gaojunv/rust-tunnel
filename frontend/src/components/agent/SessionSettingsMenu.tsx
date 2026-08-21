@@ -120,7 +120,7 @@ export default function SessionSettingsMenu({
           {modelLabel}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="w-56">
+      <DropdownMenuContent align="start" side="top" className="w-56">
         <ModelPicker
           models={data?.models ?? []}
           groups={data?.groups ?? []}

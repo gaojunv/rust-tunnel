@@ -516,7 +516,7 @@ mod tests {
     ) -> String {
         let id = "w1".to_string();
         db.agent_create_workspace(
-            &id, "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            &id, "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

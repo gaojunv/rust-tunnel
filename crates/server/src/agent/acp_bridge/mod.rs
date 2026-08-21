@@ -406,6 +406,7 @@ mod tests {
             agent_path: None,
             llm_model_id: Some("model-1".into()),
             agent_config_overrides: None,
+            claude_tier_models: None,
             github_token: None,
             github_owner: None,
             github_repo: None,
@@ -798,7 +799,7 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None,
+            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None, None,
         )
         .await
         .unwrap();
@@ -939,6 +940,7 @@ mod tests {
             None,
             None,
             "gemini",
+            None,
             None,
             None,
             None,
@@ -1291,6 +1293,7 @@ mod tests {
                 None,
                 None,
                 "gemini",
+                None,
                 None,
                 None,
                 None,
@@ -2158,6 +2161,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2255,6 +2259,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2328,6 +2333,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2386,6 +2392,7 @@ mod tests {
             None,
             None,
             "gemini",
+            None,
             None,
             None,
             None,
@@ -2473,6 +2480,7 @@ mod tests {
             None,
             None,
             "gemini",
+            None,
             None,
             None,
             None,
@@ -2639,6 +2647,7 @@ mod tests {
             None,
             None,
             "gemini",
+            None,
             None,
             None,
             None,
@@ -2867,6 +2876,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2944,6 +2954,7 @@ mod tests {
             None,
             Some("model-1"),
             Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -3177,6 +3188,7 @@ mod tests {
             None,
             Some("model-1"),
             Some(r#"{"model":"sonnet","fast":"haiku"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -3411,6 +3423,7 @@ mod tests {
             None,
             Some("model-1"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3513,6 +3526,7 @@ mod tests {
             None,
             Some("model-1"),
             Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -3572,6 +3586,7 @@ mod tests {
             "gemini",
             None,
             Some("model-1"),
+            None,
             None,
         )
         .await
@@ -4005,6 +4020,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4122,7 +4138,7 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         db.save_server_auth("secret").await.unwrap();
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None,
+            "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None, None,
         )
         .await
         .unwrap();

@@ -239,6 +239,71 @@ impl AcpBridge {
             } else {
                 Vec::new()
             };
+            // Claude Code tier 模型映射：workspace.claude_tier_models（JSON object，
+            // key ∈ {opus,sonnet,haiku}）→ ANTHROPIC_DEFAULT_*_MODEL 等 env。
+            // 仅 claude-code 且非空时解析；单档解析失败 warn 跳过该档，不阻断 spawn。
+            // **不注入 ANTHROPIC_MODEL**——spawn 时锁死默认模型会覆盖 session.model
+            // 的每请求动态解析。
+            let tier_envs: Vec<(String, String)> = if agent_type == "claude-code" {
+                if let Some(raw) = workspace.claude_tier_models.as_deref() {
+                    match serde_json::from_str::<serde_json::Value>(raw) {
+                        Ok(serde_json::Value::Object(map)) => {
+                            let mut envs = Vec::new();
+                            for (tier, val) in map {
+                                let Some(s) = val.as_str() else { continue };
+                                if s.trim().is_empty() {
+                                    continue;
+                                }
+                                match crate::agent::session::resolve_workspace_model_ref(
+                                    &self.db,
+                                    Some(s),
+                                )
+                                .await
+                                {
+                                    Ok(Some(resolved)) => {
+                                        let (env_key, dup_key) = match tier.as_str() {
+                                            "opus" => {
+                                                ("ANTHROPIC_DEFAULT_OPUS_MODEL", None::<&str>)
+                                            }
+                                            "sonnet" => ("ANTHROPIC_DEFAULT_SONNET_MODEL", None),
+                                            "haiku" => (
+                                                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                                                Some("ANTHROPIC_SMALL_FAST_MODEL"),
+                                            ),
+                                            _ => continue,
+                                        };
+                                        envs.push((env_key.to_string(), resolved.clone()));
+                                        if let Some(dk) = dup_key {
+                                            envs.push((dk.to_string(), resolved));
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session_id,
+                                            tier,
+                                            "claude tier model resolve failed, skipped: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            envs
+                        }
+                        Ok(_) => Vec::new(),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id,
+                                "claude_tier_models not a JSON object, skipped: {e}"
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             self.spawner
                 .spawn_agent(
                     &client_id,
@@ -250,6 +315,7 @@ impl AcpBridge {
                     SPAWN_TIMEOUT,
                     spawn_model.as_deref(),
                     &available_models,
+                    &tier_envs,
                 )
                 .await?;
             tracing::info!(

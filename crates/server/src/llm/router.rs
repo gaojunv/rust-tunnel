@@ -200,6 +200,24 @@ pub async fn resolve_error_response(
     }
 }
 
+/// 判断模型名（或别名/组名）能否被网关解析：模型须自身启用且所属 provider
+/// 启用（与 `available_models` 过滤语义一致）；组只须启用（成员在路由期
+/// 逐个解析，failover 自行跳过禁用项）。llm_bridge 用它决定保留还是覆盖
+/// 请求体中的 model。
+pub async fn model_resolvable(state: &LlmState, name: &str) -> bool {
+    let Some(db) = state.db.as_ref() else {
+        return false;
+    };
+    let snap = state
+        .route_cache
+        .snapshot(Some(db), state.cipher.as_ref())
+        .await;
+    if let Some(m) = snap.find_model_by_name_or_alias(name) {
+        return snap.provider(&m.provider_id).is_some_and(|p| p.enabled);
+    }
+    snap.group_by_name(name).is_some()
+}
+
 /// Get list of all enabled models (for /v1/models).
 /// Only returns models whose provider is also enabled.
 pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::Value>, String> {

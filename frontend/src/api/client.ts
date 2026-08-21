@@ -583,6 +583,8 @@ export async function createAgentWorkspace(body: {
   agent_path?: string;
   llm_model_id?: string;
   agent_config_overrides?: string;
+  /** Claude Code 三档位模型映射（JSON object：{opus,sonnet,haiku} → `model:<id>`/`group:<id>`） */
+  claude_tier_models?: string;
   /** GitHub Actions 面板：owner/repo 空串=不设置；token 仅在非空时发送（服务端加密落库） */
   github_owner?: string;
   github_repo?: string;
@@ -607,6 +609,8 @@ export const updateAgentWorkspace = (
     agent_path?: string;
     llm_model_id?: string;
     agent_config_overrides?: string;
+    /** Claude Code 三档位模型映射（JSON object；`"{}"` 显式清空，缺省保持原值） */
+    claude_tier_models?: string;
     /** GitHub 字段：空串=保持不变（服务端 COALESCE）；token 仅在非空时发送 */
     github_owner?: string;
     github_repo?: string;

@@ -767,6 +767,7 @@ impl Database {
         Self::migrate_agent_workspaces_v3(pool).await?;
         Self::migrate_agent_workspaces_v4(pool).await?;
         Self::migrate_agent_workspaces_v5(pool).await?;
+        Self::migrate_agent_workspaces_v6(pool).await?;
         Self::migrate_agent_sessions_v2(pool).await?;
         Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_sessions_add_distilled(pool).await?;
@@ -1084,6 +1085,27 @@ impl Database {
                     }
                     tracing::debug!(column, "agent_workspaces migration: column already exists");
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// agent_workspaces 补全 Claude Code tier 模型映射列：`claude_tier_models`
+    ///（TEXT 可空，JSON object：key ∈ {opus,sonnet,haiku}，值为模型引用
+    /// `model:<id>`/`group:<id>`/裸别名）。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_workspaces_v6(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_workspaces ADD COLUMN claude_tier_models TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!(
+                    "agent_workspaces migration: claude_tier_models column already exists"
+                );
             }
         }
         Ok(())

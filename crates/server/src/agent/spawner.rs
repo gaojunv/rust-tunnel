@@ -47,6 +47,7 @@ pub fn agent_env(
     port: u16,
     model: Option<&str>,
     available_models: &[String],
+    tier_envs: &[(String, String)],
 ) -> Vec<(String, String)> {
     let base = format!("http://127.0.0.1:{port}");
     let mut env = vec![
@@ -59,6 +60,11 @@ pub fn agent_env(
     if agent_type == "opencode" {
         if let Some(content) = opencode_config_content(port, model, available_models) {
             env.push(("OPENCODE_CONFIG_CONTENT".into(), content));
+        }
+    }
+    if agent_type == "claude-code" {
+        for (k, v) in tier_envs {
+            env.push((k.clone(), v.clone()));
         }
     }
     env
@@ -202,6 +208,7 @@ impl AgentSpawner {
         timeout: Duration,
         model: Option<&str>,
         available_models: &[String],
+        tier_envs: &[(String, String)],
     ) -> Result<(), String> {
         let (command, args) = agent_command(agent_type, agent_path)?;
         let msg = self
@@ -213,7 +220,7 @@ impl AgentSpawner {
                     session_id: session_id.to_string(),
                     command,
                     args,
-                    env: agent_env(agent_type, port, model, available_models),
+                    env: agent_env(agent_type, port, model, available_models, tier_envs),
                     cwd: Some(cwd.to_string()),
                 },
                 timeout,
@@ -316,6 +323,61 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_env_claude_code_injects_tier_envs() {
+        // claude-code + tier 映射 → ANTHROPIC_DEFAULT_*_MODEL / ANTHROPIC_SMALL_FAST_MODEL
+        // 原样注入（值已由调用方 resolve 为网关模型引用）。
+        let tier = vec![
+            (
+                "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+                "model:opus-x".to_string(),
+            ),
+            (
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                "model:haiku-y".to_string(),
+            ),
+            (
+                "ANTHROPIC_SMALL_FAST_MODEL".to_string(),
+                "model:haiku-y".to_string(),
+            ),
+        ];
+        let env = agent_env("claude-code", 45678, None, &[], &tier);
+        for (k, v) in &tier {
+            assert!(
+                env.iter().any(|(ek, ev)| ek == k && ev == v),
+                "missing tier env {k}: {env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_env_claude_code_empty_tier_envs_no_injection() {
+        // 未配置 tier 映射 → 不注入任何 tier env（行为与旧版一致）。
+        let env = agent_env("claude-code", 45678, None, &[], &[]);
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k.starts_with("ANTHROPIC_DEFAULT_")
+                    || k == "ANTHROPIC_SMALL_FAST_MODEL"),
+            "no tier envs expected: {env:?}"
+        );
+    }
+
+    #[test]
+    fn test_agent_env_non_claude_ignores_tier_envs() {
+        // 非 claude-code（opencode/gemini）即使调用方误传 tier_envs 也不注入。
+        let tier = vec![(
+            "ANTHROPIC_DEFAULT_OPUS_MODEL".to_string(),
+            "model:x".to_string(),
+        )];
+        for ty in ["opencode", "gemini", ""] {
+            let env = agent_env(ty, 45678, None, &[], &tier);
+            assert!(
+                !env.iter().any(|(k, _)| k == "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                "{ty} must not inject tier envs: {env:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_agent_command_opencode() {
         let (cmd, args) = agent_command("opencode", None).unwrap();
         assert_eq!(cmd, "opencode");
@@ -326,7 +388,7 @@ mod tests {
     fn test_agent_env_common_injects_both_anthropic_key_vars() {
         // claude-code-acp 认 AUTH_TOKEN；opencode 认 API_KEY——两者都注入，
         // 各自按需读取，互无副作用。
-        let env = agent_env("claude-code", 45678, None, &[]);
+        let env = agent_env("claude-code", 45678, None, &[], &[]);
         let base = env.iter().find(|(k, _)| k == "OPENAI_BASE_URL").unwrap();
         assert_eq!(base.1, "http://127.0.0.1:45678/v1");
         assert!(
@@ -353,6 +415,7 @@ mod tests {
             45678,
             Some("gpt-4o"),
             &["gpt-4o-mini".to_string(), "claude-3-5-sonnet".to_string()],
+            &[],
         );
         let content = env
             .iter()
@@ -391,7 +454,7 @@ mod tests {
         assert_eq!(models_map["gpt-4o"], serde_json::json!({"name": "gpt-4o"}));
         assert_eq!(models_map.len(), 3);
         // default None：不注入 model 键但 provider 仍注入
-        let env_none = agent_env("opencode", 45678, None, &["gpt-4o".to_string()]);
+        let env_none = agent_env("opencode", 45678, None, &["gpt-4o".to_string()], &[]);
         let content_none = env_none
             .iter()
             .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
@@ -406,13 +469,13 @@ mod tests {
             "http://127.0.0.1:45678/v1"
         );
         // 空/None 模型不注入
-        let env_blank = agent_env("opencode", 45678, Some("   "), &["gpt-4o".to_string()]);
+        let env_blank = agent_env("opencode", 45678, Some("   "), &["gpt-4o".to_string()], &[]);
         assert!(
             env_blank.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
             "blank model but available models -> still inject provider: {env_blank:?}"
         );
         // 空模型 + 空 available_models：无注入意义，返回 None → 不注入环境变量
-        let env_empty = agent_env("opencode", 45678, None, &[]);
+        let env_empty = agent_env("opencode", 45678, None, &[], &[]);
         assert!(
             !env_empty.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
             "empty models + no default -> no injection: {env_empty:?}"
@@ -544,6 +607,7 @@ mod tests {
                 Duration::from_secs(2),
                 None,
                 &[],
+                &[],
             )
             .await
             .expect("spawn should succeed");
@@ -606,6 +670,7 @@ mod tests {
                 Duration::from_secs(2),
                 Some("gpt-4o"),
                 &[],
+                &[],
             )
             .await
             .expect("spawn should succeed");
@@ -631,6 +696,7 @@ mod tests {
                 Duration::from_secs(2),
                 None,
                 &[],
+                &[],
             )
             .await
             .expect_err("client error should propagate");
@@ -652,6 +718,7 @@ mod tests {
                 "/workspace",
                 Duration::from_secs(1),
                 None,
+                &[],
                 &[],
             )
             .await

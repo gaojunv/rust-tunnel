@@ -347,7 +347,7 @@ mod tests {
     /// 到 agent_workspaces 的 FK）。
     async fn seed_session(db: &Database) -> String {
         db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None,
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

@@ -66,6 +66,38 @@ export const serializeOverrides = (rows: OverrideRow[]): string | undefined => {
   return Object.keys(obj).length > 0 ? JSON.stringify(obj) : undefined;
 };
 
+/** Claude Code 三档位 tier：key ∈ {opus, sonnet, haiku} → model/group 引用。 */
+export type ClaudeTierKey = 'opus' | 'sonnet' | 'haiku';
+export const CLAUDE_TIERS: ClaudeTierKey[] = ['opus', 'sonnet', 'haiku'];
+
+/** 解析存储的 claude_tier_models JSON（非法/空 → {}）；只保留合法 tier key，且值必须为 string。 */
+export const parseTierModels = (raw?: string | null): Partial<Record<ClaudeTierKey, string>> => {
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Partial<Record<ClaudeTierKey, string>> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if ((k === 'opus' || k === 'sonnet' || k === 'haiku') && typeof v === 'string' && v !== '') {
+        out[k as ClaudeTierKey] = v;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
+
+/** 将三档位序列化为 JSON；有任一非空 → JSON object，无有效项 → undefined（调用方决定省略或 "" 清空）。 */
+export const serializeTierModels = (tiers: Partial<Record<ClaudeTierKey, string>>): string | undefined => {
+  const obj: Record<string, string> = {};
+  for (const k of CLAUDE_TIERS) {
+    const v = tiers[k];
+    if (v && v.trim() !== '') obj[k] = v.trim();
+  }
+  return Object.keys(obj).length > 0 ? JSON.stringify(obj) : undefined;
+};
+
 interface Props {
   /** 传入则为编辑模式：仅可改 name/root_path/system_prompt/approval_mode 及 ACP 字段（client/运行时不可变） */
   editing?: AgentWorkspace;
@@ -115,6 +147,10 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
   const [overrideRows, setOverrideRows] = useState<OverrideRow[]>(
     parseOverrides(editing?.agent_config_overrides),
   );
+  // Claude Code 三档位模型映射（opus/sonnet/haiku → model:<id> / group:<id> / 空=不配置）
+  const [tierModels, setTierModels] = useState<Partial<Record<ClaudeTierKey, string>>>(
+    parseTierModels(editing?.claude_tier_models),
+  );
   // GitHub Actions 面板：owner/repo 可手填（探测失败的兜底）；token 密码框——
   // 已配置时不回填明文，placeholder 提示「留空保持不变」，且本版本不支持清空。
   const [githubOwner, setGithubOwner] = useState(editing?.github_owner ?? '');
@@ -147,6 +183,17 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     );
   };
 
+  // 序列化 Claude Code 三档位 tier 模型；仅 claude-code 引擎提交。
+  // 有任一非空 → JSON object；三档全空且原记录有值（编辑模式）→ "{}" 显式清空；
+  // 三档全空且无原值 → undefined（不发送，后端保持原值）。与 overridesPayload 约定一致。
+  const tierModelsPayload = (): string | undefined => {
+    if (agentType !== 'claude-code') return undefined;
+    const serialized = serializeTierModels(tierModels);
+    if (serialized !== undefined) return serialized;
+    // 三档全空：编辑模式下有原值 → 发 "{}" 清空（后端空串归一 None=保持，"{}" 才清空）
+    return editing?.claude_tier_models ? '{}' : undefined;
+  };
+
   const submit = async () => {
     if (!canSubmit || submitting) return;
     setSubmitting(true);
@@ -169,6 +216,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           ...(overridesPayload() !== undefined
             ? { agent_config_overrides: overridesPayload() }
             : {}),
+          ...(tierModelsPayload() !== undefined
+            ? { claude_tier_models: tierModelsPayload() }
+            : {}),
           // GitHub 字段：owner/repo 空串=保持不变（后端 COALESCE）；token 仅非空时更新
           github_owner: githubOwner.trim(),
           github_repo: githubRepo.trim(),
@@ -184,6 +234,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           agent_path: agentPath.trim() !== '' ? agentPath.trim() : undefined,
           llm_model_id: llmModelId !== '' ? llmModelId : undefined,
           agent_config_overrides: overridesPayload(),
+          claude_tier_models: tierModelsPayload() !== undefined ? tierModelsPayload()! : editing.claude_tier_models,
           github_owner: githubOwner.trim() !== '' ? githubOwner.trim() : editing.github_owner,
           github_repo: githubRepo.trim() !== '' ? githubRepo.trim() : editing.github_repo,
           github_token_set: githubToken.trim() !== ''
@@ -203,6 +254,9 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
           ...(llmModelId !== '' ? { llm_model_id: llmModelId } : {}),
           ...(overridesPayload() !== undefined
             ? { agent_config_overrides: overridesPayload() }
+            : {}),
+          ...(tierModelsPayload() !== undefined
+            ? { claude_tier_models: tierModelsPayload() }
             : {}),
           github_owner: githubOwner.trim(),
           github_repo: githubRepo.trim(),
@@ -413,6 +467,55 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                     )}
                   </select>
                 </div>
+                {/* Claude Code 三档位模型：切换 tier（含自动切换/fast mode）时走对应网关模型 */}
+                {agentType === 'claude-code' && (
+                  <div className="space-y-3">
+                    {([['opus', 'agent.tierModelOpus'], ['sonnet', 'agent.tierModelSonnet'], ['haiku', 'agent.tierModelHaiku']] as const).map(([tier, labelKey]) => (
+                      <div key={tier} className="space-y-2">
+                        <Label>{t(labelKey)}</Label>
+                        <select
+                          value={tierModels[tier] ?? ''}
+                          onChange={(e) =>
+                            setTierModels((prev) => ({ ...prev, [tier]: e.target.value }))
+                          }
+                          aria-label={t(labelKey)}
+                          className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                        >
+                          <option value="">{t('agent.tierModelDefault')}</option>
+                          <optgroup label={t('agent.model')}>
+                            {(models ?? [])
+                              .filter((m) => m.enabled)
+                              .map((m) => {
+                                const pname = m.provider_id
+                                  ? providerName.get(m.provider_id)
+                                  : undefined;
+                                const label = pname
+                                  ? `${m.model_name}（${pname}）`
+                                  : m.model_name;
+                                return (
+                                  <option key={m.id} value={`model:${m.id}`}>
+                                    {label}
+                                  </option>
+                                );
+                              })}
+                          </optgroup>
+                          {(groups ?? []).some((g) => g.enabled) && (
+                            <optgroup label={t('agent.modelGroups')}>
+                              {(groups ?? [])
+                                .filter((g) => g.enabled)
+                                .map((g) => (
+                                  <option key={g.id} value={`group:${g.id}`}>
+                                    {g.name}
+                                  </option>
+                                ))}
+                            </optgroup>
+                          )}
+                        </select>
+                      </div>
+                    ))}
+                    <p className="text-xs text-muted-foreground">{t('agent.tierModelHint')}</p>
+                  </div>
+                )}
                 <div className="space-y-2">
                   <Label>{t('agent.configOverrides')}</Label>
                   {overrideRows.map((row, i) => (

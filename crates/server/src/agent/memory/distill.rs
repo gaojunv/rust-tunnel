@@ -875,7 +875,7 @@ mod tests {
         // 覆盖「LLM 失败静默降级 + 事件广播」路径。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -916,7 +916,7 @@ mod tests {
         // Skill 蒸馏仅需 LLM，不依赖 embedding。事件照常广播（LLM 不可达 → failed）。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

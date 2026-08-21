@@ -26,6 +26,10 @@ pub struct CreateWorkspaceRequest {
     /// ACP 引擎选项覆盖（JSON map：config_id → value）；空串归一化为 None。
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值为
+    /// 模型引用 `model:<id>`/`group:<id>`/裸别名）；空串归一化为 None，`"{}"` 显式清空。
+    #[serde(default)]
+    pub claude_tier_models: Option<String>,
     /// GitHub Actions 集成：token（API 层加密后落库；空串视为未配置）。
     #[serde(default)]
     pub github_token: Option<String>,
@@ -54,6 +58,10 @@ pub struct UpdateWorkspaceRequest {
     /// ACP 引擎选项覆盖（JSON map：config_id → value）；None 保持原值，`"{}"` 清空。
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值
+    /// 为模型引用）；None 保持原值，`"{}"` 清空。
+    #[serde(default)]
+    pub claude_tier_models: Option<String>,
     /// GitHub Actions 集成字段，COALESCE 语义：缺省（None）/ 空串保持原值，
     /// 非空更新。token 由 API 层加密后落库。
     #[serde(default)]

@@ -82,30 +82,71 @@ pub fn forward(
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        // 2. 统一模型解析（session → workspace → 全局默认 → 第一个可用），
-        //    注入到请求体（网关的下游 resolve_with_failover 按此引用解析）。
-        let model_name = match super::session::resolve_effective_model(
-            &db,
-            Some(gateway.llm_state.as_ref()),
-            &session_id,
-        )
-        .await
-        {
-            Ok(name) => name,
-            Err(e) => {
-                tracing::warn!(
-                    session_id,
-                    request_id = %request_id,
-                    error = %e,
-                    "llm proxy: model resolve failed"
-                );
-                yield AgentLlmProxyChunk {
-                    request_id,
-                    data: e.into_bytes(),
-                    done: true,
-                    status: 502,
-                };
-                return;
+        // 2. 模型解析：如果请求体中的 model 已经可被网关解析（模型名/别名/组名），
+        //    则保留请求体中的 model（tier 环境变量注入场景）；否则走
+        //    resolve_effective_model（session → workspace → 全局默认 → 第一个可用）。
+        let request_model = body_json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let model_name = if let Some(ref rm) = request_model {
+            if crate::llm::router::model_resolvable(
+                gateway.llm_state.as_ref(),
+                rm,
+            )
+            .await
+            {
+                rm.clone()
+            } else {
+                match super::session::resolve_effective_model(
+                    &db,
+                    Some(gateway.llm_state.as_ref()),
+                    &session_id,
+                )
+                .await
+                {
+                    Ok(name) => name,
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id,
+                            request_id = %request_id,
+                            error = %e,
+                            "llm proxy: model resolve failed"
+                        );
+                        yield AgentLlmProxyChunk {
+                            request_id,
+                            data: e.into_bytes(),
+                            done: true,
+                            status: 502,
+                        };
+                        return;
+                    }
+                }
+            }
+        } else {
+            match super::session::resolve_effective_model(
+                &db,
+                Some(gateway.llm_state.as_ref()),
+                &session_id,
+            )
+            .await
+            {
+                Ok(name) => name,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id,
+                        request_id = %request_id,
+                        error = %e,
+                        "llm proxy: model resolve failed"
+                    );
+                    yield AgentLlmProxyChunk {
+                        request_id,
+                        data: e.into_bytes(),
+                        done: true,
+                        status: 502,
+                    };
+                    return;
+                }
             }
         };
         body_json["model"] = Value::String(model_name);
@@ -236,6 +277,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -303,6 +345,7 @@ mod tests {
             None,
             None,
             "",
+            None,
             None,
             None,
             None,
@@ -542,6 +585,129 @@ mod tests {
         assert!(
             !body.contains("model is required"),
             "model injected → must not fail on missing model, body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_resolvable_request_model_kept() {
+        // tier 切换场景：请求体 model 可被网关解析（enabled 模型）→ 保留，
+        // 不被 workspace 配置覆盖。判别手段：workspace 故意指向 disabled 模型——
+        // 旧逻辑覆盖后 resolve 报 "disabled"（502），新逻辑保留请求模型走到
+        // 上游调用阶段（不可达 → 5xx，且错误不含 "disabled"）。
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-req", "http://127.0.0.1:1", true).await;
+        db.llm_save_model("model-off", "prov-1", "gpt-off", "gpt-off", "", false, None)
+            .await
+            .unwrap();
+        seed_configured_session(&db, "sess-1", "model-off").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            br#"{"model":"gpt-test","stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        let body: String = chunks
+            .iter()
+            .map(|c| String::from_utf8_lossy(&c.data).into_owned())
+            .collect();
+        assert!(
+            !body.contains("disabled"),
+            "resolvable request model must be kept (not overridden by workspace), body: {body}"
+        );
+        assert!(
+            last.status >= 400,
+            "kept model reaches upstream (unreachable → error), got {}",
+            last.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_unresolvable_request_model_falls_back() {
+        // 向后兼容：请求体 model 网关不可解析（claude-code 默认发的
+        // claude-sonnet-4-5 等真实 tier 名）→ 回退 resolve_effective_model
+        // 覆盖为 workspace 模型（行为同旧逻辑：进入上游调用 → 不可达 5xx，
+        // 而非 model not found 4xx）。
+        let db = Database::new(":memory:").await.unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            // 带合法 messages：回退路径可走到上游调用（5xx）；若 model 被
+            // 错误保留则路由 resolve 失败于更早阶段（4xx）。
+            br#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"stream":false}"#.to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        assert!(
+            last.status >= 500,
+            "unresolvable model falls back to workspace model → upstream 5xx, got {}",
+            last.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_model_with_disabled_provider_not_resolvable() {
+        // 模型启用但所属 provider 禁用 → 视为不可解析 → 回退 workspace 模型
+        // （与 available_models 的过滤语义一致；若被保留，路由期 resolve 失败
+        // 返回 4xx 而非上游 5xx）。
+        let db = Database::new(":memory:").await.unwrap();
+        db.llm_save_provider(
+            "prov-off",
+            "disabled-provider",
+            "deepseek",
+            "http://127.0.0.1:1",
+            "sk-test",
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        db.llm_save_model(
+            "model-poff",
+            "prov-off",
+            "gpt-poff",
+            "gpt-poff",
+            "",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        save_provider_model(&db, "model-1", "http://127.0.0.1:1", true).await;
+        seed_configured_session(&db, "sess-1", "model-1").await;
+        let gw = test_gateway(&db).await;
+
+        let stream = forward(
+            db,
+            "sess-1".into(),
+            "req-1".into(),
+            gw,
+            "/v1/chat/completions".into(),
+            br#"{"model":"gpt-poff","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+                .to_vec(),
+        );
+        let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
+        let last = chunks.last().expect("at least one chunk");
+        assert!(last.done);
+        assert!(
+            last.status >= 500,
+            "disabled-provider model must fall back to workspace model → upstream 5xx, got {}",
+            last.status
         );
     }
 

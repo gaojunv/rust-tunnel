@@ -382,7 +382,7 @@ mod tests {
         .unwrap();
         // 创建 workspace + session + 绑定角色
         db.agent_create_workspace(
-            "w1", "p", "c1", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "c1", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

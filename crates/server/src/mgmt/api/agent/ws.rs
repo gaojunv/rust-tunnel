@@ -902,7 +902,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         };
                         if let Err(e) = agent.db.agent_update_workspace(
                             &ws.id, &ws.name, &ws.root_path,
-                            None, Some(&mode), None, None, None, None,
+                            None, Some(&mode), None, None, None, None, None,
                         ).await {
                             let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set mode failed: {e}")})).await;
                             continue;
@@ -1273,7 +1273,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                     if let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await {
                                         let _ = agent.db.agent_update_workspace(
                                             &ws.id, &ws.name, &ws.root_path,
-                                            None, Some(&mode), None, None, None, None,
+                                            None, Some(&mode), None, None, None, None, None,
                                         ).await;
                                     }
                                 }
@@ -1646,6 +1646,7 @@ mod tests {
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
+            claude_tier_models: None,
             github_token: None,
             github_owner: None,
             github_repo: None,
@@ -1672,6 +1673,7 @@ mod tests {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
             "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            None,
         )
         .await
         .unwrap();
@@ -1705,6 +1707,7 @@ mod tests {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
             "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            None,
         )
         .await
         .unwrap();
@@ -1744,6 +1747,7 @@ mod tests {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
             "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            None,
         )
         .await
         .unwrap();

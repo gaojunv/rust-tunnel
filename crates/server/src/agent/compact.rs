@@ -442,7 +442,7 @@ mod tests {
         // 重插 kept]，load 从最后一个 summary 起重放即可命中保留段。
         let db = crate::db::Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -493,7 +493,7 @@ mod tests {
         // 刷新后 kept 段完整重放。
         let db = crate::db::Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

@@ -2646,7 +2646,7 @@ mod tests {
     async fn test_persist_message_v2_writes_all_columns() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

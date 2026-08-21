@@ -623,7 +623,7 @@ mod tests {
 
     async fn seed_ws(db: &Database, ws_id: &str, llm_model_id: Option<&str>) {
         db.agent_create_workspace(
-            ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -798,7 +798,7 @@ mod tests {
     async fn test_load_session_rebuilds_history() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -834,7 +834,7 @@ mod tests {
     async fn test_load_session_skips_tool_rows() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -861,7 +861,7 @@ mod tests {
     async fn test_load_session_model_fallback() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -890,6 +890,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -914,6 +915,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -935,7 +937,7 @@ mod tests {
     async fn test_load_replays_new_format_tool_structure() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -991,7 +993,7 @@ mod tests {
     async fn test_load_resumes_from_last_summary() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1040,7 +1042,7 @@ mod tests {
         // 取消链路（AgentExecCancel 停止回合）依赖 sanitize_tool_pairs 占位补齐。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1097,7 +1099,7 @@ mod tests {
         // （否则把 JSON 壳当工具结果内容）；旧纯文本行原样使用（向后兼容）。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1183,7 +1185,7 @@ mod tests {
         // 清洗后孤儿 tool 结果应被丢弃。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1235,7 +1237,7 @@ mod tests {
         // 必须被跳过（不能落入普通文本消息分支产生非法 OpenAI 序列）。
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

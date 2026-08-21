@@ -38,6 +38,20 @@ fn validate_config_overrides(raw: &str) -> bool {
     }
 }
 
+/// 校验 claude_tier_models：空串合法（调用方归一化 None）；非空必须是
+/// JSON object，key 白名单 opus|sonnet|haiku 且 value 必须为 string（模型引用）。
+fn validate_tier_models(raw: &str) -> bool {
+    if raw.is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map
+            .iter()
+            .all(|(k, v)| matches!(k.as_str(), "opus" | "sonnet" | "haiku") && v.is_string()),
+        _ => false,
+    }
+}
+
 pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -82,6 +96,15 @@ pub async fn create_workspace(
                 .into_response();
         }
     }
+    if let Some(raw) = body.claude_tier_models.as_deref() {
+        if !validate_tier_models(raw) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "claude_tier_models must be a JSON object with opus|sonnet|haiku keys and string values",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -92,6 +115,7 @@ pub async fn create_workspace(
         .agent_config_overrides
         .as_deref()
         .filter(|s| !s.is_empty());
+    let claude_tier_models = body.claude_tier_models.as_deref().filter(|s| !s.is_empty());
     // GitHub 字段：token 空串归一化 None；非空则用 LlmCipher 加密后落库（与 LLM
     // provider API Key 同一机制，未配置主密钥时明文兼容降级）。owner/repo 空串
     // 归一化 None。写入走独立的 `agent_set_workspace_github`（COALESCE 语义）。
@@ -116,6 +140,7 @@ pub async fn create_workspace(
             agent_path,
             llm_model_id,
             agent_config_overrides,
+            claude_tier_models,
         )
         .await
     {
@@ -189,6 +214,15 @@ pub async fn update_workspace(
                 .into_response();
         }
     }
+    if let Some(raw) = body.claude_tier_models.as_deref() {
+        if !validate_tier_models(raw) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "claude_tier_models must be a JSON object with opus|sonnet|haiku keys and string values",
+            )
+                .into_response();
+        }
+    }
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -207,6 +241,7 @@ pub async fn update_workspace(
         .agent_config_overrides
         .as_deref()
         .filter(|s| !s.is_empty());
+    let claude_tier_models = body.claude_tier_models.as_deref().filter(|s| !s.is_empty());
     // GitHub 字段：token 空串/缺省 → None（DB COALESCE 保持已存密文）；非空 →
     // 加密后更新。owner/repo 同语义。写入走独立的 `agent_set_workspace_github`。
     let cipher = super::agent_cipher(&state).await;
@@ -227,6 +262,7 @@ pub async fn update_workspace(
             agent_path,
             llm_model_id,
             agent_config_overrides,
+            claude_tier_models,
         )
         .await
     {
@@ -1104,6 +1140,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1133,6 +1170,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1159,6 +1197,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1205,6 +1244,7 @@ mod tests {
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1239,6 +1279,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1253,7 +1294,7 @@ mod tests {
     async fn test_update_workspace_acp_fields() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1269,6 +1310,7 @@ mod tests {
                 agent_path: Some("/opt/gemini".into()),
                 llm_model_id: Some("model-1".into()),
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1301,6 +1343,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: Some("ghp_secret_123".into()),
                 github_owner: Some("octo".into()),
                 github_repo: Some("repo".into()),
@@ -1345,6 +1388,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: Some("".into()), // 空串归一化 → 未配置
                 github_owner: Some("".into()),
                 github_repo: Some("".into()),
@@ -1366,7 +1410,7 @@ mod tests {
     async fn test_update_workspace_github_keep_or_replace() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1387,6 +1431,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: Some("".into()),
                 github_owner: Some("".into()),
                 github_repo: None,
@@ -1420,6 +1465,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: Some("ghp_new".into()),
                 github_owner: Some("newowner".into()),
                 github_repo: Some("newrepo".into()),
@@ -1451,6 +1497,7 @@ mod tests {
             Some("/opt/gemini"),
             Some("model-1"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1466,6 +1513,7 @@ mod tests {
                 agent_path: Some("".into()),
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1485,7 +1533,7 @@ mod tests {
         // agent_type 空串合法：从 ACP 引擎切回内置 runner（与 path/model 不同，可清空）。
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1501,6 +1549,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1530,6 +1579,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("not-json".into()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1553,6 +1603,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some(r#"["model"]"#.into()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1576,6 +1627,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some(r#"{"model": 1}"#.into()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1603,6 +1655,7 @@ mod tests {
             None,
             None,
             Some(r#"{"mode":"plan"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -1625,6 +1678,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: None,
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1652,6 +1706,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("{}".into()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1676,6 +1731,7 @@ mod tests {
                 agent_path: None,
                 llm_model_id: None,
                 agent_config_overrides: Some("not-json".into()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1686,6 +1742,152 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
         assert_eq!(ws.agent_config_overrides.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn test_validate_tier_models() {
+        // 合法：空串（归一化 None）、空对象（清空语义）、白名单 key + string 值
+        assert!(validate_tier_models(""));
+        assert!(validate_tier_models("{}"));
+        assert!(validate_tier_models(r#"{"opus":"model:x"}"#));
+        assert!(validate_tier_models(
+            r#"{"opus":"model:x","sonnet":"group:y","haiku":"plain-alias"}"#
+        ));
+        // 非法：白名单外 key / 非 string 值 / 非 object / 非法 JSON
+        assert!(!validate_tier_models(r#"{"opusx":"model:x"}"#));
+        assert!(!validate_tier_models(r#"{"opus":"a","b":"c"}"#));
+        assert!(!validate_tier_models(r#"{"opus":1}"#));
+        assert!(!validate_tier_models(r#"{"opus":null}"#));
+        assert!(!validate_tier_models(r#"["opus"]"#));
+        assert!(!validate_tier_models("not-json"));
+    }
+
+    #[tokio::test]
+    async fn test_create_workspace_invalid_tier_models_400() {
+        let (state, _db) = test_state().await;
+        for bad in [
+            r#"{"opusx":"model:x"}"#, // 白名单外 key
+            r#"{"opus":1}"#,          // 非 string 值
+            r#"["opus"]"#,            // 非 object
+        ] {
+            let resp = create_workspace(
+                State(state.clone()),
+                Json(CreateWorkspaceRequest {
+                    name: "p".into(),
+                    client_id: "nas".into(),
+                    runtime_type: "host".into(),
+                    root_path: "/p".into(),
+                    docker_image: None,
+                    docker_container_id: None,
+                    agent_type: "claude-code".into(),
+                    agent_path: None,
+                    llm_model_id: None,
+                    agent_config_overrides: None,
+                    claude_tier_models: Some(bad.into()),
+                    github_token: None,
+                    github_owner: None,
+                    github_repo: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "invalid tier models must 400: {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_workspace_tier_models_clear_semantics() {
+        // 与 agent_config_overrides 同语义：None 保持、空串保持（归一化 None）、
+        // "{}" 显式清空、非法值 400 且原值不变。
+        let (state, db) = test_state().await;
+        db.agent_create_workspace(
+            "w1",
+            "p",
+            "nas",
+            "host",
+            "/p",
+            None,
+            None,
+            "claude-code",
+            None,
+            None,
+            None,
+            Some(r#"{"opus":"model:x"}"#),
+        )
+        .await
+        .unwrap();
+        let mk_update = |tier: Option<&str>| UpdateWorkspaceRequest {
+            name: "p".into(),
+            root_path: "/p".into(),
+            system_prompt: None,
+            approval_mode: None,
+            agent_type: None,
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: tier.map(str::to_string),
+            github_token: None,
+            github_owner: None,
+            github_repo: None,
+        };
+
+        // 1) None → 保持原值
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(mk_update(None)),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.claude_tier_models.as_deref(),
+            Some(r#"{"opus":"model:x"}"#)
+        );
+
+        // 2) 空串 → 归一化 None → COALESCE 保持原值
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(mk_update(Some(""))),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(
+            ws.claude_tier_models.as_deref(),
+            Some(r#"{"opus":"model:x"}"#)
+        );
+
+        // 3) "{}" → 显式清空
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(mk_update(Some("{}"))),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.claude_tier_models.as_deref(), Some("{}"));
+
+        // 4) 非法值 → 400 且原值不变
+        let resp = update_workspace(
+            State(state.clone()),
+            Path("w1".to_string()),
+            Json(mk_update(Some(r#"{"haiku":2}"#))),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
+        assert_eq!(ws.claude_tier_models.as_deref(), Some("{}"));
     }
 
     /// create 空串归一化：agent_path/llm_model_id/agent_config_overrides 传
@@ -1706,6 +1908,7 @@ mod tests {
                 agent_path: Some(String::new()),
                 llm_model_id: Some(String::new()),
                 agent_config_overrides: Some(String::new()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1738,6 +1941,7 @@ mod tests {
             Some("/opt/agent"),
             Some("model-1"),
             Some(r#"{"mode":"plan"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -1753,6 +1957,7 @@ mod tests {
                 agent_path: Some(String::new()),
                 llm_model_id: Some(String::new()),
                 agent_config_overrides: Some(String::new()),
+                claude_tier_models: None,
                 github_token: None,
                 github_owner: None,
                 github_repo: None,
@@ -1794,7 +1999,7 @@ mod tests {
     async fn test_list_workspace_files_client_offline_returns_503() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1888,7 +2093,7 @@ mod tests {
     async fn test_fs_endpoints_client_offline_returns_503() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1979,7 +2184,7 @@ mod tests {
     async fn test_fs_file_requires_path() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1997,7 +2202,7 @@ mod tests {
     async fn test_put_fs_file_safe_mode_needs_approval_409() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2040,7 +2245,7 @@ mod tests {
     async fn test_put_fs_file_full_auto_skips_approval() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2050,6 +2255,7 @@ mod tests {
             "/p",
             None,
             Some("full_auto"),
+            None,
             None,
             None,
             None,
@@ -2117,7 +2323,7 @@ mod tests {
     async fn test_git_read_old_client_409_upgrade() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2139,7 +2345,7 @@ mod tests {
         // 客户端在线（0.5.0）但隧道执行失败（无人消费控制通道 → 超时）→ 503。
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2154,7 +2360,7 @@ mod tests {
     async fn test_git_write_safe_mode_approval_flow() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2195,7 +2401,7 @@ mod tests {
     async fn test_git_write_dangerous_auto_write_approval() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2205,6 +2411,7 @@ mod tests {
             "/p",
             None,
             Some("auto_write"),
+            None,
             None,
             None,
             None,
@@ -2263,7 +2470,7 @@ mod tests {
     async fn test_git_write_plan_validation_400() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2310,7 +2517,7 @@ mod tests {
     async fn test_git_write_old_client_409_upgrade() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -2337,7 +2544,7 @@ mod tests {
     async fn test_git_write_empty_body_pull() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

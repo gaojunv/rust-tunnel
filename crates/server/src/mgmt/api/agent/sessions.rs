@@ -314,7 +314,7 @@ mod tests {
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -367,7 +367,7 @@ mod tests {
     async fn test_list_messages_pagination_api() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -467,7 +467,7 @@ mod tests {
     async fn test_list_messages_limit_clamped_to_500() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -501,7 +501,7 @@ mod tests {
     async fn test_update_session_model_endpoint() {
         let (state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

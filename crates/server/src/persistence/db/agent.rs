@@ -60,6 +60,12 @@ pub struct AgentWorkspaceRecord {
     pub github_owner: Option<String>,
     #[sqlx(default)]
     pub github_repo: Option<String>,
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，
+    /// 值为模型引用 `model:<id>`/`group:<id>`/裸别名）。列由
+    /// `migrate_agent_workspaces_v6`（schema.rs）落地；`#[sqlx(default)]`
+    /// 保证旧库未跑 v6 迁移前 `SELECT *` 仍可解码。
+    #[sqlx(default)]
+    pub claude_tier_models: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -78,7 +84,7 @@ impl AgentWorkspaceRecord {
 impl serde::Serialize for AgentWorkspaceRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("AgentWorkspaceRecord", 19)?;
+        let mut s = serializer.serialize_struct("AgentWorkspaceRecord", 20)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("client_id", &self.client_id)?;
@@ -95,6 +101,7 @@ impl serde::Serialize for AgentWorkspaceRecord {
         s.serialize_field("github_owner", &self.github_owner)?;
         s.serialize_field("github_repo", &self.github_repo)?;
         s.serialize_field("github_token_set", &self.github_token_set())?;
+        s.serialize_field("claude_tier_models", &self.claude_tier_models)?;
         s.serialize_field("created_at", &normalize_db_datetime(&self.created_at))?;
         s.serialize_field("updated_at", &normalize_db_datetime(&self.updated_at))?;
         s.end()
@@ -175,13 +182,14 @@ impl Database {
         agent_path: Option<&str>,
         llm_model_id: Option<&str>,
         agent_config_overrides: Option<&str>,
+        claude_tier_models: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO agent_workspaces
                 (id, name, client_id, runtime_type, root_path, docker_image, docker_container_id,
-                 agent_type, agent_path, llm_model_id, agent_config_overrides)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 agent_type, agent_path, llm_model_id, agent_config_overrides, claude_tier_models)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(id)
@@ -195,6 +203,7 @@ impl Database {
         .bind(agent_path)
         .bind(llm_model_id)
         .bind(agent_config_overrides)
+        .bind(claude_tier_models)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -234,6 +243,7 @@ impl Database {
         agent_path: Option<&str>,
         llm_model_id: Option<&str>,
         agent_config_overrides: Option<&str>,
+        claude_tier_models: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
@@ -242,6 +252,7 @@ impl Database {
              agent_path = COALESCE(?, agent_path), \
              llm_model_id = COALESCE(?, llm_model_id), \
              agent_config_overrides = COALESCE(?, agent_config_overrides), \
+             claude_tier_models = COALESCE(?, claude_tier_models), \
              updated_at = datetime('now') WHERE id = ?",
         )
         .bind(name)
@@ -252,6 +263,7 @@ impl Database {
         .bind(agent_path)
         .bind(llm_model_id)
         .bind(agent_config_overrides)
+        .bind(claude_tier_models)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -853,6 +865,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -865,6 +878,7 @@ mod tests {
             Some("node:20"),
             Some("dev-ctr"),
             "",
+            None,
             None,
             None,
             None,
@@ -892,6 +906,7 @@ mod tests {
             "w1",
             "renamed",
             "/new/path",
+            None,
             None,
             None,
             None,
@@ -934,6 +949,7 @@ mod tests {
             Some("/opt/acp-agent"),
             Some("m1"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -955,6 +971,7 @@ mod tests {
             Some("/opt/acp-claude"),
             Some("m2"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -968,6 +985,7 @@ mod tests {
             "w1",
             "acp-proj",
             "/workspace",
+            None,
             None,
             None,
             None,
@@ -993,6 +1011,7 @@ mod tests {
             None,
             Some("m3"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1006,7 +1025,7 @@ mod tests {
     async fn test_session_crud_and_archive() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1043,7 +1062,7 @@ mod tests {
     async fn test_update_session_model() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1068,7 +1087,7 @@ mod tests {
     async fn test_message_append_and_list() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1130,7 +1149,7 @@ mod tests {
     async fn test_message_page_last_n_and_before() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1177,7 +1196,7 @@ mod tests {
     async fn test_message_page_has_more_boundary() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1217,7 +1236,7 @@ mod tests {
     async fn test_message_page_empty_and_missing_cursor() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1280,7 +1299,7 @@ mod tests {
     async fn test_message_list_orders_by_rowid_not_created_at() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1320,7 +1339,7 @@ mod tests {
     async fn test_update_tool_call_args() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1377,7 +1396,7 @@ mod tests {
     async fn test_update_tool_call_args_scoped_to_session() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1431,7 +1450,7 @@ mod tests {
     async fn test_upsert_tool_result_dedup_content() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1461,7 +1480,7 @@ mod tests {
     async fn test_upsert_tool_result_empty_does_not_clear() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1488,7 +1507,7 @@ mod tests {
     async fn test_upsert_tool_result_stores_structured_json() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1527,7 +1546,7 @@ mod tests {
     async fn test_upsert_tool_result_legacy_plain_text_compat() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1558,7 +1577,7 @@ mod tests {
     async fn test_upsert_tool_call_keeps_longer_json() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1597,7 +1616,7 @@ mod tests {
     async fn test_delete_workspace_cascades() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1617,7 +1636,7 @@ mod tests {
     async fn test_message_v2_columns_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1677,7 +1696,7 @@ mod tests {
     async fn test_parent_tool_call_id_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1746,7 +1765,7 @@ mod tests {
     async fn test_upsert_parent_backfilled_on_update() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1772,7 +1791,7 @@ mod tests {
     async fn test_config_state_upsert_and_clear() {
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None,
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1836,6 +1855,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1855,6 +1875,7 @@ mod tests {
             None,
             None,
             Some(r#"{"model":"sonnet","fast":"haiku"}"#),
+            None,
         )
         .await
         .unwrap();
@@ -1869,6 +1890,7 @@ mod tests {
             "w1",
             "acp-proj",
             "/workspace",
+            None,
             None,
             None,
             None,
@@ -1896,6 +1918,7 @@ mod tests {
             None,
             None,
             Some("{}"),
+            None,
         )
         .await
         .unwrap();
@@ -1914,7 +1937,7 @@ mod tests {
 
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1977,7 +2000,7 @@ mod tests {
 
         let db = Database::new(":memory:").await.unwrap();
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1997,7 +2020,7 @@ mod tests {
         assert_eq!(json["github_repo"], "repo");
         // 未配置时布尔位为 false
         db.agent_create_workspace(
-            "w2", "q", "nas", "host", "/q", None, None, "", None, None, None,
+            "w2", "q", "nas", "host", "/q", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();

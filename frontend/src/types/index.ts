@@ -705,6 +705,8 @@ export interface AgentWorkspace {
   llm_model_id?: string;
   /** ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时注入 agent */
   agent_config_overrides?: string;
+  /** Claude Code 三档位模型映射（JSON object：{opus,sonnet,haiku} → `model:<id>`/`group:<id>`）；空档位落空 */
+  claude_tier_models?: string | null;
   /** 是否已配置 GitHub token（仅布尔位，token 明文永不回传） */
   github_token_set?: boolean;
   /** 手填 GitHub owner（组织/用户名）；为 null 时经隧道从 git remote 探测 */
