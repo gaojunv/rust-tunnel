@@ -14,7 +14,7 @@ import {
 } from '../../api/client';
 import type { AgentMessagesPage } from '../../api/client';
 import { useRoles } from '../../api/hooks';
-import type { AgentMessage, AgentRole, AgentWsEvent, TodoItem } from '../../types';
+import type { AgentMessage, AgentRole, AgentSession, AgentWsEvent, TodoItem } from '../../types';
 import type { ChatItem } from './types';
 import ApprovalCard from './ApprovalCard';
 import ElicitationCard from './ElicitationCard';
@@ -147,6 +147,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
   const [approvalMode, setApprovalMode] = useState(initialApprovalMode ?? 'safe');
   // 任务清单（todo_write 工具维护）：全量替换语义，todo_update 帧实时更新
   const [todos, setTodos] = useState<TodoItem[]>([]);
+  // ACP 上下文用量快照（usage 帧实时更新；初始值从 sessions 缓存的
+  // context_used/context_size 恢复——usage 已落库，刷新后用量条不丢）
+  const [contextUsage, setContextUsage] = useState<{ used?: number; size?: number } | null>(null);
   // config option 乐观更新的回滚快照：按 config_id 分键（prev=发送前值，opt=乐观值），
   // 并发点击不同选项互不覆盖（旧实现单槽快照互相覆盖，M19）。发送后保留，等
   // 服务端权威确认帧（session_state/config_option_update，已确认项移除）或「设置失败」
@@ -873,7 +876,42 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
           return [...prev, { kind: 'plan', content: '', planEntries: entries, id: nextLiveItemId() }];
         });
       } else if (msg.type === 'usage') {
-        // MVP：仅实时推送不落库不渲染（保留帧类型兼容，静默忽略）
+        // ACP 上下文用量快照：更新输入框上方的用量条（覆盖语义，取最新值）
+        setContextUsage({ used: msg.used, size: msg.size });
+      } else if (msg.type === 'attachment') {
+        // ACP 多模态占位帧（image/audio/resource）：冲掉流式缓冲后追加附件占位卡
+        flushChunks();
+        breakStream();
+        const parentId = msg.parent_tool_call_id;
+        const card: ChatItem = {
+          kind: 'attachment',
+          content: '',
+          id: nextLiveItemId(),
+          attachmentKind: msg.media_kind ?? 'resource',
+          attachmentName: msg.name ?? '',
+          attachmentUri: msg.uri,
+          attachmentMime: msg.mime,
+          parentToolId: parentId,
+        };
+        if (parentId) {
+          // 子 agent 产出：收进父 Task 卡 children；父卡缺失（时序异常）则平铺
+          // 进主流（带 parentToolId 标记，父卡到达时经孤儿收纳移入 children）
+          breakSubStream(parentId);
+          setItems((prev) => {
+            const parentIdx = prev.findIndex(
+              (it) => it.kind === 'tool' && it.toolId === parentId,
+            );
+            if (parentIdx < 0) return [...prev, card];
+            const next = [...prev];
+            next[parentIdx] = {
+              ...next[parentIdx],
+              children: [...(next[parentIdx].children ?? []), card],
+            };
+            return next;
+          });
+        } else {
+          setItems((prev) => [...prev, card]);
+        }
       } else if (msg.type === 'status') {
         // 轻量提示行（压缩等中间状态）：复用 assistant 气泡样式但标记 status；
         // 不进气泡流 → 冲掉缓冲后断开流式气泡再追加独立行
@@ -1446,6 +1484,18 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     if (initialApprovalMode) setApprovalMode(initialApprovalMode);
   }, [initialApprovalMode]);
 
+  // 会话切换时从 sessions 缓存恢复用量快照（usage 已随帧落库；缓存未命中
+  // 或快照为空时置 null，等首个 usage 帧到达再显示）
+  useEffect(() => {
+    const sessions = queryClient.getQueryData<AgentSession[]>(['agent-sessions', workspaceId]);
+    const s = sessions?.find((x) => x.id === sessionId);
+    setContextUsage(
+      s && (s.context_used != null || s.context_size != null)
+        ? { used: s.context_used ?? undefined, size: s.context_size ?? undefined }
+        : null,
+    );
+  }, [queryClient, workspaceId, sessionId]);
+
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
   // （assistant/thought），MessageBubble 据此用 `<Markdown streaming />` 渲染
   // （保留 md 结构、去掉 code 插件避免 Shiki 每帧全量重高亮，见 Markdown.tsx）。
@@ -1607,6 +1657,32 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 ))}
               </ul>
             </div>
+          )}
+          {/* ACP 上下文用量条：usage 帧/会话快照驱动；>80% 黄、>95% 红 */}
+          {contextUsage?.size != null && contextUsage.size > 0 && (
+            (() => {
+              const used = contextUsage.used ?? 0;
+              const size = contextUsage.size;
+              const pct = Math.min(100, Math.round((used / size) * 100));
+              const tone =
+                pct > 95 ? 'bg-destructive' : pct > 80 ? 'bg-yellow-500' : 'bg-primary/60';
+              const fmt = (n: number) =>
+                n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n);
+              return (
+                <div
+                  className="mb-2 flex items-center gap-2 px-1"
+                  data-testid="context-usage-bar"
+                  title={t('agent.contextUsageTooltip', { used, size })}
+                >
+                  <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+                    <div className={`h-full rounded-full transition-all ${tone}`} style={{ width: `${pct}%` }} />
+                  </div>
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                    {fmt(used)}/{fmt(size)} · {pct}%
+                  </span>
+                </div>
+              );
+            })()
           )}
           {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边 */}
           <div className={`relative rounded-2xl border bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring ${running ? 'agent-input-running' : 'border-input'}`}>

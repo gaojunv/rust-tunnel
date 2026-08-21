@@ -2,7 +2,7 @@ import type { ApprovalOption, ElicitationRequestSchema } from '../../types';
 
 /** 聊天区单条消息。 */
 export interface ChatItem {
-  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'elicitation' | 'thought' | 'plan' | 'system';
+  kind: 'user' | 'assistant' | 'tool' | 'approval' | 'elicitation' | 'thought' | 'plan' | 'system' | 'attachment';
   content: string;
   /** 稳定身份，供 React key 使用（渲染时 `id ?? index`）：
    *  history 装载的行用服务端 rowid（AgentMessage.id），live WS 帧创建的气泡
@@ -50,6 +50,11 @@ export interface ChatItem {
   isSubagent?: boolean;
   /** 子 agent 父卡的嵌套子项（工具卡/文本/思考气泡按到达顺序收纳） */
   children?: ChatItem[];
+  /** kind='attachment'：ACP 多模态占位卡（image/audio/resource），只带元信息 */
+  attachmentKind?: 'image' | 'audio' | 'resource' | string;
+  attachmentName?: string;
+  attachmentUri?: string;
+  attachmentMime?: string;
 }
 
 export interface ToolDiff {
