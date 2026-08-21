@@ -3,17 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <!-- PWA 全面屏 + 状态栏融合（正确方案）：
-         viewport-fit=cover 让内容延伸到屏幕物理边缘（含状态栏/刘海/Home 指示条区）；
-         black-translucent 让状态栏透明、透出下方页面背景色，实现状态栏与背景融合。
-         配套：html+body 都要设背景色（index.css），内容区用 env(safe-area-inset-top)
-         避开刘海。键盘三问题的真正根因是 html 背景透明导致状态栏透白，与 cover 无关。 -->
+    <!-- 直接照抄 Kimi 的字面值（实测为准，不做推断）：
+         viewport 无 viewport-fit=cover（默认 contain）；
+         mobile-web-app-capable（iOS 16.4+ 通用，Kimi 用此而非 apple- 前缀）；
+         status-bar-style = black（Kimi 字面值）。 -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <!-- theme-color 的 content 不支持 CSS 变量（hsl(var(--background)) 是无效值），

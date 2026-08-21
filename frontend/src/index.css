@@ -63,9 +63,6 @@
 
   html {
     color-scheme: light;
-    /* PWA black-translucent 状态栏透出的是 html 背景：html 透明会透白（状态栏
-       区域发白），必须和 body 一样设 bg-background，状态栏才与页面背景融合。 */
-    @apply bg-background;
     /* 防 iOS 橡皮筋滚动/下拉刷新干扰 h-dvh 非滚动布局（/agent 页外层永不滚动，
        橡皮筋只会让布局抖动） */
     overscroll-behavior-y: none;
