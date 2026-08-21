@@ -80,7 +80,7 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_TIMEOUT: Duration = Duration::from_secs(150);
 /// config option 切换超时：agent 无响应时让 WS 连接及时拿到 error 帧回滚，
 /// 而非无限阻塞（回放挂起同样受此约束）。
-const CONFIG_OPTION_TIMEOUT: Duration = Duration::from_secs(15);
+const CONFIG_OPTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// 排队消息上限：进行中回合期间 submit_prompt 入队；超出上限报错（不静默丢弃，
 /// 用户能立刻知道消息未被接受）。
 const MAX_PENDING_PROMPTS: usize = 20;

@@ -220,6 +220,24 @@ describe('historyToChatItems', () => {
     expect(items.some((it) => it.kind === 'assistant' && it.content === '回答')).toBe(true);
   });
 
+  it('restores attachment placeholder rows (name=attachment, content=frame JSON)', () => {
+    const frame = JSON.stringify({
+      type: 'attachment', media_kind: 'image', name: 'pic.png',
+      uri: 'https://example.com/pic.png', mime: 'image/png',
+    });
+    const items = historyToChatItems([
+      row({ id: 'm1', name: 'attachment', kind: 'message', content: frame }),
+      // 坏 JSON 容错跳过
+      row({ id: 'm2', name: 'attachment', kind: 'message', content: '{bad' }),
+    ]);
+    const att = items.filter((it) => it.kind === 'attachment');
+    expect(att).toHaveLength(1);
+    expect(att[0].attachmentKind).toBe('image');
+    expect(att[0].attachmentName).toBe('pic.png');
+    expect(att[0].attachmentUri).toBe('https://example.com/pic.png');
+    expect(att[0].attachmentMime).toBe('image/png');
+  });
+
   it('nests subagent rows (tool/text/thought) into the parent Task card (parent_tool_call_id)', () => {
     // 服务端契约：子 agent 的 tool_result/message 行带 parent_tool_call_id 列，
     // tool_calls JSON 元素也带。历史还原应与实时路径一致：子项收进父卡 children。

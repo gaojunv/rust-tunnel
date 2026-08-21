@@ -1617,11 +1617,43 @@ impl AcpBridge {
         )
         .await
         {
-            Err(_) => Err(format!("set_config_option timed out: {config_id}")),
+            Err(_) => {
+                // 超时对账：agent 可能实际已生效但响应丢失，也可能未生效——
+                // 无论哪种，都把内存中的权威快照广播给前端，让其收敛回真实
+                // 状态（前端 optimistic UI 得以回滚）。
+                self.broadcast_config_snapshot(session_id).await;
+                Err(format!("set_config_option timed out: {config_id}"))
+            }
             Ok(inner) => {
-                inner.map_err(|e| format!("set_config_option failed: {e}"))?;
+                if let Err(e) = inner {
+                    // 错误路径同样对账（agent 显式拒绝时快照即旧值）。
+                    self.broadcast_config_snapshot(session_id).await;
+                    return Err(format!("set_config_option failed: {e}"));
+                }
                 Ok(())
             }
+        }
+    }
+
+    /// 把会话内存中的 config_options 快照以 `config_option_update` 帧广播给
+    /// 当前 WS 连接（best-effort）——用于 set_config_option 超时/失败后的对账。
+    async fn broadcast_config_snapshot(&self, session_id: &str) {
+        let options = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .map(|a| a.config_options.clone())
+        };
+        let Some(options) = options else { return };
+        if options.is_empty() {
+            return;
+        }
+        let frame = serde_json::json!({
+            "type": "config_option_update",
+            "options": options,
+        });
+        if let Some(ws_tx) = current_ws_tx(&self.sessions, session_id).await {
+            let _ = ws_tx.try_send(frame);
         }
     }
 

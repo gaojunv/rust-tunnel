@@ -723,6 +723,10 @@ export interface AgentSession {
   status: 'active' | 'archived';
   model?: string;
   role_id?: string | null;
+  /** ACP usage_update 快照：最近一次上下文用量（tokens），刷新后恢复用量条 */
+  context_used?: number | null;
+  /** 上下文窗口大小（tokens），与 context_used 成对出现 */
+  context_size?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -936,6 +940,16 @@ export type AgentWsEvent =
     }
   | { type: 'plan'; entries?: PlanEntryItem[] }
   | { type: 'usage'; used?: number; size?: number }
+  | {
+      /** ACP 多模态内容块占位帧（image/audio/resource）：只携带元信息，
+       *  不透传 base64 数据——渲染为附件占位卡 */
+      type: 'attachment';
+      media_kind?: 'image' | 'audio' | 'resource' | string;
+      name?: string;
+      uri?: string;
+      mime?: string;
+      parent_tool_call_id?: string;
+    }
   | {
       /** runner 路径工具参数流式透出（模型写大文件时前端实时可见参数增量） */
       type: 'tool_call_chunk';

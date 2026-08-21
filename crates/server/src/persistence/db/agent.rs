@@ -127,6 +127,15 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub role_id: Option<String>,
+    /// ACP UsageUpdate 最近一次上下文用量快照（tokens）。列由
+    /// `migrate_agent_sessions_add_context_usage`（schema.rs）落地。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub context_used: Option<i64>,
+    /// 上下文窗口大小（tokens），与 `context_used` 成对出现。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub context_size: Option<i64>,
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
     #[serde(serialize_with = "ser_de_normalized_dt")]
@@ -418,6 +427,25 @@ impl Database {
             "UPDATE agent_sessions SET acp_session_id = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(acp_session_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 写入 session 的上下文用量快照（ACP UsageUpdate 每次推送覆盖；用于
+    /// 刷新/重连后恢复前端用量条，不做历史累计）。
+    pub async fn agent_update_session_context_usage(
+        &self,
+        id: &str,
+        used: Option<i64>,
+        size: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_sessions SET context_used = ?, context_size = ? WHERE id = ?",
+        )
+        .bind(used)
+        .bind(size)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -1844,6 +1872,41 @@ mod tests {
             .unwrap();
         let s = db.agent_get_session("s1").await.unwrap().unwrap();
         assert!(s.config_state.is_none());
+    }
+
+    /// context_used/context_size（ACP usage_update 快照列）覆盖式写入往返：
+    /// 初始 NULL → 写入 → 覆盖为最新值（不累计）。
+    #[tokio::test]
+    async fn test_session_context_usage_snapshot() {
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
+
+        // 初始为空
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert!(s.context_used.is_none());
+        assert!(s.context_size.is_none());
+
+        // 写入快照
+        db.agent_update_session_context_usage("s1", Some(1234), Some(200_000))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.context_used, Some(1234));
+        assert_eq!(s.context_size, Some(200_000));
+
+        // 覆盖为最新快照（不累计）
+        db.agent_update_session_context_usage("s1", Some(5678), Some(200_000))
+            .await
+            .unwrap();
+        let s = db.agent_get_session("s1").await.unwrap().unwrap();
+        assert_eq!(s.context_used, Some(5678));
     }
 
     /// agent_config_overrides（v4 列）的创建→读取→更新→清空完整往返。

@@ -179,7 +179,8 @@ fn encode_raw(value: &serde_json::Value) -> String {
     }
 }
 
-/// 文本 chunk（assistant 正文 / thought）→ assistant_chunk 帧。
+/// 文本 chunk（assistant 正文 / thought）→ assistant_chunk 帧；非文本块
+/// （image/audio/resource/resource_link）→ attachment 占位帧，不再静默丢弃。
 ///
 /// `chunk_meta` 是 chunk 级 `_meta`（`ContentChunk.meta`）；`TextContent` 内部还有
 /// content 级 `_meta`（`TextContent.meta`）。子 agent 文本归属两级都查，优先 chunk 级。
@@ -189,7 +190,7 @@ fn map_text_chunk(
     thought: bool,
 ) -> Option<serde_json::Value> {
     let ContentBlock::Text(text) = content else {
-        return None; // 非文本块（image/audio/resource 等）无正文可推
+        return map_attachment_chunk(content);
     };
     if text.text.is_empty() {
         return None;
@@ -204,6 +205,80 @@ fn map_text_chunk(
     }
     if is_subagent {
         frame["is_subagent"] = serde_json::Value::Bool(true);
+    }
+    Some(frame)
+}
+
+/// 非文本内容块 → attachment 占位帧：
+/// `{"type":"attachment","media_kind":"image|audio|resource","name","uri"?,"mime"?}`。
+/// 正文数据（base64 等）不透传——占位卡只表达"这里有一个附件"，避免大 payload
+/// 刷屏 WS 与控制通道。
+fn map_attachment_chunk(content: &ContentBlock) -> Option<serde_json::Value> {
+    use agent_client_protocol::schema::v1::EmbeddedResourceResource;
+    let (media_kind, name, uri, mime) = match content {
+        ContentBlock::Image(img) => (
+            "image",
+            // 图片无文件名，用 uri 末段或 mime 兜底
+            img.uri
+                .as_deref()
+                .and_then(|u| u.rsplit('/').next().filter(|s| !s.is_empty()))
+                .unwrap_or("image")
+                .to_string(),
+            img.uri.clone(),
+            Some(img.mime_type.clone()),
+        ),
+        ContentBlock::Audio(audio) => (
+            "audio",
+            "audio".to_string(),
+            None,
+            Some(audio.mime_type.clone()),
+        ),
+        ContentBlock::ResourceLink(link) => (
+            "resource",
+            link.name.clone(),
+            Some(link.uri.clone()),
+            link.mime_type.clone(),
+        ),
+        ContentBlock::Resource(res) => match &res.resource {
+            EmbeddedResourceResource::TextResourceContents(t) => (
+                "resource",
+                t.uri
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("resource")
+                    .to_string(),
+                Some(t.uri.clone()),
+                t.mime_type.clone(),
+            ),
+            EmbeddedResourceResource::BlobResourceContents(b) => (
+                "resource",
+                b.uri
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("resource")
+                    .to_string(),
+                Some(b.uri.clone()),
+                b.mime_type.clone(),
+            ),
+            // schema 标注 non_exhaustive：未来新增资源类型安全降级为无占位帧
+            _ => return None,
+        },
+        ContentBlock::Text(_) => return None,
+        // ContentBlock 同样 non_exhaustive
+        _ => return None,
+    };
+    let mut frame = serde_json::json!({
+        "type": "attachment",
+        "media_kind": media_kind,
+        "name": name,
+    });
+    if let Some(u) = uri {
+        frame["uri"] = serde_json::Value::String(u);
+    }
+    if let Some(m) = mime {
+        frame["mime"] = serde_json::Value::String(m);
     }
     Some(frame)
 }
@@ -777,6 +852,41 @@ mod tests {
         assert_eq!(frame["type"], "usage");
         assert_eq!(frame["used"], 1234);
         assert_eq!(frame["size"], 200000);
+    }
+
+    #[test]
+    fn test_map_image_chunk_to_attachment_frame() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "image",
+                "data": "iVBORw0KGgo=",
+                "mimeType": "image/png",
+                "uri": "https://example.com/pic.png"
+            }
+        }));
+        let frame = map_update(&u).expect("image chunk 应映射为 attachment 占位帧");
+        assert_eq!(frame["type"], "attachment");
+        assert_eq!(frame["media_kind"], "image");
+        assert_eq!(frame["uri"], "https://example.com/pic.png");
+        assert_eq!(frame["mime"], "image/png");
+    }
+
+    #[test]
+    fn test_map_resource_link_chunk_to_attachment_frame() {
+        let u = update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {
+                "type": "resource_link",
+                "name": "readme.md",
+                "uri": "file:///home/x/readme.md"
+            }
+        }));
+        let frame = map_update(&u).expect("resource_link chunk 应映射为 attachment 占位帧");
+        assert_eq!(frame["type"], "attachment");
+        assert_eq!(frame["media_kind"], "resource");
+        assert_eq!(frame["name"], "readme.md");
+        assert_eq!(frame["uri"], "file:///home/x/readme.md");
     }
 
     // ── claude-code subagent-transcript `_meta` 透传 ──────────────
