@@ -780,8 +780,54 @@ impl Database {
         Self::migrate_agent_roles(pool).await?;
         Self::migrate_agent_sessions_add_role(pool).await?;
         Self::migrate_agent_sessions_add_context_usage(pool).await?;
+        Self::migrate_agent_sessions_add_spawn_error(pool).await?;
+        Self::migrate_agent_pending_prompts(pool).await?;
         Self::seed_builtin_roles(pool).await?;
 
+        Ok(())
+    }
+
+    /// ACP 排队 prompt 持久化表：busy 时入队的消息落库（内存 VecDeque 仅作热
+    /// 缓存），服务端重启/reaper 回收后 ensure_session 可从 DB 恢复 FIFO 队列。
+    /// 取出执行即删行（消息本身已作为 user 消息落 agent_messages，不丢历史）。
+    async fn migrate_agent_pending_prompts(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_pending_prompts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                refs TEXT NOT NULL DEFAULT '[]',
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_pending_prompts_session
+             ON agent_pending_prompts(session_id)",
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// agent_sessions 补 `last_spawn_error` 列（最近一次 ACP spawn 失败的归因
+    /// 描述，成功时清空；供重启后/会话列表追溯）。幂等：列已存在时 ALTER 报错即跳过。
+    async fn migrate_agent_sessions_add_spawn_error(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+        match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN last_spawn_error TEXT")
+            .execute(pool)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+                tracing::debug!("agent_sessions migration: last_spawn_error column already exists");
+            }
+        }
         Ok(())
     }
 

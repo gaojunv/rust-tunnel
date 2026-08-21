@@ -516,6 +516,10 @@ pub async fn run_api_server(
             get(agent::list_messages),
         )
         .route(
+            "/api/agent/sessions/:id/export",
+            get(agent::export_session),
+        )
+        .route(
             "/api/agent/default-model",
             get(agent::get_default_model).put(agent::put_default_model),
         )

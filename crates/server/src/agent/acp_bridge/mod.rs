@@ -90,7 +90,9 @@ const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// 排队等待发送的用户 prompt（进行中回合时经 [`AcpBridge::submit_prompt`] 暂存）。
 /// `content` 是注入 @引用后的完整消息（mgmt/api/agent.rs 分派前已 `inject_refs`，
 /// refs 内容已内联）；`refs` 原样留存备查。FIFO：终态回调逐个取出续跑，队列排空才
-/// 发 done。
+/// 发 done。入队即落 `agent_pending_prompts` 表（`persist_id` 为行 id，None = 落库
+/// 失败的纯内存降级），取出执行时删行——重启/reaper 回收后 ensure_session 从 DB
+/// 恢复队列，排队消息不再丢失。
 #[derive(Clone)]
 struct PendingPrompt {
     content: String,
@@ -98,6 +100,8 @@ struct PendingPrompt {
     /// refs 内容已内联进 `content`，本字段仅作记录不参与运行）。
     #[allow(dead_code)]
     refs: Vec<String>,
+    /// `agent_pending_prompts` 行 id（持久化副本）；None = 落库失败的纯内存项。
+    persist_id: Option<String>,
 }
 
 /// 回合内一段已到达但尚未落库的 assistant 输出（正文或思考）。流式 chunk 按
@@ -166,6 +170,9 @@ struct SpawnedAgent {
     /// 回合代数计数器：每次 prompt 递增，与 cancelled_turns 配合区分
     /// "哪个回合被取消"。
     turn_generation: u64,
+    /// 当前回合开始时间（`prompt_inner` 置 busy 时记录）：终态 done 帧携带
+    /// `duration_ms` 供前端展示回合耗时；终态回调取出即清除。
+    turn_started_at: Option<std::time::Instant>,
     /// 最近活动时间（prompt / cancel / stdio / ACP 通知都会刷新；idle reaper 依据）。
     last_activity: std::time::Instant,
     /// AgentSpawnExit 已到达（进程结束）。
@@ -454,6 +461,7 @@ mod tests {
             busy: false,
             cancelled_turns: std::collections::HashSet::new(),
             turn_generation: 0,
+            turn_started_at: None,
             last_activity: std::time::Instant::now(),
             exited: false,
             turn_segments: Vec::new(),
@@ -645,7 +653,17 @@ mod tests {
                 registry2.resolve_spawn_pending(&sid, respond(req)).await;
             }
         });
-        AcpBridge::new(AgentSpawner::new(registry), db)
+        AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db))
+    }
+
+    /// 测试用 dummy 网关：仅让 ensure_session 的「网关未配置」前置门禁放行，
+    /// 不会真有 LLM 请求发出（mock 注册表在到达那步前已按脚本应答/报错）。
+    fn test_gateway(db: &Database) -> crate::agent::llm_bridge::LlmGatewayEndpoint {
+        crate::agent::llm_bridge::LlmGatewayEndpoint {
+            llm_state: std::sync::Arc::new(crate::llm::LlmState::new(Some(db.clone()), None)),
+            api_key: "test-internal-key".into(),
+        }
     }
 
     #[test]
@@ -900,6 +918,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_prompt_busy_persists_pending() {
+        // busy 入队：消息同时落 agent_pending_prompts（persist_id=Some），
+        // 重启后可恢复。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone());
+        let mut agent = spawned_agent();
+        agent.busy = true;
+        bridge.sessions.lock().await.insert("sess-1".into(), agent);
+
+        bridge
+            .submit_prompt("sess-1", "排队消息一", vec![])
+            .await
+            .expect("enqueue should succeed");
+
+        let rows = db.agent_pending_list("sess-1").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "排队消息一");
+        let sessions = bridge.sessions.lock().await;
+        let queued = &sessions.get("sess-1").unwrap().pending_prompts;
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].persist_id.as_deref(), Some(rows[0].0.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_session_restores_persisted_pending() {
+        // 恢复路径：DB 里残留的排队 prompt 在 ensure_session 重拉时载入条目；
+        // 落库失败的纯内存降级项（persist_id=None）保留在队尾，不与 DB 行重复。
+        let db = Database::new(":memory:").await.unwrap();
+        db.save_server_auth("secret").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "nas", "host", "/workspace", None, None, "gemini",
+            None, Some("model-1"), None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+        db.agent_pending_enqueue("p1", "sess-1", "重启前排队", "[]")
+            .await
+            .unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
+        // exited 旧条目：带一项无持久副本的降级 prompt（验证合并去重）
+        let mut exited = spawned_agent();
+        exited.exited = true;
+        exited.pending_prompts.push_back(PendingPrompt {
+            content: "降级内存项".into(),
+            refs: vec![],
+            persist_id: None,
+        });
+        bridge.sessions.lock().await.insert("sess-1".into(), exited);
+
+        // 直接调恢复逻辑（ensure_session 在 spawn 前调用同一函数；spawn 失败
+        // 会移除占位条目，事后无法观测内存态）。
+        bridge.restore_pending_prompts("sess-1").await;
+        let sessions = bridge.sessions.lock().await;
+        let queue = &sessions.get("sess-1").unwrap().pending_prompts;
+        assert_eq!(queue.len(), 2, "DB 行 + 降级内存项");
+        // DB 行在前（FIFO），带持久 id；降级项居队尾
+        assert_eq!(queue[0].content, "重启前排队");
+        assert_eq!(queue[0].persist_id.as_deref(), Some("p1"));
+        assert_eq!(queue[1].content, "降级内存项");
+        assert_eq!(queue[1].persist_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_session_no_gateway_rejected_early() {
+        // 网关未注入（生产：启动时无 provider → llm_state 为空）→ 前置拦截，
+        // 不发起任何控制通道请求（agent spawn 出来也只会每个 LLM 请求 502）。
+        let db = Database::new(":memory:").await.unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let (ws_tx, _rx) = mpsc::channel(16);
+        let err = bridge
+            .ensure_session("sess-1", &acp_workspace(), ws_tx, TEST_CONN_ID)
+            .await
+            .expect_err("missing gateway should be rejected");
+        assert!(err.contains("LLM 网关未配置"), "err: {err}");
+        assert!(err.contains("gateway:"), "stage 前缀缺失: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_failure_persisted_with_stage_attribution() {
+        // spawn 失败（llm_proxy 阶段：客户端离线）→ 归因带 stage 前缀持久化到
+        // agent_sessions.last_spawn_error，重启后仍可追溯。
+        let db = Database::new(":memory:").await.unwrap();
+        db.agent_create_workspace(
+            "w1", "proj", "ghost", "host", "/workspace", None, None, "gemini",
+            None, Some("model-1"), None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("sess-1", "w1", None, None)
+            .await
+            .unwrap();
+        let registry = crate::client_registry::ClientRegistry::new(db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
+        let mut ws = acp_workspace();
+        ws.client_id = "ghost".into();
+        let (ws_tx, _rx) = mpsc::channel(16);
+        let err = bridge
+            .ensure_session("sess-1", &ws, ws_tx, TEST_CONN_ID)
+            .await
+            .expect_err("offline client should fail");
+        assert!(err.starts_with("llm_proxy:"), "stage 前缀缺失: {err}");
+        let s = db.agent_get_session("sess-1").await.unwrap().unwrap();
+        let persisted = s.last_spawn_error.expect("spawn error should persist");
+        assert!(persisted.starts_with("llm_proxy:"), "persisted: {persisted}");
+    }
+
+    #[tokio::test]
     async fn test_ensure_session_docker_rejected() {
         let bridge = mock_bridge(|_| unreachable!("docker rejection should not spawn")).await;
         let (ws_tx, _rx) = mpsc::channel(16);
@@ -993,7 +1126,8 @@ mod tests {
                 registry2.resolve_spawn_pending(&sid, resp).await;
             }
         });
-        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
         let mut ws = acp_workspace();
         ws.llm_model_id = None;
         let (ws_tx, _rx) = mpsc::channel(16);
@@ -1012,7 +1146,8 @@ mod tests {
         // 客户端未注册 → start_llm_proxy 报 NotConnected，before spawn_agent
         let db = Database::new(":memory:").await.unwrap();
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
-        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
         let mut ws = acp_workspace();
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
@@ -1052,7 +1187,8 @@ mod tests {
         // 真实原因，而非误导性的 "session not spawned"。
         let db = Database::new(":memory:").await.unwrap();
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
-        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
         let mut ws = acp_workspace();
         ws.client_id = "ghost".into();
         let (ws_tx, _rx) = mpsc::channel(16);
@@ -1158,7 +1294,8 @@ mod tests {
         // 路径快速失败——若 ensure_session 直接 Ok（bug 行为）则 expect_err panic。
         let db = Database::new(":memory:").await.unwrap();
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
-        let bridge = AcpBridge::new(AgentSpawner::new(registry), db);
+        let bridge = AcpBridge::new(AgentSpawner::new(registry), db.clone())
+            .with_llm_gateway(test_gateway(&db));
         let mut exited = spawned_agent();
         exited.exited = true;
         bridge.sessions.lock().await.insert("sess-1".into(), exited);
@@ -1863,6 +2000,12 @@ mod tests {
         assert_eq!(events[4]["type"], "plan");
         assert_eq!(events[4]["entries"][0]["content"], "步骤一");
         assert_eq!(events[5]["type"], "done");
+        // 回合耗时：done 帧携带 duration_ms（回合开始于 prompt 置 busy 时）
+        assert!(
+            events[5]["duration_ms"].as_u64().is_some(),
+            "done 帧应携带 duration_ms: {}",
+            events[5]
+        );
         // 回合结束：busy 复位，可再次 prompt
         assert!(!bridge.sessions.lock().await.get("sess-1").unwrap().busy);
     }
@@ -3213,7 +3356,8 @@ mod tests {
         ]);
         let applied = Arc::new(Mutex::new(Vec::new()));
         let registry = crate::client_registry::ClientRegistry::new(db.clone());
-        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone());
+        let bridge = AcpBridge::new(AgentSpawner::new(registry.clone()), db.clone())
+            .with_llm_gateway(test_gateway(&db));
         // 本用例不测 MCP 注入：mock 缺省 http=false，mcpServers 丢弃。
         spawn_e2e_client(
             &registry,

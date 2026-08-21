@@ -967,7 +967,8 @@ export type AgentWsEvent =
   | { type: 'queued' }
   // 停止超时兜底：agent 未在时限内响应停止，服务端强制杀进程并重启
   | { type: 'cancel_fallback' }
-  | { type: 'done' }
+  // duration_ms：ACP 路径回合耗时（排队连续回合的中间 done 不携带）
+  | { type: 'done'; duration_ms?: number }
   | { type: 'stopped' }
   | { type: 'session_title'; title?: string; session_id?: string }
   | {
