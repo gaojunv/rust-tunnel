@@ -174,7 +174,7 @@ export function GitHistoryTab({ workspaceId }: { workspaceId: string }) {
                       type="button"
                       aria-label={t('agent.gitReset')}
                       title={t('agent.gitReset')}
-                      className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-accent hover:text-foreground"
+                      className="shrink-0 rounded p-1 text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-foreground"
                     >
                       <RotateCcw className="h-3 w-3" />
                     </button>
@@ -200,7 +200,7 @@ export function GitHistoryTab({ workspaceId }: { workspaceId: string }) {
                   onClick={() => setRevertTarget(commit)}
                   aria-label={t('agent.gitRevert')}
                   title={t('agent.gitRevert')}
-                  className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-accent hover:text-destructive"
+                  className="shrink-0 rounded p-1 text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-destructive"
                 >
                   <Undo2 className="h-3 w-3" />
                 </button>

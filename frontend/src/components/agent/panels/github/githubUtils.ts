@@ -89,3 +89,46 @@ export function serializeGhInputs(rows: { key: string; value: string }[]): Recor
   }
   return out;
 }
+
+/** 耗时毫秒 → 紧凑可读串：1m32s / 58s / 2h5m。不足 1s 按 1s 计；非有限值返回空串。 */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const totalSec = Math.max(1, Math.round(ms / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h${minutes}m` : `${hours}h`;
+  }
+  if (minutes > 0) {
+    return seconds > 0 ? `${minutes}m${seconds}s` : `${minutes}m`;
+  }
+  return `${seconds}s`;
+}
+
+/** 统一状态图标名（供 RunRow/JobStepRow 按名渲染对应 lucide 组件）。 */
+export type GhStatusIconKind = 'success' | 'failure' | 'cancelled' | 'action_required' | 'active' | 'unknown';
+
+/** 根据 status + conclusion 决定图标种类（priority：conclusion 优先于 status）。 */
+export function runStatusIconKind(
+  status: string | undefined | null,
+  conclusion: string | null | undefined,
+): GhStatusIconKind {
+  // 已完成 → 按 conclusion 决定
+  if (conclusion === 'success') return 'success';
+  if (conclusion === 'failure' || conclusion === 'timed_out') return 'failure';
+  if (conclusion === 'cancelled' || conclusion === 'skipped') return 'cancelled';
+  if (conclusion === 'action_required') return 'action_required';
+  if (conclusion) return 'unknown';
+  // 未完成 → 按 status
+  if (status && ['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(status)) {
+    return 'active';
+  }
+  return 'unknown';
+}
+
+/** Git 推送事件 → 图标名的最小映射（供 RunRow 元信息行）。 */
+export function ghEventIconKind(event: string | undefined | null): string | null {
+  if (!event) return null;
+  return event;
+}

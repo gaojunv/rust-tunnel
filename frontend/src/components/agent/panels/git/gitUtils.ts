@@ -81,6 +81,17 @@ export function branchNameFromHeader(header: string | null): string | null {
   return hashIdx >= 0 ? name.slice(0, hashIdx).trim() : name.trim();
 }
 
+/** 从分支头行解析 ahead/behind 计数（`[ahead 2, behind 1]`），缺省为 0。 */
+export function parseAheadBehind(header: string | null): { ahead: number; behind: number } {
+  if (!header) return { ahead: 0, behind: 0 };
+  const aheadMatch = header.match(/ahead (\d+)/);
+  const behindMatch = header.match(/behind (\d+)/);
+  return {
+    ahead: aheadMatch ? parseInt(aheadMatch[1], 10) : 0,
+    behind: behindMatch ? parseInt(behindMatch[1], 10) : 0,
+  };
+}
+
 /** 相对时间格式化 key（分钟/小时/天档）。 */
 export function formatCommitDate(date: string, now: number, t: TranslateFn): string {
   const ts = Date.parse(date);

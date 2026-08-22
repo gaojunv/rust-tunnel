@@ -167,7 +167,7 @@ export function GitBranchesTab({ workspaceId }: { workspaceId: string }) {
                   disabled={busy}
                   aria-label={t('agent.gitDeleteBranch')}
                   title={t('agent.gitDeleteBranch')}
-                  className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-accent hover:text-destructive"
+                  className="shrink-0 rounded p-1 text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-destructive"
                 >
                   <Trash2 className="h-3 w-3" />
                 </button>

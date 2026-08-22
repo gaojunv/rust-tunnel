@@ -1,8 +1,14 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ArrowDownToLine, ArrowUpFromLine, GitCommitHorizontal } from 'lucide-react';
+import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  ChevronDown,
+  GitCommitHorizontal,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useImeGuard } from '@/hooks/useImeGuard';
 import {
   postAgentGitCommit,
   postAgentGitPull,
@@ -10,9 +16,15 @@ import {
   postAgentGitStage,
   postAgentGitUnstage,
 } from '../../../../api/client';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '../../../../components/ui/dropdown-menu';
 import { useGitMutation } from './useGitMutation';
 import { DiffView, EntryRow, GitApprovalDialog, GitGroup, type EntryRowAction } from './shared';
-import { branchNameFromHeader, type GitEntry } from './gitUtils';
+import { branchNameFromHeader, parseAheadBehind, type GitEntry } from './gitUtils';
 
 type GroupKey = 'staged' | 'changes' | 'untracked';
 
@@ -32,7 +44,8 @@ function groupOf(entry: GitEntry): GroupKey {
 /**
  * Changes Tab：staged / changes / untracked 三组，每行 hover 有暂存/取消暂存按钮，
  * 组头有「全部暂存 / 全部取消暂存」；staged 组点开看 cached diff，其余看工作区 diff；
- * 底部为提交区（多行 message + commit），顶栏为 pull / push。
+ * 底部为提交区（多行 message + commit，Cmd/Ctrl+Enter 快捷提交），顶栏为 VS Code 式
+ * 单个 sync 按钮（⇅ main ↑2 ↓1，含 ahead/behind 徽标与 pull/push 下拉）。
  *
  * entries 由 GitPanel 容器解析后传入（status query 归属容器，保证非 git 仓库/
  * 回退路径统一）；写操作成功后 invalidate 容器持有的 status query。
@@ -47,10 +60,12 @@ export function GitChangesTab({
   branch: string | null;
 }) {
   const { t } = useTranslation();
+  const tr = t as (key: string) => string;
   const queryClient = useQueryClient();
   const [expandedPath, setExpandedPath] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState('');
+  const ime = useImeGuard();
 
   // 写操作成功后统一刷新：status（容器）+ log/stash 等（commit 会推进历史）
   const invalidate = () => {
@@ -101,6 +116,12 @@ export function GitChangesTab({
 
   const canCommit = message.trim() !== '' && !commitMutation.isPending;
   const branchName = branchNameFromHeader(branch);
+  const { ahead, behind } = parseAheadBehind(branch);
+
+  const doCommit = useCallback(() => {
+    if (!canCommit) return;
+    commitMutation.mutate(message.trim());
+  }, [canCommit, commitMutation, message]);
 
   const rowAction = (entry: GitEntry): EntryRowAction => {
     if (groupOf(entry) === 'staged') {
@@ -117,36 +138,93 @@ export function GitChangesTab({
     };
   };
 
+  // 单个 sync 按钮：behind 优先 pull，否则 push；两者都有时下拉二选一
+  const hasBoth = ahead > 0 && behind > 0;
+  const syncPrimary = behind > 0 ? 'pull' : ahead > 0 ? 'push' : null;
+
+  const handleSyncClick = () => {
+    if (hasBoth) return; // 由下拉菜单处理
+    if (syncPrimary === 'pull') pullMutation.mutate();
+    else if (syncPrimary === 'push') pushMutation.mutate();
+    else {
+      // 无 ahead/behind：默认 pull（保持与历史行为一致）
+      pullMutation.mutate();
+    }
+  };
+
   return (
     <div className="space-y-1.5">
-      {/* 顶栏：当前分支 + pull / push（写操作走审批流） */}
+      {/* 顶栏：VS Code 式单个 sync 按钮 ⇅ main ↑2 ↓1 */}
       <div className="flex items-center gap-1 px-1">
-        {branchName && (
-          <span className="truncate font-mono text-[10px] text-muted-foreground/80">
-            {branchName}
-          </span>
+        {branchName ? (
+          <div className="flex min-w-0 items-center gap-1">
+            {/* 分支名独立文本节点（测试断言 getByText('main') 依赖兄弟 span 隔离） */}
+            <span className="truncate font-mono text-xs text-muted-foreground/80">
+              {branchName}
+            </span>
+            {(ahead > 0 || behind > 0) && (
+              <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70">
+                {ahead > 0 && <span> ↑{ahead}</span>}
+                {behind > 0 && <span> ↓{behind}</span>}
+              </span>
+            )}
+          </div>
+        ) : (
+          <span className="truncate font-mono text-xs text-muted-foreground/60">—</span>
         )}
-        <div className="ml-auto flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => pullMutation.mutate()}
-            disabled={pullMutation.isPending}
-            title={t('agent.gitPull')}
-            aria-label={t('agent.gitPull')}
-            className="rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            {t('agent.gitPull')}
-          </button>
-          <button
-            type="button"
-            onClick={() => pushMutation.mutate()}
-            disabled={pushMutation.isPending}
-            title={t('agent.gitPush')}
-            aria-label={t('agent.gitPush')}
-            className="rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          >
-            {t('agent.gitPush')}
-          </button>
+        <div className="ml-auto flex items-center">
+          {hasBoth ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={tr('agent.gitSync')}
+                  title={tr('agent.gitSync')}
+                  className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  ⇅
+                  <span className="font-mono text-[11px] text-muted-foreground/70">
+                    ↑{ahead} ↓{behind}
+                  </span>
+                  <ChevronDown className="h-3 w-3" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => pullMutation.mutate()}>
+                  {tr('agent.gitPull')} ↓{behind}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => pushMutation.mutate()}>
+                  {tr('agent.gitPush')} ↑{ahead}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSyncClick}
+              disabled={pullMutation.isPending || pushMutation.isPending}
+              aria-label={
+                syncPrimary === 'pull'
+                  ? tr('agent.gitPull')
+                  : syncPrimary === 'push'
+                    ? tr('agent.gitPush')
+                    : tr('agent.gitSync')
+              }
+              title={
+                syncPrimary === 'pull'
+                  ? tr('agent.gitPull')
+                  : syncPrimary === 'push'
+                    ? tr('agent.gitPush')
+                    : tr('agent.gitSync')
+              }
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+            >
+              ⇅
+              {ahead > 0 && <span className="font-mono">↑{ahead}</span>}
+              {behind > 0 && <span className="font-mono">↓{behind}</span>}
+              {!ahead && !behind && <span className="sr-only">{tr('agent.gitSync')}</span>}
+            </button>
+          )}
         </div>
       </div>
 
@@ -202,11 +280,19 @@ export function GitChangesTab({
         );
       })}
 
-      {/* 提交区 */}
+      {/* 提交区：Cmd/Ctrl+Enter 快捷提交，IME 组词期防误触 */}
       <div className="space-y-1 border-t border-border/60 pt-1.5">
         <textarea
           value={message}
           onChange={(e) => setMessage(e.target.value)}
+          {...ime.bind}
+          onKeyDown={(e) => {
+            if (ime.isComposing(e)) return;
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+              e.preventDefault();
+              doCommit();
+            }
+          }}
           rows={2}
           spellCheck={false}
           placeholder={t('agent.gitCommitPlaceholder')}
@@ -218,10 +304,10 @@ export function GitChangesTab({
         <div className="flex items-center justify-end">
           <button
             type="button"
-            onClick={() => commitMutation.mutate(message.trim())}
+            onClick={doCommit}
             disabled={!canCommit}
             className={cn(
-              'inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium',
+              'inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium',
               canCommit
                 ? 'bg-primary text-primary-foreground hover:bg-primary/90'
                 : 'cursor-not-allowed bg-muted text-muted-foreground/60'

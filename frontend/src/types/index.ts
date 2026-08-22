@@ -1122,24 +1122,32 @@ export interface GhWorkflow {
 
 /** GitHub REST 原生 workflow_run 条目子集。status: queued|in_progress|waiting|
  *  requested|pending|completed；conclusion: success|failure|neutral|cancelled|
- *  skipped|timed_out|action_required|null（未完成时）。 */
+ *  skipped|timed_out|action_required|null（未完成时）。可选字段宽松兜底，测试 mock 缺省不崩。 */
 export interface GhWorkflowRun {
   id: number;
   name?: string;
   display_title?: string;
   head_branch?: string;
+  head_sha?: string;
+  event?: string;
+  run_number?: number;
   workflow_id?: number;
   status: string;
   conclusion?: string | null;
   run_started_at?: string;
+  created_at?: string;
   updated_at?: string;
   html_url?: string;
+  head_commit?: { message?: string; id?: string } | null;
 }
 
 export interface GhJobStep {
   name: string;
   status: string;
   conclusion?: string | null;
+  number?: number;
+  started_at?: string;
+  completed_at?: string;
 }
 
 /** GitHub REST 原生 job 条目子集。 */

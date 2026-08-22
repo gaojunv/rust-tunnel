@@ -188,17 +188,17 @@ export function WorkflowsTab({
       {(workflows ?? []).map((wf) => (
         <div
           key={wf.id}
-          className="group flex items-center gap-1.5 rounded border border-border/60 px-1.5 py-1"
+          className="group flex items-center gap-1.5 rounded border border-border/60 px-1.5 py-1 min-h-[36px] md:min-h-[28px]"
         >
           <span className="min-w-0 flex-1">
             <span className="block truncate text-xs font-medium">{wf.name}</span>
-            <span className="block truncate font-mono text-[10px] text-muted-foreground">
+            <span className="block truncate font-mono text-[11px] text-muted-foreground">
               {wf.path}
             </span>
           </span>
           <span
             className={cn(
-              'shrink-0 rounded px-1 py-0.5 text-[10px] font-medium',
+              'shrink-0 rounded px-1 py-0.5 text-xs font-medium',
               wf.state === 'active'
                 ? 'bg-green-500/15 text-green-600 dark:text-green-400'
                 : 'bg-muted text-muted-foreground'
@@ -210,9 +210,9 @@ export function WorkflowsTab({
             type="button"
             onClick={() => setDispatchWorkflow(wf)}
             aria-label={`${t('agent.githubDispatch')} ${wf.name}`}
-            className="flex shrink-0 items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            className="flex shrink-0 items-center gap-0.5 rounded px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
-            <Play className="h-2.5 w-2.5" />
+            <Play className="h-3 w-3" />
             {t('agent.githubDispatch')}
           </button>
         </div>

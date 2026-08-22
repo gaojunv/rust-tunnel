@@ -7,6 +7,7 @@ import FilesPanel from './panels/FilesPanel';
 import TerminalPanel from './panels/TerminalPanel';
 import GitPanel from './panels/GitPanel';
 import GitHubActionsPanel from './panels/github/GitHubActionsPanel';
+import { safeLocalStorageGet, safeLocalStorageSet } from './safeStorage';
 
 type PanelKind = 'files' | 'terminal' | 'git' | 'github';
 
@@ -37,6 +38,15 @@ const PANEL_MIN_WIDTH: Record<PanelKind, number> = {
 /** 面板最大宽度：不超过外层容器宽度的 80%（至少保留对话区可见）。 */
 const MAX_WIDTH_RATIO = 0.8;
 
+/** 移动端底部 Sheet 高度比例持久化 */
+const MOBILE_PANEL_HEIGHT_KEY = 'agent.mobilePanelHeightRatio';
+const MOBILE_PANEL_DEFAULT_RATIO = 0.5;
+const MOBILE_PANEL_MIN_RATIO = 0.25;
+const MOBILE_PANEL_MAX_RATIO = 0.92;
+const MOBILE_PANEL_STEP = 0.05;
+const clampRatio = (v: number) =>
+  Math.min(MOBILE_PANEL_MAX_RATIO, Math.max(MOBILE_PANEL_MIN_RATIO, v));
+
 interface ActivityBarProps {
   sessionId: string;
   workspaceId: string;
@@ -54,6 +64,23 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
   const [widths, setWidths] = useState<Record<PanelKind, number>>({ ...PANEL_DEFAULT_WIDTH });
   const [dragging, setDragging] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  // 移动端底部 Sheet 共享高度比例（0.25-0.92，默认 0.5 半屏）
+  const [heightRatio, setHeightRatio] = useState(MOBILE_PANEL_DEFAULT_RATIO);
+  const [mobileDragging, setMobileDragging] = useState(false);
+
+  // 读取持久化高度：校验数字并钳到合法区间，非法回落 0.5
+  useEffect(() => {
+    const raw = safeLocalStorageGet(MOBILE_PANEL_HEIGHT_KEY);
+    if (raw == null) return;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    setHeightRatio(clampRatio(n));
+  }, []);
+
+  // 高度变化时写回 localStorage
+  useEffect(() => {
+    safeLocalStorageSet(MOBILE_PANEL_HEIGHT_KEY, String(heightRatio));
+  }, [heightRatio]);
 
   const toggle = (kind: PanelKind) => setActive((cur) => (cur === kind ? null : kind));
 
@@ -89,6 +116,41 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
     [active, widths]
   );
 
+  // 移动端 Sheet 顶部拖动手柄：纵向拖动改变共享高度比例
+  const onMobileHandlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startRatio = heightRatio;
+      setMobileDragging(true);
+      const onMove = (ev: PointerEvent) => {
+        const deltaY = ev.clientY - startY;
+        const vh = window.innerHeight || 1;
+        // 向上拖（deltaY 为负）→ 变高，故用减法
+        const next = clampRatio(startRatio - deltaY / vh);
+        setHeightRatio(next);
+      };
+      const onUp = () => {
+        setMobileDragging(false);
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    [heightRatio]
+  );
+
+  const onMobileHandleKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHeightRatio((r) => clampRatio(r + MOBILE_PANEL_STEP));
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHeightRatio((r) => clampRatio(r - MOBILE_PANEL_STEP));
+    }
+  }, []);
+
   // 窗口尺寸变化时把超出上限的宽度钳回合法范围
   useEffect(() => {
     const onResize = () => {
@@ -117,7 +179,7 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
   // 移动端（<768px）：VS Code 侧栏在 393px 宽度上不可用——改为卡片内底部 footer
   // 图标行（由 AgentPage 渲染在对话区下方），面板经底部 Sheet（side="bottom"）弹出。
   // 面板内容仅在对应 Sheet open 时挂载（Radix Dialog 关闭即卸载），避免在页面常驻
-  // 重量级文件/终端面板。
+  // 重量级文件/终端面板。Sheet 默认半屏可拖动，四面板共享同一 heightRatio。
   if (variant === 'mobile') {
     return (
       <>
@@ -149,8 +211,25 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             open={active === kind}
             onOpenChange={(open) => setActive(open ? kind : null)}
           >
-            {/* 60dvh 动态视口高度：地址栏伸缩时 Sheet 高度不跳变（60vh 会跳） */}
-            <SheetContent side="bottom" className="flex h-[60dvh] flex-col gap-0 p-0">
+            {/* 默认半屏（50dvh），可拖动改变高度；保留 dvh 语义，地址栏伸缩时不跳变 */}
+            <SheetContent
+              side="bottom"
+              className="flex flex-col gap-0 p-0"
+              style={{ height: `calc(${heightRatio} * 100dvh)` }}
+            >
+              {/* 顶部拖动手柄：iOS 式 grabber，py-2 撑出约 28px 触控区 */}
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                /* key 由主会话统一补到 locales JSON，此处先硬编码（as any 规避已生成的严格 key 类型） */
+                aria-label={(t as (k: string) => string)('agent.resizePanelHeight')}
+                tabIndex={0}
+                onPointerDown={onMobileHandlePointerDown}
+                onKeyDown={onMobileHandleKeyDown}
+                className="flex touch-none justify-center py-2"
+              >
+                <div className="h-1 w-10 rounded-full bg-muted-foreground/30" />
+              </div>
               <div className="flex items-center justify-between border-b border-border/60 py-3 pl-4 pr-10">
                 <SheetTitle className="text-sm font-medium">{t(labelKey)}</SheetTitle>
               </div>
@@ -163,6 +242,13 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
             </SheetContent>
           </Sheet>
         ))}
+        {/* 拖动期透明遮罩：防底层吞掉 pointermove，复用桌面端手法 */}
+        {mobileDragging && (
+          <div
+            className="fixed inset-0 z-50 cursor-row-resize select-none"
+            data-testid="activity-panel-drag-overlay"
+          />
+        )}
       </>
     );
   }

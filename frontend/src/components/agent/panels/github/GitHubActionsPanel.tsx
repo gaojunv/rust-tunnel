@@ -112,10 +112,10 @@ export default function GitHubActionsPanel({ workspaceId }: { workspaceId: strin
     );
   }
 
-  // 正常态：双 tab
+  // 正常态：双 tab（带刷新按钮）
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <GitToolbar title={t('agent.github')} />
+      <GitToolbar title={t('agent.github')} onRefresh={reprobe} refreshLabel={t('agent.refresh')} />
       <GitTabBar
         tabs={TABS.map((item) => ({ key: item.key, label: t(item.i18nKey) }))}
         active={tab}

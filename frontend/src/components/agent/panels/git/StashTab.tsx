@@ -98,7 +98,7 @@ export function GitStashTab({ workspaceId }: { workspaceId: string }) {
       title={label}
       onClick={onClick}
       disabled={disabled}
-      className="shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
+      className="shrink-0 rounded p-1 text-muted-foreground opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-opacity hover:bg-accent hover:text-foreground disabled:pointer-events-none disabled:opacity-30"
     >
       {icon}
     </button>
