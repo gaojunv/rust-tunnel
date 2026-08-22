@@ -14,7 +14,7 @@ data/rag_docs/
 data/llm_master.key
 .env
 .vscode/.DS_Store
-
+.claude/
 server.toml
 client.toml
 .superpowers/
