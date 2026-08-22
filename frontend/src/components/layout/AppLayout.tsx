@@ -53,7 +53,12 @@ export default function AppLayout() {
       {isDesktop ? <Header onLogout={handleLogout} /> : <MobileMenuFab onLogout={handleLogout} />}
       {isAgentRoute ? (
         <main className="min-h-0 flex-1 overflow-hidden">
-          <div className="mx-auto h-full w-full max-w-[1400px] overflow-hidden px-2 py-3 md:px-6 md:py-6">
+          {/* 移动端底部垫高 48px+12px：48px 避开 ActivityBar fixed 底部按钮栏，
+              +12px 保留原 py-3 的底部呼吸。垫在本层（而非 AgentPage 内容区）是为了
+              抬高整个白色卡片壳（bg-card rounded-xl），让卡片底边在按钮栏上方干净
+              结束——若只垫卡片内内容，卡片壳仍向下穿透到按钮栏顶，多露出一块白色。
+              桌面端无底部 fixed 栏，md: 恢复 px-6/py-6。 */}
+          <div className="mx-auto h-full w-full max-w-[1400px] overflow-hidden px-2 pb-[calc(3rem+0.75rem)] pt-3 md:px-6 md:py-6">
             {page}
           </div>
         </main>

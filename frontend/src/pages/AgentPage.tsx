@@ -243,14 +243,18 @@ export default function AgentPage() {
           onNew={() => setShowWorkspaceDialog(true)}
           onEdit={openEditWorkspace}
         />
+        {/* SessionBar 仅桌面端：移动端由 SessionTabBar 的会话标题承担点击打开
+            同一会话下拉的职责（标题即按钮），不再重复渲染这个图标按钮。 */}
         {workspaceId && (
-          <SessionBar
-            workspaceId={workspaceId}
-            sessionId={tabs.active}
-            onSelect={handleSelectSession}
-            onSessionDeleted={handleSessionDeleted}
-            onNew={handleNewSession}
-          />
+          <div className="hidden md:contents">
+            <SessionBar
+              workspaceId={workspaceId}
+              sessionId={tabs.active}
+              onSelect={handleSelectSession}
+              onSessionDeleted={handleSessionDeleted}
+              onNew={handleNewSession}
+            />
+          </div>
         )}
         {tabs.open.length > 0 && (
           <SessionTabBar
@@ -260,11 +264,12 @@ export default function AgentPage() {
             onSelect={handleSelectSession}
             onClose={handleCloseTab}
             onNew={handleNewSession}
+            onSessionDeleted={handleSessionDeleted}
           />
         )}
       </div>
 
-      <div className="flex min-h-0 flex-1 pb-12 md:pb-0">
+      <div className="flex min-h-0 flex-1">
         {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例） */}
         {tabs.active && (
           <ActivityBar
@@ -274,7 +279,10 @@ export default function AgentPage() {
           />
         )}
 
-        {/* 对话区：所有打开的 tab 保持挂载，非激活用 hidden 隐藏（后台流式继续、草稿不丢） */}
+        {/* 对话区：所有打开的 tab 保持挂载，非激活用 hidden 隐藏（后台流式继续、草稿不丢）。
+            移动端避开底部 fixed 按钮栏的 48px 由 AppLayout 在 /agent 路由 main 上
+            垫高承担（抬高整个卡片壳），不在本区垫——否则只是抬高卡片内内容，白色
+            卡片壳（bg-card）仍向下穿透到按钮栏顶，多露出一块白色。 */}
         <div className="min-w-0 flex-1">
           {tabs.open.length > 0 ? (
             tabs.open.map((id) => (

@@ -9,10 +9,20 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string) => k }),
 }));
 
-const api = vi.hoisted(() => ({ listAgentSessions: vi.fn() }));
+const api = vi.hoisted(() => ({
+  listAgentSessions: vi.fn(),
+  deleteAgentSession: vi.fn(),
+  exportAgentSession: vi.fn(),
+  updateAgentSessionTitle: vi.fn(),
+  getApiErrorMessage: vi.fn((e: unknown) => String(e)),
+}));
 
 vi.mock('../../api/client', () => ({
   listAgentSessions: api.listAgentSessions,
+  deleteAgentSession: api.deleteAgentSession,
+  exportAgentSession: api.exportAgentSession,
+  updateAgentSessionTitle: api.updateAgentSessionTitle,
+  getApiErrorMessage: api.getApiErrorMessage,
 }));
 
 const sessions = [
@@ -36,7 +46,24 @@ const sessions = [
 
 beforeEach(() => {
   api.listAgentSessions.mockResolvedValue(sessions);
+  // 默认按桌面端（matchMedia.matches=true）渲染多标签分支；个别用例可改 mobileMatches
+  mockMatchMedia(true);
 });
+
+// 可控的 matchMedia mock：jsdom 无 matchMedia，useMediaQuery 会恒返回 false（移动端分支）。
+// 多数断言针对桌面端多标签行为，故默认返回 true。
+function mockMatchMedia(matches: boolean) {
+  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+    matches,
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    onchange: null,
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
 
 afterEach(() => {
   cleanup();
@@ -137,5 +164,23 @@ describe('SessionTabBar', () => {
     expect((screen.getByLabelText('agent.newTab') as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(screen.getByLabelText('agent.newTab'));
     expect(onNew).toHaveBeenCalled();
+  });
+
+  it('mobile (<768px): title-only trigger opens session dropdown, no + / no other tabs', async () => {
+    mockMatchMedia(false); // 切到移动端分支
+    renderBar({ open: ['s1', 's2'], active: 's2' });
+    // 仅当前激活会话 s2（未命名 → fallback）显示；s1 标题不出现
+    expect(await screen.findByText('agent.unnamedSession')).toBeTruthy();
+    expect(screen.queryByText('修复登录')).toBeNull();
+    // 无独立 + 新建按钮（新建走下拉内入口）
+    expect(screen.queryByLabelText('agent.newTab')).toBeNull();
+    // 无 tab 角色（不是标签页形态）
+    expect(screen.queryByRole('tab')).toBeNull();
+
+    // 标题即触发器：点击打开 SessionBar 同一会话下拉（Radix 需 pointerDown 打开）
+    const trigger = screen.getByLabelText('agent.selectSessionAria');
+    fireEvent.pointerDown(trigger);
+    fireEvent.click(trigger);
+    expect(await screen.findByText('agent.newSession')).toBeTruthy();
   });
 });

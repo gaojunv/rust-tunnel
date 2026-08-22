@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Check, ChevronDown, FolderOpen, Loader2, Plus, Settings, Trash2 } from 'lucide-react';
+import { Check, FolderOpen, Loader2, Plus, Settings, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -85,7 +85,6 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
             <span className="sr-only">
               {current ? current.name : t('agent.selectWorkspace')}
             </span>
-            <ChevronDown className="h-3.5 w-3.5 opacity-50" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-[calc(100vw-2rem)] max-w-80 p-0 md:w-72">

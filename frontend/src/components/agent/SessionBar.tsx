@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, Download, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
+import { Download, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useImeGuard } from '@/hooks/useImeGuard';
 import {
@@ -35,10 +35,17 @@ interface Props {
   /** 删除任意会话后回调（AgentPage 据此关闭对应标签页）。 */
   onSessionDeleted: (id: string) => void;
   onNew: () => void;
+  /**
+   * 自定义触发器内容：缺省渲染「消息图标」按钮（桌面顶栏）；移动端传入会话标题，
+   * 让标题本身成为打开下拉切换会话的入口（替代独立 session 图标按钮，省横向空间）。
+   */
+  triggerContent?: ReactNode;
+  /** 自定义触发器的额外 className（移动端标题需要 truncate/flex-1 等布局类） */
+  triggerClassName?: string;
 }
 
 /** 顶栏会话选择：图标下拉（sticky 新建会话 + 列表项内改名/删除 + 信息增强）。 */
-export default function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew }: Props) {
+export default function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew, triggerContent, triggerClassName }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -114,19 +121,31 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
       )}
       <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger asChild>
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-label={t('agent.selectSessionAria')}
-            title={current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
-          >
-            <MessageSquare className="h-4 w-4" />
-            {/* sr-only：保留可访问性 + 供测试断言触发器文本 */}
-            <span className="sr-only">
-              {current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
-            </span>
-            <ChevronDown className="h-3.5 w-3.5 opacity-50" />
-          </Button>
+          {triggerContent !== undefined ? (
+            // 自定义触发器（移动端：会话标题本身即切换入口）
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={t('agent.selectSessionAria')}
+              title={current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
+              className={triggerClassName}
+            >
+              {triggerContent}
+            </Button>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={t('agent.selectSessionAria')}
+              title={current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
+            >
+              <MessageSquare className="h-4 w-4" />
+              {/* sr-only：保留可访问性 + 供测试断言触发器文本 */}
+              <span className="sr-only">
+                {current ? current.title || t('agent.unnamedSession') : t('agent.selectSession')}
+              </span>
+            </Button>
+          )}
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-[calc(100vw-2rem)] max-w-80 p-0 md:w-72">
           {/* sticky 新建会话：列表长时滚动仍保持可见；onSelect 触发后 Radix 自动收起菜单 */}

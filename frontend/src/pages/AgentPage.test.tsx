@@ -142,6 +142,18 @@ describe('AgentPage', () => {
     // 刷新恢复用 localStorage：用例间清空，避免污染
     localStorage.clear();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
+    // 桌面端 mock：jsdom 无 matchMedia，AgentPage 的 isDesktop 与 SessionTabBar
+    // 的多标签分支都靠它；恒 true 让这些用例走桌面端多标签路径。
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: true,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      onchange: null,
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
   });
 
   afterEach(() => {
