@@ -278,7 +278,7 @@ html body[data-scroll-locked] {
   /* AI 工作台「运行中」输入框边框（替代原消息流丝带）：主题色
      （primary/chart-2/chart-3）渐变沿边框循环流动。双层背景——padding-box
      实色盖住容器底色，border-box 渐变透过 transparent 边框显示为彩色描边；
-     与 focus-within ring、shadow-2xl 叠加不冲突。 */
+     与 focus-within ring、shadow-md 叠加不冲突。 */
   .agent-input-running {
     border-color: transparent;
     background:

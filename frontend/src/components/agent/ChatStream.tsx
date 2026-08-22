@@ -1628,14 +1628,20 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         {/* 悬浮输入框：sticky 钉在滚动容器可视底部，作为限宽层最后一个子元素与
             消息流共享同一 content 宽度基准（滚动条占位同步收缩），因此有/无滚动条
             时都与消息流左/右边缘精确对齐。sticky 在文档流中占位，滚动到底时输入框
-            落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区，
-            滚动内容从输入框底下经过时被 bg-card 遮挡。顶部 absolute 渐隐让内容
-            淡出到输入框，不占文档流高度。底部垫高用 env(safe-area-inset-bottom)
-            自适应（对标 Kimi：全面屏 iPhone 垫满 Home 指示条区、home 键机型垫 0
-            不悬空），+12px 最小值兜底保证输入框不贴屏幕物理边缘。 */}
-        <div className="sticky bottom-0 z-20 -mx-3 bg-card px-3 pb-[calc(env(safe-area-inset-bottom,0px)+12px)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
-          <div className="pointer-events-none absolute inset-x-0 bottom-full h-9 bg-gradient-to-t from-card to-transparent" />
-          <div className="mx-auto w-full max-w-3xl">
+            落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区。
+            容器自身无色，内部单层渐变背景遮挡滚动内容，不占文档流高度。
+            底部垫高用 env(safe-area-inset-bottom) 自适应（对标 Kimi：全面屏
+            iPhone 垫满 Home 指示条区、home 键机型垫 0 不悬空），+12px 最小值
+            兜底保证输入框不贴屏幕物理边缘。 */}
+        <div className="sticky bottom-0 z-20 -mx-3 px-3 pb-[calc(env(safe-area-inset-bottom,0px)+12px)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+          {/* 单层渐变背景：容器顶（0%，消息完全可见）→ 输入框卡片底边（100%，
+              完全消失）→ 保持到底。同色 alpha 渐变（hsl(var(--card)/0) →
+              hsl(var(--card))）不发灰。无论有无 turn-duration/todos 等附加
+              面板（容器高度变化），渐隐都连续无跳变——替代原两层方案（实色块 +
+              渐隐带，中间有 100%→0% 跳变，附加面板区域消息被一刀切挡住）。
+              内容 div 用 relative 压在背景层之上。 */}
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_env(safe-area-inset-bottom,0px)_-_12px))] md:bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_1.25rem))]" />
+          <div className="relative mx-auto w-full max-w-3xl">
           {running && (
             /* 运行中指示：视觉已迁移到输入框彩色边框（容器 .agent-input-running，
                见 index.css），此处仅保留视觉隐藏的 status 语义供屏幕阅读器播报。
@@ -1706,8 +1712,10 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 : `${(lastTurnDurationMs / 1000).toFixed(1)}s`}
             </div>
           )}
-          {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边 */}
-          <div className={`relative rounded-2xl border bg-background shadow-2xl focus-within:ring-1 focus-within:ring-ring ${running ? 'agent-input-running' : 'border-input'}`}>
+          {/* 运行时输入框边框换成彩色渐变流动（.agent-input-running），空闲恢复默认描边。
+              mx-2/md:mx-3 让输入框比消息流（同限宽层 max-w-3xl）每侧窄 8/12px，
+              形成「输入框略窄于对话」的层次 */}
+          <div className={`relative mx-2 rounded-2xl border bg-background shadow-md focus-within:ring-1 focus-within:ring-ring md:mx-3 ${running ? 'agent-input-running' : 'border-input'}`}>
           {refs.length > 0 && (
             <div className="flex flex-wrap gap-1 px-2 pt-1.5">
               {refs.map((r) => (
