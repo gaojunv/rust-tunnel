@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, ChevronUp } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -110,7 +110,6 @@ export default function ModeEffortPicker({
           className="h-7 w-auto rounded-full px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         >
           {currentOptionLabel(mode ?? effort!)}
-          <ChevronUp className="ml-1 h-3 w-3 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" side="top" className="w-72">
@@ -162,13 +161,38 @@ export default function ModeEffortPicker({
                 {effortValues[shownIdx]?.name ?? ''}
               </span>
               <span className="relative flex flex-1 items-center">
-                {/* 档位刻度：提示可选档数，不参与命中 */}
+                {/* 基础轨道（原生 range 轨道已透明——z-10 的 input 会遮住下层，
+                    轨道/填充/圆点全由叠加层绘制，input 只留 thumb 与命中区） */}
+                <span
+                  aria-hidden
+                  className="pointer-events-none absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-muted"
+                />
+                {/* 已选区段填充条（Claude Code 插件形态：轨道 + 每档圆点）：从轨道
+                    左缘填到当前档中线。thumb 宽 12px，档位中线行程为 inset-x-[6px]，
+                    故宽度 = 6px + (100% - 12px) * 档位比例 */}
+                <span
+                  aria-hidden
+                  className="pointer-events-none absolute left-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-primary/60 transition-[width]"
+                  style={{
+                    width:
+                      lastIdx > 0
+                        ? `calc(6px + (100% - 12px) * ${shownIdx / lastIdx})`
+                        : '0px',
+                  }}
+                />
+                {/* 档位圆点：每档一个点，已过/当前档 primary 填充，未到达档 muted；
+                    仅作视觉提示，命中交给上方 range input */}
                 <span
                   aria-hidden
                   className="pointer-events-none absolute inset-x-[6px] top-1/2 flex -translate-y-1/2 justify-between"
                 >
-                  {effortValues.map((v) => (
-                    <span key={v.value} className="h-1 w-1 rounded-full bg-border" />
+                  {effortValues.map((v, i) => (
+                    <span
+                      key={v.value}
+                      className={`h-1.5 w-1.5 rounded-full transition-colors ${
+                        i <= shownIdx ? 'bg-primary' : 'bg-muted-foreground/35'
+                      }`}
+                    />
                   ))}
                 </span>
                 <input

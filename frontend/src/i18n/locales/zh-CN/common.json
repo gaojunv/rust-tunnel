@@ -1023,6 +1023,7 @@
     "attachmentAudio": "音频",
     "attachmentResource": "资源附件",
     "contextUsageTooltip": "上下文用量：{{used}} / {{size}} tokens",
+    "contextCompactHint": "点击压缩上下文",
     "turnDuration": "上回合耗时",
     "plan": "执行计划",
     "toolFailed": "失败",

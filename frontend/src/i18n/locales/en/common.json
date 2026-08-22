@@ -1026,6 +1026,7 @@
     "attachmentAudio": "Audio",
     "attachmentResource": "Resource",
     "contextUsageTooltip": "Context usage: {{used}} / {{size}} tokens",
+    "contextCompactHint": "Click to compact context",
     "turnDuration": "Last turn took",
     "plan": "Plan",
     "toolFailed": "Failed",

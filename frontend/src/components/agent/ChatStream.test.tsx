@@ -1450,18 +1450,19 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('✓')).toBeTruthy();
   });
 
-  it('usage frame renders context usage bar', async () => {
+  it('usage frame renders context usage ring', async () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
     act(() => {
       wsInstance!.emit({ type: 'usage', used: 100, size: 200000 });
       wsInstance!.emit({ type: 'done' });
     });
-    // 用量条出现，显示 used/size 与百分比
-    const bar = screen.getByTestId('context-usage-bar');
-    expect(bar.textContent).toContain('100');
-    expect(bar.textContent).toContain('200k');
-    expect(bar.textContent).toContain('0%');
+    // 用量环出现，显示百分比；used/size 明细在 tooltip（i18n 参数被 mock 丢弃，
+    // 只能断言 key）；≤50% 不可点击压缩
+    const ring = screen.getByTestId('context-usage-ring');
+    expect(ring.textContent).toContain('0%');
+    expect(ring.getAttribute('title')).toContain('agent.contextUsageTooltip');
+    expect(ring.getAttribute('aria-disabled')).toBe('true');
   });
 
   it('usage frame over 80% renders warning tone', async () => {
@@ -1471,9 +1472,41 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'usage', used: 190000, size: 200000 });
       wsInstance!.emit({ type: 'done' });
     });
-    const bar = screen.getByTestId('context-usage-bar');
-    expect(bar.textContent).toContain('95%');
-    expect(bar.querySelector('.bg-yellow-500')).toBeTruthy();
+    const ring = screen.getByTestId('context-usage-ring');
+    expect(ring.textContent).toContain('95%');
+    expect(ring.querySelector('.text-yellow-500')).toBeTruthy();
+  });
+
+  it('usage ring over 50% with compact command is clickable and sends it', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({
+        type: 'available_commands',
+        commands: [{ name: 'compact', description: 'Compact context' }],
+      });
+      wsInstance!.emit({ type: 'usage', used: 120000, size: 200000 });
+      wsInstance!.emit({ type: 'done' });
+    });
+    const ring = screen.getByTestId('context-usage-ring');
+    expect(ring.getAttribute('aria-disabled')).toBe('false');
+    fireEvent.click(ring);
+    // 点击后把 compact 命令当用户消息发出，并本地回显气泡
+    const sent = wsInstance!.sent.map((s) => JSON.parse(s) as { type: string; content?: string });
+    expect(sent.some((m) => m.type === 'user_message' && m.content === '/compact')).toBe(true);
+  });
+
+  it('usage ring without compact command stays non-clickable', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    renderChat();
+    act(() => {
+      wsInstance!.emit({ type: 'usage', used: 120000, size: 200000 });
+      wsInstance!.emit({ type: 'done' });
+    });
+    const ring = screen.getByTestId('context-usage-ring');
+    expect(ring.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(ring);
+    expect(wsInstance!.sent).toHaveLength(0);
   });
 
   it('attachment frame renders placeholder card', async () => {

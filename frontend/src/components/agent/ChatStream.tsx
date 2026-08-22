@@ -1376,6 +1376,25 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     setItems((prev) => [...prev, { kind: 'system', systemTone: 'stopped', content: t('agent.stopped'), id: nextLiveItemId() }]);
   };
 
+  // 用量环点击压缩上下文：把 agent 上报的 compact 斜杠命令（ACP available_commands）
+  // 当作用户消息发出——与在输入框手打 /compact 同一条链路，agent 侧原生执行压缩。
+  // 可点条件（pct>50、命令存在、空闲无待办交互）由调用处（用量环按钮）收敛。
+  const triggerCompact = () => {
+    const cmd = slashCommands.find((c) => c.name.toLowerCase().includes('compact'));
+    const ws = wsRef.current;
+    if (!cmd || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const text = `/${cmd.name}`;
+    try {
+      ws.send(JSON.stringify({ type: 'user_message', content: text, refs: [] }));
+    } catch {
+      setItems((prev) => [...prev, { kind: 'system', systemTone: 'error', content: t('agent.connectionLost'), id: nextLiveItemId() }]);
+      return;
+    }
+    // 与 send() 一致：本地回显用户气泡 + 置 running，等 done 帧收尾
+    setItems((prev) => [...prev, { kind: 'user', content: text, id: nextLiveItemId() }]);
+    armRunning();
+  };
+
   const handleModelChange = (id: string) => {
     const prev = model;
     const seq = ++modelChangeSeqRef.current;
@@ -1674,32 +1693,6 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               </ul>
             </div>
           )}
-          {/* ACP 上下文用量条：usage 帧/会话快照驱动；>80% 黄、>95% 红 */}
-          {contextUsage?.size != null && contextUsage.size > 0 && (
-            (() => {
-              const used = contextUsage.used ?? 0;
-              const size = contextUsage.size;
-              const pct = Math.min(100, Math.round((used / size) * 100));
-              const tone =
-                pct > 95 ? 'bg-destructive' : pct > 80 ? 'bg-yellow-500' : 'bg-primary/60';
-              const fmt = (n: number) =>
-                n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n);
-              return (
-                <div
-                  className="mb-2 flex items-center gap-2 px-1"
-                  data-testid="context-usage-bar"
-                  title={t('agent.contextUsageTooltip', { used, size })}
-                >
-                  <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
-                    <div className={`h-full rounded-full transition-all ${tone}`} style={{ width: `${pct}%` }} />
-                  </div>
-                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                    {fmt(used)}/{fmt(size)} · {pct}%
-                  </span>
-                </div>
-              );
-            })()
-          )}
           {/* 上一回合耗时（ACP done 帧 duration_ms；running 时隐藏，切会话清除） */}
           {lastTurnDurationMs != null && !running && (
             <div
@@ -1862,6 +1855,58 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 onChange={sendConfigOption}
                 placeholder={configOptions.length > 0}
               />
+              {/* ACP 上下文用量环（Claude Code 插件形态）：usage 帧/会话快照驱动，
+                  >80% 黄、>95% 红；占比 >50% 且 agent 提供 compact 命令时可点击
+                  触发压缩上下文。aria-disabled 而非 disabled：禁用态下 hover
+                  tooltip（用量明细）仍需可达。 */}
+              {contextUsage?.size != null && contextUsage.size > 0 && (
+                (() => {
+                  const used = contextUsage.used ?? 0;
+                  const size = contextUsage.size;
+                  const pct = Math.min(100, Math.round((used / size) * 100));
+                  const tone =
+                    pct > 95 ? 'text-destructive' : pct > 80 ? 'text-yellow-500' : 'text-primary/70';
+                  const compactCmd = slashCommands.find((c) =>
+                    c.name.toLowerCase().includes('compact'),
+                  );
+                  const clickable =
+                    pct > 50 && !!compactCmd && !running && !hasPendingInteraction;
+                  const R = 7;
+                  const C = 2 * Math.PI * R;
+                  const tip = t('agent.contextUsageTooltip', { used, size });
+                  return (
+                    <button
+                      type="button"
+                      data-testid="context-usage-ring"
+                      aria-label={tip}
+                      aria-disabled={!clickable}
+                      title={clickable ? `${tip} · ${t('agent.contextCompactHint')}` : tip}
+                      onClick={() => {
+                        if (clickable) triggerCompact();
+                      }}
+                      className={`flex h-7 items-center gap-1 rounded-full px-1.5 text-[10px] tabular-nums text-muted-foreground transition-colors ${
+                        clickable ? 'hover:bg-accent hover:text-foreground' : 'cursor-default'
+                      }`}
+                    >
+                      <svg viewBox="0 0 18 18" className={`h-[18px] w-[18px] -rotate-90 ${tone}`} aria-hidden>
+                        <circle cx="9" cy="9" r={R} fill="none" strokeWidth="2.5" className="stroke-muted" />
+                        <circle
+                          cx="9"
+                          cy="9"
+                          r={R}
+                          fill="none"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          className="stroke-current transition-[stroke-dashoffset]"
+                          strokeDasharray={C}
+                          strokeDashoffset={C * (1 - pct / 100)}
+                        />
+                      </svg>
+                      <span>{pct}%</span>
+                    </button>
+                  );
+                })()
+              )}
               {/* 发送/暂停按输入动态切换（Claude Code 风格）：对话进行中若输入框
                   有文字则显示发送（服务端 busy 排队），无文字则显示停止；空闲时
                   固定显示发送。二者不并存。 */}

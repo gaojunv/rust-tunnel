@@ -312,10 +312,12 @@ html body[data-scroll-locked] {
     opacity: 0.5;
   }
 
+  /* 原生轨道透明：input 叠在 z-10 层，不透明轨道会遮住下层的填充条/档位圆点
+     （轨道、填充、圆点全部由 ModeEffortPicker 内的叠加层绘制，input 只留 thumb
+     与命中区）。轨道高度保留——webkit thumb 的负 margin 对齐依赖它。 */
   .effort-slider::-webkit-slider-runnable-track {
     height: 0.25rem;
-    border-radius: 9999px;
-    background: hsl(var(--muted));
+    background: transparent;
   }
 
   .effort-slider::-webkit-slider-thumb {
@@ -334,8 +336,7 @@ html body[data-scroll-locked] {
 
   .effort-slider::-moz-range-track {
     height: 0.25rem;
-    border-radius: 9999px;
-    background: hsl(var(--muted));
+    background: transparent;
   }
 
   .effort-slider::-moz-range-thumb {
