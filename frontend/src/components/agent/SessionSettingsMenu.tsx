@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Check } from 'lucide-react';
@@ -16,7 +17,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import type { SessionConfigOption } from '../../types';
 import { currentOptionLabel } from './sessionConfig';
-import { listAgentSelectableModels } from '../../api/agentModels';
+import { listAgentSelectableModels, resolveWorkspaceModelRef } from '../../api/agentModels';
 import { useRoles, useUpdateSessionRole } from '../../api/hooks';
 import ModelPicker from './ModelPicker';
 
@@ -31,6 +32,8 @@ interface Props {
   roleId?: string | null;
   /** 当前会话 id（切换角色时调用 PATCH） */
   sessionId?: string;
+  claudeTierModels?: string | null;
+  agentType?: string | null;
 }
 
 /** 统一会话设置菜单（输入框左下，原 ModelSelect 位置）：网关模型 + 会话角色 +
@@ -43,6 +46,8 @@ export default function SessionSettingsMenu({
   disabled,
   roleId,
   sessionId,
+  claudeTierModels,
+  agentType,
 }: Props) {
   const { t } = useTranslation();
   const { data } = useQuery({
@@ -66,11 +71,66 @@ export default function SessionSettingsMenu({
 
   const currentRoleName = primaryRoles.find((r) => r.id === roleId)?.name ?? null;
 
-  const modelLabel =
-    data?.models.find((m) => m.id === model)?.label ??
-    data?.groups.find((g) => g.id === model)?.label ??
-    model ??
-    t('agent.sessionSettings');
+  // 实际生效模型推导：优先展示后端实际裁决的模型（tier 映射 / 直通），回退到 session.model 链
+  const { display: modelLabel, tierActive } = useMemo(() => {
+    const fallback =
+      data?.models.find((m) => m.id === model)?.label ??
+      data?.groups.find((g) => g.id === model)?.label ??
+      model ??
+      t('agent.sessionSettings');
+    const modelOption = configOptions.find((o) => o.category === 'model');
+    const current =
+      typeof modelOption?.currentValue === 'string' && modelOption.currentValue.trim()
+        ? modelOption.currentValue.trim()
+        : undefined;
+    if (!current) return { display: fallback, tierActive: false };
+
+    // 规则 1（tier 映射）：claude-code 且 current 为 tier 名时，按 workspace 的 tier 映射解析
+    if (agentType === 'claude-code') {
+      let tierMap: Record<string, string> | null = null;
+      if (claudeTierModels) {
+        try {
+          const parsed = JSON.parse(claudeTierModels);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            tierMap = parsed as Record<string, string>;
+          }
+        } catch {
+          // 解析失败视为无映射
+        }
+      }
+      if (tierMap) {
+        // claude-code 的 default 档即 sonnet tier，ANTHROPIC_DEFAULT_SONNET_MODEL 生效
+        const tier = current === 'default' ? 'sonnet' : current;
+        if (tier === 'opus' || tier === 'sonnet' || tier === 'haiku') {
+          const rawRef = tierMap[tier];
+          if (typeof rawRef === 'string' && rawRef.trim()) {
+            const resolved = resolveWorkspaceModelRef(rawRef.trim(), data);
+            if (resolved) {
+              const label =
+                data?.models.find((m) => m.id === resolved)?.label ??
+                data?.groups.find((g) => g.id === resolved)?.label ??
+                resolved;
+              const tierCapitalized = tier.charAt(0).toUpperCase() + tier.slice(1);
+              return {
+                display: t('agent.tierModelLabel', { tier: tierCapitalized, model: label }),
+                tierActive: true,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    // 规则 2（直通）：current 本身即为可选模型/组的 id
+    const directLabel =
+      data?.models.find((m) => m.id === current)?.label ??
+      data?.groups.find((g) => g.id === current)?.label;
+    if (directLabel) {
+      return { display: directLabel, tierActive: false };
+    }
+
+    return { display: fallback, tierActive: false };
+  }, [data, model, configOptions, claudeTierModels, agentType, t]);
 
   const renderOptionSub = (o: SessionConfigOption, hint?: string) => (
     <DropdownMenuSub key={o.id}>
@@ -121,6 +181,11 @@ export default function SessionSettingsMenu({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="top" className="w-56">
+        {tierActive && (
+          <DropdownMenuLabel className="text-xs text-muted-foreground">
+            {t('agent.tierModelActiveHint')}
+          </DropdownMenuLabel>
+        )}
         <ModelPicker
           models={data?.models ?? []}
           groups={data?.groups ?? []}

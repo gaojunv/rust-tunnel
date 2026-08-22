@@ -3,9 +3,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import SessionSettingsMenu from './SessionSettingsMenu';
+import { listAgentSelectableModels } from '../../api/agentModels';
+import type { AgentModelOptions } from '../../api/agentModels';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (k: string) => k }),
+  useTranslation: () => ({
+    t: (k: string, opts?: Record<string, string>) => {
+      if (k === 'agent.tierModelLabel' && opts) return `${opts.tier} · ${opts.model}`;
+      return k;
+    },
+  }),
 }));
 
 vi.mock('../../api/agentModels', () => ({
@@ -13,6 +20,18 @@ vi.mock('../../api/agentModels', () => ({
     models: [{ id: 'deepseek-chat', label: 'deepseek-chat' }],
     groups: [],
   }),
+  resolveWorkspaceModelRef: vi.fn((ref: string, data: AgentModelOptions | undefined) => {
+    if (!ref) return '';
+    const raw = ref.trim();
+    if (raw.startsWith('model:')) return data?.byModelId?.[raw.slice('model:'.length)] ?? '';
+    if (raw.startsWith('group:')) return data?.byGroupId?.[raw.slice('group:'.length)] ?? '';
+    return data?.byModelId?.[raw] ?? raw;
+  }),
+}));
+
+vi.mock('../../api/hooks', () => ({
+  useRoles: () => ({ data: { roles: [] } }),
+  useUpdateSessionRole: () => ({ mutate: vi.fn() }),
 }));
 
 afterEach(cleanup);
@@ -51,17 +70,14 @@ describe('SessionSettingsMenu', () => {
         { id: 'fast', name: 'Fast', type: 'boolean', currentBool: true, currentValue: 'true' },
       ],
     });
-    // trigger 冒烟：菜单项内容依赖 Radix portal，jsdom 下只断言 trigger 存在
     expect(await screen.findByText('deepseek-chat')).toBeTruthy();
   });
 
   it('opens a flat searchable model list at the top of the menu (no nested submenu)', async () => {
     renderMenu();
     await openMenu();
-    // 模型项直接是 menuitem（一层），不再是需展开的子菜单
     const item = await screen.findByRole('menuitem', { name: 'deepseek-chat' });
     expect(item).toBeTruthy();
-    // 模型区 label 在同一层出现
     expect(screen.getByText('agent.model')).toBeTruthy();
   });
 
@@ -73,5 +89,122 @@ describe('SessionSettingsMenu', () => {
     });
     expect(await screen.findByText('agent.noModelsFound')).toBeTruthy();
     expect(screen.queryByRole('menuitem', { name: 'deepseek-chat' })).toBeNull();
+  });
+
+  it('shows tier-mapped model when agentType is claude-code and currentValue is sonnet', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [
+        { id: 'deepseek-chat', label: 'deepseek-chat' },
+        { id: 'my-sonnet-alias', label: 'Claude Sonnet（Anthropic）' },
+      ],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      agentType: 'claude-code',
+      claudeTierModels: '{"sonnet":"my-sonnet-alias"}',
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [] },
+      ],
+    });
+    expect(await screen.findByText('Sonnet · Claude Sonnet（Anthropic）')).toBeTruthy();
+  });
+
+  it('falls back to session chain label when tier is unmapped (opus not in map)', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [
+        { id: 'deepseek-chat', label: 'deepseek-chat' },
+        { id: 'my-sonnet-alias', label: 'Claude Sonnet（Anthropic）' },
+      ],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      model: 'deepseek-chat',
+      agentType: 'claude-code',
+      claudeTierModels: '{"sonnet":"my-sonnet-alias"}',
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'opus', options: [] },
+      ],
+    });
+    expect(await screen.findByText('deepseek-chat')).toBeTruthy();
+    expect(screen.queryByText(/Sonnet ·/)).toBeNull();
+  });
+
+  it('shows direct model label when currentValue equals a selectable model id (passthrough)', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [
+        { id: 'deepseek-chat', label: 'DeepSeek Chat' },
+        { id: 'other-model', label: 'Other Model' },
+      ],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      model: 'other-model',
+      agentType: null,
+      claudeTierModels: null,
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'deepseek-chat', options: [] },
+      ],
+    });
+    expect(await screen.findByText('DeepSeek Chat')).toBeTruthy();
+  });
+
+  it('keeps current behavior when no category=model option', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [{ id: 'deepseek-chat', label: 'deepseek-chat' }],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      model: 'deepseek-chat',
+      configOptions: [
+        { id: 'fast', name: 'Fast', type: 'boolean', currentBool: true, currentValue: 'true' },
+      ],
+    });
+    expect(await screen.findByText('deepseek-chat')).toBeTruthy();
+  });
+
+  it('treats default as sonnet tier when tier mapping contains sonnet', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [
+        { id: 'deepseek-chat', label: 'deepseek-chat' },
+        { id: 'my-sonnet-alias', label: 'Claude Sonnet（Anthropic）' },
+      ],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      agentType: 'claude-code',
+      claudeTierModels: '{"sonnet":"my-sonnet-alias"}',
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'default', options: [] },
+      ],
+    });
+    expect(await screen.findByText('Sonnet · Claude Sonnet（Anthropic）')).toBeTruthy();
+  });
+
+  it('shows tier active hint inside the menu when tier mapping is active', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [{ id: 'my-sonnet-alias', label: 'Claude Sonnet（Anthropic）' }],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    renderMenu({
+      agentType: 'claude-code',
+      claudeTierModels: '{"sonnet":"my-sonnet-alias"}',
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [] },
+      ],
+    });
+    await openMenu();
+    expect(screen.getByText('agent.tierModelActiveHint')).toBeTruthy();
   });
 });

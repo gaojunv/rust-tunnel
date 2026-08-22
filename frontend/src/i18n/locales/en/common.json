@@ -1204,6 +1204,8 @@
     "configOn": "On",
     "configOff": "Off",
     "agentModelHint": "Agent-internal model; actual LLM calls use the gateway model above",
+    "tierModelLabel": "{{tier}} · {{model}}",
+    "tierModelActiveHint": "Tier mapping active: actual model follows the Agent-internal tier; the gateway model picker above is fallback only",
     "tierModelOpus": "Opus model",
     "tierModelSonnet": "Sonnet model",
     "tierModelHaiku": "Haiku model",

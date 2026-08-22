@@ -293,6 +293,8 @@ export default function AgentPage() {
                   approvalMode={workspaces?.find(w => w.id === workspaceId)?.approval_mode ?? 'safe'}
                   active={id === tabs.active}
                   onModelChange={(m) => setModelOverrides((o) => ({ ...o, [id]: m }))}
+                  claudeTierModels={currentWorkspace?.claude_tier_models}
+                  agentType={currentWorkspace?.agent_type}
                 />
               </div>
             ))

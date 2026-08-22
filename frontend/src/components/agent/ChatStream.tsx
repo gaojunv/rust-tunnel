@@ -105,9 +105,11 @@ interface Props {
   onModelChange: (id: string) => void;
   /** 多标签页模式下当前是否激活（hidden → 可见切换时对齐底部）。缺省视为激活。 */
   active?: boolean;
+  claudeTierModels?: string | null;
+  agentType?: string | null;
 }
 
-export default function ChatStream({ sessionId, workspaceId, model, approvalMode: initialApprovalMode, onModelChange, active }: Props) {
+export default function ChatStream({ sessionId, workspaceId, model, approvalMode: initialApprovalMode, onModelChange, active, claudeTierModels, agentType }: Props) {
   const { t } = useTranslation();
   // t 的身份随语言切换变化，把它放进 WS effect 的依赖会导致切语言时拆断
   // 进行中的回合（onclose 追加"连接中断"气泡、过期所有 pending 审批、
@@ -1824,6 +1826,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onModelChange={handleModelChange}
               configOptions={menuOptions}
               onConfigChange={sendConfigOption}
+              claudeTierModels={claudeTierModels}
+              agentType={agentType}
             />
             {/* ACP 上下文用量环（Claude Code 插件形态）：usage 帧/会话快照驱动，
                 >80% 黄、>95% 红；占比 >50% 且 agent 提供 compact 命令时可点击

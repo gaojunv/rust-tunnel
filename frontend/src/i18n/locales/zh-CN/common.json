@@ -1201,6 +1201,8 @@
     "configOn": "开",
     "configOff": "关",
     "agentModelHint": "Agent 内部模型；实际 LLM 调用由上方网关模型决定",
+    "tierModelLabel": "{{tier}} · {{model}}",
+    "tierModelActiveHint": "tier 映射已生效：实际模型由 Agent-internal tier 决定，上方网关模型仅作兜底",
     "tierModelOpus": "Opus 模型",
     "tierModelSonnet": "Sonnet 模型",
     "tierModelHaiku": "Haiku 模型",
