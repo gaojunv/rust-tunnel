@@ -21,6 +21,7 @@ import {
   useLlmKbs,
 } from '@/api/hooks';
 import { getApiErrorMessage } from '@/api/client';
+import { ConfirmDialog, useConfirm } from './confirm';
 import { Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 import type { LlmApiKey, CreateApiKeyResponse } from '@/types';
 
@@ -39,6 +40,7 @@ export default function ApiKeyTable() {
   const [showNewKey, setShowNewKey] = useState<CreateApiKeyResponse | null>(null);
   const [copied, setCopied] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
 
   return (
     <div className="space-y-4">
@@ -123,7 +125,21 @@ export default function ApiKeyTable() {
                         </SelectContent>
                       </Select>
                       <Switch checked={k.enabled} onCheckedChange={(v) => toggleMutation.mutate({ id: k.id, enabled: v })} />
-                      <Button variant="ghost" size="icon" onClick={() => { if (confirm(t('llm.apiKeys.revokeConfirm'))) deleteMutation.mutate(k.id); }}>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() =>
+                          confirm(
+                            { title: t('common.confirm'), description: t('llm.apiKeys.revokeConfirm') },
+                            () => {
+                              setActionError(null);
+                              deleteMutation.mutate(k.id, {
+                                onError: (err) => setActionError(t('common.saveError', { error: getApiErrorMessage(err) })),
+                              });
+                            },
+                          )
+                        }
+                      >
                         <Trash2 className="w-3 h-3 text-destructive" />
                       </Button>
                     </div>
@@ -134,6 +150,7 @@ export default function ApiKeyTable() {
           )}
         </CardContent>
       </Card>
+      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" />
     </div>
   );
 }

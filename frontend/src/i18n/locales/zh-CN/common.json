@@ -23,7 +23,9 @@
     "noData": "暂无数据",
     "close": "关闭",
     "add": "添加",
-    "disabled": "已禁用"
+    "disabled": "已禁用",
+    "confirm": "确认",
+    "saveError": "保存失败：{{error}}"
   },
   "timeRange": {
     "custom": "自定义"

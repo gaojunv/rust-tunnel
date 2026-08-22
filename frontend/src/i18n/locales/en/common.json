@@ -23,7 +23,9 @@
     "noData": "No data available",
     "close": "Close",
     "add": "Add",
-    "disabled": "Disabled"
+    "disabled": "Disabled",
+    "confirm": "Confirm",
+    "saveError": "Save failed: {{error}}"
   },
   "timeRange": {
     "custom": "Custom"
