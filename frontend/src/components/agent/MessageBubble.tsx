@@ -23,6 +23,8 @@ import {
 import type { ChatItem, ToolKind, PlanEntryItem } from './types';
 import Markdown from './Markdown';
 import ToolDiffView from './ToolDiffView';
+import { ToolArgsView, ToolResultView } from './ToolArgsView';
+import { cn } from '../../lib/utils';
 
 /** 折叠阈值：tool 参数/结果超过该行数时只显示前 3 行，可手动展开。 */
 const COLLAPSE_LINE_THRESHOLD = 6;
@@ -48,8 +50,18 @@ function truncateChars(text: string, max: number): string {
 }
 
 /** 工具调用的长文本（args/result）：超过阈值折叠为前 3 行 + 展开按钮。
- *  导出供 SubagentTaskCard 复用（父 Task 卡最终结果展示）。 */
-export function CollapsiblePre({ text, className }: { text: string; className?: string }) {
+ *  导出供 SubagentTaskCard 复用（父 Task 卡最终结果展示）。
+ *  `preClassName` 经 cn() 合并到内层 pre：冲突类以后者为准（tailwind-merge
+ *  去重），ToolResultView 用它把折叠块换成终端深色输出样式。 */
+export function CollapsiblePre({
+  text,
+  className,
+  preClassName,
+}: {
+  text: string;
+  className?: string;
+  preClassName?: string;
+}) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const lineCount = text.split('\n').length;
@@ -69,7 +81,7 @@ export function CollapsiblePre({ text, className }: { text: string; className?: 
 
   return (
     <div className={className}>
-      <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{shown}</pre>
+      <pre className={cn('whitespace-pre-wrap break-words text-xs text-muted-foreground', preClassName)}>{shown}</pre>
       {collapsible && (
         <button
           type="button"
@@ -498,6 +510,16 @@ export function ToolCard({ item }: { item: ChatItem }) {
   // 不确定进度条：工具仍在执行（pending/in_progress/running，result 未产出）时
   // 在卡片头部下方显示一条呼吸动画进度条，替代静态转圈的区域性弱提示
   const isRunning = status !== 'completed' && status !== 'failed';
+  // 展开区是否显示结构化 args 视图（ToolArgsView）：
+  // - 空参数（{} / null / 空串）没有信息量 → 不显示
+  // - edit 类且带 diffs → diff 已是输入的完整呈现，args JSON 纯冗余
+  // - read/search 类且头部摘要非空 → 摘要已表达输入要点（路径/搜索词），避免重复
+  const kind = effectiveToolKind(item.toolName, item.toolKind);
+  const showArgs =
+    !!item.toolArgs &&
+    !isNoopArgs(item.toolArgs) &&
+    !(kind === 'edit' && item.toolDiffs && item.toolDiffs.length > 0) &&
+    !((kind === 'read' || kind === 'search') && summary != null);
 
   return (
     <div>
@@ -539,9 +561,17 @@ export function ToolCard({ item }: { item: ChatItem }) {
       {open && (
         <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
           {item.toolDiffs && item.toolDiffs.length > 0 && <ToolDiffView diffs={item.toolDiffs} />}
-          {item.toolArgs && !isNoopArgs(item.toolArgs) && <CollapsiblePre text={item.toolArgs} />}
+          {showArgs && (
+            <ToolArgsView name={item.toolName} kind={item.toolKind} args={item.toolArgs as string} />
+          )}
           {item.toolResult ? (
-            <CollapsiblePre text={item.toolResult} className={item.toolArgs || item.toolDiffs ? 'border-t border-border/60 pt-2' : undefined} />
+            <ToolResultView
+              name={item.toolName}
+              kind={item.toolKind}
+              args={item.toolArgs}
+              result={item.toolResult}
+              className={item.toolArgs || item.toolDiffs ? 'border-t border-border/60 pt-2' : undefined}
+            />
           ) : isRunning ? (
             // 仅运行中才显示「执行中」：结果为空但状态已是终态（completed/failed）时
             // 不再误显执行中（M5）——历史 JSON tool_result 的失败工具 status=failed

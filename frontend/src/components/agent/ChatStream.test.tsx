@@ -1369,7 +1369,7 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('✓')).toBeTruthy();
     // 展开卡片应看到 diff（点击头部——标题归一化为 Edit，内嵌目标 a.ts 为摘要）
     fireEvent.click(screen.getByText('Edit').closest('button')!);
-    expect(screen.getByText('+ y')).toBeTruthy();
+    expect(screen.getAllByText('+ y').length).toBeGreaterThanOrEqual(1);
   });
 
   it('tool_result without name falls back to id matching', async () => {
@@ -1414,9 +1414,10 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('echo hello')).toBeTruthy();
     // 已完成
     expect(screen.getByText('✓')).toBeTruthy();
-    // 展开卡片应看到完整 args（含 description 字段，证明不是 {} 占位）
+    // 展开卡片应看到结构化 args（execute 类渲染 command 块与 description——头部摘要已含 echo hello，所以 getAllByText）
     fireEvent.click(screen.getByText('Terminal'));
-    expect(screen.getByText(/"command":"echo hello"/)).toBeTruthy();
+    expect(screen.getAllByText('echo hello').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Print hello')).toBeTruthy();
   });
 
   it('tool_result without args preserves existing card args', async () => {
@@ -1432,9 +1433,9 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'tool_result', id: 'c1', status: 'completed', result: 'ok' });
       wsInstance!.emit({ type: 'done' });
     });
-    // shell 归一化为 Terminal，点击头部展开
+    // shell 归一化为 Terminal，点击头部展开后结构化渲染“ls”命令块（头部摘要 + 展开区命令块各一份）
     fireEvent.click(screen.getByText('Terminal'));
-    expect(screen.getByText(/"cmd":"ls"/)).toBeTruthy();
+    expect(screen.getAllByText('ls').length).toBeGreaterThanOrEqual(1);
   });
 
   it('plan frame updates the last plan bubble in place', async () => {
@@ -1551,7 +1552,7 @@ describe('ChatStream running state', () => {
     await act(async () => {
       screen.getByText('Edit').closest('button')!.click();
     });
-    expect(screen.getByText('+ y')).toBeTruthy();
+    expect(screen.getAllByText('+ y').length).toBeGreaterThanOrEqual(1);
     // thought 折叠：只显示首行预览，完整内容（后续行）不可见
     expect(screen.getByText('想一下')).toBeTruthy();
     expect(screen.queryByText('隐藏的推理')).not.toBeTruthy();

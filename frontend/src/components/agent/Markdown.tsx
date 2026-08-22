@@ -36,6 +36,16 @@ const PreFrame: Components['pre'] = ({ children }) => {
   );
 };
 
+const PlainCode: Components['code'] = (props) => {
+  const { children, className } = props;
+  if (!('data-block' in props)) return <code className={className}>{children}</code>;
+  return (
+    <pre className={className}>
+      <code>{children}</code>
+    </pre>
+  );
+};
+
 /** 表格（components.table 覆盖）：横向滚动容器 + 干净网格。
  *  Streamdown 默认在表格外再套一层带复制按钮的 wrapper，结构臃肿，这里简化为单层。
  *  边框：容器 border 提供外框，单元格只画内部线（竖线 border-r 去末列，
@@ -70,8 +80,8 @@ const MD_CLASS = [
   '[&_th]:!border-0 [&_th]:!border-r [&_th]:!border-border [&_th]:!bg-muted/60 [&_th]:!px-3 [&_th]:!py-1.5 [&_th]:!text-left [&_th]:!font-medium [&_th:last-child]:!border-r-0',
   '[&_td]:!border-0 [&_td]:!border-r [&_td]:!border-border [&_td]:!px-3 [&_td]:!py-1.5 [&_td:last-child]:!border-r-0',
   '[&_tr]:!border-0 [&_tr]:!border-t [&_tr]:!border-border [&_thead_tr]:!border-t-0',
-  // 行内代码
-  '[&_code:not(pre_code)]:!rounded [&_code:not(pre_code)]:!bg-muted [&_code:not(pre_code)]:!px-1.5 [&_code:not(pre_code)]:!py-0.5 [&_code:not(pre_code)]:!text-[0.875em]',
+  // 行内代码（覆盖后默认 font-mono 会丢，需显式补回）
+  '[&_code:not(pre_code)]:!rounded [&_code:not(pre_code)]:!bg-muted [&_code:not(pre_code)]:!px-1.5 [&_code:not(pre_code)]:!py-0.5 [&_code:not(pre_code)]:!text-[0.875em] [&_code:not(pre_code)]:!font-mono',
   // 代码块 pre：无高亮插件，code 内为纯文本，底色由 PreFrame 容器 bg-muted/40 承载
   '[&_pre]:!bg-transparent dark:[&_pre]:!bg-transparent [&_pre]:!my-0 [&_pre]:!overflow-x-auto [&_pre]:!p-3 [&_pre]:!font-mono [&_pre]:!text-[13px] [&_pre]:!leading-relaxed',
 ].join(' ');
@@ -89,8 +99,7 @@ export default memo(function Markdown({
     <Streamdown
       className={MD_CLASS}
       plugins={{ cjk }}
-      controls={{ code: { copy: false, download: false } }}
-      components={{ pre: PreFrame, table: Table }}
+      components={{ pre: PreFrame, code: PlainCode, table: Table }}
     >
       {content}
     </Streamdown>

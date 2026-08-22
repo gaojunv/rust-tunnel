@@ -15,13 +15,28 @@ describe('Markdown', () => {
     expect(screen.getByText('code').tagName).toBe('CODE');
   });
 
-  it('renders fenced code block with language header and copy button', () => {
+  it('renders fenced code block without nested streamdown frame', () => {
     const { container } = render(<Markdown content={'```rust\nfn main() {}\n```'} />);
-    // Streamdown 代码块容器带 data-language；body 仍带 language-rust 类
-    const block = container.querySelector('[data-streamdown="code-block"]');
-    expect(block?.getAttribute('data-language')).toBe('rust');
-    expect(container.querySelector('[data-streamdown="code-block-body"]')?.className).toContain('language-rust');
-    expect(container.querySelector('[data-streamdown="code-block-copy-button"]')).toBeTruthy();
+    // 修复后代码块不再走 streamdown 默认 block code 的双层边框容器，
+    // DOM 中不应再出现 [data-streamdown="code-block"] / code-block-body
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull();
+    expect(container.querySelector('[data-streamdown="code-block-body"]')).toBeNull();
+    // PreFrame 自己的单层框（带 language 头 + copy 按钮，code 内容原样保留）
+    expect(screen.getByText('rust')).toBeTruthy();
+    expect(screen.getByText('fn main() {}')).toBeTruthy();
+  });
+
+  it('inline code still carries font-mono', () => {
+    const { container } = render(<Markdown content={'这是 `code`'} />);
+    function countFontMono(): number {
+      return (container.innerHTML.match(/font-mono/g) ?? []).length;
+    }
+    const code = screen.getByText('code');
+    expect(code.tagName).toBe('CODE');
+    // PlainCode 覆盖后行内 code 的 font-mono 由 MD_CLASS 的
+    // [&_code:not(pre_code)]:!font-mono 任意变体经父容器 className 施加（jsdom 不
+    // 计算 CSS，无法断言计算样式），故断言容器 className 里保留该规则
+    expect(countFontMono()).toBeGreaterThan(0);
   });
 
   it('renders GFM table inside styled wrapper', () => {

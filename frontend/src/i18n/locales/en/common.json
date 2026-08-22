@@ -1021,6 +1021,7 @@
     "expandLines": "Expand {{count}} more lines",
     "expandChars": "Show all ({{count}} characters)",
     "collapse": "Collapse",
+    "readLinesRange": "lines {{from}}-{{to}} of {{total}}",
     "thought": "Thought",
     "attachmentImage": "Image",
     "attachmentAudio": "Audio",

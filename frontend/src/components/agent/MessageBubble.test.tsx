@@ -158,7 +158,9 @@ describe('MessageBubble tool card collapsing', () => {
     );
     fireEvent.click(screen.getByRole('button', { expanded: false }));
     expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
-    expect(screen.getByText('{"cmd":"ls -la"}')).toBeTruthy();
+    // execute 类：ToolArgsView 结构化为命令块（不再曝露 raw JSON——头部摘要已含 ls -la，展开区又有一份命令块，所以 getAllByText）。
+    expect(screen.getAllByText('ls -la').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('{"cmd":"ls -la"}')).toBeNull();
     expect(screen.getByText('total 4')).toBeTruthy();
   });
 
@@ -832,5 +834,73 @@ describe('MessageBubble PathTip 完整路径提示', () => {
     const header = screen.getByRole('button', { expanded: false });
     expect(header.textContent).toContain('src ⌕ todo');
     expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+});
+
+describe('MessageBubble 工具卡片参数/结果区分展示', () => {
+  afterEach(cleanup);
+
+  it('read 工具展开后隐藏 args（摘要已表达）、只显示结果', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Read File',
+          toolKind: 'read',
+          toolArgs: '{"file_path":"src/main.rs"}',
+          toolResult: 'pub fn main() {}',
+          toolStatus: 'completed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    // 展开区不显示 args JSON（含 file_path），但显示结果
+    expect(screen.queryByText(/"file_path"/)).toBeNull();
+    expect(screen.getByText('pub fn main() {}')).toBeTruthy();
+  });
+
+  it('edit+diffs 后不显示 args JSON（diff 已覆盖）', () => {
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'Edit a.ts',
+          toolKind: 'edit',
+          toolArgs: '{"file_path":"a.ts","old_string":"x"}',
+          toolDiffs: [{ path: 'a.ts', old_text: 'x', new_text: 'y' }],
+          toolResult: 'ok',
+          toolStatus: 'completed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    // 展开区是 diff 视图 + 结果，不再曝露工具参数 JSON
+    expect(screen.queryByText(/old_string/)).toBeNull();
+    expect(screen.getAllByText('a.ts').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('shell 展开后显示结构化命令（非 raw JSON，heredoc 保留换行）', () => {
+    const cmd = 'git commit -m "$(cat <<\'EOF\'\nfix\nEOF\n)"';
+    render(
+      <MessageBubble
+        item={{
+          kind: 'tool',
+          content: '',
+          toolName: 'shell',
+          toolKind: 'execute',
+          toolArgs: JSON.stringify({ cmd, description: '提交' }),
+          toolResult: 'ok',
+          toolStatus: 'completed',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText('提交')).toBeTruthy();
+    // 命令块是 <pre> 原样文本，Testing Library 会 normalize 空白导致多行匹配失效，用 textContent 断言
+    const text = document.body.textContent ?? '';
+    expect(text).toContain(cmd);
+    expect(text).not.toContain('"cmd"');
   });
 });

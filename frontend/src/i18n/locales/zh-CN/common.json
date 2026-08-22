@@ -1018,6 +1018,7 @@
     "expandLines": "展开剩余 {{count}} 行",
     "expandChars": "显示全部（{{count}} 字符）",
     "collapse": "收起",
+    "readLinesRange": "第 {{from}}-{{to}} 行 / 共 {{total}} 行",
     "thought": "思考过程",
     "attachmentImage": "图片",
     "attachmentAudio": "音频",

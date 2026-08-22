@@ -12,10 +12,13 @@ describe('ToolDiffView', () => {
       />,
     );
     expect(screen.getByText('src/a.ts')).toBeTruthy();
-    expect(container.querySelector('.diff-line-add')?.textContent).toBe('+ new line');
-    expect(container.querySelector('.diff-line-del')?.textContent).toBe('- old line');
-    // 上下文行无标记类
-    const ctx = Array.from(container.querySelectorAll('div')).find(
+    // 移动 unified 视图（pre.md:hidden）内：+ - 前缀仍存在，上下文行无标记类
+    const pre = container.querySelector('pre.md\\:hidden');
+    expect(pre).toBeTruthy();
+    expect(pre?.textContent).toContain('+ new line');
+    expect(pre?.textContent).toContain('- old line');
+    // unified 容器内：context 行是空前缀行
+    const ctx = Array.from(pre!.querySelectorAll('div')).find(
       (d) => d.textContent === '  keep',
     );
     expect(ctx).toBeTruthy();
@@ -27,14 +30,45 @@ describe('ToolDiffView', () => {
     const { container } = render(
       <ToolDiffView diffs={[{ path: 'new.ts', old_text: null, new_text: 'a\nb' }]} />,
     );
-    expect(container.querySelectorAll('.diff-line-add')).toHaveLength(2);
-    expect(container.querySelector('.diff-line-del')).toBeNull();
+    // 新结构：桌面双栏与移动 unified 各一份，所以统计以 unified pre 为准
+    const pre = container.querySelector('pre.md\\:hidden');
+    expect(pre).toBeTruthy();
+    expect(pre!.querySelectorAll('.diff-line-add')).toHaveLength(2);
+    expect(pre!.querySelector('.diff-line-del')).toBeNull();
   });
 
   it('renders removed-file (new_text null) as all-removed', () => {
     const { container } = render(
       <ToolDiffView diffs={[{ path: 'gone.ts', old_text: 'x', new_text: null }]} />,
     );
-    expect(container.querySelectorAll('.diff-line-del')).toHaveLength(1);
+    const pre = container.querySelector('pre.md\\:hidden');
+    expect(pre).toBeTruthy();
+    expect(pre!.querySelectorAll('.diff-line-del')).toHaveLength(1);
+  });
+
+  it('pairs del/add replacement in the same grid row (desktop two-pane)', () => {
+    const { container } = render(
+      <ToolDiffView
+        diffs={[{ path: 'p.ts', old_text: 'hello', new_text: 'world' }]}
+      />,
+    );
+    // 桌面视图：单一 grid-cols-2 容器 + 扁平格子（左格带 border-r），替换行的
+    // del/add 应相邻排列（同行左右对齐：左格 'hello' 紧跟右格 'world'）
+    const grid = container.querySelector('.grid.grid-cols-2');
+    expect(grid).toBeTruthy();
+    const cells = Array.from(grid!.children) as HTMLElement[];
+    const delIdx = cells.findIndex((c) => c.textContent?.includes('hello'));
+    expect(delIdx).toBeGreaterThanOrEqual(0);
+    expect(cells[delIdx + 1]?.textContent).toContain('world');
+    expect(cells[delIdx].className).toContain('diff-line-del');
+    expect(cells[delIdx + 1].className).toContain('diff-line-add');
+  });
+
+  it('has responsive class split (desktop hidden md:block, mobile md:hidden)', () => {
+    const { container } = render(
+      <ToolDiffView diffs={[{ path: 'p.ts', old_text: 'a', new_text: 'b' }]} />,
+    );
+    expect(container.querySelector('.hidden.md\\:block')).toBeTruthy();
+    expect(container.querySelector('.md\\:hidden')).toBeTruthy();
   });
 });
