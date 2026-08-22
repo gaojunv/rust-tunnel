@@ -160,8 +160,8 @@ export default function ModeEffortPicker({
               <span className="shrink-0 font-medium text-foreground">
                 {effortValues[shownIdx]?.name ?? ''}
               </span>
-              <span className="relative flex w-24 shrink-0 items-center">
-                {/* 固定宽度（w-24）：标题 + 当前档名 + 滑条整体靠左，不随面板拉伸 */}
+              <span className="relative ml-auto flex w-24 shrink-0 items-center">
+                {/* 固定宽度（w-24）+ ml-auto：标题/档名靠左，滑条贴面板右缘，不随面板拉伸 */}
                 {/* 基础轨道（原生 range 轨道已透明——z-10 的 input 会遮住下层，
                     轨道/填充/圆点全由叠加层绘制，input 只留 thumb 与命中区） */}
                 <span
