@@ -11,6 +11,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { agentNotificationsWsUrl } from '../api/client';
 import type { AgentNotification } from '../types';
+import { writePendingActivate } from '../components/agent/tabsStore';
 import {
   getNotificationsEnabled,
   setNotificationsEnabled,
@@ -195,12 +196,9 @@ export function AgentNotificationsProvider({ children }: { children: ReactNode }
           notif.onclick = () => {
             window.focus();
             stopFlashing();
-            // 记录选中会话，让 /agent 打开对应会话
-            try {
-              localStorage.setItem('agent.lastSessionId', n.session_id);
-            } catch {
-              /* ignore */
-            }
+            // 记录待激活会话（含 workspaceId），/agent 打开对应工作区与会话标签；
+            // 会话可能不在当前工作区，故不能复用 migrateLegacy 的 lastSessionId。
+            writePendingActivate(n.workspace_id, n.session_id);
             navigate('/agent');
           };
         } catch {

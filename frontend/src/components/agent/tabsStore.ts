@@ -16,6 +16,38 @@ export interface TabState {
 
 export const MAX_TABS = 10;
 
+/** 通知点击后的「待激活会话」key：NotificationProvider 写入（含 workspaceId，
+ *  会话可能不在当前工作区），AgentPage 消费后删除。与 migrateLegacy 的
+ *  `agent.lastSessionId`（单标签时代迁移，只在无持久化 tabs 时生效）分离——
+ *  那条链路管不了「已有 tabs 时点击通知定位会话」。 */
+export const PENDING_ACTIVATE_KEY = 'agent.pendingActivateSession';
+
+export interface PendingActivate {
+  workspaceId: string;
+  sessionId: string;
+}
+
+export function writePendingActivate(workspaceId: string, sessionId: string): void {
+  safeLocalStorageSet(PENDING_ACTIVATE_KEY, JSON.stringify({ workspaceId, sessionId }));
+}
+
+/** 读取并清除待激活会话（一次性语义）；损坏/格式非法 → null。 */
+export function takePendingActivate(): PendingActivate | null {
+  try {
+    const raw = safeLocalStorageGet(PENDING_ACTIVATE_KEY);
+    if (raw == null) return null;
+    safeLocalStorageRemove(PENDING_ACTIVATE_KEY);
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.workspaceId !== 'string' || typeof obj.sessionId !== 'string') return null;
+    if (!obj.workspaceId || !obj.sessionId) return null;
+    return { workspaceId: obj.workspaceId, sessionId: obj.sessionId };
+  } catch {
+    return null;
+  }
+}
+
 const storageKey = (workspaceId: string) => `agent.openTabs.${workspaceId}`;
 
 /**

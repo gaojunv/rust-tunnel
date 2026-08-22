@@ -24,6 +24,7 @@ import {
   reconcile,
   openOrActivate,
   closeTab,
+  takePendingActivate,
   type TabState,
 } from '../components/agent/tabsStore';
 import { safeLocalStorageGet, safeLocalStorageSet } from '../components/agent/safeStorage';
@@ -156,6 +157,36 @@ export default function AgentPage() {
       saveTabs(workspaceId, tabs);
     }
   }, [workspaceId, tabs]);
+
+  // 通知点击定位：消费「待激活会话」（NotificationProvider 写入）。workspaces 已载
+  // 即切到目标工作区；该工作区 sessions 到达（且 tabs 初始化完成）后把会话并入
+  // tabs 并激活。pendingRef 跨渲染持有：takePendingActivate 是一次性消费，而工作区
+  // 切换→sessions 到达是异步两步。
+  const pendingActivateRef = useRef<{ workspaceId: string; sessionId: string } | null>(null);
+  useEffect(() => {
+    if (!workspaces) return;
+    const pending = (pendingActivateRef.current ??= takePendingActivate());
+    if (!pending) return;
+    if (!workspaces.some((w) => w.id === pending.workspaceId)) {
+      // 目标工作区已被删除：无可定位，丢弃。
+      pendingActivateRef.current = null;
+      return;
+    }
+    if (workspaceId !== pending.workspaceId) {
+      setWorkspaceId(pending.workspaceId);
+      return; // sessions 由下一个 effect 周期到达
+    }
+    if (!sessions || !initedWsRef.current[workspaceId]) return;
+    pendingActivateRef.current = null;
+    if (sessions.some((s) => s.id === pending.sessionId)) {
+      const wsId = pending.workspaceId;
+      setTabsByWs((prev) => {
+        const cur = prev[wsId] ?? { open: [], active: '' };
+        return { ...prev, [wsId]: openOrActivate(cur, pending.sessionId) };
+      });
+    }
+    // 会话已被删除（sessions 里没有）：静默丢弃，停留当前 tab。
+  }, [workspaces, workspaceId, sessions]);
 
   // 会话模型派生：tab 局部覆盖优先；否则按「会话模型 → workspace 默认 →
   // 全局默认 → 第一个可用模型」的 falsy 链回退（?? 与 || 混合处加括号，避免

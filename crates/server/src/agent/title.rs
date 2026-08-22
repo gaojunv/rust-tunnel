@@ -131,20 +131,20 @@ async fn generate_title_inner(
     } = outcome else {
         return Err("LLM unavailable for title generation".to_string());
     };
-    // 记录用量（fire-and-forget，db 为 None 时跳过）
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .map_err(|e| format!("read response failed: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON: {e}"))?;
+    // 记录用量（fire-and-forget，db 为 None 时跳过）；usage 需先读响应体再提取
     if let Some(db) = llm.db.as_ref() {
         let ctx = super::runner::runner_usage_ctx(
             &candidate,
             model,
             if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
         );
-        ctx.record_success(db, crate::llm::usage::UsageInfo::default(), started);
+        ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&json), started);
     }
-    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .map_err(|e| format!("read response failed: {e}"))?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON: {e}"))?;
     let raw = json
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())

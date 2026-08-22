@@ -990,6 +990,9 @@ export function useUpdateSessionRole() {
       updateAgentSessionRole(sessionId, roleId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['agent-roles'] });
+      // 会话列表缓存里带了 role_id（SessionSettingsMenu 当前角色回显的读取源），
+      // 不失效则切换角色后菜单勾选不更新。
+      qc.invalidateQueries({ queryKey: ['agent-sessions'] });
     },
   });
 }

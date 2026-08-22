@@ -101,8 +101,8 @@ async fn exec_on_client_impl(
             wait_timeout,
         )
         .await;
-    // 无论成败都清 inflight，避免 stale 条目。
-    agent.inflight_end(workspace_id).await;
+    // 无论成败都清本条 inflight，避免 stale 条目（并发组各自精确清除自己的 id）。
+    agent.inflight_end(workspace_id, &request_id).await;
     match result {
         Ok(result) => result,
         Err(e) => AgentResult::Error {

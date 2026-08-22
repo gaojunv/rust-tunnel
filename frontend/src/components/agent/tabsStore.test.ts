@@ -7,6 +7,8 @@ import {
   reconcile,
   openOrActivate,
   closeTab,
+  writePendingActivate,
+  takePendingActivate,
   MAX_TABS,
   type TabState,
 } from './tabsStore';
@@ -173,5 +175,24 @@ describe('closeTab', () => {
   it('is a no-op when the id is not open', () => {
     const state: TabState = { open: ['a'], active: 'a' };
     expect(closeTab(state, 'zzz')).toBe(state);
+  });
+});
+
+describe('pendingActivate', () => {
+  it('round-trips and is consumed once', () => {
+    writePendingActivate('w1', 's1');
+    expect(takePendingActivate()).toEqual({ workspaceId: 'w1', sessionId: 's1' });
+    // 一次性语义：第二次取为空
+    expect(takePendingActivate()).toBeNull();
+  });
+
+  it('returns null for missing / corrupted / malformed entries', () => {
+    expect(takePendingActivate()).toBeNull();
+    localStorage.setItem('agent.pendingActivateSession', '{bad json');
+    expect(takePendingActivate()).toBeNull();
+    localStorage.setItem('agent.pendingActivateSession', JSON.stringify({ workspaceId: 'w1' }));
+    expect(takePendingActivate()).toBeNull();
+    localStorage.setItem('agent.pendingActivateSession', JSON.stringify({ workspaceId: '', sessionId: 's1' }));
+    expect(takePendingActivate()).toBeNull();
   });
 });

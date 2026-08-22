@@ -148,9 +148,10 @@ pub struct AgentState {
     elicitations: Arc<Mutex<PendingElicitations>>,
     /// "本会话允许此类工具"记忆集：`session_id` → 工具名集合。内存态，进程重启清零。
     session_allowed: Arc<Mutex<HashMap<String, HashSet<String>>>>,
-    /// 进行中的 exec：workspace_id → request_id。WS cancel/断连时据此把取消
-    /// 信号下发到客户端。锁短持有（仅索引），与 workspace_locks 分离。
-    exec_inflight: Arc<Mutex<HashMap<String, String>>>,
+    /// 进行中的 exec：workspace_id → 在途 request_id 集合（只读并发组会同时
+    /// 存在多个）。WS cancel/断连时据此把取消信号下发到客户端。锁短持有（仅索引），
+    /// 与 workspace_locks 分离。
+    exec_inflight: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// ACP 远程 agent 会话桥（配置了 agent_type 的 workspace 走 ACP 路径）。
     /// 惰性 spawn + 事件映射 + LLM 代理路由；控制循环的 AgentSpawnData/Exit、
     /// AgentLlmProxyRequest 经它路由。
@@ -511,24 +512,38 @@ impl AgentState {
     }
 
     /// 生成新 exec 的 request_id 并记入 inflight，返回 id。
-    /// WS cancel 用 `inflight_take` 取走；exec 结束后 `inflight_end` 清除。
+    /// WS cancel 用 `inflight_take` 取走全部；exec 结束后 `inflight_end` 精确清除本条。
     pub async fn inflight_begin(&self, workspace_id: &str) -> String {
         let id = format!("{:032x}", rand::random::<u128>());
         self.exec_inflight
             .lock()
             .await
-            .insert(workspace_id.to_string(), id.clone());
+            .entry(workspace_id.to_string())
+            .or_default()
+            .insert(id.clone());
         id
     }
 
-    /// exec 正常结束后清除（幂等）。
-    pub async fn inflight_end(&self, workspace_id: &str) {
-        self.exec_inflight.lock().await.remove(workspace_id);
+    /// exec 正常结束后精确移除本条 request_id（集合空则清除条目，幂等）。
+    pub async fn inflight_end(&self, workspace_id: &str, request_id: &str) {
+        let mut map = self.exec_inflight.lock().await;
+        if let Some(set) = map.get_mut(workspace_id) {
+            set.remove(request_id);
+            if set.is_empty() {
+                map.remove(workspace_id);
+            }
+        }
     }
 
-    /// 取出进行中的 exec request_id 并清除（cancel/断连时用，先取后清防重复取消）。
-    pub async fn inflight_take(&self, workspace_id: &str) -> Option<String> {
-        self.exec_inflight.lock().await.remove(workspace_id)
+    /// 取出该 workspace 全部进行中 exec 的 request_id 并清除（cancel/断连时用，
+    /// 先取后清防重复取消）。只读并发组可能同时多条在途，全部都要取消。
+    pub async fn inflight_take(&self, workspace_id: &str) -> Vec<String> {
+        self.exec_inflight
+            .lock()
+            .await
+            .remove(workspace_id)
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// 广播一条工作台通知（无订阅者时静默忽略，不阻塞调用方）。
@@ -754,5 +769,36 @@ mod tests {
             0,
             "dropped future must clean up its pending entry"
         );
+    }
+
+    /// inflight 多值结构：同 workspace 并发 begin 不互踩（回归：只读并发组
+    /// 同时多个在途请求，旧单值 insert 互相覆盖 → cancel 取消错请求）。
+    #[tokio::test]
+    async fn test_inflight_concurrent_begin_and_precise_end() {
+        let agent = test_agent().await;
+        let id_a = agent.inflight_begin("ws1").await;
+        let id_b = agent.inflight_begin("ws1").await;
+        let id_c = agent.inflight_begin("ws2").await;
+        assert_ne!(id_a, id_b);
+        // 精确移除：结束 A 不影响 B；跨 workspace 互不影响。
+        agent.inflight_end("ws1", &id_a).await;
+        let remaining = agent.inflight_take("ws1").await;
+        assert_eq!(remaining, vec![id_b.clone()]);
+        // take 后条目已清除：再次 take 为空。
+        assert!(agent.inflight_take("ws1").await.is_empty());
+        // ws2 不受 ws1 操作影响。
+        assert_eq!(agent.inflight_take("ws2").await, vec![id_c]);
+    }
+
+    /// inflight_end 幂等：不存在的 id/workspace 静默 no-op；集合空则清条目。
+    #[tokio::test]
+    async fn test_inflight_end_idempotent() {
+        let agent = test_agent().await;
+        let id = agent.inflight_begin("ws1").await;
+        agent.inflight_end("ws1", "nonexistent").await;
+        agent.inflight_end("ws1", &id).await;
+        agent.inflight_end("ws1", &id).await; // 重复 end 不 panic
+        agent.inflight_end("ws-none", "x").await; // 不存在的 workspace
+        assert!(agent.inflight_take("ws1").await.is_empty());
     }
 }

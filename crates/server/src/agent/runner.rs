@@ -1239,8 +1239,15 @@ async fn run_subagent_loop(
         )
         .await;
 
-        let resp = match outcome {
-            crate::llm::upstream::FailoverOutcome::Success { resp, .. } => resp,
+        let (resp, usage_ctx, usage_started) = match outcome {
+            crate::llm::upstream::FailoverOutcome::Success { resp, candidate, failed_over, .. } => {
+                let ctx = runner_usage_ctx(
+                    &candidate,
+                    &sub_rt.model,
+                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                );
+                (resp, Some(ctx), Some(std::time::Instant::now()))
+            }
             crate::llm::upstream::FailoverOutcome::Exhausted { status, message, .. } => {
                 // 上下文溢出自愈：内存级降级（清除最老 tool 消息）
                 if super::compact::is_context_overflow(status.as_u16(), &message)
@@ -1350,6 +1357,10 @@ async fn run_subagent_loop(
             if let Some(buf) = non_sse_buf {
                 let body: serde_json::Value = serde_json::from_slice(&buf)
                     .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
+                // 记录用量（非 SSE 嗅探路径：从 body 提取 usage）
+                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
+                    ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+                }
                 match parse_llm_turn(&body)? {
                     LlmTurn::Text(text) => {
                         sub_rt.messages.push(ChatMessage::text("assistant", &text));
@@ -1404,6 +1415,10 @@ async fn run_subagent_loop(
             }
 
             let turn = agg.finish()?;
+            // 记录用量（SSE 路径：usage 从聚合器提取；fatal 已在上游 return）
+            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
+                ctx.record_success(db, turn.usage, started);
+            }
             if turn.tool_calls.is_empty() {
                 sub_rt.messages.push(ChatMessage::text("assistant", &turn.text));
                 let mut frame = serde_json::json!({"type": "assistant_chunk", "content": "", "final": true});
@@ -1421,6 +1436,10 @@ async fn run_subagent_loop(
             .map_err(|e| format!("failed to read LLM response: {e}"))?;
         let body: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
+        // 记录用量（非 SSE 回退路径：从 body 提取 usage）
+        if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
+            ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+        }
         match parse_llm_turn(&body)? {
             LlmTurn::Text(text) => {
                 sub_rt.messages.push(ChatMessage::text("assistant", &text));
@@ -1469,12 +1488,22 @@ async fn run_subagent_loop(
     )
     .await;
     match outcome {
-        crate::llm::upstream::FailoverOutcome::Success { resp, .. } => {
+        crate::llm::upstream::FailoverOutcome::Success { resp, candidate, failed_over, .. } => {
+            let started = std::time::Instant::now();
             let body_bytes = axum::body::to_bytes(resp.into_body(), sse::MAX_STREAM_BYTES)
                 .await
                 .map_err(|e| format!("failed to read LLM response: {e}"))?;
             let body: serde_json::Value = serde_json::from_slice(&body_bytes)
                 .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
+            // 记录用量（轮数耗尽的最终摘要调用）
+            if let Some(db) = llm.db.as_ref() {
+                let ctx = runner_usage_ctx(
+                    &candidate,
+                    &sub_rt.model,
+                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                );
+                ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+            }
             let text = parse_llm_turn(&body).and_then(|turn| match turn {
                 LlmTurn::Text(t) => Ok(t),
                 _ => Err("expected text response".to_string()),

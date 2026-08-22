@@ -248,21 +248,10 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         None,
     )
     .await;
-    let resp = match outcome {
+    let (resp, candidate, failed_over) = match outcome {
         crate::llm::upstream::FailoverOutcome::Success {
             resp, candidate, failed_over, ..
-        } => {
-            // 记录用量（fire-and-forget，db 为 None 时跳过）
-            if let Some(db) = llm.db.as_ref() {
-                let ctx = super::runner::runner_usage_ctx(
-                    &candidate,
-                    model,
-                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
-                );
-                ctx.record_success(db, crate::llm::usage::UsageInfo::default(), started);
-            }
-            resp
-        }
+        } => (resp, candidate, failed_over),
         crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
             return Err(format!("summary LLM unavailable: {message}"));
         }
@@ -272,6 +261,15 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         .map_err(|e| format!("failed to read summary response: {e}"))?;
     let body: serde_json::Value =
         serde_json::from_slice(&body_bytes).map_err(|e| format!("invalid summary JSON: {e}"))?;
+    // 记录用量（fire-and-forget，db 为 None 时跳过）；usage 需先读响应体再提取
+    if let Some(db) = llm.db.as_ref() {
+        let ctx = super::runner::runner_usage_ctx(
+            &candidate,
+            model,
+            if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+        );
+        ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+    }
     match super::runner::parse_llm_turn(&body)? {
         super::runner::LlmTurn::Text(t) => Ok(t),
         super::runner::LlmTurn::ToolCalls(_) => Err("summary model returned tool calls".into()),

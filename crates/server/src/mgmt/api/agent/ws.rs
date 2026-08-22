@@ -1423,9 +1423,10 @@ async fn send_cancel_to_client(
     client_id: &str,
     _event_tx: &tokio::sync::mpsc::Sender<serde_json::Value>,
 ) {
-    let Some(request_id) = agent.inflight_take(workspace_id).await else {
+    let request_ids = agent.inflight_take(workspace_id).await;
+    if request_ids.is_empty() {
         return;
-    };
+    }
     let version = agent
         .registry
         .get(client_id)
@@ -1435,12 +1436,15 @@ async fn send_cancel_to_client(
         tracing::debug!("client {} does not support cancel, skipping", client_id);
         return;
     }
-    if !agent
-        .registry
-        .send_agent_cancel(client_id, &request_id)
-        .await
-    {
-        tracing::debug!("send_agent_cancel failed for client {}", client_id);
+    // 只读并发组可能多条在途：逐条下发取消。
+    for request_id in request_ids {
+        if !agent
+            .registry
+            .send_agent_cancel(client_id, &request_id)
+            .await
+        {
+            tracing::debug!("send_agent_cancel failed for client {}", client_id);
+        }
     }
 }
 

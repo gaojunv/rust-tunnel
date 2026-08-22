@@ -1901,6 +1901,8 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onModelChange={handleModelChange}
               configOptions={menuOptions}
               onConfigChange={sendConfigOption}
+              sessionId={sessionId}
+              roleId={sessionRecord?.role_id}
               claudeTierModels={claudeTierModels}
               agentType={agentType}
               configState={sessionRecord?.config_state}

@@ -7,29 +7,91 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use super::store::flush_acp_turn_buffers;
 use super::{AcpBridge, SpawnedAgent};
+
+/// 回合超时广播（status 帧）：看门狗触发 cancel 前给用户明确原因。
+/// 独立小函数而非直接调 session 的 broadcast_ws_frame（其为 session 模块
+/// 私有）：reaper 只需这一帧，不值得把广播器提升为跨模块公共项——这里经
+/// 同一 ws_conns 结构手动 fan-out，语义与 broadcast_ws_frame(must_deliver=true)
+/// 一致（阻塞发送 + 刷新 last_activity）。
+async fn broadcast_turn_timeout(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) {
+    let frame = serde_json::json!({
+        "type": "status",
+        "message": "回合超时（10 分钟无响应），已自动取消"
+    });
+    let conns: Vec<mpsc::Sender<serde_json::Value>> = {
+        let mut map = sessions.lock().await;
+        let Some(a) = map.get_mut(sid) else {
+            return;
+        };
+        a.last_activity = std::time::Instant::now();
+        a.ws_conns.iter().map(|(_, tx)| tx.clone()).collect()
+    };
+    for tx in conns {
+        let _ = tx.send(frame.clone()).await;
+    }
+}
 
 /// 空闲 30 分钟杀进程（重挂 ACP 连接由客户端 spawn manager 处理）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// reaper 检查间隔。
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// 回合级看门狗：单回合超此时长即触发 session/cancel（agent 在
+/// `cancel_grace` 内不响应则复用 cancel 兜底杀进程）。模型/上游网络挂起
+/// 时避免会话永久 busy——此前只能靠 idle reaper（30min）兜底，且活动刷新
+/// 可能让挂起回合永远不被回收。10 分钟对长任务（大重构/批量文件生成）
+/// 足够宽容，对真挂起（无任何事件到达）足够快。
+const TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 impl AcpBridge {
     /// 后台回收空闲 ACP agent：超 `IDLE_TIMEOUT` 未活动即移除会话表条目并
     /// 经 registry 下发进程退出语义（AgentExecCancel request_id = session_id，
     /// 客户端 spawn manager 终止对应进程）。
+    ///
+    /// 同一循环兼任回合级看门狗：busy 回合超 `TURN_TIMEOUT` 即触发 cancel
+    /// （agent 在 cancel_grace 内不响应则由 cancel 的兜底任务真杀进程）。
     pub(super) fn start_idle_reaper(&self) {
         let sessions = self.sessions.clone();
         let spawner = self.spawner.clone();
         let db = self.db.clone();
         #[cfg(feature = "rag")]
         let memory = self.memory.clone();
+        let watchdog = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REAP_INTERVAL).await;
+                // ── 回合级看门狗：先收超时回合并逐个触发 cancel（锁外调用，
+                // cancel 内部自取锁）。最后活动时间在回合进行中由事件帧持续刷新，
+                // 但 turn_started_at 只看回合起点，不受刷新影响。
+                let timed_out: Vec<String> = sessions
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(_, a)| {
+                        a.busy
+                            && !a.exited
+                            && a.turn_started_at
+                                .is_some_and(|t| t.elapsed() > TURN_TIMEOUT)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in timed_out {
+                    tracing::warn!(
+                        session_id = %id,
+                        "ACP turn exceeded TURN_TIMEOUT ({}s); cancelling",
+                        TURN_TIMEOUT.as_secs()
+                    );
+                    // 广播先于 cancel：cancel 的兜底路径发 cancel_fallback 帧，
+                    // 先给用户一条明确的超时原因。
+                    broadcast_turn_timeout(&sessions, &id).await;
+                    watchdog.cancel(&id).await;
+                }
                 let stale: Vec<String> = sessions
                     .lock()
                     .await
