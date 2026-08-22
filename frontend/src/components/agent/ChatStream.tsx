@@ -1819,12 +1819,65 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
           />
           {/* 底部操作行：上边框与输入区分隔（模型/模式/effort 按钮 vs 文本输入） */}
           <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border/60 px-1.5 pb-1.5 pt-1 md:px-2">
+            <div className="flex items-center gap-0.5">
             <SessionSettingsMenu
               model={model}
               onModelChange={handleModelChange}
               configOptions={menuOptions}
               onConfigChange={sendConfigOption}
             />
+            {/* ACP 上下文用量环（Claude Code 插件形态）：usage 帧/会话快照驱动，
+                >80% 黄、>95% 红；占比 >50% 且 agent 提供 compact 命令时可点击
+                触发压缩上下文。纯 SVG 弧，无百分比文本。aria-disabled 保留 hover
+                tooltip。 */}
+            {contextUsage?.size != null && contextUsage.size > 0 && (
+              (() => {
+                const used = contextUsage.used ?? 0;
+                const size = contextUsage.size;
+                const pct = Math.min(100, Math.round((used / size) * 100));
+                const tone =
+                  pct > 95 ? 'text-destructive' : pct > 80 ? 'text-yellow-500' : 'text-primary/70';
+                const compactCmd = slashCommands.find((c) =>
+                  c.name.toLowerCase().includes('compact'),
+                );
+                const clickable =
+                  pct > 50 && !!compactCmd && !running && !hasPendingInteraction;
+                const R = 7;
+                const C = 2 * Math.PI * R;
+                const tip = t('agent.contextUsageTooltip', { used, size });
+                return (
+                  <button
+                    type="button"
+                    data-testid="context-usage-ring"
+                    aria-label={tip}
+                    aria-disabled={!clickable}
+                    title={clickable ? `${tip} · ${t('agent.contextCompactHint')}` : tip}
+                    onClick={() => {
+                      if (clickable) triggerCompact();
+                    }}
+                    className={`flex h-7 items-center rounded-full px-1 text-muted-foreground transition-colors ${
+                      clickable ? 'hover:bg-accent hover:text-foreground' : 'cursor-default'
+                    }`}
+                  >
+                    <svg viewBox="0 0 18 18" className={`h-[18px] w-[18px] -rotate-90 ${tone}`} aria-hidden>
+                      <circle cx="9" cy="9" r={R} fill="none" strokeWidth="2.5" className="stroke-muted" />
+                      <circle
+                        cx="9"
+                        cy="9"
+                        r={R}
+                        fill="none"
+                        strokeWidth="2.5"
+                        strokeLinecap="round"
+                        className="stroke-current transition-[stroke-dashoffset]"
+                        strokeDasharray={C}
+                        strokeDashoffset={C * (1 - pct / 100)}
+                      />
+                    </svg>
+                  </button>
+                );
+              })()
+            )}
+            </div>
             <div className="flex items-center gap-0.5">
               {/* Plan 模式切换按钮（runner 路径）：ACP 会话（已上报 config_options）隐藏——
                   ACP 的 mode 切换走右侧 ModeEffortPicker（set_config_option 帧），
@@ -1855,58 +1908,6 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                 onChange={sendConfigOption}
                 placeholder={configOptions.length > 0}
               />
-              {/* ACP 上下文用量环（Claude Code 插件形态）：usage 帧/会话快照驱动，
-                  >80% 黄、>95% 红；占比 >50% 且 agent 提供 compact 命令时可点击
-                  触发压缩上下文。aria-disabled 而非 disabled：禁用态下 hover
-                  tooltip（用量明细）仍需可达。 */}
-              {contextUsage?.size != null && contextUsage.size > 0 && (
-                (() => {
-                  const used = contextUsage.used ?? 0;
-                  const size = contextUsage.size;
-                  const pct = Math.min(100, Math.round((used / size) * 100));
-                  const tone =
-                    pct > 95 ? 'text-destructive' : pct > 80 ? 'text-yellow-500' : 'text-primary/70';
-                  const compactCmd = slashCommands.find((c) =>
-                    c.name.toLowerCase().includes('compact'),
-                  );
-                  const clickable =
-                    pct > 50 && !!compactCmd && !running && !hasPendingInteraction;
-                  const R = 7;
-                  const C = 2 * Math.PI * R;
-                  const tip = t('agent.contextUsageTooltip', { used, size });
-                  return (
-                    <button
-                      type="button"
-                      data-testid="context-usage-ring"
-                      aria-label={tip}
-                      aria-disabled={!clickable}
-                      title={clickable ? `${tip} · ${t('agent.contextCompactHint')}` : tip}
-                      onClick={() => {
-                        if (clickable) triggerCompact();
-                      }}
-                      className={`flex h-7 items-center gap-1 rounded-full px-1.5 text-[10px] tabular-nums text-muted-foreground transition-colors ${
-                        clickable ? 'hover:bg-accent hover:text-foreground' : 'cursor-default'
-                      }`}
-                    >
-                      <svg viewBox="0 0 18 18" className={`h-[18px] w-[18px] -rotate-90 ${tone}`} aria-hidden>
-                        <circle cx="9" cy="9" r={R} fill="none" strokeWidth="2.5" className="stroke-muted" />
-                        <circle
-                          cx="9"
-                          cy="9"
-                          r={R}
-                          fill="none"
-                          strokeWidth="2.5"
-                          strokeLinecap="round"
-                          className="stroke-current transition-[stroke-dashoffset]"
-                          strokeDasharray={C}
-                          strokeDashoffset={C * (1 - pct / 100)}
-                        />
-                      </svg>
-                      <span>{pct}%</span>
-                    </button>
-                  );
-                })()
-              )}
               {/* 发送/暂停按输入动态切换（Claude Code 风格）：对话进行中若输入框
                   有文字则显示发送（服务端 busy 排队），无文字则显示停止；空闲时
                   固定显示发送。二者不并存。 */}

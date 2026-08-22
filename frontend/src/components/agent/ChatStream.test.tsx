@@ -1457,10 +1457,10 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'usage', used: 100, size: 200000 });
       wsInstance!.emit({ type: 'done' });
     });
-    // 用量环出现，显示百分比；used/size 明细在 tooltip（i18n 参数被 mock 丢弃，
+    // 用量环出现（纯弧无数字）；used/size 明细在 tooltip（i18n 参数被 mock 丢弃，
     // 只能断言 key）；≤50% 不可点击压缩
     const ring = screen.getByTestId('context-usage-ring');
-    expect(ring.textContent).toContain('0%');
+    expect(ring.querySelector('svg')).toBeTruthy();
     expect(ring.getAttribute('title')).toContain('agent.contextUsageTooltip');
     expect(ring.getAttribute('aria-disabled')).toBe('true');
   });
@@ -1473,7 +1473,6 @@ describe('ChatStream running state', () => {
       wsInstance!.emit({ type: 'done' });
     });
     const ring = screen.getByTestId('context-usage-ring');
-    expect(ring.textContent).toContain('95%');
     expect(ring.querySelector('.text-yellow-500')).toBeTruthy();
   });
 
