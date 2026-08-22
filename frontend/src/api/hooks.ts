@@ -523,7 +523,9 @@ export function useAddModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ providerId, ...req }: { providerId: string } & CreateModelRequest) => addModel(providerId, req),
-    onSuccess: (_data, vars) => qc.invalidateQueries({ queryKey: ['llm-models', vars.providerId] }),
+    // 新增模型后需刷新该 provider 的列表以及全部模型列表（GroupDialog 用 ['llm-models','all']）。
+    // 仅刷新 ['llm-models', providerId] 会让 GroupDialog 的选模型下拉陈旧。
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
   });
 }
 
@@ -593,6 +595,7 @@ export function useLlmModelGroup(id: string | undefined) {
     queryFn: () => getLlmModelGroup(id!),
     enabled: !!id,
     refetchInterval: 5000, // 熔断状态轮询刷新
+    refetchIntervalInBackground: false, // 页签后台时暂停轮询
   });
 }
 
