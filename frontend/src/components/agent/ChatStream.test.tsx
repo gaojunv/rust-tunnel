@@ -1571,7 +1571,7 @@ describe('ChatStream running state', () => {
         ],
       });
     });
-    // 发送按钮左侧的 Mode 快捷按钮显示当前值 "Plan"
+    // 发送按钮左侧的合并胶囊显示当前 mode 值 "Plan"
     const modeBtn = screen.getByRole('button', { name: 'agent.configMode' });
     expect(modeBtn).toBeTruthy();
     expect(modeBtn.textContent).toContain('Plan');
@@ -1607,16 +1607,20 @@ describe('ChatStream running state', () => {
     });
     const effortBtn = screen.getByRole('button', { name: 'agent.configEffort' });
     expect(effortBtn.textContent).toContain('Medium');
-    // 展开 Effort 快捷菜单 → 点击 "High"（点击前捕获当前活跃连接：乐观更新后
-    // ChatStream 重渲染会轮换 WS 实例，帧发在点击时刻的活跃连接上）
+    // 打开合并面板 → 拖滑条到 High 并松手（点击前捕获当前活跃连接：乐观更新后
+    // ChatStream 重渲染会轮换 WS 实例，帧发在操作时刻的活跃连接上）
     fireEvent.pointerDown(effortBtn);
+    const slider = screen.getByRole('slider');
+    fireEvent.change(slider, { target: { value: '2' } });
     const ws = wsInstance!;
-    fireEvent.click(screen.getByText('High'));
+    fireEvent.pointerUp(slider);
     // 发送 set_config_option 帧（最后一条）
     expect(ws.sent[ws.sent.length - 1]).toBe(
       '{"type":"set_config_option","config_id":"effort","value":"high"}',
     );
-    // 乐观更新：按钮文本立即变为 "High"（生效确认以服务端回推帧为准）
+    // 乐观更新：关掉面板（打开期间页面其余部分被 Radix aria-hidden）后胶囊文本
+    // 立即变为 "High"（生效确认以服务端回推帧为准）
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
     expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
   });
 
@@ -1643,9 +1647,11 @@ describe('ChatStream running state', () => {
         ],
       });
     });
-    // 展开 Effort 快捷菜单 → 点击 High：乐观更新使按钮文本立即变 High
+    // 展开合并面板 → 滑条拖到 High 并松手，关面板后胶囊文本立即变 High（乐观更新）
     fireEvent.pointerDown(screen.getByRole('button', { name: 'agent.configEffort' }));
-    fireEvent.click(screen.getByText('High'));
+    fireEvent.change(screen.getByRole('slider'), { target: { value: '2' } });
+    fireEvent.pointerUp(screen.getByRole('slider'));
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' });
     expect(screen.getByRole('button', { name: 'agent.configEffort' }).textContent).toContain('High');
     // 服务端回「设置失败」error 帧（config_id 失效/agent 退出等）：
     // 乐观值从未生效，应回滚到发送前快照 Medium，而非停留在假性 High
@@ -1692,7 +1698,7 @@ describe('ChatStream running state', () => {
     expect(screen.getByRole('button', { name: 'agent.configMode' }).textContent).toContain('Plan');
   });
 
-  it('shows disabled Effort placeholder when agent reported options without effort', () => {
+  it('shows unsupported hint inside the panel when agent reported options without effort', () => {
     (listAgentMessages as Mock).mockResolvedValue([]);
     renderChat();
     // 注入 session_state：只有 mode 项（无 thought_level）→ 当前模型不支持 Effort
@@ -1711,13 +1717,14 @@ describe('ChatStream running state', () => {
         ],
       });
     });
-    // Mode 快捷按钮正常显示当前值
-    expect(screen.getByRole('button', { name: 'agent.configMode' }).textContent).toContain('Plan');
-    // Effort 占位按钮存在且禁用（title 提示原因）
-    const effortBtn = screen.getByRole('button', { name: 'agent.configEffort' });
-    expect(effortBtn).toBeTruthy();
-    expect((effortBtn as HTMLButtonElement).disabled).toBe(true);
-    expect(effortBtn.getAttribute('title')).toBe('agent.configOptionUnsupported');
+    // Mode 胶囊正常显示当前值
+    const modeBtn = screen.getByRole('button', { name: 'agent.configMode' });
+    expect(modeBtn.textContent).toContain('Plan');
+    // 不再有独立 Effort 按钮：面板内的 effort 行给出「模型不支持」提示，且无滑条
+    expect(screen.queryByRole('button', { name: 'agent.configEffort' })).toBeNull();
+    fireEvent.pointerDown(modeBtn);
+    expect(screen.getByText('agent.configOptionUnsupported')).toBeTruthy();
+    expect(screen.queryByRole('slider')).toBeNull();
   });
 
   it('nests subagent events inside the parent Task card (tool/text/result)', async () => {

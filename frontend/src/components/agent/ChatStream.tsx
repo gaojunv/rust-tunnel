@@ -26,7 +26,7 @@ import SessionSettingsMenu from './SessionSettingsMenu';
 import SubagentTaskCard from './SubagentTaskCard';
 import SubagentPanel from './SubagentPanel';
 import SystemMessage from './SystemMessage';
-import ConfigOptionButton from './ConfigOptionButton';
+import ModeEffortPicker from './ModeEffortPicker';
 import { normalizeConfigOptions, optionValue, restoreConfigValue } from './sessionConfig';
 import {
   compactionSkippedIndices,
@@ -1834,7 +1834,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             />
             <div className="flex items-center gap-0.5">
               {/* Plan 模式切换按钮（runner 路径）：ACP 会话（已上报 config_options）隐藏——
-                  ACP 的 mode 切换走右侧 ConfigOptionButton（set_config_option 帧），
+                  ACP 的 mode 切换走右侧 ModeEffortPicker（set_config_option 帧），
                   set_mode 帧只改 workspace.approval_mode（runner 审批语义），ACP 下无意义。 */}
               {configOptions.length === 0 && (
                 <>
@@ -1854,17 +1854,13 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
                   </Button>
                 </>
               )}
-              <ConfigOptionButton
-                option={modeOption}
-                label="agent.configMode"
+              {/* Mode + Effort 合二为一：胶囊只显示当前 mode，面板内含 mode 列表与
+                  effort 滑条（两项都缺才退化成禁用占位） */}
+              <ModeEffortPicker
+                modeOption={modeOption}
+                effortOption={effortOption}
                 onChange={sendConfigOption}
-                placeholder={configOptions.length > 0 && !modeOption}
-              />
-              <ConfigOptionButton
-                option={effortOption}
-                label="agent.configEffort"
-                onChange={sendConfigOption}
-                placeholder={configOptions.length > 0 && !effortOption}
+                placeholder={configOptions.length > 0}
               />
               {/* 发送/暂停按输入动态切换（Claude Code 风格）：对话进行中若输入框
                   有文字则显示发送（服务端 busy 排队），无文字则显示停止；空闲时
