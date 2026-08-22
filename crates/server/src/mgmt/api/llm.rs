@@ -14,6 +14,7 @@ use crate::llm::{
     auth::generate_api_key,
     breaker::ModelBreakers,
     crypto::{decrypt_field, encrypt_field, LlmCipher},
+    normalize_anthropic_base_url,
     provider::{is_valid_provider_type, resolve_base_url, VALID_PROVIDER_TYPES},
     ApiKeyView, CreateApiKeyRequest, CreateApiKeyResponse, LlmGatewayConfig, ModelConfig,
     ModelRequest, ProviderConfig, ProviderRequest,
@@ -189,7 +190,9 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
                 base_url: r.base_url,
                 api_key: String::new(),
                 extra_config,
-                anthropic_base_url: r.anthropic_base_url,
+                // 防御性归一：库里历史脏数据可能存 ""（前端旧版本清空时写入），
+                // 回显时归一成 None，避免前端显示空串却仍走直通。
+                anthropic_base_url: normalize_anthropic_base_url(r.anthropic_base_url),
                 enabled: r.enabled != 0,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
@@ -236,6 +239,8 @@ pub async fn create_provider(
         .extra_config
         .flatten()
         .map(|ec| encrypt_field(cipher.as_ref(), &ec));
+    // anthropic_base_url：缺失/null/空串 → 未配置；字符串 → trim 后归一落库（不留 "" 脏数据）
+    let anthropic_base_url = normalize_anthropic_base_url(body.anthropic_base_url.flatten());
 
     if let Err(e) = db
         .llm_save_provider(
@@ -245,7 +250,7 @@ pub async fn create_provider(
             &base_url,
             &api_key,
             extra_config.as_deref(),
-            body.anthropic_base_url.as_deref(),
+            anthropic_base_url.as_deref(),
             true,
         )
         .await
@@ -317,11 +322,12 @@ pub async fn update_provider(
         Some(None) => None,
         Some(Some(ec)) => Some(encrypt_field(cipher.as_ref(), ec)),
     };
-    // anthropic_base_url: None 表示不修改，Some 表示更新（含清空）
-    let anthropic_base_url = body
-        .anthropic_base_url
-        .as_deref()
-        .or(existing.anthropic_base_url.as_deref());
+    // anthropic_base_url 三态：字段缺失 → 沿用已有值；显式 null → 清除；
+    // 字符串 → trim 后归一（空串按未配置处理）。任一分支都归一，把历史 "" 脏数据一并清掉。
+    let anthropic_base_url = match body.anthropic_base_url {
+        None => normalize_anthropic_base_url(existing.anthropic_base_url.clone()),
+        Some(inner) => normalize_anthropic_base_url(inner),
+    };
 
     if let Err(e) = db
         .llm_save_provider(
@@ -331,7 +337,7 @@ pub async fn update_provider(
             &base_url,
             &api_key,
             extra_config.as_deref(),
-            anthropic_base_url,
+            anthropic_base_url.as_deref(),
             enabled,
         )
         .await
@@ -1179,7 +1185,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{header, Method, Request, StatusCode as HttpStatus};
-    use axum::routing::{get, patch};
+    use axum::routing::{get, patch, put};
     use axum::Router;
     use serde_json::{json, Value};
     use std::sync::Arc;
@@ -1199,7 +1205,7 @@ mod tests {
         }
     }
 
-    /// 覆盖 api key 全部路由的测试 Router（免 JWT，auth_config 关闭）。
+    /// 覆盖 api key 全部路由 + provider 路由的测试 Router（免 JWT，auth_config 关闭）。
     fn test_router(state: ApiState) -> Router {
         Router::new()
             .route(
@@ -1210,6 +1216,11 @@ mod tests {
                 "/api/llm/api-keys/:id",
                 patch(super::toggle_api_key).delete(super::delete_api_key),
             )
+            .route(
+                "/api/llm/providers",
+                get(super::list_providers).post(super::create_provider),
+            )
+            .route("/api/llm/providers/:id", put(super::update_provider))
             .with_state(state)
     }
 
@@ -1264,6 +1275,58 @@ mod tests {
         .await;
         assert_eq!(status, HttpStatus::OK, "list keys: {body}");
         body["api_keys"].clone()
+    }
+
+    /// 辅助：POST 建 provider（anthropic_base_url 取传入值，可为字符串/null/""），返回 id。
+    async fn create_provider(app: &Router, anthropic_base_url: Value) -> String {
+        let (status, body) = call(
+            app,
+            json_request(
+                Method::POST,
+                "/api/llm/providers".to_string(),
+                &json!({
+                    "name": "测试",
+                    "provider_type": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "sk-test",
+                    "anthropic_base_url": anthropic_base_url,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::CREATED, "create provider: {body}");
+        body["id"].as_str().expect("provider id").to_string()
+    }
+
+    /// 辅助：PUT 更新 provider（默认字段缺省 anthropic_base_url → 语义为“不修改”）。
+    /// 需要覆盖该字段时传 `anthropic_override`（None 表示请求体不含该字段）。
+    async fn update_provider(app: &Router, id: &str, anthropic_override: Option<Value>) {
+        let mut req = json!({
+            "name": "测试",
+            "provider_type": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "",
+        });
+        if let Some(v) = anthropic_override {
+            req["anthropic_base_url"] = v;
+        }
+        let (status, body) = call(
+            app,
+            json_request(Method::PUT, format!("/api/llm/providers/{id}"), &req),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "update provider: {body}");
+    }
+
+    /// 辅助：GET /api/llm/providers 返回的 providers 数组。
+    async fn list_providers(app: &Router) -> Value {
+        let (status, body) = call(
+            app,
+            json_request(Method::GET, "/api/llm/providers".to_string(), &json!(null)),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "list providers: {body}");
+        body["providers"].clone()
     }
 
     #[tokio::test]
@@ -1426,5 +1489,90 @@ mod tests {
         let keys = list_keys(&app).await;
         assert_eq!(keys[0]["enabled"], json!(true), "校验失败不应改动 enabled");
         assert_eq!(keys[0]["kb_id"], Value::Null, "绑定失败不应改动 kb_id");
+    }
+
+    // ── anthropic_base_url 清空语义（三态） ──────────────────────────────────
+
+    /// 显式 `null` 必须清空 anthropic_base_url（回归：裸 Option 把 null 当“不修改”，
+    /// 旧值永远留在库里，用户无法清空）。
+    #[tokio::test]
+    async fn provider_anthropic_base_url_null_clears() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+        let id = create_provider(&app, json!("https://anthropic.test")).await;
+
+        // 创建后回显有值
+        let providers = list_providers(&app).await;
+        assert_eq!(
+            providers[0]["anthropic_base_url"],
+            json!("https://anthropic.test"),
+            "创建时应回显 anthropic_base_url"
+        );
+
+        // 显式 null → 清空
+        update_provider(&app, &id, Some(Value::Null)).await;
+        let providers = list_providers(&app).await;
+        assert_eq!(
+            providers[0]["anthropic_base_url"],
+            Value::Null,
+            "显式 null 应清空 anthropic_base_url"
+        );
+    }
+
+    /// 字段缺失 → 不修改（沿用已有值）；这是“null=清空”之外的另一个三态分支。
+    #[tokio::test]
+    async fn provider_anthropic_base_url_missing_keeps_existing() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+        let id = create_provider(&app, json!("https://anthropic.test")).await;
+
+        // 请求体不含 anthropic_base_url 字段 → 保留既有值
+        update_provider(&app, &id, None).await;
+        let providers = list_providers(&app).await;
+        assert_eq!(
+            providers[0]["anthropic_base_url"],
+            json!("https://anthropic.test"),
+            "字段缺失应保留已有值"
+        );
+    }
+
+    /// 空串/纯空白 → 归一为 None（创建与更新两侧都不落 "" 脏数据）。
+    #[tokio::test]
+    async fn provider_anthropic_base_url_empty_string_normalized() {
+        let state = test_api_state().await;
+        let app = test_router(state);
+
+        // 创建时空串 → None
+        let id = create_provider(&app, json!("")).await;
+        let providers = list_providers(&app).await;
+        assert_eq!(
+            providers[0]["anthropic_base_url"],
+            Value::Null,
+            "创建时空串应归一为 None: {providers}"
+        );
+
+        // 更新时纯空白（trim 后为空）→ None（清掉既有值，不产生 "" 脏数据）
+        let (status, _) = call(
+            &app,
+            json_request(
+                Method::PUT,
+                format!("/api/llm/providers/{id}"),
+                &json!({
+                    "name": "测试",
+                    "provider_type": "deepseek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "",
+                    "anthropic_base_url": "   ",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        let providers = list_providers(&app).await;
+        assert_eq!(
+            providers[0]["anthropic_base_url"],
+            Value::Null,
+            "更新时空串（trim 后）应归一为 None: {providers}"
+        );
     }
 }

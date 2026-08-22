@@ -150,7 +150,9 @@ async fn load_snapshot(db: &Database, cipher: Option<&LlmCipher>) -> RouteSnapsh
                     base_url: p.base_url,
                     api_key,
                     extra_config,
-                    anthropic_base_url: p.anthropic_base_url,
+                    // 防御性归一：库里历史脏数据可能存 ""（前端旧版本清空时写入），
+                    // 归一成 None 后不再触发 Anthropic 直通（Some("") 的 is_some() 为 true）。
+                    anthropic_base_url: super::normalize_anthropic_base_url(p.anthropic_base_url),
                     enabled: p.enabled != 0,
                     created_at: p.created_at,
                     updated_at: p.updated_at,

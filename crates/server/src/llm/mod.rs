@@ -127,6 +127,16 @@ where
     )?))
 }
 
+/// 归一 `anthropic_base_url`：trim 后为空视为未配置（`None`）。
+///
+/// 读写两侧都调用：写侧拒绝空串落库（创建/更新把 `""` 归一成 NULL）；
+/// 读侧（route_cache 快照构造 / provider 列表回显）防御性归一，使库里**已存的** `""`
+/// 脏数据不再触发 Anthropic 直通——`Some("")` 时 `is_some()` 为 true 会误走直通，
+/// 而前端输入框显示空、卡片也不渲染，用户完全看不出已配置。
+pub fn normalize_anthropic_base_url(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Request body for creating/updating a provider.
 #[derive(Debug, serde::Deserialize)]
 pub struct ProviderRequest {
@@ -137,8 +147,11 @@ pub struct ProviderRequest {
     /// 三态语义：缺失 = 不修改；`null` = 清除；字符串 = 覆盖。
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub extra_config: Option<Option<String>>,
-    /// Anthropic Messages API base URL; 留空或 null 表示不支持。
-    pub anthropic_base_url: Option<String>,
+    /// Anthropic Messages API base URL。
+    /// 三态语义（同 extra_config）：字段缺失 = 不修改；显式 `null` = 清除；
+    /// 字符串 = 覆盖（trim 后为空按未配置处理）。前端总是发送该字段、清空时为 null。
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    pub anthropic_base_url: Option<Option<String>>,
 }
 
 /// Model configuration.

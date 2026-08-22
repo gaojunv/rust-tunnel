@@ -192,23 +192,30 @@ pub async fn run_execution(
     let has_tools = prepared.has_tools;
     let compat_enabled = prepared.compat_enabled;
 
-    // 构造完整上游请求体（协议解析 + RAG/compat 改写后的最终内容），
-    // 写入请求日志后发送，保证日志与实际发送内容一致。
+    // 构造两个上游请求体（协议解析 + RAG/compat 改写后的最终内容）：
+    // - openai_body：转换路径请求体，候选走 v1/chat/completions（或 v1/responses）。
+    // - anthropic_body：原始 Anthropic 请求体，配 anthropic_base_url 的候选直发 /v1/messages。
     //
-    // Anthropic 直通（至少一个候选配 anthropic_base_url 且入口带原始 body）：
-    // 日志记录原始 Anthropic body（实际发送给 /v1/messages 的内容，model 覆盖为
-    // 首选候选真实名）；否则记录转换路径的 build_upstream_body 结果。
-    let direct_anthropic = prepared.anthropic_body.is_some()
+    // 发送策略由 execute_with_failover 每候选独立判定（配 anthropic_base_url → 直发原始
+    // Anthropic body；否则用 openai_body 打 OpenAI 端点）。此处把两个 body 都传下去，
+    // 绝不能让"链上存在直通候选"把 openai_body 整个换掉——否则无 anthropic_base_url 的
+    // 候选会拿着 Anthropic 格式 body 打 v1/chat/completions（上游 400，用户实证的根因）。
+    //
+    // 请求日志记录"首选候选实际发送的内容"（混合链下与真实发送一致）：
+    // 首选配 anthropic_base_url 且入口带原始 body → 记录原始 Anthropic body（model 覆盖为
+    // 首选候选真实名）；否则记录转换路径的 openai_body。
+    let openai_body = super::upstream::build_upstream_body(request);
+    let first_is_direct_anthropic = prepared.anthropic_body.is_some()
         && chain
             .candidates
-            .iter()
-            .any(|c| c.provider.anthropic_base_url.is_some());
-    let req_body = if direct_anthropic {
+            .first()
+            .is_some_and(|c| c.provider.anthropic_base_url.is_some());
+    let log_body = if first_is_direct_anthropic {
         let mut raw = prepared.anthropic_body.clone().unwrap();
         raw["model"] = request.model.clone().into();
         raw
     } else {
-        super::upstream::build_upstream_body(request)
+        openai_body.clone()
     };
     super::log_llm_request(
         &state.llm,
@@ -220,14 +227,14 @@ pub async fn run_execution(
         None,
         None,
         0,
-        &req_body,
+        &log_body,
     )
     .await;
     let outcome = super::upstream::execute_with_failover(
         &state.llm.breakers,
         &state.llm.known_failures,
         chain,
-        &req_body,
+        &openai_body,
         request.stream,
         prepared.anthropic_body.as_ref(),
     )
