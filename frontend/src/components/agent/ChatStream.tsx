@@ -75,6 +75,11 @@ const EARLIER_PAGE_SIZE = 200;
 const HEARTBEAT_TIMEOUT_MS = 75_000;
 /** 看门狗扫描周期：远小于心跳超时，保证假死判定延迟在可接受范围。 */
 const WATCHDOG_INTERVAL_MS = 30_000;
+/** 回前台/网络恢复的「快速判定」阈值：此刻浏览器/操作系统刚恢复计时器与网络
+ *  栈，连接若在后台期间已被静默掐死则绝不显示旧帧；超过一个心跳间隔（25s）无帧
+ *  直接判定假死立即重连（低于常规假死阈值 75s——回前台是廉价的重新同步时机，
+ *  误杀健康连接只多一次无害重连 + 历史对账，远好于让用户等看门狗下一轮扫描）。 */
+const RESUME_STALE_MS = 30_000;
 /** live WS 帧创建消息的稳定 id 计数器：history 行用服务端 rowid（AgentMessage.id），
  *  live 创建的流式气泡/user/system/plan 消息在创建时分配 `live-N` 唯一 id（React key
  *  用）。模块级计数跨组件挂载/多标签页递增，与 DB rowid（数字串）格式不冲突。
@@ -598,6 +603,9 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     let watchdogTimer: ReturnType<typeof setInterval> | null = null;
     // 断线且重连成功时需要重载历史：服务端在断线期间可能已把回合跑完并落库
     let needHistoryReload = false;
+    // 回前台主动体检（onResumeCheck）使用的探测定时器：发 ping 后等一个 RTT，
+    // 无回帧即判定假死。CONNECTING 卡的守上限见 handleResume。
+    let probeTimer: ReturnType<typeof setTimeout> | null = null;
     // ref 在组件生命周期内恒定，复制到局部变量供 handler/cleanup 使用（exhaustive-deps）
     const pendingTools = pendingToolsRef.current;
 
@@ -1102,8 +1110,68 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
         w.close();
       }
     }, WATCHDOG_INTERVAL_MS);
+
+    // 回前台/网络恢复主动体检：页面在后台（切浏览器/手机熄屏）时 JS 定时器冻结、
+    // 系统休眠会静默杀死 WS（半开 TCP 无 onclose），后台期间的指数退避还可能已
+    // 累积到 15s——仅靠看门狗要等下一轮扫描（30s）+ 常规阈值（75s），用户回前台
+    // 会长时间看到「正在重连」。此刻立即收敛：
+    //  - 无连接（退避等待中）→ 重置退避立即重连；
+    //  - OPEN 但超过一个心跳间隔无帧 → 直接判定假死立即重连；
+    //  - OPEN 且刚有帧 → 发探测帧，1 个 RTT（2s）内无回帧判定假死重连；
+    //  - CONNECTING（移动网络重建后握手可能永远挂着）→ 关闭重新握手。
+    const handleResume = () => {
+      if (closedByCleanup) return;
+      const w = wsRef.current;
+      if (!w || w.readyState === WebSocket.CLOSED || w.readyState === WebSocket.CLOSING) {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        attempts = 0;
+        connect();
+        return;
+      }
+      if (w.readyState === WebSocket.CONNECTING) {
+        w.close(); // 后台挂起的握手：onclose 调度重连（attempts 递进，快速重试）
+        return;
+      }
+      // OPEN
+      if (probeTimer) return; // 上一次的探测还在等回帧，不叠加
+      if (Date.now() - lastFrameAtRef.current > RESUME_STALE_MS) {
+        w.close(); // 明显假死：跳过节流直接重连
+        return;
+      }
+      try {
+        w.send(JSON.stringify({ type: 'ping' })); // 服务端忽略未知帧，仅探活
+      } catch {
+        w.close();
+        return;
+      }
+      // 快照连接实例与发出时刻基线：2s 后若已被更新的实例顶替（onopen 已重置过
+      // 基线）则不动作；只看「发出后」是否收到回帧（不能用全局基线的绝对值比较——
+      // 中途经过多次 handleResume 的基线早已越过窗口）。
+      const probed = w;
+      const probeSentAt = Date.now();
+      probeTimer = globalThis.setTimeout(() => {
+        probeTimer = null;
+        if (wsRef.current === probed && lastFrameAtRef.current <= probeSentAt) {
+          probed.close();
+        }
+      }, 2_000);
+    };
+    const onVisibility = () => {
+      if (!document.hidden) handleResume();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    globalThis.addEventListener('online', handleResume);
     return () => {
       closedByCleanup = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      globalThis.removeEventListener('online', handleResume);
+      if (probeTimer) {
+        clearTimeout(probeTimer);
+        probeTimer = null;
+      }
       if (watchdogTimer) {
         clearInterval(watchdogTimer);
         watchdogTimer = null;

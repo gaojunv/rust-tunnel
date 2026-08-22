@@ -359,6 +359,74 @@ describe('ChatStream running state', () => {
     expect(screen.getByText('agent.reconnecting')).toBeTruthy();
   });
 
+  it('回前台（visibilitychange）时超过一个心跳间隔无帧直接判定假死重连', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    // 模拟切浏览器/熄屏回前台场景：连接 OPEN 但后台期间被静默掐死（无 onclose），
+    // 看门狗还要等下一轮 30s 扫描 + 75s 阈值；visibilitychange 应立即收敛。
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    renderChat();
+    act(() => {
+      wsInstance!.onopen?.(); // 建立基线
+    });
+    // 后台挂起 40s（超过 RESUME_STALE_MS=30s，未到看门狗 75s 阈值）后回前台
+    nowSpy.mockReturnValue(1_000_000 + 40_000);
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    // 立即判定假死：主动 close → onclose 走重连路径（不等看门狗下一轮扫描）
+    expect(wsInstance!.close).toHaveBeenCalled();
+    expect(screen.getByText('agent.reconnecting')).toBeTruthy();
+  });
+
+  it('回前台时连接刚有帧则发探测帧，2s 内收到回帧不动作', async () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    renderChat();
+    act(() => {
+      wsInstance!.onopen?.();
+    });
+    // 回前台时连接可能还活着（刚收到帧）→ 发 ping 探测而不是盲目重连
+    nowSpy.mockReturnValue(1_000_000 + 5_000);
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(wsInstance!.sent.some((s) => s.includes('"type":"ping"'))).toBe(true);
+    expect(wsInstance!.close).not.toHaveBeenCalled();
+    // 探测后服务端心跳回帧（连接活着）→ 2s 检查点不关闭。探测定时器是真实
+    // setTimeout（未启 fake timers），用真时钟等待其触发；Date.now 由 mock 控制。
+    nowSpy.mockReturnValue(1_000_000 + 5_500);
+    act(() => {
+      wsInstance!.emit({ type: 'heartbeat', ts: 0 });
+    });
+    nowSpy.mockReturnValue(1_000_000 + 8_000); // 越过 2s 探测窗口
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 2_100));
+    });
+    expect(wsInstance!.close).not.toHaveBeenCalled();
+  });
+
+  it('online 事件时无连接（退避等待中）立即重连并重置退避', () => {
+    (listAgentMessages as Mock).mockResolvedValue([]);
+    vi.useFakeTimers();
+    renderChat();
+    act(() => {
+      wsInstance!.onopen?.();
+      wsInstance!.onclose?.(); // 断线 → 退避 1s 后重连
+    });
+    // 连续断两次把退避推到 2s（验证重置：online 后 attempts 归零，下次断线回 1s）
+    act(() => {
+      vi.advanceTimersByTime(1_000); // 触发第一次重连（新实例）
+      wsInstance!.onopen?.();
+      wsInstance!.onclose?.();
+    });
+    const before = wsInstances.length;
+    // 网络恢复事件：退避计时器未到期也应立即重连
+    act(() => {
+      globalThis.dispatchEvent(new Event('online'));
+    });
+    expect(wsInstances.length).toBe(before + 1); // 立即新建连接
+  });
+
   it('renders new-format tool_calls/tool_result history', async () => {
     (listAgentMessages as Mock).mockResolvedValue([
       { id: 'm1', session_id: 's1', role: 'user', content: '看下文件', tool_calls: null, tool_call_id: null, name: null, kind: 'message', created_at: '2026-08-05' },
