@@ -33,7 +33,9 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-background p-4">
+    // 容器背景透明：开极光时露出 Aurora 画布；未开启（titleEffect === 'none'）时
+    // 直接透出 body 背景（--background + 深色模式辉光渐变），与菜单页保持一致
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden p-4">
       {prefs.titleEffect !== 'none' && (
         <Suspense fallback={null}>
           <AuroraBackground />
