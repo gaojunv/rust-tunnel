@@ -10,9 +10,22 @@ const SHORT_STRING_MAX = 120;
  *  截断提示行之后，或个别实现的首行）。剥出做 caption + 行号起始。 */
 const READ_MARKER_RE = /\[showing lines\s+(\d+)\s*-\s*(\d+)\s+of\s+(\d+)\]/;
 
-/** ACP claude-code Read 输出自带行号前缀（形如 `   123→code` 或 `123│code`）：
- *  命中首个非空行则原样透传，不重复加行号。 */
-const ACP_LINE_PREFIX_RE = /^\s*\d+\s*[→│|]/;
+/** ACP agent 的 Read 输出自带行号前缀。实测格式：
+ *  - claude-code：`spaces + 行号 + Tab`（终端把 Tab 渲染成 `→`，原文是 \t；
+ *    只认 →/│/| 会漏判 → 我们再叠一层 gutter 就是用户反馈的「双行号」）
+ *  - 其他 agent 可能是 `123│code` / `123|code` / `123: code`
+ *  冒号形态有误判面（日志行 `12:30:45` 也命中），故单行命中不足为凭——
+ *  hasOwnLineNumbers 用前 3 个非空行多数确认。 */
+const ACP_LINE_PREFIX_RE = /^\s*\d+\s*(?:[→│|:]|\t)/;
+
+/** 结果正文是否已自带行号：取前 3 个非空行，多数（单行样本则唯一行）命中
+ *  行号前缀即判定透传。多行确认防日志/冒号文本的偶发误判。 */
+function hasOwnLineNumbers(bodyLines: string[]): boolean {
+  const sample = bodyLines.filter((l) => l.trim()).slice(0, 3);
+  if (sample.length === 0) return false;
+  const hits = sample.filter((l) => ACP_LINE_PREFIX_RE.test(l)).length;
+  return sample.length === 1 ? hits === 1 : hits >= 2;
+}
 
 function parseArgsObject(args: string): Record<string, unknown> | null {
   try {
@@ -153,13 +166,14 @@ function CodeBlock({ text }: { text: string }) {
   );
 }
 
-/** read 结果：marker 剥出做 caption + 行号 gutter；ACP 自带行号则原样透传。 */
+/** read 结果：marker 剥出做 caption + 行号 gutter；已自带行号（ACP 各 agent
+ *  的 Read 输出）则原样透传——caption 仍保留（marker 信息独立于行号）。 */
 function ReadResult({ result, args }: { result: string; args?: string }) {
   const { t } = useTranslation();
   const lines = result.split('\n');
   const { marker, body } = extractReadMarker(lines);
   const bodyLines = body.split('\n');
-  const acpPrefixed = ACP_LINE_PREFIX_RE.test(bodyLines.find((l) => l.trim()) ?? '');
+  const acpPrefixed = hasOwnLineNumbers(bodyLines);
   // 起始行号：marker 的 X 优先；否则 args 的 offset（缺省 1 但仍需要「显式」
   // 依据才启用 gutter——全量读取无 marker 无 offset 时退化为无行号代码块）
   const start = marker ? marker.from : (parseArgsOffset(args) ?? null);
@@ -167,7 +181,20 @@ function ReadResult({ result, args }: { result: string; args?: string }) {
   const caption = marker
     ? t('agent.readLinesRange', { from: marker.from, to: marker.to, total: marker.total })
     : null;
-  if (acpPrefixed) return <CodeBlock text={body} />;
+  if (acpPrefixed) {
+    return (
+      <div className="overflow-hidden rounded-md border border-border/60">
+        {caption && (
+          <div className="border-b border-border/60 bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
+            {caption}
+          </div>
+        )}
+        <div className="max-h-72 overflow-auto whitespace-pre px-2 py-1 font-mono text-xs leading-5">
+          {body}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="overflow-hidden rounded-md border border-border/60">
       {caption && (

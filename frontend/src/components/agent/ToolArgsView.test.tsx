@@ -83,6 +83,36 @@ describe('ToolResultView', () => {
     expect(container.querySelector('.w-10')).toBeNull();
   });
 
+  it('read: claude-code tab-separated line numbers passthrough (no double gutter)', () => {
+    // claude-code Read 的真实输出是「空格 + 行号 + Tab」（终端把 Tab 显示成 →），
+    // 只认 →/│/| 会漏判而再叠一层 gutter（双行号回归）
+    const result = '     1\tfn main() {}\n     2\tlet x = 1;';
+    const { container } = render(
+      <ToolResultView name="Read" kind="read" args={'{"file_path":"a.ts","offset":1}'} result={result} />,
+    );
+    expect(container.textContent ?? '').toContain('fn main()');
+    // 无 gutter（.w-10 是 gutter 的定宽类）
+    expect(container.querySelector('.w-10')).toBeNull();
+  });
+
+  it('read: marker caption kept even when content is ACP-prefixed', () => {
+    const result = '  10→fn main() {}\n  11→let x = 1;\n[showing lines 10-11 of 100]';
+    const { container } = render(<ToolResultView name="Read" kind="read" result={result} />);
+    expect(container.textContent ?? '').toContain('10-11');
+    expect(container.textContent ?? '').not.toContain('[showing lines');
+    expect(container.querySelector('.w-10')).toBeNull();
+  });
+
+  it('read: non-prefixed plain content with offset still gets gutter', () => {
+    // 确认多数确认规则不误伤：普通代码 + offset → 仍加 gutter
+    const result = 'fn main() {}\nlet x = 1;\nreturn 0;';
+    const { container } = render(
+      <ToolResultView name="Read" kind="read" args={'{"file_path":"a.ts","offset":20}'} result={result} />,
+    );
+    expect(container.querySelector('.w-10')).toBeTruthy();
+    expect(screen.getByText('20')).toBeTruthy();
+  });
+
   it('search: code-block style with result text', () => {
     render(<ToolResultView name="search" kind="search" result={'src/a.ts:3: todo fix'} />);
     expect(screen.getByText('src/a.ts:3: todo fix')).toBeTruthy();
