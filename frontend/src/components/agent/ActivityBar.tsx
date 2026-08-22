@@ -114,38 +114,33 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
-  // 移动端（<768px）：VS Code 侧栏在 393px 宽度上不可用——改为底部固定图标栏，
-  // 面板经底部 Sheet（side="bottom"）弹出。面板内容仅在对应 Sheet open 时挂载
-  // （Radix Dialog 关闭即卸载），避免在页面常驻重量级文件/终端面板。
+  // 移动端（<768px）：VS Code 侧栏在 393px 宽度上不可用——改为卡片内底部 footer
+  // 图标行（由 AgentPage 渲染在对话区下方），面板经底部 Sheet（side="bottom"）弹出。
+  // 面板内容仅在对应 Sheet open 时挂载（Radix Dialog 关闭即卸载），避免在页面常驻
+  // 重量级文件/终端面板。
   if (variant === 'mobile') {
     return (
       <>
-        {/* 底部固定图标栏：外层承担安全区下内边距，内层 h-12 保持触控高度不被挤压。
-            聊天区/输入框的垂直占位（避开本栏）由 AgentPage 主区域 pb-12 承担——
-            此前在横向 flex 里放 h-12 spacer 宽度为 0，不产生占位，导致输入框卡片
-            底部被本栏遮挡（发送/停止按钮不可见）。
-            垫高用 env(safe-area-inset-bottom) 自适应（对标 Kimi）：全面屏 iPhone
-            垫满 Home 指示条区，home 键机型 safe-area=0 时 h-12 本身已是触控高度、
-            无需额外垫高。 */}
-        <div className="fixed bottom-0 left-0 right-0 z-40 border-t border-border/60 bg-card/95 backdrop-blur-md pb-[env(safe-area-inset-bottom,0px)] md:hidden">
-          <div className="flex h-12 items-center justify-around">
-            {ICONS.map(({ kind, Icon, labelKey }) => (
-              <button
-                key={kind}
-                type="button"
-                aria-label={t(labelKey)}
-                aria-pressed={active === kind}
-                onClick={() => toggle(kind)}
-                className={cn(
-                  // 44px 触控目标（Apple HIG）：移动端图标按钮比桌面大一号
-                  'flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
-                  active === kind && 'bg-accent text-primary'
-                )}
-              >
-                <Icon className="h-5 w-5" />
-              </button>
-            ))}
-          </div>
+        {/* 底栏 footer：与顶栏（border-b p-1.5 + ghost sm 按钮）上下对称——
+            相同行高/内边距/按钮规格（h-9 w-9 + h-4 图标），border-t 贴住对话区，
+            无空隙；justify-around 让四个按钮整行平均分布。
+            安全区垫高由 AppLayout 容器统一承担，本栏不重复处理。 */}
+        <div className="flex items-center justify-around border-t border-border/60 p-1.5">
+          {ICONS.map(({ kind, Icon, labelKey }) => (
+            <button
+              key={kind}
+              type="button"
+              aria-label={t(labelKey)}
+              aria-pressed={active === kind}
+              onClick={() => toggle(kind)}
+              className={cn(
+                'flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                active === kind && 'bg-accent text-primary'
+              )}
+            >
+              <Icon className="h-4 w-4" />
+            </button>
+          ))}
         </div>
         {/* 底部 Sheet 面板：每个图标一个受控 Sheet，open 时挂载对应面板 */}
         {ICONS.map(({ kind, labelKey }) => (

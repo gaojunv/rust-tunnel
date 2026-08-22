@@ -270,19 +270,18 @@ export default function AgentPage() {
       </div>
 
       <div className="flex min-h-0 flex-1">
-        {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例） */}
-        {tabs.active && (
+        {/* VS Code 式 Activity Bar（选中会话后可用；workspace 级单实例）。
+            桌面端：侧栏在横向 flex 内；移动端：footer 行在对话区下方（见下方
+            第二个渲染点），与顶栏上下对称、贴住聊天区无空隙。 */}
+        {tabs.active && isDesktop && (
           <ActivityBar
             sessionId={tabs.active}
             workspaceId={workspaceId}
-            variant={isDesktop ? 'sidebar' : 'mobile'}
+            variant="sidebar"
           />
         )}
 
-        {/* 对话区：所有打开的 tab 保持挂载，非激活用 hidden 隐藏（后台流式继续、草稿不丢）。
-            移动端避开底部 fixed 按钮栏的 48px 由 AppLayout 在 /agent 路由 main 上
-            垫高承担（抬高整个卡片壳），不在本区垫——否则只是抬高卡片内内容，白色
-            卡片壳（bg-card）仍向下穿透到按钮栏顶，多露出一块白色。 */}
+        {/* 对话区：所有打开的 tab 保持挂载，非激活用 hidden 隐藏（后台流式继续、草稿不丢）。 */}
         <div className="min-w-0 flex-1">
           {tabs.open.length > 0 ? (
             tabs.open.map((id) => (
@@ -309,6 +308,16 @@ export default function AgentPage() {
           )}
         </div>
       </div>
+
+      {/* 移动端底栏：卡片内 footer（border-t 贴住对话区下缘，与顶栏对称）。
+          输入框随聊天区下移到本栏正上方，中间无空隙。 */}
+      {tabs.active && !isDesktop && (
+        <ActivityBar
+          sessionId={tabs.active}
+          workspaceId={workspaceId}
+          variant="mobile"
+        />
+      )}
 
       {showWorkspaceDialog && (
         <WorkspaceDialog

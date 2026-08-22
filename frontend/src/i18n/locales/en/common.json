@@ -982,7 +982,7 @@
     "loadEarlierMessages": "Load earlier messages",
     "loadingEarlier": "Loading…",
     "cancelFallback": "Agent did not respond to stop; it was force-restarted and context may be lost",
-    "inputPlaceholder": "Describe what you need… (Enter to send, Shift+Enter for newline)",
+    "inputPlaceholder": "Describe what you need…",
     "send": "Send",
     "connectionLost": "Connection lost. Please refresh and try again.",
     "selectSession": "Select session…",

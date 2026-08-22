@@ -1649,17 +1649,16 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
             时都与消息流左/右边缘精确对齐。sticky 在文档流中占位，滚动到底时输入框
             落在消息流末尾；-mx-3 md:-mx-5 把背景横向铺满滚动容器 padding 区。
             容器自身无色，内部单层渐变背景遮挡滚动内容，不占文档流高度。
-            底部垫高用 env(safe-area-inset-bottom) 自适应（对标 Kimi：全面屏
-            iPhone 垫满 Home 指示条区、home 键机型垫 0 不悬空），+12px 最小值
-            兜底保证输入框不贴屏幕物理边缘。 */}
-        <div className="sticky bottom-0 z-20 -mx-3 px-3 pb-[calc(env(safe-area-inset-bottom,0px)+12px)] pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
+            移动端底部 pb-3 即可：输入框下方是卡片内 ActivityBar footer 栏，
+            Home 指示条安全区由 AppLayout 容器统一垫高，本层不再重复处理。 */}
+        <div className="sticky bottom-0 z-20 -mx-3 px-3 pb-3 pt-1.5 md:-mx-5 md:px-5 md:pb-5 md:pt-2">
           {/* 单层渐变背景：容器顶（0%，消息完全可见）→ 输入框卡片底边（100%，
               完全消失）→ 保持到底。同色 alpha 渐变（hsl(var(--card)/0) →
               hsl(var(--card))）不发灰。无论有无 turn-duration/todos 等附加
               面板（容器高度变化），渐隐都连续无跳变——替代原两层方案（实色块 +
               渐隐带，中间有 100%→0% 跳变，附加面板区域消息被一刀切挡住）。
               内容 div 用 relative 压在背景层之上。 */}
-          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_env(safe-area-inset-bottom,0px)_-_12px))] md:bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_1.25rem))]" />
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_0.75rem))] md:bg-[linear-gradient(to_bottom,hsl(var(--card)/0),hsl(var(--card))_calc(100%_-_1.25rem))]" />
           <div className="relative mx-auto w-full max-w-3xl">
           {running && (
             /* 运行中指示：视觉已迁移到输入框彩色边框（容器 .agent-input-running，
