@@ -731,6 +731,11 @@ export interface AgentSession {
   context_used?: number | null;
   /** 上下文窗口大小（tokens），与 context_used 成对出现 */
   context_size?: number | null;
+  /** ACP 会话配置状态（JSON map：config_id → value；仅用户显式切换过的项）。
+   *  含 model tier（claude-code opus/sonnet/haiku）、mode、effort 等。后端
+   *  set_config_option 成功后持久化；前端用作 WS 快照未达时的显示种子，避免
+   *  切页/刷新后模型/配置显示重置为默认。 */
+  config_state?: string | null;
   created_at: string;
   updated_at: string;
 }

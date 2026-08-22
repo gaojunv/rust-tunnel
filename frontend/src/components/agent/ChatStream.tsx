@@ -1525,6 +1525,13 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
     setLastTurnDurationMs(null);
   }, [queryClient, workspaceId, sessionId]);
 
+  // 当前会话记录（会话切换/缓存更新时重取）：用于透传持久化 config_state 给
+  // SessionSettingsMenu——WS 快照（configOptions）未达时作 model tier 显示种子，
+  // 切页/刷新后 ACP 进程已回收场景下模型选择不回退显示默认。
+  const sessionRecord = queryClient
+    .getQueryData<AgentSession[]>(['agent-sessions', workspaceId])
+    ?.find((x) => x.id === sessionId);
+
   // 单条消息渲染：虚拟化与全量路径共用。streaming 标记当前正在流式写入的气泡
   // （assistant/thought），MessageBubble 据此用 `<Markdown streaming />` 渲染
   // （保留 md 结构、去掉 code 插件避免 Shiki 每帧全量重高亮，见 Markdown.tsx）。
@@ -1828,6 +1835,7 @@ export default function ChatStream({ sessionId, workspaceId, model, approvalMode
               onConfigChange={sendConfigOption}
               claudeTierModels={claudeTierModels}
               agentType={agentType}
+              configState={sessionRecord?.config_state}
             />
             {/* ACP 上下文用量环（Claude Code 插件形态）：usage 帧/会话快照驱动，
                 >80% 黄、>95% 红；占比 >50% 且 agent 提供 compact 命令时可点击

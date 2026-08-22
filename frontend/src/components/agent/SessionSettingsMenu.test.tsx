@@ -207,4 +207,46 @@ describe('SessionSettingsMenu', () => {
     await openMenu();
     expect(screen.getByText('agent.tierModelActiveHint')).toBeTruthy();
   });
+
+  it('seeds tier model from persisted configState when WS snapshot absent (page switch)', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [{ id: 'my-opus-alias', label: 'Claude Opus（Anthropic）' }],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    // 切页/刷新后：ACP 进程已回收，configOptions 为空（WS 快照未达），但
+    // config_state 持久化过 model=opus —— 显示种子应显示映射模型而非默认。
+    renderMenu({
+      model: 'deepseek-chat',
+      agentType: 'claude-code',
+      claudeTierModels: '{"opus":"my-opus-alias"}',
+      configOptions: [],
+      configState: '{"model":"opus"}',
+    });
+    expect(await screen.findByText('Opus · Claude Opus（Anthropic）')).toBeTruthy();
+  });
+
+  it('prefers live WS snapshot over persisted configState when both present', async () => {
+    vi.mocked(listAgentSelectableModels).mockResolvedValue({
+      models: [
+        { id: 'my-sonnet-alias', label: 'Claude Sonnet（Anthropic）' },
+        { id: 'my-opus-alias', label: 'Claude Opus（Anthropic）' },
+      ],
+      groups: [],
+      byModelId: {},
+      byGroupId: {},
+    });
+    // WS 快照（进程活着/回放后）优先于持久化种子——config_state 可能滞后于在途切换。
+    renderMenu({
+      agentType: 'claude-code',
+      claudeTierModels: '{"opus":"my-opus-alias","sonnet":"my-sonnet-alias"}',
+      configOptions: [
+        { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'sonnet', options: [] },
+      ],
+      configState: '{"model":"opus"}',
+    });
+    expect(await screen.findByText('Sonnet · Claude Sonnet（Anthropic）')).toBeTruthy();
+    expect(screen.queryByText(/Opus ·/)).toBeNull();
+  });
 });

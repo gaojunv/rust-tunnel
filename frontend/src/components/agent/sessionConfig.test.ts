@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { currentOptionLabel, normalizeConfigOptions } from './sessionConfig';
+import { configStateModelValue, currentOptionLabel, normalizeConfigOptions } from './sessionConfig';
 
 describe('normalizeConfigOptions', () => {
   it('flattens grouped select options and keeps currentValue', () => {
@@ -53,5 +53,23 @@ describe('currentOptionLabel', () => {
     expect(
       currentOptionLabel({ id: 'mode', name: 'Mode', type: 'select', currentValue: 'x', options: [] }),
     ).toBe('x');
+  });
+});
+
+describe('configStateModelValue', () => {
+  it('extracts model value from persisted config_state', () => {
+    expect(configStateModelValue('{"model":"opus","mode":"plan"}')).toBe('opus');
+  });
+
+  it('returns undefined for empty/missing/malformed input', () => {
+    expect(configStateModelValue(undefined)).toBeUndefined();
+    expect(configStateModelValue(null)).toBeUndefined();
+    expect(configStateModelValue('')).toBeUndefined();
+    expect(configStateModelValue('   ')).toBeUndefined();
+    expect(configStateModelValue('not-json')).toBeUndefined();
+    expect(configStateModelValue('["model"]')).toBeUndefined();
+    expect(configStateModelValue('{"mode":"plan"}')).toBeUndefined();
+    expect(configStateModelValue('{"model": 1}')).toBeUndefined();
+    expect(configStateModelValue('{"model":"  "}')).toBeUndefined();
   });
 });

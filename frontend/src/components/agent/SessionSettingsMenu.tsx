@@ -16,7 +16,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import type { SessionConfigOption } from '../../types';
-import { currentOptionLabel } from './sessionConfig';
+import { configStateModelValue, currentOptionLabel } from './sessionConfig';
 import { listAgentSelectableModels, resolveWorkspaceModelRef } from '../../api/agentModels';
 import { useRoles, useUpdateSessionRole } from '../../api/hooks';
 import ModelPicker from './ModelPicker';
@@ -34,6 +34,11 @@ interface Props {
   sessionId?: string;
   claudeTierModels?: string | null;
   agentType?: string | null;
+  /** 持久化的会话 config_state（后端 set_config_option 成功后落库的 JSON map）。
+   *  WS 快照（configOptions）未达/未含 model 项时，用它解析出的 model 值做 tier
+   *  显示种子——切页/刷新后 ACP 进程被回收、session_state 未到时，tier 选择
+   *  不回退显示默认。 */
+  configState?: string | null;
 }
 
 /** 统一会话设置菜单（输入框左下，原 ModelSelect 位置）：网关模型 + 会话角色 +
@@ -48,6 +53,7 @@ export default function SessionSettingsMenu({
   sessionId,
   claudeTierModels,
   agentType,
+  configState,
 }: Props) {
   const { t } = useTranslation();
   const { data } = useQuery({
@@ -79,10 +85,12 @@ export default function SessionSettingsMenu({
       model ??
       t('agent.sessionSettings');
     const modelOption = configOptions.find((o) => o.category === 'model');
+    // WS 快照优先；未达/未含 model 项时回退持久化 config_state 种子（切页/刷新、
+    // ACP 进程已回收场景下保持模型显示，不为默认）。
     const current =
-      typeof modelOption?.currentValue === 'string' && modelOption.currentValue.trim()
+      (typeof modelOption?.currentValue === 'string' && modelOption.currentValue.trim()
         ? modelOption.currentValue.trim()
-        : undefined;
+        : undefined) ?? configStateModelValue(configState);
     if (!current) return { display: fallback, tierActive: false };
 
     // 规则 1（tier 映射）：claude-code 且 current 为 tier 名时，按 workspace 的 tier 映射解析
@@ -130,7 +138,7 @@ export default function SessionSettingsMenu({
     }
 
     return { display: fallback, tierActive: false };
-  }, [data, model, configOptions, claudeTierModels, agentType, t]);
+  }, [data, model, configOptions, claudeTierModels, agentType, configState, t]);
 
   const renderOptionSub = (o: SessionConfigOption, hint?: string) => (
     <DropdownMenuSub key={o.id}>

@@ -42,6 +42,22 @@ export function optionValue(o: SessionConfigOption): string | boolean {
   return o.type === 'boolean' ? (o.currentBool ?? false) : (o.currentValue ?? '');
 }
 
+/** 从持久化 config_state（JSON map：config_id → value）提取 model 配置项的值
+ * （claude-code 为 opus/sonnet/haiku tier）。供 SessionSettingsMenu 在 WS 快照
+ * 未达（configOptions 为空/未含 model 项）时作显示种子——切页/刷新后 ACP 进程
+ * 已被回收的场景下，模型选择不回退显示默认。解析失败/非对象/无 model 键返回 undefined。 */
+export function configStateModelValue(configState: string | null | undefined): string | undefined {
+  if (!configState || !configState.trim()) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(configState);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    const v = (parsed as Record<string, unknown>).model;
+    return typeof v === 'string' && v.trim() ? v.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 把选项恢复到某前值：boolean 同时写回 currentBool 与 "true"/"false" 的
  * currentValue（保持归一化形态），select 写 currentValue。 */
 export function restoreConfigValue(
