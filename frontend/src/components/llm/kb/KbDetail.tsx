@@ -18,6 +18,7 @@ import {
   useDeleteLlmKb,
 } from '@/api/hooks';
 import KbDialog from './KbDialog';
+import { ConfirmDialog, useConfirm } from '../confirm';
 import type { LlmKnowledgeBase, LlmKbDocument } from '@/types';
 import {
   ArrowLeft,
@@ -142,6 +143,7 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
+  const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const [overrides, setOverrides] = useState<Record<string, DocOverride>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   // per-doc 的 processing 过期定时器（doc_id → timer）：SSE 终态事件丢失时解除
@@ -230,15 +232,18 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
   };
 
   const deleteKb = () => {
-    if (confirm(t('kb.deleteKb', { name: kb.name }))) {
-      setActionError(null);
-      deleteKbMutation.mutate(kb.id, {
-        onSuccess: onDeleted,
-        onError: (err) => {
-          setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
-        },
-      });
-    }
+    confirm(
+      { title: t('common.confirm'), description: t('kb.deleteKb', { name: kb.name }) },
+      () => {
+        setActionError(null);
+        deleteKbMutation.mutate(kb.id, {
+          onSuccess: onDeleted,
+          onError: (err) => {
+            setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+          },
+        });
+      },
+    );
   };
 
   return (
@@ -351,32 +356,38 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
                     doc={d}
                     deleting={deleting}
                     reindexing={reindexing}
-                    onDelete={() => {
-                      if (confirm(t('kb.deleteDoc', { name: d.filename }))) {
-                        setActionError(null);
-                        deleteMutation.mutate(
-                          { kbId: kb.id, docId: d.id },
-                          {
-                            onError: (err) => {
-                              setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                    onDelete={() =>
+                      confirm(
+                        { title: t('common.confirm'), description: t('kb.deleteDoc', { name: d.filename }) },
+                        () => {
+                          setActionError(null);
+                          deleteMutation.mutate(
+                            { kbId: kb.id, docId: d.id },
+                            {
+                              onError: (err) => {
+                                setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                              },
                             },
-                          },
-                        );
-                      }
-                    }}
-                    onReindex={() => {
-                      if (confirm(t('kb.reindexConfirm', { name: d.filename }))) {
-                        setActionError(null);
-                        reindexMutation.mutate(
-                          { kbId: kb.id, docId: d.id },
-                          {
-                            onError: (err) => {
-                              setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                          );
+                        },
+                      )
+                    }
+                    onReindex={() =>
+                      confirm(
+                        { title: t('common.confirm'), description: t('kb.reindexConfirm', { name: d.filename }) },
+                        () => {
+                          setActionError(null);
+                          reindexMutation.mutate(
+                            { kbId: kb.id, docId: d.id },
+                            {
+                              onError: (err) => {
+                                setActionError(t('kb.actionError', { error: getApiErrorMessage(err) }));
+                              },
                             },
-                          },
-                        );
-                      }
-                    }}
+                          );
+                        },
+                      )
+                    }
                   />
                 );
               })}
@@ -441,6 +452,7 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
       </Card>
 
       <KbDialog open={editOpen} onClose={() => setEditOpen(false)} kbId={kb.id} />
+      <ConfirmDialog open={confirmOpen} payload={confirmPayload} onConfirm={confirmAndClose} onCancel={cancelConfirm} variant="destructive" />
     </div>
   );
 }

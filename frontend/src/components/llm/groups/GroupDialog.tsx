@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ArrowDown, ArrowUp, Trash2, RotateCcw } from 'lucide-react';
+import { ArrowDown, ArrowUp, Trash2, RotateCcw, AlertTriangle } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -26,6 +26,7 @@ import {
   useLlmAllModels,
   useLlmProviders,
 } from '@/api/hooks';
+import { getApiErrorMessage } from '@/api/client';
 
 interface MemberRow {
   model_id: string;
@@ -58,6 +59,8 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
   const [createdId, setCreatedId] = useState<string | null>(null);
   // 记录本次 (open, groupId) 是否已完成编辑态回填，防止 5s 熔断轮询的 detail 刷新覆盖用户编辑
   const backfilledRef = useRef(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   // 打开/切换组时重置编辑态（detail 仅用于熔断展示，不参与这里的依赖）
   useEffect(() => {
@@ -65,6 +68,8 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
     setMembers([]);
     setPickModelId('');
     setCreatedId(null);
+    setSaveError(null);
+    setResetError(null);
     backfilledRef.current = false;
   }, [open, groupId]);
 
@@ -104,23 +109,31 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
   };
 
   const save = async () => {
+    setSaveError(null);
+    // trim 后再提交与判空：`!name` 会让纯空格通过
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setSaveError(t('llm.groups.nameRequired'));
+      return;
+    }
     try {
       const effectiveId = groupId ?? createdId;
       let id = effectiveId;
       if (!id) {
-        const created = await createGroup.mutateAsync({ name });
+        const created = await createGroup.mutateAsync({ name: trimmedName });
         id = created.id;
         setCreatedId(created.id);
       } else {
-        await updateGroup.mutateAsync({ id, name });
+        await updateGroup.mutateAsync({ id, name: trimmedName });
       }
       await replaceMembers.mutateAsync({
         id,
         members: members.map((m, i) => ({ model_id: m.model_id, priority: i + 1 })),
       });
       onOpenChange(false);
-    } catch {
-      // 保存失败时保持对话框打开，让用户修正后重试
+    } catch (err) {
+      // 保存失败时保持对话框打开并显示错误，让用户修正后重试
+      setSaveError(getApiErrorMessage(err));
     }
   };
 
@@ -202,6 +215,19 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
             </div>
           </div>
 
+          {saveError && (
+            <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {saveError}
+            </div>
+          )}
+          {resetError && (
+            <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {resetError}
+            </div>
+          )}
+
           <div className="flex items-center justify-between">
             <div className="flex gap-2">
               {groupId && (
@@ -209,7 +235,13 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => resetBreaker.mutate(groupId)}
+                    disabled={resetBreaker.isPending}
+                    onClick={() => {
+                      setResetError(null);
+                      resetBreaker.mutate(groupId, {
+                        onError: (err) => setResetError(getApiErrorMessage(err)),
+                      });
+                    }}
                   >
                     <RotateCcw className="mr-1 h-4 w-4" />
                     {t('llm.groups.resetBreaker')}
@@ -220,7 +252,10 @@ export function GroupDialog({ open, onOpenChange, groupId, onDelete }: Props) {
                 </>
               )}
             </div>
-            <Button onClick={save} disabled={!name}>
+            <Button
+              onClick={save}
+              disabled={!name.trim() || createGroup.isPending || updateGroup.isPending || replaceMembers.isPending}
+            >
               {t('common.save')}
             </Button>
           </div>

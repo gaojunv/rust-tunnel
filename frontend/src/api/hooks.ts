@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   api,
   login,
@@ -523,7 +523,9 @@ export function useAddModel() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ providerId, ...req }: { providerId: string } & CreateModelRequest) => addModel(providerId, req),
-    onSuccess: (_data, vars) => qc.invalidateQueries({ queryKey: ['llm-models', vars.providerId] }),
+    // 新增模型后需刷新该 provider 的列表以及全部模型列表（GroupDialog 用 ['llm-models','all']）。
+    // 仅刷新 ['llm-models', providerId] 会让 GroupDialog 的选模型下拉陈旧。
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['llm-models'] }),
   });
 }
 
@@ -593,6 +595,7 @@ export function useLlmModelGroup(id: string | undefined) {
     queryFn: () => getLlmModelGroup(id!),
     enabled: !!id,
     refetchInterval: 5000, // 熔断状态轮询刷新
+    refetchIntervalInBackground: false, // 页签后台时暂停轮询
   });
 }
 
@@ -649,6 +652,8 @@ export function useLlmUsageSummary(range: UsageRange) {
   return useQuery({
     queryKey: ['llm-usage-summary', range.start, range.end],
     queryFn: () => getLlmUsageSummary(range),
+    // 统计跟随时间滚动：时间窗冻结在挂载时刻会让「最近 N 小时」口径失真
+    refetchInterval: 30_000,
   });
 }
 
@@ -656,6 +661,7 @@ export function useLlmUsageAggregate(groupBy: UsageGroupBy, range: UsageRange) {
   return useQuery({
     queryKey: ['llm-usage-aggregate', groupBy, range.start, range.end],
     queryFn: () => getLlmUsageAggregate(groupBy, range),
+    refetchInterval: 30_000,
   });
 }
 
@@ -663,6 +669,9 @@ export function useLlmUsageLogs(range: UsageRange, limit = 50, offset = 0) {
   return useQuery({
     queryKey: ['llm-usage-logs', range.start, range.end, limit, offset],
     queryFn: () => getLlmUsageLogs({ ...range, limit, offset }),
+    refetchInterval: 30_000,
+    // 翻页时保留上一页数据，避免整表闪回 loading 行
+    placeholderData: keepPreviousData,
   });
 }
 

@@ -23,7 +23,9 @@
     "noData": "No data available",
     "close": "Close",
     "add": "Add",
-    "disabled": "Disabled"
+    "disabled": "Disabled",
+    "confirm": "Confirm",
+    "saveError": "Save failed: {{error}}"
   },
   "timeRange": {
     "custom": "Custom"
@@ -566,7 +568,10 @@
       "anthropicDomainHint": "Accepts /v1/messages",
       "listenAddress": "Listen Address",
       "tls": "TLS",
-      "acmeAutoRenew": "ACME Auto-Renew"
+      "acmeAutoRenew": "ACME Auto-Renew",
+      "saved": "Saved",
+      "saveError": "Save failed: {{error}}",
+      "unsaved": "Unsaved changes"
     },
     "providerCard": {
       "baseUrl": "Base URL: {{url}}",
@@ -624,7 +629,9 @@
         "closed": "Closed",
         "halfOpen": "Probing",
         "open": "Open {{secs}}s"
-      }
+      },
+      "nameRequired": "Group name is required",
+      "saveError": "Save failed: {{error}}"
     },
     "usage": {
       "stats": {
@@ -658,6 +665,7 @@
       },
       "empty": "No usage data for this time range",
       "loading": "Loading...",
+      "loadFailed": "Failed to load usage data. Please retry.",
       "unknown": "Unknown",
       "detail": {
         "title": "Request Details",
@@ -677,7 +685,8 @@
         "prev": "Previous",
         "next": "Next"
       }
-    }
+    },
+    "providersEmpty": "No providers yet. Click the button above to create one."
   },
   "kb": {
     "title": "Knowledge Base",

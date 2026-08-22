@@ -8,6 +8,7 @@ import { Switch } from '@/components/ui/switch';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { ChevronDown, Loader2, Wifi } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
+import { ConfirmDialog, useConfirm } from '../confirm';
 import {
   useLlmKbs,
   useCreateLlmKb,
@@ -55,6 +56,13 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
   const [testMsg, setTestMsg] = useState<string | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const {
+    open: confirmOpen,
+    payload: confirmPayload,
+    confirm,
+    cancel: cancelConfirm,
+    confirmAndClose,
+  } = useConfirm();
 
   // 用户是否手动切换过"使用全局配置"开关（防加载竞态下的自动回填覆盖用户选择）。
   const userToggledGlobal = useRef(false);
@@ -153,6 +161,29 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
       Number(embDimension) !== existing.emb_dimension ||
       embApiKey !== '');
 
+  const doReindexSubmit = () => {
+    if (!existing) return;
+    updateMutation.mutate(
+      {
+        id: existing.id,
+        name: name.trim(),
+        description,
+        emb_base_url: embBaseUrl.trim(),
+        emb_api_key: embApiKey,
+        emb_model: embModel.trim(),
+        emb_dimension: embDimension as number,
+        top_k: topK,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        score_threshold: scoreThreshold,
+      },
+      {
+        onSuccess: onClose,
+        onError: (err) => setSubmitError(t('kb.saveError', { error: getApiErrorMessage(err) })),
+      },
+    );
+  };
+
   // emb 字段组：创建态（useGlobalEmb 关闭时）与编辑态复用。
   // editMode=true 时 api_key 占位提示为"留空表示保持不变"，且不带全局开关。
   const renderEmbFields = (editMode: boolean) => (
@@ -220,7 +251,12 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
         return;
       }
       if (embChanged) {
-        if (!window.confirm(t('kb.reindexAllConfirm'))) return;
+        // 全量重建是破坏性操作，改用确认对话框而非 window.confirm
+        confirm(
+          { title: t('common.confirm'), description: t('kb.reindexAllConfirm') },
+          () => doReindexSubmit(),
+        );
+        return;
       }
       updateMutation.mutate(
         {
@@ -230,7 +266,7 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           emb_base_url: embBaseUrl.trim(),
           emb_api_key: embApiKey,
           emb_model: embModel.trim(),
-          emb_dimension: embDimension,
+          emb_dimension: embDimension as number,
           top_k: topK,
           chunk_size: chunkSize,
           chunk_overlap: chunkOverlap,
@@ -305,7 +341,8 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
     !embBaseUrl.trim() || !embModel.trim() || embDimension === '' || Number(embDimension) < 1;
 
   return (
-    <Dialog open={open} onOpenChange={onClose}>
+    <>
+      <Dialog open={open} onOpenChange={onClose}>
       <DialogContent className="max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{isEdit ? t('kb.editKb') : t('kb.newKb')}</DialogTitle>
@@ -421,6 +458,14 @@ export default function KbDialog({ open, onClose, kbId, onCreated }: Props) {
           </Button>
         </DialogFooter>
       </DialogContent>
-    </Dialog>
+      </Dialog>
+      <ConfirmDialog
+        open={confirmOpen}
+        payload={confirmPayload}
+        onConfirm={confirmAndClose}
+        onCancel={cancelConfirm}
+        variant="destructive"
+      />
+    </>
   );
 }

@@ -357,6 +357,8 @@ export interface LlmUsageSummary {
   cache_miss_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** 发生故障转移的请求数（failover_from 非空），用于计算转移率。 */
+  failover_count: number;
 }
 
 export interface LlmUsageAggregateRow {

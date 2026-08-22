@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Dialog,
@@ -21,14 +22,33 @@ import RoleSection from '@/components/agent/role/RoleSection';
 
 /** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出统一设置弹窗
  *  （共享 Embedding / 记忆设置 / 技能设置 三个子 Tab）。 */
+const KNOW_TAB_VALUES = ['kb', 'memory', 'skill', 'roles'] as const;
+type KnowTab = (typeof KNOW_TAB_VALUES)[number];
+const DEFAULT_KNOW_TAB: KnowTab = 'kb';
+
 export default function KnowledgePage() {
   const { t } = useTranslation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const raw = searchParams.get('tab');
+  const activeTab: KnowTab = (KNOW_TAB_VALUES as readonly string[]).includes(raw ?? '')
+    ? (raw as KnowTab)
+    : DEFAULT_KNOW_TAB;
+  const setActiveTab = useCallback(
+    (v: string) => {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        next.set('tab', v);
+        return next;
+      }, { replace: true });
+    },
+    [setSearchParams],
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <div className="space-y-6">
       <PageHeader title={t('knowledge.title')} description={t('knowledge.description')} />
-      <Tabs defaultValue="kb">
+      <Tabs value={activeTab} onValueChange={setActiveTab}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <TabsList>
             <TabsTrigger value="kb">{t('nav.knowledgeBase')}</TabsTrigger>

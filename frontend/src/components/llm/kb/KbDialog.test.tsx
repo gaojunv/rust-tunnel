@@ -73,15 +73,16 @@ describe('KbDialog edit-mode embedding', () => {
   });
 
   it('changing dimension shows rebuild warning, pops confirm, submits new emb payload', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderDialog('kb1');
     const dim = (await screen.findByDisplayValue('768')) as HTMLInputElement;
     fireEvent.change(dim, { target: { value: '1024' } });
     // 改动后显示 amber 重建警告
     expect(await screen.findByText('kb.embRebuildWarning')).toBeTruthy();
     fireEvent.click(await screen.findByText('common.save'));
-    // 弹出确认且确认后提交
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledWith('kb.reindexAllConfirm'));
+    // 弹出确认对话框（不再是 window.confirm），确认后提交
+    expect(await screen.findByText('kb.reindexAllConfirm')).toBeTruthy();
+    const confirms = await screen.findAllByText('common.confirm');
+    fireEvent.click(confirms[confirms.length - 1]);
     await waitFor(() => expect(captured.updateLlmKb).toHaveBeenCalled());
     const [vars] = captured.updateLlmKb.mock.calls[0];
     expect(vars.id).toBe('kb1');
@@ -89,31 +90,31 @@ describe('KbDialog edit-mode embedding', () => {
     expect(vars.emb_model).toBe('old-model');
     expect(vars.emb_dimension).toBe(1024);
     expect(vars.emb_api_key).toBe('');
-    confirmSpy.mockRestore();
   });
 
   it('canceling confirm does not submit', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderDialog('kb1');
     const dim = (await screen.findByDisplayValue('768')) as HTMLInputElement;
     fireEvent.change(dim, { target: { value: '1024' } });
     fireEvent.click(await screen.findByText('common.save'));
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(await screen.findByText('kb.reindexAllConfirm')).toBeTruthy();
+    // 确认弹窗的取消按钮（同名按钮有两个，取最后一个 = 弹窗内的）
+    const cancels = await screen.findAllByText('common.cancel');
+    fireEvent.click(cancels[cancels.length - 1]);
+    await new Promise((r) => setTimeout(r, 50));
     expect(captured.updateLlmKb).not.toHaveBeenCalled();
-    confirmSpy.mockRestore();
   });
 
   it('no emb change skips confirm but still submits emb payload', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderDialog('kb1');
     fireEvent.click(await screen.findByText('common.save'));
     await waitFor(() => expect(captured.updateLlmKb).toHaveBeenCalled());
-    expect(confirmSpy).not.toHaveBeenCalled();
+    // 未改动时不弹确认框
+    expect(screen.queryByText('kb.reindexAllConfirm')).toBeNull();
     const [vars] = captured.updateLlmKb.mock.calls[0];
     expect(vars.emb_base_url).toBe('https://old.example.com/v1');
     expect(vars.emb_model).toBe('old-model');
     expect(vars.emb_dimension).toBe(768);
-    confirmSpy.mockRestore();
   });
 
   it('test embedding in edit mode sends kb_id', async () => {

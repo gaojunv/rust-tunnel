@@ -36,6 +36,10 @@ const fmt = (n: number): string => n.toLocaleString('en-US');
 const pct = (num: number, denom: number): string =>
   denom === 0 ? '—' : `${((num / denom) * 100).toFixed(1)}%`;
 
+/** 耗时人性化：≥1s 显示「1.2s」，否则显示毫秒。 */
+const fmtLatency = (ms: number): string =>
+  ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${fmt(ms)}ms`;
+
 const PAGE_SIZE = 20;
 
 export default function UsageTab() {
@@ -58,13 +62,14 @@ export default function UsageTab() {
     setPage(0);
   }, [apiRange.start, apiRange.end, groupBy]);
 
-  const { data: summary } = useLlmUsageSummary(apiRange);
-  const { data: rows, isLoading: rowsLoading } = useLlmUsageAggregate(groupBy, apiRange);
-  const { data: logsData, isLoading: logsLoading } = useLlmUsageLogs(
-    apiRange,
-    PAGE_SIZE,
-    page * PAGE_SIZE
-  );
+  const { data: summary, isError: summaryError } = useLlmUsageSummary(apiRange);
+  const { data: rows, isLoading: rowsLoading, isError: rowsError } = useLlmUsageAggregate(groupBy, apiRange);
+  const {
+    data: logsData,
+    isLoading: logsLoading,
+    isError: logsError,
+    isFetching: logsFetching,
+  } = useLlmUsageLogs(apiRange, PAGE_SIZE, page * PAGE_SIZE);
 
   const logs = logsData?.logs ?? [];
   const totalLogs = logsData?.total ?? 0;
@@ -74,13 +79,6 @@ export default function UsageTab() {
 
   const successRate = summary ? pct(summary.success, summary.requests) : '—';
   const cacheRate = summary ? pct(summary.cache_hit_tokens, summary.prompt_tokens) : '—';
-
-  // 转移率：当前页日志中 failover_from 非空的比例（前端计算）
-  const failoverRate = useMemo(() => {
-    const pageLogs = logsData?.logs ?? [];
-    if (pageLogs.length === 0) return 0;
-    return pageLogs.filter((l) => l.failover_from).length / pageLogs.length;
-  }, [logsData]);
 
   return (
     <div className="space-y-6">
@@ -96,8 +94,13 @@ export default function UsageTab() {
         />
       </div>
 
-      {/* Stat Cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
+      {/* Stat Cards：错误态用横幅提示，转移率读 summary 汇总而非分页数据 */}
+      {summaryError && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {t('llm.usage.loadFailed')}
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
         <StatCard
           title={t('llm.usage.stats.totalRequests')}
           value={summary ? fmt(summary.requests) : '—'}
@@ -127,8 +130,12 @@ export default function UsageTab() {
         />
         <StatCard
           title={t('llm.usage.failoverRate')}
-          value={`${(failoverRate * 100).toFixed(1)}%`}
-          description={t('llm.usage.failoverRateDesc', { count: logs.filter((l) => l.failover_from).length, total: logs.length })}
+          value={summary ? pct(summary.failover_count, summary.requests) : '—'}
+          description={
+            summary
+              ? t('llm.usage.failoverRateDesc', { count: fmt(summary.failover_count), total: fmt(summary.requests) })
+              : undefined
+          }
           icon={<GitCompareArrows className="h-4 w-4" />}
         />
       </div>
@@ -151,7 +158,13 @@ export default function UsageTab() {
           </Select>
         </CardHeader>
         <CardContent>
-          <Table>
+          {rowsError && (
+            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {t('llm.usage.loadFailed')}
+            </div>
+          )}
+          <div className="overflow-x-auto">
+            <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>{t(GROUP_BY_LABEL_KEYS[groupBy])}</TableHead>
@@ -201,6 +214,7 @@ export default function UsageTab() {
               )}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
 
@@ -215,7 +229,13 @@ export default function UsageTab() {
           )}
         </CardHeader>
         <CardContent>
-          <Table>
+          {logsError && (
+            <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {t('llm.usage.loadFailed')}
+            </div>
+          )}
+          <div className="overflow-x-auto">
+            <Table>
             <TableHeader>
               <TableRow>
                 <TableHead>{t('llm.usage.detail.time')}</TableHead>
@@ -275,13 +295,19 @@ export default function UsageTab() {
                       </span>
                     </TableCell>
                     <TableCell className="text-right tabular-nums text-xs">
-                      {fmt(l.latency_ms)}ms
+                      {fmtLatency(l.latency_ms)}
                     </TableCell>
                   </TableRow>
                 ))
               )}
             </TableBody>
           </Table>
+          </div>
+
+          {/* 翻页拉取中提示（keepPreviousData 保留旧数据，仅轻量标记） */}
+          {logsFetching && !logsLoading && (
+            <div className="mt-2 text-center text-xs text-muted-foreground">{t('llm.usage.loading')}</div>
+          )}
 
           {/* Pagination */}
           {totalPages > 1 && (

@@ -152,6 +152,8 @@ pub struct LlmUsageSummary {
     pub cache_miss_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// 发生故障转移的请求数（failover_from 非空），供前端计算转移率。
+    pub failover_count: i64,
 }
 
 // ── Provider CRUD ─────────────────────────────────────────────
@@ -507,7 +509,9 @@ impl Database {
                 COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit_tokens,
                 COALESCE(SUM(cache_miss_tokens), 0) AS cache_miss_tokens,
                 COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-                COALESCE(SUM(total_tokens), 0) AS total_tokens
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(CASE WHEN failover_from IS NOT NULL THEN 1 ELSE 0 END), 0)
+                    AS failover_count
             FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
             "#,
@@ -1120,9 +1124,10 @@ mod tests {
         db.llm_insert_usage_log(&sample_usage("deepseek-chat", 100, 30, 50))
             .await
             .unwrap();
-        db.llm_insert_usage_log(&sample_usage("deepseek-chat", 200, 0, 80))
-            .await
-            .unwrap();
+        // 第二条带 failover_from：验证 summary 的 failover_count 统计口径。
+        let mut failover = sample_usage("deepseek-chat", 200, 0, 80);
+        failover.failover_from = Some("deepseek-r1".into());
+        db.llm_insert_usage_log(&failover).await.unwrap();
 
         let full = ("1970-01-01T00:00:00Z", "2999-01-01T00:00:00Z");
         let summary = db.llm_usage_summary(full.0, full.1).await.unwrap();
@@ -1133,6 +1138,10 @@ mod tests {
         assert_eq!(summary.cache_miss_tokens, 270);
         assert_eq!(summary.completion_tokens, 130);
         assert_eq!(summary.total_tokens, 430);
+        assert_eq!(
+            summary.failover_count, 1,
+            "failover_from 非空的日志应计入 failover_count"
+        );
 
         let logs = db
             .llm_query_usage_logs(full.0, full.1, 10, 0)

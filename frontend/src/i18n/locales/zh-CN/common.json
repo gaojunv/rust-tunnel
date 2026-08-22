@@ -23,7 +23,9 @@
     "noData": "暂无数据",
     "close": "关闭",
     "add": "添加",
-    "disabled": "已禁用"
+    "disabled": "已禁用",
+    "confirm": "确认",
+    "saveError": "保存失败：{{error}}"
   },
   "timeRange": {
     "custom": "自定义"
@@ -566,7 +568,10 @@
       "anthropicDomainHint": "接收 /v1/messages",
       "listenAddress": "监听地址",
       "tls": "TLS",
-      "acmeAutoRenew": "ACME 自动续期"
+      "acmeAutoRenew": "ACME 自动续期",
+      "saved": "已保存",
+      "saveError": "保存失败：{{error}}",
+      "unsaved": "有未保存的修改"
     },
     "providerCard": {
       "baseUrl": "Base URL: {{url}}",
@@ -624,7 +629,9 @@
         "closed": "正常",
         "halfOpen": "试探中",
         "open": "熔断中 {{secs}}s"
-      }
+      },
+      "nameRequired": "请输入组名",
+      "saveError": "保存失败：{{error}}"
     },
     "usage": {
       "stats": {
@@ -658,6 +665,7 @@
       },
       "empty": "该时间范围内暂无用量数据",
       "loading": "加载中...",
+      "loadFailed": "用量数据加载失败，请重试。",
       "unknown": "未知",
       "detail": {
         "title": "请求明细",
@@ -677,7 +685,8 @@
         "prev": "上一页",
         "next": "下一页"
       }
-    }
+    },
+    "providersEmpty": "暂无供应商，点击上方按钮创建一个。"
   },
   "kb": {
     "title": "知识库",
