@@ -665,6 +665,7 @@
       },
       "empty": "No usage data for this time range",
       "loading": "Loading...",
+      "loadFailed": "Failed to load usage data. Please retry.",
       "unknown": "Unknown",
       "detail": {
         "title": "Request Details",

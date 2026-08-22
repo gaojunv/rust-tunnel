@@ -665,6 +665,7 @@
       },
       "empty": "该时间范围内暂无用量数据",
       "loading": "加载中...",
+      "loadFailed": "用量数据加载失败，请重试。",
       "unknown": "未知",
       "detail": {
         "title": "请求明细",
