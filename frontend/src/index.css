@@ -295,6 +295,72 @@ html body[data-scroll-locked] {
     animation: agent-input-border-flow 2.4s linear infinite;
   }
 
+  /* Effort 离散滑条（ModeEffortPicker 面板内）。轨道与滑块只能用 vendor 伪元素
+     定制——Tailwind 无对应工具类，accent-color 也管不了轨道粗细与滑块描边。
+     取色全走 CSS 变量，明暗主题自动跟随；滑块描边用 popover 底色，压在刻度点
+     上时仍能看出边界。 */
+  .effort-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 1rem;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .effort-slider:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .effort-slider::-webkit-slider-runnable-track {
+    height: 0.25rem;
+    border-radius: 9999px;
+    background: hsl(var(--muted));
+  }
+
+  .effort-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    box-sizing: border-box;
+    height: 0.75rem;
+    width: 0.75rem;
+    /* webkit 下 thumb 以轨道顶边对齐，负 margin 把它压回轨道中线 */
+    margin-top: -0.25rem;
+    border: 2px solid hsl(var(--popover));
+    border-radius: 9999px;
+    background: hsl(var(--primary));
+    box-shadow: 0 1px 2px hsl(var(--foreground) / 0.25);
+  }
+
+  .effort-slider::-moz-range-track {
+    height: 0.25rem;
+    border-radius: 9999px;
+    background: hsl(var(--muted));
+  }
+
+  .effort-slider::-moz-range-thumb {
+    box-sizing: border-box;
+    height: 0.75rem;
+    width: 0.75rem;
+    border: 2px solid hsl(var(--popover));
+    border-radius: 9999px;
+    background: hsl(var(--primary));
+    box-shadow: 0 1px 2px hsl(var(--foreground) / 0.25);
+  }
+
+  /* 焦点环画在滑块上（外层 outline 会围住整条轨道，视觉太重） */
+  .effort-slider:focus-visible {
+    outline: none;
+  }
+
+  .effort-slider:focus-visible::-webkit-slider-thumb {
+    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.35);
+  }
+
+  .effort-slider:focus-visible::-moz-range-thumb {
+    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.35);
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .header-light-flow,
     .animate-aurora,
