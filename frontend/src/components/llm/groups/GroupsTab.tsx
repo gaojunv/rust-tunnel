@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
   useLlmModelGroups,
   useUpdateLlmModelGroup,
@@ -35,7 +36,12 @@ export function GroupsTab() {
         </Button>
       </div>
 
-      {isLoading && <div className="text-muted-foreground">{t('common.loading')}</div>}
+      {isLoading && (
+        <div className="space-y-3">
+          <Skeleton className="h-16 w-full rounded-lg" />
+          <Skeleton className="h-16 w-full rounded-lg" />
+        </div>
+      )}
 
       {groups?.length === 0 && (
         <Card>

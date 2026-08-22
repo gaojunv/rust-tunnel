@@ -5,6 +5,7 @@ import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { Skeleton } from '@/components/ui/skeleton';
 import { AlertTriangle, Loader2 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 import { useLlmGatewayConfig, useUpdateLlmGatewayConfig } from '@/api/hooks';
@@ -75,7 +76,18 @@ export default function GatewayTab() {
     );
   };
 
-  if (isLoading) return <div className="text-muted-foreground">{t('common.loading')}</div>;
+  if (isLoading) {
+    return (
+      <Card>
+        <CardContent className="space-y-3 pt-6">
+          <Skeleton className="h-6 w-full rounded" />
+          <Skeleton className="h-10 w-full rounded" />
+          <Skeleton className="h-10 w-full rounded" />
+          <Skeleton className="h-10 w-full rounded" />
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <Card>

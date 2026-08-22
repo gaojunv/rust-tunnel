@@ -684,7 +684,8 @@
         "prev": "Previous",
         "next": "Next"
       }
-    }
+    },
+    "providersEmpty": "No providers yet. Click the button above to create one."
   },
   "kb": {
     "title": "Knowledge Base",

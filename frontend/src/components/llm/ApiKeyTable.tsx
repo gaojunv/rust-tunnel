@@ -21,6 +21,7 @@ import {
   useLlmKbs,
 } from '@/api/hooks';
 import { getApiErrorMessage } from '@/api/client';
+import { Skeleton } from '@/components/ui/skeleton';
 import { ConfirmDialog, useConfirm } from './confirm';
 import { Plus, Trash2, Copy, Check, AlertTriangle } from 'lucide-react';
 import type { LlmApiKey, CreateApiKeyResponse } from '@/types';
@@ -73,7 +74,12 @@ export default function ApiKeyTable() {
               {actionError}
             </div>
           )}
-          {isLoading ? <div className="text-muted-foreground">{t('common.loading')}</div> : keys?.length === 0 ? <div className="text-muted-foreground text-sm">{t('llm.apiKeys.empty')}</div> : (
+          {isLoading ? (
+            <div className="space-y-2">
+              <Skeleton className="h-12 w-full rounded" />
+              <Skeleton className="h-12 w-full rounded" />
+            </div>
+          ) : keys?.length === 0 ? <div className="text-muted-foreground text-sm">{t('llm.apiKeys.empty')}</div> : (
             <div className="space-y-1">
               {keys?.map((k: LlmApiKey) => {
                 const boundKb = k.kb_id ? kbs?.find((kb) => kb.id === k.kb_id) : undefined;
