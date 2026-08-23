@@ -344,13 +344,34 @@ impl Database {
 
     /// 对账：把 `pending`/`processing` 的 wiki 置为 `failed`（启动时调用）。
     pub async fn wiki_fail_inflight(&self, error: &str) -> Result<u64, sqlx::Error> {
+        let _ = error; // 容器无 error 列，仅复位状态（参数保留与 docs 对账签名一致）
         let r = sqlx::query(
             "UPDATE agent_wikis SET status = 'failed', updated_at = datetime('now') WHERE status IN ('pending','processing')",
         )
-        .bind(error)
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected())
+    }
+
+    /// 容器状态更新（摄入管线用：processing/ready/failed）。
+    pub async fn wiki_update_status(&self, id: &str, status: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE agent_wikis SET status = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 原子 CAS：仅当 `pending` → `processing` 可抢占（摄入入口）。
+    pub async fn wiki_mark_doc_processing_if_pending(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE agent_wiki_docs SET status = 'processing', updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     // ── 文档 CRUD ────────────────────────────────────────────────

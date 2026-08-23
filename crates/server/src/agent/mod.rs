@@ -162,6 +162,11 @@ pub struct AgentState {
     /// `server.rs` 在 `init_llm_state` 之后经 [`Self::with_memory`] 注入。
     #[cfg(feature = "rag")]
     pub memory: Option<memory::MemoryState>,
+    /// Wiki 运行时（摄入/SSE/search 共用）。仅 `rag` feature 下存在；
+    /// `server.rs` 在 `init_llm_state` 之后经 [`Self::with_wiki`] 注入，
+    /// 与 `with_memory` 并列。
+    #[cfg(feature = "rag")]
+    pub wiki: Option<wiki::WikiState>,
     /// 工作台全局通知广播：任务完成 / 出错 / 需用户干预时，`push_task`
     /// （`mgmt/api/agent/ws.rs`）把出站帧翻译成 [`notify::AgentNotification`]
     /// 发布于此，浏览器全局通知 WS（`/api/agent/notifications/ws`）订阅消费。
@@ -190,6 +195,8 @@ impl AgentState {
             acp_bridge: None,
             #[cfg(feature = "rag")]
             memory: None,
+            #[cfg(feature = "rag")]
+            wiki: None,
             notifications: notify_tx,
             github_base_url: crate::agent::github::GITHUB_API_BASE.to_string(),
         };
@@ -281,6 +288,16 @@ impl AgentState {
             self.acp_bridge = Some(bridge.with_memory(memory.clone()));
         }
         self.memory = Some(memory);
+        self
+    }
+
+    /// 把 Wiki 运行时挂到 AgentState（摄入/SSE 共用）。对齐 `with_memory` 的
+    /// 注入时机：`server.rs` 在 `init_llm_state` 之后构造注入；与 memory 并列，
+    /// 不注入 ACP 桥（Wiki 无 kill/蒸馏语义）。
+    #[cfg(feature = "rag")]
+    #[must_use]
+    pub fn with_wiki(mut self, wiki: wiki::WikiState) -> Self {
+        self.wiki = Some(wiki);
         self
     }
 

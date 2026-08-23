@@ -369,6 +369,18 @@ async fn main() -> TunnelResult<()> {
                 ),
                 Err(e) => tracing::warn!(error = %e, "RAG startup reconciliation failed"),
             }
+            // Wiki 启动对账：同上，把卡死的 wiki doc 复位为 failed。
+            match db
+                .wiki_fail_inflight_docs("interrupted by server restart")
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::warn!(
+                    reset = n,
+                    "Wiki startup reconciliation: reset stale in-flight documents to failed"
+                ),
+                Err(e) => tracing::warn!(error = %e, "Wiki startup reconciliation failed"),
+            }
         }
     }
 
@@ -398,7 +410,13 @@ async fn main() -> TunnelResult<()> {
                         (*llm_state).clone(),
                     );
                     tracing::info!("AI memory runtime injected into agent state");
-                    a.with_memory(memory_state)
+                    a.with_memory(memory_state).with_wiki(
+                        rust_tunnel_server::agent::wiki::WikiState::new(
+                            // with_memory 已消费一份 db 克隆，这里再取一份
+                            state.db().cloned().expect("db checked above"),
+                            (*llm_state).clone(),
+                        ),
+                    )
                 } else {
                     tracing::warn!("no database; AI memory runtime not injected");
                     a

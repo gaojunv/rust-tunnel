@@ -23,6 +23,7 @@ use sha2::Digest;
 use tokio::sync::broadcast;
 
 use crate::agent::memory::scope_coords;
+use crate::agent::wiki::WikiState;
 use crate::auth::validate_token;
 use crate::db::agent::normalize_db_datetime;
 use crate::db::wiki::{
@@ -35,32 +36,18 @@ use crate::mgmt::api::ApiState;
 
 use super::mem_runtime;
 
-// ── WikiEvent / broadcast 挂载 ──────────────────────────────────
-
-/// Wiki 文档状态事件（批 1 先建通道，摄入在批 2 推送）。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WikiEvent {
-    pub wiki_id: String,
-    pub doc_id: String,
-    pub status: String,
-    pub page_count: i64,
-    pub error: Option<String>,
-}
-
-/// Wiki 运行时（挂 `MemoryState` 旁，复用其 `broadcast` 能力）。
-/// 本批不引入新 `VectorStore`，事件通道挂 `LlmState.rag_tx` 的同级位置：
-/// 由 `bin/server.rs` 在 `init_llm_state` 之后注入（对齐 `MemoryState` 的
-/// 注入点），此处先以 `once_cell` 级别的静态通道过渡，批 2 再接入 `LlmState`。
-static WIKI_TX: std::sync::OnceLock<broadcast::Sender<WikiEvent>> = std::sync::OnceLock::new();
-
-pub(crate) fn wiki_tx() -> broadcast::Sender<WikiEvent> {
-    WIKI_TX
-        .get_or_init(|| broadcast::channel(64).0)
-        .clone()
-}
-
-pub(crate) fn wiki_subscribe() -> broadcast::Receiver<WikiEvent> {
-    wiki_tx().subscribe()
+/// 从 `ApiState` 取 Wiki 运行时；未注入（非 rag 构建 / 未初始化）→ 503。
+/// 与 `mem_runtime` 同模式，对齐 `MemoryState` 的挂载形态。
+pub(crate) fn wiki_runtime(
+    state: &ApiState,
+) -> Result<WikiState, (StatusCode, String)> {
+    let Some(agent) = &state.server_state.agent_state else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "agent workbench not initialized".into()));
+    };
+    let Some(wiki) = &agent.wiki else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "wiki runtime not initialized".into()));
+    };
+    Ok(wiki.clone())
 }
 
 // ── 辅助 ─────────────────────────────────────────────────────────
@@ -345,6 +332,10 @@ pub async fn update_wiki(
 }
 
 pub async fn delete_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let wiki_rt = match wiki_runtime(&state) {
+        Ok(rt) => rt,
+        Err(e) => return e.into_response(),
+    };
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -354,11 +345,18 @@ pub async fn delete_wiki(State(state): State<ApiState>, Path(id): Path<String>) 
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
     }
-    match mem.db.wiki_delete(&id).await {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    // 先落库删，再清落盘目录（best-effort：DB 是源，残留文件无害）。
+    if let Err(e) = mem.db.wiki_delete(&id).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
-    // 批 2：删 `wiki_docs` 落盘目录 `<data_dir>/wiki_docs/<wiki_id>/`
+    let data_dir = wiki_rt.llm.rag_store.data_dir().to_path_buf();
+    let dir = data_dir.join("wiki_docs").join(&id);
+    if dir.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(wiki_id = %id, error = %e, "wiki delete: remove wiki_docs dir failed");
+        }
+    }
+    Json(serde_json::json!({ "status": "ok" })).into_response()
 }
 
 // ── Handlers: 文档 ───────────────────────────────────────────────
@@ -404,6 +402,10 @@ pub async fn reindex_doc(
     State(state): State<ApiState>,
     Path((wiki_id, doc_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let wiki_rt = match wiki_runtime(&state) {
+        Ok(rt) => rt,
+        Err(e) => return e.into_response(),
+    };
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -414,12 +416,31 @@ pub async fn reindex_doc(
     if doc.wiki_id != wiki_id {
         return StatusCode::NOT_FOUND.into_response();
     }
-    // 批 1 占位：清非 locked 页并置 pending，批 2 接管摄入
     if !mem.db.wiki_mark_doc_pending_if_idle(&doc_id).await.unwrap_or(false) {
         return (StatusCode::CONFLICT, "document is being processed").into_response();
     }
+    let Some(ft) = FileType::from_extension(&doc.file_type) else {
+        let _ = mem.db.wiki_update_doc_status(&doc_id, "failed", Some("unsupported file type")).await;
+        return (StatusCode::CONFLICT, "unsupported file type; delete and re-upload").into_response();
+    };
+    let data_dir = wiki_rt.llm.rag_store.data_dir().to_path_buf();
+    let source_path = wiki_doc_source_path(&data_dir, &wiki_id, &doc_id, ft.as_str());
+    if tokio::fs::metadata(&source_path).await.is_err() {
+        let _ = mem.db.wiki_update_doc_status(&doc_id, "failed", Some("original document missing; delete and re-upload")).await;
+        return (StatusCode::CONFLICT, "original document missing; delete and re-upload").into_response();
+    }
+    // 清该 doc 旧非 locked 页（FTS/边同事务，见 wiki_clear_pages_by_doc）。
     let _ = mem.db.wiki_clear_pages_by_doc(&wiki_id, &doc_id).await;
-    // 批 2：spawn_wiki_ingest 此处接入；当前停留 pending
+    crate::agent::wiki::ingest::spawn_wiki_ingest(
+        wiki_rt.db.clone(),
+        wiki_rt.llm.clone(),
+        wiki_id.clone(),
+        doc_id.clone(),
+        source_path,
+        ft,
+        wiki_rt.events.clone(),
+        Some(wiki_rt.ingest_sem.clone()),
+    );
     Json(serde_json::json!({ "status": "pending", "id": doc_id })).into_response()
 }
 
@@ -524,7 +545,24 @@ pub async fn upload_doc(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
 
-    // 本批不接摄入管线，停留 pending；批 2 在此 spawn_wiki_ingest
+    // 取 WikiState 运行时（与 memory 共用 data_dir/DB/LLM，事件走 wiki 通道）。
+    let wiki_rt = match wiki_runtime(&state) {
+        Ok(rt) => rt,
+        Err((status, msg)) => {
+            return (status, msg).into_response();
+        }
+    };
+    crate::agent::wiki::ingest::spawn_wiki_ingest(
+        wiki_rt.db.clone(),
+        wiki_rt.llm.clone(),
+        wiki_id.clone(),
+        doc_id.clone(),
+        source_path,
+        ft,
+        wiki_rt.events.clone(),
+        Some(wiki_rt.ingest_sem.clone()),
+    );
+
     match mem.db.wiki_get_doc(&doc_id).await {
         Ok(Some(doc)) => (StatusCode::CREATED, Json(doc_json(&doc))).into_response(),
         _ => (StatusCode::CREATED, Json(serde_json::json!({ "id": doc_id, "wiki_id": wiki_id, "status": "pending" }))).into_response(),
@@ -707,10 +745,16 @@ pub async fn sse_wiki_events(
                 .unwrap();
         }
     }
-    let mut rx = wiki_subscribe();
-    // 复用 MemoryState 的 LlmState 存在性门控（rag 未初始化时仍可订阅 SSE，仅无事件）
+    // wiki 运行时未注入（非 rag 构建 / 未初始化）时仍可订阅 SSE，仅发 ping 保活。
+    let mut rx = wiki_runtime(&state).ok().map(|w| w.subscribe());
     let stream = async_stream::stream! {
         loop {
+            let Some(rx) = rx.as_mut() else {
+                // 无运行时：周期性 ping，事件永不到达。
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                yield Ok::<_, std::convert::Infallible>(Event::default().event("ping").data(""));
+                continue;
+            };
             match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
                 Ok(Ok(ev)) => {
                     let json = serde_json::to_string(&ev).unwrap_or_default();
