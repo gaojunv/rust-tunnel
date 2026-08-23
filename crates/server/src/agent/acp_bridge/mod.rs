@@ -47,7 +47,7 @@ use super::spawner::AgentSpawner;
 use super::{ApprovalOption, ApprovalResult, ElicitationResult};
 
 #[cfg(test)]
-use crate::persistence::db::agent::AgentWorkspaceRecord;
+use crate::db::agent::AgentWorkspaceRecord;
 #[cfg(test)]
 use rust_tunnel_common::ControlMessage;
 #[cfg(test)]

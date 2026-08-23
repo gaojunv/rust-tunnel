@@ -254,8 +254,11 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::in_memory_db;
     use chrono::Duration;
+
+    async fn in_memory_db() -> Database {
+        Database::new(":memory:").await.expect("in-memory db")
+    }
 
     #[tokio::test]
     async fn certificate_crud_save_get_update_delete() {

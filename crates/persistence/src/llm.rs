@@ -787,7 +787,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::Database;
+    use crate::Database;
 
     async fn fresh_db() -> (Database, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1259,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn test_model_group_crud() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = crate::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -1298,7 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn test_group_members_replace_and_join() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = crate::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -1350,7 +1350,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_group_cleans_members() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = crate::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         db.llm_save_provider(
@@ -1384,7 +1384,7 @@ mod tests {
     #[tokio::test]
     async fn test_group_name_conflicts() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = crate::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         db.llm_save_provider(
@@ -1428,10 +1428,10 @@ mod tests {
     #[tokio::test]
     async fn test_usage_insert_with_failover_from() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = crate::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let u = crate::persistence::db::llm::LlmUsageInsert {
+        let u = crate::LlmUsageInsert {
             requested_model: "router".into(),
             protocol: "openai".into(),
             stream: false,

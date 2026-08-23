@@ -128,8 +128,12 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_helpers::in_memory_db;
+    use crate::Database;
     use chrono::Utc;
+
+    async fn in_memory_db() -> Database {
+        Database::new(":memory:").await.expect("in-memory db")
+    }
 
     #[tokio::test]
     async fn test_crud_full_chain() {

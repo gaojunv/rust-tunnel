@@ -13,10 +13,10 @@ pub mod control_plane;
 pub use control_plane as control;
 pub use control_plane::client_registry;
 pub use control_plane::tunnel_stream;
-pub use persistence::db;
+// 持久化层已拆分为独立 crate；`db` 路径保持兼容 re-export
+pub use rust_tunnel_persistence as db;
 pub mod llm;
 pub mod net;
-pub mod persistence;
 pub use net::dns;
 pub use net::listener;
 pub use net::mesh;

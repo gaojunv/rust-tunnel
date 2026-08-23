@@ -275,7 +275,7 @@ async fn bridge_terminal(
     mut ws_stream: futures_util::stream::SplitStream<WebSocket>,
     tunnel: crate::tunnel_stream::ClientTunnelStream,
     agent: &crate::agent::AgentState,
-    workspace: &crate::persistence::db::agent::AgentWorkspaceRecord,
+    workspace: &crate::db::agent::AgentWorkspaceRecord,
     terminal_id: &str,
 ) {
     let (mut tunnel_rd, mut tunnel_wr) = tokio::io::split(tunnel);
@@ -363,7 +363,7 @@ async fn refresh_session_state(
     db: &crate::db::Database,
     session_id: &str,
     rt_model: &mut String,
-    active_role: &mut Option<crate::persistence::db::roles::AgentRoleRecord>,
+    active_role: &mut Option<crate::db::roles::AgentRoleRecord>,
 ) -> bool {
     let Ok(Some(session)) = db.agent_get_session(session_id).await else {
         return false;
@@ -604,7 +604,7 @@ enum TurnOutcome {
 
 /// 选择回合执行路径：workspace 配置了 `agent_type`（非空）走 ACP 远程 agent，
 /// 否则走自研 runner（保留）。
-fn use_acp_path(workspace: &crate::persistence::db::agent::AgentWorkspaceRecord) -> bool {
+fn use_acp_path(workspace: &crate::db::agent::AgentWorkspaceRecord) -> bool {
     !workspace.agent_type.is_empty()
 }
 
@@ -615,7 +615,7 @@ fn use_acp_path(workspace: &crate::persistence::db::agent::AgentWorkspaceRecord)
 async fn load_workspace_for_session(
     db: &crate::db::Database,
     session_id: &str,
-) -> Result<Option<crate::persistence::db::agent::AgentWorkspaceRecord>, String> {
+) -> Result<Option<crate::db::agent::AgentWorkspaceRecord>, String> {
     let session = match db.agent_get_session(session_id).await {
         Ok(session) => session,
         Err(e) => return Err(format!("load session failed: {e}")),
@@ -1682,8 +1682,8 @@ mod tests {
         )
     }
 
-    fn ws_record() -> crate::persistence::db::agent::AgentWorkspaceRecord {
-        crate::persistence::db::agent::AgentWorkspaceRecord {
+    fn ws_record() -> crate::db::agent::AgentWorkspaceRecord {
+        crate::db::agent::AgentWorkspaceRecord {
             id: "w1".into(),
             name: "proj".into(),
             client_id: "nas".into(),

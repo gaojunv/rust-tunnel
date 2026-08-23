@@ -24,6 +24,7 @@ rag = ["dep:qdrant-edge"]
 
 [dependencies]
 rust-tunnel-common = { path = "../common" }
+rust-tunnel-persistence = { path = "../persistence" }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

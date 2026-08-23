@@ -318,6 +318,24 @@ impl Database {
         Ok(())
     }
 
+    /// 单字段更新 workspace 的 `llm_model_id`。原为测试专用 helper，拆 crate 后
+    /// server 侧测试跨 crate 调用，提升为正式方法（语义：直接覆盖）。
+    pub async fn agent_set_workspace_llm_model_id(
+        &self,
+        id: &str,
+        model_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE agent_workspaces SET llm_model_id = ?, updated_at = datetime('now') \
+             WHERE id = ?",
+        )
+        .bind(model_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 写 workspace 的 GitHub Actions 集成三列（token 为 LlmCipher 加密后的密文，
     /// owner/repo 明文）。写语义「空串 / 缺省（None）= 保持已存值，非空 = 更新」，
     /// 经 `COALESCE(NULLIF(?, ''), col)` 表达：空串归一化为 NULL 后取原列值，
@@ -796,7 +814,7 @@ impl Database {
     /// （空字段省略），status 落库供前端区分失败/成功（修复失败工具刷新后恒显 ✓）。
     /// 存量旧行是纯文本，读取方须向后兼容。中间态空占位（无产出、非异常终态）
     /// 传 ""，不覆盖已落库真实结果；failed 等异常终态即使 text 为空也须传非空
-    /// JSON。装配见 [`crate::db::tool_result::tool_result_persist_content`]。
+    /// JSON。装配见 [`crate::tool_result::tool_result_persist_content`]。
     pub async fn agent_upsert_tool_result(
         &self,
         id: &str,
@@ -965,27 +983,6 @@ mod tests {
         // 空串 / 非 19 位格式原样返回（防御：不破坏异常数据）
         assert_eq!(normalize_db_datetime(""), "");
         assert_eq!(normalize_db_datetime("2026-08-14"), "2026-08-14");
-    }
-
-    /// 测试专用：给 workspace 补写 llm_model_id（正式 CRUD 写入口随 Task 7
-    /// 提供）。llm_bridge 测试用它构造已配置链路。
-    #[cfg(test)]
-    impl Database {
-        pub(crate) async fn agent_set_workspace_llm_model_id(
-            &self,
-            id: &str,
-            model_id: &str,
-        ) -> Result<(), sqlx::Error> {
-            sqlx::query(
-                "UPDATE agent_workspaces SET llm_model_id = ?, updated_at = datetime('now') \
-                 WHERE id = ?",
-            )
-            .bind(model_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-            Ok(())
-        }
     }
 
     #[tokio::test]
@@ -1661,7 +1658,7 @@ mod tests {
             .await
             .unwrap();
 
-        let content = crate::db::tool_result::tool_result_persist_content(
+        let content = crate::tool_result::tool_result_persist_content(
             Some("a.rs"),
             Some("failed"),
             Some(&serde_json::json!([{"old": "x", "new": "y"}])),
@@ -1681,7 +1678,7 @@ mod tests {
         assert_eq!(v["locations"][0]["line"], 3);
         // 读取方解析：提取 text 应成功（新格式）
         assert_eq!(
-            crate::db::tool_result::tool_result_text(&rows[0].content),
+            crate::tool_result::tool_result_text(&rows[0].content),
             Some("a.rs".to_string())
         );
     }
@@ -1712,7 +1709,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "plain result");
         assert_eq!(
-            crate::db::tool_result::tool_result_text(&rows[0].content),
+            crate::tool_result::tool_result_text(&rows[0].content),
             None,
             "旧纯文本行必须走旧路径"
         );

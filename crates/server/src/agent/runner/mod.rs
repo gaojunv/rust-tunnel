@@ -577,7 +577,7 @@ async fn handle_tool_calls(
                     // 并发执行子 agent 循环：join_all 在同一 task 内并发 poll，
                     // 无需 Send；外层 turn future 被 drop 时子 future 随之中止。
                     // 先收集 owned 数据（prompt、sub_rt、call_id、role），再创建借用它们的 future。
-                    let mut sub_owned: Vec<(String, SessionRuntime, String, Option<crate::persistence::db::roles::AgentRoleRecord>)> = Vec::new();
+                    let mut sub_owned: Vec<(String, SessionRuntime, String, Option<crate::db::roles::AgentRoleRecord>)> = Vec::new();
                     let mut error_indices: Vec<(usize, String)> = Vec::new();
 
                     // 批处理前一次性查可见角色列表（避免每个 task 调用都查库）

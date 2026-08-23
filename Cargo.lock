@@ -4817,6 +4817,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-persistence"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "rust-tunnel-common",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rust-tunnel-server"
 version = "0.4.0"
 dependencies = [
@@ -4856,6 +4871,7 @@ dependencies = [
  "reqwest",
  "rust-embed",
  "rust-tunnel-common",
+ "rust-tunnel-persistence",
  "rustls 0.22.4",
  "rustls-native-certs 0.7.3",
  "rustls-pemfile",

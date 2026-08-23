@@ -131,7 +131,7 @@ pub(crate) async fn run_subagent_loop(
     task_prompt: &str,
     parent_tool_call_id: &str,
     ws_tx: &mpsc::Sender<serde_json::Value>,
-    role: Option<&crate::persistence::db::roles::AgentRoleRecord>,
+    role: Option<&crate::db::roles::AgentRoleRecord>,
 ) -> Result<String, String> {
     let system_prompt = roles::subagent_system_prompt(role);
     let model_override = role.and_then(|r| r.model_override.as_deref());

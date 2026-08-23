@@ -1,3 +1,6 @@
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Pool, Sqlite,
@@ -32,7 +35,9 @@ pub use records::*;
 /// Database wrapper for persistence
 #[derive(Debug, Clone)]
 pub struct Database {
-    pub(crate) pool: Pool<Sqlite>,
+    /// 连接池。pub 可见性：server 侧 12+ 处直接 `&db.pool` 传入 sqlx query，
+    /// 与 `pool()` 方法并存（方法返回 `&SqlitePool` 等价类型）。
+    pub pool: Pool<Sqlite>,
 }
 
 impl Database {

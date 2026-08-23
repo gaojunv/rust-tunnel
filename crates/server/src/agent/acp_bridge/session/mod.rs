@@ -32,7 +32,7 @@ use crate::agent::llm_bridge;
 use crate::agent::spawner::AgentSpawner;
 use crate::agent::{ApprovalOption, ApprovalResult, ElicitationResult};
 use crate::db::Database;
-use crate::persistence::db::agent::AgentWorkspaceRecord;
+use crate::db::agent::AgentWorkspaceRecord;
 use rust_tunnel_common::ControlMessage;
 
 use super::pump::run_stdio_pump;
