@@ -676,6 +676,8 @@ impl Database {
                 pin_always_inject INTEGER NOT NULL DEFAULT 1,
                 skill_enabled INTEGER NOT NULL DEFAULT 0,
                 skill_list_max INTEGER NOT NULL DEFAULT 20,
+                wiki_enabled INTEGER NOT NULL DEFAULT 1,
+                wiki_list_max INTEGER NOT NULL DEFAULT 20,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
@@ -762,6 +764,122 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // ============================================================
+        // Wiki: 容器 / 文档 / 页面 / 边 / FTS5
+        // ============================================================
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_wikis (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','pending','processing','ready','failed')),
+                version INTEGER NOT NULL DEFAULT 1,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                scope_type TEXT NOT NULL DEFAULT 'workspace',
+                client_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wikis_name_scope ON agent_wikis(name, scope_type, client_id, workspace_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wikis_scope ON agent_wikis(client_id, workspace_id)")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_wiki_docs (
+                id TEXT PRIMARY KEY,
+                wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                file_type TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','ready','failed')),
+                error TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_docs_wiki ON agent_wiki_docs(wiki_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_docs_status ON agent_wiki_docs(status)")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_wiki_pages (
+                id TEXT PRIMARY KEY,
+                wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
+                ref TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                locked INTEGER NOT NULL DEFAULT 0,
+                source_doc_id TEXT REFERENCES agent_wiki_docs(id) ON DELETE SET NULL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(wiki_id, ref)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_pages_wiki ON agent_wiki_pages(wiki_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_pages_ref ON agent_wiki_pages(ref)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_pages_locked ON agent_wiki_pages(locked)")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_wiki_edges (
+                wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
+                src_page_id TEXT NOT NULL REFERENCES agent_wiki_pages(id) ON DELETE CASCADE,
+                src_ref TEXT NOT NULL,
+                dst_ref TEXT NOT NULL,
+                dst_page_id TEXT REFERENCES agent_wiki_pages(id) ON DELETE SET NULL,
+                PRIMARY KEY (wiki_id, src_page_id, dst_ref)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_wiki ON agent_wiki_edges(wiki_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_src ON agent_wiki_edges(src_page_id)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_dst ON agent_wiki_edges(dst_page_id)")
+            .execute(pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS agent_wiki_pages_fts USING fts5(ref, title, summary, content, tokenize='trigram')",
+        )
+        .execute(pool)
+        .await?;
+
         Self::migrate_agent_messages_v2(pool).await?;
         Self::migrate_agent_workspaces_v2(pool).await?;
         Self::migrate_agent_workspaces_v3(pool).await?;
@@ -772,6 +890,7 @@ impl Database {
         Self::migrate_agent_sessions_v3(pool).await?;
         Self::migrate_agent_sessions_add_distilled(pool).await?;
         Self::migrate_agent_memory_settings_add_skill_columns(pool).await?;
+        Self::migrate_agent_memory_settings_add_wiki_columns(pool).await?;
         Self::migrate_agent_messages_v3(pool).await?;
         Self::migrate_agent_messages_v4(pool).await?;
 
@@ -845,6 +964,34 @@ impl Database {
             (
                 "skill_list_max",
                 "ALTER TABLE agent_memory_settings ADD COLUMN skill_list_max INTEGER NOT NULL DEFAULT 20",
+            ),
+        ] {
+            match sqlx::query(ddl).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e);
+                    }
+                    tracing::debug!(column, "agent_memory_settings migration: column already exists");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `agent_memory_settings` 补 Wiki 设置列（`wiki_enabled` 默认 1、`wiki_list_max` 默认 20）。
+    /// 幂等：列已存在时 ALTER 报错即跳过（照技能列迁移模式）。
+    async fn migrate_agent_memory_settings_add_wiki_columns(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        for (column, ddl) in [
+            (
+                "wiki_enabled",
+                "ALTER TABLE agent_memory_settings ADD COLUMN wiki_enabled INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "wiki_list_max",
+                "ALTER TABLE agent_memory_settings ADD COLUMN wiki_list_max INTEGER NOT NULL DEFAULT 20",
             ),
         ] {
             match sqlx::query(ddl).execute(pool).await {

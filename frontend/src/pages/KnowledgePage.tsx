@@ -19,10 +19,11 @@ import KbSection from '@/components/knowledge/KbSection';
 import MemorySection from '@/components/knowledge/MemorySection';
 import SkillSection from '@/components/knowledge/SkillSection';
 import RoleSection from '@/components/agent/role/RoleSection';
+import WikiSection from '@/components/knowledge/WikiSection';
 
 /** 知识库 + 会话记忆合并页：Tab 行右侧「设置」按钮弹出统一设置弹窗
  *  （共享 Embedding / 记忆设置 / 技能设置 三个子 Tab）。 */
-const KNOW_TAB_VALUES = ['kb', 'memory', 'skill', 'roles'] as const;
+const KNOW_TAB_VALUES = ['kb', 'memory', 'skill', 'roles', 'wiki'] as const;
 type KnowTab = (typeof KNOW_TAB_VALUES)[number];
 const DEFAULT_KNOW_TAB: KnowTab = 'kb';
 
@@ -55,6 +56,7 @@ export default function KnowledgePage() {
             <TabsTrigger value="memory">{t('nav.memory')}</TabsTrigger>
             <TabsTrigger value="skill">{t('nav.skill')}</TabsTrigger>
             <TabsTrigger value="roles">{t('nav.roles')}</TabsTrigger>
+            <TabsTrigger value="wiki">{t('wiki.tab', 'Wiki')}</TabsTrigger>
           </TabsList>
           <Button variant="outline" size="sm" onClick={() => setSettingsOpen(true)}>
             <Settings className="mr-1 h-4 w-4" />
@@ -72,6 +74,9 @@ export default function KnowledgePage() {
         </TabsContent>
         <TabsContent value="roles" className="mt-4">
           <RoleSection />
+        </TabsContent>
+        <TabsContent value="wiki" className="mt-4">
+          <WikiSection />
         </TabsContent>
       </Tabs>
 

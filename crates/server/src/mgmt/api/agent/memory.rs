@@ -70,6 +70,12 @@ pub struct UpdateMemorySettingsRequest {
     /// 会话开始注入的技能清单条数上限（默认 20）。
     #[serde(default)]
     pub skill_list_max: Option<i64>,
+    /// Wiki 总闸（默认 1：显式上传才有 LLM 开销，无非预期成本）。
+    #[serde(default)]
+    pub wiki_enabled: Option<bool>,
+    /// 会话开始注入的 Wiki 清单条数上限（默认 20）。
+    #[serde(default)]
+    pub wiki_list_max: Option<i64>,
 }
 
 /// GET /api/agent/memories 的 query 参数。`limit` 默认 50（handler 层 clamp 到 [1, 200]）。
@@ -144,6 +150,8 @@ fn settings_json(s: &AgentMemorySettingsRecord, cipher: Option<&LlmCipher>) -> s
         "pin_always_inject": s.pin_always_inject != 0,
         "skill_enabled": s.skill_enabled != 0,
         "skill_list_max": s.skill_list_max,
+        "wiki_enabled": s.wiki_enabled != 0,
+        "wiki_list_max": s.wiki_list_max,
         "created_at": normalize_db_datetime(&s.created_at),
         "updated_at": normalize_db_datetime(&s.updated_at),
     })
@@ -381,6 +389,8 @@ pub async fn put_settings(
         ),
         skill_enabled: i32::from(body.skill_enabled.unwrap_or(current.skill_enabled != 0)),
         skill_list_max: body.skill_list_max.unwrap_or(current.skill_list_max),
+        wiki_enabled: i32::from(body.wiki_enabled.unwrap_or(current.wiki_enabled != 0)),
+        wiki_list_max: body.wiki_list_max.unwrap_or(current.wiki_list_max),
         created_at: current.created_at,
         updated_at: current.updated_at,
     };

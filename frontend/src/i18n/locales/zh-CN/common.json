@@ -828,7 +828,7 @@
   },
   "skill": {
     "title": "技能库",
-    "description": "管理 AI 工作台的可复用技能：会话蒸馏、清单注入与手动维护",
+    "description": "描述",
     "listTitle": "技能",
     "newSkill": "新建技能",
     "editSkill": "编辑技能",
@@ -856,7 +856,6 @@
     "trigger_manual": "手动",
     "name": "名称",
     "namePlaceholder": "动词短语，如 发布清单检查",
-    "description": "描述",
     "descriptionPlaceholder": "触发边界与概述（≤200 字符），仅凭此判断何时调用",
     "content": "内容",
     "contentPlaceholder": "Markdown：前置条件 / 步骤 / 命令 / 验证…",
@@ -882,7 +881,7 @@
   },
   "role": {
     "title": "角色",
-    "description": "管理 AI 工作台的多角色子代理：系统提示词、工具权限、模型覆盖与作用域",
+    "description": "描述",
     "listTitle": "角色",
     "newRole": "新建角色",
     "editRole": "编辑角色",
@@ -899,7 +898,6 @@
     "toggle": "启用/禁用",
     "name": "名称",
     "namePlaceholder": "角色名（如 code-reviewer）",
-    "description": "描述",
     "descriptionPlaceholder": "角色用途与触发边界（≤200 字符），供 LLM 调度决策",
     "systemPrompt": "系统提示词",
     "systemPromptPlaceholder": "角色专属的系统指令…",
@@ -1256,5 +1254,15 @@
       "autoScrollOn": "自动滚动已开启",
       "scrollToBottom": "滚动到底部"
     }
+  },
+  "wiki": {
+    "tab": "Wiki",
+    "title": "Wiki",
+    "newWiki": "新建 Wiki",
+    "newWikiDesc": "创建 Wiki 容器",
+    "name": "名称",
+    "summary": "简介",
+    "placeholder": "Wiki 功能开发中 — 容器列表与 API 已打通，文档与页面在后续批次完成。",
+    "empty": "暂无 Wiki"
   }
 }

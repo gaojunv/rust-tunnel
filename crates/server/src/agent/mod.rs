@@ -14,6 +14,8 @@ pub mod mcp;
 pub mod memory;
 #[cfg(feature = "rag")]
 pub mod skill;
+#[cfg(feature = "rag")]
+pub mod wiki;
 pub mod notify;
 pub mod roles;
 pub mod runner;

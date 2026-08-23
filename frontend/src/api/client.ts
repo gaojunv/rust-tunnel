@@ -814,6 +814,50 @@ export async function toggleSkill(id: string): Promise<AgentSkill> {
   return data;
 }
 
+// ── Wiki（批 1 空壳） ──────────────────────────────────────────
+
+export interface WikiListParams {
+  scope?: string;
+  client_id?: string;
+  workspace_id?: string;
+  q?: string;
+  status?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listWikis(params: WikiListParams = {}): Promise<import('../types').AgentWikisResponse> {
+  const clean: Record<string, string | number> = {};
+  if (params.scope) clean.scope = params.scope;
+  if (params.client_id) clean.client_id = params.client_id;
+  if (params.workspace_id) clean.workspace_id = params.workspace_id;
+  if (params.q) clean.q = params.q;
+  if (params.status) clean.status = params.status;
+  if (params.limit !== undefined) clean.limit = params.limit;
+  if (params.offset !== undefined) clean.offset = params.offset;
+  const { data } = await api.get('/agent/wiki', { params: clean });
+  return { wikis: data.wikis ?? [], total: data.total ?? 0 };
+}
+
+export async function createWiki(req: import('../types').CreateWikiRequest): Promise<import('../types').AgentWiki> {
+  const { data } = await api.post('/agent/wiki', req);
+  return data;
+}
+
+export async function getWiki(id: string): Promise<import('../types').AgentWiki> {
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(id)}`);
+  return data;
+}
+
+export async function updateWiki(id: string, req: import('../types').UpdateWikiRequest): Promise<import('../types').AgentWiki> {
+  const { data } = await api.patch(`/agent/wiki/${encodeURIComponent(id)}`, req);
+  return data;
+}
+
+export async function deleteWiki(id: string): Promise<void> {
+  await api.delete(`/agent/wiki/${encodeURIComponent(id)}`);
+}
+
 // ── Agent Role（多角色子代理系统） ────────────────────────────────
 
 export async function listRoles(params: RoleListParams = {}): Promise<AgentRolesResponse> {

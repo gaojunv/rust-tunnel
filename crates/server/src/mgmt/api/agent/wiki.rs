@@ -1,0 +1,929 @@
+//! Wiki 管理 API（批 1 骨架）：容器/文档/页面/搜索/图谱/SSE。
+//! 仅 `rag` feature 编译，对齐 `agent/memory.rs` 与 `agent/skills.rs` 风格。
+
+#![cfg(feature = "rag")]
+
+use std::time::Duration;
+
+use axum::{
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
+    routing::{delete, get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+#[allow(unused_imports)]
+use std::sync::Arc;
+use sha2::Digest;
+use tokio::sync::broadcast;
+
+use crate::agent::memory::scope_coords;
+use crate::auth::validate_token;
+use crate::db::agent::normalize_db_datetime;
+use crate::db::wiki::{
+    normalize_wiki_ref, AgentWikiDocRecord, AgentWikiPageRecord, AgentWikiPageSummary,
+    AgentWikiRecord,
+};
+use crate::llm::rag::extractor::FileType;
+use crate::mgmt::api::dto::SseQuery;
+use crate::mgmt::api::ApiState;
+
+use super::mem_runtime;
+
+// ── WikiEvent / broadcast 挂载 ──────────────────────────────────
+
+/// Wiki 文档状态事件（批 1 先建通道，摄入在批 2 推送）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WikiEvent {
+    pub wiki_id: String,
+    pub doc_id: String,
+    pub status: String,
+    pub page_count: i64,
+    pub error: Option<String>,
+}
+
+/// Wiki 运行时（挂 `MemoryState` 旁，复用其 `broadcast` 能力）。
+/// 本批不引入新 `VectorStore`，事件通道挂 `LlmState.rag_tx` 的同级位置：
+/// 由 `bin/server.rs` 在 `init_llm_state` 之后注入（对齐 `MemoryState` 的
+/// 注入点），此处先以 `once_cell` 级别的静态通道过渡，批 2 再接入 `LlmState`。
+static WIKI_TX: std::sync::OnceLock<broadcast::Sender<WikiEvent>> = std::sync::OnceLock::new();
+
+pub(crate) fn wiki_tx() -> broadcast::Sender<WikiEvent> {
+    WIKI_TX
+        .get_or_init(|| broadcast::channel(64).0)
+        .clone()
+}
+
+pub(crate) fn wiki_subscribe() -> broadcast::Receiver<WikiEvent> {
+    wiki_tx().subscribe()
+}
+
+// ── 辅助 ─────────────────────────────────────────────────────────
+
+const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
+
+fn wiki_json(w: &AgentWikiRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": w.id,
+        "name": w.name,
+        "summary": w.summary,
+        "status": w.status,
+        "version": w.version,
+        "page_count": w.page_count,
+        "scope_type": w.scope_type,
+        "client_id": w.client_id,
+        "workspace_id": w.workspace_id,
+        "created_at": normalize_db_datetime(&w.created_at),
+        "updated_at": normalize_db_datetime(&w.updated_at),
+    })
+}
+
+fn page_summary_json(p: &AgentWikiPageSummary) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "wiki_id": p.wiki_id,
+        "ref": p.page_ref,
+        "title": p.title,
+        "summary": p.summary,
+        "locked": p.locked != 0,
+        "source_doc_id": p.source_doc_id,
+        "use_count": p.use_count,
+        "last_used_at": p.last_used_at.as_ref().map(|t| normalize_db_datetime(t)),
+        "created_at": normalize_db_datetime(&p.created_at),
+        "updated_at": normalize_db_datetime(&p.updated_at),
+    })
+}
+
+fn page_json(p: &AgentWikiPageRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "wiki_id": p.wiki_id,
+        "ref": p.page_ref,
+        "title": p.title,
+        "summary": p.summary,
+        "content": p.content,
+        "locked": p.locked != 0,
+        "source_doc_id": p.source_doc_id,
+        "use_count": p.use_count,
+        "last_used_at": p.last_used_at.as_ref().map(|t| normalize_db_datetime(t)),
+        "created_at": normalize_db_datetime(&p.created_at),
+        "updated_at": normalize_db_datetime(&p.updated_at),
+    })
+}
+
+fn doc_json(d: &AgentWikiDocRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": d.id,
+        "wiki_id": d.wiki_id,
+        "filename": d.filename,
+        "file_type": d.file_type,
+        "content_hash": d.content_hash,
+        "status": d.status,
+        "error": d.error,
+        "created_at": normalize_db_datetime(&d.created_at),
+        "updated_at": normalize_db_datetime(&d.updated_at),
+    })
+}
+
+fn new_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
+fn validate_wiki_name(name: &str) -> Result<(), (StatusCode, String)> {
+    let t = name.trim();
+    if t.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".into()));
+    }
+    if t.chars().count() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "name too long (max 64)".into()));
+    }
+    Ok(())
+}
+
+// ── Query DTO ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListWikisParams {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateWikiRequest {
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub scope_type: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateWikiRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListPagesParams {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub ref_prefix: Option<String>,
+    #[serde(default)]
+    pub locked: Option<bool>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PutPageRequest {
+    #[serde(rename = "ref")]
+    pub page_ref: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchParams {
+    pub q: String,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+// ── Handlers: 容器 ───────────────────────────────────────────────
+
+pub async fn list_wikis(
+    State(state): State<ApiState>,
+    Query(params): Query<ListWikisParams>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let rows = match mem
+        .db
+        .wiki_list(
+            params.scope.as_deref(),
+            params.client_id.as_deref(),
+            params.workspace_id.as_deref(),
+            params.q.as_deref(),
+            params.status.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    };
+    let total = match mem
+        .db
+        .wiki_count(
+            params.scope.as_deref(),
+            params.client_id.as_deref(),
+            params.workspace_id.as_deref(),
+            params.q.as_deref(),
+            params.status.as_deref(),
+        )
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    };
+    let wikis: Vec<_> = rows.iter().map(wiki_json).collect();
+    Json(serde_json::json!({ "wikis": wikis, "total": total })).into_response()
+}
+
+pub async fn create_wiki(
+    State(state): State<ApiState>,
+    Json(body): Json<CreateWikiRequest>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = validate_wiki_name(&body.name) {
+        return e.into_response();
+    }
+    let scope = if body.scope_type.trim().is_empty() {
+        "workspace"
+    } else {
+        body.scope_type.trim()
+    };
+    if !VALID_SCOPES.contains(&scope) {
+        return (StatusCode::BAD_REQUEST, "scope_type must be global|client|workspace").into_response();
+    }
+    let (scope_type, client_id, workspace_id) = scope_coords(scope, &body.client_id, &body.workspace_id);
+    let id = new_id();
+    match mem
+        .db
+        .wiki_create(&id, body.name.trim(), body.summary.trim(), &scope_type, &client_id, &workspace_id)
+        .await
+    {
+        Ok(()) => match mem.db.wiki_get(&id).await {
+            Ok(Some(w)) => (StatusCode::CREATED, Json(wiki_json(&w))).into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(e) if e.to_string().contains("UNIQUE") => {
+            (StatusCode::CONFLICT, "wiki name already exists in this scope").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn get_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    match mem.db.wiki_get(&id).await {
+        Ok(Some(w)) => Json(wiki_json(&w)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn update_wiki(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateWikiRequest>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let existing = match mem.db.wiki_get(&id).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    };
+    let name = body.name.as_deref().unwrap_or(&existing.name);
+    let summary = body.summary.as_deref().unwrap_or(&existing.summary);
+    if let Err(e) = validate_wiki_name(name) {
+        return e.into_response();
+    }
+    match mem.db.wiki_update(&id, name.trim(), summary.trim()).await {
+        Ok(()) => match mem.db.wiki_get(&id).await {
+            Ok(Some(w)) => Json(wiki_json(&w)).into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(e) if e.to_string().contains("UNIQUE") => {
+            (StatusCode::CONFLICT, "wiki name already exists in this scope").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn delete_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    match mem.db.wiki_get(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+    match mem.db.wiki_delete(&id).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+    // 批 2：删 `wiki_docs` 落盘目录 `<data_dir>/wiki_docs/<wiki_id>/`
+}
+
+// ── Handlers: 文档 ───────────────────────────────────────────────
+
+pub async fn list_docs(State(state): State<ApiState>, Path(wiki_id): Path<String>) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match mem.db.wiki_list_docs(&wiki_id).await {
+        Ok(docs) => {
+            let v: Vec<_> = docs.iter().map(doc_json).collect();
+            Json(serde_json::json!({ "documents": v })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn delete_doc(
+    State(state): State<ApiState>,
+    Path((wiki_id, doc_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let Some(doc) = mem.db.wiki_get_doc(&doc_id).await.unwrap_or(None) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if doc.wiki_id != wiki_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match mem.db.wiki_delete_doc(&doc_id).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn reindex_doc(
+    State(state): State<ApiState>,
+    Path((wiki_id, doc_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let Some(doc) = mem.db.wiki_get_doc(&doc_id).await.unwrap_or(None) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if doc.wiki_id != wiki_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // 批 1 占位：清非 locked 页并置 pending，批 2 接管摄入
+    if !mem.db.wiki_mark_doc_pending_if_idle(&doc_id).await.unwrap_or(false) {
+        return (StatusCode::CONFLICT, "document is being processed").into_response();
+    }
+    let _ = mem.db.wiki_clear_pages_by_doc(&wiki_id, &doc_id).await;
+    // 批 2：spawn_wiki_ingest 此处接入；当前停留 pending
+    Json(serde_json::json!({ "status": "pending", "id": doc_id })).into_response()
+}
+
+fn wiki_doc_source_path(data_dir: &std::path::Path, wiki_id: &str, doc_id: &str, ext: &str) -> std::path::PathBuf {
+    data_dir.join("wiki_docs").join(wiki_id).join(format!("{doc_id}.{ext}"))
+}
+
+/// POST /api/agent/wiki/:id/docs — multipart 上传，落盘 pending（批 2 接摄入）。
+pub async fn upload_doc(
+    State(state): State<ApiState>,
+    Path(wiki_id): Path<String>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut filename: Option<String> = None;
+    let mut file_type: Option<FileType> = None;
+    let mut bytes: Vec<u8> = Vec::new();
+
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid multipart body").into_response(),
+        };
+        if field.file_name().is_none() {
+            continue;
+        }
+        if filename.is_some() {
+            return (StatusCode::BAD_REQUEST, "multiple files in one request").into_response();
+        }
+        let name = field.file_name().unwrap_or_default().to_string();
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase);
+        let Some(ft) = ext.as_deref().and_then(FileType::from_extension) else {
+            let e = ext.as_deref().unwrap_or("");
+            return (StatusCode::BAD_REQUEST, format!("unsupported file type '{e}'")).into_response();
+        };
+        let max = ft.max_bytes();
+        loop {
+            let chunk = match field.chunk().await {
+                Ok(Some(c)) => c,
+                Ok(None) => break,
+                Err(_) => return (StatusCode::BAD_REQUEST, "failed to read file field").into_response(),
+            };
+            if bytes.len() + chunk.len() > max {
+                return (StatusCode::BAD_REQUEST, format!("file too large (max {max} bytes)")).into_response();
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        filename = Some(name);
+        file_type = Some(ft);
+    }
+    let Some(name) = filename else {
+        return (StatusCode::BAD_REQUEST, "missing file field").into_response();
+    };
+    let Some(ft) = file_type else {
+        return (StatusCode::BAD_REQUEST, "missing file field").into_response();
+    };
+    if let Err(e) = ft.probe(&bytes) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if matches!(ft, FileType::Markdown | FileType::Text) {
+        let Ok(text) = String::from_utf8(bytes) else {
+            return (StatusCode::BAD_REQUEST, "file must be UTF-8 text").into_response();
+        };
+        if text.trim().is_empty() {
+            return (StatusCode::BAD_REQUEST, "file is empty").into_response();
+        }
+        bytes = text.into_bytes();
+    }
+
+    let doc_id = new_id();
+    let content_hash = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
+
+    // 落盘：取 LlmState 的 rag_data_dir（VectorStore.data_dir() 为根，拼 wiki_docs）
+    let data_dir = mem
+        .llm
+        .rag_store
+        .data_dir()
+        .to_path_buf();
+    let source_path = wiki_doc_source_path(&data_dir, &wiki_id, &doc_id, ft.as_str());
+    if let Some(parent) = source_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to init storage: {e}")).into_response();
+        }
+    }
+    if let Err(e) = tokio::fs::write(&source_path, &bytes).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to persist document: {e}")).into_response();
+    }
+
+    if let Err(e) = mem.db.wiki_create_doc(&doc_id, &wiki_id, &name, ft.as_str(), &content_hash).await {
+        let _ = tokio::fs::remove_file(&source_path).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
+    }
+
+    // 本批不接摄入管线，停留 pending；批 2 在此 spawn_wiki_ingest
+    match mem.db.wiki_get_doc(&doc_id).await {
+        Ok(Some(doc)) => (StatusCode::CREATED, Json(doc_json(&doc))).into_response(),
+        _ => (StatusCode::CREATED, Json(serde_json::json!({ "id": doc_id, "wiki_id": wiki_id, "status": "pending" }))).into_response(),
+    }
+}
+
+// ── Handlers: 页面 ───────────────────────────────────────────────
+
+pub async fn list_pages(
+    State(state): State<ApiState>,
+    Path(wiki_id): Path<String>,
+    Query(params): Query<ListPagesParams>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0).max(0);
+    match mem
+        .db
+        .wiki_list_pages(&wiki_id, params.q.as_deref(), params.ref_prefix.as_deref(), params.locked, limit, offset)
+        .await
+    {
+        Ok(rows) => {
+            let pages: Vec<_> = rows.iter().map(page_summary_json).collect();
+            Json(serde_json::json!({ "pages": pages, "total": pages.len() })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn get_page(
+    State(state): State<ApiState>,
+    Path((wiki_id, page_ref)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    // axum wildcard: page_ref 可能含 `/`，Path 已解码
+    let Some(norm) = normalize_wiki_ref(&page_ref) else {
+        return (StatusCode::BAD_REQUEST, "invalid ref").into_response();
+    };
+    match mem.db.wiki_get_page(&wiki_id, &norm).await {
+        Ok(Some(p)) => Json(page_json(&p)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn put_page(
+    State(state): State<ApiState>,
+    Path((wiki_id, page_ref)): Path<(String, String)>,
+    Json(body): Json<PutPageRequest>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // ref 来源：路径优先，其次 body.ref
+    let raw_ref = body.page_ref.as_deref().unwrap_or(&page_ref);
+    let Some(norm) = normalize_wiki_ref(raw_ref) else {
+        return (StatusCode::BAD_REQUEST, "invalid ref").into_response();
+    };
+    if body.content.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "content is required").into_response();
+    }
+    if body.title.chars().count() > 64 {
+        return (StatusCode::BAD_REQUEST, "title too long (max 64)").into_response();
+    }
+    if body.summary.chars().count() > 200 {
+        return (StatusCode::BAD_REQUEST, "summary too long (max 200)").into_response();
+    }
+    // 手动页 locked=1（ingest 不覆盖）
+    match mem
+        .db
+        .wiki_upsert_page(&wiki_id, &norm, body.title.trim(), body.summary.trim(), &body.content, true, None)
+        .await
+    {
+        Ok(id) => match mem.db.wiki_get_page_by_id(&id).await {
+            Ok(Some(p)) => Json(page_json(&p)).into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn delete_page(
+    State(state): State<ApiState>,
+    Path((wiki_id, page_ref)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let Some(norm) = normalize_wiki_ref(&page_ref) else {
+        return (StatusCode::BAD_REQUEST, "invalid ref").into_response();
+    };
+    match mem.db.wiki_delete_page(&wiki_id, &norm).await {
+        Ok(true) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+// ── Handlers: graph / search ────────────────────────────────────
+
+pub async fn get_graph(State(state): State<ApiState>, Path(wiki_id): Path<String>) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match mem.db.wiki_graph(&wiki_id).await {
+        Ok(g) => {
+            let nodes: Vec<_> = g.nodes.iter().map(page_summary_json).collect();
+            Json(serde_json::json!({ "nodes": nodes, "edges": g.edges })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn search_wiki(
+    State(state): State<ApiState>,
+    Path(wiki_id): Path<String>,
+    Query(params): Query<SearchParams>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let limit = params.limit.unwrap_or(20).clamp(1, 20);
+    match mem.db.wiki_search(&[wiki_id], &params.q, limit).await {
+        Ok(hits) => Json(serde_json::json!({ "hits": hits })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+pub async fn search_all_wikis(
+    State(state): State<ApiState>,
+    Query(params): Query<SearchParams>,
+) -> impl IntoResponse {
+    let mem = match mem_runtime(&state) {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    let limit = params.limit.unwrap_or(20).clamp(1, 20);
+    // 批 1：跨容器搜全量（scope 过滤在批 3 接入可见性）
+    match mem.db.wiki_search(&[], &params.q, limit).await {
+        Ok(hits) => Json(serde_json::json!({ "hits": hits })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
+    }
+}
+
+// ── SSE ──────────────────────────────────────────────────────────
+
+pub async fn sse_wiki_events(
+    State(state): State<ApiState>,
+    Query(params): Query<SseQuery>,
+) -> impl IntoResponse {
+    if state.auth_config.is_enabled() {
+        let token = params.token.as_deref().unwrap_or("");
+        let is_valid = !token.is_empty() && validate_token(token, &state.auth_config.jwt_secret).is_ok();
+        if !is_valid {
+            return axum::response::Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("Unauthorized"))
+                .unwrap();
+        }
+    }
+    let mut rx = wiki_subscribe();
+    // 复用 MemoryState 的 LlmState 存在性门控（rag 未初始化时仍可订阅 SSE，仅无事件）
+    let stream = async_stream::stream! {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    let json = serde_json::to_string(&ev).unwrap_or_default();
+                    yield Ok::<_, std::convert::Infallible>(Event::default().event("wiki").data(json));
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    yield Ok::<_, std::convert::Infallible>(
+                        Event::default().event("sync").data(format!(r#"{{"lagged":{n}}}"#)),
+                    );
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_) => {
+                    yield Ok::<_, std::convert::Infallible>(Event::default().event("ping").data(""));
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(30))).into_response()
+}
+
+// ── 路由 ─────────────────────────────────────────────────────────
+
+pub fn protected_router() -> Router<ApiState> {
+    Router::new()
+        .route("/api/agent/wiki", get(list_wikis).post(create_wiki))
+        .route("/api/agent/wiki/:id", get(get_wiki).patch(update_wiki).delete(delete_wiki))
+        .route("/api/agent/wiki/:id/docs", get(list_docs).post(upload_doc))
+        .route("/api/agent/wiki/:id/docs/:docId", delete(delete_doc))
+        .route("/api/agent/wiki/:id/docs/:docId/reindex", post(reindex_doc))
+        .route("/api/agent/wiki/:id/pages", get(list_pages))
+        .route("/api/agent/wiki/:id/pages/*ref", get(get_page).put(put_page).delete(delete_page))
+        .route("/api/agent/wiki/:id/graph", get(get_graph))
+        .route("/api/agent/wiki/:id/search", get(search_wiki))
+        .route("/api/agent/wiki/search", get(search_all_wikis))
+}
+
+pub fn public_router() -> Router<ApiState> {
+    Router::new().route("/api/agent/wiki/events", get(sse_wiki_events))
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "rag"))]
+mod tests {
+    use super::*;
+    
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode as HttpStatus};
+    use axum::Router;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use crate::auth::AuthConfig;
+    use crate::control::ServerState;
+    use crate::db::Database;
+
+    async fn test_api_state(rag_dir: &std::path::Path) -> ApiState {
+        let db = Database::new(":memory:").await.expect("in-memory db");
+        let mut server_state = ServerState::with_db(db);
+        server_state
+            .proxy_state
+            .init_llm_state(
+                server_state.db().cloned(),
+                Some([42u8; 32]),
+                rag_dir,
+                Arc::new(tokio::sync::RwLock::new(
+                    crate::dynamic_config::DynamicConfig::default_for_llm(),
+                )),
+            )
+            .await;
+        let mem = {
+            let llm = server_state
+                .proxy_state
+                .llm_state
+                .read()
+                .await
+                .as_ref()
+                .expect("llm state")
+                .clone();
+            crate::agent::memory::MemoryState::new(
+                server_state.db().cloned().expect("db present"),
+                llm.rag_store.clone(),
+                llm.cipher.clone(),
+                (*llm).clone(),
+            )
+        };
+        let agent = server_state.agent_state.take().expect("agent state").with_memory(mem);
+        server_state.agent_state = Some(agent);
+        ApiState {
+            server_state,
+            auth_config: Arc::new(AuthConfig::new(None, None)),
+            log_store: None,
+        }
+    }
+
+    fn test_router(state: ApiState) -> Router {
+        super::protected_router()
+            .merge(super::public_router())
+            .merge(crate::mgmt::api::agent::memory::protected_router())
+            .merge(crate::mgmt::api::agent::memory::public_router())
+            .with_state(state)
+    }
+
+    async fn call(app: &Router, req: Request<Body>) -> (HttpStatus, Value) {
+        let resp = app.clone().oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.expect("read body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+        (status, body)
+    }
+
+    fn json_request(method: Method, uri: String, body: &Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn wiki_container_crud_and_manual_page_and_search_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(test_api_state(dir.path()).await);
+
+        // create wiki
+        let (status, body) = call(
+            &app,
+            json_request(Method::POST, "/api/agent/wiki".to_string(), &json!({"name": "my-wiki","summary":"desc","scope_type":"workspace","client_id":"c1","workspace_id":"w1"})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::CREATED, "create wiki: {body}");
+        let wiki_id = body["id"].as_str().unwrap().to_string();
+
+        // list
+        let (status, body) = call(&app, json_request(Method::GET, "/api/agent/wiki?scope=workspace&workspace_id=w1".to_string(), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["total"], json!(1));
+
+        // get
+        let (status, _) = call(&app, json_request(Method::GET, format!("/api/agent/wiki/{wiki_id}"), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+
+        // manual page PUT（locked=1）
+        let (status, body) = call(
+            &app,
+            json_request(Method::PUT, format!("/api/agent/wiki/{wiki_id}/pages/deploy/prod"), &json!({"title":"部署","summary":"摘要","content":"内容 [[other/page]]"})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "put page: {body}");
+        assert_eq!(body["ref"], json!("deploy/prod"));
+
+        // GET page
+        let (status, body) = call(&app, json_request(Method::GET, format!("/api/agent/wiki/{wiki_id}/pages/deploy/prod"), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["content"], json!("内容 [[other/page]]"));
+
+        // pages list（不含 content 视图亦可用，但本批返回 summary 视图）
+        let (status, body) = call(&app, json_request(Method::GET, format!("/api/agent/wiki/{wiki_id}/pages"), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["pages"].as_array().unwrap().len(), 1);
+
+        // graph
+        let (status, body) = call(&app, json_request(Method::GET, format!("/api/agent/wiki/{wiki_id}/graph"), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["nodes"].as_array().unwrap().len(), 1);
+
+        // search 端到端（2字 LIKE 回退）
+        let req = Request::builder().method(Method::GET).uri(format!("/api/agent/wiki/{wiki_id}/search?q=部署")).body(Body::empty()).unwrap();
+        let (status, body) = call(&app, req).await;
+        assert_eq!(status, HttpStatus::OK, "search: {body}");
+        assert!(body["hits"].as_array().unwrap().iter().any(|h| h["ref"] == json!("deploy/prod")));
+
+        // delete page
+        let (status, _) = call(&app, json_request(Method::DELETE, format!("/api/agent/wiki/{wiki_id}/pages/deploy/prod"), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+
+        // settings roundtrip：wiki_enabled / wiki_list_max 不丢（INSERT OR REPLACE 坑回归）
+        let (status, body) = call(&app, json_request(Method::GET, "/api/agent/memory/settings".to_string(), &json!(null))).await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["wiki_enabled"], json!(true));
+        assert_eq!(body["wiki_list_max"], json!(20));
+
+        let (status, body) = call(
+            &app,
+            json_request(Method::PUT, "/api/agent/memory/settings".to_string(), &json!({"wiki_enabled": false, "wiki_list_max": 8})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK, "put settings: {body}");
+        assert_eq!(body["wiki_enabled"], json!(false));
+        assert_eq!(body["wiki_list_max"], json!(8));
+
+        // 再改 top_k：wiki 字段不应被重置
+        let (status, body) = call(
+            &app,
+            json_request(Method::PUT, "/api/agent/memory/settings".to_string(), &json!({"top_k": 16})),
+        )
+        .await;
+        assert_eq!(status, HttpStatus::OK);
+        assert_eq!(body["wiki_enabled"], json!(false), "wiki_enabled 不应被重置");
+        assert_eq!(body["wiki_list_max"], json!(8), "wiki_list_max 不应被重置");
+    }
+
+    #[tokio::test]
+    async fn wiki_sse_events_stream_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_router(test_api_state(dir.path()).await);
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/agent/wiki/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "text/event-stream");
+    }
+}

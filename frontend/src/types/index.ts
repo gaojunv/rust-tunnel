@@ -568,6 +568,10 @@ export interface AgentMemorySettings {
   skill_enabled: boolean;
   /** 会话开始注入的技能清单最大条数。 */
   skill_list_max: number;
+  /** Wiki 总闸（默认 1）：显式上传才有 LLM 开销。 */
+  wiki_enabled: boolean;
+  /** 会话开始注入的 Wiki 清单最大条数。 */
+  wiki_list_max: number;
   /** API 密钥是否已配置（脱敏标志）。 */
   has_key: boolean;
   created_at?: string;
@@ -613,6 +617,8 @@ export interface MemorySettingsRequest {
   pin_always_inject?: boolean;
   skill_enabled?: boolean;
   skill_list_max?: number;
+  wiki_enabled?: boolean;
+  wiki_list_max?: number;
 }
 
 /** 记忆列表分页响应。 */
@@ -685,6 +691,40 @@ export interface UpdateSkillRequest {
   content?: string;
   scope_type?: AgentMemoryScope;
   tags?: string[];
+}
+
+// === Wiki（批 1 骨架） ===
+
+export interface AgentWiki {
+  id: string;
+  name: string;
+  summary: string;
+  status: string;
+  version: number;
+  page_count: number;
+  scope_type: AgentMemoryScope;
+  client_id: string;
+  workspace_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentWikisResponse {
+  wikis: AgentWiki[];
+  total: number;
+}
+
+export interface CreateWikiRequest {
+  name: string;
+  summary?: string;
+  scope_type?: AgentMemoryScope;
+  client_id?: string;
+  workspace_id?: string;
+}
+
+export interface UpdateWikiRequest {
+  name?: string;
+  summary?: string;
 }
 
 // === Agent Workbench ===

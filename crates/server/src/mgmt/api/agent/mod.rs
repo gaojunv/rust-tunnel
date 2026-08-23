@@ -11,6 +11,8 @@ pub mod memory;
 pub mod roles;
 #[cfg(feature = "rag")]
 pub mod skills;
+#[cfg(feature = "rag")]
+pub mod wiki;
 mod sessions;
 mod workspaces;
 mod ws;

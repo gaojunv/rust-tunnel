@@ -552,6 +552,9 @@ pub async fn run_api_server(
         public_routes = public_routes.merge(agent::memory::public_router());
         // Skill 库管理路由（skills CRUD + toggle）
         protected_routes = protected_routes.merge(agent::skills::protected_router());
+        // Wiki 容器/文档/页面/搜索/图谱/SSE 路由
+        protected_routes = protected_routes.merge(agent::wiki::protected_router());
+        public_routes = public_routes.merge(agent::wiki::public_router());
     }
 
     // Only apply auth middleware if password is set

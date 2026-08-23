@@ -828,7 +828,7 @@
   },
   "skill": {
     "title": "Skill Library",
-    "description": "Manage reusable AI workbench skills: session distill, list injection and manual curation",
+    "description": "Description",
     "listTitle": "Skills",
     "newSkill": "New Skill",
     "editSkill": "Edit Skill",
@@ -856,7 +856,6 @@
     "trigger_manual": "Manual",
     "name": "Name",
     "namePlaceholder": "A verb phrase, e.g. release checklist",
-    "description": "Description",
     "descriptionPlaceholder": "Trigger boundary and overview (≤200 chars); decides when to call this skill",
     "content": "Content",
     "contentPlaceholder": "Markdown: prerequisites / steps / commands / verification…",
@@ -882,7 +881,7 @@
   },
   "role": {
     "title": "Roles",
-    "description": "Manage multi-role subagents: system prompts, tool permissions, model overrides, and scopes",
+    "description": "Description",
     "listTitle": "Roles",
     "newRole": "New Role",
     "editRole": "Edit Role",
@@ -899,7 +898,6 @@
     "toggle": "Enable/Disable",
     "name": "Name",
     "namePlaceholder": "Role name (e.g. code-reviewer)",
-    "description": "Description",
     "descriptionPlaceholder": "Purpose and trigger boundary (≤200 chars), used by LLM for dispatch decisions",
     "systemPrompt": "System Prompt",
     "systemPromptPlaceholder": "Role-specific system instructions…",
@@ -1259,5 +1257,15 @@
       "autoScrollOn": "Auto-scroll on",
       "scrollToBottom": "Scroll to bottom"
     }
+  },
+  "wiki": {
+    "tab": "Wiki",
+    "title": "Wiki",
+    "newWiki": "New Wiki",
+    "newWikiDesc": "Create a wiki container",
+    "name": "Name",
+    "summary": "Summary",
+    "placeholder": "Wiki is under construction — containers and APIs are live; docs and pages in later batches.",
+    "empty": "No wikis yet"
   }
 }

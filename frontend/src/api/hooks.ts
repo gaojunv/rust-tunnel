@@ -996,3 +996,37 @@ export function useUpdateSessionRole() {
     },
   });
 }
+
+// ── Wiki（批 1 空壳） ──────────────────────────────────────────
+
+export function useWikis(params: import('./client').WikiListParams = {}) {
+  return useQuery({
+    queryKey: ['agent-wikis', params],
+    queryFn: () => import('./client').then((m) => m.listWikis(params)),
+  });
+}
+
+export function useCreateWiki() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: import('../types').CreateWikiRequest) => import('./client').then((m) => m.createWiki(req)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
+  });
+}
+
+export function useUpdateWiki() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...req }: { id: string } & import('../types').UpdateWikiRequest) =>
+      import('./client').then((m) => m.updateWiki(id, req)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
+  });
+}
+
+export function useDeleteWiki() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => import('./client').then((m) => m.deleteWiki(id)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
+  });
+}

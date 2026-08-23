@@ -11,6 +11,7 @@ pub mod clients;
 pub mod memory;
 pub mod roles;
 pub mod skills;
+pub mod wiki;
 pub mod dns;
 pub mod llm;
 pub mod logs;
