@@ -1083,7 +1083,6 @@ async fn llm_gateway_config_restored_from_rule() {
             .expect("load rules from db");
         harness
             .server_state
-            .proxy_state
             .init_llm_state(
                 harness.server_state.db().cloned(),
                 Some([42u8; 32]),

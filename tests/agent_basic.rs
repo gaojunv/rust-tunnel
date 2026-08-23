@@ -498,7 +498,6 @@ async fn run_turn_with_approval(
         .expect("harness agent_state");
     let llm = harness
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await
@@ -818,7 +817,6 @@ async fn run_turn_collect(
         .expect("harness agent_state");
     let llm = harness
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await

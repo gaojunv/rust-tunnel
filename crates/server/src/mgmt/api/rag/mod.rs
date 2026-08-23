@@ -70,7 +70,6 @@ pub fn protected_router() -> Router<ApiState> {
 async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
     state
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await
@@ -129,7 +128,6 @@ mod tests {
         let db = Database::new(":memory:").await.expect("in-memory db");
         let server_state = ServerState::with_db(db);
         server_state
-            .proxy_state
             .init_llm_state(
                 server_state.db().cloned(),
                 Some([42u8; 32]),
@@ -367,7 +365,7 @@ mod tests {
         // 订阅 SSE 端点同源事件通道（上传后应收到 processing → ready）
         let db = state.server_state.db().unwrap().clone();
         let tx = {
-            let guard = state.server_state.proxy_state.llm_state.read().await;
+            let guard = state.server_state.llm_state.read().await;
             guard.as_ref().unwrap().rag_tx.clone()
         };
         let mut rx = tx.subscribe();

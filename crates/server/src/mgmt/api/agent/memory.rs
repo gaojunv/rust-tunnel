@@ -829,7 +829,6 @@ mod tests {
         let db = Database::new(":memory:").await.expect("in-memory db");
         let mut server_state = ServerState::with_db(db);
         server_state
-            .proxy_state
             .init_llm_state(
                 server_state.db().cloned(),
                 Some([42u8; 32]),
@@ -841,7 +840,6 @@ mod tests {
             .await;
         let mem = {
             let llm = server_state
-                .proxy_state
                 .llm_state
                 .read()
                 .await

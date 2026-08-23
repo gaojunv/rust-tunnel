@@ -996,7 +996,6 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
             state.server_state.agent_state.clone(),
             state
                 .server_state
-                .proxy_state
                 .llm_state
                 .read()
                 .await

@@ -1,11 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
 use crate::acme::{CertificateManager, CertificateProvider};
 use crate::db::Database;
-use crate::llm::{LlmGatewayConfig, LlmState};
+use super::llm_dispatch::LlmDispatcher;
 use crate::reverse_proxy::connector;
 use crate::reverse_proxy::rules::{
     resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
@@ -38,8 +37,8 @@ pub struct ReverseProxyState {
     /// Trojan SNI 分流表项（ArcSwap 热替换）：SNI 命中 domain 时，
     /// 对应 listen_addr 的共享监听器把连接交给 Trojan 处理。None = 独立监听模式。
     pub trojan_sni: Arc<arc_swap::ArcSwap<Option<Arc<TrojanSniEntry>>>>,
-    /// LLM Gateway state (set when LLM is configured).
-    pub llm_state: Arc<tokio::sync::RwLock<Option<Arc<LlmState>>>>,
+    /// LLM Gateway dispatcher (type-erased, injected by assembly layer).
+    pub llm_dispatcher: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmDispatcher>>>>,
 }
 
 impl ReverseProxyState {
@@ -56,7 +55,7 @@ impl ReverseProxyState {
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
             trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
-            llm_state: Arc::new(tokio::sync::RwLock::new(None)),
+            llm_dispatcher: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -73,66 +72,8 @@ impl ReverseProxyState {
             direct_connector: Arc::new(connector::DirectConnector),
             client_connector: Arc::new(tokio::sync::RwLock::new(None)),
             trojan_sni: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
-            llm_state: Arc::new(tokio::sync::RwLock::new(None)),
+            llm_dispatcher: Arc::new(tokio::sync::RwLock::new(None)),
         }
-    }
-
-    /// Initialize the LlmState from the in-memory `__llm_gateway__` rule (if any).
-    /// Called during server startup after rules are loaded from DB.
-    /// `master_key` 用于提供商 API Key 的落库加解密；None 表示不加解密（明文兼容）。
-    /// `rag_data_dir` 是 RAG 向量库数据根目录（建议传 DB 所在目录，VectorStore 内部再拼 `rag/<kb_id>`）。
-    pub async fn init_llm_state(
-        &self,
-        db: Option<Database>,
-        master_key: Option<[u8; 32]>,
-        #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &Path,
-        dynamic_config: Arc<tokio::sync::RwLock<crate::dynamic_config::DynamicConfig>>,
-    ) {
-        let gateway_rule = {
-            let rules = self.rules.lock().await;
-            rules.get("__llm_gateway__").cloned()
-        };
-
-        let cipher = master_key.map(crate::llm::crypto::LlmCipher::from_master_key);
-        #[cfg(feature = "rag")]
-        let mut llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
-        #[cfg(not(feature = "rag"))]
-        let mut llm = LlmState::new(db, cipher);
-        llm.dynamic_config = dynamic_config;
-
-        // Derive gateway config from the ProxyRule
-        if let Some(rule) = gateway_rule {
-            let tls = rule.tls.as_ref();
-            let (openai_domain, anthropic_domain) = if rule.domains.len() >= 2 {
-                (
-                    Some(rule.domains[0].clone()).filter(|d| !d.is_empty()),
-                    Some(rule.domains[1].clone()).filter(|d| !d.is_empty()),
-                )
-            } else {
-                let old = rule.domains.first().cloned().filter(|d| !d.is_empty());
-                (old, None)
-            };
-            let config = LlmGatewayConfig {
-                enabled: rule.enabled,
-                openai_domain,
-                anthropic_domain,
-                listen: rule.listen.clone(),
-                tls_enabled: tls.is_some_and(|t| t.enabled),
-                tls_acme: tls.is_some_and(|t| t.acme),
-            };
-            *llm.gateway_config.write().await = Some(config);
-        } else {
-            *llm.gateway_config.write().await = Some(LlmGatewayConfig {
-                enabled: false,
-                openai_domain: None,
-                anthropic_domain: None,
-                listen: "0.0.0.0:443".to_string(),
-                tls_enabled: false,
-                tls_acme: false,
-            });
-        }
-
-        *self.llm_state.write().await = Some(Arc::new(llm));
     }
 
     /// Set the concrete certificate manager for TLS termination and coverage queries.
@@ -551,125 +492,4 @@ mod tests {
         assert!(state.http_listen_addr_for_port(8443).await.is_none());
     }
 
-    #[tokio::test]
-    async fn init_llm_state_from_gateway_rule() {
-        let state = ReverseProxyState::new();
-
-        // Before init, llm_state should be None
-        assert!(state.llm_state.read().await.is_none());
-
-        // Insert a gateway rule
-        let mut rules = state.rules.lock().await;
-        rules.insert(
-            "__llm_gateway__".into(),
-            ProxyRule {
-                id: "__llm_gateway__".into(),
-                name: "LLM Gateway".into(),
-                rule_type: RuleType::Llm,
-                listen: "0.0.0.0:443".into(),
-                domains: vec!["llm.example.com".into()],
-                routes: vec![],
-                tls: Some(ProxyTlsConfig {
-                    enabled: true,
-                    acme: true,
-                    domain: Some("llm.example.com".into()),
-                }),
-                enabled: true,
-                created_at: None,
-                cert_status: None,
-            },
-        );
-        drop(rules);
-
-        // Initialize LlmState (without DB)
-        state
-            .init_llm_state(
-                None,
-                None,
-                std::path::Path::new("."),
-                std::sync::Arc::new(tokio::sync::RwLock::new(
-                    crate::dynamic_config::DynamicConfig::default_for_llm(),
-                )),
-            )
-            .await;
-
-        let llm_guard = state.llm_state.read().await;
-        assert!(llm_guard.is_some(), "llm_state should be initialized");
-        let llm = llm_guard.as_ref().unwrap();
-        let cfg = llm.gateway_config.read().await;
-        let cfg = cfg.as_ref().expect("gateway config should be loaded");
-        assert!(cfg.enabled);
-        assert_eq!(cfg.openai_domain.as_deref(), Some("llm.example.com"));
-        assert_eq!(cfg.listen, "0.0.0.0:443");
-        assert!(cfg.tls_enabled);
-        assert!(cfg.tls_acme);
-    }
-
-    #[tokio::test]
-    async fn init_llm_state_no_gateway_rule() {
-        let state = ReverseProxyState::new();
-        // No gateway rule — llm_state should still be initialized (disabled)
-        state
-            .init_llm_state(
-                None,
-                None,
-                std::path::Path::new("."),
-                std::sync::Arc::new(tokio::sync::RwLock::new(
-                    crate::dynamic_config::DynamicConfig::default_for_llm(),
-                )),
-            )
-            .await;
-        let llm_guard = state.llm_state.read().await;
-        assert!(
-            llm_guard.is_some(),
-            "llm_state should always be initialized for API access"
-        );
-        let llm = llm_guard.as_ref().unwrap();
-        let cfg = llm.gateway_config.read().await;
-        let cfg = cfg.as_ref().expect("gateway config should exist");
-        assert!(!cfg.enabled, "should be disabled by default");
-    }
-
-    #[tokio::test]
-    async fn init_llm_state_disabled_gateway() {
-        let state = ReverseProxyState::new();
-
-        let mut rules = state.rules.lock().await;
-        rules.insert(
-            "__llm_gateway__".into(),
-            ProxyRule {
-                id: "__llm_gateway__".into(),
-                name: "LLM Gateway".into(),
-                rule_type: RuleType::Llm,
-                listen: "0.0.0.0:443".into(),
-                domains: vec!["llm.example.com".into()],
-                routes: vec![],
-                tls: None,
-                enabled: false,
-                created_at: None,
-                cert_status: None,
-            },
-        );
-        drop(rules);
-
-        state
-            .init_llm_state(
-                None,
-                None,
-                std::path::Path::new("."),
-                std::sync::Arc::new(tokio::sync::RwLock::new(
-                    crate::dynamic_config::DynamicConfig::default_for_llm(),
-                )),
-            )
-            .await;
-
-        // Even if the rule exists but is disabled, llm_state should be initialized
-        // (the enabled flag is checked per-request)
-        let llm_guard = state.llm_state.read().await;
-        assert!(llm_guard.is_some());
-        let llm = llm_guard.as_ref().unwrap();
-        let cfg = llm.gateway_config.read().await;
-        let cfg = cfg.as_ref().expect("gateway config should exist");
-        assert!(!cfg.enabled);
-    }
 }

@@ -24,6 +24,7 @@ pub mod server_auth;
 pub mod settings;
 pub mod shadowsocks;
 pub mod stats;
+pub mod tool_result;
 pub mod trojan;
 pub use llm::*;
 pub use records::*;

@@ -340,7 +340,6 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
             }
         };
     state
-        .proxy_state
         .init_llm_state(
             state.db().cloned(),
             llm_master_key,
@@ -380,7 +379,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
     // 必须克隆 LlmState.rag_store 同一实例）。注意要在任何 state.clone() 之前
     // 完成，确保所有后续克隆共享注入后的桥。
     {
-        let llm_state_opt = state.proxy_state.llm_state.read().await.clone();
+        let llm_state_opt = state.llm_state.read().await.clone();
         if let Some(llm_state) = llm_state_opt {
             let llm_cipher = llm_state.cipher.clone();
             let agent_state = state
@@ -418,7 +417,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
         use rust_tunnel_server::agent::llm_bridge::LlmGatewayEndpoint;
         use rust_tunnel_server::llm::auth::generate_api_key;
 
-        let llm_state_opt = state.proxy_state.llm_state.read().await.clone();
+        let llm_state_opt = state.llm_state.read().await.clone();
 
         if let Some(llm_state) = llm_state_opt {
             // 创建/复用内部 API key（稳定的 id，幂等 INSERT OR REPLACE 模式）。

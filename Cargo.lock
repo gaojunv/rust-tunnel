@@ -4796,6 +4796,8 @@ dependencies = [
 name = "rust-tunnel-common"
 version = "0.4.0"
 dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
  "bincode 1.3.3",
  "rand 0.8.6",
  "rcgen",
@@ -4818,7 +4820,6 @@ dependencies = [
 name = "rust-tunnel-server"
 version = "0.4.0"
 dependencies = [
- "aes-gcm",
  "agent-client-protocol",
  "anyhow",
  "arc-swap",

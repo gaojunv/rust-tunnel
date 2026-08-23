@@ -49,7 +49,7 @@ fn new_id() -> String {
 pub(crate) async fn agent_cipher(
     state: &crate::mgmt::api::ApiState,
 ) -> Option<crate::llm::crypto::LlmCipher> {
-    let guard = state.server_state.proxy_state.llm_state.read().await;
+    let guard = state.server_state.llm_state.read().await;
     guard.as_ref().and_then(|l| l.cipher.clone())
 }
 

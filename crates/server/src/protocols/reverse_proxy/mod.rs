@@ -2,6 +2,7 @@ pub mod config;
 pub mod connector;
 pub mod error;
 pub mod handler;
+pub mod llm_dispatch;
 pub mod router;
 pub mod rules;
 pub mod shared_listener;

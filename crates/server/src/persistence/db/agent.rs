@@ -796,7 +796,7 @@ impl Database {
     /// （空字段省略），status 落库供前端区分失败/成功（修复失败工具刷新后恒显 ✓）。
     /// 存量旧行是纯文本，读取方须向后兼容。中间态空占位（无产出、非异常终态）
     /// 传 ""，不覆盖已落库真实结果；failed 等异常终态即使 text 为空也须传非空
-    /// JSON。装配见 [`crate::agent::tool_result::tool_result_persist_content`]。
+    /// JSON。装配见 [`crate::db::tool_result::tool_result_persist_content`]。
     pub async fn agent_upsert_tool_result(
         &self,
         id: &str,
@@ -1661,7 +1661,7 @@ mod tests {
             .await
             .unwrap();
 
-        let content = crate::agent::tool_result::tool_result_persist_content(
+        let content = crate::db::tool_result::tool_result_persist_content(
             Some("a.rs"),
             Some("failed"),
             Some(&serde_json::json!([{"old": "x", "new": "y"}])),
@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(v["locations"][0]["line"], 3);
         // 读取方解析：提取 text 应成功（新格式）
         assert_eq!(
-            crate::agent::tool_result::tool_result_text(&rows[0].content),
+            crate::db::tool_result::tool_result_text(&rows[0].content),
             Some("a.rs".to_string())
         );
     }
@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "plain result");
         assert_eq!(
-            crate::agent::tool_result::tool_result_text(&rows[0].content),
+            crate::db::tool_result::tool_result_text(&rows[0].content),
             None,
             "旧纯文本行必须走旧路径"
         );
@@ -2117,7 +2117,7 @@ mod tests {
     /// 读回密文 → 用同一 LlmCipher 解密得到明文；「空串/缺省保持、非空更新」。
     #[tokio::test]
     async fn test_workspace_github_columns_roundtrip() {
-        use crate::llm::crypto::LlmCipher;
+        use rust_tunnel_common::crypto::LlmCipher;
         let cipher = LlmCipher::from_master_key([7u8; 32]);
         let token = "ghp_secret_token_123";
         let stored = cipher.encrypt(token);
@@ -2180,7 +2180,7 @@ mod tests {
     /// 只暴露 github_token_set 布尔位；其余字段（owner/repo）正常下发。
     #[tokio::test]
     async fn test_workspace_github_token_redacted_in_json() {
-        use crate::llm::crypto::LlmCipher;
+        use rust_tunnel_common::crypto::LlmCipher;
         let cipher = LlmCipher::from_master_key([9u8; 32]);
         let token = "ghp_ultra_secret_42";
         let stored = cipher.encrypt(token);
