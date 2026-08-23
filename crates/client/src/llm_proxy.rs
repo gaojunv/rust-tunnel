@@ -16,6 +16,7 @@ const MAX_LLM_PROXY_BODY: usize = 900 * 1024;
 /// request_id -> 等待响应 chunk 的 HTTP 连接发送端
 pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>;
 
+#[must_use] 
 pub fn new_pending_map() -> PendingMap {
     Arc::new(Mutex::new(HashMap::new()))
 }

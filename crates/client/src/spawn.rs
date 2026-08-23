@@ -25,6 +25,7 @@ pub struct SpawnManager {
 }
 
 impl SpawnManager {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }

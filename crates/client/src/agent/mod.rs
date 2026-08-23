@@ -296,7 +296,7 @@ fn apply_edits(content: &str, edits: &[FileEdit]) -> Result<String, String> {
         } else if count == 1 {
             current = current.replacen(&edit.old_string, &edit.new_string, 1);
         } else {
-            let line_nums: Vec<String> = matches.iter().map(|l| l.to_string()).collect();
+            let line_nums: Vec<String> = matches.iter().map(std::string::ToString::to_string).collect();
             return Err(format!(
                 "edit #{n}: old_string matches {count} times at lines {}; provide more context",
                 line_nums.join(", ")
@@ -427,22 +427,19 @@ async fn write_file2_host(
         }
     }
     // 生成 diff
-    let diff = match &old_content {
-        Some(old) => unified_diff(old, content),
-        None => {
-            // 新文件：全增 diff
-            let mut out = String::new();
-            for line in content.lines() {
-                out.push('+');
-                out.push_str(line);
-                out.push('\n');
-                if out.len() > DIFF_MAX_BYTES {
-                    out.push_str("[diff truncated]");
-                    break;
-                }
+    let diff = if let Some(old) = &old_content { unified_diff(old, content) } else {
+        // 新文件：全增 diff
+        let mut out = String::new();
+        for line in content.lines() {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+            if out.len() > DIFF_MAX_BYTES {
+                out.push_str("[diff truncated]");
+                break;
             }
-            out
         }
+        out
     };
     let (lines_added, lines_removed) = count_diff_lines(&diff);
     // 原子写
@@ -611,7 +608,7 @@ async fn run_host(
         tokio::select! {
             status = child.wait() => status.map_err(|e| format!("wait failed: {e}")),
             _ = cr => Err("command cancelled".to_string()),
-            _ = tokio::time::sleep_until(deadline_ts) => Err(format!("command timed out after {}s", timeout.as_secs())),
+            () = tokio::time::sleep_until(deadline_ts) => Err(format!("command timed out after {}s", timeout.as_secs())),
         }
     } else {
         match tokio::time::timeout_at(deadline_ts, child.wait()).await {
@@ -640,21 +637,18 @@ async fn run_host(
                 };
                 (stdout, stderr)
             };
-            match tokio::time::timeout_at(deadline_ts, drain).await {
-                Ok((stdout, stderr)) => CmdOutput {
-                    stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
-                    stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
-                    exit_code: status.code().unwrap_or(-1),
-                },
-                Err(_) => {
-                    // writer 已在 drain 前 await 过（child 退出即 EPIPE 收尾），无需再等
-                    #[cfg(unix)]
-                    {
-                        kill_group(child_pid);
-                    }
-                    let _ = child.wait().await; // 收割（tokio 缓存状态，立即返回）
-                    return Err(format!("command timed out after {}s", timeout.as_secs()));
+            if let Ok((stdout, stderr)) = tokio::time::timeout_at(deadline_ts, drain).await { CmdOutput {
+                stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
+                stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
+                exit_code: status.code().unwrap_or(-1),
+            } } else {
+                // writer 已在 drain 前 await 过（child 退出即 EPIPE 收尾），无需再等
+                #[cfg(unix)]
+                {
+                    kill_group(child_pid);
                 }
+                let _ = child.wait().await; // 收割（tokio 缓存状态，立即返回）
+                return Err(format!("command timed out after {}s", timeout.as_secs()));
             }
         }
         Err(msg) => {
@@ -980,21 +974,18 @@ pub async fn handle_exec_request(
                             }
                         }
                     }
-                    let diff = match &old_content {
-                        Some(old) => unified_diff(old, content),
-                        None => {
-                            let mut out = String::new();
-                            for line in content.lines() {
-                                out.push('+');
-                                out.push_str(line);
-                                out.push('\n');
-                                if out.len() > DIFF_MAX_BYTES {
-                                    out.push_str("[diff truncated]");
-                                    break;
-                                }
+                    let diff = if let Some(old) = &old_content { unified_diff(old, content) } else {
+                        let mut out = String::new();
+                        for line in content.lines() {
+                            out.push('+');
+                            out.push_str(line);
+                            out.push('\n');
+                            if out.len() > DIFF_MAX_BYTES {
+                                out.push_str("[diff truncated]");
+                                break;
                             }
-                            out
                         }
+                        out
                     };
                     let (lines_added, lines_removed) = count_diff_lines(&diff);
                     match docker_write_file(c, &abs, content, timeout).await {
@@ -1066,7 +1057,7 @@ async fn list_dir(path: &Path) -> AgentResult {
         total += 1;
         if lines.len() < LIST_DIR_MAX_ENTRIES {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
             lines.push(if is_dir { format!("{name}/") } else { name });
         }
     }
@@ -1333,38 +1324,35 @@ async fn git_exec(
     docker_container: Option<&str>,
     timeout: Duration,
 ) -> AgentResult {
-    let output = match docker_container {
-        Some(c) => {
-            let cmd = docker_git_cmd(c, &root_path.to_string_lossy(), args);
-            match run_host(&cmd, None, None, timeout, None).await {
-                Ok(out) => out,
-                Err(message) => return AgentResult::Error { message },
-            }
+    let output = if let Some(c) = docker_container {
+        let cmd = docker_git_cmd(c, &root_path.to_string_lossy(), args);
+        match run_host(&cmd, None, None, timeout, None).await {
+            Ok(out) => out,
+            Err(message) => return AgentResult::Error { message },
         }
-        None => {
-            let child = tokio::process::Command::new("git")
-                .args(args)
-                .current_dir(root_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .output();
-            match tokio::time::timeout(timeout, child).await {
-                Ok(Ok(out)) => CmdOutput {
-                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                    exit_code: out.status.code().unwrap_or(-1),
-                },
-                Ok(Err(e)) => {
-                    return AgentResult::Error {
-                        message: format!("spawn git failed: {e}"),
-                    };
-                }
-                Err(_) => {
-                    return AgentResult::Error {
-                        message: format!("git command timed out after {}s", timeout.as_secs()),
-                    };
-                }
+    } else {
+        let child = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(root_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(timeout, child).await {
+            Ok(Ok(out)) => CmdOutput {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                exit_code: out.status.code().unwrap_or(-1),
+            },
+            Ok(Err(e)) => {
+                return AgentResult::Error {
+                    message: format!("spawn git failed: {e}"),
+                };
+            }
+            Err(_) => {
+                return AgentResult::Error {
+                    message: format!("git command timed out after {}s", timeout.as_secs()),
+                };
             }
         }
     };

@@ -302,9 +302,9 @@ async fn main() -> TunnelResult<()> {
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(rust_tunnel_server::acme::CertEvent::Issued { .. })
-                        | Ok(rust_tunnel_server::acme::CertEvent::Renewed { .. })
-                        | Ok(rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
+                        Ok(rust_tunnel_server::acme::CertEvent::Issued { .. } |
+rust_tunnel_server::acme::CertEvent::Renewed { .. } |
+rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
                             proxy_state.refresh_all_cert_status(&mgr).await;
                         }
                         Ok(rust_tunnel_server::acme::CertEvent::Error { .. }) => {}
@@ -487,14 +487,12 @@ async fn main() -> TunnelResult<()> {
     let control_tls_rx = if config.tls {
         let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key).map_err(|e| {
             std::io::Error::other(format!(
-                "Failed to load TLS certificates for control channel: {}",
-                e
+                "Failed to load TLS certificates for control channel: {e}"
             ))
         })?;
         let tls_config = create_server_config(cert_pair).map_err(|e| {
             std::io::Error::other(format!(
-                "Failed to create TLS config for control channel: {}",
-                e
+                "Failed to create TLS config for control channel: {e}"
             ))
         })?;
 
@@ -616,18 +614,15 @@ async fn main() -> TunnelResult<()> {
         if let Some(ref cert_manager) = state.cert_manager {
             // Try to get certificate for API domain
             if let Some(ref domain) = config.api_domain {
-                match cert_manager.get_tls_server_config(domain).await {
-                    Some(cfg) => {
-                        tracing::info!(
-                            "API server TLS enabled with ACME certificate for domain: {}",
-                            domain
-                        );
-                        Some(cfg)
-                    }
-                    None => {
-                        tracing::warn!("No ACME certificate found for API domain '{}', API server will run without TLS", domain);
-                        None
-                    }
+                if let Some(cfg) = cert_manager.get_tls_server_config(domain).await {
+                    tracing::info!(
+                        "API server TLS enabled with ACME certificate for domain: {}",
+                        domain
+                    );
+                    Some(cfg)
+                } else {
+                    tracing::warn!("No ACME certificate found for API domain '{}', API server will run without TLS", domain);
+                    None
                 }
             } else {
                 tracing::warn!(
@@ -667,7 +662,7 @@ async fn main() -> TunnelResult<()> {
     // Task: flush snapshots to DB + broadcast every 60 seconds
     let sc_flush = sc.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
         loop {
             interval.tick().await;
             sc_flush.flush().await;
@@ -677,7 +672,7 @@ async fn main() -> TunnelResult<()> {
     // Task: cleanup old stats snapshots every 30 minutes
     let db_for_stats_cleanup = db.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1800));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(30));
         loop {
             interval.tick().await;
             let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);
@@ -701,14 +696,13 @@ async fn main() -> TunnelResult<()> {
     // Start periodic cleanup of old data (every hour)
     let db_for_cleanup = db.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_hours(1));
         loop {
             interval.tick().await;
             // Remove logs older than 7 days
             let seven_days_ago = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_micros() as i64)
-                .unwrap_or(0)
+                .map_or(0, |d| d.as_micros() as i64)
                 - 7 * 24 * 3600 * 1_000_000i64;
             if let Err(e) = db_for_cleanup.cleanup_old_logs(seven_days_ago).await {
                 tracing::warn!("Failed to cleanup old logs: {}", e);

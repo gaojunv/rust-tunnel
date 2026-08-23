@@ -140,7 +140,7 @@ impl ClientConfig {
                 let file_config: ClientConfigFile = Figment::new()
                     .merge(Toml::file(config_path))
                     .extract()
-                    .map_err(|e| format!("Failed to parse config file: {}", e))?;
+                    .map_err(|e| format!("Failed to parse config file: {e}"))?;
 
                 if let Some(v) = file_config.server {
                     config.server = v;
@@ -179,7 +179,7 @@ impl ClientConfig {
                     config.agent_pty_port = v;
                 }
             } else {
-                return Err(format!("Config file not found: {}", config_path));
+                return Err(format!("Config file not found: {config_path}"));
             }
         }
 

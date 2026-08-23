@@ -5,6 +5,9 @@ edition = "2021"
 description = "Shared protocol and infrastructure for rust-tunnel"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 bincode.workspace = true
 rand.workspace = true

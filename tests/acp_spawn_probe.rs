@@ -44,6 +44,7 @@ async fn seed_workspace(
         Some("/usr/local/bin/claude-code-acp"),
         Some("fake-model-gate"), // 仅过门禁；本探针不跑回合
         overrides,
+        None,
     )
     .await
     .expect("create workspace");

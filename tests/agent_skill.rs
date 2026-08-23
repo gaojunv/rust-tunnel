@@ -118,6 +118,7 @@ async fn seed_session(harness: &TestHarness, model: Option<&str>) -> String {
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("create workspace");

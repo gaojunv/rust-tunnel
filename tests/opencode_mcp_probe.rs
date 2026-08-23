@@ -53,6 +53,7 @@ async fn opencode_mcp_inject_probe() {
             Some(&opencode_path),
             Some("fake-model-gate"), // 仅过门禁；本探针不跑回合
             None,
+            None,
         )
         .await
         .expect("create workspace");
