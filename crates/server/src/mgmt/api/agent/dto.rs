@@ -1,7 +1,7 @@
 //! Agent workbench 请求 / 响应 / query 类型（DTO）。
 use serde::Deserialize;
 
-use crate::persistence::db::agent::AgentMessageRecord;
+use crate::db::agent::AgentMessageRecord;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateWorkspaceRequest {

@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use axum::{
-    body::Body,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{
@@ -449,6 +448,7 @@ fn wiki_doc_source_path(data_dir: &std::path::Path, wiki_id: &str, doc_id: &str,
 }
 
 /// POST /api/agent/wiki/:id/docs — multipart 上传，落盘 pending（批 2 接摄入）。
+#[allow(clippy::too_many_lines)]
 pub async fn upload_doc(
     State(state): State<ApiState>,
     Path(wiki_id): Path<String>,
@@ -739,10 +739,7 @@ pub async fn sse_wiki_events(
         let token = params.token.as_deref().unwrap_or("");
         let is_valid = !token.is_empty() && validate_token(token, &state.auth_config.jwt_secret).is_ok();
         if !is_valid {
-            return axum::response::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::from("Unauthorized"))
-                .unwrap();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
     // wiki 运行时未注入（非 rag 构建 / 未初始化）时仍可订阅 SSE，仅发 ping 保活。
@@ -815,7 +812,6 @@ mod tests {
         let db = Database::new(":memory:").await.expect("in-memory db");
         let mut server_state = ServerState::with_db(db);
         server_state
-            .proxy_state
             .init_llm_state(
                 server_state.db().cloned(),
                 Some([42u8; 32]),
@@ -827,13 +823,12 @@ mod tests {
             .await;
         let mem = {
             let llm = server_state
-                .proxy_state
                 .llm_state
                 .read()
                 .await
                 .as_ref()
-                .expect("llm state")
-                .clone();
+                .expect("llm state initialized")
+                .clone(); // Arc<LlmState>
             crate::agent::memory::MemoryState::new(
                 server_state.db().cloned().expect("db present"),
                 llm.rag_store.clone(),

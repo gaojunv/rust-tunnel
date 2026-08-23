@@ -6,7 +6,7 @@ pub mod retriever;
 pub mod store;
 
 use crate::db::Database;
-use crate::llm::crypto::LlmCipher;
+use rust_tunnel_common::crypto::LlmCipher;
 use crate::llm::{ChatCompletionRequest, ChatMessage};
 use store::VectorStore;
 

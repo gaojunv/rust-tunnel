@@ -149,3 +149,139 @@ impl AcmeFullConfig {
         seed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ServerConfig;
+    use crate::test_helpers::in_memory_db;
+
+    #[tokio::test]
+    async fn default_seed_on_empty_db_matches_server_config_defaults() {
+        let db = in_memory_db().await;
+        let cfg = ServerConfig::default();
+        let out = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        let expected = AcmeFullConfig::default();
+        assert!(!out.enabled);
+        assert_eq!(out.server_url, expected.server_url);
+        assert_eq!(out.email, expected.email);
+        assert_eq!(out.cert_dir, expected.cert_dir);
+        assert_eq!(out.auto_renew, expected.auto_renew);
+        assert_eq!(out.renewal_check_interval, expected.renewal_check_interval);
+        assert_eq!(
+            out.renewal_days_before_expiry,
+            expected.renewal_days_before_expiry
+        );
+        assert!(!out.tos_agreed);
+
+        // 种子已持久化到 DB
+        let json = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .expect("acme_config row should exist after seed");
+        let stored: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(stored.server_url, expected.server_url);
+        assert_eq!(stored.cert_dir, expected.cert_dir);
+        assert!(!stored.tos_agreed);
+    }
+
+    #[tokio::test]
+    async fn non_default_config_is_preserved_and_db_is_source_of_truth() {
+        let db = in_memory_db().await;
+
+        let first_cfg = ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://custom.example/acme".to_string(),
+            acme_email: Some("ops@example.test".to_string()),
+            acme_cert_dir: "/tmp/custom-certs".to_string(),
+            acme_auto_renew: false,
+            acme_renewal_check_interval: 12,
+            acme_renewal_days_before_expiry: 7,
+            ..Default::default()
+        };
+        let first = AcmeFullConfig::load_or_seed(&db, &first_cfg).await;
+        assert!(first.enabled);
+        assert_eq!(first.server_url, "https://custom.example/acme");
+        assert_eq!(first.email.as_deref(), Some("ops@example.test"));
+        assert_eq!(first.cert_dir, "/tmp/custom-certs");
+        assert!(!first.auto_renew);
+        assert_eq!(first.renewal_check_interval, 12);
+        assert_eq!(first.renewal_days_before_expiry, 7);
+
+        // 第二次调用传入完全不同的 ServerConfig，DB 已有值时应被忽略
+        let second_cfg = ServerConfig {
+            acme_enabled: false,
+            acme_server_url: "https://other.example/acme".to_string(),
+            acme_email: Some("other@example.test".to_string()),
+            acme_cert_dir: "/other".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 99,
+            acme_renewal_days_before_expiry: 99,
+            ..Default::default()
+        };
+        let second = AcmeFullConfig::load_or_seed(&db, &second_cfg).await;
+        assert_eq!(second.server_url, first.server_url);
+        assert_eq!(second.cert_dir, first.cert_dir);
+        assert_eq!(second.email, first.email);
+        assert_eq!(second.auto_renew, first.auto_renew);
+        assert_eq!(second.renewal_check_interval, first.renewal_check_interval);
+        assert_eq!(
+            second.renewal_days_before_expiry,
+            first.renewal_days_before_expiry
+        );
+        assert_eq!(second.enabled, first.enabled);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_seed_to_reload_is_identical() {
+        let db = in_memory_db().await;
+
+        let cfg = ServerConfig {
+            acme_enabled: true,
+            acme_server_url: "https://roundtrip.example/acme".to_string(),
+            acme_email: Some("rt@example.test".to_string()),
+            acme_cert_dir: "/tmp/rt-certs".to_string(),
+            acme_auto_renew: true,
+            acme_renewal_check_interval: 6,
+            acme_renewal_days_before_expiry: 20,
+            ..Default::default()
+        };
+
+        let seeded = AcmeFullConfig::load_or_seed(&db, &cfg).await;
+
+        // DB 中的 JSON 与种子返回值一致
+        let json = db
+            .load_server_setting("acme_config")
+            .await
+            .unwrap()
+            .unwrap();
+        let from_db: AcmeFullConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_db.server_url, seeded.server_url);
+        assert_eq!(from_db.cert_dir, seeded.cert_dir);
+        assert_eq!(from_db.email, seeded.email);
+        assert_eq!(from_db.auto_renew, seeded.auto_renew);
+        assert_eq!(from_db.renewal_check_interval, seeded.renewal_check_interval);
+        assert_eq!(
+            from_db.renewal_days_before_expiry,
+            seeded.renewal_days_before_expiry
+        );
+        assert_eq!(from_db.tos_agreed, seeded.tos_agreed);
+        assert_eq!(from_db.enabled, seeded.enabled);
+
+        // 再次 load_or_seed 走 DB 命中分支，返回值与首次种子完全一致
+        let reloaded = AcmeFullConfig::load_or_seed(&db, &ServerConfig::default()).await;
+        assert_eq!(reloaded.server_url, seeded.server_url);
+        assert_eq!(reloaded.cert_dir, seeded.cert_dir);
+        assert_eq!(reloaded.email, seeded.email);
+        assert_eq!(reloaded.enabled, seeded.enabled);
+        assert_eq!(reloaded.auto_renew, seeded.auto_renew);
+        assert_eq!(reloaded.renewal_check_interval, seeded.renewal_check_interval);
+        assert_eq!(
+            reloaded.renewal_days_before_expiry,
+            seeded.renewal_days_before_expiry
+        );
+        assert_eq!(reloaded.tos_agreed, seeded.tos_agreed);
+    }
+}

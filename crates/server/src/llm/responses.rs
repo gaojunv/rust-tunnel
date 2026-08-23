@@ -1860,13 +1860,13 @@ pub fn convert_responses_stream_to_chat(
         }
     });
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/event-stream")
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(Body::from_stream(out))
-        .unwrap())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("build sse response: {e}")))
 }
 
 // ── 测试 ────────────────────────────────────────────────────────

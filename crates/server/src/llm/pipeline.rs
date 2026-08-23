@@ -334,3 +334,460 @@ pub async fn run_execution(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::openai_handler::LlmHandlerState;
+    use crate::llm::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn handler_state(protocol: Option<LlmProtocol>) -> LlmHandlerState {
+        let llm = Arc::new(LlmState::new(None, None));
+        LlmHandlerState { llm, protocol }
+    }
+
+    fn handler_state_with_db(db: crate::db::Database, protocol: Option<LlmProtocol>) -> LlmHandlerState {
+        let llm = Arc::new(LlmState::new(Some(db), None));
+        LlmHandlerState { llm, protocol }
+    }
+
+    fn authed_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        h
+    }
+
+    fn make_request(
+        model: &str,
+        messages: Vec<ChatMessage>,
+        raw_body: Option<serde_json::Value>,
+    ) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            tools: None,
+            tool_choice: None,
+            raw_body,
+        }
+    }
+
+    // ── PreparedRequest ────────────────────────────────────────
+
+    #[test]
+    fn prepared_request_construction_minimal() {
+        let req = make_request("gpt-4", vec![ChatMessage::text("user", "hi")], None);
+        let pr = PreparedRequest {
+            request: req,
+            message_count: 1,
+            has_tools: false,
+            compat_enabled: false,
+            anthropic_body: None,
+        };
+        assert_eq!(pr.request.model, "gpt-4");
+        assert_eq!(pr.message_count, 1);
+        assert!(!pr.has_tools);
+        assert!(!pr.compat_enabled);
+        assert!(pr.anthropic_body.is_none());
+    }
+
+    #[test]
+    fn prepared_request_with_anthropic_body() {
+        let req = make_request("claude-3", vec![ChatMessage::text("user", "hello")], None);
+        let body = json!({"model":"claude-3","messages":[{"role":"user","content":"hello"}]});
+        let pr = PreparedRequest {
+            request: req,
+            message_count: 1,
+            has_tools: false,
+            compat_enabled: false,
+            anthropic_body: Some(body.clone()),
+        };
+        assert!(pr.anthropic_body.is_some());
+        assert_eq!(pr.anthropic_body.unwrap()["model"], "claude-3");
+    }
+
+    #[test]
+    fn prepared_request_has_tools_and_compat() {
+        let req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "hi")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
+        );
+        let pr = PreparedRequest {
+            request: req,
+            message_count: 5,
+            has_tools: true,
+            compat_enabled: true,
+            anthropic_body: None,
+        };
+        assert_eq!(pr.message_count, 5);
+        assert!(pr.has_tools);
+        assert!(pr.compat_enabled);
+        assert!(pr.request.raw_body.is_some());
+    }
+
+    #[test]
+    fn prepared_request_stream_and_model() {
+        let mut req = make_request("model-x", vec![], None);
+        req.stream = true;
+        let pr = PreparedRequest {
+            request: req,
+            message_count: 0,
+            has_tools: false,
+            compat_enabled: false,
+            anthropic_body: None,
+        };
+        assert!(pr.request.stream);
+        assert_eq!(pr.request.model, "model-x");
+        assert_eq!(pr.message_count, 0);
+    }
+
+    // ── ResponsePostProcess ────────────────────────────────────
+
+    #[test]
+    fn response_post_process_equality() {
+        assert_eq!(ResponsePostProcess::None, ResponsePostProcess::None);
+        assert_eq!(ResponsePostProcess::ToAnthropic, ResponsePostProcess::ToAnthropic);
+        assert_eq!(ResponsePostProcess::ToResponses, ResponsePostProcess::ToResponses);
+        assert_ne!(ResponsePostProcess::None, ResponsePostProcess::ToAnthropic);
+        assert_ne!(ResponsePostProcess::ToAnthropic, ResponsePostProcess::ToResponses);
+        assert_ne!(ResponsePostProcess::None, ResponsePostProcess::ToResponses);
+    }
+
+    #[test]
+    fn response_post_process_clone_copy() {
+        let a = ResponsePostProcess::ToAnthropic;
+        let b = a;
+        let c = a.clone();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        let d: ResponsePostProcess = a;
+        assert_eq!(d, ResponsePostProcess::ToAnthropic);
+    }
+
+    #[test]
+    fn response_post_process_debug_contains_variant() {
+        assert!(format!("{:?}", ResponsePostProcess::None).contains("None"));
+        assert!(format!("{:?}", ResponsePostProcess::ToAnthropic).contains("ToAnthropic"));
+        assert!(format!("{:?}", ResponsePostProcess::ToResponses).contains("ToResponses"));
+    }
+
+    #[test]
+    fn response_post_process_match_exhaustive() {
+        fn as_u8(v: ResponsePostProcess) -> u8 {
+            match v {
+                ResponsePostProcess::None => 0,
+                ResponsePostProcess::ToAnthropic => 1,
+                ResponsePostProcess::ToResponses => 2,
+            }
+        }
+        assert_eq!(as_u8(ResponsePostProcess::None), 0);
+        assert_eq!(as_u8(ResponsePostProcess::ToAnthropic), 1);
+        assert_eq!(as_u8(ResponsePostProcess::ToResponses), 2);
+    }
+
+    // ── write_back_messages (private) ──────────────────────────
+
+    #[test]
+    fn write_back_messages_with_raw_body_updates_messages() {
+        let mut req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "hi")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"old"}]})),
+        );
+        req.messages.push(ChatMessage::text("assistant", "hello"));
+        write_back_messages(&mut req);
+        let raw = req.raw_body.unwrap();
+        let msgs = raw["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "hi");
+        assert_eq!(msgs[1]["content"], "hello");
+    }
+
+    #[test]
+    fn write_back_messages_without_raw_body_is_noop() {
+        let mut req = make_request("m", vec![ChatMessage::text("user", "hi")], None);
+        req.messages.push(ChatMessage::text("user", "extra"));
+        write_back_messages(&mut req);
+        assert!(req.raw_body.is_none());
+        assert_eq!(req.messages.len(), 2);
+    }
+
+    #[test]
+    fn write_back_messages_overwrites_stale_raw() {
+        let mut req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "new")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"stale"}],"extra":"keep"})),
+        );
+        write_back_messages(&mut req);
+        let raw = req.raw_body.unwrap();
+        assert_eq!(raw["extra"], "keep");
+        assert_eq!(raw["messages"][0]["content"], "new");
+    }
+
+    #[test]
+    fn write_back_messages_empty_messages() {
+        let mut req = make_request(
+            "m",
+            vec![],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"x"}]})),
+        );
+        write_back_messages(&mut req);
+        let raw = req.raw_body.unwrap();
+        assert_eq!(raw["messages"].as_array().unwrap().len(), 0);
+    }
+
+    // ── inject_rag_and_compat ──────────────────────────────────
+
+    #[tokio::test]
+    async fn inject_rag_and_compat_noop_when_disabled() {
+        let state = LlmState::new(None, None);
+        let mut req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "hi")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
+        );
+        let mut ctx = crate::llm::usage::UsageContext {
+            protocol: "openai".into(),
+            ..Default::default()
+        };
+        let before = req.messages.clone();
+        inject_rag_and_compat(&state, None, None, false, &mut req, &mut ctx).await;
+        assert_eq!(req.messages.len(), before.len());
+        assert_eq!(req.messages[0].content, before[0].content);
+        assert!(ctx.rag_chunks_injected.is_none());
+    }
+
+    #[tokio::test]
+    async fn inject_rag_and_compat_compat_rewrites_tool_history_and_guidance() {
+        let state = LlmState::new(None, None);
+        let mut req = make_request(
+            "m",
+            vec![
+                ChatMessage::text("user", "call tool"),
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some("thinking".into()),
+                    reasoning_content: None,
+                    tool_calls: Some(vec![
+                        json!({"id":"call_1","type":"function","function":{"name":"search","arguments":"{\"q\":\"hi\"}"}}),
+                    ]),
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "tool".into(),
+                    content: Some("result text".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".into()),
+                    name: None,
+                },
+            ],
+            Some(json!({"model":"m","messages":[]})),
+        );
+        let mut ctx = crate::llm::usage::UsageContext {
+            protocol: "openai".into(),
+            ..Default::default()
+        };
+        inject_rag_and_compat(&state, None, None, true, &mut req, &mut ctx).await;
+        assert!(req.messages.iter().all(|m| m.tool_calls.is_none()));
+        let has_tool_result = req
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref().unwrap_or("").contains("<tool_result"));
+        assert!(has_tool_result, "tool result should be rewritten: {:?}", req.messages);
+        let has_tool_call = req
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref().unwrap_or("").contains("<tool_call>"));
+        assert!(has_tool_call, "tool_calls should be rewritten: {:?}", req.messages);
+        let last = req.messages.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert!(last.content.as_deref().unwrap().contains("<tool_call>"));
+        let raw_msgs = req.raw_body.as_ref().unwrap()["messages"].as_array().unwrap();
+        assert_eq!(raw_msgs.len(), req.messages.len());
+        assert!(ctx.rag_chunks_injected.is_none());
+    }
+
+    #[tokio::test]
+    async fn inject_rag_and_compat_writes_back_when_compat_enabled_without_raw_body() {
+        let state = LlmState::new(None, None);
+        let mut req = make_request("m", vec![ChatMessage::text("user", "hi")], None);
+        let mut ctx = crate::llm::usage::UsageContext {
+            protocol: "openai".into(),
+            ..Default::default()
+        };
+        inject_rag_and_compat(&state, None, None, true, &mut req, &mut ctx).await;
+        assert_eq!(req.messages.len(), 2);
+        assert!(req.raw_body.is_none());
+    }
+
+    #[tokio::test]
+    async fn inject_rag_and_compat_with_db_but_no_kb_still_no_rag() {
+        let db = crate::test_helpers::in_memory_db().await;
+        let state = crate::llm::LlmState::new(Some(db.clone()), None);
+        let mut req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "hi")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
+        );
+        let mut ctx = crate::llm::usage::UsageContext {
+            protocol: "openai".into(),
+            ..Default::default()
+        };
+        inject_rag_and_compat(&state, Some(&db), None, false, &mut req, &mut ctx).await;
+        assert!(ctx.rag_chunks_injected.is_none());
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn inject_rag_and_compat_with_db_and_kb_id_noop_without_feature_or_data() {
+        let db = crate::test_helpers::in_memory_db().await;
+        let state = crate::llm::LlmState::new(Some(db.clone()), None);
+        let mut req = make_request(
+            "m",
+            vec![ChatMessage::text("user", "hi")],
+            Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
+        );
+        let mut ctx = crate::llm::usage::UsageContext {
+            protocol: "openai".into(),
+            ..Default::default()
+        };
+        inject_rag_and_compat(&state, Some(&db), Some("kb-unknown".into()), false, &mut req, &mut ctx).await;
+        assert!(ctx.rag_chunks_injected.is_none());
+    }
+
+    // ── authenticate_or_reject / extract_model_or_reject / resolve_chain_or_reject ──
+
+    #[tokio::test]
+    async fn authenticate_or_reject_without_db_returns_401() {
+        let state = handler_state(None);
+        let headers = HeaderMap::new();
+        let res = authenticate_or_reject(&state, &headers, "openai").await;
+        assert!(res.is_err());
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn authenticate_or_reject_with_invalid_token_returns_401() {
+        let state = handler_state(None);
+        let headers = authed_headers("sk-invalid");
+        let res = authenticate_or_reject(&state, &headers, "openai").await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_or_reject_anthropic_protocol_returns_anthropic_error_shape() {
+        let state = handler_state(Some(LlmProtocol::Anthropic));
+        let headers = HeaderMap::new();
+        let res = authenticate_or_reject(&state, &headers, "anthropic").await;
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn extract_model_or_reject_success() {
+        let state = handler_state(None);
+        let body = json!({"model":"gpt-4","messages":[]});
+        let res = extract_model_or_reject(&state, &body, "key-id", "key-name", "openai").await;
+        assert_eq!(res.unwrap(), "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn extract_model_or_reject_missing_returns_400() {
+        let state = handler_state(None);
+        let body = json!({"messages":[]});
+        let res = extract_model_or_reject(&state, &body, "key-id", "key-name", "openai").await;
+        assert!(res.is_err());
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn extract_model_or_reject_missing_anthropic_shape() {
+        let state = handler_state(Some(LlmProtocol::Anthropic));
+        let body = json!({});
+        let res = extract_model_or_reject(&state, &body, "k1", "n1", "anthropic").await;
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn extract_model_or_reject_non_string_model_returns_400() {
+        let state = handler_state(None);
+        let body = json!({"model":123});
+        let res = extract_model_or_reject(&state, &body, "k1", "n1", "openai").await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_or_reject_without_db_returns_404() {
+        let state = handler_state(None);
+        let res = resolve_chain_or_reject(&state, "any-model", "k1", "n1", "openai").await;
+        assert!(res.is_err());
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(v["error"]["type"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_chain_or_reject_with_empty_db_returns_404_with_available_models() {
+        let db = crate::test_helpers::in_memory_db().await;
+        let state = handler_state_with_db(db, None);
+        let res = resolve_chain_or_reject(&state, "no-such-model", "k1", "n1", "openai").await;
+        let resp = res.unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(
+            v["error"]["available_models"].is_array(),
+            "should include available_models: {v}"
+        );
+    }
+
+    // ── LlmState::new lightweight construction ─────────────────
+
+    #[test]
+    fn llm_state_new_without_db_is_lightweight() {
+        let s = LlmState::new(None, None);
+        assert!(s.db.is_none());
+        assert!(s.cipher.is_none());
+    }
+
+    #[tokio::test]
+    async fn llm_state_new_with_in_memory_db() {
+        let db = crate::test_helpers::in_memory_db().await;
+        let s = LlmState::new(Some(db), None);
+        assert!(s.db.is_some());
+    }
+}

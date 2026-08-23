@@ -453,6 +453,7 @@ async fn setup_approval_env(
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("create workspace");
@@ -466,6 +467,9 @@ async fn setup_approval_env(
         None,
         None,
         None,
+        None,
+        false,
+        false,
     )
     .await
     .expect("set approval_mode=safe");
@@ -494,7 +498,6 @@ async fn run_turn_with_approval(
         .expect("harness agent_state");
     let llm = harness
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await
@@ -787,6 +790,7 @@ async fn setup_text_turn_env(
         None,
         None,
         None,
+        None,
     )
     .await
     .expect("create workspace");
@@ -813,7 +817,6 @@ async fn run_turn_collect(
         .expect("harness agent_state");
     let llm = harness
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await

@@ -25,7 +25,7 @@ use crate::agent::git_plan;
 use crate::agent::github::{GitHubClient, GitHubError};
 use crate::agent::AgentState;
 use crate::mgmt::api::ApiState;
-use crate::persistence::db::agent::AgentWorkspaceRecord;
+use crate::db::agent::AgentWorkspaceRecord;
 
 use super::dto::{GithubApprovedBody, GithubDispatchBody, GithubRepoQuery, GithubRunsQuery};
 

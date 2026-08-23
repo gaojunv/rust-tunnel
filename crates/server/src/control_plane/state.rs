@@ -40,6 +40,8 @@ pub struct ServerState {
     pub dns_registry: Option<DnsRegistry>,
     /// Reverse proxy state
     pub proxy_state: ReverseProxyState,
+    /// LLM Gateway state (set when LLM is configured). 由装配层 init_llm_state 注入。
+    pub llm_state: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<crate::llm::LlmState>>>>,
     /// Client registry (spec §2.6)
     pub client_registry: Option<ClientRegistry>,
     /// AI agent workbench state (workspace execution locks, DB access)
@@ -91,6 +93,7 @@ impl ServerState {
             mesh_manager: MeshManager::new(),
             dns_registry: None,
             proxy_state: ReverseProxyState::new(),
+            llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: None,
             agent_state: None,
             acme_client: Arc::new(RwLock::new(None)),
@@ -141,6 +144,7 @@ impl ServerState {
             mesh_manager: MeshManager::new(),
             dns_registry: None,
             proxy_state: ReverseProxyState::with_db(db.clone()),
+            llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
             agent_state: Some(crate::agent::AgentState::new(registry, db)),
             acme_client: Arc::new(RwLock::new(None)),
@@ -192,6 +196,29 @@ impl ServerState {
             self.proxy_state.set_client_connector(cc).await;
             info!("ClientConnector registered into ReverseProxyState");
         }
+    }
+
+    /// Initialize the LlmState from the in-memory `__llm_gateway__` rule (if any).
+    /// Called during server startup after rules are loaded from DB.
+    pub async fn init_llm_state(
+        &self,
+        db: Option<Database>,
+        master_key: Option<[u8; 32]>,
+        #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &std::path::Path,
+        dynamic_config: std::sync::Arc<tokio::sync::RwLock<DynamicConfig>>,
+    ) {
+        let llm = crate::llm::init_llm_state(
+            &self.proxy_state,
+            db,
+            master_key,
+            rag_data_dir,
+            dynamic_config,
+        )
+        .await;
+        *self.llm_state.write().await = Some(llm.clone());
+        // 同时注入反代分流器
+        *self.proxy_state.llm_dispatcher.write().await =
+            Some(std::sync::Arc::new(crate::llm::LlmDispatcherImpl::new(llm)));
     }
 
     pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {

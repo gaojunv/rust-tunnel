@@ -11,7 +11,7 @@ use rust_tunnel_common::AgentResult;
 
 use crate::agent::git_plan;
 use crate::mgmt::api::ApiState;
-use crate::persistence::db::agent::AgentWorkspaceRecord;
+use crate::db::agent::AgentWorkspaceRecord;
 
 use super::dto::{
     CreateWorkspaceRequest, FsPathQuery, GitApprovedBody, GitBranchDeleteRequest,

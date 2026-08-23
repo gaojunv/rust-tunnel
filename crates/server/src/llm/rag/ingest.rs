@@ -8,7 +8,7 @@ use super::{
 };
 use crate::db::rag::RagKnowledgeBaseRecord;
 use crate::db::Database;
-use crate::llm::crypto::{decrypt_field, LlmCipher};
+use rust_tunnel_common::crypto::{decrypt_field, LlmCipher};
 use futures_util::FutureExt;
 use std::sync::Arc;
 use tokio::sync::broadcast;

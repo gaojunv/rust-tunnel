@@ -3,7 +3,7 @@ use super::Database;
 
 impl Database {
     /// Insert a log entry into the database
-    pub async fn insert_log(&self, entry: &crate::logs::LogEntry) -> Result<i64, sqlx::Error> {
+    pub async fn insert_log(&self, entry: &DbLogEntry) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             INSERT INTO server_logs (timestamp, level, source, target, message)
@@ -24,7 +24,7 @@ impl Database {
     /// Insert a batch of log entries
     pub async fn insert_logs_batch(
         &self,
-        entries: &[crate::logs::LogEntry],
+        entries: &[DbLogEntry],
     ) -> Result<(), sqlx::Error> {
         if entries.is_empty() {
             return Ok(());
@@ -153,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_query_logs() {
         let db = create_test_db().await;
-        let entry = crate::logs::LogEntry {
+        let entry = DbLogEntry {
             id: 0,
             timestamp: 1000000,
             level: "INFO".into(),
@@ -172,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_logs_level_filter() {
         let db = create_test_db().await;
-        let info_entry = crate::logs::LogEntry {
+        let info_entry = DbLogEntry {
             id: 0,
             timestamp: 1000000,
             level: "INFO".into(),
@@ -180,7 +180,7 @@ mod tests {
             target: "test".into(),
             message: "info msg".into(),
         };
-        let error_entry = crate::logs::LogEntry {
+        let error_entry = DbLogEntry {
             id: 0,
             timestamp: 2000000,
             level: "ERROR".into(),
@@ -203,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_old_logs() {
         let db = create_test_db().await;
-        let entry = crate::logs::LogEntry {
+        let entry = DbLogEntry {
             id: 0,
             timestamp: 1000000,
             level: "INFO".into(),
@@ -224,8 +224,8 @@ mod tests {
     #[tokio::test]
     async fn test_insert_logs_batch() {
         let db = create_test_db().await;
-        let entries: Vec<crate::logs::LogEntry> = (0..3)
-            .map(|i| crate::logs::LogEntry {
+        let entries: Vec<DbLogEntry> = (0..3)
+            .map(|i| DbLogEntry {
                 id: 0,
                 timestamp: 1000000 + i * 1000,
                 level: "INFO".into(),

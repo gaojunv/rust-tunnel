@@ -329,8 +329,8 @@ pub async fn export_session(
 
 /// 会话 → Markdown（导出 handler 与单测共用的纯函数）。
 fn session_to_markdown(
-    session: &crate::persistence::db::agent::AgentSessionRecord,
-    messages: &[crate::persistence::db::agent::AgentMessageRecord],
+    session: &crate::db::agent::AgentSessionRecord,
+    messages: &[crate::db::agent::AgentMessageRecord],
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

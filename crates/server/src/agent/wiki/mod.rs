@@ -48,18 +48,20 @@ impl std::fmt::Debug for WikiState {
 
 #[cfg(feature = "rag")]
 impl WikiState {
+    #[must_use]
     pub fn new(db: Database, llm: LlmState) -> Self {
         // 容量 64：与 MemoryState / LlmState.rag_tx 一致，低频事件不阻塞调用方。
         let (events, _rx) = tokio::sync::broadcast::channel(64);
         Self { db, llm, events, ingest_sem: Arc::new(Semaphore::new(2)) }
     }
 
+    #[must_use]
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WikiEvent> {
         self.events.subscribe()
     }
 }
 
-pub use crate::persistence::db::wiki::{normalize_wiki_ref, parse_wiki_links};
+pub use crate::db::wiki::{normalize_wiki_ref, parse_wiki_links};
 
 // ── 清单注入与工具短路（仅 rag）────────────────────────────────────
 
@@ -87,10 +89,10 @@ pub async fn retrieve_wiki_list_for_session(
     if s.wiki_enabled == 0 {
         return None;
     }
-    let max = s.wiki_list_max.clamp(1, 50) as usize;
+    let max = usize::try_from(s.wiki_list_max.clamp(1, 50)).unwrap_or(20);
     let rows = wiki_state
         .db
-        .wiki_visible_wikis(client_id, workspace_id, max as i64)
+        .wiki_visible_wikis(client_id, workspace_id, i64::try_from(max).unwrap_or(50))
         .await
         .unwrap_or_default();
     if rows.is_empty() {
@@ -102,6 +104,7 @@ pub async fn retrieve_wiki_list_for_session(
 /// 组装 `<wikis>...</wikis>` 清单块：按 page_count DESC 排序，预算（条数上限 +
 /// 字符上限）内只保留完整行，绝不半截。无条目 → None。
 #[cfg(feature = "rag")]
+#[must_use]
 pub fn build_wiki_list_block(
     items: &[AgentWikiRecord],
     max_items: usize,
@@ -161,6 +164,9 @@ async fn resolve_wiki_by_name(
 }
 
 /// wiki_search 工具短路：`{query, limit?, wiki?}` → 可见容器内 BM25+LIKE 检索，命中渲染为紧凑文本。
+///
+/// # Errors
+/// 参数非法 / wiki 禁用 / 数据库读取失败时返回错误文本喂回模型。
 #[cfg(feature = "rag")]
 pub async fn wiki_search_from_agent(
     wiki_state: &WikiState,
@@ -168,13 +174,13 @@ pub async fn wiki_search_from_agent(
     workspace_id: &str,
     args_json: &str,
 ) -> Result<String, String> {
+    use std::fmt::Write as _;
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid arguments: {e}"))?;
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if query.is_empty() {
         return Err("wiki_search requires non-empty 'query'".into());
     }
@@ -183,8 +189,8 @@ pub async fn wiki_search_from_agent(
     }
     let limit = args
         .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5) as i64;
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5);
     if !(1..=20).contains(&limit) {
         return Err("limit must be 1-20".into());
     }
@@ -221,7 +227,7 @@ pub async fn wiki_search_from_agent(
     }
     let hits = wiki_state
         .db
-        .wiki_search(&visible_ids, query, limit)
+        .wiki_search(&visible_ids, query, i64::try_from(limit).unwrap_or(20))
         .await
         .map_err(|e| format!("wiki search failed: {e}"))?;
     if hits.is_empty() {
@@ -229,15 +235,19 @@ pub async fn wiki_search_from_agent(
     }
     let mut out = format!("wiki_search results for \"{query}\" ({} hits):\n", hits.len());
     for hit in hits {
-        out.push_str(&format!(
-            "- ref: {} | title: {} | summary: {} | snippet: {}\n",
+        let _ = writeln!(
+            out,
+            "- ref: {} | title: {} | summary: {} | snippet: {}",
             hit.page_ref, hit.title, hit.summary, hit.snippet
-        ));
+        );
     }
     Ok(out)
 }
 
 /// wiki_read 工具短路：`{wiki, refs[]}` → 批量取全文，命中 bump_use。
+///
+/// # Errors
+/// 参数非法 / wiki 禁用 / 数据库读取失败时返回错误文本喂回模型。
 #[cfg(feature = "rag")]
 pub async fn wiki_read_from_agent(
     wiki_state: &WikiState,
@@ -245,13 +255,13 @@ pub async fn wiki_read_from_agent(
     workspace_id: &str,
     args_json: &str,
 ) -> Result<String, String> {
+    use std::fmt::Write as _;
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid arguments: {e}"))?;
     let wiki_name = args
         .get("wiki")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if wiki_name.is_empty() {
         return Err("wiki_read requires non-empty 'wiki'".into());
     }
@@ -297,12 +307,13 @@ pub async fn wiki_read_from_agent(
             .map_err(|e| format!("wiki read failed: {e}"))?;
         if let Some(p) = page {
             let _ = wiki_state.db.wiki_bump_use(&p.id).await;
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "## {} - {}\n{}\n\n{}\n\n---\n",
                 p.page_ref, p.title, p.summary, p.content
-            ));
+            );
         } else {
-            out.push_str(&format!("ref not found: {r}\n---\n"));
+            let _ = writeln!(out, "ref not found: {r}\n---");
         }
     }
     Ok(out)

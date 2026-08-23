@@ -4,7 +4,7 @@
 //! 本模块为纯函数 + 单测，不依赖 async/DB——DB 查询结果作为
 //! `&[AgentRoleRecord]` 传入，由 `runner.rs` / `ws.rs` 负责异步加载。
 
-use crate::persistence::db::roles::AgentRoleRecord;
+use crate::db::roles::AgentRoleRecord;
 
 /// 子 agent 独立系统提示词（runner.rs 定义的默认值常量引用）。
 pub const SUBAGENT_DEFAULT_SYSTEM_PROMPT: &str =

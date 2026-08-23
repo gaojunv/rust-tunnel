@@ -1,4 +1,10 @@
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod pki;
+// 测试辅助设施（仅 cfg(test) 编译）
+#[cfg(test)]
+pub mod test_helpers;
 pub use mgmt::api;
 pub use pki::acme;
 pub mod agent;
@@ -7,10 +13,10 @@ pub mod control_plane;
 pub use control_plane as control;
 pub use control_plane::client_registry;
 pub use control_plane::tunnel_stream;
-pub use persistence::db;
+// 持久化层已拆分为独立 crate；`db` 路径保持兼容 re-export
+pub use rust_tunnel_persistence as db;
 pub mod llm;
 pub mod net;
-pub mod persistence;
 pub use net::dns;
 pub use net::listener;
 pub use net::mesh;

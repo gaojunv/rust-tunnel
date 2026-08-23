@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { memo, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, MessageSquare, Pencil, Plus, Trash2, Check, X } from 'lucide-react';
@@ -45,7 +45,7 @@ interface Props {
 }
 
 /** 顶栏会话选择：图标下拉（sticky 新建会话 + 列表项内改名/删除 + 信息增强）。 */
-export default function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew, triggerContent, triggerClassName }: Props) {
+function SessionBar({ workspaceId, sessionId, onSelect, onSessionDeleted, onNew, triggerContent, triggerClassName }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -302,3 +302,5 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
     </div>
   );
 }
+
+export default memo(SessionBar);

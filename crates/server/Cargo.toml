@@ -6,6 +6,9 @@ description = "rust-tunnel server (intranet penetration, proxy, LLM gateway, age
 license = "MIT"
 default-run = "rust-tunnel-server"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rust-tunnel-server"
 path = "src/bin/server.rs"
@@ -21,6 +24,7 @@ rag = ["dep:qdrant-edge"]
 
 [dependencies]
 rust-tunnel-common = { path = "../common" }
+rust-tunnel-persistence = { path = "../persistence" }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -70,7 +74,6 @@ sha1.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
-aes-gcm.workspace = true
 hickory-proto.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true

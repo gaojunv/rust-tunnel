@@ -20,6 +20,7 @@ pub struct ClientLogLayer {
 impl ClientLogLayer {
     /// Create a layer with no sender yet.  Call [`set_sender`](Self::set_sender)
     /// before (or after) registering this layer with `tracing_subscriber`.
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             tx: Arc::new(Mutex::new(None)),
@@ -52,8 +53,7 @@ where
         let metadata = event.metadata();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_micros() as i64);
 
         struct ClientFieldVisitor {
             message: String,
@@ -62,7 +62,7 @@ where
         impl tracing::field::Visit for ClientFieldVisitor {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
-                    self.message = format!("{:?}", value);
+                    self.message = format!("{value:?}");
                     if self.message.starts_with('"') && self.message.ends_with('"') {
                         self.message = self.message[1..self.message.len() - 1].to_string();
                     }

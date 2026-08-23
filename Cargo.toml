@@ -6,7 +6,23 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT"
 
 [workspace]
-members = ["crates/common", "crates/client", "crates/server"]
+members = ["crates/common", "crates/client", "crates/persistence", "crates/server"]
+
+[workspace.lints.clippy]
+# 企业级 lint 基线：pedantic 组先 warn 基线运行，批次 9 清零后转 deny
+pedantic = { level = "warn", priority = -1 }
+# doc_markdown 对中文注释误报率极高（863 条），自动修复会破坏中文文档
+doc_markdown = "allow"
+# panic 风险关键项（restriction 组）：生产代码 warn，测试经 cfg_attr(test) 豁免
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+# 正确性兜底（默认 warn 提升为 deny，无存量风险）
+unwrap_in_result = "deny"
+
+[workspace.lints.rust]
+# 文档缺口显性化（批次 9 渐进补全）
+missing_docs = "allow" # 现状 80% 缺失，先不开启警告洪泛
 
 [workspace.dependencies]
 # Async runtime

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Sparkles } from 'lucide-react';
@@ -83,12 +83,12 @@ export default function AgentPage() {
     [tabsByWs, workspaceId],
   );
 
-  const setTabs = (updater: (cur: TabState) => TabState) => {
+  const setTabs = useCallback((updater: (cur: TabState) => TabState) => {
     setTabsByWs((prev) => {
       const cur = prev[workspaceId] ?? { open: [], active: '' };
       return { ...prev, [workspaceId]: updater(cur) };
     });
-  };
+  }, [workspaceId]);
 
   // 工作区选中：空态下只有一个 workspace 时自动选中；从 localStorage 恢复的
   // workspaceId 若已不在列表中（被删除/失效），回退到第一个可用工作区，而不是
@@ -198,14 +198,30 @@ export default function AgentPage() {
     () => resolveWorkspaceModelRef(currentWorkspace?.llm_model_id, selectableModels),
     [currentWorkspace?.llm_model_id, selectableModels],
   );
-  const modelFor = (sid: string) =>
-    modelOverrides[sid] ??
-    (sessions?.find((s) => s.id === sid)?.model?.trim() ||
+  // 会话 id → 模型的反向索引：sessions 数组变化时一次性构建，避免 modelFor 内
+  // 每次 find 扫描（O(n) → O(1)），也让 modelFor 的依赖稳定（Map 引用仅随
+  // sessions 变化）。
+  const sessionModelMap = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const s of sessions ?? []) {
+      const v = (s.model ?? '').trim();
+      if (v) m.set(s.id, v);
+    }
+    return m;
+  }, [sessions]);
+  const fallbackModel = useMemo(
+    () =>
       workspaceModel ||
       defaultModel?.trim() ||
       selectableModels?.models[0]?.id ||
       selectableModels?.groups[0]?.id ||
-      '');
+      '',
+    [workspaceModel, defaultModel, selectableModels],
+  );
+  const modelFor = useCallback(
+    (sid: string) => modelOverrides[sid] ?? sessionModelMap.get(sid) ?? fallbackModel,
+    [modelOverrides, sessionModelMap, fallbackModel],
+  );
 
   // 上报当前查看的会话（激活标签页）给全局通知服务；离开 Agent 页（卸载）时清空，
   // 让其它会话的任务完成/需干预事件能正常提醒。
@@ -214,7 +230,26 @@ export default function AgentPage() {
     return () => setActiveSessionId(null);
   }, [tabs.active, setActiveSessionId]);
 
-  const handleNewSession = async () => {
+  // 删除会话：任意会话被删都关掉对应标签（若已打开）
+  const handleSessionDeleted = useCallback((id: string) => {
+    setTabs((cur) => closeTab(cur, id));
+  }, [setTabs]);
+
+  const handleSelectWorkspace = useCallback((id: string) => {
+    setWorkspaceId(id);
+  }, []);
+
+  // 点击标签 / SessionBar 选择会话 → 打开或激活对应 tab
+  const handleSelectSession = useCallback((id: string) => {
+    setTabs((cur) => openOrActivate(cur, id));
+  }, [setTabs]);
+
+  // 关闭标签：仅关标签，会话数据保留（SessionBar 下拉仍可重新打开）
+  const handleCloseTab = useCallback((id: string) => {
+    setTabs((cur) => closeTab(cur, id));
+  }, [setTabs]);
+
+  const handleNewSession = useCallback(async () => {
     if (!workspaceId) return;
     // 仅在用户显式选择过模型（tab 记忆）时继承；否则不落库 model，交由后端按
     // session→workspace→全局 链解析（M11）——把前端推导值（workspace 默认/
@@ -228,33 +263,24 @@ export default function AgentPage() {
       ...(old ?? []),
     ]);
     setTabs((cur) => openOrActivate(cur, s.id));
-  };
-
-  const handleSelectWorkspace = (id: string) => {
-    setWorkspaceId(id);
-  };
-
-  // 点击标签 / SessionBar 选择会话 → 打开或激活对应 tab
-  const handleSelectSession = (id: string) => {
-    setTabs((cur) => openOrActivate(cur, id));
-  };
-
-  // 关闭标签：仅关标签，会话数据保留（SessionBar 下拉仍可重新打开）
-  const handleCloseTab = (id: string) => {
-    setTabs((cur) => closeTab(cur, id));
-  };
-
-  // 删除会话：任意会话被删都关掉对应标签（若已打开）
-  const handleSessionDeleted = (id: string) => {
-    setTabs((cur) => closeTab(cur, id));
-  };
+  }, [workspaceId, modelOverrides, tabs.active, queryClient, setTabs]);
 
   // 齿轮入口：打开编辑模式的 WorkspaceDialog（预填当前工作区，client/运行时不可改）
-  const openEditWorkspace = () => {
+  const openEditWorkspace = useCallback(() => {
     const w = workspaces?.find((x) => x.id === workspaceId) ?? null;
     setEditingWorkspace(w);
     setShowWorkspaceDialog(true);
-  };
+  }, [workspaces, workspaceId]);
+
+  const workspaceApprovalMode = useMemo(
+    () => workspaces?.find((w) => w.id === workspaceId)?.approval_mode ?? 'safe',
+    [workspaces, workspaceId],
+  );
+
+  const handleModelChangeFor = useCallback(
+    (sid: string) => (m: string) => setModelOverrides((o) => ({ ...o, [sid]: m })),
+    [],
+  );
 
   // 高度由外层布局决定：AppLayout 对 /agent 路由走非滚动分支（h-dvh → flex-1 →
   // h-full 高度链），本页用 h-full 精确填满 Header 以下剩余空间。此前用
@@ -321,9 +347,9 @@ export default function AgentPage() {
                   sessionId={id}
                   workspaceId={workspaceId}
                   model={modelFor(id)}
-                  approvalMode={workspaces?.find(w => w.id === workspaceId)?.approval_mode ?? 'safe'}
+                  approvalMode={workspaceApprovalMode}
                   active={id === tabs.active}
-                  onModelChange={(m) => setModelOverrides((o) => ({ ...o, [id]: m }))}
+                  onModelChange={handleModelChangeFor(id)}
                   claudeTierModels={currentWorkspace?.claude_tier_models}
                   agentType={currentWorkspace?.agent_type}
                 />

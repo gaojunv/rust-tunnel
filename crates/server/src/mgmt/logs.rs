@@ -8,15 +8,9 @@ use tracing_subscriber::Layer;
 use crate::db::Database;
 
 /// A log entry captured from tracing events
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    pub id: i64,
-    pub timestamp: i64,
-    pub level: String,
-    pub source: String,
-    pub target: String,
-    pub message: String,
-}
+///
+/// 与持久化层共享同一行类型（`DbLogEntry`），避免双类型逐字段拷贝。
+pub use crate::db::DbLogEntry as LogEntry;
 
 /// Maximum number of log entries kept in the in-memory ring buffer
 const MAX_BUFFER_SIZE: usize = 1000;
@@ -189,17 +183,7 @@ impl LogStore {
         let guard = self.inner.lock().await;
         if let Some(ref db) = guard.db {
             match db.query_logs(level, source, search, limit, before_id).await {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|r| LogEntry {
-                        id: r.id,
-                        timestamp: r.timestamp,
-                        level: r.level,
-                        source: r.source,
-                        target: r.target,
-                        message: r.message,
-                    })
-                    .collect(),
+                Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!("Failed to query logs from DB: {}", e);
                     vec![]

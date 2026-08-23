@@ -183,7 +183,7 @@ pub struct SessionRuntime {
     /// 当前主会话活跃角色（`@role` 显式指定或 session.role_id 持久化）。
     /// None = 使用默认行为（无角色过滤）。含 role.tools_allow/tools_deny
     /// 用于工具过滤；含 role.model_override 用于子 agent 模型覆盖。
-    pub active_role: Option<crate::persistence::db::roles::AgentRoleRecord>,
+    pub active_role: Option<crate::db::roles::AgentRoleRecord>,
 }
 
 impl SessionRuntime {

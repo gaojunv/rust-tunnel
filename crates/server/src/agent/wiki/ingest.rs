@@ -219,7 +219,7 @@ async fn do_ingest(
     let mut seen = std::collections::HashSet::new();
     let mut upserted = 0i64;
     for page in &all_pages {
-        let Some(norm_ref) = crate::persistence::db::wiki::normalize_wiki_ref(&page.page_ref) else {
+        let Some(norm_ref) = crate::db::wiki::normalize_wiki_ref(&page.page_ref) else {
             tracing::warn!(wiki_id, doc_id, r = %page.page_ref, "wiki ingest: skip invalid ref");
             continue;
         };
@@ -343,7 +343,7 @@ fn parse_extract_value(raw: &str) -> Result<Vec<ExtractedPage>, String> {
         if raw_ref.is_empty() {
             continue;
         }
-        let Some(norm) = crate::persistence::db::wiki::normalize_wiki_ref(raw_ref) else {
+        let Some(norm) = crate::db::wiki::normalize_wiki_ref(raw_ref) else {
             continue;
         };
         let title = obj

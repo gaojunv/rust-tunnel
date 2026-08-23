@@ -130,26 +130,11 @@ pub fn build_memory_block(items: &[AgentMemoryRecord], budget_tokens: usize) -> 
     Some(s)
 }
 
-#[cfg(all(test, feature = "rag"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
-
-    async fn memory_state() -> (Database, super::super::MemoryState) {
-        let db = Database::new(":memory:").await.unwrap();
-        let (_dir, store) = super::super::test_store();
-        let llm = crate::llm::LlmState::new(None, None);
-        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
-        // 开启并配好 embedding（dim=8）
-        let mut s = db.memory_get_settings().await.unwrap();
-        s.enabled = 1;
-        s.emb_base_url = "http://localhost:1/v1".into(); // 不可达 → embed 失败路径
-        s.emb_api_key = "key".into();
-        s.emb_model = "m".into();
-        s.emb_dimension = 8;
-        db.memory_upsert_settings(&s).await.unwrap();
-        (db, memory)
-    }
+    use crate::db::memory::AgentMemoryRecord;
+    use crate::test_helpers::{in_memory_db, seed_workspace_and_session};
 
     fn record(id: &str, scope: &str, client: &str, ws: &str, pinned: bool, content: &str) -> AgentMemoryRecord {
         AgentMemoryRecord {
@@ -170,32 +155,48 @@ mod tests {
         }
     }
 
+    // ── build_memory_block ────────────────────────────────
+
     #[test]
-    fn block_wraps_in_memory_tags() {
-        let block = build_memory_block(&[record("m1", "workspace", "c1", "w1", false, "事实")], 1500).unwrap();
-        assert!(block.starts_with("<memory>"));
-        assert!(block.ends_with("</memory>"));
-        assert!(block.contains("事实"));
-        assert!(block.contains("工作区"));
+    fn build_memory_block_empty_returns_none() {
+        assert!(build_memory_block(&[], 1500).is_none());
+        assert!(build_memory_block(&[], 0).is_none());
+        assert!(build_memory_block(&[], 1).is_none());
     }
 
     #[test]
-    fn block_budget_keeps_complete_entries() {
+    fn build_memory_block_single_returns_some_concatenated() {
+        let items = vec![record("m1", "workspace", "c1", "w1", false, "事实A")];
+        let block = build_memory_block(&items, 1500).unwrap();
+        assert!(block.starts_with("<memory>"));
+        assert!(block.ends_with("</memory>"));
+        assert!(block.contains("事实A"));
+        assert!(block.contains("[记忆1]"));
+        // 多条拼接
+        let items2 = vec![
+            record("m1", "global", "", "", false, "第一条"),
+            record("m2", "client", "c1", "", false, "第二条"),
+        ];
+        let block2 = build_memory_block(&items2, 1500).unwrap();
+        assert!(block2.contains("第一条"));
+        assert!(block2.contains("第二条"));
+        assert!(block2.contains("[记忆1]"));
+        assert!(block2.contains("[记忆2]"));
+    }
+
+    #[test]
+    fn build_memory_block_budget_clipping_keeps_complete_entries() {
         // 40 条 ~500 字符记忆 → 超出 1500 token 预算 → 只保留前若干完整条目
         let items: Vec<AgentMemoryRecord> = (0..40)
             .map(|i| record(&format!("m{i}"), "global", "", "", false, &format!("z{i}-{}", "x".repeat(500))))
             .collect();
         let block = build_memory_block(&items, 1500).unwrap();
         assert!(block.contains(&items[0].content));
-        assert!(
-            !block.contains(&items[39].content),
-            "超预算条目应被整条截断"
-        );
+        assert!(!block.contains(&items[39].content), "超预算条目应被整条截断");
         assert!(
             block.chars().count() / 4 <= 1500 + 256,
             "结果近似 token 不应大幅超出预算"
         );
-        // 不半截：块内任意一条记忆内容要么完整出现、要么完全不出现
         for item in &items {
             if block.contains(&item.content) {
                 assert!(item.content.len() <= 520, "未截断的条目应完整");
@@ -204,35 +205,159 @@ mod tests {
     }
 
     #[test]
-    fn block_empty_items_is_none() {
-        assert!(build_memory_block(&[], 1500).is_none());
-    }
-
-    #[test]
-    fn block_tiny_budget_keeps_first() {
-        // 预算 1 token：至少注入首条，不返回空
+    fn build_memory_block_tiny_budget_keeps_first() {
         let items = [record("m1", "global", "", "", false, "首条")];
         let block = build_memory_block(&items, 1).unwrap();
         assert!(block.contains("首条"));
+        // 预算 0 也保留首条（added==0 时不触发 break）
+        let block0 = build_memory_block(&items, 0).unwrap();
+        assert!(block0.contains("首条"));
+    }
+
+    #[test]
+    fn build_memory_block_record_fields_serialized() {
+        // scope 映射
+        let g = record("m1", "global", "", "", false, "global内容");
+        let c = record("m2", "client", "c1", "", false, "client内容");
+        let w = record("m3", "workspace", "c1", "w1", false, "workspace内容");
+        let bg = build_memory_block(&[g], 1500).unwrap();
+        assert!(bg.contains("全局"), "global 应映射为 全局");
+        assert!(bg.contains("global内容"));
+        let bc = build_memory_block(&[c], 1500).unwrap();
+        assert!(bc.contains("客户端"), "client 应映射为 客户端");
+        assert!(bc.contains("client内容"));
+        let bw = build_memory_block(&[w], 1500).unwrap();
+        assert!(bw.contains("工作区"), "workspace 应映射为 工作区");
+        assert!(bw.contains("workspace内容"));
+
+        // confidence 保留两位小数
+        let mut r = record("m4", "global", "", "", false, "conf");
+        r.confidence = 0.85;
+        let b = build_memory_block(&[r.clone()], 1500).unwrap();
+        assert!(b.contains("0.85"), "confidence 应格式化为 0.85");
+        r.confidence = 1.0;
+        let b2 = build_memory_block(&[r], 1500).unwrap();
+        assert!(b2.contains("1.00"));
+
+        // 内容原样保留，包含特殊字符
+        let special = record("m5", "global", "", "", false, "特殊字符：\n换行\t制表");
+        let bs = build_memory_block(&[special], 1500).unwrap();
+        assert!(bs.contains("特殊字符：\n换行\t制表"));
+
+        // <memory> 包裹
+        let r2 = record("m6", "global", "", "", false, "x");
+        let full = build_memory_block(&[r2], 1500).unwrap();
+        assert!(full.starts_with("<memory>"));
+        assert!(full.ends_with("</memory>"));
     }
 
     #[tokio::test]
+    async fn build_memory_block_with_seeded_helpers() {
+        // 演示使用 test_helpers 构造数据（满足任务要求）
+        let db = in_memory_db().await;
+        let sess_id = seed_workspace_and_session(&db).await;
+        assert_eq!(sess_id, "sess-test");
+        // 同时验证 DB 中 workspace/session 已创建
+        let ws: Option<String> = sqlx::query_scalar("SELECT id FROM agent_workspaces WHERE id='ws-test'")
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ws.as_deref(), Some("ws-test"));
+        // build_memory_block 本身不依赖 DB，但此处展示 helpers 可用
+        let rec = record("m1", "workspace", "test-client", "ws-test", false, "seeded helper 事实");
+        let block = build_memory_block(&[rec], 1500).unwrap();
+        assert!(block.contains("seeded helper 事实"));
+    }
+
+    // ── retrieve_for_session（脱离 LLM/Embedder 的 early-return 路径）──
+    // 注意 VectorStore/TempDir 析构顺序：TempDir 必须比 VectorStore/MemoryState 活得久，
+    // 否则 EdgeShard Drop 时 flush 已删目录会 panic。所有含向量检索的用例显式绑定
+    // (_dir, store) 且 _dir 声明在 MemoryState 之前（Rust 逆序析构保证 _dir 最后 drop）。
+
+    #[tokio::test]
+    #[cfg(feature = "rag")]
     async fn retrieve_disabled_returns_none() {
-        let (db, memory) = memory_state().await;
+        let db = in_memory_db().await;
+        let _sess = seed_workspace_and_session(&db).await;
+        // 正确顺序：_dir 先声明，store 次之，memory 最后 → drop 时 memory/store/_dir
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        // 默认 enabled=0
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "hello").await.is_none());
+        // 显式开启后再关闭
         let mut s = db.memory_get_settings().await.unwrap();
-        s.enabled = 0;
+        s.enabled = 1;
+        s.emb_base_url = "http://localhost:1".into();
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(retrieve_for_session(&memory, "c1", "w1", "q").await.is_none());
+        let mut s2 = db.memory_get_settings().await.unwrap();
+        s2.enabled = 0;
+        db.memory_upsert_settings(&s2).await.unwrap();
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "q").await.is_none());
     }
 
     #[tokio::test]
-    async fn retrieve_embed_failure_degrades_none() {
-        // base_url 不可达 → embed 失败 → None（静默降级，不 panic、不报错）
-        let (_db, memory) = memory_state().await;
-        assert!(retrieve_for_session(&memory, "c1", "w1", "查询").await.is_none());
+    #[cfg(feature = "rag")]
+    async fn retrieve_empty_query_returns_none() {
+        let db = in_memory_db().await;
+        let _sess = seed_workspace_and_session(&db).await;
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = "http://localhost:1".into();
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "").await.is_none());
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "   ").await.is_none());
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "\n\t ").await.is_none());
     }
 
-    /// 直接 seed：SQLite 行 + 向量点（固定向量 0.1，dim=8）。
+    #[tokio::test]
+    #[cfg(feature = "rag")]
+    async fn retrieve_embed_failure_degrades_none() {
+        let db = in_memory_db().await;
+        let _sess = seed_workspace_and_session(&db).await;
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = "http://localhost:1/v1".into(); // 不可达
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "查询").await.is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "rag")]
+    async fn retrieve_zero_dimension_returns_none() {
+        let db = in_memory_db().await;
+        let _sess = seed_workspace_and_session(&db).await;
+        let base = super::super::mock_embedding_server(8).await;
+        // _dir 先于 store/memory 声明，保证最后 drop
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = base;
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 0; // 未配置
+        db.memory_upsert_settings(&s).await.unwrap();
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "hello").await.is_none());
+    }
+
+    #[cfg(feature = "rag")]
     async fn seed_memory(
         memory: &super::super::MemoryState,
         id: &str,
@@ -265,23 +390,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_scope_filter_and_order() {
+    #[cfg(feature = "rag")]
+    async fn retrieve_scope_filter_and_order_with_helpers() {
+        let db = in_memory_db().await;
+        let _sess = seed_workspace_and_session(&db).await;
+        db.agent_create_workspace("ws2", "ws2-name", "test-client", "host", "/tmp", None, None, "", None, None, None, None)
+            .await
+            .unwrap();
         let base = super::super::mock_embedding_server(8).await;
-        let (_db, memory) = super::super::test_memory_with_embedding(&base).await;
-        seed_memory(&memory, "g1", "global", "", "", false, "全局事实").await;
-        seed_memory(&memory, "cl1", "client", "c1", "", false, "客户端事实").await;
-        seed_memory(&memory, "w1a", "workspace", "c1", "w1", false, "工作区事实A").await;
-        seed_memory(&memory, "w1p", "workspace", "c1", "w1", true, "工作区置顶").await;
-        seed_memory(&memory, "w2", "workspace", "c1", "w2", false, "别的工作区").await;
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = base;
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
 
-        // 默认阈值 0.4：全部命中（cosine=1.0）→ 作用域过滤为主
-        let block = retrieve_for_session(&memory, "c1", "w1", "查询").await.unwrap();
+        seed_memory(&memory, "g1", "global", "", "", false, "全局事实").await;
+        seed_memory(&memory, "cl1", "client", "test-client", "", false, "客户端事实").await;
+        seed_memory(&memory, "w1a", "workspace", "test-client", "ws-test", false, "工作区事实A").await;
+        seed_memory(&memory, "w1p", "workspace", "test-client", "ws-test", true, "工作区置顶").await;
+        seed_memory(&memory, "w2", "workspace", "test-client", "ws2", false, "别的工作区").await;
+
+        let block = retrieve_for_session(&memory, "test-client", "ws-test", "查询")
+            .await
+            .unwrap();
         assert!(block.contains("全局事实"), "global 恒可见");
         assert!(block.contains("客户端事实"), "client 匹配可见");
         assert!(block.contains("工作区事实A"), "workspace 匹配可见");
         assert!(block.contains("工作区置顶"));
         assert!(!block.contains("别的工作区"), "其他 workspace 应被作用域过滤");
-        // pinned 优先：置顶排在第一个 [记忆1]
         assert!(
             block.find("工作区置顶").unwrap() < block.find("全局事实").unwrap(),
             "pinned 应排最前"
@@ -289,58 +430,73 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "rag")]
     async fn retrieve_pinned_bypasses_high_threshold() {
+        let db = in_memory_db().await;
+        let _ = seed_workspace_and_session(&db).await;
         let base = super::super::mock_embedding_server(8).await;
-        let (db, memory) = super::super::test_memory_with_embedding(&base).await;
-        seed_memory(&memory, "w1a", "workspace", "c1", "w1", false, "工作区事实A").await;
-        seed_memory(&memory, "w1p", "workspace", "c1", "w1", true, "工作区置顶").await;
-        // 高阈值 1.5：所有 unpinned（cosine=1.0 < 1.5）被过滤；pinned 恒注入
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = base;
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
+
+        seed_memory(&memory, "w1a", "workspace", "test-client", "ws-test", false, "工作区事实A").await;
+        seed_memory(&memory, "w1p", "workspace", "test-client", "ws-test", true, "工作区置顶").await;
         let mut s = db.memory_get_settings().await.unwrap();
         s.score_threshold = 1.5;
         db.memory_upsert_settings(&s).await.unwrap();
 
-        let block = retrieve_for_session(&memory, "c1", "w1", "查询").await.unwrap();
+        let block = retrieve_for_session(&memory, "test-client", "ws-test", "查询")
+            .await
+            .unwrap();
         assert!(block.contains("工作区置顶"), "pinned 应绕过阈值恒注入");
         assert!(!block.contains("工作区事实A"), "未 pinned 低于阈值应被过滤");
 
-        // 关闭 pin_always_inject → pinned 也需 ≥ 阈值 → 全过滤 → None
         let mut s = db.memory_get_settings().await.unwrap();
         s.pin_always_inject = 0;
         db.memory_upsert_settings(&s).await.unwrap();
         assert!(
-            retrieve_for_session(&memory, "c1", "w1", "查询").await.is_none(),
+            retrieve_for_session(&memory, "test-client", "ws-test", "查询")
+                .await
+                .is_none(),
             "pin_always_inject=0 时 pinned 也按阈值过滤"
         );
     }
 
     #[tokio::test]
+    #[cfg(feature = "rag")]
     async fn retrieve_bump_hits_only_injected() {
+        let db = in_memory_db().await;
+        let _ = seed_workspace_and_session(&db).await;
         let base = super::super::mock_embedding_server(8).await;
-        let (db, memory) = super::super::test_memory_with_embedding(&base).await;
-        seed_memory(&memory, "m1", "workspace", "c1", "w1", false, "命中事实").await;
-        // 其他作用域：不注入 → 不 bump
-        seed_memory(&memory, "m2", "workspace", "c1", "w2", false, "别的").await;
+        let (_dir, store) = super::super::test_store();
+        let llm = crate::llm::LlmState::new(None, None);
+        let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
+        let mut s = db.memory_get_settings().await.unwrap();
+        s.enabled = 1;
+        s.emb_base_url = base;
+        s.emb_api_key = "key".into();
+        s.emb_model = "m".into();
+        s.emb_dimension = 8;
+        db.memory_upsert_settings(&s).await.unwrap();
 
-        let block = retrieve_for_session(&memory, "c1", "w1", "查询").await.unwrap();
+        seed_memory(&memory, "m1", "workspace", "test-client", "ws-test", false, "命中事实").await;
+        seed_memory(&memory, "m2", "workspace", "test-client", "ws2", false, "别的").await;
+        db.agent_create_workspace("ws2", "ws2-name", "test-client", "host", "/tmp", None, None, "", None, None, None, None)
+            .await
+            .ok();
+
+        let block = retrieve_for_session(&memory, "test-client", "ws-test", "查询")
+            .await
+            .unwrap();
         assert!(block.contains("命中事实"));
         assert_eq!(db.memory_get_by_id("m1").await.unwrap().unwrap().hit_count, 1);
         assert_eq!(db.memory_get_by_id("m2").await.unwrap().unwrap().hit_count, 0);
-    }
-
-    #[test]
-    fn scope_filter_rules() {
-        // 覆盖作用域过滤的判定逻辑：global / client / workspace 各自命中条件。
-        let c1 = "c1";
-        let w1 = "w1";
-        let w2 = "w2";
-        // global 恒命中
-        assert!(super::super::scope_ok("global", "", "", c1, w1));
-        // client 需 client_id 匹配（workspace 忽略）
-        assert!(super::super::scope_ok("client", c1, "", c1, w1));
-        assert!(!super::super::scope_ok("client", "other", "", c1, w1));
-        // workspace 需 client_id + workspace_id 都匹配
-        assert!(super::super::scope_ok("workspace", c1, w1, c1, w1));
-        assert!(!super::super::scope_ok("workspace", c1, w2, c1, w1));
-        assert!(!super::super::scope_ok("workspace", "other", w1, c1, w1));
     }
 }

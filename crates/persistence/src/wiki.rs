@@ -12,6 +12,7 @@ use super::Database;
 /// 归一化 wiki `ref`：`trim` + `lowercase` + 校验后返回 `Some(normalized)`，
 /// 非法返回 `None`。规范：`^[a-z0-9][a-z0-9/_-]{0,127}$`，禁 `//`、`./`、`../`，
 /// 长度 ≤128。
+#[must_use]
 pub fn normalize_wiki_ref(raw: &str) -> Option<String> {
     let s = raw.trim().to_lowercase();
     if s.is_empty() || s.len() > 128 {
@@ -34,6 +35,7 @@ pub fn normalize_wiki_ref(raw: &str) -> Option<String> {
 }
 
 /// 从 `content` 中抽取内联链接 `[[ref]]`，归一化并去重后返回。
+#[must_use]
 pub fn parse_wiki_links(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -59,6 +61,7 @@ pub fn parse_wiki_links(content: &str) -> Vec<String> {
 
 /// 容器行对当前会话是否可见。`global` 恒可见；`client` 需客户端匹配；
 /// `workspace` 需客户端 + 工作区都匹配。
+#[must_use]
 pub fn wiki_scope_ok(
     scope_type: &str,
     client_id: &str,
@@ -178,6 +181,8 @@ pub struct WikiGraphEdge {
 // ── 容器 CRUD ───────────────────────────────────────────────────
 
 impl Database {
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_create(
         &self,
         id: &str,
@@ -188,8 +193,8 @@ impl Database {
         workspace_id: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"INSERT INTO agent_wikis (id, name, summary, scope_type, client_id, workspace_id)
-               VALUES (?, ?, ?, ?, ?, ?)"#,
+            r"INSERT INTO agent_wikis (id, name, summary, scope_type, client_id, workspace_id)
+               VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(name)
@@ -201,14 +206,16 @@ impl Database {
         .await?;
         Ok(())
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get(&self, id: &str) -> Result<Option<AgentWikiRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiRecord>("SELECT * FROM agent_wikis WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_by_name_scope(
         &self,
         name: &str,
@@ -226,7 +233,8 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update(
         &self,
         id: &str,
@@ -243,7 +251,8 @@ impl Database {
         .await?;
         Ok(())
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         // Pages/Docs/Edges 经 FK CASCADE 清理；FTS 残留需显式清理（rowid 无 FK）
         let page_ids: Vec<(String,)> =
@@ -273,6 +282,8 @@ impl Database {
     }
 
     /// 列表（作用域 / q / status 过滤 + 分页）。`scope_type` 精确过滤；空串不过滤。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     #[allow(clippy::too_many_arguments)]
     pub async fn wiki_list(
         &self,
@@ -310,7 +321,8 @@ impl Database {
             .fetch_all(&self.pool)
             .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_count(
         &self,
         scope_type: Option<&str>,
@@ -343,6 +355,8 @@ impl Database {
     }
 
     /// 对账：把 `pending`/`processing` 的 wiki 置为 `failed`（启动时调用）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_fail_inflight(&self, error: &str) -> Result<u64, sqlx::Error> {
         let _ = error; // 容器无 error 列，仅复位状态（参数保留与 docs 对账签名一致）
         let r = sqlx::query(
@@ -354,6 +368,8 @@ impl Database {
     }
 
     /// 容器状态更新（摄入管线用：processing/ready/failed）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update_status(&self, id: &str, status: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE agent_wikis SET status = ?, updated_at = datetime('now') WHERE id = ?")
             .bind(status)
@@ -364,6 +380,8 @@ impl Database {
     }
 
     /// 原子 CAS：仅当 `pending` → `processing` 可抢占（摄入入口）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_mark_doc_processing_if_pending(&self, id: &str) -> Result<bool, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'processing', updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
@@ -375,7 +393,8 @@ impl Database {
     }
 
     // ── 文档 CRUD ────────────────────────────────────────────────
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_create_doc(
         &self,
         id: &str,
@@ -396,14 +415,16 @@ impl Database {
         .await?;
         Ok(())
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_doc(&self, id: &str) -> Result<Option<AgentWikiDocRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiDocRecord>("SELECT * FROM agent_wiki_docs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_list_docs(&self, wiki_id: &str) -> Result<Vec<AgentWikiDocRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiDocRecord>(
             "SELECT * FROM agent_wiki_docs WHERE wiki_id = ? ORDER BY created_at",
@@ -412,7 +433,8 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_delete_doc(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_wiki_docs WHERE id = ?")
             .bind(id)
@@ -421,7 +443,8 @@ impl Database {
         // source_doc_id SET NULL 由 FK 负责，无需额外处理
         Ok(())
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update_doc_status(
         &self,
         id: &str,
@@ -440,6 +463,8 @@ impl Database {
     }
 
     /// CAS：仅当 `pending`→`processing` 或 `ready`/`failed`→`pending` 的空闲态可抢占。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_mark_doc_pending_if_idle(&self, id: &str) -> Result<bool, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'pending', error = NULL, updated_at = datetime('now') \
@@ -450,7 +475,8 @@ impl Database {
         .await?;
         Ok(r.rows_affected() > 0)
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_fail_inflight_docs(&self, error: &str) -> Result<u64, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'failed', error = ?, updated_at = datetime('now') \
@@ -466,7 +492,9 @@ impl Database {
 
     /// 页面 upsert：`locked=1` 的页不被覆盖；同事务同步 FTS 与边。
     /// `source_doc_id` 可空（手动页为 `None`）。
-    #[allow(clippy::too_many_arguments)]
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn wiki_upsert_page(
         &self,
         wiki_id: &str,
@@ -504,8 +532,7 @@ impl Database {
 
         let page_id = existing
             .as_ref()
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+            .map_or_else(|| format!("{:032x}", rand::random::<u128>()), |r| r.id.clone());
 
         let links = parse_wiki_links(content);
 
@@ -513,9 +540,9 @@ impl Database {
 
         if existing.is_some() {
             sqlx::query(
-                r#"UPDATE agent_wiki_pages
+                r"UPDATE agent_wiki_pages
                    SET title = ?, summary = ?, content = ?, locked = ?, source_doc_id = ?, updated_at = datetime('now')
-                   WHERE id = ?"#,
+                   WHERE id = ?",
             )
             .bind(title)
             .bind(summary)
@@ -538,8 +565,8 @@ impl Database {
                 .await?;
         } else {
             sqlx::query(
-                r#"INSERT INTO agent_wiki_pages (id, wiki_id, ref, title, summary, content, locked, source_doc_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                r"INSERT INTO agent_wiki_pages (id, wiki_id, ref, title, summary, content, locked, source_doc_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&page_id)
             .bind(wiki_id)
@@ -614,7 +641,8 @@ impl Database {
         tx.commit().await?;
         Ok(page_id)
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_page(
         &self,
         wiki_id: &str,
@@ -628,7 +656,8 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_page_by_id(&self, id: &str) -> Result<Option<AgentWikiPageRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiPageRecord>("SELECT * FROM agent_wiki_pages WHERE id = ?")
             .bind(id)
@@ -637,6 +666,8 @@ impl Database {
     }
 
     /// 删除页面：同事务清 FTS、出边与入边悬空化。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_delete_page(&self, wiki_id: &str, page_ref: &str) -> Result<bool, sqlx::Error> {
         let existing: Option<AgentWikiPageRecord> = sqlx::query_as(
             "SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND ref = ?",
@@ -688,6 +719,8 @@ impl Database {
     }
 
     /// 清空某文档抽取的非 locked 页（reindex 用：清旧页+FTS+边）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_clear_pages_by_doc(&self, wiki_id: &str, doc_id: &str) -> Result<u64, sqlx::Error> {
         let rows: Vec<AgentWikiPageRecord> = sqlx::query_as(
             "SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND source_doc_id = ? AND locked = 0",
@@ -741,6 +774,8 @@ impl Database {
     }
 
     /// 页面列表（q/ref 前缀/locked 过滤+分页，摘要视图不含 content）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_list_pages(
         &self,
         wiki_id: &str,
@@ -773,7 +808,8 @@ impl Database {
             .fetch_all(&self.pool)
             .await
     }
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_bump_use(&self, page_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_wiki_pages SET use_count = use_count + 1, last_used_at = datetime('now') WHERE id = ?",
@@ -785,7 +821,8 @@ impl Database {
     }
 
     // ── Graph ──────────────────────────────────────────────────────
-
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_graph(&self, wiki_id: &str) -> Result<WikiGraph, sqlx::Error> {
         let nodes: Vec<AgentWikiPageSummary> = sqlx::query_as(
             "SELECT id, wiki_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
@@ -826,6 +863,8 @@ impl Database {
 
     /// 两段式检索：在 `visible_wiki_ids` 范围内检索（空表示全局）。
     /// 1) 短词直接 LIKE；2) 否则 FTS MATCH + bm25，零命中回退 LIKE。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_search(
         &self,
         visible_wiki_ids: &[String],
@@ -990,6 +1029,8 @@ impl Database {
     }
 
     /// 可见 wiki 列表（scope 过滤，对齐 `skill_injectable` 的可见性语义）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_visible_ids(
         &self,
         client_id: &str,
@@ -1011,6 +1052,8 @@ impl Database {
     /// 可见 wiki 完整记录（清单注入用）：scope 过滤 + page_count DESC + limit。
     /// 与 [`Self::wiki_visible_ids`] 同一可见性语义，返回整行（name/summary/
     /// page_count 供 `<wikis>` 清单渲染）。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_visible_wikis(
         &self,
         client_id: &str,
@@ -1033,6 +1076,8 @@ impl Database {
 
     /// 大小写不敏感的同作用域容器名查找（agent 工具寻址用）。SQLite LIKE 对
     /// ASCII 不区分大小写，中文不受影响；`name` 必须已由调用方 normalize。
+/// # Errors
+/// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_by_name_scope_ci(
         &self,
         name_lower: &str,

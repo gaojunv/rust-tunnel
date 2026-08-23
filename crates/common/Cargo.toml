@@ -5,7 +5,12 @@ edition = "2021"
 description = "Shared protocol and infrastructure for rust-tunnel"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
 bincode.workspace = true
 rand.workspace = true
 rcgen.workspace = true

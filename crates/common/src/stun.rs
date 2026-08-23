@@ -22,6 +22,7 @@ pub struct StunMessage {
 
 /// Build a STUN Binding Request packet.
 /// Returns the raw packet bytes and the transaction ID for verification.
+#[must_use] 
 pub fn build_binding_request() -> ([u8; 20], [u8; 12]) {
     let mut rng = rand::thread_rng();
     let mut transaction_id = [0u8; 12];
@@ -44,6 +45,7 @@ pub fn build_binding_request() -> ([u8; 20], [u8; 12]) {
 
 /// Parse a STUN Binding Response and extract the XOR-MAPPED-ADDRESS.
 /// Returns None if the message is malformed, wrong type, or TID mismatch.
+#[must_use] 
 pub fn parse_binding_response(data: &[u8], expected_tid: &[u8; 12]) -> Option<StunMessage> {
     if data.len() < 20 {
         return None;
@@ -129,7 +131,7 @@ fn parse_xor_mapped_address(data: &[u8]) -> Option<String> {
         (ip >> 8) & 0xFF,
         ip & 0xFF
     );
-    Some(format!("{}:{}", ip_str, port))
+    Some(format!("{ip_str}:{port}"))
 }
 
 fn parse_mapped_address(data: &[u8]) -> Option<String> {
@@ -142,7 +144,7 @@ fn parse_mapped_address(data: &[u8]) -> Option<String> {
     }
     let port = u16::from_be_bytes([data[2], data[3]]);
     let ip = format!("{}.{}.{}.{}", data[4], data[5], data[6], data[7]);
-    Some(format!("{}:{}", ip, port))
+    Some(format!("{ip}:{port}"))
 }
 
 #[cfg(test)]

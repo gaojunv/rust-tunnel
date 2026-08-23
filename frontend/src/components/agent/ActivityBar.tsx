@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Folder, TerminalSquare, GitBranch, Workflow } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -57,7 +57,7 @@ interface ActivityBarProps {
   variant?: 'sidebar' | 'mobile';
 }
 
-export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar' }: ActivityBarProps) {
+function ActivityBar({ sessionId, workspaceId, variant = 'sidebar' }: ActivityBarProps) {
   const { t } = useTranslation();
   const [active, setActive] = useState<PanelKind | null>(null);
   // 每种面板各自记住拖动后的宽度（px）
@@ -317,3 +317,5 @@ export default function ActivityBar({ sessionId, workspaceId, variant = 'sidebar
     </div>
   );
 }
+
+export default memo(ActivityBar);

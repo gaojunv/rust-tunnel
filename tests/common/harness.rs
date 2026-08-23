@@ -141,7 +141,6 @@ impl TestHarness {
         // no gateway rule exists yet → disabled; fixed test master key enables
         // provider API key encryption at rest.
         state
-            .proxy_state
             .init_llm_state(
                 state.db().cloned(),
                 Some([42u8; 32]),
@@ -158,7 +157,7 @@ impl TestHarness {
         // AgentState（顺带注入 ACP 桥）。非 rag 构建 cfg 掉，行为与旧 harness 一致。
         #[cfg(feature = "rag")]
         {
-            let llm = state.proxy_state.llm_state.read().await.clone();
+            let llm = state.llm_state.read().await.clone();
             if let Some(llm) = llm {
                 let memory = rust_tunnel_server::agent::memory::MemoryState::new(
                     state.db().cloned().expect("db present"),

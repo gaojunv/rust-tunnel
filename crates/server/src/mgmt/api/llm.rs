@@ -22,14 +22,14 @@ use crate::llm::{
 
 /// 取当前 LLM 字段加密器（未初始化 / 未配置主密钥时为 None → 明文兼容）。
 async fn llm_cipher(state: &ApiState) -> Option<LlmCipher> {
-    let guard = state.server_state.proxy_state.llm_state.read().await;
+    let guard = state.server_state.llm_state.read().await;
     guard.as_ref().and_then(|l| l.cipher.clone())
 }
 
 // ── Gateway config ────────────────────────────────────────────
 
 pub async fn get_gateway_config(State(state): State<ApiState>) -> impl IntoResponse {
-    let llm_guard = state.server_state.proxy_state.llm_state.read().await;
+    let llm_guard = state.server_state.llm_state.read().await;
     match llm_guard.as_ref() {
         Some(llm) => {
             let cfg = llm.gateway_config.read().await;
@@ -126,7 +126,7 @@ pub async fn update_gateway_config(
 
     // Step 3: Update in-memory gateway config
     {
-        let llm_guard = state.server_state.proxy_state.llm_state.read().await;
+        let llm_guard = state.server_state.llm_state.read().await;
         if let Some(llm) = llm_guard.as_ref() {
             *llm.gateway_config.write().await = Some(config.clone());
         }
@@ -847,7 +847,6 @@ pub async fn get_usage_logs(
 async fn llm_breakers(state: &ApiState) -> ModelBreakers {
     state
         .server_state
-        .proxy_state
         .llm_state
         .read()
         .await
@@ -859,7 +858,7 @@ async fn llm_breakers(state: &ApiState) -> ModelBreakers {
 /// 任何 provider/model/group 配置写入后调用：使路由缓存失效并清空确定性失败缓存，
 /// 让最新配置立即作用于请求热路径（换 key / 改模型 / 调组成员无需等 TTL）。
 async fn llm_invalidate(state: &ApiState) {
-    let guard = state.server_state.proxy_state.llm_state.read().await;
+    let guard = state.server_state.llm_state.read().await;
     if let Some(llm) = guard.as_ref() {
         llm.route_cache.invalidate().await;
         llm.known_failures.clear_all();

@@ -5,6 +5,9 @@ edition = "2021"
 description = "rust-tunnel client (zero-config intranet penetration)"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "rust-tunnel-client"
 path = "src/bin/client.rs"

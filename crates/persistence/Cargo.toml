@@ -1,0 +1,23 @@
+[package]
+name = "rust-tunnel-persistence"
+version = "0.4.0"
+edition = "2021"
+description = "SQLite persistence layer for rust-tunnel"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-common = { path = "../common" }
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tempfile.workspace = true

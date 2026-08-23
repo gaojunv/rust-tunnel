@@ -30,7 +30,7 @@ async fn seed_workspace(
     client_id: &str,
     root: &std::path::Path,
     overrides: Option<&str>,
-) -> rust_tunnel_server::persistence::db::agent::AgentWorkspaceRecord {
+) -> rust_tunnel_server::db::agent::AgentWorkspaceRecord {
     let db = harness.server_state.db().expect("db").clone();
     db.agent_create_workspace(
         "ws-acp",
@@ -44,6 +44,7 @@ async fn seed_workspace(
         Some("/usr/local/bin/claude-code-acp"),
         Some("fake-model-gate"), // 仅过门禁；本探针不跑回合
         overrides,
+        None,
     )
     .await
     .expect("create workspace");

@@ -83,40 +83,37 @@ impl ClientState {
         stream: Box<dyn AsyncWrite + Unpin + Send>,
     ) -> bool {
         let mut conns = self.active_connections.lock().await;
-        match conns.get_mut(&connection_id) {
-            Some(conn) => {
-                match std::mem::replace(
-                    &mut conn.state,
-                    LocalConnectionState::Active(Arc::new(Mutex::new(stream))),
-                ) {
-                    LocalConnectionState::Pending(buffered) => {
-                        if !buffered.is_empty() {
-                            if let LocalConnectionState::Active(writer) = &conn.state {
-                                let mut writer = writer.lock().await;
-                                for data in buffered {
-                                    let _ = writer.write_all(&data).await;
-                                }
-                                let _ = writer.flush().await;
+        if let Some(conn) = conns.get_mut(&connection_id) {
+            match std::mem::replace(
+                &mut conn.state,
+                LocalConnectionState::Active(Arc::new(Mutex::new(stream))),
+            ) {
+                LocalConnectionState::Pending(buffered) => {
+                    if !buffered.is_empty() {
+                        if let LocalConnectionState::Active(writer) = &conn.state {
+                            let mut writer = writer.lock().await;
+                            for data in buffered {
+                                let _ = writer.write_all(&data).await;
                             }
+                            let _ = writer.flush().await;
                         }
-                        true
                     }
-                    LocalConnectionState::Active(_) => {
-                        debug!(
-                            "Connection {} already active, ignoring duplicate activation",
-                            connection_id
-                        );
-                        false
-                    }
+                    true
+                }
+                LocalConnectionState::Active(_) => {
+                    debug!(
+                        "Connection {} already active, ignoring duplicate activation",
+                        connection_id
+                    );
+                    false
                 }
             }
-            None => {
-                debug!(
-                    "Connection {} not found during activation (may have been closed)",
-                    connection_id
-                );
-                false
-            }
+        } else {
+            debug!(
+                "Connection {} not found during activation (may have been closed)",
+                connection_id
+            );
+            false
         }
     }
 
@@ -187,8 +184,7 @@ async fn start_heartbeat(sender: ControlSender) {
         }
         let timestamp_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_micros() as u64);
         seq = seq.wrapping_add(1);
         if let Err(e) = sender
             .send(ControlMessage::Ping {
@@ -220,8 +216,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                     } => {
                         let client_rtt_micros = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0)
+                            .map_or(0, |d| d.as_micros() as u64)
                             .wrapping_sub(ping_timestamp_micros);
                         let server_processing_time =
                             pong_timestamp_micros.wrapping_sub(ping_timestamp_micros);
@@ -299,7 +294,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                 rust_tunnel_common::AgentCommand::ShellWithTimeout { timeout_secs, .. } => {
                                     std::time::Duration::from_secs((*timeout_secs).clamp(1, 3600))
                                 }
-                                _ => std::time::Duration::from_secs(120),
+                                _ => std::time::Duration::from_mins(2),
                             };
                             let result = crate::agent::handle_exec_request(
                                 &command,
@@ -335,7 +330,14 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         env,
                         cwd,
                     } => {
-                        if !state.config.enable_agent {
+                        if state.config.enable_agent {
+                            let mgr = state.spawn_manager.clone();
+                            let tx = state.control_sender.clone();
+                            tokio::spawn(async move {
+                                mgr.handle_spawn(session_id, command, args, env, cwd, tx)
+                                    .await;
+                            });
+                        } else {
                             let sender = state.control_sender.clone();
                             tokio::spawn(async move {
                                 let _ = sender
@@ -344,13 +346,6 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                         success: false,
                                         error: Some("agent not enabled".into()),
                                     })
-                                    .await;
-                            });
-                        } else {
-                            let mgr = state.spawn_manager.clone();
-                            let tx = state.control_sender.clone();
-                            tokio::spawn(async move {
-                                mgr.handle_spawn(session_id, command, args, env, cwd, tx)
                                     .await;
                             });
                         }

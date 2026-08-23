@@ -1221,6 +1221,7 @@
     "tierModelOpus": "Opus 模型",
     "tierModelSonnet": "Sonnet 模型",
     "tierModelHaiku": "Haiku 模型",
+    "tierModelSubagent": "子代理模型",
     "tierModelDefault": "默认（跟随会话模型）",
     "tierModelHint": "Tier 映射对新 spawn 的会话生效；留空的档位走会话模型。",
     "notifTurnDone": "任务完成",

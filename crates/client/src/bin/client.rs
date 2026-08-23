@@ -19,7 +19,7 @@ fn wait_for_exit() {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("启动失败: {}", e);
+        eprintln!("启动失败: {e}");
         wait_for_exit();
         std::process::exit(1);
     }
@@ -69,7 +69,7 @@ async fn run() -> TunnelResult<()> {
         tracing::info!("Reconnecting in {}s... (Ctrl+C to quit)", backoff_secs);
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
+            () = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {
                 backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             }
             _ = tokio::signal::ctrl_c() => {

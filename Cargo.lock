@@ -4796,6 +4796,8 @@ dependencies = [
 name = "rust-tunnel-common"
 version = "0.4.0"
 dependencies = [
+ "aes-gcm",
+ "base64 0.22.1",
  "bincode 1.3.3",
  "rand 0.8.6",
  "rcgen",
@@ -4815,10 +4817,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-persistence"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "rand 0.8.6",
+ "rust-tunnel-common",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rust-tunnel-server"
 version = "0.4.0"
 dependencies = [
- "aes-gcm",
  "agent-client-protocol",
  "anyhow",
  "arc-swap",
@@ -4855,6 +4872,7 @@ dependencies = [
  "reqwest",
  "rust-embed",
  "rust-tunnel-common",
+ "rust-tunnel-persistence",
  "rustls 0.22.4",
  "rustls-native-certs 0.7.3",
  "rustls-pemfile",

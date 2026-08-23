@@ -343,8 +343,7 @@ impl ControlMessage {
         const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
         if len > MAX_MESSAGE_SIZE {
             return Err(TunnelError::Protocol(format!(
-                "Message too large: {} bytes (max: {})",
-                len, MAX_MESSAGE_SIZE
+                "Message too large: {len} bytes (max: {MAX_MESSAGE_SIZE})"
             )));
         }
         let mut buf = vec![0u8; len];

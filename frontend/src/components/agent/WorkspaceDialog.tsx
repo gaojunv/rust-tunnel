@@ -66,9 +66,9 @@ export const serializeOverrides = (rows: OverrideRow[]): string | undefined => {
   return Object.keys(obj).length > 0 ? JSON.stringify(obj) : undefined;
 };
 
-/** Claude Code 三档位 tier：key ∈ {opus, sonnet, haiku} → model/group 引用。 */
-export type ClaudeTierKey = 'opus' | 'sonnet' | 'haiku';
-export const CLAUDE_TIERS: ClaudeTierKey[] = ['opus', 'sonnet', 'haiku'];
+/** Claude Code 四档位 tier：key ∈ {opus, sonnet, haiku, subagent} → model/group 引用。 */
+export type ClaudeTierKey = 'opus' | 'sonnet' | 'haiku' | 'subagent';
+export const CLAUDE_TIERS: ClaudeTierKey[] = ['opus', 'sonnet', 'haiku', 'subagent'];
 
 /** 解析存储的 claude_tier_models JSON（非法/空 → {}）；只保留合法 tier key，且值必须为 string。 */
 export const parseTierModels = (raw?: string | null): Partial<Record<ClaudeTierKey, string>> => {
@@ -78,7 +78,7 @@ export const parseTierModels = (raw?: string | null): Partial<Record<ClaudeTierK
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     const out: Partial<Record<ClaudeTierKey, string>> = {};
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if ((k === 'opus' || k === 'sonnet' || k === 'haiku') && typeof v === 'string' && v !== '') {
+      if ((k === 'opus' || k === 'sonnet' || k === 'haiku' || k === 'subagent') && typeof v === 'string' && v !== '') {
         out[k as ClaudeTierKey] = v;
       }
     }
@@ -88,7 +88,7 @@ export const parseTierModels = (raw?: string | null): Partial<Record<ClaudeTierK
   }
 };
 
-/** 将三档位序列化为 JSON；有任一非空 → JSON object，无有效项 → undefined（调用方决定省略或 null 清空）。 */
+/** 将四档位序列化为 JSON；有任一非空 → JSON object，无有效项 → undefined（调用方决定省略或 null 清空）。 */
 export const serializeTierModels = (tiers: Partial<Record<ClaudeTierKey, string>>): string | undefined => {
   const obj: Record<string, string> = {};
   for (const k of CLAUDE_TIERS) {
@@ -147,7 +147,7 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
   const [overrideRows, setOverrideRows] = useState<OverrideRow[]>(
     parseOverrides(editing?.agent_config_overrides),
   );
-  // Claude Code 三档位模型映射（opus/sonnet/haiku → model:<id> / group:<id> / 空=不配置）
+  // Claude Code 四档位模型映射（opus/sonnet/haiku/subagent → model:<id> / group:<id> / 空=不配置）
   const [tierModels, setTierModels] = useState<Partial<Record<ClaudeTierKey, string>>>(
     parseTierModels(editing?.claude_tier_models),
   );
@@ -186,15 +186,15 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
     );
   };
 
-  // 序列化 Claude Code 三档位 tier 模型；仅 claude-code 引擎提交。
-  // 有任一非空 → JSON object；三档全空且原记录有值（编辑模式）→ null 显式清空
-  // （后端 null=清空为 NULL）；三档全空且无原值 → undefined（不发送，后端保持原值）。
+  // 序列化 Claude Code 四档位 tier 模型；仅 claude-code 引擎提交。
+  // 有任一非空 → JSON object；四档全空且原记录有值（编辑模式）→ null 显式清空
+  // （后端 null=清空为 NULL）；四档全空且无原值 → undefined（不发送，后端保持原值）。
   // 与 overridesPayload 的三态约定一致。
   const tierModelsPayload = (): string | null | undefined => {
     if (agentType !== 'claude-code') return undefined;
     const serialized = serializeTierModels(tierModels);
     if (serialized !== undefined) return serialized;
-    // 三档全空：编辑模式下有原值 → 发 null 清空
+    // 四档全空：编辑模式下有原值 → 发 null 清空
     return editing?.claude_tier_models ? null : undefined;
   };
 
@@ -471,10 +471,10 @@ export default function WorkspaceDialog({ editing, onClose, onCreated }: Props) 
                     )}
                   </select>
                 </div>
-                {/* Claude Code 三档位模型：切换 tier（含自动切换/fast mode）时走对应网关模型 */}
+                {/* Claude Code 四档位模型：切换 tier（含自动切换/fast mode/subagent）时走对应网关模型 */}
                 {agentType === 'claude-code' && (
                   <div className="space-y-3">
-                    {([['opus', 'agent.tierModelOpus'], ['sonnet', 'agent.tierModelSonnet'], ['haiku', 'agent.tierModelHaiku']] as const).map(([tier, labelKey]) => (
+                    {([['opus', 'agent.tierModelOpus'], ['sonnet', 'agent.tierModelSonnet'], ['haiku', 'agent.tierModelHaiku'], ['subagent', 'agent.tierModelSubagent']] as const).map(([tier, labelKey]) => (
                       <div key={tier} className="space-y-2">
                         <Label>{t(labelKey)}</Label>
                         <select

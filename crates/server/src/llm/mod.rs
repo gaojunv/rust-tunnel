@@ -382,6 +382,200 @@ impl LlmState {
     }
 }
 
+/// 从 `__llm_gateway__` 规则构造 LlmState（装配层函数，替代原 ReverseProxyState::init_llm_state）。
+pub async fn init_llm_state(
+    proxy_state: &crate::reverse_proxy::ReverseProxyState,
+    db: Option<Database>,
+    master_key: Option<[u8; 32]>,
+    #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &std::path::Path,
+    dynamic_config: Arc<tokio::sync::RwLock<crate::dynamic_config::DynamicConfig>>,
+) -> Arc<LlmState> {
+    let gateway_rule = {
+        let rules = proxy_state.rules.lock().await;
+        rules.get("__llm_gateway__").cloned()
+    };
+
+    let cipher = master_key.map(crate::llm::crypto::LlmCipher::from_master_key);
+    #[cfg(feature = "rag")]
+    let mut llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
+    #[cfg(not(feature = "rag"))]
+    let mut llm = LlmState::new(db, cipher);
+    llm.dynamic_config = dynamic_config;
+
+    if let Some(rule) = gateway_rule {
+        let tls = rule.tls.as_ref();
+        let (openai_domain, anthropic_domain) = if rule.domains.len() >= 2 {
+            (
+                Some(rule.domains[0].clone()).filter(|d| !d.is_empty()),
+                Some(rule.domains[1].clone()).filter(|d| !d.is_empty()),
+            )
+        } else {
+            let old = rule.domains.first().cloned().filter(|d| !d.is_empty());
+            (old, None)
+        };
+        let config = LlmGatewayConfig {
+            enabled: rule.enabled,
+            openai_domain,
+            anthropic_domain,
+            listen: rule.listen.clone(),
+            tls_enabled: tls.is_some_and(|t| t.enabled),
+            tls_acme: tls.is_some_and(|t| t.acme),
+        };
+        *llm.gateway_config.write().await = Some(config);
+    } else {
+        *llm.gateway_config.write().await = Some(LlmGatewayConfig {
+            enabled: false,
+            openai_domain: None,
+            anthropic_domain: None,
+            listen: "0.0.0.0:443".to_string(),
+            tls_enabled: false,
+            tls_acme: false,
+        });
+    }
+
+    Arc::new(llm)
+}
+
+/// LLM Gateway 分流器实现（注入 ReverseProxyState，替代原 shared_listener 的内联分流）。
+pub struct LlmDispatcherImpl {
+    llm: Arc<LlmState>,
+}
+
+impl LlmDispatcherImpl {
+    pub fn new(llm: Arc<LlmState>) -> Self {
+        Self { llm }
+    }
+}
+
+impl crate::reverse_proxy::llm_dispatch::LlmDispatcher for LlmDispatcherImpl {
+    fn try_handle(
+        self: Arc<Self>,
+        host: String,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<axum::response::Response, axum::http::Request<axum::body::Body>>> + Send>> {
+        Box::pin(async move {
+            let protocol = {
+                let cfg = self.llm.gateway_config.read().await;
+                cfg.as_ref().and_then(|c| c.match_protocol(&host))
+            };
+            let Some(protocol) = protocol else {
+                return Err(req);
+            };
+            Ok(llm_handle(self.llm.clone(), protocol, req).await)
+        })
+    }
+}
+
+/// 把已匹配 LLM Gateway 的请求分发给对应的 handler。
+/// 按命中的协议入口严格限制接受的路径，跨协议路径返回协议各自的 404 风格。
+async fn llm_handle(
+    llm: Arc<LlmState>,
+    protocol: LlmProtocol,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    use axum::extract::State;
+    use axum::http::{Method, StatusCode};
+    use axum::Json;
+
+    let state = openai_handler::LlmHandlerState {
+        llm,
+        protocol: Some(protocol),
+    };
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let is_models = method == Method::GET && path == "/v1/models";
+    let is_messages = method == Method::POST && path == "/v1/messages";
+    let is_chat_completions = method == Method::POST && path == "/v1/chat/completions";
+    let is_responses = method == Method::POST && path == "/v1/responses";
+    let (parts, body) = req.into_parts();
+    let mut headers = parts.headers;
+
+    // HTTP/2 请求没有 Host 头，authority 由 hyper 映射到 URI；
+    // 下游 handler 的 validate_host 只认 Host 头，这里按 h1 语义补齐。
+    if !headers.contains_key(axum::http::header::HOST) {
+        if let Some(authority) = parts.uri.authority() {
+            if let Ok(value) = axum::http::HeaderValue::from_str(authority.as_str()) {
+                headers.insert(axum::http::header::HOST, value);
+            }
+        }
+    }
+
+    // 严格协议隔离：按入口协议判定允许的路径
+    let allowed = match protocol {
+        LlmProtocol::OpenAI => is_models || is_chat_completions || is_responses,
+        LlmProtocol::Anthropic => is_models || is_messages,
+    };
+
+    if !allowed {
+        let etype = "invalid_request_error";
+        let msg = "Not found".to_string();
+        return match protocol {
+            LlmProtocol::OpenAI => upstream::error_response(StatusCode::NOT_FOUND, msg, etype),
+            LlmProtocol::Anthropic => {
+                upstream::error_response_anthropic(StatusCode::NOT_FOUND, msg, etype)
+            }
+        };
+    }
+
+    if is_models {
+        return openai_handler::handle_list_models(State(state), headers).await;
+    }
+
+    let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = format!("failed to read request body: {}", e);
+            return match protocol {
+                LlmProtocol::OpenAI => {
+                    upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+                }
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                    StatusCode::BAD_REQUEST,
+                    msg,
+                    "invalid_request_error",
+                ),
+            };
+        }
+    };
+    if std::str::from_utf8(&bytes).is_err() {
+        let msg = "request body is not valid UTF-8; JSON must be UTF-8 encoded (inline non-ASCII text in terminals like Windows cmd is often not UTF-8 — use \\uXXXX escapes or a UTF-8 file)".into();
+        return match protocol {
+            LlmProtocol::OpenAI => {
+                upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+            }
+            LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+            ),
+        };
+    }
+    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("invalid JSON body: {}", e);
+            return match protocol {
+                LlmProtocol::OpenAI => {
+                    upstream::error_response(StatusCode::BAD_REQUEST, msg, "invalid_request_error")
+                }
+                LlmProtocol::Anthropic => upstream::error_response_anthropic(
+                    StatusCode::BAD_REQUEST,
+                    msg,
+                    "invalid_request_error",
+                ),
+            };
+        }
+    };
+
+    if is_messages {
+        anthropic_handler::handle_messages(State(state), headers, Json(json)).await
+    } else if is_responses {
+        responses_handler::handle_responses(State(state), headers, Json(json)).await
+    } else {
+        openai_handler::handle_chat_completions(State(state), headers, Json(json)).await
+    }
+}
+
 /// LLM 请求日志中单个字符串字段的截断上限（字符）。
 ///
 /// 完整对话正文（可能含用户 secrets）原样落盘是安全风险；日志保留结构

@@ -1224,6 +1224,7 @@
     "tierModelOpus": "Opus model",
     "tierModelSonnet": "Sonnet model",
     "tierModelHaiku": "Haiku model",
+    "tierModelSubagent": "Subagent model",
     "tierModelDefault": "Default (follow session model)",
     "tierModelHint": "Tier mapping applies to newly spawned sessions. Tiers left blank fall back to the session model.",
     "notifTurnDone": "Task completed",
