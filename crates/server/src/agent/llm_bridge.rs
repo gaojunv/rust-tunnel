@@ -719,8 +719,14 @@ mod tests {
 
         let db = Database::new(":memory:").await.unwrap();
 
-        // mock 上游：返回 ~600KB 非流式 JSON 响应（单块远超协议 1MB 切块线）
-        let big_body = vec![b'a'; 600 * 1024];
+        // mock 上游：返回 ~600KB 非流式 JSON 响应（单块远超协议 1MB 切块线）。
+        // 必须是合法 JSON——网关故障转移循环对非流式 200 做 body 质量校验
+        // （空/非 JSON → 502 重试），纯字节填充会被判为畸形响应。
+        let big_body = format!(
+            "{{\"id\":\"chatcmpl-big\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}]}}",
+            "a".repeat(600 * 1024)
+        )
+        .into_bytes();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let body_for_server = big_body.clone();

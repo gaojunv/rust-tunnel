@@ -343,6 +343,58 @@ async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (Statu
         .unwrap())
 }
 
+/// 非流式响应体的质量校验：读 body → 校验非空 + 合法 JSON → 重建 Response。
+///
+/// `relay_upstream_body` 对 200 空 body 或 200 非 JSON body 返回 Ok（无法区分），
+/// 本函数在 body 层面做二次校验，把"假成功"识别为 502 供故障转移/原地重试：
+/// - 空 body → Err(502, "empty response body ...")
+/// - 非 JSON → Err(502, "malformed response body ...")
+/// - 合法 JSON → Ok(重建的 Response)
+///
+/// 入参为 axum `Response`（而非 reqwest `Response`），因此同时适用于
+/// `relay_upstream_body` 产物与 Anthropic 直通产物，调用方无需关心来源。
+async fn validate_response_body(resp: Response) -> Result<Response, (StatusCode, String)> {
+    let body_bytes = axum::body::to_bytes(resp.into_body(), MAX_UPSTREAM_BODY_BYTES)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to read upstream body: {e}"),
+            )
+        })?;
+    if body_bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "empty response body from upstream".into(),
+        ));
+    }
+    if serde_json::from_slice::<serde_json::Value>(&body_bytes).is_err() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "malformed response body (not valid JSON)".into(),
+        ));
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body_bytes))
+        .unwrap())
+}
+
+/// 判定错误消息是否为"上游 200 但空/畸形响应"类（可原地重试 + 可转移）。
+///
+/// 覆盖四种来源：
+/// - `empty response body` / `malformed response body`：非流式 body 质量校验（本文件）
+/// - `empty SSE stream`：流式首字节守卫的空流（`call_upstream_stream_guarded`）
+/// - `invalid responses-format upstream body`：Responses 非流式转换的 parse 失败
+///   （`super::responses::convert_responses_to_chat_response`）
+fn is_malformed_error(msg: &str) -> bool {
+    msg.contains("empty response body")
+        || msg.contains("malformed response body")
+        || msg.contains("empty SSE stream")
+        || msg.contains("invalid responses-format upstream body")
+}
+
 /// 判定上游失败是否可转移（换下一个候选重试）。
 ///
 /// 可转移：5xx（含连接/超时映射来的 502）、429（受 `failover_on_429` 开关控制）。
@@ -444,7 +496,15 @@ pub async fn call_upstream_stream_guarded(
                 return Ok(());
             }
         }
-        // 流正常结束但没等到事件——空流也放行（上游立刻 [DONE] 的边界场景）
+        // 流正常结束但没等到任何 SSE 事件——空流不放行，返回 502 供故障转移。
+        // 上游立刻 [DONE] 的边界场景：首 chunk 通常包含 [DONE] 事件（含 \n\n），
+        // 会在上面的 windows 检查中命中放行；真正到达这里的空流是异常的。
+        if prefix.is_empty() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "empty SSE stream from upstream (no events before EOF)".to_string(),
+            ));
+        }
         Ok(())
     };
     tokio::time::timeout(first_event_deadline, collect)
@@ -521,6 +581,10 @@ fn deterministic_failure(status: StatusCode) -> Option<crate::llm::down::Failure
 /// 调用方负责 RAG/compat 改写与 `req_body` 构造；本函数循环内仅
 /// clone body + 定点改 `model`。中途失败尝试不记 usage（仅 warn 日志）。
 ///
+/// "假成功"识别：HTTP 200 但 body 为空 / 非 JSON（非流式），或 SSE 流
+/// 在首个事件前 EOF（链长 >1 的流式守卫）——统一归为 502 畸形类失败，
+/// 每候选原地重试最多 1 次后按 retryable 转移到下一候选。
+///
 /// `anthropic_body`：Anthropic 入口携带的原始请求体（OpenAI/Responses 入口为 None）。
 /// 当候选 provider 配了 `anthropic_base_url` 且 `anthropic_body` 存在时，该候选走
 /// `/v1/messages` 直通（原始 Anthropic body，model 替换为候选名）；否则走下方
@@ -568,85 +632,123 @@ pub async fn execute_with_failover(
             );
             continue;
         }
-        attempts += 1;
-        last_attempted = Some(cand.model_id.as_str());
+        // 每候选最多 1 + MAX_MALFORMED_RETRIES 次尝试：首次 + 原地重试
+        // （仅针对"上游 200 但空/畸形响应"类 502——空 body / 非 JSON body /
+        // 空 SSE 流 / Responses 转换 parse 失败）。这类失败穿透状态码判定
+        // （HTTP 200），但 body 校验识别后属于可重试的上游抖动。
+        let mut cand_attempt = 0usize;
+        const MAX_MALFORMED_RETRIES: usize = 1; // 首次之外的额外重试次数
 
-        let mut body = req_body.clone();
-        set_body_model(&mut body, &cand.model_name);
+        let (result, upstream_anthropic) = loop {
+            cand_attempt += 1;
+            attempts += 1;
+            last_attempted = Some(cand.model_id.as_str());
 
-        // ── Anthropic 直通分支：候选 provider 配了 anthropic_base_url 且入口携带原始
-        //    Anthropic body 时，原始请求体（仅替换 model 为候选真实名）直发 /v1/messages。
-        //    每候选独立判定：组内可混合"直通候选"与"转换候选"并互相故障转移。
-        //    失败路径与转换分支共用（retryable / 确定性 4xx / 不可转移 4xx 不区分直通与否）。
-        let (result, upstream_anthropic) = if let (Some(url), Some(raw)) =
-            (&cand.provider.anthropic_base_url, anthropic_body)
-        {
-            let mut raw = raw.clone();
-            set_body_model(&mut raw, &cand.model_name);
-            (
-                call_upstream_raw(url, &cand.provider.api_key, "/v1/messages", &raw, stream).await,
-                true,
-            )
-        } else {
-            // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
-            let result = match cand.upstream_protocol {
-                crate::llm::router::UpstreamProtocol::ChatCompletions => {
-                    // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
-                    // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
-                    // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
-                    if stream && chain.candidates.len() > 1 {
-                        call_upstream_stream_guarded(
-                            &cand.provider.base_url,
-                            &cand.provider.api_key,
-                            &body,
-                            "v1/chat/completions",
-                        )
-                        .await
-                    } else {
-                        call_upstream_with_body(
-                            &cand.provider.base_url,
-                            &cand.provider.api_key,
-                            &body,
-                            "v1/chat/completions",
-                        )
-                        .await
-                    }
-                }
-                crate::llm::router::UpstreamProtocol::Responses => {
-                    // 转换请求体：chat → Responses 格式
-                    body = super::responses::chat_body_to_responses_body(&body);
-                    // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
-                    let upstream_resp = if stream && chain.candidates.len() > 1 {
-                        call_upstream_stream_guarded(
-                            &cand.provider.base_url,
-                            &cand.provider.api_key,
-                            &body,
-                            "v1/responses",
-                        )
-                        .await
-                    } else {
-                        call_upstream_with_body(
-                            &cand.provider.base_url,
-                            &cand.provider.api_key,
-                            &body,
-                            "v1/responses",
-                        )
-                        .await
-                    };
-                    // 响应转换：Responses → Chat Completions 格式
-                    match upstream_resp {
-                        Ok(resp) => {
-                            if stream {
-                                super::responses::convert_responses_stream_to_chat(resp)
-                            } else {
-                                super::responses::convert_responses_to_chat_response(resp).await
-                            }
+            let mut body = req_body.clone();
+            set_body_model(&mut body, &cand.model_name);
+
+            // ── Anthropic 直通分支：候选 provider 配了 anthropic_base_url 且入口携带原始
+            //    Anthropic body 时，原始请求体（仅替换 model 为候选真实名）直发 /v1/messages。
+            //    每候选独立判定：组内可混合"直通候选"与"转换候选"并互相故障转移。
+            //    失败路径与转换分支共用（retryable / 确定性 4xx / 不可转移 4xx 不区分直通与否）。
+            let (r, ua) = if let (Some(url), Some(raw)) =
+                (&cand.provider.anthropic_base_url, anthropic_body)
+            {
+                let mut raw = raw.clone();
+                set_body_model(&mut raw, &cand.model_name);
+                (
+                    call_upstream_raw(url, &cand.provider.api_key, "/v1/messages", &raw, stream)
+                        .await,
+                    true,
+                )
+            } else {
+                // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
+                let result = match cand.upstream_protocol {
+                    crate::llm::router::UpstreamProtocol::ChatCompletions => {
+                        // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
+                        // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
+                        // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
+                        if stream && chain.candidates.len() > 1 {
+                            call_upstream_stream_guarded(
+                                &cand.provider.base_url,
+                                &cand.provider.api_key,
+                                &body,
+                                "v1/chat/completions",
+                            )
+                            .await
+                        } else {
+                            call_upstream_with_body(
+                                &cand.provider.base_url,
+                                &cand.provider.api_key,
+                                &body,
+                                "v1/chat/completions",
+                            )
+                            .await
                         }
-                        Err(e) => Err(e),
                     }
-                }
+                    crate::llm::router::UpstreamProtocol::Responses => {
+                        // 转换请求体：chat → Responses 格式
+                        body = super::responses::chat_body_to_responses_body(&body);
+                        // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
+                        let upstream_resp = if stream && chain.candidates.len() > 1 {
+                            call_upstream_stream_guarded(
+                                &cand.provider.base_url,
+                                &cand.provider.api_key,
+                                &body,
+                                "v1/responses",
+                            )
+                            .await
+                        } else {
+                            call_upstream_with_body(
+                                &cand.provider.base_url,
+                                &cand.provider.api_key,
+                                &body,
+                                "v1/responses",
+                            )
+                            .await
+                        };
+                        // 响应转换：Responses → Chat Completions 格式
+                        match upstream_resp {
+                            Ok(resp) => {
+                                if stream {
+                                    super::responses::convert_responses_stream_to_chat(resp)
+                                } else {
+                                    super::responses::convert_responses_to_chat_response(resp)
+                                        .await
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                };
+                (result, false)
             };
-            (result, false)
+
+            // 非流式：对 Ok(resp) 做 body 质量校验——200 空 body / 200 非 JSON
+            // 这类"假成功"在状态码层面无法识别，统一归一为 Err(502) 走下方
+            // 重试/转移判定。流式路径无法回读 body（响应头已发客户端），跳过。
+            let r = if !stream {
+                match r {
+                    Ok(resp) => validate_response_body(resp).await,
+                    Err(e) => Err(e),
+                }
+            } else {
+                r
+            };
+
+            // 畸形/空流类失败：同候选原地重试（上限 MAX_MALFORMED_RETRIES 次）。
+            let is_malformed = matches!(&r, Err((s, m))
+                if *s == StatusCode::BAD_GATEWAY && is_malformed_error(m));
+            if is_malformed && cand_attempt <= MAX_MALFORMED_RETRIES {
+                tracing::warn!(
+                    model_id = %cand.model_id,
+                    model = %cand.model_name,
+                    attempt = cand_attempt,
+                    "LLM upstream returned malformed/empty response, retrying same candidate"
+                );
+                continue;
+            }
+            break (r, ua);
         };
 
         match result {
@@ -1489,6 +1591,11 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\r\n\r\ndata: [DONE]\r\n\r\n"
     }
 
+    /// 非流式 200 的合法 JSON body（body 质量校验后必须是合法 JSON 才能放行）。
+    fn ok_json_response_body() -> &'static str {
+        "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+    }
+
     async fn write_http(sock: &mut tokio::net::TcpStream, status: &str, body: &str) {
         use tokio::io::AsyncWriteExt;
         let resp = format!(
@@ -1656,7 +1763,7 @@ mod tests {
         let good = start_behavior_upstream(|mut s| {
             Box::pin(async move {
                 drain_request(&mut s).await;
-                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+                write_http(&mut s, "200 OK", ok_json_response_body()).await;
             })
         })
         .await;
@@ -1906,7 +2013,7 @@ mod tests {
             Box::pin(async move {
                 h.fetch_add(1, Ordering::SeqCst);
                 drain_request(&mut s).await;
-                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+                write_http(&mut s, "200 OK", ok_json_response_body()).await;
             })
         })
         .await;
@@ -2641,5 +2748,297 @@ mod tests {
             "确定性失败后首选不再被请求"
         );
         assert_eq!(b_hits.load(Ordering::SeqCst), 2);
+    }
+
+    // ── 上游 200 空/畸形响应的重试 + 故障转移 ──────────────────────────
+
+    /// 非流式 200 空 body：同候选原地重试，第二次返回正常 JSON 后成功。
+    #[tokio::test]
+    async fn test_failover_nonstream_empty_body_retry_then_success() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let upstream = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                if n == 0 {
+                    // 第一次：200 + 空 body
+                    write_http(&mut s, "200 OK", "").await;
+                } else {
+                    // 第二次：正常 JSON
+                    write_http(&mut s, "200 OK", "{\"choices\":[]}").await;
+                }
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&upstream, "m1", "id1")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let FailoverOutcome::Success {
+            resp, failed_over, ..
+        } = out
+        else {
+            panic!("expected success after in-place retry");
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!failed_over);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "首次空 body + 1 次原地重试");
+        // 最终成功：熔断计数复位
+        assert_eq!(breakers.snapshot("id1").consecutive_failures, 0);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v.get("choices").is_some());
+    }
+
+    /// 非流式 200 空 body：首选始终空（尝试 2 次=首次+重试），转移到备选成功。
+    #[tokio::test]
+    async fn test_failover_nonstream_empty_body_failover() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let bh = bad_hits.clone();
+        let bad = start_behavior_upstream(move |mut s| {
+            let bh = bh.clone();
+            Box::pin(async move {
+                bh.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", "").await;
+            })
+        })
+        .await;
+        let good = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", "{\"choices\":[]}").await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let FailoverOutcome::Success {
+            candidate,
+            failed_over,
+            ..
+        } = out
+        else {
+            panic!("expected success via failover");
+        };
+        assert_eq!(candidate.model_id, "id-good");
+        assert!(failed_over);
+        assert_eq!(
+            bad_hits.load(Ordering::SeqCst),
+            2,
+            "首选：首次 + 1 次原地重试后才转移"
+        );
+        assert_eq!(breakers.snapshot("id-bad").consecutive_failures, 1);
+    }
+
+    /// 非流式 200 非 JSON body：首选畸形（重试 1 次仍畸形），转移到备选成功。
+    #[tokio::test]
+    async fn test_failover_nonstream_malformed_json_failover() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let bh = bad_hits.clone();
+        let bad = start_behavior_upstream(move |mut s| {
+            let bh = bh.clone();
+            Box::pin(async move {
+                bh.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", "this is not json").await;
+            })
+        })
+        .await;
+        let good = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", "{\"choices\":[]}").await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let FailoverOutcome::Success {
+            candidate,
+            failed_over,
+            ..
+        } = out
+        else {
+            panic!("expected success via failover");
+        };
+        assert_eq!(candidate.model_id, "id-good");
+        assert!(failed_over);
+        assert_eq!(bad_hits.load(Ordering::SeqCst), 2, "首选：首次 + 1 次原地重试");
+    }
+
+    /// 流式链长 2：首选 200 头后立即 EOF（无任何 SSE 事件）→ 守卫返回 502，
+    /// 同候选重试 1 次仍空流后转移到备选正常 SSE。
+    #[tokio::test]
+    async fn test_failover_stream_empty_sse_failover() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let bh = bad_hits.clone();
+        let bad = start_behavior_upstream(move |mut s| {
+            let bh = bh.clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                bh.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                // 200 头 + 立即 EOF：不写任何 SSE data，靠 Connection: close 收尾
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                s.write_all(head.as_bytes()).await.unwrap();
+            })
+        })
+        .await;
+        let good = start_behavior_upstream(|mut s| {
+            Box::pin(async move {
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", ok_sse_response_body()).await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+            ..
+        } = out
+        else {
+            panic!("expected success via failover after empty SSE stream");
+        };
+        assert_eq!(candidate.model_id, "id-good");
+        assert!(failed_over);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            bad_hits.load(Ordering::SeqCst),
+            2,
+            "空流：首次 + 1 次原地重试后才转移"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("[DONE]"));
+    }
+
+    /// 单候选链流式：不走守卫（relay 直通），200 空 body 保持既有放行行为。
+    #[tokio::test]
+    async fn test_failover_single_candidate_stream_empty_no_retry() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let upstream = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                use tokio::io::AsyncWriteExt;
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                s.write_all(head.as_bytes()).await.unwrap();
+                // 立即 EOF，不写任何 SSE 事件
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&upstream, "m1", "id1")]);
+        let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let FailoverOutcome::Success { resp, failed_over, .. } = out else {
+            panic!("单候选链流式不走守卫，空流应保持放行（Ok）");
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!failed_over);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "无守卫无重试，仅请求一次");
+    }
+
+    /// 单候选非流式始终空 body：重试 1 次仍空 → Exhausted + 502。
+    #[tokio::test]
+    async fn test_failover_nonstream_empty_body_exhausted() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let upstream = start_behavior_upstream(move |mut s| {
+            let h = h.clone();
+            Box::pin(async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut s).await;
+                write_http(&mut s, "200 OK", "").await;
+            })
+        })
+        .await;
+
+        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let chain = test_chain(&[(&upstream, "m1", "id1")]);
+        let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
+
+        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let FailoverOutcome::Exhausted {
+            status, message, ..
+        } = out
+        else {
+            panic!("expected exhausted after retries depleted");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            message.contains("empty response body"),
+            "错误消息应标识空 body: {message}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "首次 + 1 次原地重试后放弃");
+    }
+
+    /// 单元级：is_malformed_error 的判定覆盖。
+    #[test]
+    fn test_is_malformed_error() {
+        assert!(is_malformed_error("empty response body from upstream"));
+        assert!(is_malformed_error("malformed response body (not valid JSON)"));
+        assert!(is_malformed_error(
+            "empty SSE stream from upstream (no events before EOF)"
+        ));
+        assert!(is_malformed_error(
+            "invalid responses-format upstream body: missing field"
+        ));
+        // 普通 502（连接失败/上游 5xx 透传）不属于畸形类
+        assert!(!is_malformed_error("Upstream connection failed: refused"));
+        assert!(!is_malformed_error("Upstream error 500: boom"));
+        assert!(!is_malformed_error("Upstream first-byte timeout"));
     }
 }
