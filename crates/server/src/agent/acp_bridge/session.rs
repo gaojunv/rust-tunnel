@@ -254,7 +254,7 @@ impl AcpBridge {
                 Vec::new()
             };
             // Claude Code tier 模型映射：workspace.claude_tier_models（JSON object，
-            // key ∈ {opus,sonnet,haiku}）→ ANTHROPIC_DEFAULT_*_MODEL 等 env。
+            // key ∈ {opus,sonnet,haiku,subagent}）→ ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_SUBAGENT_MODEL 等 env。
             // 仅 claude-code 且非空时解析；单档解析失败 warn 跳过该档，不阻断 spawn。
             // **不注入 ANTHROPIC_MODEL**——spawn 时锁死默认模型会覆盖 session.model
             // 的每请求动态解析。
@@ -284,6 +284,7 @@ impl AcpBridge {
                                                 "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                                                 Some("ANTHROPIC_SMALL_FAST_MODEL"),
                                             ),
+                                            "subagent" => ("CLAUDE_CODE_SUBAGENT_MODEL", None),
                                             _ => continue,
                                         };
                                         envs.push((env_key.to_string(), resolved.clone()));
