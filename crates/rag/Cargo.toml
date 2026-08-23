@@ -1,0 +1,26 @@
+[package]
+name = "rust-tunnel-rag"
+version = "0.4.0"
+edition = "2021"
+description = "rust-tunnel RAG knowledge base (extract/chunk/embed/store/retrieve/ingest)"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-common = { path = "../common" }
+rust-tunnel-persistence = { path = "../persistence" }
+qdrant-edge.workspace = true
+lopdf.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

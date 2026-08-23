@@ -15,8 +15,21 @@ use serde_json::Value;
 use super::openai_handler::LlmHandlerState;
 use super::router::{resolve_with_failover, CandidateChain};
 use super::usage::UsageContext;
+#[cfg(feature = "rag")]
+use super::ChatMessage;
 use super::{ChatCompletionRequest, LlmState};
 use crate::db::Database;
+
+/// 取最后一条 user 消息的文本（RAG 检索的 query 来源）。
+#[cfg(feature = "rag")]
+fn last_user_text(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .filter(|t| !t.trim().is_empty())
+}
 
 /// 协议特有解析完成后的统一请求描述，供共享执行流水线消费。
 pub struct PreparedRequest {
@@ -135,9 +148,23 @@ pub async fn inject_rag_and_compat(
     let mut rag_injected: i64 = 0;
     #[cfg(feature = "rag")]
     if let (Some(db), Some(kb_id)) = (db, kb_id_for_rag) {
-        let outcome =
-            super::rag::enhance(db, &state.rag_store, state.cipher.as_ref(), &kb_id, request).await;
-        rag_injected = outcome.injected as i64;
+        // rag 只返回结构化检索结果；注入本请求类型（system 消息置顶）由本层负责。
+        if let Some(query_text) = last_user_text(&request.messages) {
+            if let Some(rag_ctx) = super::rag::retrieve_context(
+                db,
+                &state.rag_store,
+                state.cipher.as_ref(),
+                &kb_id,
+                &query_text,
+            )
+            .await
+            {
+                rag_injected = rag_ctx.chunks.len() as i64;
+                request
+                    .messages
+                    .insert(0, ChatMessage::text("system", rag_ctx.system_message));
+            }
+        }
     }
     if rag_injected > 0 {
         ctx.rag_chunks_injected = Some(rag_injected);
@@ -789,5 +816,28 @@ mod tests {
         let db = crate::test_helpers::in_memory_db().await;
         let s = LlmState::new(Some(db), None);
         assert!(s.db.is_some());
+    }
+
+    #[cfg(feature = "rag")]
+    #[test]
+    fn last_user_message_extracted() {
+        let msgs = vec![
+            ChatMessage::text("system", "s"),
+            ChatMessage::text("user", "第一句"),
+            ChatMessage::text("assistant", "答"),
+            ChatMessage::text("user", "第二句"),
+        ];
+        assert_eq!(last_user_text(&msgs), Some("第二句".to_string()));
+    }
+
+    #[cfg(feature = "rag")]
+    #[test]
+    fn last_user_text_blank_user_yields_none() {
+        // 实现语义：find 命中最后的 user 再 filter 空白 → None（不回溯更早 user）。
+        let msgs = vec![
+            ChatMessage::text("user", "有效"),
+            ChatMessage::text("user", "   "),
+        ];
+        assert_eq!(last_user_text(&msgs), None);
     }
 }
