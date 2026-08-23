@@ -693,13 +693,16 @@ export interface UpdateSkillRequest {
   tags?: string[];
 }
 
-// === Wiki（批 1 骨架） ===
+// === Wiki（批 4 完整） ===
+
+/** 容器/文档状态（对齐后端 CHECK 约束：draft/pending/processing/ready/failed）。 */
+export type WikiStatus = 'draft' | 'pending' | 'processing' | 'ready' | 'failed';
 
 export interface AgentWiki {
   id: string;
   name: string;
   summary: string;
-  status: string;
+  status: WikiStatus;
   version: number;
   page_count: number;
   scope_type: AgentMemoryScope;
@@ -725,6 +728,113 @@ export interface CreateWikiRequest {
 export interface UpdateWikiRequest {
   name?: string;
   summary?: string;
+}
+
+/** Wiki 原文文档（对应 `agent_wiki_docs` 表）。status: pending/processing/ready/failed。 */
+export interface WikiDocument {
+  id: string;
+  wiki_id: string;
+  filename: string;
+  file_type: string;
+  content_hash: string;
+  status: WikiStatus;
+  error?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WikiDocsResponse {
+  documents: WikiDocument[];
+}
+
+/** 页面摘要视图（不含 content，对应列表/图谱节点响应）。 */
+export interface WikiPageSummary {
+  id: string;
+  wiki_id: string;
+  ref: string;
+  title: string;
+  summary: string;
+  locked: boolean;
+  source_doc_id?: string | null;
+  use_count: number;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 页面全文（含 content，GET /pages/*ref 响应）。 */
+export interface WikiPage {
+  id: string;
+  wiki_id: string;
+  ref: string;
+  title: string;
+  summary: string;
+  content: string;
+  locked: boolean;
+  source_doc_id?: string | null;
+  use_count: number;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WikiPagesResponse {
+  pages: WikiPageSummary[];
+  total: number;
+}
+
+export interface WikiPageListParams {
+  q?: string;
+  ref_prefix?: string;
+  locked?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+/** 手动写页（PUT /pages/*ref，locked=1 由后端强制）。ref 缺省=路径值。 */
+export interface PutWikiPageRequest {
+  ref?: string;
+  title: string;
+  summary?: string;
+  content: string;
+}
+
+/** FTS5 检索命中（snippet 含 `<mark>` 标签）。 */
+export interface WikiSearchHit {
+  page_id: string;
+  wiki_id: string;
+  ref: string;
+  title: string;
+  summary: string;
+  snippet: string;
+  rank: number;
+}
+
+export interface WikiSearchResponse {
+  hits: WikiSearchHit[];
+}
+
+/** 图谱边（dangling=true 表示目标页不存在，前端红色虚线）。 */
+export interface WikiGraphEdge {
+  from: string;
+  from_ref: string;
+  to: string | null;
+  to_ref: string;
+  dangling: boolean;
+}
+
+export interface WikiGraphData {
+  nodes: WikiPageSummary[];
+  edges: WikiGraphEdge[];
+}
+
+/** Wiki 摄入 SSE 事件（事件名 "wiki"；另有 "sync" lagged 通知与 "ping" 保活）。 */
+export interface WikiEvent {
+  wiki_id: string;
+  doc_id: string;
+  status: WikiStatus;
+  page_count: number;
+  error?: string | null;
 }
 
 // === Agent Workbench ===

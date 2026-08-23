@@ -91,6 +91,21 @@ import {
   deleteRole,
   toggleRole,
   updateAgentSessionRole,
+  listWikis,
+  createWiki,
+  updateWiki,
+  deleteWiki,
+  listWikiDocs,
+  uploadWikiDoc,
+  deleteWikiDoc,
+  reindexWikiDoc,
+  listWikiPages,
+  getWikiPage,
+  putWikiPage,
+  deleteWikiPage,
+  searchWiki,
+  searchAllWikis,
+  getWikiGraph,
   type MemoryListParams,
   type SkillListParams,
 } from './client';
@@ -396,6 +411,7 @@ export function useUpdateDnsConfig() {
 
 import { statsStream } from './statsStream';
 import { memoryStream } from './memoryStream';
+import { wikiStream } from './wikiStream';
 import type { StatsSnapshot, StatsSummary } from '@/types';
 import { useEffect, useRef } from 'react';
 
@@ -997,19 +1013,20 @@ export function useUpdateSessionRole() {
   });
 }
 
-// ── Wiki（批 1 空壳） ──────────────────────────────────────────
+// ── Agent Wiki（批 4 完整） ───────────────────────────────────
 
+/** Wiki 容器列表查询参数（含 UI 过滤映射后的空值剔除）。queryKey `['agent-wikis', params]`。 */
 export function useWikis(params: import('./client').WikiListParams = {}) {
   return useQuery({
     queryKey: ['agent-wikis', params],
-    queryFn: () => import('./client').then((m) => m.listWikis(params)),
+    queryFn: () => listWikis(params),
   });
 }
 
 export function useCreateWiki() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (req: import('../types').CreateWikiRequest) => import('./client').then((m) => m.createWiki(req)),
+    mutationFn: (req: import('../types').CreateWikiRequest) => createWiki(req),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
   });
 }
@@ -1017,16 +1034,155 @@ export function useCreateWiki() {
 export function useUpdateWiki() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...req }: { id: string } & import('../types').UpdateWikiRequest) =>
-      import('./client').then((m) => m.updateWiki(id, req)),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
+    mutationFn: ({ id, ...req }: { id: string } & import('../types').UpdateWikiRequest) => updateWiki(id, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki', vars.id] });
+    },
   });
 }
 
 export function useDeleteWiki() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => import('./client').then((m) => m.deleteWiki(id)),
+    mutationFn: (id: string) => deleteWiki(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['agent-wikis'] }),
   });
+}
+
+/** Wiki 文档列表。queryKey `['agent-wiki-docs', wikiId]`。 */
+export function useWikiDocs(wikiId: string) {
+  return useQuery({
+    queryKey: ['agent-wiki-docs', wikiId],
+    queryFn: () => listWikiDocs(wikiId),
+    enabled: !!wikiId,
+  });
+}
+
+export function useUploadWikiDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ wikiId, file }: { wikiId: string; file: File }) => uploadWikiDoc(wikiId, file),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+    },
+  });
+}
+
+export function useDeleteWikiDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ wikiId, docId }: { wikiId: string; docId: string }) => deleteWikiDoc(wikiId, docId),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+    },
+  });
+}
+
+export function useReindexWikiDoc() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ wikiId, docId }: { wikiId: string; docId: string }) => reindexWikiDoc(wikiId, docId),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wiki-docs', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+    },
+  });
+}
+
+/** Wiki 页面列表（含过滤参数）。queryKey `['agent-wiki-pages', wikiId, params]`。 */
+export function useWikiPages(wikiId: string, params: import('../types').WikiPageListParams = {}) {
+  return useQuery({
+    queryKey: ['agent-wiki-pages', wikiId, params],
+    queryFn: () => listWikiPages(wikiId, params),
+    enabled: !!wikiId,
+  });
+}
+
+/** 页面全文。queryKey `['agent-wiki-page', wikiId, ref]`；ref 为 null 时禁用。 */
+export function useWikiPage(wikiId: string, ref: string | null) {
+  return useQuery({
+    queryKey: ['agent-wiki-page', wikiId, ref],
+    queryFn: () => getWikiPage(wikiId, ref!),
+    enabled: !!wikiId && !!ref,
+  });
+}
+
+export function usePutWikiPage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ wikiId, ref, req }: { wikiId: string; ref: string; req: import('../types').PutWikiPageRequest }) =>
+      putWikiPage(wikiId, ref, req),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wiki-pages', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-page', vars.wikiId, vars.req.ref ?? vars.ref] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-graph', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+    },
+  });
+}
+
+export function useDeleteWikiPage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ wikiId, ref }: { wikiId: string; ref: string }) => deleteWikiPage(wikiId, ref),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['agent-wiki-pages', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-page', vars.wikiId, vars.ref] });
+      qc.invalidateQueries({ queryKey: ['agent-wiki-graph', vars.wikiId] });
+      qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+    },
+  });
+}
+
+/** Wiki 图谱数据。queryKey `['agent-wiki-graph', wikiId]`。 */
+export function useWikiGraph(wikiId: string) {
+  return useQuery({
+    queryKey: ['agent-wiki-graph', wikiId],
+    queryFn: () => getWikiGraph(wikiId),
+    enabled: !!wikiId,
+  });
+}
+
+/** 单容器搜索（BM25+LIKE 回退）。q 为空时禁用。queryKey `['agent-wiki-search', wikiId, q]`。 */
+export function useWikiSearch(wikiId: string, q: string) {
+  return useQuery({
+    queryKey: ['agent-wiki-search', wikiId, q],
+    queryFn: () => searchWiki(wikiId, q),
+    enabled: !!wikiId && !!q,
+  });
+}
+
+/** 跨容器搜索（`/api/agent/wiki/search`）。q 为空时禁用。queryKey `['agent-wiki-search-all', q]`。 */
+export function useSearchAllWikis(q: string) {
+  return useQuery({
+    queryKey: ['agent-wiki-search-all', q],
+    queryFn: () => searchAllWikis(q),
+    enabled: !!q,
+  });
+}
+
+/** 订阅 Wiki 摄入 SSE：doc 状态事件到达即失效文档列表 + 容器 + 图谱。
+ *  事件不带逐条文档详情，无 KbDetail 的 override 通道（状态实时性靠文档列表 refetch）。
+ *  返回订阅函数供 WikiDetail 做 override 细化（仿 useMemoryStream 前置用法）。 */
+export function useWikiStream() {
+  const qc = useQueryClient();
+  useEffect(() => {
+    const unsub = wikiStream.subscribe({
+      onWiki: () => {
+        qc.invalidateQueries({ queryKey: ['agent-wiki-docs'] });
+        qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+        qc.invalidateQueries({ queryKey: ['agent-wiki-graph'] });
+      },
+      onSync: () => {
+        // Lagged：广播槽溢出丢事件，强制重拉列表以获得完整状态
+        qc.invalidateQueries({ queryKey: ['agent-wiki-docs'] });
+        qc.invalidateQueries({ queryKey: ['agent-wikis'] });
+        qc.invalidateQueries({ queryKey: ['agent-wiki-graph'] });
+      },
+    });
+    return unsub;
+  }, [qc]);
 }

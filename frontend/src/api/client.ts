@@ -814,7 +814,7 @@ export async function toggleSkill(id: string): Promise<AgentSkill> {
   return data;
 }
 
-// ── Wiki（批 1 空壳） ──────────────────────────────────────────
+// ── Wiki（批 4 完整） ──────────────────────────────────────────
 
 export interface WikiListParams {
   scope?: string;
@@ -856,6 +856,84 @@ export async function updateWiki(id: string, req: import('../types').UpdateWikiR
 
 export async function deleteWiki(id: string): Promise<void> {
   await api.delete(`/agent/wiki/${encodeURIComponent(id)}`);
+}
+
+// ── Wiki 文档 ──────────────────────────────────────────────────
+
+export async function listWikiDocs(wikiId: string): Promise<import('../types').WikiDocsResponse> {
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/docs`);
+  return { documents: data.documents ?? [] };
+}
+
+export async function uploadWikiDoc(wikiId: string, file: File): Promise<import('../types').WikiDocument> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const { data } = await api.post(`/agent/wiki/${encodeURIComponent(wikiId)}/docs`, formData);
+  return data;
+}
+
+export async function deleteWikiDoc(wikiId: string, docId: string): Promise<void> {
+  await api.delete(`/agent/wiki/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}`);
+}
+
+export async function reindexWikiDoc(wikiId: string, docId: string): Promise<{ status: string; id: string }> {
+  const { data } = await api.post(`/agent/wiki/${encodeURIComponent(wikiId)}/docs/${encodeURIComponent(docId)}/reindex`);
+  return data;
+}
+
+// ── Wiki 页面（ref 含 `/`，整段 encodeURIComponent 交给后端 wildcard 路由） ──
+
+export async function listWikiPages(
+  wikiId: string,
+  params: import('../types').WikiPageListParams = {},
+): Promise<import('../types').WikiPagesResponse> {
+  const clean: Record<string, string | number | boolean> = {};
+  if (params.q) clean.q = params.q;
+  if (params.ref_prefix) clean.ref_prefix = params.ref_prefix;
+  if (params.locked !== undefined) clean.locked = params.locked ? 'true' : 'false';
+  if (params.limit !== undefined) clean.limit = params.limit;
+  if (params.offset !== undefined) clean.offset = params.offset;
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/pages`, { params: clean });
+  return { pages: data.pages ?? [], total: data.total ?? 0 };
+}
+
+export async function getWikiPage(wikiId: string, ref: string): Promise<import('../types').WikiPage> {
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
+  return data;
+}
+
+export async function putWikiPage(
+  wikiId: string,
+  ref: string,
+  req: import('../types').PutWikiPageRequest,
+): Promise<import('../types').WikiPage> {
+  const { data } = await api.put(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`, req);
+  return data;
+}
+
+export async function deleteWikiPage(wikiId: string, ref: string): Promise<void> {
+  await api.delete(`/agent/wiki/${encodeURIComponent(wikiId)}/pages/${encodeURIComponent(ref)}`);
+}
+
+// ── Wiki 搜索 / 图谱 ───────────────────────────────────────────
+
+export async function searchWiki(
+  wikiId: string,
+  q: string,
+  limit = 20,
+): Promise<import('../types').WikiSearchResponse> {
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/search`, { params: { q, limit } });
+  return { hits: data.hits ?? [] };
+}
+
+export async function searchAllWikis(q: string, limit = 20): Promise<import('../types').WikiSearchResponse> {
+  const { data } = await api.get('/agent/wiki/search', { params: { q, limit } });
+  return { hits: data.hits ?? [] };
+}
+
+export async function getWikiGraph(wikiId: string): Promise<import('../types').WikiGraphData> {
+  const { data } = await api.get(`/agent/wiki/${encodeURIComponent(wikiId)}/graph`);
+  return { nodes: data.nodes ?? [], edges: data.edges ?? [] };
 }
 
 // ── Agent Role（多角色子代理系统） ────────────────────────────────

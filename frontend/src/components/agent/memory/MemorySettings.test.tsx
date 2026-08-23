@@ -33,6 +33,8 @@ const settingsFixture: AgentMemorySettings = {
   pin_always_inject: true,
   skill_enabled: false,
   skill_list_max: 20,
+  wiki_enabled: true,
+  wiki_list_max: 20,
   has_key: true,
   created_at: '',
   updated_at: '',
