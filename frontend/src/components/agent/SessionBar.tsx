@@ -112,8 +112,14 @@ export default function SessionBar({ workspaceId, sessionId, onSelect, onSession
     }
   };
 
+  // 根容器：缺省图标触发器 shrink-0 即可；自定义触发器（移动端会话标题）必须
+  // min-w-0 可收缩——否则 shrink-0 让整个触发器按标题 max-content 宽度撑开，顶穿
+  // flex-1 容器延到右缘伸进 fixed 悬浮的 MobileMenuFab 区域，内部标题 truncate
+  // 也因父级不受约束而失效（flex truncate 被 shrink-0 破坏陷阱）。
   return (
-    <div className="flex shrink-0 items-center gap-2">
+    <div className={triggerContent !== undefined
+      ? 'flex min-w-0 flex-1 items-center gap-2'
+      : 'flex shrink-0 items-center gap-2'}>
       {error && (
         <span className="text-xs text-destructive" role="alert" aria-live="polite">
           {error}
