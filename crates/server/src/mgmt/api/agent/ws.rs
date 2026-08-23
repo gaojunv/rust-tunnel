@@ -1094,6 +1094,20 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         .unwrap_or_default();
                         bridge.set_skill_list_block(&session_id, Some(block)).await;
                     }
+                    // Wiki 清单注入（ACP）：同 skill 模式缓存到 SpawnedAgent，纯 SQL
+                    // （FTS5）零 embedding 依赖。prompt_inner 与前两块一并 prepend。
+                    if let Some(wiki) = agent.wiki.as_ref() {
+                        if bridge.cached_wiki_list_block(&session_id).await.is_none() {
+                            let block = crate::agent::wiki::retrieve_wiki_list_for_session(
+                                wiki,
+                                &acp_workspace.client_id,
+                                &acp_workspace.id,
+                            )
+                            .await
+                            .unwrap_or_default();
+                            bridge.set_wiki_list_block(&session_id, Some(block)).await;
+                        }
+                    }
                 }
                 // 持久化 user 消息（与 runner 路径同款）：落的是注入后的 content，
                 // DB 中就是一条完整的 user 消息，前端刷新后对话不丢。排队消息同样

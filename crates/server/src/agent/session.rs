@@ -166,6 +166,9 @@ pub struct SessionRuntime {
     /// 未开启）；Some(非空) = 已注入 `<skills>` 块到 `messages[0]`。与 memory_block
     /// 同模式：每会话只检索一次（纯 SQL，零 embedding 依赖）。
     pub skill_list_block: Option<String>,
+    /// Wiki 清单注入缓存：None = 尚未检索；Some("") = 无可见 wiki（或 wiki 总闸关闭）；
+    /// Some(非空) = 已注入 `<wikis>` 块到 `messages[0]`。与 skill_list_block 同模式。
+    pub wiki_list_block: Option<String>,
     /// 可用子代理角色清单块缓存：None = 尚未检索；Some("") = 无可用角色；
     /// Some(非空) = 已注入 `roles_block` 到 task 工具 description。
     pub roles_block: Option<String>,
@@ -310,6 +313,7 @@ impl SessionRuntime {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             todos: vec![],
             messages,
@@ -321,7 +325,7 @@ impl SessionRuntime {
     }
 
     /// 构造子 agent 运行时：复制父会话关键字段，messages 只含 system + user(prompt)，
-    /// 不注入 AGENTS.md / memory / skill（子循环独立上下文）。
+    /// 不注入 AGENTS.md / memory / skill / wiki（子循环独立上下文）。
     /// `model_override`：角色有自定义模型时传入，覆盖父 model。
     pub fn subagent(
         parent: &SessionRuntime,
@@ -349,6 +353,7 @@ impl SessionRuntime {
             agents_md: Some(String::new()),
             memory_block: Some(String::new()),
             skill_list_block: Some(String::new()),
+            wiki_list_block: Some(String::new()),
             roles_block: Some(String::new()),
             messages: vec![
                 ChatMessage::text("system", system_prompt),

@@ -559,12 +559,13 @@ pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
     truncate_chars(&out, DISTILL_MAX_CHARS)
 }
 
-/// 剥离 `<memory>...</memory>`、`<skills>...</skills>` 块与 inject_refs 的
-/// `--- 引用文件:` 包装块（防蒸馏回环：已注入的记忆/技能清单/引用内容不当对话
-/// 上下文再蒸馏）。
+/// 剥离 `<memory>...</memory>`、`<skills>...</skills>`、`<wikis>...</wikis>` 块与
+/// inject_refs 的 `--- 引用文件:` 包装块（防蒸馏回环：已注入的记忆/技能/wiki 清单
+/// 不当对话上下文再蒸馏）。
 fn sanitize_distill_content(text: &str) -> String {
     let text = strip_block(text, "<memory>", "</memory>");
     let text = strip_block(&text, "<skills>", "</skills>");
+    let text = strip_block(&text, "<wikis>", "</wikis>");
     strip_refs_wrapper(&text)
 }
 
@@ -855,6 +856,20 @@ mod tests {
         assert!(out.contains("好的"));
         assert!(!out.contains("<skills>"));
         assert!(!out.contains("skill-a"));
+        assert!(out.contains("继续"));
+    }
+
+    #[test]
+    fn render_strips_wikis_block() {
+        let msgs = vec![msg(
+            "assistant",
+            "好的\n<wikis>\n- wiki-a: 摘要 (3 页)\n</wikis>\n继续",
+            "message",
+        )];
+        let out = render_distill_text(&msgs);
+        assert!(out.contains("好的"));
+        assert!(!out.contains("<wikis>"));
+        assert!(!out.contains("wiki-a"));
         assert!(out.contains("继续"));
     }
 

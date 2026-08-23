@@ -157,6 +157,7 @@ impl AcpBridge {
                     cancel_notify: Arc::new(tokio::sync::Notify::new()),
                     memory_block: None,
                     skill_list_block: None,
+                    wiki_list_block: None,
                     mcp_token: mcp_token.clone(),
                     file_hashes: HashMap::new(),
                 },
@@ -1124,7 +1125,7 @@ impl AcpBridge {
         content: &str,
         drain: bool,
     ) -> Result<(), String> {
-        let (connection, acp_session_id, turn_gen, memory_block, skill_list_block) = {
+        let (connection, acp_session_id, turn_gen, memory_block, skill_list_block, wiki_list_block) = {
             let mut sessions = self.sessions.lock().await;
             let agent = sessions
                 .get_mut(session_id)
@@ -1156,23 +1157,27 @@ impl AcpBridge {
             let turn_gen = agent.turn_generation;
             let memory_block = agent.memory_block.clone().unwrap_or_default();
             let skill_list_block = agent.skill_list_block.clone().unwrap_or_default();
-            (connection, acp_session_id, turn_gen, memory_block, skill_list_block)
+            let wiki_list_block = agent.wiki_list_block.clone().unwrap_or_default();
+            (connection, acp_session_id, turn_gen, memory_block, skill_list_block, wiki_list_block)
         };
 
         let bridge = self.clone();
         let sessions = self.sessions.clone();
         let db = self.db.clone();
         let sid = session_id.to_string();
-        // 上下文注入：`<memory>` 记忆块 + `<skills>` 技能清单**合并一次** prepend
-        // 到发给 agent 的 user content 头部。只进 agent 侧上下文，不落 DB（持久化/
-        // 蒸馏保持干净，无回环）。
+        // 上下文注入：`<memory>` / `<skills>` / `<wikis>` **合并一次** prepend 到发给
+        // agent 的 user content 头部。只进 agent 侧上下文，不落 DB（持久化/蒸馏保持
+        // 干净，无回环）。
         let final_content = {
-            let mut parts: Vec<String> = Vec::with_capacity(2);
+            let mut parts: Vec<String> = Vec::with_capacity(3);
             if !memory_block.is_empty() {
                 parts.push(memory_block);
             }
             if !skill_list_block.is_empty() {
                 parts.push(skill_list_block);
+            }
+            if !wiki_list_block.is_empty() {
+                parts.push(wiki_list_block);
             }
             if parts.is_empty() {
                 content.to_string()

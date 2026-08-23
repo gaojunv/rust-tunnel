@@ -207,6 +207,10 @@ struct SpawnedAgent {
     /// 一并 prepend；distill 渲染也会剥离 `<skills>` 块，无回环。纯 SQL 检索，
     /// 零 embedding 依赖。
     skill_list_block: Option<String>,
+    /// Wiki 清单注入缓存（同 skill_list_block 模式）：None = 尚未检索；Some("") =
+    /// 无可见 wiki；Some(非空) = 已注入 `<wikis>` 块。`prompt_inner` 与前两块一并
+    /// prepend；distill 渲染也会剥离 `<wikis>` 块，无回环。
+    wiki_list_block: Option<String>,
     /// 本会话 MCP 端点访问令牌（`/mcp/<token>` 路径）。ensure_session 铸造；
     /// 条目移除（kill/重拉/reaper）即吊销。仅 rag + memory 注入时 Some。
     /// 读取只在 rag 门控的 `/mcp/` 隧道（`handle_mcp_tunnel`）里；字段保持不
@@ -403,6 +407,23 @@ impl AcpBridge {
             a.skill_list_block = block;
         }
     }
+
+    /// 读会话的 Wiki 清单注入缓存（同 skill）。WS handler 首条消息检索后写入；
+    /// `prompt_inner` 与前两块一并 prepend。
+    pub async fn cached_wiki_list_block(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|a| a.wiki_list_block.clone())
+    }
+
+    /// 写会话的 Wiki 清单注入缓存。语义与 [`Self::set_skill_list_block`] 一致。
+    pub async fn set_wiki_list_block(&self, session_id: &str, block: Option<String>) {
+        if let Some(a) = self.sessions.lock().await.get_mut(session_id) {
+            a.wiki_list_block = block;
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -449,6 +470,7 @@ mod tests {
         SpawnedAgent {
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             mcp_token: None,
             acp_session_id: None,
             connection: None,

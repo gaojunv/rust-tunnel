@@ -456,13 +456,58 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
                 }
             }
         }));
+        // Wiki 检索工具：先 wiki_search 找 ref，再 wiki_read 取全文。服务端本地
+        // 短路（同 remember/use_skill），只读、plan 模式放行。会话开始已注入
+        // <wikis> 清单（name + summary + 页数）。
+        tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "wiki_search",
+                "description": "Search wiki knowledge-base pages by keyword (BM25 + fallback matching) across all visible wikis, or within one wiki if 'wiki' is given. Returns refs with title/summary/snippet — call wiki_read with a ref to load the full page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search keywords (any language; short 1-2 char terms use substring match)"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Max results to return (default 5)"},
+                        "wiki": {"type": "string", "description": "Optional wiki name from the <wikis> list to search only that wiki"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }));
+        tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "wiki_read",
+                "description": "Load the full content of one or more wiki pages by ref. Use wiki_search first to find the right refs, then call this to read the complete pages.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "wiki": {"type": "string", "description": "The wiki name exactly as listed in the <wikis> list"},
+                        "refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 10,
+                            "description": "Page refs to read (from wiki_search results), 1-10 items"
+                        }
+                    },
+                    "required": ["wiki", "refs"]
+                }
+            }
+        }));
     }
 
     // Plan 模式：裁剪为只读子集 + todo_write（辅助出方案），写类工具不暴露给模型。
+    // wiki_search/wiki_read 是纯只读的知识检索，plan 模式放行。
     if mode == "plan" {
         tools.retain(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
-            PLAN_MODE_TOOLS.contains(&name) || name == "todo_write" || name == "task"
+            PLAN_MODE_TOOLS.contains(&name)
+                || name == "todo_write"
+                || name == "task"
+                || name == "wiki_search"
+                || name == "wiki_read"
         });
     }
 

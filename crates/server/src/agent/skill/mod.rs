@@ -250,6 +250,7 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: Vec::new(),
             todos: Vec::new(),

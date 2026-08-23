@@ -1007,6 +1007,57 @@ impl Database {
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
+
+    /// 可见 wiki 完整记录（清单注入用）：scope 过滤 + page_count DESC + limit。
+    /// 与 [`Self::wiki_visible_ids`] 同一可见性语义，返回整行（name/summary/
+    /// page_count 供 `<wikis>` 清单渲染）。
+    pub async fn wiki_visible_wikis(
+        &self,
+        client_id: &str,
+        workspace_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWikiRecord>, sqlx::Error> {
+        sqlx::query_as::<_, AgentWikiRecord>(
+            "SELECT * FROM agent_wikis WHERE scope_type = 'global' \
+             OR (scope_type = 'client' AND client_id = ?) \
+             OR (scope_type = 'workspace' AND client_id = ? AND workspace_id = ?) \
+             ORDER BY page_count DESC LIMIT ?",
+        )
+        .bind(client_id)
+        .bind(client_id)
+        .bind(workspace_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// 大小写不敏感的同作用域容器名查找（agent 工具寻址用）。SQLite LIKE 对
+    /// ASCII 不区分大小写，中文不受影响；`name` 必须已由调用方 normalize。
+    pub async fn wiki_get_by_name_scope_ci(
+        &self,
+        name_lower: &str,
+        scope_type: &str,
+        client_id: &str,
+        workspace_id: &str,
+    ) -> Result<Option<AgentWikiRecord>, sqlx::Error> {
+        // 精确命中优先（绝大多数场景 name 本就小写），再回退大小写不敏感匹配。
+        if let Some(row) = self
+            .wiki_get_by_name_scope(name_lower, scope_type, client_id, workspace_id)
+            .await?
+        {
+            return Ok(Some(row));
+        }
+        sqlx::query_as::<_, AgentWikiRecord>(
+            "SELECT * FROM agent_wikis WHERE lower(name) = lower(?1) \
+             AND scope_type = ?2 AND client_id = ?3 AND workspace_id = ?4",
+        )
+        .bind(name_lower)
+        .bind(scope_type)
+        .bind(client_id)
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

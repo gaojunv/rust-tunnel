@@ -865,6 +865,69 @@ async fn handle_single_tool_call(
         return Ok(());
     }
 
+    // wiki_search 工具短路：服务端本地检索（同 use_skill，不进 AgentCommand、
+    // 不落审批）。WikiState 未注入（非 rag / 启动未初始化）→ 错误文本喂回模型。
+    #[cfg(feature = "rag")]
+    if call.name == "wiki_search" {
+        let text = match agent.wiki.as_ref() {
+            Some(wiki) => {
+                match crate::agent::wiki::wiki_search_from_agent(
+                    wiki,
+                    &rt.client_id,
+                    &rt.workspace_id,
+                    &call.args,
+                )
+                .await
+                {
+                    Ok(msg) => msg,
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            None => "error: wiki is not available".to_string(),
+        };
+        let mut result_frame = serde_json::json!({
+            "type": "tool_result",
+            "id": &call.id,
+            "name": &call.name,
+            "result": &text,
+        });
+        with_parent(&mut result_frame, rt);
+        let _ = ws_tx.send(result_frame).await;
+        record_tool_result(agent, rt, &call.id, &call.name, text, persist).await;
+        return Ok(());
+    }
+
+    // wiki_read 工具短路：批量取页面全文，命中 bump_use。
+    #[cfg(feature = "rag")]
+    if call.name == "wiki_read" {
+        let text = match agent.wiki.as_ref() {
+            Some(wiki) => {
+                match crate::agent::wiki::wiki_read_from_agent(
+                    wiki,
+                    &rt.client_id,
+                    &rt.workspace_id,
+                    &call.args,
+                )
+                .await
+                {
+                    Ok(msg) => msg,
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            None => "error: wiki is not available".to_string(),
+        };
+        let mut result_frame = serde_json::json!({
+            "type": "tool_result",
+            "id": &call.id,
+            "name": &call.name,
+            "result": &text,
+        });
+        with_parent(&mut result_frame, rt);
+        let _ = ws_tx.send(result_frame).await;
+        record_tool_result(agent, rt, &call.id, &call.name, text, persist).await;
+        return Ok(());
+    }
+
     // todo_write 工具短路：全量替换任务清单，发送 todo_update 帧，不进 AgentCommand 协议
     if call.name == "todo_write" {
         let text = match tools::parse_todo_write(&call.args) {
@@ -1086,6 +1149,7 @@ fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
         agents_md: rt.agents_md.clone(),
         memory_block: rt.memory_block.clone(),
         skill_list_block: rt.skill_list_block.clone(),
+        wiki_list_block: rt.wiki_list_block.clone(),
         roles_block: rt.roles_block.clone(),
         messages: rt.messages.clone(),
         depth: rt.depth,
@@ -1848,6 +1912,30 @@ pub async fn run_agent_turn(
             None
         };
         rt.skill_list_block = match block {
+            Some(b) if !b.is_empty() => {
+                let base = rt.messages[0].content.as_deref().unwrap_or_default();
+                rt.messages[0] = ChatMessage::text("system", format!("{base}\n\n---\n\n{b}"));
+                Some(b)
+            }
+            _ => Some(String::new()),
+        };
+    }
+
+    // Wiki 清单注入：skill 之后、首回合前，每会话检索一次并缓存（rt.wiki_list_block）。
+    // 纯 SQL（FTS5）零 embedding 依赖，wiki_enabled 关闭或无可见容器返回 None。
+    #[cfg(feature = "rag")]
+    if rt.wiki_list_block.is_none() {
+        let block = if let Some(wiki) = agent.wiki.as_ref() {
+            crate::agent::wiki::retrieve_wiki_list_for_session(
+                wiki,
+                &rt.client_id,
+                &rt.workspace_id,
+            )
+            .await
+        } else {
+            None
+        };
+        rt.wiki_list_block = match block {
             Some(b) if !b.is_empty() => {
                 let base = rt.messages[0].content.as_deref().unwrap_or_default();
                 rt.messages[0] = ChatMessage::text("system", format!("{base}\n\n---\n\n{b}"));
@@ -2842,6 +2930,7 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: vec![],
             depth: 0,
@@ -2872,6 +2961,7 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: vec![],
             depth: 0,
@@ -2898,6 +2988,7 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: vec![],
             depth: 1,
@@ -2946,6 +3037,7 @@ mod tests {
             agents_md: None,
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: vec![],
             depth: 1,
@@ -2993,6 +3085,7 @@ mod tests {
             agents_md: Some("agents".into()),
             memory_block: None,
             skill_list_block: None,
+            wiki_list_block: None,
             roles_block: None,
             messages: vec![ChatMessage::text("user", "hello")],
             depth: 1,
