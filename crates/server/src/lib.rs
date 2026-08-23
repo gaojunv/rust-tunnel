@@ -2,6 +2,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod pki;
+// 测试辅助设施（仅 cfg(test) 编译）
+#[cfg(test)]
+pub mod test_helpers;
 pub use mgmt::api;
 pub use pki::acme;
 pub mod agent;
