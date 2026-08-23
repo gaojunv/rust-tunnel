@@ -1,3 +1,4 @@
+import { memo, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { Plus, X } from 'lucide-react';
@@ -23,7 +24,7 @@ interface Props {
 /** 浏览器标签页式多会话栏：横向滚动，激活态高亮，× 关闭（会话数据保留），尾端 + 新建。
  *  移动端（<768px）太挤，不铺开多标签——只显示当前会话标题，点击标题打开 SessionBar
  *  同一会话下拉（切换/新建/改名/删除都在里面），替代独立 session 图标按钮与 + 号。 */
-export default function SessionTabBar({ workspaceId, open, active, onSelect, onClose, onNew, onSessionDeleted }: Props) {
+function SessionTabBar({ workspaceId, open, active, onSelect, onClose, onNew, onSessionDeleted }: Props) {
   const { t } = useTranslation();
   // 与 SessionBar 共享 queryKey：标题（session_title/done 后 invalidate）自动回显
   const { data: sessions } = useQuery({
@@ -33,7 +34,7 @@ export default function SessionTabBar({ workspaceId, open, active, onSelect, onC
   });
   // jsdom/SSR 无 matchMedia 时 useMediaQuery 返回 false → 走移动端单标题分支
   const isDesktop = useMediaQuery('(min-width: 768px)');
-  const byId = new Map((sessions ?? []).map((s) => [s.id, s]));
+  const byId = useMemo(() => new Map((sessions ?? []).map((s) => [s.id, s])), [sessions]);
   const limitReached = open.length >= MAX_TABS;
 
   const newButton = (
@@ -124,3 +125,5 @@ export default function SessionTabBar({ workspaceId, open, active, onSelect, onC
     </div>
   );
 }
+
+export default memo(SessionTabBar);

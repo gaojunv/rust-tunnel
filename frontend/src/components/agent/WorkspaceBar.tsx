@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, FolderOpen, Loader2, Plus, Settings, Trash2 } from 'lucide-react';
@@ -33,7 +33,7 @@ interface Props {
  *  工作区列表（含 client_id 小字）、编辑/删除操作项（分隔线以下）+ Dialog 确认删除
  *  （替代原 inline 两段确认——确认态文本+双按钮挤在顶栏一行，会撑破布局；对话框也
  *  避免误触）。顶栏仅保留 Sparkles logo + 触发器图标。 */
-export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: Props) {
+function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: Props) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -170,3 +170,5 @@ export default function WorkspaceBar({ workspaceId, onSelect, onNew, onEdit }: P
     </div>
   );
 }
+
+export default memo(WorkspaceBar);
