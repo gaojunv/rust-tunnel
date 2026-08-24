@@ -13,7 +13,7 @@ use common::wait_until;
 use reqwest::StatusCode;
 use rust_tunnel_server::auth::AuthConfig;
 use rust_tunnel_server::dynamic_config::DynamicConfig;
-use rust_tunnel_server::{api, control, Database, ServerConfig};
+use rust_tunnel_server::{api, control_plane as control, Database, ServerConfig};
 use std::net::TcpListener as StdTcpListener;
 use std::time::Duration;
 use tempfile::TempDir;

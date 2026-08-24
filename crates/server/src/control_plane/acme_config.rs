@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::Database;
-use crate::ServerConfig;
+use crate::config::ServerConfig;
 
 /// ACME configuration summary for API responses
 #[derive(Debug, Clone)]
@@ -153,7 +153,7 @@ impl AcmeFullConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerConfig;
+    use crate::config::ServerConfig;
     use crate::test_helpers::in_memory_db;
 
     #[tokio::test]

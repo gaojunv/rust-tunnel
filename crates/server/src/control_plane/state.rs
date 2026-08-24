@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::client_registry::ClientRegistry;
+use crate::control_plane::client_registry::ClientRegistry;
 use crate::db::Database;
 use crate::dns::registry::DnsRegistry;
 use crate::dynamic_config::DynamicConfig;
@@ -437,8 +437,8 @@ impl rust_tunnel_protocols::PortRegistry for ServerState {
         let ports = self.ports.lock().await;
         let p = ports.get(&port)?.clone();
         Some(match p {
-            crate::control::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at } => rust_tunnel_protocols::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at },
-            crate::control::PortInfo::Trojan { port, password, fallback, enabled, created_at } => rust_tunnel_protocols::PortInfo::Trojan { port, password, fallback, enabled, created_at },
+            crate::control_plane::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at } => rust_tunnel_protocols::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at },
+            crate::control_plane::PortInfo::Trojan { port, password, fallback, enabled, created_at } => rust_tunnel_protocols::PortInfo::Trojan { port, password, fallback, enabled, created_at },
         })
     }
     async fn unregister_port(&self, port: u16) -> bool { ServerState::unregister_port(self, port).await }

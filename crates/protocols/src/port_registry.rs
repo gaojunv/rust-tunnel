@@ -92,6 +92,8 @@ pub trait PortRegistry: Send + Sync + Debug {
 
 
 /// 内存版 PortRegistry，用于 protocols crate 内测试与 TrojanSniEntry 占位。
+/// （非 test 构建下未被构造属预期——供本 crate 测试及外部 crate 测试复用）
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct MockPortRegistry {
     ports: std::sync::Mutex<std::collections::HashMap<u16, PortInfo>>,
@@ -99,6 +101,7 @@ pub struct MockPortRegistry {
     trojan_conns: std::sync::Mutex<std::collections::HashMap<u16, usize>>,
 }
 
+#[allow(dead_code)]
 impl MockPortRegistry {
     pub fn new() -> Self { Self::default() }
 }

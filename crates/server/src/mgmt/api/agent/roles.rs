@@ -591,7 +591,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
 
     /// 构造 ApiState（内存 DB + agent_state）。

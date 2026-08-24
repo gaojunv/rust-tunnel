@@ -805,7 +805,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
 
     async fn test_api_state(rag_dir: &std::path::Path) -> ApiState {

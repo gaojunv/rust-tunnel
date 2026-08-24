@@ -5,7 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::client_registry::ClientRegistry;
+use crate::control_plane::client_registry::ClientRegistry;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientView {
@@ -157,7 +157,7 @@ pub async fn kick_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_registry::ClientRegistry;
+    use crate::control_plane::client_registry::ClientRegistry;
     use crate::db::Database;
     use tokio::sync::mpsc;
 

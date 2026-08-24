@@ -481,7 +481,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
 
     /// 构造 ApiState（照抄 memory.rs 测试：内存 DB + RAG 目录 + 固定测试主密钥 +

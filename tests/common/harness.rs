@@ -7,7 +7,7 @@ use rust_tunnel_server::auth::AuthConfig;
 use rust_tunnel_server::reverse_proxy::{
     tcp_proxy::TcpProxy, Backend, BackendKind, BackendProtocol, BackendScheme, ReverseProxyState,
 };
-use rust_tunnel_server::{api, control, Database, ServerConfig};
+use rust_tunnel_server::{api, control_plane as control, Database, ServerConfig};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;

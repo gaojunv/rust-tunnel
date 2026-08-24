@@ -35,7 +35,7 @@ pub mod trojan;
 pub use dto::*;
 
 use crate::auth::{auth_middleware, AuthConfig};
-use crate::control::ServerState;
+use crate::control_plane::ServerState;
 
 #[cfg(test)]
 mod tests {

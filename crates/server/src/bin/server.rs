@@ -4,7 +4,7 @@ use rust_tunnel_common::{
 };
 use rust_tunnel_server::acme::CertificateProvider;
 use rust_tunnel_server::logs::LogLayer;
-use rust_tunnel_server::{api, auth, control, listener, Database, ServerConfig};
+use rust_tunnel_server::{api, auth, control_plane, listener, Database, ServerConfig};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -110,7 +110,7 @@ async fn main() -> TunnelResult<()> {
     let db = Database::new(&config.db_path).await?;
 
     // Create shared state with database
-    let mut state = control::ServerState::with_db(db.clone());
+    let mut state = control_plane::ServerState::with_db(db.clone());
 
     // Wire up ClientConnector to ReverseProxyState so client-kind backends work
     state.wire_up_client_connector().await;
@@ -171,7 +171,7 @@ async fn main() -> TunnelResult<()> {
     // Resolve effective ACME config: DB is the runtime source of truth;
     // CLI/TOML values seed a fresh install and are ignored thereafter.
     // See docs/superpowers/specs/2026-07-16-acme-config-db-source-of-truth-design.md
-    let effective_acme_config = control::AcmeFullConfig::load_or_seed(&db, &config).await;
+    let effective_acme_config = control_plane::AcmeFullConfig::load_or_seed(&db, &config).await;
     tracing::info!(
         "ACME config resolved: enabled={}, server={}, cert_dir={}",
         effective_acme_config.enabled,
@@ -236,7 +236,7 @@ async fn main() -> TunnelResult<()> {
             tracing::warn!("Failed to initialize ACME client: {}", e);
         }
 
-        let acme_config = control::AcmeConfigInfo {
+        let acme_config = control_plane::AcmeConfigInfo {
             enabled: true,
             server_url: effective_acme_config.server_url.clone(),
             cert_dir: effective_acme_config.cert_dir.clone(),
@@ -566,7 +566,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
 
     // Spawn control server
     tokio::spawn(async move {
-        if let Err(e) = control::run_server(control_config, control_state, control_tls_rx).await {
+        if let Err(e) = control_plane::run_server(control_config, control_state, control_tls_rx).await {
             tracing::error!("Control server error: {}", e);
         }
     });

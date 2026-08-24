@@ -210,7 +210,7 @@ impl ClientRegistry {
         &self,
         client_name: &str,
         target_addr: &str,
-    ) -> std::io::Result<crate::tunnel_stream::ClientTunnelStream> {
+    ) -> std::io::Result<crate::control_plane::tunnel_stream::ClientTunnelStream> {
         use std::io::{Error, ErrorKind};
         use std::time::Duration;
 
@@ -277,7 +277,7 @@ impl ClientRegistry {
 
         match outcome {
             TunnelOpenOutcome::Ok => {
-                let stream = crate::tunnel_stream::ClientTunnelStream::new(
+                let stream = crate::control_plane::tunnel_stream::ClientTunnelStream::new(
                     cid,
                     entry.control_sender.clone(),
                     inbound_rx,

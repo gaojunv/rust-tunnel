@@ -468,7 +468,7 @@ pub async fn cancel_run(
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
     use axum::routing::get;
     use std::sync::Arc;

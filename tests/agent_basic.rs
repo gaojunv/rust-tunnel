@@ -18,7 +18,7 @@ mod common;
 use common::{HarnessOpts, TestHarness};
 use rust_tunnel_common::{AgentCommand, AgentResult};
 use rust_tunnel_server::agent::session::SessionRuntime;
-use rust_tunnel_server::client_registry::ClientRegistry;
+use rust_tunnel_server::control_plane::client_registry::ClientRegistry;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -366,7 +366,7 @@ mod tests {
 
     fn make_state() -> ApiState {
         ApiState {
-            server_state: crate::control::ServerState::new(),
+            server_state: crate::control_plane::ServerState::new(),
             auth_config: Arc::new(AuthConfig::new(None, None)),
             log_store: None,
         }
@@ -381,7 +381,7 @@ mod tests {
     async fn test_put_llm_logging_toggles_and_persists() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
         let state = ApiState {
-            server_state: crate::control::ServerState::with_db(db),
+            server_state: crate::control_plane::ServerState::with_db(db),
             auth_config: Arc::new(AuthConfig::new(None, None)),
             log_store: None,
         };
@@ -435,7 +435,7 @@ mod tests {
     async fn test_llm_logging_round_trip_survives_restart() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
         let state = ApiState {
-            server_state: crate::control::ServerState::with_db(db.clone()),
+            server_state: crate::control_plane::ServerState::with_db(db.clone()),
             auth_config: Arc::new(AuthConfig::new(None, None)),
             log_store: None,
         };
@@ -478,7 +478,7 @@ mod tests {
 
         // 重启后的新 ServerState 应用该配置后，GET 也应返回 false
         let restarted = ApiState {
-            server_state: crate::control::ServerState::with_db(db.clone()),
+            server_state: crate::control_plane::ServerState::with_db(db.clone()),
             auth_config: Arc::new(AuthConfig::new(None, None)),
             log_store: None,
         };

@@ -351,7 +351,7 @@ pub async fn update_acme_config(
                 tracing::info!("ACME client initialized successfully");
             }
 
-            let acme_config_info = crate::control::AcmeConfigInfo {
+            let acme_config_info = crate::control_plane::AcmeConfigInfo {
                 enabled: acme_enabled,
                 server_url: acme_server_url,
                 cert_dir: acme_cert_dir,
@@ -450,7 +450,7 @@ pub async fn delete_acme_certificate(
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
     use axum::extract::State;
     use axum::Json;

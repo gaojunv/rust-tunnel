@@ -1465,7 +1465,7 @@ async fn send_cancel_to_client(
 mod tests {
     use super::*;
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
     use std::sync::Arc;
 

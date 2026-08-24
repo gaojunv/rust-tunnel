@@ -11,9 +11,6 @@ pub use pki::acme;
 pub use rust_tunnel_agent as agent;
 pub mod config;
 pub mod control_plane;
-pub use control_plane as control;
-pub use control_plane::client_registry;
-pub use control_plane::tunnel_stream;
 // 持久化层已拆分为独立 crate；`db` 路径保持兼容 re-export
 pub use rust_tunnel_persistence as db;
 // LLM 网关已拆分为独立 crate；`llm` 路径保持兼容 re-export
@@ -34,7 +31,8 @@ pub use protocols::trojan;
 // trojan_runtime 已移回 server 侧（不属于 protocols 关注点）
 pub mod trojan_runtime;
 
-pub use config::*;
+// 受控 re-export（替代 config::* 扁平化）：仅装配层与外部调用方需要的根符号
+pub use config::ServerConfig;
 pub use db::Database;
 pub use net::dns::registry::DnsRegistry;
 pub use net::dns::DnsServer;

@@ -1191,7 +1191,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::auth::AuthConfig;
-    use crate::control::ServerState;
+    use crate::control_plane::ServerState;
     use crate::db::Database;
 
     /// 内存 DB 的 ApiState（api key CRUD 不依赖 llm_state 字段加密器）。

@@ -1,4 +1,4 @@
-use crate::control::ControlMessageSender;
+use crate::control_plane::ControlMessageSender;
 
 /// Sender for control messages - can be shared across tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

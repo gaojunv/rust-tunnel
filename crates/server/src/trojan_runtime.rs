@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::acme::manager::{CertEvent, CertificateManager};
 use crate::acme::provider::CertCoverage;
-use crate::control::{ServerState, TrojanRuntimeStatus};
+use crate::control_plane::{ServerState, TrojanRuntimeStatus};
 use crate::dynamic_config::TrojanDynamicConfig;
 use crate::reverse_proxy::sni_resolver::wildcard_for;
 use crate::reverse_proxy::TrojanSniEntry;
