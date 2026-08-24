@@ -4,7 +4,7 @@ use axum::response::Response;
 
 use super::super::upstream::ProxyError;
 use super::upstream_request::{count_body, strip_hop_by_hop};
-use crate::stats::StatsCollector;
+use rust_tunnel_stats::StatsCollector;
 
 /// Walk `err.source()` chain to build a string like:
 ///   "outer message | caused by: middle | caused by: inner"

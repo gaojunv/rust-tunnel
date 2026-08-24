@@ -1,0 +1,50 @@
+[package]
+name = "rust-tunnel-protocols"
+version = "0.4.0"
+edition = "2021"
+description = "rust-tunnel proxy protocols: Shadowsocks, Trojan, reverse proxy (HTTP/TCP routing, SNI dispatch, upstream forwarding)"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-common = { path = "../common" }
+rust-tunnel-pki = { path = "../pki" }
+rust-tunnel-stats = { path = "../stats" }
+rust-tunnel-persistence = { path = "../persistence" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+arc-swap.workspace = true
+base64.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hex.workspace = true
+rand.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+http-body-util.workspace = true
+shadowsocks.workspace = true
+md-5.workspace = true
+urlencoding.workspace = true
+trust-dns-resolver.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen.workspace = true
+futures-util.workspace = true
+tower.workspace = true

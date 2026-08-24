@@ -25,6 +25,7 @@ rag = ["dep:rust-tunnel-rag", "rust-tunnel-llm/rag", "rust-tunnel-agent/rag"]
 [dependencies]
 rust-tunnel-common = { path = "../common" }
 rust-tunnel-persistence = { path = "../persistence" }
+rust-tunnel-protocols = { path = "../protocols" }
 rust-tunnel-rag = { path = "../rag", optional = true }
 rust-tunnel-llm = { path = "../llm" }
 rust-tunnel-agent = { path = "../agent" }

@@ -4750,6 +4750,7 @@ dependencies = [
  "reqwest",
  "rust-tunnel-client",
  "rust-tunnel-common",
+ "rust-tunnel-protocols",
  "rust-tunnel-server",
  "rustls 0.22.4",
  "serde_json",
@@ -4919,6 +4920,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-protocols"
+version = "0.4.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls 0.26.0",
+ "hyper-util",
+ "md-5",
+ "rand 0.8.6",
+ "rcgen",
+ "reqwest",
+ "rust-tunnel-common",
+ "rust-tunnel-persistence",
+ "rust-tunnel-pki",
+ "rust-tunnel-stats",
+ "rustls 0.22.4",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "shadowsocks",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls 0.25.0",
+ "tower",
+ "tracing",
+ "trust-dns-resolver",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "rust-tunnel-rag"
 version = "0.4.0"
 dependencies = [
@@ -4983,6 +5027,7 @@ dependencies = [
  "rust-tunnel-llm",
  "rust-tunnel-persistence",
  "rust-tunnel-pki",
+ "rust-tunnel-protocols",
  "rust-tunnel-rag",
  "rust-tunnel-stats",
  "rustls 0.22.4",

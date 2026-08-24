@@ -18,7 +18,7 @@ use tracing::error;
 use super::router::RouteTable;
 use super::upstream::UpstreamClient;
 use super::{BackendKind, BackendProtocol, ReverseProxyState};
-use crate::stats::EntityType;
+use rust_tunnel_stats::EntityType;
 
 use client_backend::{handle_client_backend, host_without_port, resolve_backend};
 use downstream_response::{build_downstream_response, error_chain, error_response};
@@ -669,7 +669,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use crate::acme::CertificateManager;
+        use rust_tunnel_pki::acme::CertificateManager;
         use crate::reverse_proxy::router::RouteTable;
         use crate::reverse_proxy::shared_listener::SharedListener;
         use crate::reverse_proxy::{
@@ -852,20 +852,16 @@ mod tests {
     /// echoes raw bytes.
     #[tokio::test]
     async fn websocket_upgrade_to_client_backend_end_to_end() {
-        use std::collections::HashSet;
         use std::net::SocketAddr;
         use std::sync::Arc;
 
         use arc_swap::ArcSwap;
         use axum::routing::any;
         use axum::Router;
-        use base64::Engine;
-        use sha1::{Digest, Sha1};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use crate::client_registry::{ClientRegistry, TunnelOpenOutcome};
-        use crate::db::Database;
+        use crate::tunnel_opener::TunnelOpener;
         use crate::reverse_proxy::connector::ClientConnector;
         use crate::reverse_proxy::router::RouteTable;
         use crate::reverse_proxy::upstream::UpstreamClient;
@@ -873,75 +869,40 @@ mod tests {
             Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
             RuleType,
         };
-        use rust_tunnel_common::ControlMessage;
-
-        const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-        // 1. Fake tunnel client registered in a ClientRegistry.
-        let db = Database::new(":memory:").await.unwrap();
-        db.save_server_auth("pw").await.unwrap();
-        let registry = ClientRegistry::new(db);
-        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(64);
-        let entry = registry
-            .register("ws-client", None, None, "pw", client_tx)
-            .await
-            .unwrap();
-
-        let entry_for_client = entry.clone();
-        tokio::spawn(async move {
-            let mut upgraded: HashSet<u64> = HashSet::new();
-            while let Some(msg) = client_rx.recv().await {
-                match msg {
-                    ControlMessage::OpenTunnel { connection_id, .. } => {
-                        let mut conns = entry_for_client.active_connections.lock().await;
-                        if let Some(active) = conns.get_mut(&connection_id) {
-                            if let Some(tx) = active.open_result.take() {
-                                let _ = tx.send(TunnelOpenOutcome::Ok);
-                            }
-                        }
+        // 1. Mock TunnelOpener that echoes and performs WS handshake on first read
+        struct WsEchoOpener;
+        #[async_trait::async_trait]
+        impl TunnelOpener for WsEchoOpener {
+            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+                use tokio::io::duplex;
+                let (client_side, mut server_side) = duplex(16384);
+                tokio::spawn(async move {
+                    use base64::Engine as _;
+                    use sha1::{Digest as _, Sha1};
+                    const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+                    let mut buf = vec![0u8; 8192];
+                    let n = match tokio::io::AsyncReadExt::read(&mut server_side, &mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    let key = text.lines().find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:")).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+                    let mut h = Sha1::new();
+                    h.update(key.as_bytes());
+                    h.update(WS_MAGIC.as_bytes());
+                    let accept = base64::engine::general_purpose::STANDARD.encode(h.finalize());
+                    let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+                    if tokio::io::AsyncWriteExt::write_all(&mut server_side, resp.as_bytes()).await.is_err() { return; }
+                    let mut tmp = vec![0u8; 4096];
+                    loop {
+                        let n = match tokio::io::AsyncReadExt::read(&mut server_side, &mut tmp).await { Ok(0) | Err(_) => break, Ok(n) => n };
+                        if tokio::io::AsyncWriteExt::write_all(&mut server_side, &tmp[..n]).await.is_err() { break; }
                     }
-                    ControlMessage::Data {
-                        connection_id,
-                        data,
-                    } => {
-                        let reply = if upgraded.contains(&connection_id) {
-                            Some(data) // raw echo after the handshake
-                        } else {
-                            // First frame: HTTP upgrade request — answer 101.
-                            let text = String::from_utf8_lossy(&data);
-                            let key = text
-                                .lines()
-                                .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
-                                .and_then(|l| l.split_once(':'))
-                                .map(|(_, v)| v.trim().to_string())
-                                .expect("no ws key in upgrade request");
-                            let mut h = Sha1::new();
-                            h.update(key.as_bytes());
-                            h.update(WS_MAGIC.as_bytes());
-                            let accept =
-                                base64::engine::general_purpose::STANDARD.encode(h.finalize());
-                            upgraded.insert(connection_id);
-                            Some(
-                                format!(
-                                    "HTTP/1.1 101 Switching Protocols\r\n\
-                                     Upgrade: websocket\r\n\
-                                     Connection: Upgrade\r\n\
-                                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
-                                )
-                                .into_bytes(),
-                            )
-                        };
-                        if let Some(bytes) = reply {
-                            let conns = entry_for_client.active_connections.lock().await;
-                            if let Some(active) = conns.get(&connection_id) {
-                                let _ = active.inbound.send(bytes).await;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                });
+                Ok(Box::new(client_side))
             }
-        });
+        }
+        let opener: std::sync::Arc<dyn TunnelOpener> = std::sync::Arc::new(WsEchoOpener);
 
         // 2. Proxy with a client-kind backend.
         let rule = ProxyRule {
@@ -972,7 +933,7 @@ mod tests {
         let upstream = Arc::new(UpstreamClient::new());
         let proxy_state = Arc::new(ReverseProxyState::new());
         proxy_state
-            .set_client_connector(Arc::new(ClientConnector::new(registry)))
+            .set_client_connector(Arc::new(ClientConnector::new(opener)))
             .await;
 
         let app = Router::new()
@@ -1333,7 +1294,7 @@ mod http2_tests {
     use tokio::net::TcpListener;
     use tokio_rustls::rustls;
 
-    use crate::acme::{CertEntry, CertSource, CertificateManager};
+    use rust_tunnel_pki::acme::{CertEntry, CertSource, CertificateManager};
     use crate::reverse_proxy::shared_listener::SharedListener;
     use crate::reverse_proxy::{
         Backend, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route, RuleType,

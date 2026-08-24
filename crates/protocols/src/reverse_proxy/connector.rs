@@ -15,8 +15,9 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::client_registry::ClientRegistry;
+use crate::tunnel_opener::TunnelOpener;
 use crate::reverse_proxy::Backend;
+use std::sync::Arc;
 
 /// Marker trait combining tokio's async read+write. Blanket-impl'd for any
 /// type that satisfies both — lets us return `Box<dyn AsyncReadWrite + ...>`
@@ -48,13 +49,13 @@ impl Connector for DirectConnector {
 /// Dials a backend via a tunneled client control channel using `ClientRegistry`.
 /// Backend must have `kind == Client` and `client_name` must be set.
 pub struct ClientConnector {
-    registry: ClientRegistry,
+    opener: Arc<dyn TunnelOpener>,
 }
 
 impl ClientConnector {
     #[must_use]
-    pub fn new(registry: ClientRegistry) -> Self {
-        Self { registry }
+    pub fn new(opener: Arc<dyn TunnelOpener>) -> Self {
+        Self { opener }
     }
 }
 
@@ -75,7 +76,7 @@ impl Connector for ClientConnector {
             )
         })?;
         let stream = self
-            .registry
+            .opener
             .open_tunnel(client_name, &backend.addr)
             .await?;
         Ok(Box::new(stream))
@@ -138,46 +139,41 @@ mod tests {
 
     #[tokio::test]
     async fn client_connector_full_path() {
-        use crate::client_registry::{ClientRegistry, TunnelOpenOutcome};
-        use crate::db::Database;
-        use rust_tunnel_common::ControlMessage;
+        use crate::tunnel_opener::TunnelOpener;
+        use std::sync::Arc;
+        use tokio::io::duplex;
 
-        let db = Database::new(":memory:").await.unwrap();
-        db.save_server_auth("pw").await.unwrap();
-        let registry = ClientRegistry::new(db);
-
-        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(32);
-        let entry = registry
-            .register("home-nas", None, None, "pw", client_tx)
-            .await
-            .unwrap();
-
-        // Fake client task: reply TunnelOpenResult{true}, then echo any Data.
-        let entry_for_client = entry.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = client_rx.recv().await {
-                match msg {
-                    ControlMessage::OpenTunnel { connection_id, .. } => {
-                        let mut conns = entry_for_client.active_connections.lock().await;
-                        if let Some(active) = conns.get_mut(&connection_id) {
-                            if let Some(tx) = active.open_result.take() {
-                                let _ = tx.send(TunnelOpenOutcome::Ok);
-                            }
+        struct EchoOpener;
+        #[async_trait::async_trait]
+        impl TunnelOpener for EchoOpener {
+            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+                let (a, b) = duplex(64);
+                // Echo task: copy a->b
+                tokio::spawn(async move {
+                    let (mut ra, mut wa) = tokio::io::split(a);
+                    let (mut rb, mut wb) = tokio::io::split(b);
+                    let _ = tokio::join!(
+                        tokio::io::copy(&mut ra, &mut wb),
+                        tokio::io::copy(&mut rb, &mut wa),
+                    );
+                });
+                // Return one end that the connector caller will use; but duplex gives two ends, we need to return a duplex stream
+                // Instead, use a simple echo duplex pair: create a new duplex for the caller
+                let (client_side, server_side) = duplex(64);
+                tokio::spawn(async move {
+                    let (mut rs, mut ws) = tokio::io::split(server_side);
+                    let mut buf = vec![0u8; 64];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut rs, &mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => { if tokio::io::AsyncWriteExt::write_all(&mut ws, &buf[..n]).await.is_err() { break; } }
+                            Err(_) => break,
                         }
                     }
-                    ControlMessage::Data {
-                        connection_id,
-                        data,
-                    } => {
-                        let conns = entry_for_client.active_connections.lock().await;
-                        if let Some(active) = conns.get(&connection_id) {
-                            let _ = active.inbound.send(data).await;
-                        }
-                    }
-                    _ => {}
-                }
+                });
+                Ok(Box::new(client_side))
             }
-        });
+        }
 
         let backend = Backend {
             kind: BackendKind::Client,
@@ -187,7 +183,8 @@ mod tests {
             protocol: BackendProtocol::Http1,
             scheme: BackendScheme::Http,
         };
-        let connector = ClientConnector::new(registry);
+        let opener: Arc<dyn TunnelOpener> = Arc::new(EchoOpener);
+        let connector = ClientConnector::new(opener);
         let mut stream = connector.connect(&backend).await.unwrap();
 
         stream.write_all(b"ping").await.unwrap();
@@ -198,11 +195,17 @@ mod tests {
 
     #[tokio::test]
     async fn client_connector_offline_returns_err() {
-        use crate::client_registry::ClientRegistry;
-        use crate::db::Database;
+        use crate::tunnel_opener::TunnelOpener;
+        use std::sync::Arc;
 
-        let db = Database::new(":memory:").await.unwrap();
-        let registry = ClientRegistry::new(db);
+        struct OfflineOpener;
+        #[async_trait::async_trait]
+        impl TunnelOpener for OfflineOpener {
+            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+                Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "offline"))
+            }
+        }
+
         let backend = Backend {
             kind: BackendKind::Client,
             addr: "x:80".into(),
@@ -211,7 +214,8 @@ mod tests {
             protocol: BackendProtocol::Http1,
             scheme: BackendScheme::Http,
         };
-        let connector = ClientConnector::new(registry);
+        let opener: Arc<dyn TunnelOpener> = Arc::new(OfflineOpener);
+        let connector = ClientConnector::new(opener);
         let result = connector.connect(&backend).await;
         match result {
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotConnected),

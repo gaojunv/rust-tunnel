@@ -7,7 +7,7 @@ use hyper::Request;
 use super::super::upstream::{ProxyBody, ProxyError};
 use super::super::Backend;
 use super::websocket::is_websocket_upgrade;
-use crate::stats::{EntityType, StatsCollector};
+use rust_tunnel_stats::{EntityType, StatsCollector};
 
 /// Per RFC 7230 §6.1, these headers apply to the immediate connection only
 /// and must be stripped by any intermediary.

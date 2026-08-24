@@ -10,7 +10,7 @@ use super::downstream_response::error_response;
 use super::upstream_request::{build_upstream_request, count_body};
 use super::websocket::is_websocket_upgrade;
 use super::RouteSource;
-use crate::stats::EntityType;
+use rust_tunnel_stats::EntityType;
 
 /// Resolve the target backend for a request. Returns the matched rule id and
 /// the selected backend, or `None` when no route matches (caller should reply

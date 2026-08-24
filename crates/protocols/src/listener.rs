@@ -5,9 +5,10 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use crate::control::{PortInfo, ServerState};
-use crate::protocols::shadowsocks::proxy_ss_connection;
-use crate::protocols::trojan::proxy_trojan_connection;
+use crate::port_registry::{PortInfo, PortRegistry};
+use rust_tunnel_stats::StatsCollector;
+use crate::shadowsocks::proxy_ss_connection;
+use crate::trojan::proxy_trojan_connection;
 use crate::shadowsocks::handle_ss_handshake;
 use crate::trojan::{handle_trojan_fallback, handle_trojan_handshake};
 use rust_tunnel_common::{TunnelError, TunnelResult};
@@ -19,12 +20,13 @@ fn generate_connection_id() -> u64 {
 
 /// Start Shadowsocks listener if enabled
 pub async fn start_shadowsocks_listener(
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
     port: u16,
     cipher: String,
     password: String,
 ) -> TunnelResult<()> {
-    if !state.register_shadowsocks(port, cipher, password).await {
+    if !registry.register_shadowsocks(port, cipher, password).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!("Port {} already in use", port),
@@ -39,11 +41,12 @@ pub async fn start_shadowsocks_listener(
     loop {
         let (inbound, client_addr) = listener.accept().await?;
         debug!("New SS connection from {}", client_addr);
-        let state_clone = state.clone();
+        let reg = registry.clone();
+        let st = stats.clone();
         tokio::spawn(async move {
             let connection_id = generate_connection_id();
             if let Err(e) =
-                handle_inbound_connection(state_clone, port, connection_id, inbound).await
+                handle_inbound_connection(reg, st, port, connection_id, inbound).await
             {
                 debug!("SS connection error: {}", e);
             }
@@ -53,13 +56,14 @@ pub async fn start_shadowsocks_listener(
 
 /// Start Shadowsocks listener with abort support
 pub async fn start_shadowsocks_listener_with_abort(
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
     port: u16,
     cipher: String,
     password: String,
     mut abort_rx: tokio::sync::watch::Receiver<bool>,
 ) -> TunnelResult<()> {
-    if !state.register_shadowsocks(port, cipher, password).await {
+    if !registry.register_shadowsocks(port, cipher, password).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!("Port {} already in use", port),
@@ -76,10 +80,11 @@ pub async fn start_shadowsocks_listener_with_abort(
             result = listener.accept() => {
                 let (inbound, client_addr) = result?;
                 debug!("New SS connection from {}", client_addr);
-                let state_clone = state.clone();
+                let reg = registry.clone();
+                let st = stats.clone();
                 tokio::spawn(async move {
                     let connection_id = generate_connection_id();
-                    if let Err(e) = handle_inbound_connection(state_clone, port, connection_id, inbound).await {
+                    if let Err(e) = handle_inbound_connection(reg.clone(), st.clone(), port, connection_id, inbound).await {
                         debug!("SS connection error: {}", e);
                     }
                 });
@@ -87,7 +92,7 @@ pub async fn start_shadowsocks_listener_with_abort(
             _ = abort_rx.changed() => {
                 if *abort_rx.borrow() {
                     info!("Shadowsocks listener on port {} shutting down", port);
-                    state.unregister_port(port).await;
+                    registry.unregister_port(port).await;
                     return Ok(());
                 }
             }
@@ -106,7 +111,8 @@ pub async fn handle_trojan_connection(
     password: String,
     fallback: String,
     tls_config_rx: watch::Receiver<Arc<rustls::server::ServerConfig>>,
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
 ) {
     let connection_id = generate_connection_id();
     // Read the latest TLS config from the watch channel
@@ -129,7 +135,7 @@ pub async fn handle_trojan_connection(
                 "Trojan authenticated: target={}, cmd={:?}",
                 ctx.target_addr, ctx.command
             );
-            proxy_trojan_connection(connection_id, port, tls_stream, ctx, payload, state).await;
+            proxy_trojan_connection(connection_id, port, tls_stream, ctx, payload, registry, stats).await;
         }
         Err(e) => {
             warn!(
@@ -153,14 +159,15 @@ pub async fn handle_trojan_connection(
 
 /// Start Trojan listener with TLS
 pub async fn start_trojan_listener(
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
     port: u16,
     password: String,
     fallback: String,
     tls_config_rx: watch::Receiver<Arc<rustls::server::ServerConfig>>,
 ) -> TunnelResult<()> {
-    // Register Trojan port in ServerState
-    if !state
+    // Register Trojan port
+    if !registry
         .register_trojan(port, password.clone(), fallback.clone())
         .await
     {
@@ -178,8 +185,8 @@ pub async fn start_trojan_listener(
     loop {
         let (inbound, client_addr) = listener.accept().await?;
         debug!("New Trojan connection from {}", client_addr);
-
-        let state_clone = state.clone();
+        let reg = registry.clone();
+        let st = stats.clone();
         let password_clone = password.clone();
         let fallback_clone = fallback.clone();
         let tls_config_rx_clone = tls_config_rx.clone();
@@ -192,7 +199,8 @@ pub async fn start_trojan_listener(
                 password_clone,
                 fallback_clone,
                 tls_config_rx_clone,
-                state_clone,
+                reg,
+                st,
             )
             .await;
         });
@@ -201,14 +209,15 @@ pub async fn start_trojan_listener(
 
 /// Start Trojan listener with abort support
 pub async fn start_trojan_listener_with_abort(
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
     port: u16,
     password: String,
     fallback: String,
     tls_config_rx: tokio::sync::watch::Receiver<Arc<rustls::server::ServerConfig>>,
     mut abort_rx: tokio::sync::watch::Receiver<bool>,
 ) -> TunnelResult<()> {
-    if !state
+    if !registry
         .register_trojan(port, password.clone(), fallback.clone())
         .await
     {
@@ -228,8 +237,8 @@ pub async fn start_trojan_listener_with_abort(
             result = listener.accept() => {
                 let (inbound, client_addr) = result?;
                 debug!("New Trojan connection from {}", client_addr);
-
-                let state_clone = state.clone();
+                let reg = registry.clone();
+                let st = stats.clone();
                 let password_clone = password.clone();
                 let fallback_clone = fallback.clone();
                 let tls_config_rx_clone = tls_config_rx.clone();
@@ -242,7 +251,8 @@ pub async fn start_trojan_listener_with_abort(
                         password_clone,
                         fallback_clone,
                         tls_config_rx_clone,
-                        state_clone,
+                        reg,
+                        st,
                     )
                     .await;
                 });
@@ -250,7 +260,7 @@ pub async fn start_trojan_listener_with_abort(
             _ = abort_rx.changed() => {
                 if *abort_rx.borrow() {
                     info!("Trojan listener on port {} shutting down", port);
-                    state.unregister_port(port).await;
+                    registry.unregister_port(port).await;
                     return Ok(());
                 }
             }
@@ -259,13 +269,14 @@ pub async fn start_trojan_listener_with_abort(
 }
 
 async fn handle_inbound_connection(
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
     remote_port: u16,
     connection_id: u64,
     user_stream: TcpStream,
 ) -> TunnelResult<()> {
     // Get port info
-    let port_info = match state.get_port(remote_port).await {
+    let port_info = match registry.get_port(remote_port).await {
         Some(info) => info,
         None => {
             warn!("No port registered for {}, closing connection", remote_port);
@@ -295,7 +306,7 @@ async fn handle_inbound_connection(
             .await
             {
                 Ok((ss_ctx, proxy_stream)) => {
-                    proxy_ss_connection(connection_id, remote_port, proxy_stream, ss_ctx, state)
+                    proxy_ss_connection(connection_id, remote_port, proxy_stream, ss_ctx, registry, stats)
                         .await;
                 }
                 Err(e) => {
