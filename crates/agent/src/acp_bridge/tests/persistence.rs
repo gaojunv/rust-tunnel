@@ -162,9 +162,7 @@ async fn test_acp_persistence_survives_ws_disconnect() {
         .unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db.clone());
 
     let (ws_tx, _ws_rx) = mpsc::channel::<serde_json::Value>(16);

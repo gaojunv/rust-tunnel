@@ -41,7 +41,8 @@ pub struct ServerState {
     /// Reverse proxy state
     pub proxy_state: ReverseProxyState,
     /// LLM Gateway state (set when LLM is configured). 由装配层 init_llm_state 注入。
-    pub llm_state: std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<crate::llm::LlmState>>>>,
+    pub llm_state:
+        std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<crate::llm::LlmState>>>>,
     /// Client registry (spec §2.6)
     pub client_registry: Option<ClientRegistry>,
     /// AI agent workbench state (workspace execution locks, DB access)
@@ -146,7 +147,10 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db.clone()),
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
-            agent_state: Some(crate::agent::AgentState::new(std::sync::Arc::new(registry), db)),
+            agent_state: Some(crate::agent::AgentState::new(
+                std::sync::Arc::new(registry),
+                db,
+            )),
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
@@ -190,7 +194,8 @@ impl ServerState {
     /// has started. Called from `bin/server.rs` after `with_db()`.
     pub async fn wire_up_client_connector(&self) {
         if let Some(registry) = &self.client_registry {
-            let opener: std::sync::Arc<dyn rust_tunnel_protocols::TunnelOpener> = std::sync::Arc::new(registry.clone());
+            let opener: std::sync::Arc<dyn rust_tunnel_protocols::TunnelOpener> =
+                std::sync::Arc::new(registry.clone());
             let cc = std::sync::Arc::new(crate::reverse_proxy::connector::ClientConnector::new(
                 opener,
             ));
@@ -221,14 +226,9 @@ impl ServerState {
             tls_acme: rule.tls.as_ref().is_some_and(|t| t.acme),
         });
         let request_logging = dynamic_config.read().await.llm_request_logging;
-        let llm = crate::llm::init_llm_state(
-            gateway_rule,
-            db,
-            master_key,
-            rag_data_dir,
-            request_logging,
-        )
-        .await;
+        let llm =
+            crate::llm::init_llm_state(gateway_rule, db, master_key, rag_data_dir, request_logging)
+                .await;
         *self.llm_state.write().await = Some(llm.clone());
         // 同时注入反代分流器
         *self.proxy_state.llm_dispatcher.write().await =
@@ -437,16 +437,52 @@ impl rust_tunnel_protocols::PortRegistry for ServerState {
         let ports = self.ports.lock().await;
         let p = ports.get(&port)?.clone();
         Some(match p {
-            crate::control::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at } => rust_tunnel_protocols::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at },
-            crate::control::PortInfo::Trojan { port, password, fallback, enabled, created_at } => rust_tunnel_protocols::PortInfo::Trojan { port, password, fallback, enabled, created_at },
+            crate::control::PortInfo::Shadowsocks {
+                port,
+                cipher,
+                password,
+                enabled,
+                created_at,
+            } => rust_tunnel_protocols::PortInfo::Shadowsocks {
+                port,
+                cipher,
+                password,
+                enabled,
+                created_at,
+            },
+            crate::control::PortInfo::Trojan {
+                port,
+                password,
+                fallback,
+                enabled,
+                created_at,
+            } => rust_tunnel_protocols::PortInfo::Trojan {
+                port,
+                password,
+                fallback,
+                enabled,
+                created_at,
+            },
         })
     }
-    async fn unregister_port(&self, port: u16) -> bool { ServerState::unregister_port(self, port).await }
-    async fn get_connection_count_for_port(&self, remote_port: u16) -> usize { ServerState::get_connection_count_for_port(self, remote_port).await }
-    async fn increment_ss_connections(&self, port: u16) { ServerState::increment_ss_connections(self, port).await }
-    async fn decrement_ss_connections(&self, port: u16) { ServerState::decrement_ss_connections(self, port).await }
-    async fn increment_trojan_connections(&self, port: u16) { ServerState::increment_trojan_connections(self, port).await }
-    async fn decrement_trojan_connections(&self, port: u16) { ServerState::decrement_trojan_connections(self, port).await }
+    async fn unregister_port(&self, port: u16) -> bool {
+        ServerState::unregister_port(self, port).await
+    }
+    async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
+        ServerState::get_connection_count_for_port(self, remote_port).await
+    }
+    async fn increment_ss_connections(&self, port: u16) {
+        ServerState::increment_ss_connections(self, port).await
+    }
+    async fn decrement_ss_connections(&self, port: u16) {
+        ServerState::decrement_ss_connections(self, port).await
+    }
+    async fn increment_trojan_connections(&self, port: u16) {
+        ServerState::increment_trojan_connections(self, port).await
+    }
+    async fn decrement_trojan_connections(&self, port: u16) {
+        ServerState::decrement_trojan_connections(self, port).await
+    }
 }
 
 impl std::fmt::Debug for ServerState {
@@ -475,7 +511,10 @@ impl crate::reverse_proxy::llm_dispatch::LlmDispatcher for LlmDispatcherAdapter 
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<axum::response::Response, axum::http::Request<axum::body::Body>>,
+                    Output = Result<
+                        axum::response::Response,
+                        axum::http::Request<axum::body::Body>,
+                    >,
                 > + Send,
         >,
     > {

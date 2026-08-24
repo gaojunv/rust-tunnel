@@ -43,7 +43,12 @@ impl AgentNotification {
         }
     }
 
-    pub fn approval_needed(session_id: &str, workspace_id: &str, tool: &str, summary: &str) -> Self {
+    pub fn approval_needed(
+        session_id: &str,
+        workspace_id: &str,
+        tool: &str,
+        summary: &str,
+    ) -> Self {
         Self {
             event: "approval_needed",
             session_id: session_id.to_string(),
@@ -86,16 +91,29 @@ pub fn notification_from_frame(
             if message.starts_with("设置失败") {
                 return None;
             }
-            Some(AgentNotification::turn_error(session_id, workspace_id, message))
+            Some(AgentNotification::turn_error(
+                session_id,
+                workspace_id,
+                message,
+            ))
         }
         Some("approval_request") => {
             let tool = ev.get("tool").and_then(|v| v.as_str()).unwrap_or("");
             let summary = ev.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            Some(AgentNotification::approval_needed(session_id, workspace_id, tool, summary))
+            Some(AgentNotification::approval_needed(
+                session_id,
+                workspace_id,
+                tool,
+                summary,
+            ))
         }
         Some("elicitation_request") => {
             let message = ev.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            Some(AgentNotification::elicitation_needed(session_id, workspace_id, message))
+            Some(AgentNotification::elicitation_needed(
+                session_id,
+                workspace_id,
+                message,
+            ))
         }
         _ => None,
     }

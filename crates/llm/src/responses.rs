@@ -41,7 +41,9 @@ pub fn responses_request_to_chat(body: &Value) -> Result<ChatCompletionRequest, 
     }
 
     // input → 消息列表
-    let input = body.get("input").ok_or_else(|| "input is required".to_string())?;
+    let input = body
+        .get("input")
+        .ok_or_else(|| "input is required".to_string())?;
     match input {
         Value::String(s) => {
             messages.push(ChatMessage::text("user", s));
@@ -54,8 +56,14 @@ pub fn responses_request_to_chat(body: &Value) -> Result<ChatCompletionRequest, 
         _ => return Err("input must be a string or array".to_string()),
     }
 
-    let max_tokens = body.get("max_output_tokens").and_then(Value::as_u64).map(|v| v as u32);
-    let temperature = body.get("temperature").and_then(Value::as_f64).map(|v| v as f32);
+    let max_tokens = body
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let temperature = body
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .map(|v| v as f32);
     let top_p = body.get("top_p").and_then(Value::as_f64).map(|v| v as f32);
 
     let tools = body.get("tools").map(convert_tools_to_chat);
@@ -114,10 +122,7 @@ fn convert_input_item(item: &Value, out: &mut Vec<ChatMessage>) -> Result<(), St
             });
         }
         "function_call_output" => {
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             let output = item.get("output").map(|o| {
                 if o.is_string() {
                     o.as_str().unwrap_or("").to_string()
@@ -139,10 +144,7 @@ fn convert_input_item(item: &Value, out: &mut Vec<ChatMessage>) -> Result<(), St
         }
         _ => {
             // message 类型（显式或缺省 type 但有 role）
-            let role = item
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("user");
+            let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
             let role = match role {
                 "developer" => "system",
                 other => other,
@@ -273,10 +275,7 @@ pub fn chat_response_to_responses(chat: &Value) -> Value {
     // tool_calls → function_call output items
     if let Some(calls) = msg.get("tool_calls").and_then(Value::as_array) {
         for (i, call) in calls.iter().enumerate() {
-            let call_id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
             let name = call
                 .get("function")
                 .and_then(|f| f.get("name"))
@@ -313,9 +312,17 @@ pub fn chat_response_to_responses(chat: &Value) -> Value {
 
     // usage 映射
     if let Some(usage) = chat.get("usage").filter(|u| u.is_object()) {
-        let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let total_tokens = usage.get("total_tokens").and_then(Value::as_u64)
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let completion_tokens = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total_tokens = usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
             .unwrap_or(prompt_tokens + completion_tokens);
 
         let cached_tokens = usage
@@ -589,12 +596,8 @@ impl ChatToResponsesSseTranslator {
                     let oidx = self.next_output_index;
                     self.next_output_index += 1;
                     self.tool_output_indices.insert(up_idx, oidx);
-                    self.open_items
-                        .push(OutputItemKind::FunctionCall(oidx));
-                    let call_id = call
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    self.open_items.push(OutputItemKind::FunctionCall(oidx));
+                    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
                     let name = call
                         .get("function")
                         .and_then(|f| f.get("name"))
@@ -640,7 +643,10 @@ impl ChatToResponsesSseTranslator {
         }
 
         // finish_reason → close
-        if let Some(reason) = chunk["choices"][0].get("finish_reason").and_then(Value::as_str) {
+        if let Some(reason) = chunk["choices"][0]
+            .get("finish_reason")
+            .and_then(Value::as_str)
+        {
             // 收集 usage（可能在 finish chunk 上）
             if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
                 self.usage = Some(chunk["usage"].clone());
@@ -894,8 +900,14 @@ impl ChatToResponsesSseTranslator {
 
 /// Chat usage → Responses usage 映射。
 fn map_usage_chat_to_responses(usage: &Value) -> Value {
-    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
@@ -1110,7 +1122,10 @@ fn chat_message_to_input_items(msg: &Value) -> Vec<Value> {
             items
         }
         "tool" => {
-            let call_id = msg.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+            let call_id = msg
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let output = msg
                 .get("content")
                 .map(|c| {
@@ -1228,10 +1243,7 @@ pub fn responses_response_to_chat(resp: &Value) -> Value {
                 }
                 "function_call" => {
                     has_function_call = true;
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                     let arguments = item
                         .get("arguments")
@@ -1252,7 +1264,10 @@ pub fn responses_response_to_chat(resp: &Value) -> Value {
     }
 
     // finish_reason
-    let status = resp.get("status").and_then(Value::as_str).unwrap_or("completed");
+    let status = resp
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
     let finish_reason = if status == "incomplete" {
         "length"
     } else if has_function_call {
@@ -1290,8 +1305,14 @@ pub fn responses_response_to_chat(resp: &Value) -> Value {
 
     // usage 逆映射
     if let Some(usage) = resp.get("usage").filter(|u| u.is_object()) {
-        let input_tokens = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-        let output_tokens = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let total_tokens = usage
             .get("total_tokens")
             .and_then(Value::as_u64)
@@ -1314,8 +1335,7 @@ pub fn responses_response_to_chat(resp: &Value) -> Value {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if reasoning > 0 {
-            completion_details
-                .insert("reasoning_tokens".to_string(), json!(reasoning));
+            completion_details.insert("reasoning_tokens".to_string(), json!(reasoning));
         }
 
         let mut usage_obj = json!({
@@ -1445,10 +1465,7 @@ impl ResponsesToChatSseTranslator {
                 push_chat_chunk(out, &chunk);
             }
             "response.output_text.delta" => {
-                let delta_text = event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let delta_text = event.get("delta").and_then(Value::as_str).unwrap_or("");
                 let chunk = json!({
                     "id": self.resp_id,
                     "object": "chat.completion.chunk",
@@ -1462,10 +1479,7 @@ impl ResponsesToChatSseTranslator {
                 push_chat_chunk(out, &chunk);
             }
             "response.reasoning_summary_text.delta" => {
-                let delta_text = event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let delta_text = event.get("delta").and_then(Value::as_str).unwrap_or("");
                 let chunk = json!({
                     "id": self.resp_id,
                     "object": "chat.completion.chunk",
@@ -1532,10 +1546,7 @@ impl ResponsesToChatSseTranslator {
                     self.tool_indices.insert(output_idx, idx);
                     idx
                 };
-                let delta_args = event
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let delta_args = event.get("delta").and_then(Value::as_str).unwrap_or("");
                 let chunk = json!({
                     "id": self.resp_id,
                     "object": "chat.completion.chunk",
@@ -1558,15 +1569,19 @@ impl ResponsesToChatSseTranslator {
             "response.completed" | "response.incomplete" => {
                 // 收尾 chunk
                 let resp = event.get("response").unwrap_or(&event);
-                let status = resp.get("status").and_then(Value::as_str).unwrap_or("completed");
+                let status = resp
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
 
                 // 判断是否有 function_call item → finish_reason
                 let has_fc = resp
                     .get("output")
                     .and_then(Value::as_array)
                     .map(|arr| {
-                        arr.iter()
-                            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+                        arr.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("function_call")
+                        })
                     })
                     .unwrap_or(false);
                 let finish_reason = if status == "incomplete" {
@@ -1649,8 +1664,14 @@ impl ResponsesToChatSseTranslator {
 
 /// Responses usage → Chat usage 映射。
 fn map_usage_responses_to_chat(usage: &Value) -> Value {
-    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
@@ -1695,13 +1716,14 @@ fn push_chat_chunk(out: &mut String, chunk: &Value) {
 /// 结构与 [`super::format::convert_openai_stream_to_anthropic`] 一致：
 /// 用 [`ChatToResponsesSseTranslator`] 包装字节流，每个上游字节块喂入翻译器，
 /// 返回的字节直接发给客户端。
-pub fn convert_openai_stream_to_responses(openai_resp: axum::response::Response) -> axum::response::Response {
+pub fn convert_openai_stream_to_responses(
+    openai_resp: axum::response::Response,
+) -> axum::response::Response {
     use futures_util::StreamExt;
 
     let byte_stream = openai_resp.into_body().into_data_stream();
-    let translator = std::sync::Arc::new(std::sync::Mutex::new(
-        ChatToResponsesSseTranslator::new(),
-    ));
+    let translator =
+        std::sync::Arc::new(std::sync::Mutex::new(ChatToResponsesSseTranslator::new()));
     let out = byte_stream.filter_map(move |chunk| {
         let translator = translator.clone();
         async move {
@@ -1840,9 +1862,8 @@ pub fn convert_responses_stream_to_chat(
     use futures_util::StreamExt;
 
     let byte_stream = responses_resp.into_body().into_data_stream();
-    let translator = std::sync::Arc::new(std::sync::Mutex::new(
-        ResponsesToChatSseTranslator::new(),
-    ));
+    let translator =
+        std::sync::Arc::new(std::sync::Mutex::new(ResponsesToChatSseTranslator::new()));
     let out = byte_stream.filter_map(move |chunk| {
         let translator = translator.clone();
         async move {
@@ -1866,7 +1887,12 @@ pub fn convert_responses_stream_to_chat(
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(Body::from_stream(out))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("build sse response: {e}")))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build sse response: {e}"),
+            )
+        })
 }
 
 // ── 测试 ────────────────────────────────────────────────────────
@@ -2596,10 +2622,7 @@ mod tests {
             ]
         });
         let chat = responses_response_to_chat(&resp);
-        assert_eq!(
-            chat["choices"][0]["message"]["reasoning_content"],
-            "think"
-        );
+        assert_eq!(chat["choices"][0]["message"]["reasoning_content"], "think");
         assert_eq!(chat["choices"][0]["message"]["content"], "ans");
     }
 
@@ -2615,7 +2638,9 @@ mod tests {
             }]
         });
         let chat = responses_response_to_chat(&resp);
-        let calls = chat["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        let calls = chat["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["id"], "c1");
         assert_eq!(calls[0]["function"]["name"], "f");
@@ -2742,7 +2767,9 @@ mod tests {
         });
         let resp = chat_response_to_responses(&chat);
         let back = responses_response_to_chat(&resp);
-        let calls = back["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        let calls = back["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["function"]["name"], "f");
         assert_eq!(calls[0]["function"]["arguments"], "{\"a\":1}");
@@ -2767,11 +2794,26 @@ mod tests {
     fn c_first_chunk_emits_response_created() {
         let mut t = ChatToResponsesSseTranslator::new();
         let out = String::from_utf8(t.push(chat_sse_chunk("Hi", None).as_bytes())).unwrap();
-        assert!(out.contains("response.created"), "missing response.created:\n{out}");
-        assert!(out.contains("response.output_item.added"), "missing output_item.added:\n{out}");
-        assert!(out.contains("response.content_part.added"), "missing content_part.added:\n{out}");
-        assert!(out.contains("response.output_text.delta"), "missing output_text.delta:\n{out}");
-        assert!(!out.contains("response.completed"), "should not complete yet:\n{out}");
+        assert!(
+            out.contains("response.created"),
+            "missing response.created:\n{out}"
+        );
+        assert!(
+            out.contains("response.output_item.added"),
+            "missing output_item.added:\n{out}"
+        );
+        assert!(
+            out.contains("response.content_part.added"),
+            "missing content_part.added:\n{out}"
+        );
+        assert!(
+            out.contains("response.output_text.delta"),
+            "missing output_text.delta:\n{out}"
+        );
+        assert!(
+            !out.contains("response.completed"),
+            "should not complete yet:\n{out}"
+        );
     }
 
     #[test]
@@ -2846,11 +2888,23 @@ mod tests {
         all.extend(t.push(chat_sse_chunk("", Some("tool_calls")).as_bytes()));
         let text = String::from_utf8(all).unwrap();
 
-        assert!(text.contains("response.output_item.added"), "missing output_item.added:\n{text}");
+        assert!(
+            text.contains("response.output_item.added"),
+            "missing output_item.added:\n{text}"
+        );
         // 验证 added 事件的 data 行中包含 function_call 类型
-        assert!(text.contains("\"type\":\"function_call\""), "missing function_call in added:\n{text}");
-        assert!(text.contains("response.function_call_arguments.delta"), "missing arguments delta:\n{text}");
-        assert!(text.contains("response.function_call_arguments.done"), "missing arguments done:\n{text}");
+        assert!(
+            text.contains("\"type\":\"function_call\""),
+            "missing function_call in added:\n{text}"
+        );
+        assert!(
+            text.contains("response.function_call_arguments.delta"),
+            "missing arguments delta:\n{text}"
+        );
+        assert!(
+            text.contains("response.function_call_arguments.done"),
+            "missing arguments done:\n{text}"
+        );
     }
 
     /// 解析 SSE 文本为 (event名, data JSON) 列表。
@@ -2886,7 +2940,9 @@ mod tests {
 
         let done = events
             .iter()
-            .find(|(name, d)| name == "response.output_item.done" && d["item"]["type"] == "function_call")
+            .find(|(name, d)| {
+                name == "response.output_item.done" && d["item"]["type"] == "function_call"
+            })
             .expect("missing function_call output_item.done");
         assert_eq!(done.1["item"]["call_id"], "call_123", "{text}");
         assert_eq!(done.1["item"]["name"], "get_weather", "{text}");
@@ -2982,7 +3038,10 @@ mod tests {
     // ════════════════════════════════════════════════════════════════
 
     fn responses_sse_event(event_type: &str, data: &Value) -> String {
-        format!("data: {}\n\n", json!({ "type": event_type, "response": data }))
+        format!(
+            "data: {}\n\n",
+            json!({ "type": event_type, "response": data })
+        )
     }
 
     #[test]
@@ -3273,9 +3332,8 @@ mod tests {
         });
 
         // 组装完整的 SSE 流
-        let full_stream = format!(
-            "{created}data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n"
-        );
+        let full_stream =
+            format!("{created}data: {delta}\n\ndata: {completed}\n\ndata: [DONE]\n\n");
         let bytes = full_stream.as_bytes();
 
         for i in 1..bytes.len() {
@@ -3373,7 +3431,8 @@ mod tests {
         let _ = t.push(format!("data: {completed}\n\n").as_bytes());
         let out1 = t.push(b"data: [DONE]\n\n");
         assert!(out1.is_empty());
-        let out2 = t.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"extra\"}\n\n");
+        let out2 =
+            t.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"extra\"}\n\n");
         assert!(out2.is_empty());
     }
 
@@ -3435,7 +3494,10 @@ mod tests {
             .split("data: ")
             .filter(|s| s.contains("\"tool_calls\""))
             .collect();
-        assert!(tc_chunks.len() >= 2, "expected at least 2 tool_calls chunks:\n{text}");
+        assert!(
+            tc_chunks.len() >= 2,
+            "expected at least 2 tool_calls chunks:\n{text}"
+        );
         // index 0 和 1
         assert!(text.contains("\"index\":0"));
         assert!(text.contains("\"index\":1"));
@@ -3469,7 +3531,10 @@ mod tests {
         assert_eq!(responses_usage["input_tokens"], 100);
         assert_eq!(responses_usage["output_tokens"], 50);
         assert_eq!(responses_usage["input_tokens_details"]["cached_tokens"], 30);
-        assert_eq!(responses_usage["output_tokens_details"]["reasoning_tokens"], 10);
+        assert_eq!(
+            responses_usage["output_tokens_details"]["reasoning_tokens"],
+            10
+        );
 
         let back = map_usage_responses_to_chat(&responses_usage);
         assert_eq!(back["prompt_tokens"], 100);

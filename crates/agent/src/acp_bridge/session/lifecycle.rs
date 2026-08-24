@@ -11,18 +11,16 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 
 use crate::db::agent::AgentWorkspaceRecord;
 
 use super::super::pump::run_stdio_pump;
-use super::super::{
-    AcpBridge, SpawnedAgent, READY_TIMEOUT, SPAWN_TIMEOUT,
-};
+use super::super::{AcpBridge, SpawnedAgent, READY_TIMEOUT, SPAWN_TIMEOUT};
 
 use super::*;
 
@@ -79,11 +77,7 @@ impl AcpBridge {
                         // 多连接广播列表：同 conn_id（重连）替换 tx，新 conn_id
                         // （新标签页/新窗口）追加——流式帧 fan-out 到全部连接，
                         // 不再「最新连接获胜」劫持正在运行的回合。
-                        if let Some(slot) = a
-                            .ws_conns
-                            .iter_mut()
-                            .find(|(id, _)| *id == conn_id)
-                        {
+                        if let Some(slot) = a.ws_conns.iter_mut().find(|(id, _)| *id == conn_id) {
                             slot.1 = ws_tx.clone();
                         } else {
                             a.ws_conns.push((conn_id, ws_tx.clone()));
@@ -493,5 +487,4 @@ impl AcpBridge {
             None => "session not spawned".to_string(),
         }
     }
-
 }

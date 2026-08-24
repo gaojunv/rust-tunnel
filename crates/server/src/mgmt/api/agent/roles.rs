@@ -107,10 +107,7 @@ fn validate_scope(scope: &str) -> Result<(), (StatusCode, String)> {
 }
 
 /// 校验工具名列表：每个元素必须是合法工具名。
-fn validate_tool_list(
-    tools: &[String],
-    field_name: &str,
-) -> Result<(), (StatusCode, String)> {
+fn validate_tool_list(tools: &[String], field_name: &str) -> Result<(), (StatusCode, String)> {
     for tool in tools {
         let t = tool.trim();
         if t.is_empty() {
@@ -136,11 +133,7 @@ fn validate_tool_list(
 fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String, String, String) {
     match scope {
         "global" => ("global".to_string(), String::new(), String::new()),
-        "client" => (
-            "client".to_string(),
-            client_id.to_string(),
-            String::new(),
-        ),
+        "client" => ("client".to_string(), client_id.to_string(), String::new()),
         "workspace" => (
             "workspace".to_string(),
             client_id.to_string(),
@@ -185,10 +178,14 @@ fn validate_role_fields(
 
 /// 角色 JSON 视图（含全字段）。
 fn role_json(r: &AgentRoleRecord) -> serde_json::Value {
-    let tools_allow: Option<Vec<String>> =
-        r.tools_allow.as_deref().and_then(|s| serde_json::from_str(s).ok());
-    let tools_deny: Option<Vec<String>> =
-        r.tools_deny.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let tools_allow: Option<Vec<String>> = r
+        .tools_allow
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let tools_deny: Option<Vec<String>> = r
+        .tools_deny
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     serde_json::json!({
         "id": r.id,
         "name": r.name,
@@ -240,9 +237,7 @@ async fn count_roles(
     if let Some(m) = params.mode.as_deref().filter(|m| !m.is_empty()) {
         qb.push(" AND mode = ").push_bind(m);
     }
-    qb.build_query_scalar::<i64>()
-        .fetch_one(&db.pool)
-        .await
+    qb.build_query_scalar::<i64>().fetch_one(&db.pool).await
 }
 
 // ── Handlers ─────────────────────────────────────────────────────
@@ -320,7 +315,8 @@ pub async fn create_role(
         return e.into_response();
     }
 
-    let (scope_type, client_id, workspace_id) = scope_coords(scope, &body.client_id, &body.workspace_id);
+    let (scope_type, client_id, workspace_id) =
+        scope_coords(scope, &body.client_id, &body.workspace_id);
 
     // 唯一约束校验（提前报 409 而非 DB error）
     if let Ok(Some(_)) = agent
@@ -371,10 +367,7 @@ pub async fn create_role(
 }
 
 /// GET /api/agent/roles/:id — 详情。
-pub async fn get_role(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn get_role(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -402,7 +395,11 @@ pub async fn update_role(
         }
     };
 
-    let name = body.name.as_deref().map(str::trim).unwrap_or(&existing.name);
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.name);
     let description = body
         .description
         .as_deref()
@@ -444,7 +441,10 @@ pub async fn update_role(
         .unwrap_or_default();
     let tools_allow = body.tools_allow.as_deref().unwrap_or(&default_allow);
     let tools_deny = body.tools_deny.as_deref().unwrap_or(&default_deny);
-    let model_override = body.model_override.as_deref().or(existing.model_override.as_deref());
+    let model_override = body
+        .model_override
+        .as_deref()
+        .or(existing.model_override.as_deref());
 
     if let Err(e) = validate_role_fields(
         name,
@@ -698,7 +698,11 @@ mod tests {
         // toggle
         let (status, _) = call(
             &app,
-            json_request(Method::POST, &format!("/api/agent/roles/{id}/toggle"), &json!(null)),
+            json_request(
+                Method::POST,
+                &format!("/api/agent/roles/{id}/toggle"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -712,7 +716,11 @@ mod tests {
         // delete
         let (status, _) = call(
             &app,
-            json_request(Method::DELETE, &format!("/api/agent/roles/{id}"), &json!(null)),
+            json_request(
+                Method::DELETE,
+                &format!("/api/agent/roles/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -739,7 +747,11 @@ mod tests {
         // 非 kebab-case name（大写）
         let (status, _) = call(
             &app,
-            json_request(Method::POST, "/api/agent/roles", &json!({ "name": "MyRole" })),
+            json_request(
+                Method::POST,
+                "/api/agent/roles",
+                &json!({ "name": "MyRole" }),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
@@ -796,11 +808,7 @@ mod tests {
         // 内置角色（seed 后）存在
         let (status, body) = call(
             &app,
-            json_request(
-                Method::GET,
-                "/api/agent/roles?scope=global",
-                &json!(null),
-            ),
+            json_request(Method::GET, "/api/agent/roles?scope=global", &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);

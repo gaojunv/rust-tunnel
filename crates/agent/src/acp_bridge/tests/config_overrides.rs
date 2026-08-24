@@ -33,9 +33,7 @@ async fn test_apply_config_overrides_on_handshake() {
 
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db.clone());
 
     let applied = Arc::new(Mutex::new(Vec::new()));
@@ -91,9 +89,7 @@ async fn test_apply_config_overrides_noop_when_unset() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let options = serde_json::json!([

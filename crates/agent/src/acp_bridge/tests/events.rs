@@ -8,9 +8,7 @@ async fn test_acp_handshake_prompt_streams_events() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
@@ -75,9 +73,7 @@ async fn test_multitab_broadcasts_frames_and_detach_stops_old_tab() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     // 标签页 A：handshake 建立常驻连接任务（setup 已把 A 登记进 ws_conns）。
@@ -144,8 +140,7 @@ async fn test_multitab_broadcasts_frames_and_detach_stops_old_tab() {
         );
     }
     // A 已从广播列表移除：后续帧不再到达（只有 Ok(Some) 才是泄漏）。
-    let stale =
-        tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv()).await;
+    let stale = tokio::time::timeout(std::time::Duration::from_millis(200), ws_rx_a.recv()).await;
     assert!(
         !matches!(stale, Ok(Some(_))),
         "detached tab A should receive nothing: {stale:?}"
@@ -161,9 +156,7 @@ async fn test_cancel_suppresses_terminal_frame() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
@@ -201,8 +194,7 @@ async fn test_cancel_suppresses_terminal_frame() {
             .expect("ws channel closed");
         assert_eq!(ev["type"], expected, "event: {ev}");
     }
-    let terminal =
-        tokio::time::timeout(std::time::Duration::from_millis(300), ws_rx.recv()).await;
+    let terminal = tokio::time::timeout(std::time::Duration::from_millis(300), ws_rx.recv()).await;
     assert!(
         terminal.is_err(),
         "cancelled turn must not emit a terminal frame"
@@ -224,9 +216,7 @@ async fn test_process_crash_sends_error_frame() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
@@ -301,9 +291,7 @@ async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);
@@ -378,9 +366,7 @@ async fn test_acp_events_persisted_to_db() {
         .unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db.clone());
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(16);

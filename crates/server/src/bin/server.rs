@@ -302,9 +302,11 @@ async fn main() -> TunnelResult<()> {
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(rust_tunnel_server::acme::CertEvent::Issued { .. } |
-rust_tunnel_server::acme::CertEvent::Renewed { .. } |
-rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
+                        Ok(
+                            rust_tunnel_server::acme::CertEvent::Issued { .. }
+                            | rust_tunnel_server::acme::CertEvent::Renewed { .. }
+                            | rust_tunnel_server::acme::CertEvent::Expired { .. },
+                        ) => {
                             proxy_state.refresh_all_cert_status(&mgr).await;
                         }
                         Ok(rust_tunnel_server::acme::CertEvent::Error { .. }) => {}
@@ -596,7 +598,8 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
 
                 tokio::spawn(async move {
                     let stats = state_clone.stats_collector.clone();
-                    let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state_clone);
+                    let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
+                        std::sync::Arc::new(state_clone);
                     if let Err(e) = listener::start_shadowsocks_listener_with_abort(
                         registry,
                         stats,

@@ -153,8 +153,8 @@ impl AcmeFullConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerConfig;
     use crate::test_helpers::in_memory_db;
+    use crate::ServerConfig;
 
     #[tokio::test]
     async fn default_seed_on_empty_db_matches_server_config_defaults() {
@@ -262,7 +262,10 @@ mod tests {
         assert_eq!(from_db.cert_dir, seeded.cert_dir);
         assert_eq!(from_db.email, seeded.email);
         assert_eq!(from_db.auto_renew, seeded.auto_renew);
-        assert_eq!(from_db.renewal_check_interval, seeded.renewal_check_interval);
+        assert_eq!(
+            from_db.renewal_check_interval,
+            seeded.renewal_check_interval
+        );
         assert_eq!(
             from_db.renewal_days_before_expiry,
             seeded.renewal_days_before_expiry
@@ -277,7 +280,10 @@ mod tests {
         assert_eq!(reloaded.email, seeded.email);
         assert_eq!(reloaded.enabled, seeded.enabled);
         assert_eq!(reloaded.auto_renew, seeded.auto_renew);
-        assert_eq!(reloaded.renewal_check_interval, seeded.renewal_check_interval);
+        assert_eq!(
+            reloaded.renewal_check_interval,
+            seeded.renewal_check_interval
+        );
         assert_eq!(
             reloaded.renewal_days_before_expiry,
             seeded.renewal_days_before_expiry

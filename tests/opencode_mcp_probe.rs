@@ -40,7 +40,10 @@ async fn opencode_mcp_inject_probe() {
         let root = tempfile::tempdir().expect("tempdir");
         let db = harness.server_state.db().expect("db").clone();
         let opencode_path = format!("{}/.opencode/bin/opencode", std::env::var("HOME").unwrap());
-        assert!(std::path::Path::new(&opencode_path).exists(), "opencode binary missing");
+        assert!(
+            std::path::Path::new(&opencode_path).exists(),
+            "opencode binary missing"
+        );
         db.agent_create_workspace(
             "ws-oc",
             "oc-probe",
@@ -75,7 +78,10 @@ async fn opencode_mcp_inject_probe() {
             .ensure_session("sess-oc", &ws, ws_tx, 1)
             .await
             .expect("ensure_session");
-        println!("[probe] ensure_session (opencode + MCP 注入): {:?}", t0.elapsed());
+        println!(
+            "[probe] ensure_session (opencode + MCP 注入): {:?}",
+            t0.elapsed()
+        );
 
         bridge.wait_ready("sess-oc").await.expect("wait_ready");
         assert!(bridge.session_spawned("sess-oc").await);

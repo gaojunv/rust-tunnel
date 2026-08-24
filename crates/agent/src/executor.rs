@@ -13,7 +13,16 @@ pub async fn exec_on_client(
     docker_container: Option<&str>,
     command: AgentCommand,
 ) -> AgentResult {
-    exec_on_client_impl(agent, workspace_id, client_id, root_path, docker_container, command, true).await
+    exec_on_client_impl(
+        agent,
+        workspace_id,
+        client_id,
+        root_path,
+        docker_container,
+        command,
+        true,
+    )
+    .await
 }
 
 /// 只读命令的并发执行入口：跳过 workspace_lock（只读不触碰 git 状态/写盘，
@@ -27,7 +36,16 @@ pub async fn exec_on_client_readonly(
     docker_container: Option<&str>,
     command: AgentCommand,
 ) -> AgentResult {
-    exec_on_client_impl(agent, workspace_id, client_id, root_path, docker_container, command, false).await
+    exec_on_client_impl(
+        agent,
+        workspace_id,
+        client_id,
+        root_path,
+        docker_container,
+        command,
+        false,
+    )
+    .await
 }
 
 /// 内部实现：`take_lock` 控制是否获取 workspace_lock（只读并发跳过锁）。

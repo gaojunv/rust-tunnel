@@ -90,9 +90,7 @@ impl Database {
     // ── Settings（单行 id=1）─────────────────────────────────────
 
     /// 读取全局设置；无行（从未写入）时返回默认构造（enabled=false）。
-    pub async fn memory_get_settings(
-        &self,
-    ) -> Result<AgentMemorySettingsRecord, sqlx::Error> {
+    pub async fn memory_get_settings(&self) -> Result<AgentMemorySettingsRecord, sqlx::Error> {
         match sqlx::query_as::<_, AgentMemorySettingsRecord>(
             "SELECT * FROM agent_memory_settings WHERE id = 1",
         )
@@ -304,7 +302,10 @@ impl Database {
             _ => "updated_at DESC",
         };
         qb.push(" ORDER BY ").push(order_clause);
-        qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        qb.push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
         qb.build_query_as::<AgentMemoryRecord>()
             .fetch_all(&self.pool)
             .await
@@ -452,9 +453,15 @@ mod tests {
         assert!(m.last_hit_at.is_none());
 
         // update：content/tags/scope/confidence
-        db.memory_update("m1", "用户偏好简洁实现", r#"["rust","clean"]"#, "global", 0.85)
-            .await
-            .unwrap();
+        db.memory_update(
+            "m1",
+            "用户偏好简洁实现",
+            r#"["rust","clean"]"#,
+            "global",
+            0.85,
+        )
+        .await
+        .unwrap();
         let m = db.memory_get_by_id("m1").await.unwrap().unwrap();
         assert_eq!(m.content, "用户偏好简洁实现");
         assert_eq!(m.tags, r#"["rust","clean"]"#);
@@ -471,9 +478,11 @@ mod tests {
     #[tokio::test]
     async fn test_memory_pin_toggle() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert("m1", "fact", "global", "", "", "[]", 0.8, "s1", "remember", false)
-            .await
-            .unwrap();
+        db.memory_insert(
+            "m1", "fact", "global", "", "", "[]", 0.8, "s1", "remember", false,
+        )
+        .await
+        .unwrap();
         db.memory_toggle_pin("m1").await.unwrap();
         assert_eq!(db.memory_get_by_id("m1").await.unwrap().unwrap().pinned, 1);
         db.memory_toggle_pin("m1").await.unwrap();
@@ -504,9 +513,20 @@ mod tests {
     #[tokio::test]
     async fn test_memory_list_scope_filter() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert("m1", "全局事实", "global", "", "", "[]", 0.8, "", "manual", false)
-            .await
-            .unwrap();
+        db.memory_insert(
+            "m1",
+            "全局事实",
+            "global",
+            "",
+            "",
+            "[]",
+            0.8,
+            "",
+            "manual",
+            false,
+        )
+        .await
+        .unwrap();
         db.memory_insert(
             "m2",
             "客户端 c1 事实",
@@ -551,7 +571,10 @@ mod tests {
         .unwrap();
 
         // 全量
-        let all = db.memory_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .memory_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 4);
 
         // scope_type 过滤
@@ -620,7 +643,10 @@ mod tests {
         }
 
         // limit/offset 分页
-        let page = db.memory_list(None, None, None, None, None, None, 2, 1).await.unwrap();
+        let page = db
+            .memory_list(None, None, None, None, None, None, 2, 1)
+            .await
+            .unwrap();
         assert_eq!(page.len(), 2);
 
         // 排序白名单：hits / confidence 不 panic 且按各自键序

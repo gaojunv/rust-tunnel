@@ -146,8 +146,19 @@ mod tests {
 
         // save
         db.save_proxy_rule(
-            "r1", "web", "http", "0.0.0.0:80", None, None, false, false, None, true, None,
-            None, None,
+            "r1",
+            "web",
+            "http",
+            "0.0.0.0:80",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -181,20 +192,53 @@ mod tests {
         let db = in_memory_db().await;
 
         db.save_proxy_rule(
-            "r1", "a", "http", "0.0.0.0:80", None, None, false, false, None, true, None, None,
+            "r1",
+            "a",
+            "http",
+            "0.0.0.0:80",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
             None,
         )
         .await
         .unwrap();
         db.save_proxy_rule(
-            "r2", "b", "tcp", "0.0.0.0:9000", None, None, false, false, None, false, None,
-            None, None,
+            "r2",
+            "b",
+            "tcp",
+            "0.0.0.0:9000",
+            None,
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
         db.save_proxy_rule(
-            "r3", "c", "http", "0.0.0.0:8080", None, None, false, false, None, true, None,
-            None, None,
+            "r3",
+            "c",
+            "http",
+            "0.0.0.0:8080",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -258,7 +302,9 @@ mod tests {
         assert_eq!(r.cert_covering_domain.as_deref(), Some("example.com"));
         assert!(r.cert_status_updated_at.is_some());
         // 时间回环误差容忍 5s（SQLite 文本精度）
-        let delta = (r.cert_status_updated_at.unwrap() - now).num_seconds().abs();
+        let delta = (r.cert_status_updated_at.unwrap() - now)
+            .num_seconds()
+            .abs();
         assert!(delta < 5, "cert_status_updated_at delta {delta}s too large");
 
         // load 也应完整回环
@@ -386,7 +432,18 @@ mod tests {
         db.delete_proxy_rule("nope").await.unwrap();
 
         db.save_proxy_rule(
-            "r1", "x", "http", "0.0.0.0:80", None, None, false, false, None, true, None, None,
+            "r1",
+            "x",
+            "http",
+            "0.0.0.0:80",
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+            None,
+            None,
             None,
         )
         .await

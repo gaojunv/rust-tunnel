@@ -6,13 +6,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[cfg(feature = "rag")]
-use crate::memory::MemoryState;
-#[cfg(feature = "rag")]
-use crate::mcp::McpHttpResponse;
+use super::super::SpawnedAgent;
 #[cfg(feature = "rag")]
 use crate::db::Database;
 #[cfg(feature = "rag")]
-use super::super::SpawnedAgent;
+use crate::mcp::McpHttpResponse;
+#[cfg(feature = "rag")]
+use crate::memory::MemoryState;
 
 /// 处理 ACP agent 经回环代理转发的 MCP 请求（`/mcp/<token>`）。
 ///

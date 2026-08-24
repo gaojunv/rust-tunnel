@@ -80,7 +80,10 @@ async fn acp_spawn_baseline() {
 
         let t1 = Instant::now();
         bridge.wait_ready("sess-acp").await.expect("wait_ready");
-        println!("[probe] wait_ready after ensure_session: {:?}", t1.elapsed());
+        println!(
+            "[probe] wait_ready after ensure_session: {:?}",
+            t1.elapsed()
+        );
 
         assert!(bridge.session_spawned("sess-acp").await);
     })

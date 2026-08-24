@@ -2,16 +2,15 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use crate::session::SessionRuntime;
-use crate::{roles, sse, tools, AgentState};
-use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
+use super::exec_group::exec_readonly_group;
 use super::{
     handle_single_tool_call, is_sse_line, is_sse_response, parse_llm_turn, record_tool_result,
-    runner_usage_ctx, send_tool_call_delta, with_parent, LineBuf,
-    LlmTurn, ParsedToolCall,
+    runner_usage_ctx, send_tool_call_delta, with_parent, LineBuf, LlmTurn, ParsedToolCall,
     MAX_SUBAGENT_ROUNDS, TASK_SUMMARY_MAX_CHARS,
 };
-use super::exec_group::exec_readonly_group;
+use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
+use crate::session::SessionRuntime;
+use crate::{roles, sse, tools, AgentState};
 
 pub fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
     SessionRuntime {
@@ -136,14 +135,28 @@ pub async fn run_subagent_loop(
 ) -> Result<String, String> {
     let system_prompt = roles::subagent_system_prompt(role);
     let model_override = role.and_then(|r| r.model_override.as_deref());
-    let mut sub_rt = SessionRuntime::subagent(parent_rt, system_prompt, task_prompt, parent_tool_call_id, model_override);
+    let mut sub_rt = SessionRuntime::subagent(
+        parent_rt,
+        system_prompt,
+        task_prompt,
+        parent_tool_call_id,
+        model_override,
+    );
 
     // 工具 schema：角色过滤 → 客户端版本过滤 → 裁剪 task 与 todo_write（子循环不需要）
     let allow = role.and_then(|r| roles::parse_tools_list(r.tools_allow.as_deref()));
     let deny = role.and_then(|r| roles::parse_tools_list(r.tools_deny.as_deref()));
-    let client_ver = agent.registry.client_handle(&sub_rt.client_id).await.and_then(|h| h.client_version);
+    let client_ver = agent
+        .registry
+        .client_handle(&sub_rt.client_id)
+        .await
+        .and_then(|h| h.client_version);
     let all_tools = tools::filter_tools_for_client_version(
-        tools::agent_tools_schema_filtered(&sub_rt.approval_mode, allow.as_deref(), deny.as_deref()),
+        tools::agent_tools_schema_filtered(
+            &sub_rt.approval_mode,
+            allow.as_deref(),
+            deny.as_deref(),
+        ),
         client_ver.as_deref(),
     );
     let filtered_tools: Vec<serde_json::Value> = all_tools
@@ -183,15 +196,26 @@ pub async fn run_subagent_loop(
         .await;
 
         let (resp, usage_ctx, usage_started) = match outcome {
-            crate::llm::upstream::FailoverOutcome::Success { resp, candidate, failed_over, .. } => {
+            crate::llm::upstream::FailoverOutcome::Success {
+                resp,
+                candidate,
+                failed_over,
+                ..
+            } => {
                 let ctx = runner_usage_ctx(
                     &candidate,
                     &sub_rt.model,
-                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                    if failed_over {
+                        Some(chain.candidates[0].model_name.clone())
+                    } else {
+                        None
+                    },
                 );
                 (resp, Some(ctx), Some(std::time::Instant::now()))
             }
-            crate::llm::upstream::FailoverOutcome::Exhausted { status, message, .. } => {
+            crate::llm::upstream::FailoverOutcome::Exhausted {
+                status, message, ..
+            } => {
                 // 上下文溢出自愈：内存级降级（清除最老 tool 消息）
                 if super::super::compact::is_context_overflow(status.as_u16(), &message)
                     && subagent_compact_messages(&mut sub_rt)
@@ -280,7 +304,13 @@ pub async fn run_subagent_loop(
                             }
                         }
                         sse::SseFeed::ToolCallDelta { calls, content } => {
-                            send_tool_call_delta(ws_tx, calls, content, sub_rt.parent_tool_call_id.as_deref()).await;
+                            send_tool_call_delta(
+                                ws_tx,
+                                calls,
+                                content,
+                                sub_rt.parent_tool_call_id.as_deref(),
+                            )
+                            .await;
                         }
                         sse::SseFeed::Done => break 'sse,
                         sse::SseFeed::Overflow => {
@@ -301,8 +331,14 @@ pub async fn run_subagent_loop(
                 let body: serde_json::Value = serde_json::from_slice(&buf)
                     .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
                 // 记录用量（非 SSE 嗅探路径：从 body 提取 usage）
-                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
-                    ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+                if let (Some(ctx), Some(db), Some(started)) =
+                    (usage_ctx, llm.db.as_ref(), usage_started)
+                {
+                    ctx.record_success(
+                        db,
+                        crate::llm::usage::extract_usage_from_body(&body),
+                        started,
+                    );
                 }
                 match parse_llm_turn(&body)? {
                     LlmTurn::Text(text) => {
@@ -320,7 +356,16 @@ pub async fn run_subagent_loop(
                         let reasoning = body["choices"][0]["message"]["reasoning_content"]
                             .as_str()
                             .unwrap_or("");
-                        handle_subagent_tool_calls(agent, llm, &mut sub_rt, ws_tx, calls, raw_calls, reasoning).await?;
+                        handle_subagent_tool_calls(
+                            agent,
+                            llm,
+                            &mut sub_rt,
+                            ws_tx,
+                            calls,
+                            raw_calls,
+                            reasoning,
+                        )
+                        .await?;
                         continue;
                     }
                 }
@@ -348,7 +393,13 @@ pub async fn run_subagent_loop(
                         }
                     }
                     sse::SseFeed::ToolCallDelta { calls, content } => {
-                        send_tool_call_delta(ws_tx, calls, content, sub_rt.parent_tool_call_id.as_deref()).await;
+                        send_tool_call_delta(
+                            ws_tx,
+                            calls,
+                            content,
+                            sub_rt.parent_tool_call_id.as_deref(),
+                        )
+                        .await;
                     }
                     sse::SseFeed::Overflow => {
                         return Err("stream size limit exceeded".to_string());
@@ -359,17 +410,31 @@ pub async fn run_subagent_loop(
 
             let turn = agg.finish()?;
             // 记录用量（SSE 路径：usage 从聚合器提取；fatal 已在上游 return）
-            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
+            if let (Some(ctx), Some(db), Some(started)) =
+                (usage_ctx, llm.db.as_ref(), usage_started)
+            {
                 ctx.record_success(db, turn.usage, started);
             }
             if turn.tool_calls.is_empty() {
-                sub_rt.messages.push(ChatMessage::text("assistant", &turn.text));
-                let mut frame = serde_json::json!({"type": "assistant_chunk", "content": "", "final": true});
+                sub_rt
+                    .messages
+                    .push(ChatMessage::text("assistant", &turn.text));
+                let mut frame =
+                    serde_json::json!({"type": "assistant_chunk", "content": "", "final": true});
                 with_parent(&mut frame, &sub_rt);
                 let _ = ws_tx.send(frame).await;
                 return Ok(truncate_summary(turn.text));
             }
-            handle_subagent_tool_calls(agent, llm, &mut sub_rt, ws_tx, turn.tool_calls, turn.raw_tool_calls, &turn.reasoning).await?;
+            handle_subagent_tool_calls(
+                agent,
+                llm,
+                &mut sub_rt,
+                ws_tx,
+                turn.tool_calls,
+                turn.raw_tool_calls,
+                &turn.reasoning,
+            )
+            .await?;
             continue;
         }
 
@@ -381,12 +446,17 @@ pub async fn run_subagent_loop(
             .map_err(|e| format!("invalid LLM response JSON: {e}"))?;
         // 记录用量（非 SSE 回退路径：从 body 提取 usage）
         if let (Some(ctx), Some(db), Some(started)) = (usage_ctx, llm.db.as_ref(), usage_started) {
-            ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+            ctx.record_success(
+                db,
+                crate::llm::usage::extract_usage_from_body(&body),
+                started,
+            );
         }
         match parse_llm_turn(&body)? {
             LlmTurn::Text(text) => {
                 sub_rt.messages.push(ChatMessage::text("assistant", &text));
-                let mut frame = serde_json::json!({"type": "assistant_chunk", "content": "", "final": true});
+                let mut frame =
+                    serde_json::json!({"type": "assistant_chunk", "content": "", "final": true});
                 with_parent(&mut frame, &sub_rt);
                 let _ = ws_tx.send(frame).await;
                 return Ok(truncate_summary(text));
@@ -399,13 +469,25 @@ pub async fn run_subagent_loop(
                 let reasoning = body["choices"][0]["message"]["reasoning_content"]
                     .as_str()
                     .unwrap_or("");
-                handle_subagent_tool_calls(agent, llm, &mut sub_rt, ws_tx, calls, raw_calls, reasoning).await?;
+                handle_subagent_tool_calls(
+                    agent,
+                    llm,
+                    &mut sub_rt,
+                    ws_tx,
+                    calls,
+                    raw_calls,
+                    reasoning,
+                )
+                .await?;
             }
         }
     }
 
     // 轮数耗尽：无 tools 的 LLM 调用取最终摘要
-    sub_rt.messages.push(ChatMessage::text("user", "You have used all available rounds. Produce your final summary now."));
+    sub_rt.messages.push(ChatMessage::text(
+        "user",
+        "You have used all available rounds. Produce your final summary now.",
+    ));
     let chain = crate::llm::router::resolve_with_failover(llm, &sub_rt.model)
         .await
         .map_err(|e| format!("model resolution failed: {e}"))?;
@@ -432,7 +514,12 @@ pub async fn run_subagent_loop(
     )
     .await;
     match outcome {
-        crate::llm::upstream::FailoverOutcome::Success { resp, candidate, failed_over, .. } => {
+        crate::llm::upstream::FailoverOutcome::Success {
+            resp,
+            candidate,
+            failed_over,
+            ..
+        } => {
             let started = std::time::Instant::now();
             let body_bytes = axum::body::to_bytes(resp.into_body(), sse::MAX_STREAM_BYTES)
                 .await
@@ -444,9 +531,17 @@ pub async fn run_subagent_loop(
                 let ctx = runner_usage_ctx(
                     &candidate,
                     &sub_rt.model,
-                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                    if failed_over {
+                        Some(chain.candidates[0].model_name.clone())
+                    } else {
+                        None
+                    },
                 );
-                ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+                ctx.record_success(
+                    db,
+                    crate::llm::usage::extract_usage_from_body(&body),
+                    started,
+                );
             }
             let text = parse_llm_turn(&body).and_then(|turn| match turn {
                 LlmTurn::Text(t) => Ok(t),
@@ -515,7 +610,10 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(!filtered.contains(&"task"), "task should be filtered out");
-        assert!(!filtered.contains(&"todo_write"), "todo_write should be filtered out");
+        assert!(
+            !filtered.contains(&"todo_write"),
+            "todo_write should be filtered out"
+        );
         // 其他工具应保留
         assert!(filtered.contains(&"shell"));
         assert!(filtered.contains(&"read_file"));
@@ -677,5 +775,4 @@ mod tests {
         assert_eq!(cloned.todos.len(), 1);
         assert_eq!(cloned.messages.len(), 1);
     }
-
 }

@@ -94,7 +94,6 @@ pub fn client_supports_edit(version: Option<&str>) -> bool {
         .is_some_and(|v| v >= MIN_EDIT_CLIENT_VERSION)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +184,4 @@ mod tests {
     }
 
     // ── agent_result_to_text WriteOutcome ───────────────────
-
 }

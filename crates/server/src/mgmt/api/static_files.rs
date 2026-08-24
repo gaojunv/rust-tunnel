@@ -31,10 +31,7 @@ pub async fn serve_static(Path(path): Path<String>) -> impl IntoResponse {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             axum::http::Response::builder()
                 .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
-                .header(
-                    axum::http::header::CACHE_CONTROL,
-                    cache_control_for(path),
-                )
+                .header(axum::http::header::CACHE_CONTROL, cache_control_for(path))
                 .body(axum::body::Body::from(content.data))
                 .unwrap()
         }

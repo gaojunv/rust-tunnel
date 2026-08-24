@@ -16,7 +16,7 @@ const MAX_LLM_PROXY_BODY: usize = 900 * 1024;
 /// request_id -> 等待响应 chunk 的 HTTP 连接发送端
 pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>;
 
-#[must_use] 
+#[must_use]
 pub fn new_pending_map() -> PendingMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
@@ -261,9 +261,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
         assert!(port > 0);
 
         // 模拟服务端：收到 request 后回两个 chunk + done
@@ -340,9 +338,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
 
         let big = vec![b'x'; MAX_LLM_PROXY_BODY + 1];
         let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -374,7 +370,10 @@ mod tests {
         let leaked = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
             .await
             .is_ok();
-        assert!(!leaked, "oversized request must not reach the control channel");
+        assert!(
+            !leaked,
+            "oversized request must not reach the control channel"
+        );
 
         kill_tx.send(()).unwrap();
     }
@@ -386,9 +385,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
 
         // 模拟服务端：收到 MCP 请求后回一个 JSON chunk + done
         let server = tokio::spawn(async move {
@@ -447,7 +444,10 @@ mod tests {
             text.contains("content-type: application/json"),
             "got: {text}"
         );
-        assert!(text.contains("{\"jsonrpc\":\"2.0\",\"result\":{}}"), "got: {text}");
+        assert!(
+            text.contains("{\"jsonrpc\":\"2.0\",\"result\":{}}"),
+            "got: {text}"
+        );
         server.await.unwrap();
         kill_tx.send(()).unwrap();
     }
@@ -458,9 +458,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
 
         let server = tokio::spawn(async move {
             let Some(ControlMessage::AgentLlmProxyRequest { request_id, .. }) = rx.recv().await
@@ -492,11 +490,9 @@ mod tests {
         let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        conn.write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        conn.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
         let mut resp = Vec::new();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -522,9 +518,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
 
         let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -559,9 +553,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = new_pending_map();
         let (tx, mut rx) = mpsc::channel(32);
-        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone())
-            .await
-            .unwrap();
+        let (port, kill_tx) = serve("sess-1".into(), tx, pending.clone()).await.unwrap();
 
         let server = tokio::spawn(async move {
             let Some(ControlMessage::AgentLlmProxyRequest { request_id, .. }) = rx.recv().await

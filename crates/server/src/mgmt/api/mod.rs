@@ -399,10 +399,7 @@ pub async fn run_api_server(
             "/api/agent/workspaces/:id/git/branches",
             get(agent::get_git_branches),
         )
-        .route(
-            "/api/agent/workspaces/:id/git/log",
-            get(agent::get_git_log),
-        )
+        .route("/api/agent/workspaces/:id/git/log", get(agent::get_git_log))
         .route(
             "/api/agent/workspaces/:id/git/show",
             get(agent::get_git_show),
@@ -515,10 +512,7 @@ pub async fn run_api_server(
             "/api/agent/sessions/:id/messages",
             get(agent::list_messages),
         )
-        .route(
-            "/api/agent/sessions/:id/export",
-            get(agent::export_session),
-        )
+        .route("/api/agent/sessions/:id/export", get(agent::export_session))
         .route(
             "/api/agent/default-model",
             get(agent::get_default_model).put(agent::put_default_model),

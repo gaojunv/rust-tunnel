@@ -15,9 +15,9 @@ pub mod ingest;
 pub mod retriever;
 pub mod store;
 
+use retriever::RetrievedChunk;
 use rust_tunnel_common::crypto::LlmCipher;
 use rust_tunnel_persistence::Database;
-use retriever::RetrievedChunk;
 use store::VectorStore;
 
 /// RAG 检索结果：命中 chunk + 组装好的注入文本。

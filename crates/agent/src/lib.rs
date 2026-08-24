@@ -24,19 +24,19 @@ pub mod llm_bridge;
 pub mod mcp;
 #[cfg(feature = "rag")]
 pub mod memory;
-#[cfg(feature = "rag")]
-pub mod skill;
-#[cfg(feature = "rag")]
-pub mod wiki;
 pub mod notify;
 pub mod roles;
 pub mod runner;
 pub mod session;
+#[cfg(feature = "rag")]
+pub mod skill;
 pub mod spawner;
 pub mod sse;
 pub mod title;
 pub mod tool_result;
 pub mod tools;
+#[cfg(feature = "rag")]
+pub mod wiki;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -116,11 +116,7 @@ pub trait TunnelExecutor: Send + Sync {
     async fn send_agent_cancel(&self, client_id: &str, request_id: &str) -> bool;
 
     /// 向客户端下发任意控制消息（best-effort）；离线/通道关闭返回 false。
-    async fn send_control(
-        &self,
-        client_id: &str,
-        msg: rust_tunnel_common::ControlMessage,
-    ) -> bool;
+    async fn send_control(&self, client_id: &str, msg: rust_tunnel_common::ControlMessage) -> bool;
 
     /// 打开到客户端侧 `target_addr` 的双向字节隧道（PTY 终端等场景用）。
     /// 返回类型擦除的 `AsyncRead + AsyncWrite` 流。
@@ -136,18 +132,12 @@ pub trait TunnelExecutor: Send + Sync {
 }
 
 /// `open_tunnel` 的返回类型：类型擦除的双向字节流。
-pub type TunnelByteStream =
-    std::pin::Pin<Box<dyn TunnelAsyncReadWrite>>;
+pub type TunnelByteStream = std::pin::Pin<Box<dyn TunnelAsyncReadWrite>>;
 
 /// 类型擦除用的复合 trait（`AsyncRead + AsyncWrite + Send`）。
-pub trait TunnelAsyncReadWrite:
-    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send
-{
-}
+pub trait TunnelAsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send {}
 
-impl<T> TunnelAsyncReadWrite for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send
-{
-}
+impl<T> TunnelAsyncReadWrite for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send {}
 
 /// 审批卡片上展示的选项（ACP `session/request_permission` 透传；runner 路径为空）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,9 +680,7 @@ pub(crate) mod test_helpers {
     /// 内存 SQLite 数据库（测试 fixture）。
     #[allow(dead_code)] // rag feature 的 memory 测试使用
     pub(crate) async fn in_memory_db() -> Database {
-        Database::new(":memory:")
-            .await
-            .expect("in-memory db")
+        Database::new(":memory:").await.expect("in-memory db")
     }
 
     /// 种子：创建 workspace + session，返回 session id。
@@ -700,8 +688,18 @@ pub(crate) mod test_helpers {
     #[allow(dead_code)] // rag feature 的 memory 测试使用
     pub(crate) async fn seed_workspace_and_session(db: &Database) -> String {
         db.agent_create_workspace(
-            "ws-test", "test-ws", "test-client", "host", "/tmp",
-            None, None, "", None, None, None, None,
+            "ws-test",
+            "test-ws",
+            "test-client",
+            "host",
+            "/tmp",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("seed workspace");
@@ -726,8 +724,7 @@ pub(crate) mod test_helpers {
     #[derive(Clone, Debug)]
     pub(crate) struct TestRegistry {
         entries: Arc<tokio::sync::RwLock<HashMap<String, TestClientEntry>>>,
-        spawn_pending:
-            Arc<Mutex<HashMap<String, oneshot::Sender<ControlMessage>>>>,
+        spawn_pending: Arc<Mutex<HashMap<String, oneshot::Sender<ControlMessage>>>>,
         agent_pending:
             Arc<Mutex<HashMap<String, oneshot::Sender<rust_tunnel_common::AgentResult>>>>,
     }
@@ -823,8 +820,7 @@ pub(crate) mod test_helpers {
                 .lock()
                 .await
                 .insert(session_id.to_string(), tx);
-            let send_result =
-                tokio::time::timeout(timeout, sender.send(request)).await;
+            let send_result = tokio::time::timeout(timeout, sender.send(request)).await;
             match send_result {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
@@ -937,10 +933,7 @@ mod tests {
     /// 构造一个带空 pending 表的 AgentState（elicitation 测试用）。
     async fn test_agent() -> AgentState {
         let db = Database::new(":memory:").await.unwrap();
-        AgentState::new(
-            Arc::new(test_helpers::TestRegistry::new(&db)),
-            db,
-        )
+        AgentState::new(Arc::new(test_helpers::TestRegistry::new(&db)), db)
     }
 
     /// 发一个挂起的 elicitation（长超时，测试内 resolve/abort），并等待 pending

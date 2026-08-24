@@ -509,7 +509,8 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                         }
                         // 上游原生 tool_calls（模型走了结构化路径）：原样透传
                         if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
-                            st.queue.push_back(Bytes::from(format!("data: {payload}\n\n")));
+                            st.queue
+                                .push_back(Bytes::from(format!("data: {payload}\n\n")));
                             // 如果原生 tool_calls chunk 也携带 usage，清除 usage_chunk 防止重复
                             if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
                                 st.usage_chunk = None;
@@ -541,7 +542,8 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                             && chunk["choices"][0]["finish_reason"].as_str().is_none()
                             && !chunk.get("usage").map(|u| u.is_object()).unwrap_or(false)
                         {
-                            st.queue.push_back(Bytes::from(format!("data: {payload}\n\n")));
+                            st.queue
+                                .push_back(Bytes::from(format!("data: {payload}\n\n")));
                         }
                     }
                 }
@@ -1449,9 +1451,7 @@ mod tests {
             .body(Body::from(text.clone()))
             .unwrap();
         let anthropic_stream =
-            crate::anthropic_handler::convert_openai_stream_to_anthropic_for_test(
-                anthropic_resp,
-            );
+            crate::anthropic_handler::convert_openai_stream_to_anthropic_for_test(anthropic_resp);
         let anthropic_bytes = axum::body::to_bytes(anthropic_stream.into_body(), 1024 * 1024)
             .await
             .unwrap();

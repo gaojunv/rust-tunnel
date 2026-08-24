@@ -9,7 +9,7 @@
 //!   到服务端调用，同样落本地保存。
 
 use super::{
-    upsert_memory_with_dedup, MemoryState, MEMORY_CONTENT_MAX_CHARS, MAX_TAGS, TAG_MAX_CHARS,
+    upsert_memory_with_dedup, MemoryState, MAX_TAGS, MEMORY_CONTENT_MAX_CHARS, TAG_MAX_CHARS,
 };
 use crate::{session::SessionRuntime, AgentState};
 
@@ -113,7 +113,14 @@ pub async fn remember_from_agent(
     let Some(memory) = &agent.memory else {
         return Err("AI memory is not enabled".into());
     };
-    remember_execute(memory, &rt.client_id, &rt.workspace_id, &rt.session_id, args_json).await
+    remember_execute(
+        memory,
+        &rt.client_id,
+        &rt.workspace_id,
+        &rt.session_id,
+        args_json,
+    )
+    .await
 }
 
 #[cfg(all(test, feature = "rag"))]
@@ -175,8 +182,12 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         let agent = agent_without_memory(db).await;
         let r = rt("s1", "c1", "w1");
-        assert!(remember_from_agent(&agent, &r, r#"{"content": "  "}"#).await.is_err());
-        assert!(remember_from_agent(&agent, &r, r#"{"scope": "workspace"}"#).await.is_err());
+        assert!(remember_from_agent(&agent, &r, r#"{"content": "  "}"#)
+            .await
+            .is_err());
+        assert!(remember_from_agent(&agent, &r, r#"{"scope": "workspace"}"#)
+            .await
+            .is_err());
         assert!(remember_from_agent(&agent, &r, "not json").await.is_err());
     }
 
@@ -187,9 +198,15 @@ mod tests {
         let r = rt("s1", "c1", "w1");
         let big = "x".repeat(MEMORY_CONTENT_MAX_CHARS + 1);
         let args = serde_json::json!({"content": big}).to_string();
-        assert!(remember_from_agent(&agent, &r, &args).await.unwrap_err().contains("too long"));
+        assert!(remember_from_agent(&agent, &r, &args)
+            .await
+            .unwrap_err()
+            .contains("too long"));
         let args = r#"{"content": "ok", "scope": "bogus"}"#;
-        assert!(remember_from_agent(&agent, &r, args).await.unwrap_err().contains("invalid scope"));
+        assert!(remember_from_agent(&agent, &r, args)
+            .await
+            .unwrap_err()
+            .contains("invalid scope"));
     }
 
     #[tokio::test]
@@ -220,7 +237,10 @@ mod tests {
         let r = rt("s1", "c1", "w1");
         let args = r#"{"content": "用户偏好简洁", "scope": "workspace", "tags": ["rust"]}"#;
         let err = remember_from_agent(&agent, &r, args).await.unwrap_err();
-        assert!(err.contains("embedding") || err.contains("memory"), "err: {err}");
+        assert!(
+            err.contains("embedding") || err.contains("memory"),
+            "err: {err}"
+        );
     }
 
     #[tokio::test]
@@ -236,7 +256,9 @@ mod tests {
         )
         .with_memory(memory);
         let r = rt("s1", "c1", "w1");
-        let err = remember_from_agent(&agent, &r, r#"{"content": "x"}"#).await.unwrap_err();
+        let err = remember_from_agent(&agent, &r, r#"{"content": "x"}"#)
+            .await
+            .unwrap_err();
         assert!(err.contains("disabled"), "err: {err}");
     }
 
@@ -245,7 +267,9 @@ mod tests {
         let db = Database::new(":memory:").await.unwrap();
         let agent = agent_without_memory(db).await;
         let r = rt("s1", "c1", "w1");
-        let err = remember_from_agent(&agent, &r, r#"{"content": "x"}"#).await.unwrap_err();
+        let err = remember_from_agent(&agent, &r, r#"{"content": "x"}"#)
+            .await
+            .unwrap_err();
         assert!(err.contains("not enabled"), "err: {err}");
     }
 }

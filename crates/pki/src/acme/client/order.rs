@@ -34,7 +34,9 @@ impl AcmeClient {
             let guard = self.account.read().await;
             guard
                 .as_ref()
-                .ok_or_else(|| AcmeError::msg("ACME account not initialized. Call initialize() first."))?
+                .ok_or_else(|| {
+                    AcmeError::msg("ACME account not initialized. Call initialize() first.")
+                })?
                 .clone()
         };
 
@@ -79,12 +81,16 @@ impl AcmeClient {
         let mut challenge_tokens: Vec<String> = Vec::new();
         let mut authorizations = order.authorizations();
         while let Some(auth_result) = authorizations.next().await {
-            let mut auth_handle = auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
+            let mut auth_handle =
+                auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
 
             // Find the HTTP-01 challenge
-            let mut challenge_handle = auth_handle
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| AcmeError::msgf(format!("No HTTP-01 challenge found for domain {}", domain)))?;
+            let mut challenge_handle =
+                auth_handle
+                    .challenge(ChallengeType::Http01)
+                    .ok_or_else(|| {
+                        AcmeError::msgf(format!("No HTTP-01 challenge found for domain {}", domain))
+                    })?;
 
             // Get the key authorization response
             let key_authorization = challenge_handle.key_authorization();
@@ -134,14 +140,16 @@ impl AcmeClient {
                 }
                 return Err(AcmeError::msgf(format!(
                     "Challenge validation timed out for domain {} after {:?}",
-                    domain,
-                    CHALLENGE_POLL_TIMEOUT
+                    domain, CHALLENGE_POLL_TIMEOUT
                 )));
             }
 
             tokio::time::sleep(CHALLENGE_POLL_INTERVAL).await;
 
-            let state = order.refresh().await.map_err(AcmeError::protocol("Failed to refresh order"))?;
+            let state = order
+                .refresh()
+                .await
+                .map_err(AcmeError::protocol("Failed to refresh order"))?;
             let status = state.status;
 
             match status {
@@ -169,8 +177,7 @@ impl AcmeClient {
 
                     return Err(AcmeError::msgf(format!(
                         "ACME order became invalid for domain {}: {}",
-                        domain,
-                        error_detail
+                        domain, error_detail
                     )));
                 }
                 _ => {
@@ -202,10 +209,13 @@ impl AcmeClient {
         let retry_policy = RetryPolicy::new()
             .initial_delay(Duration::from_secs(2))
             .timeout(Duration::from_secs(120));
-        let cert_chain = order
-            .poll_certificate(&retry_policy)
-            .await
-            .map_err(AcmeError::protocol("Failed to download certificate after finalization"))?;
+        let cert_chain =
+            order
+                .poll_certificate(&retry_policy)
+                .await
+                .map_err(AcmeError::protocol(
+                    "Failed to download certificate after finalization",
+                ))?;
 
         // Parse the certificate to get expiry date
         let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)
@@ -301,7 +311,9 @@ impl AcmeClient {
             let guard = self.account.read().await;
             guard
                 .as_ref()
-                .ok_or_else(|| AcmeError::msg("ACME account not initialized. Call initialize() first."))?
+                .ok_or_else(|| {
+                    AcmeError::msg("ACME account not initialized. Call initialize() first.")
+                })?
                 .clone()
         };
 
@@ -348,12 +360,14 @@ impl AcmeClient {
         let mut authorizations = order.authorizations();
 
         while let Some(auth_result) = authorizations.next().await {
-            let mut auth_handle = auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
+            let mut auth_handle =
+                auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
 
             // Find the DNS-01 challenge
-            let mut challenge_handle = auth_handle
-                .challenge(ChallengeType::Dns01)
-                .ok_or_else(|| AcmeError::msgf(format!("No DNS-01 challenge found for domain {}", domain)))?;
+            let mut challenge_handle =
+                auth_handle.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                    AcmeError::msgf(format!("No DNS-01 challenge found for domain {}", domain))
+                })?;
 
             // Get the key authorization
             let key_authorization = challenge_handle.key_authorization();
@@ -426,14 +440,16 @@ impl AcmeClient {
                 }
                 return Err(AcmeError::msgf(format!(
                     "Challenge validation timed out for domain {} after {:?}",
-                    domain,
-                    CHALLENGE_POLL_TIMEOUT
+                    domain, CHALLENGE_POLL_TIMEOUT
                 )));
             }
 
             tokio::time::sleep(CHALLENGE_POLL_INTERVAL).await;
 
-            let state = order.refresh().await.map_err(AcmeError::protocol("Failed to refresh order"))?;
+            let state = order
+                .refresh()
+                .await
+                .map_err(AcmeError::protocol("Failed to refresh order"))?;
             let status = state.status;
 
             match status {
@@ -463,8 +479,7 @@ impl AcmeClient {
 
                     return Err(AcmeError::msgf(format!(
                         "ACME order became invalid for domain {}: {}",
-                        domain,
-                        error_detail
+                        domain, error_detail
                     )));
                 }
                 _ => {
@@ -495,10 +510,13 @@ impl AcmeClient {
         let retry_policy = RetryPolicy::new()
             .initial_delay(Duration::from_secs(2))
             .timeout(Duration::from_secs(120));
-        let cert_chain = order
-            .poll_certificate(&retry_policy)
-            .await
-            .map_err(AcmeError::protocol("Failed to download certificate after finalization"))?;
+        let cert_chain =
+            order
+                .poll_certificate(&retry_policy)
+                .await
+                .map_err(AcmeError::protocol(
+                    "Failed to download certificate after finalization",
+                ))?;
 
         // Parse the certificate to get expiry date
         let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)

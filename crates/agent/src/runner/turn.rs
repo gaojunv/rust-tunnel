@@ -207,12 +207,8 @@ pub async fn run_agent_turn(
     #[cfg(feature = "rag")]
     if rt.skill_list_block.is_none() {
         let block = if let Some(memory) = agent.memory.as_ref() {
-            crate::skill::retrieve_skill_list_for_session(
-                memory,
-                &rt.client_id,
-                &rt.workspace_id,
-            )
-            .await
+            crate::skill::retrieve_skill_list_for_session(memory, &rt.client_id, &rt.workspace_id)
+                .await
         } else {
             None
         };
@@ -231,12 +227,7 @@ pub async fn run_agent_turn(
     #[cfg(feature = "rag")]
     if rt.wiki_list_block.is_none() {
         let block = if let Some(wiki) = agent.wiki.as_ref() {
-            crate::wiki::retrieve_wiki_list_for_session(
-                wiki,
-                &rt.client_id,
-                &rt.workspace_id,
-            )
-            .await
+            crate::wiki::retrieve_wiki_list_for_session(wiki, &rt.client_id, &rt.workspace_id).await
         } else {
             None
         };
@@ -285,11 +276,11 @@ pub async fn run_agent_turn(
     // 把 task_schema_roles_block() 追加到 task 工具 description（system 块独立 tag）。
     const ROLES_BLOCK_TAG: &str = "\n\n---\n\n### Available Sub-Agent Roles";
     if rt.roles_block.is_none() && rt.depth == 0 {
-        let visible = agent.db.role_list_visible(
-            &rt.client_id,
-            &rt.workspace_id,
-            Some("subagent"),
-        ).await.unwrap_or_default();
+        let visible = agent
+            .db
+            .role_list_visible(&rt.client_id, &rt.workspace_id, Some("subagent"))
+            .await
+            .unwrap_or_default();
         let block = roles::task_schema_roles_block(&visible);
         rt.roles_block = Some(block.clone());
         // 注入到 system 块（独立 tag，便于更新）
@@ -341,12 +332,22 @@ pub async fn run_agent_turn(
             temperature: None,
             top_p: None,
             tools: {
-                let client_ver = agent.registry.client_handle(&rt.client_id).await.and_then(|h| h.client_version);
+                let client_ver = agent
+                    .registry
+                    .client_handle(&rt.client_id)
+                    .await
+                    .and_then(|h| h.client_version);
                 Some(tools::filter_tools_for_client_version(
                     tools::agent_tools_schema_filtered(
                         &rt.approval_mode,
-                        rt.active_role.as_ref().and_then(|r| roles::parse_tools_list(r.tools_allow.as_deref())).as_deref(),
-                        rt.active_role.as_ref().and_then(|r| roles::parse_tools_list(r.tools_deny.as_deref())).as_deref(),
+                        rt.active_role
+                            .as_ref()
+                            .and_then(|r| roles::parse_tools_list(r.tools_allow.as_deref()))
+                            .as_deref(),
+                        rt.active_role
+                            .as_ref()
+                            .and_then(|r| roles::parse_tools_list(r.tools_deny.as_deref()))
+                            .as_deref(),
                     ),
                     client_ver.as_deref(),
                 ))
@@ -368,25 +369,35 @@ pub async fn run_agent_turn(
 
         let mut resp = match outcome {
             crate::llm::upstream::FailoverOutcome::Success {
-                resp, candidate, failed_over, ..
+                resp,
+                candidate,
+                failed_over,
+                ..
             } => {
                 // 构造用量记录上下文
                 usage_ctx = Some(runner_usage_ctx(
                     &candidate,
                     &rt.model,
-                    if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+                    if failed_over {
+                        Some(chain.candidates[0].model_name.clone())
+                    } else {
+                        None
+                    },
                 ));
                 usage_started = Some(std::time::Instant::now());
                 resp
             }
-            crate::llm::upstream::FailoverOutcome::Exhausted { status, message, .. } => {
+            crate::llm::upstream::FailoverOutcome::Exhausted {
+                status, message, ..
+            } => {
                 // 上下文溢出自愈：token 估算（chars/4）可能低估，上游返回
                 // context-length-exceeded 时强制压缩后重试一次本回合。
                 // 压缩成功（find_cut_point 有空间）→ 重试；无可压缩段 → 报错。
                 // 无限循环被 find_cut_point 自然遏制：压缩后保留段 <= keep_recent+2，
                 // 切点必为 0，后续 force_compact 返回 false。
                 if compact::is_context_overflow(status.as_u16(), &message) {
-                    if let Ok(did_compact) = compact::force_compact(&agent, &llm, rt, &ws_tx).await {
+                    if let Ok(did_compact) = compact::force_compact(&agent, &llm, rt, &ws_tx).await
+                    {
                         if did_compact {
                             let _ = ws_tx
                                 .send(serde_json::json!({
@@ -399,7 +410,9 @@ pub async fn run_agent_turn(
                     }
                 }
                 // 记录 LLM 不可用失败
-                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                if let (Some(ctx), Some(db), Some(started)) =
+                    (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+                {
                     ctx.record_failure(db, status.as_u16() as i32, "exhausted", started);
                 }
                 let _ = ws_tx
@@ -454,7 +467,9 @@ pub async fn run_agent_turn(
                                 }))
                                 .await;
                             // 记录流中断失败
-                            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                            if let (Some(ctx), Some(db), Some(started)) =
+                                (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+                            {
                                 ctx.record_failure(db, 502, "stream_interrupted", started);
                             }
                             let retry = crate::llm::upstream::execute_with_failover(
@@ -490,7 +505,9 @@ pub async fn run_agent_turn(
                                             serde_json::from_slice(&body_bytes).map_err(|e| {
                                                 format!("invalid LLM response JSON: {e}")
                                             })?;
-                                        if handle_llm_turn_json(&agent, &llm, rt, &ws_tx, &body).await? {
+                                        if handle_llm_turn_json(&agent, &llm, rt, &ws_tx, &body)
+                                            .await?
+                                        {
                                             return Ok(());
                                         }
                                         continue 'round; // 外层 for _round
@@ -505,11 +522,15 @@ pub async fn run_agent_turn(
                                     continue 'sse;
                                 }
                                 crate::llm::upstream::FailoverOutcome::Exhausted {
-                                    status, message, ..
+                                    status,
+                                    message,
+                                    ..
                                 } => {
                                     // 上下文溢出自愈（同主路径逻辑）
                                     if compact::is_context_overflow(status.as_u16(), &message) {
-                                        if let Ok(did_compact) = compact::force_compact(&agent, &llm, rt, &ws_tx).await {
+                                        if let Ok(did_compact) =
+                                            compact::force_compact(&agent, &llm, rt, &ws_tx).await
+                                        {
                                             if did_compact {
                                                 let _ = ws_tx
                                                     .send(serde_json::json!({
@@ -522,8 +543,15 @@ pub async fn run_agent_turn(
                                         }
                                     }
                                     // 记录重试耗尽失败
-                                    if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
-                                        ctx.record_failure(db, status.as_u16() as i32, "retry_exhausted", started);
+                                    if let (Some(ctx), Some(db), Some(started)) =
+                                        (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+                                    {
+                                        ctx.record_failure(
+                                            db,
+                                            status.as_u16() as i32,
+                                            "retry_exhausted",
+                                            started,
+                                        );
                                     }
                                     let _ = ws_tx.send(serde_json::json!({"type": "error", "message": format!("LLM unavailable: {message}")})).await;
                                     return Err(format!("LLM unavailable: {message}"));
@@ -589,7 +617,13 @@ pub async fn run_agent_turn(
                             }
                         }
                         sse::SseFeed::ToolCallDelta { calls, content } => {
-                            send_tool_call_delta(&ws_tx, calls, content, rt.parent_tool_call_id.as_deref()).await;
+                            send_tool_call_delta(
+                                &ws_tx,
+                                calls,
+                                content,
+                                rt.parent_tool_call_id.as_deref(),
+                            )
+                            .await;
                         }
                         sse::SseFeed::Done => break 'sse,
                         sse::SseFeed::Overflow => {
@@ -604,7 +638,9 @@ pub async fn run_agent_turn(
 
             if fatal {
                 // 记录流致命错误
-                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                if let (Some(ctx), Some(db), Some(started)) =
+                    (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+                {
                     ctx.record_failure(db, 502, "stream_fatal_error", started);
                 }
                 let _ = ws_tx
@@ -646,7 +682,13 @@ pub async fn run_agent_turn(
                         }
                     }
                     sse::SseFeed::ToolCallDelta { calls, content } => {
-                        send_tool_call_delta(&ws_tx, calls, content, rt.parent_tool_call_id.as_deref()).await;
+                        send_tool_call_delta(
+                            &ws_tx,
+                            calls,
+                            content,
+                            rt.parent_tool_call_id.as_deref(),
+                        )
+                        .await;
                     }
                     sse::SseFeed::Overflow => {
                         let _ = ws_tx
@@ -704,15 +746,29 @@ pub async fn run_agent_turn(
                 .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
                 // 记录用量（streaming 路径：usage 从聚合器提取）
-                if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+                if let (Some(ctx), Some(db), Some(started)) =
+                    (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+                {
                     ctx.record_success(db, turn.usage, started);
                 }
                 return Ok(());
             }
             // tool 回合：转成与 parse_llm_turn 相同的处理流（见下）
-            handle_tool_calls(&agent, &llm, rt, &ws_tx, turn.tool_calls, turn.raw_tool_calls, &turn.reasoning, true).await?;
+            handle_tool_calls(
+                &agent,
+                &llm,
+                rt,
+                &ws_tx,
+                turn.tool_calls,
+                turn.raw_tool_calls,
+                &turn.reasoning,
+                true,
+            )
+            .await?;
             // 记录用量（streaming 路径：usage 从聚合器提取）
-            if let (Some(ctx), Some(db), Some(started)) = (usage_ctx.take(), llm.db.as_ref(), usage_started.take()) {
+            if let (Some(ctx), Some(db), Some(started)) =
+                (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
+            {
                 ctx.record_success(db, turn.usage, started);
             }
             continue;
@@ -809,7 +865,6 @@ pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, conten
     .await;
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,5 +939,4 @@ mod tests {
     }
 
     // ── client_supports_edit 版本门控 ──────────────────────
-
 }

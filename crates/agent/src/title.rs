@@ -128,8 +128,12 @@ async fn generate_title_inner(
     )
     .await;
     let crate::llm::upstream::FailoverOutcome::Success {
-        resp, candidate, failed_over, ..
-    } = outcome else {
+        resp,
+        candidate,
+        failed_over,
+        ..
+    } = outcome
+    else {
         return Err("LLM unavailable for title generation".to_string());
     };
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -142,9 +146,17 @@ async fn generate_title_inner(
         let ctx = super::runner::runner_usage_ctx(
             &candidate,
             model,
-            if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+            if failed_over {
+                Some(chain.candidates[0].model_name.clone())
+            } else {
+                None
+            },
         );
-        ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&json), started);
+        ctx.record_success(
+            db,
+            crate::llm::usage::extract_usage_from_body(&json),
+            started,
+        );
     }
     let raw = json
         .pointer("/choices/0/message/content")

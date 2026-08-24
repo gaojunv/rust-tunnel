@@ -669,13 +669,13 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use rust_tunnel_pki::acme::CertificateManager;
         use crate::reverse_proxy::router::RouteTable;
         use crate::reverse_proxy::shared_listener::SharedListener;
         use crate::reverse_proxy::{
             Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
             RuleType,
         };
+        use rust_tunnel_pki::acme::CertificateManager;
 
         const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -861,7 +861,6 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
-        use crate::tunnel_opener::TunnelOpener;
         use crate::reverse_proxy::connector::ClientConnector;
         use crate::reverse_proxy::router::RouteTable;
         use crate::reverse_proxy::upstream::UpstreamClient;
@@ -869,11 +868,16 @@ mod tests {
             Backend, BackendKind, BackendProtocol, BackendScheme, LoadBalancing, ProxyRule, Route,
             RuleType,
         };
+        use crate::tunnel_opener::TunnelOpener;
         // 1. Mock TunnelOpener that echoes and performs WS handshake on first read
         struct WsEchoOpener;
         #[async_trait::async_trait]
         impl TunnelOpener for WsEchoOpener {
-            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+            async fn open_tunnel(
+                &self,
+                _client_name: &str,
+                _target_addr: &str,
+            ) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
                 use tokio::io::duplex;
                 let (client_side, mut server_side) = duplex(16384);
                 tokio::spawn(async move {
@@ -886,17 +890,36 @@ mod tests {
                         _ => return,
                     };
                     let text = String::from_utf8_lossy(&buf[..n]);
-                    let key = text.lines().find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:")).and_then(|l| l.split_once(':')).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+                    let key = text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                        .and_then(|l| l.split_once(':'))
+                        .map(|(_, v)| v.trim().to_string())
+                        .unwrap_or_default();
                     let mut h = Sha1::new();
                     h.update(key.as_bytes());
                     h.update(WS_MAGIC.as_bytes());
                     let accept = base64::engine::general_purpose::STANDARD.encode(h.finalize());
                     let resp = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
-                    if tokio::io::AsyncWriteExt::write_all(&mut server_side, resp.as_bytes()).await.is_err() { return; }
+                    if tokio::io::AsyncWriteExt::write_all(&mut server_side, resp.as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     let mut tmp = vec![0u8; 4096];
                     loop {
-                        let n = match tokio::io::AsyncReadExt::read(&mut server_side, &mut tmp).await { Ok(0) | Err(_) => break, Ok(n) => n };
-                        if tokio::io::AsyncWriteExt::write_all(&mut server_side, &tmp[..n]).await.is_err() { break; }
+                        let n =
+                            match tokio::io::AsyncReadExt::read(&mut server_side, &mut tmp).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                        if tokio::io::AsyncWriteExt::write_all(&mut server_side, &tmp[..n])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 });
                 Ok(Box::new(client_side))
@@ -1294,11 +1317,11 @@ mod http2_tests {
     use tokio::net::TcpListener;
     use tokio_rustls::rustls;
 
-    use rust_tunnel_pki::acme::{CertEntry, CertSource, CertificateManager};
     use crate::reverse_proxy::shared_listener::SharedListener;
     use crate::reverse_proxy::{
         Backend, BackendScheme, LoadBalancing, ProxyRule, ProxyTlsConfig, Route, RuleType,
     };
+    use rust_tunnel_pki::acme::{CertEntry, CertSource, CertificateManager};
 
     /// Register a self-signed cert for the given domain in the manager.
     async fn seed_cert(mgr: &Arc<CertificateManager>, domain: &str) {

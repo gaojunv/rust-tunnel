@@ -115,7 +115,8 @@ async fn ss_stats_appear_in_summary() {
         let state = harness.server_state.clone();
         tokio::spawn(async move {
             let stats = state.stats_collector.clone();
-            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state);
+            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
+                std::sync::Arc::new(state);
             let _ = listener::start_shadowsocks_listener(
                 registry,
                 stats,
@@ -208,7 +209,8 @@ async fn trojan_stats_appear_in_summary() {
         let state = harness.server_state.clone();
         tokio::spawn(async move {
             let stats = state.stats_collector.clone();
-            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state);
+            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
+                std::sync::Arc::new(state);
             let _ = listener::start_trojan_listener(
                 registry,
                 stats,

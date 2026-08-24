@@ -40,8 +40,11 @@ async fn test_ensure_session_production_config_injection_order() {
     ]);
     let applied = Arc::new(Mutex::new(Vec::new()));
     let registry = crate::test_helpers::TestRegistry::new(&db);
-    let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry.clone())), db.clone())
-        .with_llm_gateway(test_gateway(&db));
+    let bridge = AcpBridge::new(
+        AgentSpawner::new(std::sync::Arc::new(registry.clone())),
+        db.clone(),
+    )
+    .with_llm_gateway(test_gateway(&db));
     // 本用例不测 MCP 注入：mock 缺省 http=false，mcpServers 丢弃。
     spawn_e2e_client(
         &registry,
@@ -120,9 +123,17 @@ async fn test_handshake_injects_mcp_server_when_http_capable() {
     .await;
 
     let received = mcp_servers.lock().await.clone();
-    assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+    assert_eq!(
+        received.len(),
+        1,
+        "session/new 应记录一次 mcpServers: {received:?}"
+    );
     let servers = received[0].as_array().expect("mcpServers 应为数组");
-    assert_eq!(servers.len(), 1, "http 能力 + token 应注入 1 条 server: {received:?}");
+    assert_eq!(
+        servers.len(),
+        1,
+        "http 能力 + token 应注入 1 条 server: {received:?}"
+    );
     let entry = &servers[0];
     assert_eq!(entry["type"], "http");
     assert_eq!(entry["name"], "rust-tunnel-memory");
@@ -150,20 +161,21 @@ async fn test_handshake_skips_mcp_injection_without_http_capability() {
     let received = mcp_servers.lock().await.clone();
     assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
     assert!(
-        received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        received[0]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "无 http 能力时 mcpServers 应为空: {received:?}"
     );
     // 会话照常建立
-    assert!(
-        bridge
-            .sessions
-            .lock()
-            .await
-            .get("sess-1")
-            .unwrap()
-            .connection
-            .is_some()
-    );
+    assert!(bridge
+        .sessions
+        .lock()
+        .await
+        .get("sess-1")
+        .unwrap()
+        .connection
+        .is_some());
 }
 
 /// 有 http 能力但会话未铸造 token（memory 未启用等）→ 不注入，不报错。
@@ -185,7 +197,10 @@ async fn test_handshake_skips_mcp_injection_without_token() {
     let received = mcp_servers.lock().await.clone();
     assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
     assert!(
-        received[0].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        received[0]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
         "无 token 时 mcpServers 应为空: {received:?}"
     );
 }
@@ -210,9 +225,17 @@ async fn test_handshake_injects_mcp_for_opencode() {
     .await;
 
     let received = mcp_servers.lock().await.clone();
-    assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+    assert_eq!(
+        received.len(),
+        1,
+        "session/new 应记录一次 mcpServers: {received:?}"
+    );
     let servers = received[0].as_array().expect("mcpServers 应为数组");
-    assert_eq!(servers.len(), 1, "http 能力 + token 应注入 1 条 server: {received:?}");
+    assert_eq!(
+        servers.len(),
+        1,
+        "http 能力 + token 应注入 1 条 server: {received:?}"
+    );
     let entry = &servers[0];
     assert_eq!(entry["type"], "http");
     assert_eq!(entry["name"], "rust-tunnel-memory");
@@ -261,9 +284,12 @@ async fn test_ensure_session_injects_mcp_server_with_memory() {
     // memory 注入（token 铸造前置条件）：mock embedding server + 开启 settings。
     let base = crate::memory::mock_embedding_server(8).await;
     let (_mdb, memory) = crate::memory::test_memory_with_embedding(&base).await;
-    let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry.clone())), db.clone())
-        .with_memory(memory)
-        .with_llm_gateway(test_gateway(&db));
+    let bridge = AcpBridge::new(
+        AgentSpawner::new(std::sync::Arc::new(registry.clone())),
+        db.clone(),
+    )
+    .with_memory(memory)
+    .with_llm_gateway(test_gateway(&db));
     // e2e mock 声明 mcp http 能力并记录收到的 mcpServers。
     spawn_e2e_client(
         &registry,
@@ -285,9 +311,17 @@ async fn test_ensure_session_injects_mcp_server_with_memory() {
 
     // session/new 收到注入的 mcpServers（1 条 http server）
     let received = mcp_servers.lock().await.clone();
-    assert_eq!(received.len(), 1, "session/new 应记录一次 mcpServers: {received:?}");
+    assert_eq!(
+        received.len(),
+        1,
+        "session/new 应记录一次 mcpServers: {received:?}"
+    );
     let servers = received[0].as_array().expect("mcpServers 应为数组");
-    assert_eq!(servers.len(), 1, "http 能力 + memory 应注入 1 条 server: {received:?}");
+    assert_eq!(
+        servers.len(),
+        1,
+        "http 能力 + memory 应注入 1 条 server: {received:?}"
+    );
     let entry = &servers[0];
     assert_eq!(entry["type"], "http");
     assert_eq!(entry["name"], "rust-tunnel-memory");

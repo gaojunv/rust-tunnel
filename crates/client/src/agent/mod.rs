@@ -296,7 +296,10 @@ fn apply_edits(content: &str, edits: &[FileEdit]) -> Result<String, String> {
         } else if count == 1 {
             current = current.replacen(&edit.old_string, &edit.new_string, 1);
         } else {
-            let line_nums: Vec<String> = matches.iter().map(std::string::ToString::to_string).collect();
+            let line_nums: Vec<String> = matches
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
             return Err(format!(
                 "edit #{n}: old_string matches {count} times at lines {}; provide more context",
                 line_nums.join(", ")
@@ -391,11 +394,7 @@ async fn edit_file_host(
 }
 
 /// WriteFile 增强版：expected_hash stale 检测 + 原子写 + WriteOutcome。
-async fn write_file2_host(
-    abs: &Path,
-    content: &str,
-    expected_hash: Option<&str>,
-) -> AgentResult {
+async fn write_file2_host(abs: &Path, content: &str, expected_hash: Option<&str>) -> AgentResult {
     // 检查文件是否存在
     let old_content = match tokio::fs::read_to_string(abs).await {
         Ok(c) => Some(c),
@@ -427,7 +426,9 @@ async fn write_file2_host(
         }
     }
     // 生成 diff
-    let diff = if let Some(old) = &old_content { unified_diff(old, content) } else {
+    let diff = if let Some(old) = &old_content {
+        unified_diff(old, content)
+    } else {
         // 新文件：全增 diff
         let mut out = String::new();
         for line in content.lines() {
@@ -637,11 +638,13 @@ async fn run_host(
                 };
                 (stdout, stderr)
             };
-            if let Ok((stdout, stderr)) = tokio::time::timeout_at(deadline_ts, drain).await { CmdOutput {
-                stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
-                stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
-                exit_code: status.code().unwrap_or(-1),
-            } } else {
+            if let Ok((stdout, stderr)) = tokio::time::timeout_at(deadline_ts, drain).await {
+                CmdOutput {
+                    stdout: truncate_output(String::from_utf8_lossy(&stdout).into_owned()),
+                    stderr: truncate_output(String::from_utf8_lossy(&stderr).into_owned()),
+                    exit_code: status.code().unwrap_or(-1),
+                }
+            } else {
                 // writer 已在 drain 前 await 过（child 退出即 EPIPE 收尾），无需再等
                 #[cfg(unix)]
                 {
@@ -714,7 +717,11 @@ pub async fn handle_exec_request(
             },
             Err(e) => AgentResult::Error { message: e },
         },
-        AgentCommand::ReadFileRange { path, offset, limit } => match resolve_sandboxed(root_path, path) {
+        AgentCommand::ReadFileRange {
+            path,
+            offset,
+            limit,
+        } => match resolve_sandboxed(root_path, path) {
             Ok(p) => match docker_container {
                 Some(c) => docker_read_file_range(c, &p, *offset, *limit, timeout).await,
                 None => read_file_range_host(&p, *offset, *limit).await,
@@ -867,7 +874,9 @@ pub async fn handle_exec_request(
                     }
                 }
                 None => match read_file_capped(&p, MAX_PARSE_FILE_BYTES).await {
-                    Ok((content, truncated)) => code_outline::exec_outline(&content, path, truncated),
+                    Ok((content, truncated)) => {
+                        code_outline::exec_outline(&content, path, truncated)
+                    }
                     Err(message) => AgentResult::Error { message },
                 },
             },
@@ -974,7 +983,9 @@ pub async fn handle_exec_request(
                             }
                         }
                     }
-                    let diff = if let Some(old) = &old_content { unified_diff(old, content) } else {
+                    let diff = if let Some(old) = &old_content {
+                        unified_diff(old, content)
+                    } else {
                         let mut out = String::new();
                         for line in content.lines() {
                             out.push('+');
@@ -1211,7 +1222,10 @@ async fn docker_read_file_range(
     let max_lines = limit.unwrap_or(DEFAULT_READ_LIMIT);
     let end = start + max_lines.saturating_sub(1);
     let path = abs.to_string_lossy();
-    let inner = format!("wc -l < {p}; sed -n '{start},{end}p' -- {p}", p = sh_quote(&path));
+    let inner = format!(
+        "wc -l < {p}; sed -n '{start},{end}p' -- {p}",
+        p = sh_quote(&path)
+    );
     let cmd = format!(
         "docker exec {} sh -c {}",
         sh_quote(container),
@@ -1542,7 +1556,10 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_range_basic() {
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content: String = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
         let result = handle_exec_request(
             &AgentCommand::ReadFileRange {
@@ -1611,7 +1628,10 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_range_default_offset() {
         let dir = tempfile::tempdir().unwrap();
-        let content: String = (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content: String = (0..10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(dir.path().join("lines.txt"), &content).unwrap();
         // 无 offset/limit → 读全部（受 DEFAULT_READ_LIMIT 限制）
         let result = handle_exec_request(
@@ -2779,12 +2799,7 @@ mod tests {
             new_string: "world".into(),
             replace_all: false,
         }];
-        let result = edit_file_host(
-            &dir.join("code.rs"),
-            &edits,
-            Some("wrong_hash"),
-        )
-        .await;
+        let result = edit_file_host(&dir.join("code.rs"), &edits, Some("wrong_hash")).await;
         match result {
             AgentResult::Error { message } => {
                 assert!(message.contains("changed externally"), "msg: {message}");
@@ -2881,8 +2896,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file2_new_file() {
         let dir = temp_workspace(&[]);
-        let result =
-            write_file2_host(&dir.join("new.txt"), "hello\nworld\n", None).await;
+        let result = write_file2_host(&dir.join("new.txt"), "hello\nworld\n", None).await;
         match result {
             AgentResult::WriteOutcome {
                 diff,
@@ -2931,12 +2945,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file2_stale_detection() {
         let dir = temp_workspace(&[("out.txt", "original\n")]);
-        let result = write_file2_host(
-            &dir.join("out.txt"),
-            "updated\n",
-            Some("wrong_hash"),
-        )
-        .await;
+        let result = write_file2_host(&dir.join("out.txt"), "updated\n", Some("wrong_hash")).await;
         assert!(matches!(result, AgentResult::Error { .. }));
         assert_eq!(
             std::fs::read_to_string(dir.join("out.txt")).unwrap(),
@@ -2948,12 +2957,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file2_expected_hash_on_new_file_errors() {
         let dir = temp_workspace(&[]);
-        let result = write_file2_host(
-            &dir.join("new.txt"),
-            "content",
-            Some("any_hash"),
-        )
-        .await;
+        let result = write_file2_host(&dir.join("new.txt"), "content", Some("any_hash")).await;
         match result {
             AgentResult::Error { message } => {
                 assert!(

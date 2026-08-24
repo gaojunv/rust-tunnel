@@ -6,8 +6,8 @@ use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, warn};
 
 use crate::port_registry::PortRegistry;
-use rust_tunnel_stats::{EntityType, StatsCollector};
 use rust_tunnel_common::{TunnelError, TunnelResult};
+use rust_tunnel_stats::{EntityType, StatsCollector};
 
 /// Trojan command types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,7 +790,15 @@ pub async fn proxy_trojan_connection(
 
     // UDP ASSOCIATE: hand off to the UDP session handler
     if trojan_ctx.command == TrojanCommand::UdpAssociate {
-        handle_udp_associate(connection_id, trojan_port, tls_stream, initial_payload, registry, stats).await;
+        handle_udp_associate(
+            connection_id,
+            trojan_port,
+            tls_stream,
+            initial_payload,
+            registry,
+            stats,
+        )
+        .await;
         return;
     }
 
@@ -1659,14 +1667,14 @@ mod legacy_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::client::TlsStream;
 
-    use crate::port_registry::MockPortRegistry;
     use crate::listener;
-    use rust_tunnel_stats::StatsCollector;
-    use std::sync::Arc as StdArc;
+    use crate::port_registry::MockPortRegistry;
     use crate::trojan::sha224_hex;
     use rust_tunnel_common::{
         create_insecure_client_config, create_server_config, load_or_generate_cert,
     };
+    use rust_tunnel_stats::StatsCollector;
+    use std::sync::Arc as StdArc;
 
     // ---------------------------------------------------------------------------
     // helper types
@@ -1770,7 +1778,8 @@ mod legacy_tests {
         let fallback = fallback.to_string();
 
         let handle = tokio::spawn(async move {
-            let _ = listener::start_trojan_listener(registry, stats, port, password, fallback, rx).await;
+            let _ = listener::start_trojan_listener(registry, stats, port, password, fallback, rx)
+                .await;
         });
 
         // Return a dummy receiver for compatibility (tx keeps it alive)
@@ -2007,12 +2016,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_echo_basic() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let response =
@@ -2027,12 +2043,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_concurrent_connections() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut handles = Vec::new();
@@ -2071,12 +2094,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // 64 KB payload
@@ -2109,12 +2139,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_connection_retry() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // First connection
@@ -2157,7 +2194,8 @@ mod legacy_tests {
                 }
             });
 
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
@@ -2222,12 +2260,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_long_lived_connection() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
@@ -2249,12 +2294,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_rapid_connect_disconnect() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             for _ in 0..20 {
@@ -2282,12 +2334,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_domain_and_ipv4_target() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Test IPv4 targeting
@@ -2322,12 +2381,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_udp_associate_echo() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // TLS connect + UDP ASSOCIATE handshake (target addr is advisory)
@@ -2374,12 +2440,19 @@ mod legacy_tests {
         async fn test_trojan_udp_associate_multi_target() {
             let (udp_port_a, udp_handle_a) = start_udp_echo_server().await;
             let (udp_port_b, udp_handle_b) = start_udp_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let config = create_insecure_client_config().unwrap();
@@ -2439,12 +2512,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_udp_associate_cleanup_on_close() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             {
@@ -2488,12 +2568,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // No connections yet
@@ -2530,12 +2617,19 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_initial_payload() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> =
+                StdArc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
-            let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+            let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
+                registry.clone(),
+                stats.clone(),
+                trojan_port,
+                "testpass",
+                "127.0.0.1:1",
+            )
+            .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Connect and include initial payload in the Trojan header

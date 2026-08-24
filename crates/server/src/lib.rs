@@ -20,17 +20,17 @@ pub use rust_tunnel_persistence as db;
 pub use rust_tunnel_llm as llm;
 pub mod net;
 pub use net::dns;
-pub use rust_tunnel_protocols::listener;
 pub use net::mesh;
+pub use rust_tunnel_protocols::listener;
 pub mod mgmt;
 pub use mgmt::auth;
 pub use mgmt::dynamic_config;
 pub use mgmt::logs;
 pub use mgmt::stats;
-pub use rust_tunnel_protocols as protocols;
 pub use protocols::reverse_proxy;
 pub use protocols::shadowsocks;
 pub use protocols::trojan;
+pub use rust_tunnel_protocols as protocols;
 // trojan_runtime 已移回 server 侧（不属于 protocols 关注点）
 pub mod trojan_runtime;
 

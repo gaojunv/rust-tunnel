@@ -519,7 +519,11 @@ mod tests {
         let chunks: Vec<AgentLlmProxyChunk> = stream.collect().await;
         let last = chunks.last().expect("at least one chunk");
         assert!(last.done, "must end with done=true");
-        assert!(last.status >= 400, "upstream failure → error status, got {}", last.status);
+        assert!(
+            last.status >= 400,
+            "upstream failure → error status, got {}",
+            last.status
+        );
         let body: String = chunks
             .iter()
             .map(|c| String::from_utf8_lossy(&c.data).into_owned())
@@ -786,7 +790,10 @@ mod tests {
             joined, big_body,
             "sliced chunks must reassemble to the upstream body"
         );
-        assert!(chunks.last().unwrap().done, "stream must end with done=true");
+        assert!(
+            chunks.last().unwrap().done,
+            "stream must end with done=true"
+        );
         assert!(
             chunks.len() > 1,
             "600KB body should span multiple ≤512KB chunks, got {}",

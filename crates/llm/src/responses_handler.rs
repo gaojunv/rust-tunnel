@@ -64,7 +64,10 @@ pub async fn handle_responses(
     let actual_model = first_candidate.model_name.clone();
     let model_id = first_candidate.model_id.clone();
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // RAG 知识库查询（同 openai_handler）
     let api_key_id_for_rag = api_key_id.clone();
@@ -361,7 +364,10 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "get_weather");
         // 重建模式：Responses 专有字段不得泄漏到 chat 上游（严格校验的上游会 400）
         assert!(upstream_body.get("input").is_none(), "{upstream_body}");
-        assert!(upstream_body.get("instructions").is_none(), "{upstream_body}");
+        assert!(
+            upstream_body.get("instructions").is_none(),
+            "{upstream_body}"
+        );
         assert!(
             upstream_body.get("max_output_tokens").is_none(),
             "{upstream_body}"
@@ -380,10 +386,7 @@ mod tests {
         let output = v["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "message");
-        assert_eq!(
-            output[0]["content"][0]["text"],
-            "Hello from Responses"
-        );
+        assert_eq!(output[0]["content"][0]["text"], "Hello from Responses");
         // usage 字段
         assert_eq!(v["usage"]["input_tokens"], 10);
         assert_eq!(v["usage"]["output_tokens"], 5);

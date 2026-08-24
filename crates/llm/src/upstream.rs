@@ -687,8 +687,15 @@ pub async fn execute_with_failover(
                 let mut raw = raw.clone();
                 set_body_model(&mut raw, &cand.model_name);
                 (
-                    call_upstream_raw(client, url, &cand.provider.api_key, "/v1/messages", &raw, stream)
-                        .await,
+                    call_upstream_raw(
+                        client,
+                        url,
+                        &cand.provider.api_key,
+                        "/v1/messages",
+                        &raw,
+                        stream,
+                    )
+                    .await,
                     true,
                 )
             } else {
@@ -747,8 +754,7 @@ pub async fn execute_with_failover(
                                 if stream {
                                     super::responses::convert_responses_stream_to_chat(resp)
                                 } else {
-                                    super::responses::convert_responses_to_chat_response(resp)
-                                        .await
+                                    super::responses::convert_responses_to_chat_response(resp).await
                                 }
                             }
                             Err(e) => Err(e),
@@ -1436,9 +1442,15 @@ mod tests {
 
         let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let resp = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
-            .await
-            .unwrap();
+        let resp = call_upstream_stream_guarded(
+            &client,
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+            "v1/chat/completions",
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // 读全量 body：应包含两个 chunk（前缀 replay + 续传）
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -1459,9 +1471,15 @@ mod tests {
         };
         let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
-            .await
-            .unwrap_err();
+        let err = call_upstream_stream_guarded(
+            &client,
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+            "v1/chat/completions",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(is_retryable(err.0, true));
     }
@@ -1485,9 +1503,15 @@ mod tests {
         });
         let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
-            .await
-            .unwrap_err();
+        let err = call_upstream_stream_guarded(
+            &client,
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+            "v1/chat/completions",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(is_retryable(err.0, true));
     }
@@ -1521,9 +1545,15 @@ mod tests {
         let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let started = std::time::Instant::now();
-        let resp = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
-            .await
-            .unwrap();
+        let resp = call_upstream_stream_guarded(
+            &client,
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+            "v1/chat/completions",
+        )
+        .await
+        .unwrap();
         let ttfb = started.elapsed();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
@@ -1602,7 +1632,9 @@ mod tests {
     }
 
     /// 快速构造混合协议 CandidateChain（测试用）。
-    fn test_chain_mixed(specs: &[(&str, &str, &str, crate::router::UpstreamProtocol)]) -> crate::router::CandidateChain {
+    fn test_chain_mixed(
+        specs: &[(&str, &str, &str, crate::router::UpstreamProtocol)],
+    ) -> crate::router::CandidateChain {
         use crate::router::{Candidate, CandidateChain};
         use crate::ProviderConfig;
         CandidateChain {
@@ -1679,7 +1711,16 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -1723,7 +1764,16 @@ mod tests {
         let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1772,7 +1822,16 @@ mod tests {
         let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1819,7 +1878,16 @@ mod tests {
 
         // 连续 5 次请求把 id-bad 打到熔断
         for _ in 0..5 {
-            let _ = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+            let _ = execute_with_failover(
+                &test_client(),
+                &breakers,
+                &EMPTY_KNOWN,
+                &chain,
+                &body,
+                false,
+                None,
+            )
+            .await;
         }
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5);
         assert_eq!(
@@ -1827,7 +1895,16 @@ mod tests {
             crate::breaker::BreakerStateView::Open
         );
         // 第 6 次：坏候选被跳过，直接打好候选
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
     }
@@ -1845,7 +1922,16 @@ mod tests {
             breakers.record_failure("id2");
         }
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status,
             message,
@@ -1889,7 +1975,16 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let started = std::time::Instant::now();
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
         let ttfb = started.elapsed();
         let FailoverOutcome::Success {
             resp, failed_over, ..
@@ -1937,7 +2032,16 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1981,9 +2085,15 @@ mod tests {
 
         let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
-            .await
-            .unwrap_err();
+        let err = call_upstream_stream_guarded(
+            &client,
+            &format!("http://{}", addr),
+            "k",
+            &req_body,
+            "v1/chat/completions",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert!(err.1.contains("prefix") || err.1.contains("limit"));
     }
@@ -2071,7 +2181,16 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         // 第一次：A 401 → 记录并转移 → B 成功
-        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2086,7 +2205,16 @@ mod tests {
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
 
         // 第二次：A 被跳过（known 失败），B 再次成功
-        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(
             a_hits.load(Ordering::SeqCst),
@@ -2120,7 +2248,16 @@ mod tests {
         let body = serde_json::json!({"model": "single", "stream": false, "messages": []});
 
         // 第一次：网络调用 → 401
-        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted { status, .. } = out else {
             panic!("expected exhausted");
         };
@@ -2128,7 +2265,16 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // 第二次：known 命中，不发起网络调用，仍返回 401 错误
-        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status, message, ..
         } = out
@@ -2148,7 +2294,16 @@ mod tests {
 
         // 手动清除后立即恢复探测
         known.clear_all();
-        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &known,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         assert!(matches!(out, FailoverOutcome::Exhausted { .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
@@ -2177,7 +2332,16 @@ mod tests {
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         for _ in 0..2 {
-            let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
+            let out = execute_with_failover(
+                &test_client(),
+                &breakers,
+                &known,
+                &chain,
+                &body,
+                false,
+                None,
+            )
+            .await;
             let FailoverOutcome::Exhausted { status, .. } = out else {
                 panic!("expected exhausted");
             };
@@ -2276,7 +2440,16 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -2365,7 +2538,16 @@ mod tests {
         );
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success { resp, .. } = out else {
             panic!("expected success");
         };
@@ -2472,7 +2654,16 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -2831,7 +3022,16 @@ mod tests {
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             resp, failed_over, ..
         } = out
@@ -2880,7 +3080,16 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2929,7 +3138,16 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2940,7 +3158,11 @@ mod tests {
         };
         assert_eq!(candidate.model_id, "id-good");
         assert!(failed_over);
-        assert_eq!(bad_hits.load(Ordering::SeqCst), 2, "首选：首次 + 1 次原地重试");
+        assert_eq!(
+            bad_hits.load(Ordering::SeqCst),
+            2,
+            "首选：首次 + 1 次原地重试"
+        );
     }
 
     /// 流式链长 2：首选 200 头后立即 EOF（无任何 SSE 事件）→ 守卫返回 502，
@@ -2977,7 +3199,16 @@ mod tests {
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -3028,8 +3259,20 @@ mod tests {
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
-        let FailoverOutcome::Success { resp, failed_over, .. } = out else {
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            true,
+            None,
+        )
+        .await;
+        let FailoverOutcome::Success {
+            resp, failed_over, ..
+        } = out
+        else {
             panic!("单候选链流式不走守卫，空流应保持放行（Ok）");
         };
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3060,7 +3303,16 @@ mod tests {
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(
+            &test_client(),
+            &breakers,
+            &EMPTY_KNOWN,
+            &chain,
+            &body,
+            false,
+            None,
+        )
+        .await;
         let FailoverOutcome::Exhausted {
             status, message, ..
         } = out
@@ -3079,7 +3331,9 @@ mod tests {
     #[test]
     fn test_is_malformed_error() {
         assert!(is_malformed_error("empty response body from upstream"));
-        assert!(is_malformed_error("malformed response body (not valid JSON)"));
+        assert!(is_malformed_error(
+            "malformed response body (not valid JSON)"
+        ));
         assert!(is_malformed_error(
             "empty SSE stream from upstream (no events before EOF)"
         ));

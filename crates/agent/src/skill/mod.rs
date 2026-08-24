@@ -8,9 +8,9 @@
 //! 块），模型调 `use_skill` 工具拉全文。防回环：蒸馏渲染会剥离 `<skills>` 块，
 //! 已注入的清单不会被当成对话内容再次蒸馏。
 
+use crate::db::skills::AgentSkillSummary;
 use crate::memory::scope_coords;
 use crate::{session::SessionRuntime, AgentState};
-use crate::db::skills::AgentSkillSummary;
 
 /// Skill content（Markdown 全文）上限（字符）。
 pub const SKILL_CONTENT_MAX_CHARS: usize = 16 * 1024;
@@ -206,9 +206,9 @@ pub async fn use_skill_from_agent(
 #[cfg(all(test, feature = "rag"))]
 mod tests {
     use super::*;
-    use crate::memory::MemoryState;
     use crate::db::Database;
     use crate::llm::LlmState;
+    use crate::memory::MemoryState;
 
     fn summary(id: &str, name: &str, description: &str, use_count: i64) -> AgentSkillSummary {
         AgentSkillSummary {
@@ -291,7 +291,9 @@ mod tests {
         let tiny = build_skill_list_block(&items, 10, 5).unwrap();
         assert!(tiny.contains("beta"));
         // 预算超限时完整行原则：不半截任何一行
-        assert!(tiny.lines().all(|l| !l.ends_with(':') || l.starts_with('-')));
+        assert!(tiny
+            .lines()
+            .all(|l| !l.ends_with(':') || l.starts_with('-')));
 
         // 空列表 → None
         assert!(build_skill_list_block(&[], 10, SKILL_LIST_MAX_CHARS).is_none());
@@ -339,7 +341,10 @@ mod tests {
         assert_eq!(row.content, "内容二");
         assert_eq!(row.use_count, 1, "use_count 保持");
         let tags = crate::memory::parse_tags(&row.tags);
-        assert!(tags.contains(&"deploy".into()) && tags.contains(&"release".into()), "tags 并集");
+        assert!(
+            tags.contains(&"deploy".into()) && tags.contains(&"release".into()),
+            "tags 并集"
+        );
 
         // 异作用域同名 → 新建
         let id3 = upsert_skill_with_dedup(
@@ -357,7 +362,10 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(id1, id3);
-        let all = db.skill_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .skill_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -365,7 +373,9 @@ mod tests {
     async fn retrieve_list_gated_and_scope_visible() {
         let (db, memory) = memory_state().await;
         // skill_enabled 关闭 → None
-        assert!(retrieve_skill_list_for_session(&memory, "c1", "w1").await.is_none());
+        assert!(retrieve_skill_list_for_session(&memory, "c1", "w1")
+            .await
+            .is_none());
 
         // 开启
         let mut s = db.memory_get_settings().await.unwrap();
@@ -373,23 +383,52 @@ mod tests {
         db.memory_upsert_settings(&s).await.unwrap();
 
         db.skill_insert(
-            "g1", "global-skill", "全局技能", "内容", "global", "", "", "[]", "", "manual",
+            "g1",
+            "global-skill",
+            "全局技能",
+            "内容",
+            "global",
+            "",
+            "",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
         db.skill_insert(
-            "w1a", "release-check", "发布前检查", "内容", "workspace", "c1", "w1", "[]", "", "manual",
+            "w1a",
+            "release-check",
+            "发布前检查",
+            "内容",
+            "workspace",
+            "c1",
+            "w1",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
         db.skill_insert(
-            "w2", "other-ws", "别的工作区", "内容", "workspace", "c1", "w2", "[]", "", "manual",
+            "w2",
+            "other-ws",
+            "别的工作区",
+            "内容",
+            "workspace",
+            "c1",
+            "w2",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
         db.skill_bump_use("g1").await.unwrap();
 
-        let block = retrieve_skill_list_for_session(&memory, "c1", "w1").await.unwrap();
+        let block = retrieve_skill_list_for_session(&memory, "c1", "w1")
+            .await
+            .unwrap();
         assert!(block.starts_with("<skills>"));
         assert!(block.contains("global-skill"));
         assert!(block.contains("release-check"));
@@ -399,7 +438,9 @@ mod tests {
         // 全部停用 → None
         db.skill_toggle_enabled("g1").await.unwrap();
         db.skill_toggle_enabled("w1a").await.unwrap();
-        assert!(retrieve_skill_list_for_session(&memory, "c1", "w1").await.is_none());
+        assert!(retrieve_skill_list_for_session(&memory, "c1", "w1")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -411,17 +452,44 @@ mod tests {
 
         // 三个作用域同名（优先 workspace）
         db.skill_insert(
-            "ws1", "deploy-app", "工作区", "工作区内容", "workspace", "c1", "w1", "[]", "", "manual",
+            "ws1",
+            "deploy-app",
+            "工作区",
+            "工作区内容",
+            "workspace",
+            "c1",
+            "w1",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
         db.skill_insert(
-            "cl1", "deploy-app", "客户端", "客户端内容", "client", "c1", "", "[]", "", "manual",
+            "cl1",
+            "deploy-app",
+            "客户端",
+            "客户端内容",
+            "client",
+            "c1",
+            "",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
         db.skill_insert(
-            "g1", "deploy-app", "全局", "全局内容", "global", "", "", "[]", "", "manual",
+            "g1",
+            "deploy-app",
+            "全局",
+            "全局内容",
+            "global",
+            "",
+            "",
+            "[]",
+            "",
+            "manual",
         )
         .await
         .unwrap();
@@ -439,8 +507,14 @@ mod tests {
             .unwrap();
         assert_eq!(out, "工作区内容");
         // workspace 命中 bump
-        assert_eq!(db.skill_get_by_id("ws1").await.unwrap().unwrap().use_count, 1);
-        assert_eq!(db.skill_get_by_id("cl1").await.unwrap().unwrap().use_count, 0);
+        assert_eq!(
+            db.skill_get_by_id("ws1").await.unwrap().unwrap().use_count,
+            1
+        );
+        assert_eq!(
+            db.skill_get_by_id("cl1").await.unwrap().unwrap().use_count,
+            0
+        );
 
         // client 作用域会话：client 命中
         let r = rt("s1", "c1", "w2");
@@ -448,7 +522,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "客户端内容");
-        assert_eq!(db.skill_get_by_id("cl1").await.unwrap().unwrap().use_count, 1);
+        assert_eq!(
+            db.skill_get_by_id("cl1").await.unwrap().unwrap().use_count,
+            1
+        );
 
         // global 作用域会话：global 命中
         let r = rt("s1", "other-client", "w9");
@@ -473,10 +550,15 @@ mod tests {
 
         // 参数校验
         assert!(use_skill_from_agent(&agent, &r, r#"{}"#).await.is_err());
-        assert!(use_skill_from_agent(&agent, &r, r#"{"name": "  "}"#).await.is_err());
+        assert!(use_skill_from_agent(&agent, &r, r#"{"name": "  "}"#)
+            .await
+            .is_err());
         let big = "x".repeat(SKILL_NAME_MAX_CHARS + 1);
         let args = serde_json::json!({"name": big}).to_string();
-        assert!(use_skill_from_agent(&agent, &r, &args).await.unwrap_err().contains("too long"));
+        assert!(use_skill_from_agent(&agent, &r, &args)
+            .await
+            .unwrap_err()
+            .contains("too long"));
     }
 
     #[tokio::test]

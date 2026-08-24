@@ -752,9 +752,11 @@ impl Database {
         )
         .execute(pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_skills_scope ON agent_skills(client_id, workspace_id)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_skills_scope ON agent_skills(client_id, workspace_id)",
+        )
+        .execute(pool)
+        .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_skills_source ON agent_skills(source_session_id)",
         )
@@ -791,9 +793,11 @@ impl Database {
         )
         .execute(pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wikis_scope ON agent_wikis(client_id, workspace_id)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_wikis_scope ON agent_wikis(client_id, workspace_id)",
+        )
+        .execute(pool)
+        .await?;
 
         sqlx::query(
             r#"
@@ -867,12 +871,16 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_wiki ON agent_wiki_edges(wiki_id)")
             .execute(pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_src ON agent_wiki_edges(src_page_id)")
-            .execute(pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_wiki_edges_dst ON agent_wiki_edges(dst_page_id)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_wiki_edges_src ON agent_wiki_edges(src_page_id)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_wiki_edges_dst ON agent_wiki_edges(dst_page_id)",
+        )
+        .execute(pool)
+        .await?;
 
         sqlx::query(
             "CREATE VIRTUAL TABLE IF NOT EXISTS agent_wiki_pages_fts USING fts5(ref, title, summary, content, tokenize='trigram')",
@@ -935,7 +943,9 @@ impl Database {
 
     /// agent_sessions 补 `last_spawn_error` 列（最近一次 ACP spawn 失败的归因
     /// 描述，成功时清空；供重启后/会话列表追溯）。幂等：列已存在时 ALTER 报错即跳过。
-    async fn migrate_agent_sessions_add_spawn_error(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    async fn migrate_agent_sessions_add_spawn_error(
+        pool: &Pool<Sqlite>,
+    ) -> Result<(), sqlx::Error> {
         match sqlx::query("ALTER TABLE agent_sessions ADD COLUMN last_spawn_error TEXT")
             .execute(pool)
             .await
@@ -1339,16 +1349,12 @@ impl Database {
         )
         .execute(pool)
         .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_roles_enabled ON agent_roles(enabled)",
-        )
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_roles_mode ON agent_roles(mode)",
-        )
-        .execute(pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_roles_enabled ON agent_roles(enabled)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_roles_mode ON agent_roles(mode)")
+            .execute(pool)
+            .await?;
         Ok(())
     }
 
@@ -1933,10 +1939,12 @@ mod tests {
         super::Database::initialize_schema(&pool).await.unwrap();
 
         // agent_skills 默认值
-        sqlx::query("INSERT INTO agent_skills (id, name, content) VALUES ('s1', 'deploy', '## 步骤')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_skills (id, name, content) VALUES ('s1', 'deploy', '## 步骤')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let (scope, enabled, use_count, trigger): (String, i64, i64, String) = sqlx::query_as(
             "SELECT scope_type, enabled, use_count, source_trigger FROM agent_skills WHERE id = 's1'",
         )
@@ -1963,7 +1971,11 @@ mod tests {
         assert_eq!(skill_list_max, 20, "skill_list_max 默认 20");
 
         // 三索引存在
-        for idx in ["idx_skills_scope", "idx_skills_source", "idx_skills_enabled"] {
+        for idx in [
+            "idx_skills_scope",
+            "idx_skills_source",
+            "idx_skills_enabled",
+        ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
             )
@@ -1985,10 +1997,11 @@ mod tests {
         super::Database::initialize_schema(&pool).await.unwrap();
 
         // 内置角色 seed：general 和 explore
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_roles WHERE is_builtin = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_roles WHERE is_builtin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 2, "应有 2 个内置角色");
 
         let general: (String, String, Option<String>) = sqlx::query_as(

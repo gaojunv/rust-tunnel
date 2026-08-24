@@ -49,7 +49,7 @@ pub enum DnsRecord {
 }
 
 impl DnsRecord {
-    #[must_use] 
+    #[must_use]
     pub fn name(&self) -> &str {
         match self {
             DnsRecord::TunnelA { name, .. }
@@ -60,7 +60,7 @@ impl DnsRecord {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn record_type(&self) -> &'static str {
         match self {
             DnsRecord::TunnelA { .. } | DnsRecord::MeshA { .. } => "A",

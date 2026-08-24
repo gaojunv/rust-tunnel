@@ -9,18 +9,14 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
-
 
 use super::super::store::flush_acp_turn_buffers;
-use super::super::{
-    AcpBridge, PendingPrompt,
-    MAX_PENDING_PROMPTS,
-};
+use super::super::{AcpBridge, PendingPrompt, MAX_PENDING_PROMPTS};
 
 use super::*;
 
@@ -109,7 +105,14 @@ impl AcpBridge {
             let memory_block = agent.memory_block.clone().unwrap_or_default();
             let skill_list_block = agent.skill_list_block.clone().unwrap_or_default();
             let wiki_list_block = agent.wiki_list_block.clone().unwrap_or_default();
-            (connection, acp_session_id, turn_gen, memory_block, skill_list_block, wiki_list_block)
+            (
+                connection,
+                acp_session_id,
+                turn_gen,
+                memory_block,
+                skill_list_block,
+                wiki_list_block,
+            )
         };
 
         let bridge = self.clone();
@@ -183,9 +186,9 @@ impl AcpBridge {
                             // 回合耗时：仅在本回合真正收尾（无排队下一条）时取出
                             // 计时——连续回合的下一条由 prompt_inner 重设起点。
                             let duration_ms = if next.is_none() {
-                                a.turn_started_at
-                                    .take()
-                                    .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+                                a.turn_started_at.take().map(|t| {
+                                    u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+                                })
                             } else {
                                 None
                             };
@@ -244,13 +247,7 @@ impl AcpBridge {
                             Some(ms) => serde_json::json!({"type": "done", "duration_ms": ms}),
                             None => serde_json::json!({"type": "done"}),
                         };
-                        broadcast_ws_frame(
-                            &sessions,
-                            &sid,
-                            &done_frame,
-                            true,
-                        )
-                        .await;
+                        broadcast_ws_frame(&sessions, &sid, &done_frame, true).await;
                     }
                     Err(e) => {
                         broadcast_ws_frame(
@@ -496,7 +493,6 @@ impl AcpBridge {
             a.pending_prompts = restored;
         }
     }
-
 }
 fn spawn_drain_next(bridge: AcpBridge, sid: String, next: PendingPrompt) {
     tokio::spawn(async move {

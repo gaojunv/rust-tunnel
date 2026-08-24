@@ -340,9 +340,7 @@ mod tests {
 
     /// 在随机端口起一个 axum mock server，返回 `http://127.0.0.1:<port>`。
     async fn spawn_mock(routes: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
@@ -376,7 +374,9 @@ mod tests {
             get(|req: axum::http::Request<axum::body::Body>| async move {
                 let req = assert_bearer(req, "ghp_test_token").await;
                 assert_eq!(
-                    req.headers().get("user-agent").and_then(|v| v.to_str().ok()),
+                    req.headers()
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok()),
                     Some("rust-tunnel")
                 );
                 assert_eq!(
@@ -405,7 +405,9 @@ mod tests {
             get(|| async {
                 (
                     axum::http::StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({"message": "Not Found", "documentation_url": "..."})),
+                    axum::Json(
+                        serde_json::json!({"message": "Not Found", "documentation_url": "..."}),
+                    ),
                 )
             }),
         ))
@@ -472,7 +474,10 @@ mod tests {
             .await
             .expect_err("connection refused should be a network error");
         let rendered = err.to_string();
-        assert!(!rendered.contains("ghp_super_secret"), "err must not leak token");
+        assert!(
+            !rendered.contains("ghp_super_secret"),
+            "err must not leak token"
+        );
     }
 
     /// 日志重定向 + 尾部截取：mock 先 302 到 /logs-body，后者返回超长日志，
@@ -490,10 +495,7 @@ mod tests {
                     get(|| async {
                         (
                             axum::http::StatusCode::MOVED_PERMANENTLY,
-                            [(
-                                axum::http::header::LOCATION,
-                                "/logs-body",
-                            )],
+                            [(axum::http::header::LOCATION, "/logs-body")],
                         )
                     }),
                 )
@@ -535,16 +537,20 @@ mod tests {
         let seen = dispatch_seen.clone();
         let base = spawn_mock(Router::new().route(
             "/repos/octo/repo/actions/workflows/ci.yml/dispatches",
-            axum::routing::post(
-                move |body: axum::Json<serde_json::Value>| async move {
-                    *seen.lock().unwrap() = body.0.clone();
-                    axum::http::StatusCode::NO_CONTENT
-                },
-            ),
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| async move {
+                *seen.lock().unwrap() = body.0.clone();
+                axum::http::StatusCode::NO_CONTENT
+            }),
         ))
         .await;
         client(&base)
-            .dispatch_workflow("octo", "repo", "ci.yml", "main", Some(serde_json::json!({"env": "prod"})))
+            .dispatch_workflow(
+                "octo",
+                "repo",
+                "ci.yml",
+                "main",
+                Some(serde_json::json!({"env": "prod"})),
+            )
             .await
             .expect("dispatch should succeed");
         assert_eq!((*dispatch_seen.lock().unwrap())["ref"], "main");

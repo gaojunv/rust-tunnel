@@ -24,8 +24,8 @@ use tokio::sync::Mutex;
 use crate::agent::git_plan;
 use crate::agent::github::{GitHubClient, GitHubError};
 use crate::agent::AgentState;
-use crate::mgmt::api::ApiState;
 use crate::db::agent::AgentWorkspaceRecord;
+use crate::mgmt::api::ApiState;
 
 use super::dto::{GithubApprovedBody, GithubDispatchBody, GithubRepoQuery, GithubRunsQuery};
 
@@ -73,10 +73,7 @@ fn github_error_response(e: &GitHubError) -> axum::response::Response {
 /// 写操作统一审批门：未确认 → 409 `{needs_approval, summary}`；已确认 → None 放行。
 /// 与 git 面板的 409 审批模式一致，但**不区分 approval_mode**——GitHub 远程写
 /// 操作（触发/重跑/取消 CI）一律需要用户确认。
-fn approve_or_409(
-    approved: bool,
-    summary: &str,
-) -> Option<axum::response::Response> {
+fn approve_or_409(approved: bool, summary: &str) -> Option<axum::response::Response> {
     if approved {
         return None;
     }
@@ -152,9 +149,7 @@ async fn probe_repo_via_tunnel(
         &ws.client_id,
         &ws.root_path,
         ws.docker_container_id.as_deref(),
-        rust_tunnel_common::AgentCommand::GitExec {
-            args: planned.args,
-        },
+        rust_tunnel_common::AgentCommand::GitExec { args: planned.args },
     )
     .await;
     match result {
@@ -310,11 +305,7 @@ pub async fn list_workflows(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    match ctx
-        .client
-        .list_workflows(&ctx.owner, &ctx.repo)
-        .await
-    {
+    match ctx.client.list_workflows(&ctx.owner, &ctx.repo).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => github_error_response(&e),
     }
@@ -375,9 +366,14 @@ pub async fn get_job_logs(
         Ok(c) => c,
         Err(resp) => return resp,
     };
-    match ctx.client.get_job_logs(&ctx.owner, &ctx.repo, &job_id).await {
-        Ok((logs, truncated)) => Json(serde_json::json!({ "logs": logs, "truncated": truncated }))
-            .into_response(),
+    match ctx
+        .client
+        .get_job_logs(&ctx.owner, &ctx.repo, &job_id)
+        .await
+    {
+        Ok((logs, truncated)) => {
+            Json(serde_json::json!({ "logs": logs, "truncated": truncated })).into_response()
+        }
         Err(e) => github_error_response(&e),
     }
 }
@@ -436,7 +432,11 @@ pub async fn rerun_workflow(
     if let Some(resp) = approve_or_409(approved, &summary) {
         return resp;
     }
-    match ctx.client.rerun_workflow(&ctx.owner, &ctx.repo, &run_id).await {
+    match ctx
+        .client
+        .rerun_workflow(&ctx.owner, &ctx.repo, &run_id)
+        .await
+    {
         Ok(_) => Json(serde_json::json!({ "status": "rerun_queued" })).into_response(),
         Err(e) => github_error_response(&e),
     }
@@ -488,13 +488,9 @@ mod tests {
 
     /// 在随机端口起 axum mock server，返回 base_url；并把 AgentState 的
     /// github_base_url 指向它。
-    async fn mock_state_with_base(
-        routes: axum::Router,
-    ) -> (ApiState, Database, String) {
+    async fn mock_state_with_base(routes: axum::Router) -> (ApiState, Database, String) {
         let (mut state, db) = test_state().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
@@ -576,7 +572,10 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("github_token 未配置"));
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("github_token 未配置"));
     }
 
     #[tokio::test]
@@ -593,7 +592,10 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("无法确定 GitHub 仓库"));
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("无法确定 GitHub 仓库"));
     }
 
     #[tokio::test]
@@ -654,18 +656,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_repo_info_with_token_fetches_repo_info() {
-        let (state, db, _base) = mock_state_with_base(
-            axum::Router::new().route(
-                "/repos/octo/repo",
-                get(|| async {
-                    axum::Json(serde_json::json!({
-                        "full_name": "octo/repo",
-                        "default_branch": "main",
-                        "private": false,
-                    }))
-                }),
-            ),
-        )
+        let (state, db, _base) = mock_state_with_base(axum::Router::new().route(
+            "/repos/octo/repo",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "full_name": "octo/repo",
+                    "default_branch": "main",
+                    "private": false,
+                }))
+            }),
+        ))
         .await;
         seed_workspace(&db, Some("ghp_test"), Some("octo"), Some("repo")).await;
         let resp = get_repo_info(
@@ -836,13 +836,11 @@ mod tests {
         let flag = dispatched.clone();
         let (state, db, _base) = mock_state_with_base(axum::Router::new().route(
             "/repos/octo/repo/actions/workflows/ci.yml/dispatches",
-            axum::routing::post(
-                move |body: axum::Json<serde_json::Value>| async move {
-                    assert_eq!(body.0["ref"], "main");
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    axum::http::StatusCode::NO_CONTENT
-                },
-            ),
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| async move {
+                assert_eq!(body.0["ref"], "main");
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                axum::http::StatusCode::NO_CONTENT
+            }),
         ))
         .await;
         seed_workspace(&db, Some("ghp_test"), Some("octo"), Some("repo")).await;
@@ -865,7 +863,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["needs_approval"], true);
-        assert!(json["summary"].as_str().unwrap().contains("workflow_dispatch"));
+        assert!(json["summary"]
+            .as_str()
+            .unwrap()
+            .contains("workflow_dispatch"));
         assert!(
             !dispatched.load(std::sync::atomic::Ordering::SeqCst),
             "未确认不得打到 GitHub"

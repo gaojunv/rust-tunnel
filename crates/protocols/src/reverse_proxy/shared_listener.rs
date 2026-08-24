@@ -6,16 +6,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    response::Response,
-    routing::any,
-    Router,
-};
 #[cfg(test)]
 use axum::http::{Method, StatusCode};
+use axum::{body::Body, extract::State, http::Request, response::Response, routing::any, Router};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -274,11 +267,8 @@ async fn llm_aware_proxy_dispatch(
         match d.try_handle(host, req).await {
             Ok(resp) => return resp,
             Err(req) => {
-                return handle_proxy_request_unified(
-                    State((source, upstream, proxy_state)),
-                    req,
-                )
-                .await;
+                return handle_proxy_request_unified(State((source, upstream, proxy_state)), req)
+                    .await;
             }
         }
     }
@@ -663,13 +653,17 @@ mod tests {
             self: Arc<Self>,
             host: String,
             req: Request<Body>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, Request<Body>>> + Send>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Response, Request<Body>>> + Send>,
+        > {
             Box::pin(async move {
                 if host == self.domain {
                     // 对需要校验 body 内容的测试，返回带关键字的 JSON；其余返回空 body。
                     // 404 -> OpenAI/Anthropic 兼容的错误体；400 -> 包含 UTF-8 的错误体。
                     let body_str = match self.status {
-                        StatusCode::NOT_FOUND => r#"{"error":{"message":"Not found"},"type":"error"}"#,
+                        StatusCode::NOT_FOUND => {
+                            r#"{"error":{"message":"Not found"},"type":"error"}"#
+                        }
                         StatusCode::BAD_REQUEST => r#"{"error":"request body is not valid UTF-8"}"#,
                         _ => "",
                     };
@@ -1058,7 +1052,9 @@ mod tests {
                 self: Arc<Self>,
                 host: String,
                 req: Request<Body>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, Request<Body>>> + Send>> {
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Response, Request<Body>>> + Send>,
+            > {
                 Box::pin(async move {
                     if host == "oa.local" || host == "an.local" {
                         Ok(Response::builder()

@@ -52,7 +52,12 @@ impl WikiState {
     pub fn new(db: Database, llm: LlmState) -> Self {
         // 容量 64：与 MemoryState / LlmState.rag_tx 一致，低频事件不阻塞调用方。
         let (events, _rx) = tokio::sync::broadcast::channel(64);
-        Self { db, llm, events, ingest_sem: Arc::new(Semaphore::new(2)) }
+        Self {
+            db,
+            llm,
+            events,
+            ingest_sem: Arc::new(Semaphore::new(2)),
+        }
     }
 
     #[must_use]
@@ -150,8 +155,7 @@ async fn resolve_wiki_by_name(
         return None;
     }
     for scope in ["workspace", "client", "global"] {
-        let (scope_type, cid, wid) =
-            crate::memory::scope_coords(scope, client_id, workspace_id);
+        let (scope_type, cid, wid) = crate::memory::scope_coords(scope, client_id, workspace_id);
         if let Ok(Some(row)) = wiki_state
             .db
             .wiki_get_by_name_scope_ci(&normalized, &scope_type, &cid, &wid)
@@ -233,7 +237,10 @@ pub async fn wiki_search_from_agent(
     if hits.is_empty() {
         return Ok(format!("no results for \"{query}\""));
     }
-    let mut out = format!("wiki_search results for \"{query}\" ({} hits):\n", hits.len());
+    let mut out = format!(
+        "wiki_search results for \"{query}\" ({} hits):\n",
+        hits.len()
+    );
     for hit in hits {
         let _ = writeln!(
             out,
@@ -368,7 +375,9 @@ mod tests {
 
         let tiny = build_wiki_list_block(&items, 10, 5).unwrap();
         assert!(tiny.contains("beta"));
-        assert!(tiny.lines().all(|l| !l.ends_with(':') || l.starts_with('-')));
+        assert!(tiny
+            .lines()
+            .all(|l| !l.ends_with(':') || l.starts_with('-')));
 
         assert!(build_wiki_list_block(&[], 10, WIKI_LIST_MAX_CHARS).is_none());
     }
@@ -377,17 +386,33 @@ mod tests {
     async fn retrieve_gated_and_scope_visible() {
         let (db, wiki) = wiki_state().await;
         // 默认 wiki_enabled=1，但无容器 → None
-        assert!(retrieve_wiki_list_for_session(&wiki, "c1", "w1").await.is_none());
+        assert!(retrieve_wiki_list_for_session(&wiki, "c1", "w1")
+            .await
+            .is_none());
 
-        db.wiki_create("g1", "global-wiki", "全局", "global", "", "").await.unwrap();
-        db.wiki_create("w1a", "ws-wiki", "工作区", "workspace", "c1", "w1").await.unwrap();
-        db.wiki_create("w2", "other-ws", "其他", "workspace", "c1", "w2").await.unwrap();
+        db.wiki_create("g1", "global-wiki", "全局", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_create("w1a", "ws-wiki", "工作区", "workspace", "c1", "w1")
+            .await
+            .unwrap();
+        db.wiki_create("w2", "other-ws", "其他", "workspace", "c1", "w2")
+            .await
+            .unwrap();
         // page_count 影响排序
-        db.wiki_upsert_page("g1", "p1", "t", "s", "c", false, None).await.unwrap();
-        db.wiki_upsert_page("g1", "p2", "t", "s", "c", false, None).await.unwrap();
-        db.wiki_upsert_page("w1a", "p1", "t", "s", "c", false, None).await.unwrap();
+        db.wiki_upsert_page("g1", "p1", "t", "s", "c", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("g1", "p2", "t", "s", "c", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1a", "p1", "t", "s", "c", false, None)
+            .await
+            .unwrap();
 
-        let block = retrieve_wiki_list_for_session(&wiki, "c1", "w1").await.unwrap();
+        let block = retrieve_wiki_list_for_session(&wiki, "c1", "w1")
+            .await
+            .unwrap();
         assert!(block.starts_with("<wikis>"));
         assert!(block.contains("global-wiki"));
         assert!(block.contains("ws-wiki"));
@@ -398,13 +423,17 @@ mod tests {
         let mut s = db.memory_get_settings().await.unwrap();
         s.wiki_enabled = 0;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(retrieve_wiki_list_for_session(&wiki, "c1", "w1").await.is_none());
+        assert!(retrieve_wiki_list_for_session(&wiki, "c1", "w1")
+            .await
+            .is_none());
 
         // 重新开启，wiki_list_max 限制
         s.wiki_enabled = 1;
         s.wiki_list_max = 1;
         db.memory_upsert_settings(&s).await.unwrap();
-        let block = retrieve_wiki_list_for_session(&wiki, "c1", "w1").await.unwrap();
+        let block = retrieve_wiki_list_for_session(&wiki, "c1", "w1")
+            .await
+            .unwrap();
         let lines: Vec<&str> = block.lines().filter(|l| l.starts_with("- ")).collect();
         assert_eq!(lines.len(), 1);
     }
@@ -412,78 +441,204 @@ mod tests {
     #[tokio::test]
     async fn search_param_validation_and_e2e() {
         let (db, wiki) = wiki_state().await;
-        db.wiki_create("w1", "my-wiki", "desc", "workspace", "c1", "w1").await.unwrap();
-        db.wiki_upsert_page("w1", "deploy/prod", "部署", "摘要", "内容含部署相关", false, None).await.unwrap();
-        db.wiki_upsert_page("w1", "other/page", "其他", "摘要", "无关", false, None).await.unwrap();
+        db.wiki_create("w1", "my-wiki", "desc", "workspace", "c1", "w1")
+            .await
+            .unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "deploy/prod",
+            "部署",
+            "摘要",
+            "内容含部署相关",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        db.wiki_upsert_page("w1", "other/page", "其他", "摘要", "无关", false, None)
+            .await
+            .unwrap();
 
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"limit":5}"#).await.is_err());
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"  "}"#).await.is_err());
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","limit":0}"#).await.is_err());
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","limit":30}"#).await.is_err());
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"ghost"}"#).await.unwrap_err().contains("not found"));
+        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"limit":5}"#)
+            .await
+            .is_err());
+        assert!(
+            wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"  "}"#)
+                .await
+                .is_err()
+        );
+        assert!(
+            wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","limit":0}"#)
+                .await
+                .is_err()
+        );
+        assert!(
+            wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","limit":30}"#)
+                .await
+                .is_err()
+        );
+        assert!(
+            wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"ghost"}"#)
+                .await
+                .unwrap_err()
+                .contains("not found")
+        );
 
-        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署"}"#).await.unwrap();
+        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署"}"#)
+            .await
+            .unwrap();
         assert!(out.contains("deploy/prod"), "out: {out}");
         assert!(out.contains("部署"));
 
-        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"my-wiki"}"#).await.unwrap();
+        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"my-wiki"}"#)
+            .await
+            .unwrap();
         assert!(out.contains("deploy/prod"));
 
-        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"My-Wiki"}"#).await.unwrap();
+        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署","wiki":"My-Wiki"}"#)
+            .await
+            .unwrap();
         assert!(out.contains("deploy/prod"));
 
-        db.wiki_create("g1", "same-name", "全局", "global", "", "").await.unwrap();
-        db.wiki_create("c1w", "same-name", "客户端", "client", "c1", "").await.unwrap();
-        db.wiki_create("w1b", "same-name", "工作区", "workspace", "c1", "w1").await.unwrap();
-        db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None).await.unwrap();
-        db.wiki_upsert_page("c1w", "cl/page", "cl", "s", "cl content", false, None).await.unwrap();
-        db.wiki_upsert_page("g1", "gl/page", "gl", "s", "gl content", false, None).await.unwrap();
-        let out = wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"ws content","wiki":"same-name"}"#).await.unwrap();
+        db.wiki_create("g1", "same-name", "全局", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_create("c1w", "same-name", "客户端", "client", "c1", "")
+            .await
+            .unwrap();
+        db.wiki_create("w1b", "same-name", "工作区", "workspace", "c1", "w1")
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("c1w", "cl/page", "cl", "s", "cl content", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("g1", "gl/page", "gl", "s", "gl content", false, None)
+            .await
+            .unwrap();
+        let out = wiki_search_from_agent(
+            &wiki,
+            "c1",
+            "w1",
+            r#"{"query":"ws content","wiki":"same-name"}"#,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("ws/page"));
-        let out = wiki_search_from_agent(&wiki, "c1", "w2", r#"{"query":"cl content","wiki":"same-name"}"#).await.unwrap();
+        let out = wiki_search_from_agent(
+            &wiki,
+            "c1",
+            "w2",
+            r#"{"query":"cl content","wiki":"same-name"}"#,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("cl/page"));
-        let out = wiki_search_from_agent(&wiki, "other", "w9", r#"{"query":"gl content","wiki":"same-name"}"#).await.unwrap();
+        let out = wiki_search_from_agent(
+            &wiki,
+            "other",
+            "w9",
+            r#"{"query":"gl content","wiki":"same-name"}"#,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("gl/page"));
 
         let mut s = db.memory_get_settings().await.unwrap();
         s.wiki_enabled = 0;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署"}"#).await.unwrap_err().contains("disabled"));
+        assert!(
+            wiki_search_from_agent(&wiki, "c1", "w1", r#"{"query":"部署"}"#)
+                .await
+                .unwrap_err()
+                .contains("disabled")
+        );
     }
 
     #[tokio::test]
     async fn read_param_validation_and_bump() {
         let (db, wiki) = wiki_state().await;
-        db.wiki_create("w1", "my-wiki", "", "workspace", "c1", "w1").await.unwrap();
-        db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None).await.unwrap();
-        db.wiki_upsert_page("w1", "c/d", "C", "sum C", "content C", false, None).await.unwrap();
+        db.wiki_create("w1", "my-wiki", "", "workspace", "c1", "w1")
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1", "c/d", "C", "sum C", "content C", false, None)
+            .await
+            .unwrap();
 
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", r#"{"refs":["a/b"]}"#).await.is_err());
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":[]}"#).await.is_err());
+        assert!(
+            wiki_read_from_agent(&wiki, "c1", "w1", r#"{"refs":["a/b"]}"#)
+                .await
+                .is_err()
+        );
+        assert!(
+            wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":[]}"#)
+                .await
+                .is_err()
+        );
         let many: Vec<String> = (0..11).map(|i| format!("r{i}")).collect();
         let args = serde_json::json!({"wiki":"my-wiki","refs": many}).to_string();
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", &args).await.is_err());
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["bad ref"]}"#).await.is_err());
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"ghost","refs":["a/b"]}"#).await.unwrap_err().contains("not found"));
+        assert!(wiki_read_from_agent(&wiki, "c1", "w1", &args)
+            .await
+            .is_err());
+        assert!(wiki_read_from_agent(
+            &wiki,
+            "c1",
+            "w1",
+            r#"{"wiki":"my-wiki","refs":["bad ref"]}"#
+        )
+        .await
+        .is_err());
+        assert!(
+            wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"ghost","refs":["a/b"]}"#)
+                .await
+                .unwrap_err()
+                .contains("not found")
+        );
 
-        let out = wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b"]}"#).await.unwrap();
+        let out = wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b"]}"#)
+            .await
+            .unwrap();
         assert!(out.contains("content A"));
         assert!(out.contains("a/b"));
         let p = db.wiki_get_page("w1", "a/b").await.unwrap().unwrap();
         assert_eq!(p.use_count, 1);
-        let _ = wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b","c/d"]}"#).await.unwrap();
+        let _ = wiki_read_from_agent(
+            &wiki,
+            "c1",
+            "w1",
+            r#"{"wiki":"my-wiki","refs":["a/b","c/d"]}"#,
+        )
+        .await
+        .unwrap();
         let p = db.wiki_get_page("w1", "a/b").await.unwrap().unwrap();
         assert_eq!(p.use_count, 2);
         let p2 = db.wiki_get_page("w1", "c/d").await.unwrap().unwrap();
         assert_eq!(p2.use_count, 1);
 
-        let out = wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b","missing/ref"]}"#).await.unwrap();
+        let out = wiki_read_from_agent(
+            &wiki,
+            "c1",
+            "w1",
+            r#"{"wiki":"my-wiki","refs":["a/b","missing/ref"]}"#,
+        )
+        .await
+        .unwrap();
         assert!(out.contains("content A"));
         assert!(out.contains("not found: missing/ref"));
 
         let mut s = db.memory_get_settings().await.unwrap();
         s.wiki_enabled = 0;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b"]}"#).await.unwrap_err().contains("disabled"));
+        assert!(
+            wiki_read_from_agent(&wiki, "c1", "w1", r#"{"wiki":"my-wiki","refs":["a/b"]}"#)
+                .await
+                .unwrap_err()
+                .contains("disabled")
+        );
     }
 }

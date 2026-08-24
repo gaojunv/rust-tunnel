@@ -127,8 +127,8 @@ impl MemoryState {
         if s.emb_base_url.is_empty() || s.emb_model.is_empty() {
             return None;
         }
-        let key =
-            crate::llm::crypto::decrypt_field(self.cipher.as_ref(), &s.emb_api_key).unwrap_or_default();
+        let key = crate::llm::crypto::decrypt_field(self.cipher.as_ref(), &s.emb_api_key)
+            .unwrap_or_default();
         if key.is_empty() {
             return None;
         }
@@ -212,7 +212,10 @@ async fn best_scope_match(
     hits.iter()
         .filter_map(|h| {
             let row = rows.iter().find(|r| r.id == h.id)?;
-            if row.scope_type == scope_type && row.client_id == client_id && row.workspace_id == workspace_id {
+            if row.scope_type == scope_type
+                && row.client_id == client_id
+                && row.workspace_id == workspace_id
+            {
                 Some((h.score, row.clone()))
             } else {
                 None
@@ -365,7 +368,9 @@ pub async fn mock_embedding_server(dim: usize) -> String {
         .expect("bind mock embedding server");
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock embedding");
+        axum::serve(listener, app)
+            .await
+            .expect("serve mock embedding");
     });
     format!("http://{addr}")
 }
@@ -396,10 +401,7 @@ mod tests {
     fn merge_tags_unions_dedups_caps() {
         let out = merge_tags(&["a".into(), "b".into()], &["b".into(), "c".into()]);
         assert_eq!(out, vec!["a", "b", "c"]);
-        let many = merge_tags(
-            &(0..10).map(|i| format!("t{i}")).collect::<Vec<_>>(),
-            &[],
-        );
+        let many = merge_tags(&(0..10).map(|i| format!("t{i}")).collect::<Vec<_>>(), &[]);
         assert_eq!(many.len(), MAX_TAGS, "tags 并集应封顶 MAX_TAGS");
     }
 
@@ -432,15 +434,33 @@ mod tests {
         let emb = memory.embedder().await.expect("embedder configured");
 
         let id1 = upsert_memory_with_dedup(
-            &memory, &s, &emb, "用户偏好简洁代码", "workspace", "c1", "w1",
-            &["rust".into()], 0.9, "s1", "distill",
+            &memory,
+            &s,
+            &emb,
+            "用户偏好简洁代码",
+            "workspace",
+            "c1",
+            "w1",
+            &["rust".into()],
+            0.9,
+            "s1",
+            "distill",
         )
         .await
         .unwrap();
         // 同作用域近似内容（mock 同向量 → cosine=1.0 ≥ 0.9）→ 更新既有而非新建
         let id2 = upsert_memory_with_dedup(
-            &memory, &s, &emb, "用户偏好简洁的代码风格", "workspace", "c1", "w1",
-            &["clean".into()], 1.0, "s1", "remember",
+            &memory,
+            &s,
+            &emb,
+            "用户偏好简洁的代码风格",
+            "workspace",
+            "c1",
+            "w1",
+            &["clean".into()],
+            1.0,
+            "s1",
+            "remember",
         )
         .await
         .unwrap();
@@ -449,20 +469,38 @@ mod tests {
         assert_eq!(row.content, "用户偏好简洁的代码风格", "content 以新为准");
         assert_eq!(row.confidence, 1.0, "confidence 取 max");
         let tags = parse_tags(&row.tags);
-        assert!(tags.contains(&"rust".into()) && tags.contains(&"clean".into()), "tags 并集");
+        assert!(
+            tags.contains(&"rust".into()) && tags.contains(&"clean".into()),
+            "tags 并集"
+        );
 
-        let all = db.memory_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .memory_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 1, "不应产生重复记忆");
 
         // 不同作用域 → 新建（不同 id）
         let id3 = upsert_memory_with_dedup(
-            &memory, &s, &emb, "用户偏好简洁代码", "global", "", "",
-            &[], 0.9, "s1", "distill",
+            &memory,
+            &s,
+            &emb,
+            "用户偏好简洁代码",
+            "global",
+            "",
+            "",
+            &[],
+            0.9,
+            "s1",
+            "distill",
         )
         .await
         .unwrap();
         assert_ne!(id1, id3, "不同作用域应新建");
-        let all = db.memory_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .memory_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -474,7 +512,17 @@ mod tests {
         let mut s = db.memory_get_settings().await.unwrap();
         s.emb_dimension = 0; // 模拟维度未配置
         let err = upsert_memory_with_dedup(
-            &memory, &s, &emb, "x", "workspace", "c1", "w1", &[], 0.9, "s1", "distill",
+            &memory,
+            &s,
+            &emb,
+            "x",
+            "workspace",
+            "c1",
+            "w1",
+            &[],
+            0.9,
+            "s1",
+            "distill",
         )
         .await
         .unwrap_err();

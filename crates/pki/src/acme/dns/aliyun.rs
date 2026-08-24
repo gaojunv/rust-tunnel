@@ -137,7 +137,10 @@ impl AliyunDnsSolver {
         let body: serde_json::Value = response.json().await?;
 
         if !status.is_success() {
-            return Err(AcmeError::Dns(format!("Aliyun API error: {} - {}", status, body)));
+            return Err(AcmeError::Dns(format!(
+                "Aliyun API error: {} - {}",
+                status, body
+            )));
         }
 
         // Check for Aliyun business-level errors

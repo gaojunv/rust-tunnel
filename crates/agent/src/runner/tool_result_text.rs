@@ -20,7 +20,11 @@ pub(crate) fn truncate_tool_result(text: String) -> String {
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        return format!("{}\n[... truncated, total {} bytes ...]", &text[..cut], text.len());
+        return format!(
+            "{}\n[... truncated, total {} bytes ...]",
+            &text[..cut],
+            text.len()
+        );
     }
     // 行级 head+tail 截断
     let lines: Vec<&str> = text.lines().collect();
@@ -48,20 +52,21 @@ pub(crate) fn agent_result_to_text(result: &AgentResult) -> String {
             diff,
             ..
         } => {
-            let base = format!(
-                "wrote: +{lines_added}/-{lines_removed} lines, {bytes_written} bytes"
-            );
+            let base =
+                format!("wrote: +{lines_added}/-{lines_removed} lines, {bytes_written} bytes");
             if diff.len() <= 4096 {
                 format!("{base}\n{diff}")
             } else {
-                let changed = diff.lines().filter(|l| l.starts_with('+') || l.starts_with('-')).count();
+                let changed = diff
+                    .lines()
+                    .filter(|l| l.starts_with('+') || l.starts_with('-'))
+                    .count();
                 format!("{base}\n(diff omitted, {changed} changed lines)")
             }
         }
     };
     truncate_tool_result(text)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -79,7 +84,7 @@ mod tests {
         assert!(lines.len() <= TOOL_RESULT_MAX_LINES + 1); // +1 为 truncated 标记行
         assert!(out.contains("[... truncated"));
         assert!(out.contains("100")); // 省略 100 行
-        // 尾部保留：最后一行应为 "line 399"
+                                      // 尾部保留：最后一行应为 "line 399"
         assert!(out.contains("line 399"));
     }
 
@@ -136,5 +141,4 @@ mod tests {
     }
 
     // ── stale hash 记录/清除 ──────────────────────────────
-
 }

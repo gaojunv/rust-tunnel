@@ -203,9 +203,7 @@ git_write_body!(GitStageRequest {
 git_write_body!(GitUnstageRequest {
     paths: Vec<String>,
 });
-git_write_body!(GitCommitRequest {
-    message: String,
-});
+git_write_body!(GitCommitRequest { message: String });
 git_write_body!(GitCheckoutRequest {
     branch: String,
     create: Option<bool>,
@@ -214,9 +212,7 @@ git_write_body!(GitBranchDeleteRequest {
     branch: String,
     force: Option<bool>,
 });
-git_write_body!(GitRevertRequest {
-    rev: String,
-});
+git_write_body!(GitRevertRequest { rev: String });
 git_write_body!(GitResetRequest {
     rev: Option<String>,
     mode: String,
@@ -224,9 +220,7 @@ git_write_body!(GitResetRequest {
 git_write_body!(GitStashPushRequest {
     message: Option<String>,
 });
-git_write_body!(GitStashIndexRequest {
-    index: usize,
-});
+git_write_body!(GitStashIndexRequest { index: usize });
 
 // ── GitHub Actions 面板 ───────────────────────────────────────
 

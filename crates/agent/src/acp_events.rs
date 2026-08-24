@@ -160,9 +160,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             "type": "config_option_update",
             "options": upd.config_options,
         })),
-        SessionUpdate::AvailableCommandsUpdate(upd) => {
-            Some(map_available_commands_update(upd))
-        }
+        SessionUpdate::AvailableCommandsUpdate(upd) => Some(map_available_commands_update(upd)),
         _ => None,
     }
 }

@@ -8,9 +8,7 @@ use crate::db::Database;
 
 /// 内存 SQLite 数据库（最常用，零文件系统依赖）。
 pub async fn in_memory_db() -> Database {
-    Database::new(":memory:")
-        .await
-        .expect("in-memory db")
+    Database::new(":memory:").await.expect("in-memory db")
 }
 
 /// 文件-backed 数据库 + 临时目录（需跨连接持久化的测试用）。
@@ -28,8 +26,18 @@ pub async fn file_db() -> (Database, tempfile::TempDir) {
 /// 满足 `agent_sessions` → `agent_workspaces` 的外键约束。
 pub async fn seed_workspace_and_session(db: &Database) -> String {
     db.agent_create_workspace(
-        "ws-test", "test-ws", "test-client", "host", "/tmp",
-        None, None, "", None, None, None, None,
+        "ws-test",
+        "test-ws",
+        "test-client",
+        "host",
+        "/tmp",
+        None,
+        None,
+        "",
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("seed workspace");
@@ -42,8 +50,18 @@ pub async fn seed_workspace_and_session(db: &Database) -> String {
 /// 种子：仅创建 workspace（不建 session），返回 workspace id。
 pub async fn seed_workspace(db: &Database) -> String {
     db.agent_create_workspace(
-        "ws-test", "test-ws", "test-client", "host", "/tmp",
-        None, None, "", None, None, None, None,
+        "ws-test",
+        "test-ws",
+        "test-client",
+        "host",
+        "/tmp",
+        None,
+        None,
+        "",
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .expect("seed workspace");

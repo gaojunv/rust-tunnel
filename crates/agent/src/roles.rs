@@ -70,10 +70,10 @@ pub fn parse_at_role_prefix<'a>(
     // 在可见角色中查找（大小写不敏感）
     let candidate_lower = candidate.to_ascii_lowercase();
     let matched = visible_roles.iter().find(|r| {
-        r.name.to_ascii_lowercase() == candidate_lower
-            && (r.mode == "primary" || r.mode == "all")
+        r.name.to_ascii_lowercase() == candidate_lower && (r.mode == "primary" || r.mode == "all")
     })?;
-    let stripped = content[content.len() - content.trim_start().len() + 1 + name_end..].trim_start();
+    let stripped =
+        content[content.len() - content.trim_start().len() + 1 + name_end..].trim_start();
     Some((matched.name.clone(), stripped))
 }
 
@@ -255,7 +255,10 @@ mod tests {
     #[test]
     fn test_subagent_prompt_no_role() {
         let prompt = subagent_system_prompt(None);
-        assert_eq!(prompt, format!("{SUBAGENT_DEFAULT_SYSTEM_PROMPT}{SUBAGENT_SYSTEM_PROMPT_SUFFIX}"));
+        assert_eq!(
+            prompt,
+            format!("{SUBAGENT_DEFAULT_SYSTEM_PROMPT}{SUBAGENT_SYSTEM_PROMPT_SUFFIX}")
+        );
     }
 
     // ── task_schema_roles_block ─────────────────────────────

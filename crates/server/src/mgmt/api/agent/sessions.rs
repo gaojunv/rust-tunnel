@@ -191,9 +191,7 @@ pub async fn delete_session(
             if let Some(snapshot) = distill_snapshot {
                 if let Some(memory) = agent.memory.as_ref() {
                     crate::agent::memory::distill::trigger_distill_with_snapshot(
-                        memory,
-                        snapshot,
-                        "delete",
+                        memory, snapshot, "delete",
                     )
                     .await;
                 }
@@ -231,7 +229,9 @@ pub async fn list_messages(
         .agent_list_messages_page(&session_id, params.before.as_deref(), limit)
         .await
     {
-        Ok((messages, has_more)) => Json(ListMessagesResponse { messages, has_more }).into_response(),
+        Ok((messages, has_more)) => {
+            Json(ListMessagesResponse { messages, has_more }).into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -356,8 +356,7 @@ fn session_to_markdown(
                     let _ = writeln!(out, "\n> 💭 **思考**\n>\n{}", blockquote(&m.content));
                 }
                 Some("attachment") => {
-                    let f: serde_json::Value =
-                        serde_json::from_str(&m.content).unwrap_or_default();
+                    let f: serde_json::Value = serde_json::from_str(&m.content).unwrap_or_default();
                     let name = f["name"].as_str().unwrap_or("附件");
                     let uri = f["uri"].as_str().unwrap_or("");
                     let mime = f["mime"].as_str().unwrap_or("");
@@ -369,8 +368,7 @@ fn session_to_markdown(
                 }
                 Some("plan") => {
                     let _ = writeln!(out, "\n**📋 计划**\n");
-                    if let Ok(entries) =
-                        serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
+                    if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&m.content)
                     {
                         for e in entries {
                             let status = e["status"].as_str().unwrap_or("pending");
@@ -515,9 +513,7 @@ mod tests {
     }
 
     /// 解析 list_messages 响应体 → (messages, has_more)。
-    async fn parse_messages(
-        resp: impl IntoResponse,
-    ) -> (Vec<serde_json::Value>, bool) {
+    async fn parse_messages(resp: impl IntoResponse) -> (Vec<serde_json::Value>, bool) {
         let resp = resp.into_response();
         let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
@@ -739,14 +735,24 @@ mod tests {
             .unwrap();
         // 思考（name=thought）
         db.agent_add_message_v2(
-            "m3", "s-export", "assistant", "先列目录", None, None, Some("thought"),
-            "message", None,
+            "m3",
+            "s-export",
+            "assistant",
+            "先列目录",
+            None,
+            None,
+            Some("thought"),
+            "message",
+            None,
         )
         .await
         .unwrap();
         // 工具调用
         db.agent_upsert_tool_call(
-            "m4", "s-export", "tc1", Some("shell"),
+            "m4",
+            "s-export",
+            "tc1",
+            Some("shell"),
             r#"[{"id":"tc1","name":"shell","arguments":"{\"cmd\":\"ls\"}"}]"#,
             None,
         )
@@ -754,7 +760,10 @@ mod tests {
         .unwrap();
         // 工具结果（结构化 content）
         db.agent_upsert_tool_result(
-            "m5", "s-export", "tc1", Some("shell"),
+            "m5",
+            "s-export",
+            "tc1",
+            Some("shell"),
             r#"{"text":"README.md\nsrc","status":"completed"}"#,
             None,
         )
@@ -804,7 +813,10 @@ mod tests {
         assert!(md.contains("README.md\nsrc"), "结果正文缺失");
         assert!(md.contains("- [x] 第一步"), "计划勾选缺失");
         assert!(md.contains("- [ ] 第二步"));
-        assert!(md.contains("[shot.png](file:///tmp/shot.png)"), "附件链接缺失");
+        assert!(
+            md.contains("[shot.png](file:///tmp/shot.png)"),
+            "附件链接缺失"
+        );
 
         // 不存在的会话 → 404
         let (state2, _db2) = test_state().await;

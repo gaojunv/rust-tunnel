@@ -337,7 +337,11 @@ impl SessionRuntime {
         let model = model_override
             .and_then(|m| {
                 let m = m.trim();
-                if m.is_empty() { None } else { Some(m.to_string()) }
+                if m.is_empty() {
+                    None
+                } else {
+                    Some(m.to_string())
+                }
             })
             .unwrap_or_else(|| parent.model.clone());
         Self {

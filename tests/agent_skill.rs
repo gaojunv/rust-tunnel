@@ -314,7 +314,9 @@ async fn archive_distills_skills_without_embedding() {
         assert_eq!(found.4, json!(["release"]));
 
         // 详情含完整 content
-        let (status, body) = api.get_json(&format!("/api/agent/skills/{}", found.0)).await;
+        let (status, body) = api
+            .get_json(&format!("/api/agent/skills/{}", found.0))
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["content"].as_str().unwrap().contains("更新 CHANGELOG"));
 

@@ -548,7 +548,11 @@ impl crate::agent::TunnelExecutor for ClientRegistry {
 
 #[async_trait::async_trait]
 impl rust_tunnel_protocols::TunnelOpener for ClientRegistry {
-    async fn open_tunnel(&self, client_name: &str, target_addr: &str) -> std::io::Result<rust_tunnel_protocols::reverse_proxy::connector::BoxedStream> {
+    async fn open_tunnel(
+        &self,
+        client_name: &str,
+        target_addr: &str,
+    ) -> std::io::Result<rust_tunnel_protocols::reverse_proxy::connector::BoxedStream> {
         let stream = ClientRegistry::open_tunnel(self, client_name, target_addr).await?;
         Ok(Box::new(stream))
     }

@@ -17,10 +17,7 @@ use super::{AcpBridge, SpawnedAgent};
 /// 私有）：reaper 只需这一帧，不值得把广播器提升为跨模块公共项——这里经
 /// 同一 ws_conns 结构手动 fan-out，语义与 broadcast_ws_frame(must_deliver=true)
 /// 一致（阻塞发送 + 刷新 last_activity）。
-async fn broadcast_turn_timeout(
-    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
-    sid: &str,
-) {
+async fn broadcast_turn_timeout(sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>, sid: &str) {
     let frame = serde_json::json!({
         "type": "status",
         "message": "回合超时（10 分钟无响应），已自动取消"
@@ -142,7 +139,10 @@ impl AcpBridge {
 /// false 放弃本帧（落库与推送都依赖会话条目，回收后两者都无意义）。
 /// 断线期间不依赖 WS 通道存活即落库，是「断线期间后台跑完的回合同样可
 /// 追溯」的前提（评审修复：persist 移出 ws_tx guard 之前）。
-pub(super) async fn touch_activity(sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>, sid: &str) -> bool {
+pub(super) async fn touch_activity(
+    sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
+    sid: &str,
+) -> bool {
     let mut map = sessions.lock().await;
     match map.get_mut(sid) {
         Some(a) => {
