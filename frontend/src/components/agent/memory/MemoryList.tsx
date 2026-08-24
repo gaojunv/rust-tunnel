@@ -1,13 +1,12 @@
-import { useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Plus, Pin, Search } from 'lucide-react';
-import { useAgentWorkspaces, useClients, useMemoryStream } from '@/api/hooks';
+import { Pin } from 'lucide-react';
+import { useMemoryStream } from '@/api/hooks';
+import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
+import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import { useTranslation } from 'react-i18next';
 import type { AgentMemory, AgentMemoryScope, MemoryFilters } from '@/types';
 
 interface Props {
@@ -17,6 +16,7 @@ interface Props {
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onSettings?: () => void;
 }
 
 function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outline' {
@@ -32,101 +32,32 @@ export default function MemoryList({
   selectedId,
   onSelect,
   onNew,
+  onSettings,
 }: Props) {
   const { t } = useTranslation();
-  // 记忆 SSE 事件无逐条 id，仅失效列表（双通道中的 invalidate 通道）。
   useMemoryStream();
-  const { data: clients } = useClients();
-  const { data: workspaces } = useAgentWorkspaces();
-
-  // 搜索框本地输入 + 300ms 防抖提交到 filters（避免每次按键触发请求）。
-  const [qInput, setQInput] = useState(filters.q);
-  useEffect(() => {
-    setQInput(filters.q);
-  }, [filters.q]);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (qInput !== filters.q) {
-        onFiltersChange({ ...filters, q: qInput });
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [qInput, filters, onFiltersChange]);
-
-  const changeScope = (scope: MemoryFilters['scope']) => {
-    onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' });
-  };
-
-  const selectClass =
-    'h-9 w-full rounded-md border border-input bg-background px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50';
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          {t('memory.listTitle')} ({memories.length})
-        </h2>
-        <Button size="sm" onClick={onNew}>
-          <Plus className="mr-1 h-4 w-4" /> {t('memory.newMemory')}
-        </Button>
-      </div>
-
-      {/* 过滤栏：作用域 / 客户端 / 工作区 / 搜索 / 置顶 */}
-      <Card>
-        <CardContent className="space-y-2 p-3">
-          <div className="flex items-center gap-2">
-            <select
-              aria-label={t('memory.scopeLabel')}
-              value={filters.scope}
-              onChange={(e) => changeScope(e.target.value as MemoryFilters['scope'])}
-              className="h-9 w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-sm"
-            >
-              <option value="all">{t('memory.all')}</option>
-              <option value="global">{t('memory.scope_global')}</option>
-              <option value="client">{t('memory.scope_client')}</option>
-              <option value="workspace">{t('memory.scope_workspace')}</option>
-            </select>
-            <div className="relative flex-1">
-              <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={qInput}
-                onChange={(e) => setQInput(e.target.value)}
-                placeholder={t('memory.searchPlaceholder')}
-                aria-label={t('memory.searchPlaceholder')}
-                className="h-9 pl-8"
-              />
-            </div>
-          </div>
-          {filters.scope === 'client' && (
-            <select
-              aria-label={t('memory.clientLabel')}
-              value={filters.clientId}
-              onChange={(e) => onFiltersChange({ ...filters, clientId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('memory.clientPlaceholder')}</option>
-              {(clients ?? []).map((c) => (
-                <option key={c.name} value={c.name}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          )}
-          {filters.scope === 'workspace' && (
-            <select
-              aria-label={t('memory.workspaceLabel')}
-              value={filters.workspaceId}
-              onChange={(e) => onFiltersChange({ ...filters, workspaceId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('memory.workspacePlaceholder')}</option>
-              {(workspaces ?? []).map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                </option>
-              ))}
-            </select>
-          )}
+    <SectionFrame
+      title={t('memory.listTitle')}
+      count={memories.length}
+      newLabel={t('memory.newMemory')}
+      onNew={onNew}
+      onSettings={onSettings}
+      settingsLabel={t('memory.settings.title')}
+    >
+      <ScopeFilterBar
+        scope={filters.scope}
+        clientId={filters.clientId}
+        workspaceId={filters.workspaceId}
+        q={filters.q}
+        scopeLabelKey="memory.scopeLabel"
+        searchPlaceholderKey="memory.searchPlaceholder"
+        onScopeChange={(scope) => onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' })}
+        onClientChange={(clientId) => onFiltersChange({ ...filters, clientId })}
+        onWorkspaceChange={(workspaceId) => onFiltersChange({ ...filters, workspaceId })}
+        onSearchChange={(q) => onFiltersChange({ ...filters, q })}
+        extra={
           <div className="flex items-center justify-between">
             <span className="text-sm">{t('memory.pinnedOnly')}</span>
             <Switch
@@ -135,8 +66,8 @@ export default function MemoryList({
               aria-label={t('memory.pinnedOnly')}
             />
           </div>
-        </CardContent>
-      </Card>
+        }
+      />
 
       {memories.length === 0 ? (
         <Card>
@@ -150,7 +81,7 @@ export default function MemoryList({
             key={m.id}
             className={cn(
               'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === m.id && 'border-primary/60 bg-primary/5'
+              selectedId === m.id && 'border-primary/60 bg-primary/5',
             )}
             onClick={() => onSelect(m.id)}
           >
@@ -180,6 +111,6 @@ export default function MemoryList({
           </Card>
         ))
       )}
-    </div>
+    </SectionFrame>
   );
 }

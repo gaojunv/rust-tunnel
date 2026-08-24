@@ -755,7 +755,15 @@
     "description": "Manage RAG knowledge bases and AI conversation memory, sharing one embedding config",
     "sharedEmbeddingTitle": "Shared Embedding Config",
     "sharedEmbeddingDesc": "Knowledge bases and AI memory share this embedding (Base URL / key / model / dimension). Changing the dimension affects existing knowledge base vectors.",
-    "settingsDesc": "Manage shared Embedding, memory, and skill settings"
+    "settingsDesc": "Settings live inside each section — click the gear icon in its header.",
+    "section": {
+      "kb": "KB",
+      "memory": "Memory",
+      "skill": "Skills",
+      "roles": "Roles",
+      "wiki": "Wiki"
+    },
+    "settingsHint": "Open settings from the gear icon in each section header"
   },
   "memory": {
     "title": "AI Memory",

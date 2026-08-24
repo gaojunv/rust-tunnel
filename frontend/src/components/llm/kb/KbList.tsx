@@ -1,9 +1,12 @@
+import { useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Plus, BookOpen } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import { Search } from 'lucide-react';
+import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import { useDebouncedSearch } from '@/components/knowledge/shared/useDebouncedSearch';
 import type { LlmKnowledgeBase } from '@/types';
 
 interface Props {
@@ -11,43 +14,61 @@ interface Props {
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onSettings?: () => void;
 }
 
-export default function KbList({ kbs, selectedId, onSelect, onNew }: Props) {
+export default function KbList({ kbs, selectedId, onSelect, onNew, onSettings }: Props) {
   const { t } = useTranslation();
+  const [q, setQ] = useState('');
+  const [qInput, setQInput] = useDebouncedSearch(q, setQ);
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return kbs;
+    return kbs.filter(
+      (kb) =>
+        kb.name.toLowerCase().includes(needle) ||
+        (kb.description && kb.description.toLowerCase().includes(needle)),
+    );
+  }, [kbs, q]);
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          {t('kb.listTitle')} ({kbs.length})
-        </h2>
-        <Button size="sm" onClick={onNew}>
-          <Plus className="mr-1 h-4 w-4" /> {t('kb.newKb')}
-        </Button>
+    <SectionFrame
+      title={t('kb.listTitle')}
+      count={filtered.length}
+      newLabel={t('kb.newKb')}
+      onNew={onNew}
+      onSettings={onSettings}
+      settingsLabel={t('knowledge.sharedEmbeddingTitle')}
+    >
+      <div className="relative">
+        <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={qInput}
+          onChange={(e) => setQInput(e.target.value)}
+          placeholder={t('wiki.searchPlaceholder')}
+          aria-label={t('wiki.searchPlaceholder')}
+          className="h-9 pl-8"
+        />
       </div>
-      {kbs.length === 0 ? (
+      {filtered.length === 0 ? (
         <Card>
           <CardContent className="p-6 text-center text-sm text-muted-foreground">
-            {t('kb.empty')}
+            {q.trim() ? t('wiki.noSearchResults') : t('kb.empty')}
           </CardContent>
         </Card>
       ) : (
-        kbs.map((kb) => (
+        filtered.map((kb) => (
           <Card
             key={kb.id}
             className={cn(
               'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === kb.id && 'border-primary/60 bg-primary/5'
+              selectedId === kb.id && 'border-primary/60 bg-primary/5',
             )}
             onClick={() => onSelect(kb.id)}
           >
             <CardContent className="p-4">
               <div className="flex items-start justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <BookOpen className="h-4 w-4 shrink-0 text-muted-foreground" />
-                  <span className="truncate font-medium">{kb.name}</span>
-                </div>
+                <span className="truncate font-medium">{kb.name}</span>
                 <Badge variant={kb.enabled ? 'default' : 'secondary'}>
                   {kb.enabled ? t('kb.enabled') : t('kb.disabled')}
                 </Badge>
@@ -62,6 +83,6 @@ export default function KbList({ kbs, selectedId, onSelect, onNew }: Props) {
           </Card>
         ))
       )}
-    </div>
+    </SectionFrame>
   );
 }

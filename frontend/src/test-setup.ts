@@ -291,6 +291,11 @@ class MockContext {
   commit(): void {}
 }
 
+// Radix Select calls Element.scrollIntoView internally; jsdom lacks it — stub to no-op.
+if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function () {};
+}
+
 // ---- Hook into HTMLCanvasElement (only in jsdom environment) -----------------
 if (typeof HTMLCanvasElement !== 'undefined') {
   const origGetContext = HTMLCanvasElement.prototype.getContext;

@@ -1,12 +1,11 @@
-import { useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Plus, Search } from 'lucide-react';
-import { useAgentWorkspaces, useClients, useWikiStream } from '@/api/hooks';
+import { useTranslation } from 'react-i18next';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { useWikiStream } from '@/api/hooks';
+import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
+import SectionFrame from '@/components/knowledge/shared/SectionFrame';
 import type { AgentMemoryScope, AgentWiki } from '@/types';
 
 /** Wiki 容器列表 UI 过滤条件（WikiSection 持有，映射到 API 查询参数）。 */
@@ -25,6 +24,7 @@ interface Props {
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onSettings?: () => void;
 }
 
 function statusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {
@@ -51,116 +51,54 @@ export default function WikiList({
   selectedId,
   onSelect,
   onNew,
+  onSettings,
 }: Props) {
   const { t } = useTranslation();
-  // 文档状态变化（上传/摄入/重建）→ 容器列表刷新（page_count/status）
   useWikiStream();
-  const { data: clients } = useClients();
-  const { data: workspaces } = useAgentWorkspaces();
-
-  // 搜索框本地输入 + 300ms 防抖提交到 filters（避免每次按键触发请求）。
-  const [qInput, setQInput] = useState(filters.q);
-  useEffect(() => {
-    setQInput(filters.q);
-  }, [filters.q]);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (qInput !== filters.q) {
-        onFiltersChange({ ...filters, q: qInput });
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [qInput, filters, onFiltersChange]);
-
-  const changeScope = (scope: WikiFilters['scope']) => {
-    onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' });
-  };
-
-  const selectClass =
-    'h-9 w-full rounded-md border border-input bg-background px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50';
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          {t('wiki.listTitle')} ({wikis.length})
-        </h2>
-        <Button size="sm" onClick={onNew}>
-          <Plus className="mr-1 h-4 w-4" /> {t('wiki.newWiki')}
-        </Button>
-      </div>
-
-      {/* 过滤栏：作用域 / 客户端 / 工作区 / 状态 / 搜索 */}
-      <Card>
-        <CardContent className="space-y-2 p-3">
-          <div className="flex items-center gap-2">
-            <select
-              aria-label={t('wiki.scopeLabel')}
-              value={filters.scope}
-              onChange={(e) => changeScope(e.target.value as WikiFilters['scope'])}
-              className="h-9 w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-sm"
-            >
-              <option value="all">{t('wiki.all')}</option>
-              <option value="global">{t('wiki.scope_global')}</option>
-              <option value="client">{t('wiki.scope_client')}</option>
-              <option value="workspace">{t('wiki.scope_workspace')}</option>
-            </select>
-            <div className="relative flex-1">
-              <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={qInput}
-                onChange={(e) => setQInput(e.target.value)}
-                placeholder={t('wiki.searchPlaceholder')}
-                aria-label={t('wiki.searchPlaceholder')}
-                className="h-9 pl-8"
-              />
-            </div>
-          </div>
-          <select
-            aria-label={t('wiki.statusFilter')}
-            value={filters.status}
-            onChange={(e) => onFiltersChange({ ...filters, status: e.target.value })}
-            className={selectClass}
+    <SectionFrame
+      title={t('wiki.listTitle')}
+      count={wikis.length}
+      newLabel={t('wiki.newWiki')}
+      onNew={onNew}
+      onSettings={onSettings}
+      settingsLabel={t('wiki.settings.title')}
+    >
+      <ScopeFilterBar
+        scope={filters.scope}
+        clientId={filters.clientId}
+        workspaceId={filters.workspaceId}
+        q={filters.q}
+        scopeLabelKey="wiki.scopeLabel"
+        searchPlaceholderKey="wiki.searchPlaceholder"
+        clientLabelKey="wiki.clientLabel"
+        workspaceLabelKey="wiki.workspaceLabel"
+        clientPlaceholderKey="wiki.clientPlaceholder"
+        workspacePlaceholderKey="wiki.workspacePlaceholder"
+        onScopeChange={(scope) => onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' })}
+        onClientChange={(clientId) => onFiltersChange({ ...filters, clientId })}
+        onWorkspaceChange={(workspaceId) => onFiltersChange({ ...filters, workspaceId })}
+        onSearchChange={(q) => onFiltersChange({ ...filters, q })}
+        extra={
+          <Select
+            value={filters.status || '__all__'}
+            onValueChange={(v) => onFiltersChange({ ...filters, status: v === '__all__' ? '' : v })}
           >
-            <option value="">{t('wiki.statusAll')}</option>
-            <option value="draft">{t('wiki.status.draft')}</option>
-            <option value="pending">{t('wiki.status.pending')}</option>
-            <option value="processing">{t('wiki.status.processing')}</option>
-            <option value="ready">{t('wiki.status.ready')}</option>
-            <option value="failed">{t('wiki.status.failed')}</option>
-          </select>
-          {filters.scope === 'client' && (
-            <select
-              aria-label={t('wiki.clientLabel')}
-              value={filters.clientId}
-              onChange={(e) => onFiltersChange({ ...filters, clientId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('wiki.clientPlaceholder')}</option>
-              {(clients ?? []).map((c) => (
-                <option key={c.name} value={c.name}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          )}
-          {filters.scope === 'workspace' && (
-            <select
-              aria-label={t('wiki.workspaceLabel')}
-              value={filters.workspaceId}
-              onChange={(e) => onFiltersChange({ ...filters, workspaceId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('wiki.workspacePlaceholder')}</option>
-              {(workspaces ?? []).map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                </option>
-              ))}
-            </select>
-          )}
-        </CardContent>
-      </Card>
+            <SelectTrigger className="h-9" aria-label={t('wiki.statusFilter')}>
+              <SelectValue placeholder={t('wiki.statusAll')} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">{t('wiki.statusAll')}</SelectItem>
+              <SelectItem value="draft">{t('wiki.status.draft')}</SelectItem>
+              <SelectItem value="pending">{t('wiki.status.pending')}</SelectItem>
+              <SelectItem value="processing">{t('wiki.status.processing')}</SelectItem>
+              <SelectItem value="ready">{t('wiki.status.ready')}</SelectItem>
+              <SelectItem value="failed">{t('wiki.status.failed')}</SelectItem>
+            </SelectContent>
+          </Select>
+        }
+      />
 
       {wikis.length === 0 ? (
         <Card>
@@ -174,7 +112,7 @@ export default function WikiList({
             key={w.id}
             className={cn(
               'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === w.id && 'border-primary/60 bg-primary/5'
+              selectedId === w.id && 'border-primary/60 bg-primary/5',
             )}
             onClick={() => onSelect(w.id)}
           >
@@ -198,6 +136,6 @@ export default function WikiList({
           </Card>
         ))
       )}
-    </div>
+    </SectionFrame>
   );
 }

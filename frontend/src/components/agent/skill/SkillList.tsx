@@ -1,13 +1,11 @@
-import { useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Plus, Search } from 'lucide-react';
-import { useAgentWorkspaces, useClients, useMemoryStream } from '@/api/hooks';
+import { useMemoryStream } from '@/api/hooks';
+import ScopeFilterBar from '@/components/knowledge/shared/ScopeFilterBar';
+import SectionFrame from '@/components/knowledge/shared/SectionFrame';
+import { useTranslation } from 'react-i18next';
 import type { AgentMemoryScope, AgentSkill, SkillFilters } from '@/types';
 
 interface Props {
@@ -17,6 +15,7 @@ interface Props {
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
+  onSettings?: () => void;
 }
 
 function scopeVariant(scope: AgentMemoryScope): 'default' | 'secondary' | 'outline' {
@@ -32,101 +31,36 @@ export default function SkillList({
   selectedId,
   onSelect,
   onNew,
+  onSettings,
 }: Props) {
   const { t } = useTranslation();
-  // 技能无独立 SSE 流：复用记忆 SSE（事件体含 skills_found），到达即失效列表。
   useMemoryStream();
-  const { data: clients } = useClients();
-  const { data: workspaces } = useAgentWorkspaces();
-
-  // 搜索框本地输入 + 300ms 防抖提交到 filters（避免每次按键触发请求）。
-  const [qInput, setQInput] = useState(filters.q);
-  useEffect(() => {
-    setQInput(filters.q);
-  }, [filters.q]);
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (qInput !== filters.q) {
-        onFiltersChange({ ...filters, q: qInput });
-      }
-    }, 300);
-    return () => clearTimeout(timer);
-  }, [qInput, filters, onFiltersChange]);
-
-  const changeScope = (scope: SkillFilters['scope']) => {
-    onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' });
-  };
-
-  const selectClass =
-    'h-9 w-full rounded-md border border-input bg-background px-2 py-1 text-sm disabled:cursor-not-allowed disabled:opacity-50';
 
   return (
-    <div className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
-          {t('skill.listTitle')} ({skills.length})
-        </h2>
-        <Button size="sm" onClick={onNew}>
-          <Plus className="mr-1 h-4 w-4" /> {t('skill.newSkill')}
-        </Button>
-      </div>
-
-      {/* 过滤栏：作用域 / 客户端 / 工作区 / 搜索 / 仅启用 */}
-      <Card>
-        <CardContent className="space-y-2 p-3">
-          <div className="flex items-center gap-2">
-            <select
-              aria-label={t('skill.scopeLabel')}
-              value={filters.scope}
-              onChange={(e) => changeScope(e.target.value as SkillFilters['scope'])}
-              className="h-9 w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-sm"
-            >
-              <option value="all">{t('skill.all')}</option>
-              <option value="global">{t('skill.scope_global')}</option>
-              <option value="client">{t('skill.scope_client')}</option>
-              <option value="workspace">{t('skill.scope_workspace')}</option>
-            </select>
-            <div className="relative flex-1">
-              <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={qInput}
-                onChange={(e) => setQInput(e.target.value)}
-                placeholder={t('skill.searchPlaceholder')}
-                aria-label={t('skill.searchPlaceholder')}
-                className="h-9 pl-8"
-              />
-            </div>
-          </div>
-          {filters.scope === 'client' && (
-            <select
-              aria-label={t('skill.clientLabel')}
-              value={filters.clientId}
-              onChange={(e) => onFiltersChange({ ...filters, clientId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('skill.clientPlaceholder')}</option>
-              {(clients ?? []).map((c) => (
-                <option key={c.name} value={c.name}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          )}
-          {filters.scope === 'workspace' && (
-            <select
-              aria-label={t('skill.workspaceLabel')}
-              value={filters.workspaceId}
-              onChange={(e) => onFiltersChange({ ...filters, workspaceId: e.target.value })}
-              className={selectClass}
-            >
-              <option value="">{t('skill.workspacePlaceholder')}</option>
-              {(workspaces ?? []).map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                </option>
-              ))}
-            </select>
-          )}
+    <SectionFrame
+      title={t('skill.listTitle')}
+      count={skills.length}
+      newLabel={t('skill.newSkill')}
+      onNew={onNew}
+      onSettings={onSettings}
+      settingsLabel={t('skill.settings.title')}
+    >
+      <ScopeFilterBar
+        scope={filters.scope}
+        clientId={filters.clientId}
+        workspaceId={filters.workspaceId}
+        q={filters.q}
+        scopeLabelKey="skill.scopeLabel"
+        searchPlaceholderKey="skill.searchPlaceholder"
+        clientLabelKey="skill.clientLabel"
+        workspaceLabelKey="skill.workspaceLabel"
+        clientPlaceholderKey="skill.clientPlaceholder"
+        workspacePlaceholderKey="skill.workspacePlaceholder"
+        onScopeChange={(scope) => onFiltersChange({ ...filters, scope, clientId: '', workspaceId: '' })}
+        onClientChange={(clientId) => onFiltersChange({ ...filters, clientId })}
+        onWorkspaceChange={(workspaceId) => onFiltersChange({ ...filters, workspaceId })}
+        onSearchChange={(q) => onFiltersChange({ ...filters, q })}
+        extra={
           <div className="flex items-center justify-between">
             <span className="text-sm">{t('skill.enabledOnly')}</span>
             <Switch
@@ -135,8 +69,8 @@ export default function SkillList({
               aria-label={t('skill.enabledOnly')}
             />
           </div>
-        </CardContent>
-      </Card>
+        }
+      />
 
       {skills.length === 0 ? (
         <Card>
@@ -150,7 +84,7 @@ export default function SkillList({
             key={s.id}
             className={cn(
               'cursor-pointer transition-colors hover:border-primary/40',
-              selectedId === s.id && 'border-primary/60 bg-primary/5'
+              selectedId === s.id && 'border-primary/60 bg-primary/5',
             )}
             onClick={() => onSelect(s.id)}
           >
@@ -159,9 +93,7 @@ export default function SkillList({
                 <div className="min-w-0">
                   <p className="truncate text-sm font-semibold">{s.name}</p>
                   {s.description && (
-                    <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">
-                      {s.description}
-                    </p>
+                    <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{s.description}</p>
                   )}
                 </div>
                 <Badge variant={scopeVariant(s.scope_type)} className="shrink-0">
@@ -172,14 +104,11 @@ export default function SkillList({
                 <span
                   className={cn(
                     'inline-flex items-center gap-1',
-                    s.enabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'
+                    s.enabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground',
                   )}
                 >
                   <span
-                    className={cn(
-                      'h-1.5 w-1.5 rounded-full',
-                      s.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50'
-                    )}
+                    className={cn('h-1.5 w-1.5 rounded-full', s.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50')}
                   />
                   {s.enabled ? t('skill.enabled') : t('skill.disabled')}
                 </span>
@@ -195,6 +124,6 @@ export default function SkillList({
           </Card>
         ))
       )}
-    </div>
+    </SectionFrame>
   );
 }

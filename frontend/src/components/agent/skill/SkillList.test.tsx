@@ -28,7 +28,7 @@ const skillFixture: AgentSkill = {
   id: 's1',
   name: 'Release checklist',
   description: 'Run before every release',
-  content: '', // 列表响应不含 content
+  content: '',
   scope_type: 'global',
   client_id: '',
   workspace_id: '',
@@ -46,10 +46,9 @@ const onFiltersChange = vi.fn();
 const onSelect = vi.fn();
 const onNew = vi.fn();
 
-// 有状态宿主：模拟 SkillSection 持有 filters 并回写，UI 随过滤条件变化（受控组件）。
-function Harness({ skills }: { skills: AgentSkill[] }) {
+function Harness({ skills, initialScope = 'all' as SkillFilters['scope'] }: { skills: AgentSkill[]; initialScope?: SkillFilters['scope'] }) {
   const [filters, setFilters] = useState<SkillFilters>({
-    scope: 'all',
+    scope: initialScope,
     clientId: '',
     workspaceId: '',
     q: '',
@@ -71,12 +70,12 @@ function Harness({ skills }: { skills: AgentSkill[] }) {
   );
 }
 
-const renderList = (skills: AgentSkill[] = [skillFixture]) => {
+const renderList = (skills: AgentSkill[] = [skillFixture], opts?: { initialScope?: SkillFilters['scope'] }) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <Harness skills={skills} />
-    </QueryClientProvider>
+      <Harness skills={skills} initialScope={opts?.initialScope} />
+    </QueryClientProvider>,
   );
 };
 
@@ -90,38 +89,22 @@ describe('SkillList', () => {
     renderList();
     expect(screen.getByText('Release checklist')).toBeTruthy();
     expect(screen.getByText('Run before every release')).toBeTruthy();
-    // scope 下拉里也有同文案的 option，卡片 Badge 用 getAllByText 断言
     expect(screen.getAllByText('skill.scope_global').length).toBeGreaterThan(0);
     expect(screen.getByText('skill.enabled')).toBeTruthy();
     expect(screen.getByText('skill.trigger_distill')).toBeTruthy();
     expect(screen.getByText('skill.uses')).toBeTruthy();
-    // 标签显示
     expect(screen.getByText('deploy')).toBeTruthy();
     expect(screen.getByText('review')).toBeTruthy();
   });
 
-  it('switching scope to client reveals client select and clears stale bindings', () => {
-    renderList();
-    const scope = screen.getByLabelText('skill.scopeLabel') as HTMLSelectElement;
-    fireEvent.change(scope, { target: { value: 'client' } });
-
-    expect(onFiltersChange).toHaveBeenCalledWith({
-      scope: 'client',
-      clientId: '',
-      workspaceId: '',
-      q: '',
-      enabledOnly: false,
-    });
-    // client 下拉出现
-    expect(screen.getByLabelText('skill.clientLabel')).toBeTruthy();
-    expect(screen.queryByLabelText('skill.workspaceLabel')).toBeNull();
-  });
-
-  it('switching scope to workspace reveals workspace select', () => {
-    renderList();
-    const scope = screen.getByLabelText('skill.scopeLabel') as HTMLSelectElement;
-    fireEvent.change(scope, { target: { value: 'workspace' } });
-    expect(screen.getByLabelText('skill.workspaceLabel')).toBeTruthy();
+  it('shows client/workspace selects only for matching scope', () => {
+    renderList([], { initialScope: 'all' });
+    expect(screen.queryByRole('combobox', { name: 'skill.clientLabel' })).toBeNull();
+    expect(screen.queryByRole('combobox', { name: 'skill.workspaceLabel' })).toBeNull();
+    cleanup();
+    renderList([], { initialScope: 'client' });
+    expect(screen.getByRole('combobox', { name: 'skill.clientLabel' })).toBeTruthy();
+    expect(screen.queryByRole('combobox', { name: 'skill.workspaceLabel' })).toBeNull();
   });
 
   it('toggling enabled filter commits enabledOnly=true', () => {

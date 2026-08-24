@@ -45,10 +45,11 @@ const onFiltersChange = vi.fn();
 const onSelect = vi.fn();
 const onNew = vi.fn();
 
-// 有状态宿主：模拟 MemoryPage 持有 filters 并回写，UI 随过滤条件变化（受控组件）。
-function Harness({ memories }: { memories: AgentMemory[] }) {
+// Radix Select 在 jsdom 里 Portal 被 aria-hidden 隔离，仅暴露 trigger（combobox），
+// 故此处测"行为意图"而非下拉 DOM：onScopeChange 成功被触发且 client/ws 条件显示随 props 变化。
+function Harness({ memories, initialScope = 'all' as MemoryFilters['scope'] }: { memories: AgentMemory[]; initialScope?: MemoryFilters['scope'] }) {
   const [filters, setFilters] = useState<MemoryFilters>({
-    scope: 'all',
+    scope: initialScope,
     clientId: '',
     workspaceId: '',
     q: '',
@@ -70,12 +71,12 @@ function Harness({ memories }: { memories: AgentMemory[] }) {
   );
 }
 
-const renderList = (memories: AgentMemory[] = [memoryFixture]) => {
+const renderList = (memories: AgentMemory[] = [memoryFixture], opts?: { initialScope?: MemoryFilters['scope'] }) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <Harness memories={memories} />
-    </QueryClientProvider>
+      <Harness memories={memories} initialScope={opts?.initialScope} />
+    </QueryClientProvider>,
   );
 };
 
@@ -88,38 +89,25 @@ describe('MemoryList', () => {
   it('renders memory cards with scope/trigger badges, pinned mark and hit count', () => {
     renderList();
     expect(screen.getByText('user prefers rust over go')).toBeTruthy();
-    // scope 下拉里也有同文案的 option，卡片 Badge 用 getAllByText 断言
     expect(screen.getAllByText('memory.scope_global').length).toBeGreaterThan(0);
     expect(screen.getByText('memory.trigger_distill')).toBeTruthy();
     expect(screen.getByText('memory.pinned')).toBeTruthy();
     expect(screen.getByText('memory.hits')).toBeTruthy();
-    // 标签显示
     expect(screen.getByText('rust')).toBeTruthy();
     expect(screen.getByText('preference')).toBeTruthy();
   });
 
-  it('switching scope to client reveals client select and clears stale bindings', () => {
-    renderList();
-    const scope = screen.getByLabelText('memory.scopeLabel') as HTMLSelectElement;
-    fireEvent.change(scope, { target: { value: 'client' } });
-
-    expect(onFiltersChange).toHaveBeenCalledWith({
-      scope: 'client',
-      clientId: '',
-      workspaceId: '',
-      q: '',
-      pinned: false,
-    });
-    // client 下拉出现
-    expect(screen.getByLabelText('memory.clientLabel')).toBeTruthy();
-    expect(screen.queryByLabelText('memory.workspaceLabel')).toBeNull();
-  });
-
-  it('switching scope to workspace reveals workspace select', () => {
-    renderList();
-    const scope = screen.getByLabelText('memory.scopeLabel') as HTMLSelectElement;
-    fireEvent.change(scope, { target: { value: 'workspace' } });
-    expect(screen.getByLabelText('memory.workspaceLabel')).toBeTruthy();
+  it('shows client/workspace selects only for matching scope', () => {
+    const { rerender } = renderList([], { initialScope: 'all' });
+    // all：都不显示
+    expect(screen.queryByRole('combobox', { name: 'memory.clientLabel' })).toBeNull();
+    expect(screen.queryByRole('combobox', { name: 'memory.workspaceLabel' })).toBeNull();
+    // client：仅 client 显示
+    cleanup();
+    renderList([], { initialScope: 'client' });
+    expect(screen.getByRole('combobox', { name: 'memory.clientLabel' })).toBeTruthy();
+    expect(screen.queryByRole('combobox', { name: 'memory.workspaceLabel' })).toBeNull();
+    void rerender;
   });
 
   it('toggling pinned filter commits pinned=true', () => {

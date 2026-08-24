@@ -755,7 +755,15 @@
     "description": "管理 RAG 知识库与 AI 会话记忆，共享同一套 Embedding 配置",
     "sharedEmbeddingTitle": "共享 Embedding 配置",
     "sharedEmbeddingDesc": "知识库与 AI 记忆体共用此 Embedding（Base URL / 密钥 / 模型 / 维度）。修改维度将影响现有知识库的向量检索。",
-    "settingsDesc": "管理共享 Embedding、记忆体与技能库的相关配置"
+    "settingsDesc": "各分区的设置在分区右上角齿轮按钮中打开",
+    "section": {
+      "kb": "知识库",
+      "memory": "记忆",
+      "skill": "技能",
+      "roles": "角色",
+      "wiki": "Wiki"
+    },
+    "settingsHint": "在各分区右上角 ··· 打开设置"
   },
   "memory": {
     "title": "AI 记忆体",

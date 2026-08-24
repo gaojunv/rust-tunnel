@@ -1,14 +1,15 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Card, CardContent } from '@/components/ui/card';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import MemoryList from '@/components/agent/memory/MemoryList';
 import MemoryDetail from '@/components/agent/memory/MemoryDetail';
 import MemoryDialog from '@/components/agent/memory/MemoryDialog';
+import MemorySettings from '@/components/agent/memory/MemorySettings';
+import SharedEmbeddingSettings from '@/components/knowledge/SharedEmbeddingSettings';
+import MasterDetail from '@/components/knowledge/shared/MasterDetail';
 import { useMemories } from '@/api/hooks';
 import type { AgentMemory, MemoryFilters } from '@/types';
 
-/** 会话记忆 Tab 内容（原 MemoryPage，去掉页面级 PageHeader）。
- *  记忆设置已收进页面右上角统一设置弹窗（KnowledgePage）。 */
 export default function MemorySection() {
   const { t } = useTranslation();
   const [filters, setFilters] = useState<MemoryFilters>({
@@ -20,9 +21,8 @@ export default function MemorySection() {
   });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // UI 过滤条件 → API 查询参数：空值剔除；scope 非 all 才发送；client/workspace
-  // 仅对相应 scope 生效（切换 scope 时 MemoryList 会清空这两项）。
   const params = useMemo(
     () => ({
       scope: filters.scope === 'all' ? undefined : filters.scope,
@@ -40,48 +40,50 @@ export default function MemorySection() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-        {/* 移动端选中记忆后隐藏列表，仅桌面保持左侧栏 */}
-        <div className={selectedMemory ? 'hidden lg:block lg:w-80 lg:shrink-0' : 'lg:w-80 lg:shrink-0'}>
-          {isLoading ? (
-            <Card>
-              <CardContent className="p-6 text-sm text-muted-foreground">
-                {t('common.loading')}
-              </CardContent>
-            </Card>
-          ) : (
-            <MemoryList
-              memories={memories}
-              filters={filters}
-              onFiltersChange={setFilters}
-              selectedId={selectedId}
-              onSelect={setSelectedId}
-              onNew={() => setDialogOpen(true)}
-            />
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          {selectedMemory ? (
+      <MasterDetail
+        isLoading={isLoading}
+        loadingText={t('common.loading')}
+        hasSelection={!!selectedMemory}
+        emptyText={t('memory.noSelection')}
+        list={
+          <MemoryList
+            memories={memories}
+            filters={filters}
+            onFiltersChange={setFilters}
+            selectedId={selectedId}
+            onSelect={setSelectedId}
+            onNew={() => setDialogOpen(true)}
+            onSettings={() => setSettingsOpen(true)}
+          />
+        }
+        detail={
+          selectedMemory ? (
             <MemoryDetail
               key={selectedMemory.id}
               memory={selectedMemory}
               onBack={() => setSelectedId(null)}
               onDeleted={() => setSelectedId(null)}
             />
-          ) : (
-            <Card>
-              <CardContent className="p-8 text-center text-sm text-muted-foreground">
-                {t('memory.noSelection')}
-              </CardContent>
-            </Card>
-          )}
-        </div>
-      </div>
+          ) : null
+        }
+      />
       <MemoryDialog
         open={dialogOpen}
         onClose={() => setDialogOpen(false)}
         onCreated={(m: AgentMemory) => setSelectedId(m.id)}
       />
+      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t('memory.settings.title')}</DialogTitle>
+            <DialogDescription>{t('knowledge.sharedEmbeddingDesc')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-6">
+            <SharedEmbeddingSettings />
+            <MemorySettings />
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
