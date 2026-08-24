@@ -327,6 +327,12 @@ pub async fn put_llm_logging(
         dc.llm_request_logging = body.enabled;
     }
 
+    // 同步 LLM 热路径开关投影（LlmState 持有的 AtomicBool）
+    if let Some(llm) = state.server_state.llm_state.read().await.as_ref() {
+        llm.request_logging
+            .store(body.enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // 持久化到 DB
     if let Some(db) = state.server_state.db() {
         let _ = db

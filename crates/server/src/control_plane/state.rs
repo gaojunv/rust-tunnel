@@ -207,18 +207,31 @@ impl ServerState {
         #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &std::path::Path,
         dynamic_config: std::sync::Arc<tokio::sync::RwLock<DynamicConfig>>,
     ) {
+        // 装配层职责：反代规则 → llm 自有输入类型；DynamicConfig → 热路径开关初值
+        let gateway_rule = {
+            let rules = self.proxy_state.rules.lock().await;
+            rules.get("__llm_gateway__").cloned()
+        }
+        .map(|rule| crate::llm::LlmGatewayRuleInput {
+            enabled: rule.enabled,
+            domains: rule.domains.clone(),
+            listen: rule.listen.clone(),
+            tls_enabled: rule.tls.as_ref().is_some_and(|t| t.enabled),
+            tls_acme: rule.tls.as_ref().is_some_and(|t| t.acme),
+        });
+        let request_logging = dynamic_config.read().await.llm_request_logging;
         let llm = crate::llm::init_llm_state(
-            &self.proxy_state,
+            gateway_rule,
             db,
             master_key,
             rag_data_dir,
-            dynamic_config,
+            request_logging,
         )
         .await;
         *self.llm_state.write().await = Some(llm.clone());
         // 同时注入反代分流器
         *self.proxy_state.llm_dispatcher.write().await =
-            Some(std::sync::Arc::new(crate::llm::LlmDispatcherImpl::new(llm)));
+            Some(std::sync::Arc::new(LlmDispatcherAdapter::new(llm)));
     }
 
     pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
@@ -407,6 +420,43 @@ impl ServerState {
     pub async fn set_dynamic_config(&self, config: DynamicConfig) {
         let mut dc = self.dynamic_config.write().await;
         *dc = config;
+    }
+}
+
+/// LLM Gateway 分流适配器：protocols 的 [`LlmDispatcher`] trait ← llm crate 的
+/// `llm_handle` 自由函数。装配层拥有此适配，llm 不依赖 protocols 类型。
+struct LlmDispatcherAdapter {
+    llm: std::sync::Arc<crate::llm::LlmState>,
+}
+
+impl LlmDispatcherAdapter {
+    fn new(llm: std::sync::Arc<crate::llm::LlmState>) -> Self {
+        Self { llm }
+    }
+}
+
+impl crate::reverse_proxy::llm_dispatch::LlmDispatcher for LlmDispatcherAdapter {
+    fn try_handle(
+        self: std::sync::Arc<Self>,
+        host: String,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<axum::response::Response, axum::http::Request<axum::body::Body>>,
+                > + Send,
+        >,
+    > {
+        Box::pin(async move {
+            let protocol = {
+                let cfg = self.llm.gateway_config.read().await;
+                cfg.as_ref().and_then(|c| c.match_protocol(&host))
+            };
+            let Some(protocol) = protocol else {
+                return Err(req);
+            };
+            Ok(crate::llm::llm_handle(self.llm.clone(), protocol, req).await)
+        })
     }
 }
 

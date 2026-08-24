@@ -316,6 +316,65 @@ where
 mod tests {
     use super::*;
 
+    /// 回归测试：日志页面曾只显示 "LLM request" 几个字。
+    /// 原因是 LogLayer 的 FieldVisitor 只把 record_str 字段拼进 message，
+    /// 裸字段（record_debug）除 message 外全部丢弃。
+    /// 这里端到端走真实 LogLayer，断言 llm 侧 log_llm_request 的所有字段
+    /// 都出现在最终 message 中（llm 拆 crate 后从 llm/mod.rs 迁入——
+    /// 本测试验证的是 LogLayer 契约，归属 mgmt）。
+    #[tokio::test]
+    async fn test_log_llm_request_fields_reach_log_message() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let store = LogStore::new_in_memory();
+        let subscriber = tracing_subscriber::registry().with(LogLayer::new(store.clone()));
+
+        let state = crate::llm::LlmState::new(None, None);
+        let body =
+            serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
+
+        // set_default guard 覆盖整个 await（with_default 对 async 块的注册语义不可靠）
+        let _guard = tracing::subscriber::set_default(subscriber);
+        crate::llm::log_llm_request(
+            &state,
+            "openai",
+            "gpt-4",
+            3,
+            true,
+            false,
+            Some(200),
+            None,
+            42,
+            &body,
+        )
+        .await;
+
+        // send → ring buffer 由后台 task 转发，轮询等待落地
+        let mut msg = String::new();
+        for _ in 0..50 {
+            if let Some(entry) = store
+                .get_all()
+                .await
+                .into_iter()
+                .find(|e| e.target == "llm_request")
+            {
+                msg = entry.message;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!msg.is_empty(), "no llm_request log entry captured");
+        assert!(msg.contains("LLM request"), "msg={msg}");
+        assert!(msg.contains("protocol=openai"), "msg={msg}");
+        assert!(msg.contains("model=gpt-4"), "msg={msg}");
+        assert!(msg.contains("message_count=3"), "msg={msg}");
+        assert!(msg.contains("has_tools=true"), "msg={msg}");
+        assert!(msg.contains("status=200"), "msg={msg}");
+        assert!(msg.contains("elapsed_ms=42"), "msg={msg}");
+        assert!(msg.contains("request_body="), "msg={msg}");
+        assert!(msg.contains("\"content\":\"hi\""), "msg={msg}");
+    }
+
     #[tokio::test]
     async fn test_log_store_new() {
         let store = LogStore::new_in_memory();

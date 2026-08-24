@@ -329,8 +329,9 @@ pub struct LlmState {
     /// RAG 摄入状态事件通道（SSE 推送给前端）。
     #[cfg(feature = "rag")]
     pub rag_tx: tokio::sync::broadcast::Sender<rag::ingest::KbEvent>,
-    /// 动态配置引用（LLM 请求日志开关等）。默认开启，生产路径由 init_llm_state 注入真实实例。
-    pub dynamic_config: Arc<RwLock<crate::dynamic_config::DynamicConfig>>,
+    /// LLM 请求摘要日志开关（server `DynamicConfig.llm_request_logging` 的热路径投影）。
+    /// 默认开启；装配层 init 时注入初值，运行时由 API handler 同步写。
+    pub request_logging: Arc<std::sync::atomic::AtomicBool>,
     /// 按模型粒度的熔断器（故障转移时跳过持续失败的候选）。
     pub breakers: breaker::ModelBreakers,
     /// 路由实体（provider/model/group）内存缓存，避免请求热路径的 DB 往返。
@@ -351,9 +352,7 @@ impl LlmState {
             rag_store: rag::store::VectorStore::new(Path::new(&std::env::temp_dir())),
             #[cfg(feature = "rag")]
             rag_tx: tokio::sync::broadcast::channel(256).0,
-            dynamic_config: Arc::new(RwLock::new(
-                crate::dynamic_config::DynamicConfig::default_for_llm(),
-            )),
+            request_logging: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             breakers: breaker::ModelBreakers::new(),
             route_cache: route_cache::RouteCache::new(),
             known_failures: down::KnownFailures::new(),
@@ -373,9 +372,7 @@ impl LlmState {
             cipher,
             rag_store: rag::store::VectorStore::new(rag_data_dir),
             rag_tx: tokio::sync::broadcast::channel(256).0,
-            dynamic_config: Arc::new(RwLock::new(
-                crate::dynamic_config::DynamicConfig::default_for_llm(),
-            )),
+            request_logging: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             breakers: breaker::ModelBreakers::new(),
             route_cache: route_cache::RouteCache::new(),
             known_failures: down::KnownFailures::new(),
@@ -383,28 +380,33 @@ impl LlmState {
     }
 }
 
-/// 从 `__llm_gateway__` 规则构造 LlmState（装配层函数，替代原 ReverseProxyState::init_llm_state）。
+/// LLM Gateway 规则输入（装配层从反代 `ProxyRule` 提取转换，llm 不依赖 protocols 类型）。
+#[derive(Debug, Clone)]
+pub struct LlmGatewayRuleInput {
+    pub enabled: bool,
+    pub domains: Vec<String>,
+    pub listen: String,
+    pub tls_enabled: bool,
+    pub tls_acme: bool,
+}
+
+/// 从 gateway 规则输入构造 LlmState（装配层函数，替代原 ReverseProxyState::init_llm_state）。
 pub async fn init_llm_state(
-    proxy_state: &crate::reverse_proxy::ReverseProxyState,
+    gateway_rule: Option<LlmGatewayRuleInput>,
     db: Option<Database>,
     master_key: Option<[u8; 32]>,
     #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &std::path::Path,
-    dynamic_config: Arc<tokio::sync::RwLock<crate::dynamic_config::DynamicConfig>>,
+    request_logging_enabled: bool,
 ) -> Arc<LlmState> {
-    let gateway_rule = {
-        let rules = proxy_state.rules.lock().await;
-        rules.get("__llm_gateway__").cloned()
-    };
-
     let cipher = master_key.map(crate::llm::crypto::LlmCipher::from_master_key);
     #[cfg(feature = "rag")]
-    let mut llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
+    let llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
     #[cfg(not(feature = "rag"))]
-    let mut llm = LlmState::new(db, cipher);
-    llm.dynamic_config = dynamic_config;
+    let llm = LlmState::new(db, cipher);
+    llm.request_logging
+        .store(request_logging_enabled, std::sync::atomic::Ordering::Relaxed);
 
     if let Some(rule) = gateway_rule {
-        let tls = rule.tls.as_ref();
         let (openai_domain, anthropic_domain) = if rule.domains.len() >= 2 {
             (
                 Some(rule.domains[0].clone()).filter(|d| !d.is_empty()),
@@ -419,8 +421,8 @@ pub async fn init_llm_state(
             openai_domain,
             anthropic_domain,
             listen: rule.listen.clone(),
-            tls_enabled: tls.is_some_and(|t| t.enabled),
-            tls_acme: tls.is_some_and(|t| t.acme),
+            tls_enabled: rule.tls_enabled,
+            tls_acme: rule.tls_acme,
         };
         *llm.gateway_config.write().await = Some(config);
     } else {
@@ -437,39 +439,11 @@ pub async fn init_llm_state(
     Arc::new(llm)
 }
 
-/// LLM Gateway 分流器实现（注入 ReverseProxyState，替代原 shared_listener 的内联分流）。
-pub struct LlmDispatcherImpl {
-    llm: Arc<LlmState>,
-}
-
-impl LlmDispatcherImpl {
-    pub fn new(llm: Arc<LlmState>) -> Self {
-        Self { llm }
-    }
-}
-
-impl crate::reverse_proxy::llm_dispatch::LlmDispatcher for LlmDispatcherImpl {
-    fn try_handle(
-        self: Arc<Self>,
-        host: String,
-        req: axum::http::Request<axum::body::Body>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<axum::response::Response, axum::http::Request<axum::body::Body>>> + Send>> {
-        Box::pin(async move {
-            let protocol = {
-                let cfg = self.llm.gateway_config.read().await;
-                cfg.as_ref().and_then(|c| c.match_protocol(&host))
-            };
-            let Some(protocol) = protocol else {
-                return Err(req);
-            };
-            Ok(llm_handle(self.llm.clone(), protocol, req).await)
-        })
-    }
-}
-
 /// 把已匹配 LLM Gateway 的请求分发给对应的 handler。
 /// 按命中的协议入口严格限制接受的路径，跨协议路径返回协议各自的 404 风格。
-async fn llm_handle(
+///
+/// 供 server 装配层的 `LlmDispatcher` 适配器调用。
+pub async fn llm_handle(
     llm: Arc<LlmState>,
     protocol: LlmProtocol,
     req: axum::http::Request<axum::body::Body>,
@@ -635,7 +609,7 @@ pub async fn log_llm_request(
     elapsed_ms: u128,
     request_body: &serde_json::Value,
 ) {
-    if !llm.dynamic_config.read().await.llm_request_logging {
+    if !llm.request_logging.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     // 全部字段用 %（record_str）输出：LogLayer 只把 record_str 字段拼进 message，
@@ -679,12 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_config_default_enabled() {
-        // 默认构造：llm_request_logging 必须开启（生产路径由 init_llm_state 注入真实实例覆盖）
+    fn test_request_logging_default_enabled() {
+        // 默认构造：request_logging 必须开启（生产路径由 init_llm_state 注入真实值覆盖）
         let state = LlmState::new(None, None);
         assert!(
-            state.dynamic_config.blocking_read().llm_request_logging,
-            "default dynamic_config should enable llm request logging"
+            state.request_logging.load(std::sync::atomic::Ordering::Relaxed),
+            "default request_logging should be enabled"
         );
     }
 
@@ -692,7 +666,9 @@ mod tests {
     async fn test_log_llm_request_respects_disabled_flag() {
         let state = LlmState::new(None, None);
         // 关闭开关
-        state.dynamic_config.write().await.llm_request_logging = false;
+        state
+            .request_logging
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // 开关关闭时应直接返回，不 panic
         let body = serde_json::json!({"model": "gpt-4", "messages": []});
         log_llm_request(
@@ -776,64 +752,6 @@ mod tests {
             &body,
         )
         .await;
-    }
-
-    /// 回归测试：日志页面曾只显示 "LLM request" 几个字。
-    /// 原因是 LogLayer 的 FieldVisitor 只把 record_str 字段拼进 message，
-    /// 裸字段（record_debug）除 message 外全部丢弃。
-    /// 这里端到端走真实 LogLayer，断言所有字段都出现在最终 message 中。
-    #[tokio::test]
-    async fn test_log_llm_request_fields_reach_log_message() {
-        use crate::mgmt::logs::{LogLayer, LogStore};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let store = LogStore::new_in_memory();
-        let subscriber = tracing_subscriber::registry().with(LogLayer::new(store.clone()));
-
-        let state = LlmState::new(None, None);
-        let body =
-            serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
-
-        // set_default guard 覆盖整个 await（with_default 对 async 块的注册语义不可靠）
-        let _guard = tracing::subscriber::set_default(subscriber);
-        log_llm_request(
-            &state,
-            "openai",
-            "gpt-4",
-            3,
-            true,
-            false,
-            Some(200),
-            None,
-            42,
-            &body,
-        )
-        .await;
-
-        // send → ring buffer 由后台 task 转发，轮询等待落地
-        let mut msg = String::new();
-        for _ in 0..50 {
-            if let Some(entry) = store
-                .get_all()
-                .await
-                .into_iter()
-                .find(|e| e.target == "llm_request")
-            {
-                msg = entry.message;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(!msg.is_empty(), "no llm_request log entry captured");
-        assert!(msg.contains("LLM request"), "msg={msg}");
-        assert!(msg.contains("protocol=openai"), "msg={msg}");
-        assert!(msg.contains("model=gpt-4"), "msg={msg}");
-        assert!(msg.contains("message_count=3"), "msg={msg}");
-        assert!(msg.contains("has_tools=true"), "msg={msg}");
-        assert!(msg.contains("status=200"), "msg={msg}");
-        assert!(msg.contains("elapsed_ms=42"), "msg={msg}");
-        assert!(msg.contains("request_body="), "msg={msg}");
-        assert!(msg.contains("\"content\":\"hi\""), "msg={msg}");
     }
 
     #[test]
