@@ -19,15 +19,208 @@ use super::port_info::{ClientInfo, PortInfo as ServerPortInfo, TrojanRuntimeStat
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 
-/// Global server state shared between all tasks
-#[derive(Clone)]
-pub struct ServerState {
+/// ACME 证书生命周期状态（client / 配置 / 证书管理器 / DNS provider）。
+/// 领域切片：原 ServerState 的 5 个 acme_* 扁平字段归并于此。
+#[derive(Clone, Default)]
+pub struct AcmeState {
+    /// ACME client for certificate management (set when ACME is enabled)
+    pub client: Arc<RwLock<Option<std::sync::Arc<crate::acme::client::AcmeClient>>>>,
+    /// ACME configuration info (set when ACME is enabled)
+    pub config: Arc<RwLock<Option<AcmeConfigInfo>>>,
+    /// Full ACME configuration for API access
+    pub full_config: Arc<RwLock<AcmeFullConfig>>,
+    /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
+    pub cert_manager: Option<std::sync::Arc<crate::acme::manager::CertificateManager>>,
+    /// DNS provider configuration for ACME DNS-01 challenges
+    pub dns_provider: Arc<RwLock<Option<crate::acme::dns::DnsProviderConfig>>>,
+}
+
+/// API/控制通道 TLS 只读设置（来自 config，运行期不变）。
+/// 领域切片：原 ServerState 的 api_tls/api_domain/tls_cert_path/tls_key_path 归并于此。
+#[derive(Debug, Clone)]
+pub struct TlsSettings {
+    /// Whether API TLS is enabled (read-only, from config)
+    pub enabled: bool,
+    /// API domain for TLS certificate (read-only, from config)
+    pub domain: Option<String>,
+    /// 控制通道 TLS 证书路径（Trojan 自签名回退复用，read-only，来自 config）
+    pub cert_path: String,
+    /// 控制通道 TLS 私钥路径
+    pub key_path: String,
+}
+
+impl Default for TlsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: None,
+            cert_path: "./data/tls/cert.pem".to_string(),
+            key_path: "./data/tls/key.pem".to_string(),
+        }
+    }
+}
+
+/// SS/Trojan 端口表与监听器运行时（端口注册、连接计数、监听生命周期）。
+/// 领域切片：原 ServerState 的 3 个私有端口字段 + 3 个监听器字段归并于此。
+#[derive(Clone, Default)]
+pub struct ProxyPortsState {
     /// Map from port to port info (Shadowsocks or Trojan)
     ports: Arc<Mutex<HashMap<u16, ServerPortInfo>>>,
     /// Active Shadowsocks connections per port
-    ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
+    ss_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Active Trojan connections per port
-    trojan_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
+    trojan_connections: Arc<Mutex<HashMap<u16, usize>>>,
+    /// Shadowsocks listener abort handle
+    pub ss_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// Trojan listener abort handle
+    pub trojan_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
+    /// Trojan 运行时状态（证书来源、共享模式）
+    pub trojan_runtime: Arc<RwLock<TrojanRuntimeStatus>>,
+}
+
+impl ProxyPortsState {
+    /// 注册 Shadowsocks 端口；端口已被占用（任一协议）时返回 false
+    pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
+        let mut ports = self.ports.lock().await;
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(
+            port,
+            ServerPortInfo::Shadowsocks {
+                port,
+                cipher,
+                password,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
+        true
+    }
+
+    /// 查询端口信息
+    pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
+        let ports = self.ports.lock().await;
+        ports.get(&port).cloned()
+    }
+
+    /// 注销端口；端口存在时返回 true
+    pub async fn unregister_port(&self, port: u16) -> bool {
+        let mut ports = self.ports.lock().await;
+        ports.remove(&port).is_some()
+    }
+
+    /// Get the number of active connections for a specific port (SS/Trojan only)
+    pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
+        let ss_connections = self.ss_connections.lock().await;
+        let ss_count = ss_connections.get(&remote_port).copied().unwrap_or(0);
+
+        let trojan_connections = self.trojan_connections.lock().await;
+        let trojan_count = trojan_connections.get(&remote_port).copied().unwrap_or(0);
+
+        ss_count + trojan_count
+    }
+
+    /// Increment active Shadowsocks connections for a port
+    pub async fn increment_ss_connections(&self, port: u16) {
+        let mut ss_connections = self.ss_connections.lock().await;
+        *ss_connections.entry(port).or_insert(0) += 1;
+    }
+
+    /// Decrement active Shadowsocks connections for a port
+    pub async fn decrement_ss_connections(&self, port: u16) {
+        let mut ss_connections = self.ss_connections.lock().await;
+        if let Some(count) = ss_connections.get_mut(&port) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+    }
+
+    /// 注册 Trojan 端口；端口已被占用（任一协议）时返回 false
+    pub async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
+        let mut ports = self.ports.lock().await;
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(
+            port,
+            ServerPortInfo::Trojan {
+                port,
+                password,
+                fallback,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
+        true
+    }
+
+    /// Get all Trojan ports
+    pub async fn get_trojan_ports(&self) -> Vec<u16> {
+        let ports = self.ports.lock().await;
+        ports
+            .iter()
+            .filter_map(|(port, info)| match info {
+                ServerPortInfo::Trojan { .. } => Some(*port),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check if a port is a Trojan port
+    pub async fn is_trojan_port(&self, port: u16) -> bool {
+        let ports = self.ports.lock().await;
+        matches!(ports.get(&port), Some(ServerPortInfo::Trojan { .. }))
+    }
+
+    /// Increment active Trojan connections for a port
+    pub async fn increment_trojan_connections(&self, port: u16) {
+        let mut trojan_connections = self.trojan_connections.lock().await;
+        *trojan_connections.entry(port).or_insert(0) += 1;
+    }
+
+    /// Decrement active Trojan connections for a port
+    pub async fn decrement_trojan_connections(&self, port: u16) {
+        let mut trojan_connections = self.trojan_connections.lock().await;
+        if let Some(count) = trojan_connections.get_mut(&port) {
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+    }
+
+    /// Get total active connection count (SS + Trojan only)
+    pub async fn get_active_connection_count(&self) -> usize {
+        let ss_connections = self.ss_connections.lock().await;
+        let trojan_connections = self.trojan_connections.lock().await;
+        ss_connections.values().sum::<usize>() + trojan_connections.values().sum::<usize>()
+    }
+
+    /// Get all Shadowsocks ports
+    pub async fn get_shadowsocks_ports(&self) -> Vec<u16> {
+        let ports = self.ports.lock().await;
+        ports
+            .iter()
+            .filter_map(|(port, info)| match info {
+                ServerPortInfo::Shadowsocks { .. } => Some(*port),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Check if a port is a Shadowsocks port
+    pub async fn is_shadowsocks_port(&self, port: u16) -> bool {
+        let ports = self.ports.lock().await;
+        matches!(ports.get(&port), Some(ServerPortInfo::Shadowsocks { .. }))
+    }
+}
+
+/// Global server state shared between all tasks
+#[derive(Clone)]
+pub struct ServerState {
+    /// SS/Trojan 端口与监听器运行时（领域切片）
+    pub proxy_ports: ProxyPortsState,
     /// Unified statistics collector (traffic / connections for all entity types)
     pub stats_collector: crate::stats::StatsCollector,
     /// Database connection (optional)
@@ -46,32 +239,12 @@ pub struct ServerState {
     pub client_registry: Option<ClientRegistry>,
     /// AI agent workbench state (workspace execution locks, DB access)
     pub agent_state: Option<crate::agent::AgentState>,
-    /// ACME client for certificate management (set when ACME is enabled)
-    pub acme_client: Arc<RwLock<Option<std::sync::Arc<crate::acme::client::AcmeClient>>>>,
-    /// ACME configuration info (set when ACME is enabled)
-    pub acme_config: Arc<RwLock<Option<AcmeConfigInfo>>>,
-    /// Full ACME configuration for API access
-    pub acme_full_config: Arc<RwLock<AcmeFullConfig>>,
-    /// Certificate manager for TLS certificate lifecycle (set when ACME is enabled)
-    pub cert_manager: Option<std::sync::Arc<crate::acme::manager::CertificateManager>>,
-    /// DNS provider configuration for ACME DNS-01 challenges
-    pub dns_provider_config: Arc<RwLock<Option<crate::acme::dns::DnsProviderConfig>>>,
+    /// ACME 证书生命周期（领域切片）
+    pub acme: AcmeState,
     /// Dynamic configuration (DB-backed, runtime-changeable)
     pub dynamic_config: Arc<RwLock<DynamicConfig>>,
-    /// Shadowsocks listener abort handle
-    pub ss_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
-    /// Trojan listener abort handle
-    pub trojan_listener_abort: Arc<RwLock<Option<tokio::sync::watch::Sender<bool>>>>,
-    /// Whether API TLS is enabled (read-only, from config)
-    pub api_tls: bool,
-    /// API domain for TLS certificate (read-only, from config)
-    pub api_domain: Option<String>,
-    /// 控制通道 TLS 证书路径（Trojan 自签名回退复用，read-only，来自 config）
-    pub tls_cert_path: String,
-    /// 控制通道 TLS 私钥路径
-    pub tls_key_path: String,
-    /// Trojan 运行时状态（证书来源、共享模式）
-    pub trojan_runtime: Arc<RwLock<TrojanRuntimeStatus>>,
+    /// API/控制通道 TLS 只读设置（领域切片）
+    pub tls: TlsSettings,
 }
 
 impl Default for ServerState {
@@ -84,9 +257,7 @@ impl ServerState {
     /// Create a new server state without database (for backwards compatibility)
     pub fn new() -> Self {
         let mut state = Self {
-            ports: Arc::new(Mutex::new(HashMap::new())),
-            ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
-            trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
+            proxy_ports: ProxyPortsState::default(),
             stats_collector: crate::stats::StatsCollector::new(None),
             db: None,
             log_store: None,
@@ -96,11 +267,7 @@ impl ServerState {
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: None,
             agent_state: None,
-            acme_client: Arc::new(RwLock::new(None)),
-            acme_config: Arc::new(RwLock::new(None)),
-            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
-            cert_manager: None,
-            dns_provider_config: Arc::new(RwLock::new(None)),
+            acme: AcmeState::default(),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
                 log_level: "info".to_string(),
                 llm_request_logging: true,
@@ -116,13 +283,7 @@ impl ServerState {
                     mesh_domain: "mesh.local".to_string(),
                 },
             })),
-            ss_listener_abort: Arc::new(RwLock::new(None)),
-            trojan_listener_abort: Arc::new(RwLock::new(None)),
-            api_tls: false,
-            api_domain: None,
-            tls_cert_path: "./data/tls/cert.pem".to_string(),
-            tls_key_path: "./data/tls/key.pem".to_string(),
-            trojan_runtime: Arc::new(RwLock::new(TrojanRuntimeStatus::default())),
+            tls: TlsSettings::default(),
         };
         // 反代状态挂上同一个统计采集器：proxy 埋点才能汇总到 /api/stats/*
         state
@@ -135,9 +296,7 @@ impl ServerState {
     pub fn with_db(db: Database) -> Self {
         let registry = ClientRegistry::new(db.clone());
         let mut state = Self {
-            ports: Arc::new(Mutex::new(HashMap::new())),
-            ss_active_connections: Arc::new(Mutex::new(HashMap::new())),
-            trojan_active_connections: Arc::new(Mutex::new(HashMap::new())),
+            proxy_ports: ProxyPortsState::default(),
             stats_collector: crate::stats::StatsCollector::new(Some(db.clone())),
             db: Some(db.clone()),
             log_store: Some(crate::logs::LogStore::new(Some(db.clone()))),
@@ -147,11 +306,7 @@ impl ServerState {
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
             agent_state: Some(crate::agent::AgentState::new(std::sync::Arc::new(registry), db)),
-            acme_client: Arc::new(RwLock::new(None)),
-            acme_config: Arc::new(RwLock::new(None)),
-            acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),
-            cert_manager: None,
-            dns_provider_config: Arc::new(RwLock::new(None)),
+            acme: AcmeState::default(),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
                 log_level: "info".to_string(),
                 llm_request_logging: true,
@@ -167,13 +322,7 @@ impl ServerState {
                     mesh_domain: "mesh.local".to_string(),
                 },
             })),
-            ss_listener_abort: Arc::new(RwLock::new(None)),
-            trojan_listener_abort: Arc::new(RwLock::new(None)),
-            api_tls: false,
-            api_domain: None,
-            tls_cert_path: "./data/tls/cert.pem".to_string(),
-            tls_key_path: "./data/tls/key.pem".to_string(),
-            trojan_runtime: Arc::new(RwLock::new(TrojanRuntimeStatus::default())),
+            tls: TlsSettings::default(),
         };
         // ClientRegistry 挂上统计采集器：open_tunnel 的连接数/流量埋点依赖它
         if let Some(registry) = state.client_registry.as_mut() {
@@ -236,110 +385,54 @@ impl ServerState {
     }
 
     pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
-        let mut ports = self.ports.lock().await;
-        if ports.contains_key(&port) {
-            return false;
-        }
-        ports.insert(
-            port,
-            ServerPortInfo::Shadowsocks {
-                port,
-                cipher,
-                password,
-                enabled: true,
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
-        true
+        self.proxy_ports.register_shadowsocks(port, cipher, password).await
     }
 
     pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
-        let ports = self.ports.lock().await;
-        ports.get(&port).cloned()
+        self.proxy_ports.get_port(port).await
     }
 
     pub async fn unregister_port(&self, port: u16) -> bool {
-        let mut ports = self.ports.lock().await;
-        ports.remove(&port).is_some()
+        self.proxy_ports.unregister_port(port).await
     }
 
     /// Get the number of active connections for a specific port (SS/Trojan only)
     pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
-        let ss_connections = self.ss_active_connections.lock().await;
-        let ss_count = ss_connections.get(&remote_port).copied().unwrap_or(0);
-
-        let trojan_connections = self.trojan_active_connections.lock().await;
-        let trojan_count = trojan_connections.get(&remote_port).copied().unwrap_or(0);
-
-        ss_count + trojan_count
+        self.proxy_ports.get_connection_count_for_port(remote_port).await
     }
 
     /// Increment active Shadowsocks connections for a port
     pub async fn increment_ss_connections(&self, port: u16) {
-        let mut ss_connections = self.ss_active_connections.lock().await;
-        *ss_connections.entry(port).or_insert(0) += 1;
+        self.proxy_ports.increment_ss_connections(port).await;
     }
 
     /// Decrement active Shadowsocks connections for a port
     pub async fn decrement_ss_connections(&self, port: u16) {
-        let mut ss_connections = self.ss_active_connections.lock().await;
-        if let Some(count) = ss_connections.get_mut(&port) {
-            if *count > 0 {
-                *count -= 1;
-            }
-        }
+        self.proxy_ports.decrement_ss_connections(port).await;
     }
 
     pub async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
-        let mut ports = self.ports.lock().await;
-        if ports.contains_key(&port) {
-            return false;
-        }
-        ports.insert(
-            port,
-            ServerPortInfo::Trojan {
-                port,
-                password,
-                fallback,
-                enabled: true,
-                created_at: chrono::Utc::now().timestamp(),
-            },
-        );
-        true
+        self.proxy_ports.register_trojan(port, password, fallback).await
     }
 
     /// Get all Trojan ports
     pub async fn get_trojan_ports(&self) -> Vec<u16> {
-        let ports = self.ports.lock().await;
-        ports
-            .iter()
-            .filter_map(|(port, info)| match info {
-                ServerPortInfo::Trojan { .. } => Some(*port),
-                _ => None,
-            })
-            .collect()
+        self.proxy_ports.get_trojan_ports().await
     }
 
     /// Check if a port is a Trojan port
     pub async fn is_trojan_port(&self, port: u16) -> bool {
-        let ports = self.ports.lock().await;
-        matches!(ports.get(&port), Some(ServerPortInfo::Trojan { .. }))
+        self.proxy_ports.is_trojan_port(port).await
     }
 
     /// Increment active Trojan connections for a port
     pub async fn increment_trojan_connections(&self, port: u16) {
-        let mut trojan_connections = self.trojan_active_connections.lock().await;
-        *trojan_connections.entry(port).or_insert(0) += 1;
+        self.proxy_ports.increment_trojan_connections(port).await;
     }
 
     /// Decrement active Trojan connections for a port
     pub async fn decrement_trojan_connections(&self, port: u16) {
-        let mut trojan_connections = self.trojan_active_connections.lock().await;
-        if let Some(count) = trojan_connections.get_mut(&port) {
-            if *count > 0 {
-                *count -= 1;
-            }
-        }
+        self.proxy_ports.decrement_trojan_connections(port).await;
     }
 
     // API helper methods — kept for backward compat, return empty data since
@@ -361,27 +454,17 @@ impl ServerState {
 
     /// Get total active connection count (SS + Trojan only)
     pub async fn get_active_connection_count(&self) -> usize {
-        let ss_connections = self.ss_active_connections.lock().await;
-        let trojan_connections = self.trojan_active_connections.lock().await;
-        ss_connections.values().sum::<usize>() + trojan_connections.values().sum::<usize>()
+        self.proxy_ports.get_active_connection_count().await
     }
 
     /// Get all Shadowsocks ports
     pub async fn get_shadowsocks_ports(&self) -> Vec<u16> {
-        let ports = self.ports.lock().await;
-        ports
-            .iter()
-            .filter_map(|(port, info)| match info {
-                ServerPortInfo::Shadowsocks { .. } => Some(*port),
-                _ => None,
-            })
-            .collect()
+        self.proxy_ports.get_shadowsocks_ports().await
     }
 
     /// Check if a port is a Shadowsocks port
     pub async fn is_shadowsocks_port(&self, port: u16) -> bool {
-        let ports = self.ports.lock().await;
-        matches!(ports.get(&port), Some(ServerPortInfo::Shadowsocks { .. }))
+        self.proxy_ports.is_shadowsocks_port(port).await
     }
 
     /// Set the ACME client for this server state
@@ -390,8 +473,8 @@ impl ServerState {
         client: std::sync::Arc<crate::acme::client::AcmeClient>,
         config: AcmeConfigInfo,
     ) {
-        *self.acme_client.write().await = Some(client);
-        *self.acme_config.write().await = Some(config);
+        *self.acme.client.write().await = Some(client);
+        *self.acme.config.write().await = Some(config);
     }
 
     /// Set the certificate manager for this server state
@@ -399,7 +482,7 @@ impl ServerState {
         &mut self,
         manager: std::sync::Arc<crate::acme::manager::CertificateManager>,
     ) {
-        self.cert_manager = Some(manager);
+        self.acme.cert_manager = Some(manager);
     }
 
     /// Set the DNS registry for this server state
@@ -434,7 +517,7 @@ impl rust_tunnel_protocols::PortRegistry for ServerState {
         ServerState::register_trojan(self, port, password, fallback).await
     }
     async fn get_port(&self, port: u16) -> Option<rust_tunnel_protocols::PortInfo> {
-        let ports = self.ports.lock().await;
+        let ports = self.proxy_ports.ports.lock().await;
         let p = ports.get(&port)?.clone();
         Some(match p {
             crate::control_plane::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at } => rust_tunnel_protocols::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at },

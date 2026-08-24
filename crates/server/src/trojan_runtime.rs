@@ -146,7 +146,7 @@ pub async fn apply_trojan_config(
 ) -> Result<(), String> {
     // 1. 停掉现有实例（独立 listener 与证书热更新任务共享同一个 abort channel）
     {
-        let mut abort = state.trojan_listener_abort.write().await;
+        let mut abort = state.proxy_ports.trojan_listener_abort.write().await;
         if let Some(tx) = abort.take() {
             let _ = tx.send(true);
         }
@@ -156,7 +156,7 @@ pub async fn apply_trojan_config(
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     if !cfg.enabled {
-        *state.trojan_runtime.write().await = Default::default();
+        *state.proxy_ports.trojan_runtime.write().await = Default::default();
         return Ok(());
     }
 
@@ -185,41 +185,41 @@ pub async fn apply_trojan_config(
             "Trojan 端口 {} 仍被反代共享监听器 {} 占用，无法回退独立监听，Trojan 已停止",
             cfg.port, addr
         );
-        *state.trojan_runtime.write().await = Default::default();
+        *state.proxy_ports.trojan_runtime.write().await = Default::default();
         return Ok(());
     }
 
     // 3. 证书解析（ACME 优先，回退自签名）
     let domain_lc = cfg.domain.to_ascii_lowercase();
     let (tls_config, source) = resolve_trojan_tls(
-        state.cert_manager.as_ref(),
+        state.acme.cert_manager.as_ref(),
         &domain_lc,
-        &state.tls_cert_path,
-        &state.tls_key_path,
+        &state.tls.cert_path,
+        &state.tls.key_path,
     )
     .await
     .map_err(|e| format!("Trojan TLS 配置解析失败: {e}"))?;
 
     let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
     let (abort_tx, abort_rx) = watch::channel(false);
-    *state.trojan_listener_abort.write().await = Some(abort_tx);
+    *state.proxy_ports.trojan_listener_abort.write().await = Some(abort_tx);
 
     // 4. 证书热更新订阅：domain 非空即订阅（自签名模式也可经此热升级到 ACME）
     if !domain_lc.is_empty() {
-        if let Some(mgr) = state.cert_manager.clone() {
+        if let Some(mgr) = state.acme.cert_manager.clone() {
             spawn_trojan_cert_reload(
                 mgr,
                 domain_lc.clone(),
                 tls_config_tx,
                 abort_rx.clone(),
-                state.trojan_runtime.clone(),
+                state.proxy_ports.trojan_runtime.clone(),
             );
         }
     }
 
     // 5. 记录运行时状态（GET /api/trojan 读取）
     {
-        let mut rt = state.trojan_runtime.write().await;
+        let mut rt = state.proxy_ports.trojan_runtime.write().await;
         rt.cert_source = Some(source.as_str().to_string());
         rt.shared = shared_listen_addr.is_some();
     }
@@ -287,7 +287,7 @@ pub async fn sync_trojan_mode(state: &ServerState) {
             state.proxy_state.http_listen_addr_for_port(cfg.port).await,
             Some((_, true))
         );
-    let actual_shared = state.trojan_runtime.read().await.shared;
+    let actual_shared = state.proxy_ports.trojan_runtime.read().await.shared;
     if desired_shared != actual_shared {
         info!(
             "Trojan 监听模式切换: shared {} -> {}，重新应用配置",
@@ -380,7 +380,7 @@ mod tests {
             domain: String::new(),
         };
         apply_trojan_config(&state, &cfg).await.unwrap();
-        let rt = state.trojan_runtime.read().await;
+        let rt = state.proxy_ports.trojan_runtime.read().await;
         assert!(rt.cert_source.is_none());
         assert!(!rt.shared);
     }
@@ -392,9 +392,9 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let mgr = Arc::new(CertificateManager::new(temp.path().to_str().unwrap()));
         let mut state = ServerState::new();
-        state.cert_manager = Some(mgr.clone());
-        state.tls_cert_path = temp.path().join("c.pem").to_str().unwrap().to_string();
-        state.tls_key_path = temp.path().join("k.pem").to_str().unwrap().to_string();
+        state.acme.cert_manager = Some(mgr.clone());
+        state.tls.cert_path = temp.path().join("c.pem").to_str().unwrap().to_string();
+        state.tls.key_path = temp.path().join("k.pem").to_str().unwrap().to_string();
 
         let cfg = TrojanDynamicConfig {
             enabled: true,
@@ -406,7 +406,7 @@ mod tests {
         apply_trojan_config(&state, &cfg).await.unwrap();
         // 启动时无 ACME 证书 → 自签名回退
         assert_eq!(
-            state.trojan_runtime.read().await.cert_source.as_deref(),
+            state.proxy_ports.trojan_runtime.read().await.cert_source.as_deref(),
             Some("self_signed")
         );
 
@@ -416,7 +416,7 @@ mod tests {
         // 热升级：watch 推送新配置（同一分支内）并把 cert_source 更新为 acme_exact
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if state.trojan_runtime.read().await.cert_source.as_deref() == Some("acme_exact") {
+                if state.proxy_ports.trojan_runtime.read().await.cert_source.as_deref() == Some("acme_exact") {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -542,7 +542,7 @@ mod tests {
 
         // 模拟 trojan 原处于共享模式运行中
         {
-            let mut rt = state.trojan_runtime.write().await;
+            let mut rt = state.proxy_ports.trojan_runtime.write().await;
             rt.cert_source = Some("acme_exact".to_string());
             rt.shared = true;
         }
@@ -558,10 +558,10 @@ mod tests {
 
         // 端口被占用：运行状态清空，abort handle 未重建（未 spawn 独立 listener）
         {
-            let rt = state.trojan_runtime.read().await;
+            let rt = state.proxy_ports.trojan_runtime.read().await;
             assert!(rt.cert_source.is_none());
             assert!(!rt.shared);
         }
-        assert!(state.trojan_listener_abort.read().await.is_none());
+        assert!(state.proxy_ports.trojan_listener_abort.read().await.is_none());
     }
 }

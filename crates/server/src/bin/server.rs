@@ -162,7 +162,7 @@ async fn main() -> TunnelResult<()> {
             if let Ok(dns_config) =
                 serde_json::from_str::<rust_tunnel_server::acme::dns::DnsProviderConfig>(&json)
             {
-                *state.dns_provider_config.write().await = Some(dns_config);
+                *state.acme.dns_provider.write().await = Some(dns_config);
                 tracing::info!("Loaded persisted DNS provider config from database");
             }
         }
@@ -178,14 +178,14 @@ async fn main() -> TunnelResult<()> {
         effective_acme_config.server_url,
         effective_acme_config.cert_dir,
     );
-    *state.acme_full_config.write().await = effective_acme_config.clone();
+    *state.acme.full_config.write().await = effective_acme_config.clone();
 
     // Set API TLS config on state (read-only, from config)
-    state.api_tls = config.api_tls;
-    state.api_domain = config.api_domain.clone();
+    state.tls.enabled = config.api_tls;
+    state.tls.domain = config.api_domain.clone();
     // 控制通道 TLS 证书路径：Trojan 无匹配 ACME 证书时回退复用
-    state.tls_cert_path = config.tls_cert.clone();
-    state.tls_key_path = config.tls_key.clone();
+    state.tls.cert_path = config.tls_cert.clone();
+    state.tls.key_path = config.tls_key.clone();
 
     // Initialize logging with LogStore capture (after state creation so LogStore is available)
     let log_store = state.log_store.clone();
@@ -261,7 +261,7 @@ async fn main() -> TunnelResult<()> {
 
         // Set ACME client on the certificate manager
         {
-            let acme_client_guard = state.acme_client.read().await;
+            let acme_client_guard = state.acme.client.read().await;
             if let Some(ref acme_client) = *acme_client_guard {
                 cert_manager.set_acme_client(acme_client.clone()).await;
             }
@@ -290,7 +290,7 @@ async fn main() -> TunnelResult<()> {
         // listener's SNI resolver and coverage queries have access to it.
         // ServerState::set_cert_manager (called above) only sets the top-level
         // cert_manager field; ReverseProxyState needs its own copy.
-        if let Some(mgr) = state.cert_manager.clone() {
+        if let Some(mgr) = state.acme.cert_manager.clone() {
             state.proxy_state.set_cert_manager(mgr);
         }
 
@@ -516,7 +516,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
         let (tls_config_tx, tls_config_rx) = watch::channel(tls_config);
 
         // If a cert_manager exists, subscribe to cert events and update the watch channel
-        if let Some(ref cert_manager) = state.cert_manager {
+        if let Some(ref cert_manager) = state.acme.cert_manager {
             let mut cert_rx = cert_manager.subscribe();
             let tx = tls_config_tx.clone();
             let cert_manager_clone = cert_manager.clone();
@@ -590,7 +590,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
                 // Register abort handle so API updates can stop this listener
                 let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
                 {
-                    let mut abort = state.ss_listener_abort.write().await;
+                    let mut abort = state.proxy_ports.ss_listener_abort.write().await;
                     *abort = Some(abort_tx);
                 }
 
@@ -631,7 +631,7 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
 
     // Spawn API server
     let api_tls_config = if config.api_tls {
-        if let Some(ref cert_manager) = state.cert_manager {
+        if let Some(ref cert_manager) = state.acme.cert_manager {
             // Try to get certificate for API domain
             if let Some(ref domain) = config.api_domain {
                 if let Some(cfg) = cert_manager.get_tls_server_config(domain).await {

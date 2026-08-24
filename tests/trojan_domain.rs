@@ -389,8 +389,8 @@ async fn shared_mode_e2e_sni_dispatch() {
         add_test_cert(&cm, "proxy.test.local").await;
         state.set_cert_manager(cm.clone());
         state.proxy_state.set_cert_manager(cm);
-        state.tls_cert_path = tempdir.path().join("tls/cert.pem").to_string_lossy().into();
-        state.tls_key_path = tempdir.path().join("tls/key.pem").to_string_lossy().into();
+        state.tls.cert_path = tempdir.path().join("tls/cert.pem").to_string_lossy().into();
+        state.tls.key_path = tempdir.path().join("tls/key.pem").to_string_lossy().into();
 
         let echo_port = start_echo().await;
         let backend_port = start_http_backend("hello-from-backend").await;
@@ -420,7 +420,7 @@ async fn shared_mode_e2e_sni_dispatch() {
             .await
             .unwrap();
         {
-            let rt = state.trojan_runtime.read().await;
+            let rt = state.proxy_ports.trojan_runtime.read().await;
             assert!(rt.shared, "应进入共享模式");
             assert_eq!(rt.cert_source.as_deref(), Some("acme_exact"));
         }
@@ -500,8 +500,8 @@ async fn standalone_mode_self_signed_fallback() {
         let cm = Arc::new(CertificateManager::new(cert_dir.to_str().unwrap()));
         state.set_cert_manager(cm.clone());
         state.proxy_state.set_cert_manager(cm);
-        state.tls_cert_path = tempdir.path().join("tls/cert.pem").to_string_lossy().into();
-        state.tls_key_path = tempdir.path().join("tls/key.pem").to_string_lossy().into();
+        state.tls.cert_path = tempdir.path().join("tls/cert.pem").to_string_lossy().into();
+        state.tls.key_path = tempdir.path().join("tls/key.pem").to_string_lossy().into();
 
         let echo_port = start_echo().await;
         let port = reserve_port();
@@ -516,7 +516,7 @@ async fn standalone_mode_self_signed_fallback() {
             .await
             .unwrap();
         {
-            let rt = state.trojan_runtime.read().await;
+            let rt = state.proxy_ports.trojan_runtime.read().await;
             assert!(!rt.shared, "无反代规则应为独立监听");
             assert_eq!(
                 rt.cert_source.as_deref(),
@@ -535,7 +535,7 @@ async fn standalone_mode_self_signed_fallback() {
         assert_eq!(resp, data);
 
         // 清理
-        if let Some(tx) = state.trojan_listener_abort.write().await.take() {
+        if let Some(tx) = state.proxy_ports.trojan_listener_abort.write().await.take() {
             let _ = tx.send(true);
         };
     })

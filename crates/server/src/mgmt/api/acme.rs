@@ -32,7 +32,7 @@ pub struct CertificateRequest {
 
 // GET /api/acme/certificates — list all certificates
 pub async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoResponse {
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
         Some(c) => c.clone(),
         None => {
@@ -61,7 +61,7 @@ pub async fn request_acme_certificate(
     Path(domain): Path<String>,
     Json(req): Json<CertificateRequest>,
 ) -> impl IntoResponse {
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
         Some(c) => c.clone(),
         None => {
@@ -80,7 +80,7 @@ pub async fn request_acme_certificate(
     let result = match challenge_type.as_str() {
         "dns-01" => {
             // 获取 DNS solver
-            let dns_config = state.server_state.dns_provider_config.read().await;
+            let dns_config = state.server_state.acme.dns_provider.read().await;
             match dns_config.as_ref() {
                 Some(config) => {
                     let solver: Arc<dyn crate::acme::dns::DnsChallengeSolver> =
@@ -117,7 +117,7 @@ pub async fn request_acme_certificate(
             tracing::info!("Certificate request successful for domain: {}", domain);
             // 签发结果写入 CertificateManager 内存缓存并广播 CertEvent::Issued，
             // 否则重启前 Trojan / 反代 SNI resolver 看不到新证书。
-            if let Some(ref cm) = state.server_state.cert_manager {
+            if let Some(ref cm) = state.server_state.acme.cert_manager {
                 if let Err(e) = cm.load_issued_certificate(&domain).await {
                     tracing::warn!(
                         "Failed to load issued certificate into cache for {}: {}",
@@ -148,7 +148,7 @@ pub async fn get_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
         Some(c) => c.clone(),
         None => {
@@ -181,7 +181,7 @@ pub async fn renew_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
         Some(c) => c.clone(),
         None => {
@@ -207,13 +207,13 @@ pub async fn renew_acme_certificate(
 // GET /api/acme/status — get ACME status
 pub async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
     // Read enabled status from acme_full_config to stay in sync with API updates
-    let full_config = state.server_state.acme_full_config.read().await;
+    let full_config = state.server_state.acme.full_config.read().await;
     let enabled = full_config.enabled;
     let server_url = full_config.server_url.clone();
     let cert_dir = full_config.cert_dir.clone();
     drop(full_config);
 
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let cert_count = match client_guard.as_ref() {
         Some(client) => match client.list_certificates().await {
             Ok(certs) => certs.len(),
@@ -223,9 +223,9 @@ pub async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse
     };
     drop(client_guard);
 
-    let api_tls = state.server_state.cert_manager.is_some();
+    let api_tls = state.server_state.acme.cert_manager.is_some();
     let trojan = !state.server_state.get_trojan_ports().await.is_empty();
-    let control_tls = state.server_state.cert_manager.is_some();
+    let control_tls = state.server_state.acme.cert_manager.is_some();
 
     // Check if any reverse-proxy rule has TLS with ACME enabled
     let reverse_proxy = {
@@ -252,7 +252,7 @@ pub async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse
 
 // GET /api/acme/config — get ACME configuration
 pub async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse {
-    let config = state.server_state.acme_full_config.read().await;
+    let config = state.server_state.acme.full_config.read().await;
     Json(serde_json::json!({
         "enabled": config.enabled,
         "server_url": config.server_url,
@@ -270,7 +270,7 @@ pub async fn update_acme_config(
     State(state): State<ApiState>,
     Json(req): Json<UpdateAcmeConfigRequest>,
 ) -> impl IntoResponse {
-    let mut config = state.server_state.acme_full_config.write().await;
+    let mut config = state.server_state.acme.full_config.write().await;
     if let Some(v) = req.enabled {
         config.enabled = v;
     }
@@ -303,7 +303,7 @@ pub async fn update_acme_config(
     }
 
     // Capture config values for ACME client initialization
-    let has_client = state.server_state.acme_client.read().await.is_some();
+    let has_client = state.server_state.acme.client.read().await.is_some();
     let should_init_client = config.enabled && !has_client;
     let acme_server_url = config.server_url.clone();
     let acme_cert_dir = config.cert_dir.clone();
@@ -376,7 +376,7 @@ pub async fn update_acme_config(
 
 // GET /api/acme/dns-providers — get available providers and current config
 pub async fn get_dns_providers(State(state): State<ApiState>) -> impl IntoResponse {
-    let config = state.server_state.dns_provider_config.read().await;
+    let config = state.server_state.acme.dns_provider.read().await;
     Json(serde_json::json!({
         "providers": ["cloudflare", "aliyun", "tencent", "custom"],
         "config": *config
@@ -388,7 +388,7 @@ pub async fn update_dns_provider(
     State(state): State<ApiState>,
     Json(req): Json<crate::acme::dns::DnsProviderConfig>,
 ) -> impl IntoResponse {
-    let mut config = state.server_state.dns_provider_config.write().await;
+    let mut config = state.server_state.acme.dns_provider.write().await;
     *config = Some(req.clone());
 
     // Persist DNS provider config to database
@@ -423,7 +423,7 @@ pub async fn delete_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
 ) -> impl IntoResponse {
-    let client_guard = state.server_state.acme_client.read().await;
+    let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
         Some(c) => c.clone(),
         None => {
@@ -463,7 +463,7 @@ mod tests {
         let server_state = ServerState::with_db(db);
 
         // Verify ACME client is not initialized
-        assert!(server_state.acme_client.read().await.is_none());
+        assert!(server_state.acme.client.read().await.is_none());
 
         // Create API state
         let state = ApiState {
@@ -487,10 +487,10 @@ mod tests {
         let _ = update_acme_config(State(state), Json(req)).await;
 
         // Verify ACME client is now initialized (shared Arc, visible from original)
-        assert!(server_state.acme_client.read().await.is_some());
+        assert!(server_state.acme.client.read().await.is_some());
 
         // Verify ACME config is set
-        let acme_config_guard = server_state.acme_config.read().await;
+        let acme_config_guard = server_state.acme.config.read().await;
         assert!(acme_config_guard.is_some());
         let acme_config = acme_config_guard.as_ref().unwrap();
         assert!(acme_config.enabled);
@@ -501,7 +501,7 @@ mod tests {
         drop(acme_config_guard);
 
         // Verify ACME full config is updated
-        let full_config = server_state.acme_full_config.read().await;
+        let full_config = server_state.acme.full_config.read().await;
         assert!(full_config.enabled);
         assert_eq!(
             full_config.server_url,
@@ -517,7 +517,7 @@ mod tests {
         let server_state = ServerState::with_db(db);
 
         // Verify ACME client is not initialized
-        assert!(server_state.acme_client.read().await.is_none());
+        assert!(server_state.acme.client.read().await.is_none());
 
         // Create API state
         let state = ApiState {
@@ -541,13 +541,13 @@ mod tests {
         let _ = update_acme_config(State(state), Json(req)).await;
 
         // Verify ACME client is still not initialized
-        assert!(server_state.acme_client.read().await.is_none());
+        assert!(server_state.acme.client.read().await.is_none());
 
         // Verify ACME config is still not set
-        assert!(server_state.acme_config.read().await.is_none());
+        assert!(server_state.acme.config.read().await.is_none());
 
         // Verify ACME full config is updated
-        let full_config = server_state.acme_full_config.read().await;
+        let full_config = server_state.acme.full_config.read().await;
         assert!(!full_config.enabled);
     }
 
@@ -566,7 +566,7 @@ mod tests {
 
         // Initial status should show ACME disabled
         let _ = get_acme_status(State(state.clone())).await;
-        let full_config = server_state.acme_full_config.read().await;
+        let full_config = server_state.acme.full_config.read().await;
         assert!(!full_config.enabled);
         drop(full_config);
 
@@ -584,7 +584,7 @@ mod tests {
         let _ = update_acme_config(State(state), Json(req)).await;
 
         // Verify ACME is now enabled in the config
-        let full_config = server_state.acme_full_config.read().await;
+        let full_config = server_state.acme.full_config.read().await;
         assert!(full_config.enabled);
         assert_eq!(
             full_config.server_url,
@@ -592,6 +592,6 @@ mod tests {
         );
 
         // Verify ACME client is initialized
-        assert!(server_state.acme_client.read().await.is_some());
+        assert!(server_state.acme.client.read().await.is_some());
     }
 }

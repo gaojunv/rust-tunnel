@@ -16,7 +16,7 @@ pub async fn get_trojan_config(State(state): State<ApiState>) -> Json<super::dto
             None => (false, None, None, None),
         }
     };
-    let rt = state.server_state.trojan_runtime.read().await;
+    let rt = state.server_state.proxy_ports.trojan_runtime.read().await;
     Json(super::dto::TrojanConfig {
         enabled,
         port,

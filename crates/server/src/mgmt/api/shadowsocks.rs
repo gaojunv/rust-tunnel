@@ -78,7 +78,7 @@ pub async fn update_shadowsocks_config(
 
     // Handle listener lifecycle
     {
-        let mut abort = state.server_state.ss_listener_abort.write().await;
+        let mut abort = state.server_state.proxy_ports.ss_listener_abort.write().await;
         // Stop existing listener if any
         if let Some(tx) = abort.take() {
             let _ = tx.send(true);
