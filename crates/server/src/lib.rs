@@ -7,7 +7,8 @@ pub mod pki;
 pub mod test_helpers;
 pub use mgmt::api;
 pub use pki::acme;
-pub mod agent;
+// agent 工作台已拆分为独立 crate；`agent` 路径保持兼容 re-export
+pub use rust_tunnel_agent as agent;
 pub mod config;
 pub mod control_plane;
 pub use control_plane as control;

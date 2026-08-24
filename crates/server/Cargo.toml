@@ -20,13 +20,14 @@ path = "src/bin/checkdb.rs"
 [features]
 default = []
 embed-frontend = ["dep:rust-embed"]
-rag = ["dep:rust-tunnel-rag", "rust-tunnel-llm/rag"]
+rag = ["dep:rust-tunnel-rag", "rust-tunnel-llm/rag", "rust-tunnel-agent/rag"]
 
 [dependencies]
 rust-tunnel-common = { path = "../common" }
 rust-tunnel-persistence = { path = "../persistence" }
 rust-tunnel-rag = { path = "../rag", optional = true }
 rust-tunnel-llm = { path = "../llm" }
+rust-tunnel-agent = { path = "../agent" }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

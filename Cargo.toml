@@ -6,7 +6,7 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT"
 
 [workspace]
-members = ["crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/rag", "crates/server"]
+members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/rag", "crates/server"]
 
 [workspace.lints.clippy]
 # 企业级 lint 基线：pedantic 组先 warn 基线运行，批次 9 清零后转 deny

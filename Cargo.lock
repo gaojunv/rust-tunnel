@@ -4764,6 +4764,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-agent"
+version = "0.4.0"
+dependencies = [
+ "agent-client-protocol",
+ "async-stream",
+ "async-trait",
+ "axum 0.7.9",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "rand 0.8.6",
+ "reqwest",
+ "rust-tunnel-common",
+ "rust-tunnel-llm",
+ "rust-tunnel-persistence",
+ "rust-tunnel-rag",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rust-tunnel-client"
 version = "0.8.0"
 dependencies = [
@@ -4917,6 +4946,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rust-embed",
+ "rust-tunnel-agent",
  "rust-tunnel-common",
  "rust-tunnel-llm",
  "rust-tunnel-persistence",

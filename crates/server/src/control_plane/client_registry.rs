@@ -482,6 +482,70 @@ impl ClientRegistry {
     }
 }
 
+/// agent crate 的依赖倒置接缝：`AgentState`/`AgentSpawner` 消费
+/// `Arc<dyn TunnelExecutor>`，此处用 `ClientRegistry` 适配实现。
+#[async_trait::async_trait]
+impl crate::agent::TunnelExecutor for ClientRegistry {
+    async fn client_handle(&self, client_id: &str) -> Option<crate::agent::ClientHandle> {
+        self.get(client_id)
+            .await
+            .map(|entry| crate::agent::ClientHandle {
+                client_version: entry.client_version.clone(),
+                control_sender: entry.control_sender.clone(),
+            })
+    }
+
+    async fn spawn_negotiate(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        request: ControlMessage,
+        timeout: Duration,
+    ) -> std::io::Result<ControlMessage> {
+        Self::spawn_negotiate(self, client_id, session_id, request, timeout).await
+    }
+
+    async fn agent_exec(
+        &self,
+        client_id: &str,
+        request_id: &str,
+        session_id: &str,
+        root_path: &str,
+        docker_container: Option<&str>,
+        command: rust_tunnel_common::AgentCommand,
+        timeout: Duration,
+    ) -> std::io::Result<rust_tunnel_common::AgentResult> {
+        Self::agent_exec(
+            self,
+            client_id,
+            request_id,
+            session_id,
+            root_path,
+            docker_container,
+            command,
+            timeout,
+        )
+        .await
+    }
+
+    async fn send_agent_cancel(&self, client_id: &str, request_id: &str) -> bool {
+        Self::send_agent_cancel(self, client_id, request_id).await
+    }
+
+    async fn send_control(&self, client_id: &str, msg: ControlMessage) -> bool {
+        Self::send_control(self, client_id, msg).await
+    }
+
+    async fn open_tunnel(
+        &self,
+        client_id: &str,
+        target_addr: &str,
+    ) -> std::io::Result<crate::agent::TunnelByteStream> {
+        let stream = Self::open_tunnel(self, client_id, target_addr).await?;
+        Ok(Box::pin(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

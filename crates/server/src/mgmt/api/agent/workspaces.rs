@@ -367,7 +367,7 @@ async fn load_git_workspace(
     if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    match agent.registry.get(&ws.client_id).await {
+    match agent.registry.client_handle(&ws.client_id).await {
         // 客户端未注册（离线）：与其余面板端点一致 → 503（前端区分「离线」与「升级」）。
         None => return Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
         Some(entry) => {
@@ -469,7 +469,7 @@ async fn run_git_write(
     if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match agent.registry.get(&ws.client_id).await {
+    match agent.registry.client_handle(&ws.client_id).await {
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Some(entry) => {
             if !crate::agent::runner::client_supports_git_exec(entry.client_version.as_deref()) {
@@ -2407,10 +2407,9 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(32);
         state
             .server_state
-            .agent_state
+            .client_registry
             .as_ref()
-            .expect("agent_state")
-            .registry
+            .expect("client_registry")
             .register(name, None, version.map(str::to_string), "secret", tx)
             .await
             .unwrap();

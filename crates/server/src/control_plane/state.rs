@@ -146,7 +146,7 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db.clone()),
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
-            agent_state: Some(crate::agent::AgentState::new(registry, db)),
+            agent_state: Some(crate::agent::AgentState::new(std::sync::Arc::new(registry), db)),
             acme_client: Arc::new(RwLock::new(None)),
             acme_config: Arc::new(RwLock::new(None)),
             acme_full_config: Arc::new(RwLock::new(AcmeFullConfig::default())),

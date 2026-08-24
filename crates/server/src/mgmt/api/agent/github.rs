@@ -132,7 +132,7 @@ async fn probe_repo_via_tunnel(
     if ws.runtime_type == "docker" && ws.docker_container_id.is_none() {
         return None;
     }
-    match agent.registry.get(&ws.client_id).await {
+    match agent.registry.client_handle(&ws.client_id).await {
         None => return None,
         Some(entry) => {
             if !crate::agent::runner::client_supports_git_exec(entry.client_version.as_deref()) {

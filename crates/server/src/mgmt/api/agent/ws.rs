@@ -199,7 +199,7 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
 
     // 3. 版本门控：离线（get 返回 None，无版本信息）与过旧（< 0.3.0）都视为
     //    不支持——老客户端没有 PTY 服务，建隧道只会连到客户端上不存在的端口。
-    let entry = agent.registry.get(&ws.client_id).await;
+    let entry = agent.registry.client_handle(&ws.client_id).await;
     let version = entry.as_ref().and_then(|e| e.client_version.clone());
     if !crate::agent::runner::client_supports_terminal(version.as_deref()) {
         let message = if entry.is_none() {
@@ -273,7 +273,7 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
 async fn bridge_terminal(
     mut ws_sink: futures_util::stream::SplitSink<WebSocket, Message>,
     mut ws_stream: futures_util::stream::SplitStream<WebSocket>,
-    tunnel: crate::tunnel_stream::ClientTunnelStream,
+    tunnel: crate::agent::TunnelByteStream,
     agent: &crate::agent::AgentState,
     workspace: &crate::db::agent::AgentWorkspaceRecord,
     terminal_id: &str,
@@ -1442,7 +1442,7 @@ async fn send_cancel_to_client(
     }
     let version = agent
         .registry
-        .get(client_id)
+        .client_handle(client_id)
         .await
         .and_then(|e| e.client_version.clone());
     if !crate::agent::runner::client_supports_cancel(version.as_deref()) {
