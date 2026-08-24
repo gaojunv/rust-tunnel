@@ -26,7 +26,7 @@ pub struct CreateWorkspaceRequest {
     /// ACP 引擎选项覆盖（JSON map：config_id → value）；空串归一化为 None。
     #[serde(default)]
     pub agent_config_overrides: Option<String>,
-    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值为
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku,subagent}，值为
     /// 模型引用 `model:<id>`/`group:<id>`/裸别名）；空串归一化为 None。
     #[serde(default)]
     pub claude_tier_models: Option<String>,
@@ -61,7 +61,7 @@ pub struct UpdateWorkspaceRequest {
     /// 空串 `""` 在 handler 层归一化为清空（向后兼容旧前端传空串=清空的惯例）。
     #[serde(default)]
     pub agent_config_overrides: Option<Option<String>>,
-    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，值为
+    /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku,subagent}，值为
     /// 模型引用）。三态语义同 `agent_config_overrides`：省略=保持、显式 null
     ///（或空串）= 清空、非空字符串=写入。
     #[serde(default)]

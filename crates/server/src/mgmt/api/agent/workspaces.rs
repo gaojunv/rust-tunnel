@@ -39,7 +39,7 @@ fn validate_config_overrides(raw: &str) -> bool {
 }
 
 /// 校验 claude_tier_models：空串合法（调用方归一化 None）；非空必须是
-/// JSON object，key 白名单 opus|sonnet|haiku 且 value 必须为 string（模型引用）。
+/// JSON object，key 白名单 opus|sonnet|haiku|subagent 且 value 必须为 string（模型引用）。
 fn validate_tier_models(raw: &str) -> bool {
     if raw.is_empty() {
         return true;
@@ -47,7 +47,7 @@ fn validate_tier_models(raw: &str) -> bool {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(serde_json::Value::Object(map)) => map
             .iter()
-            .all(|(k, v)| matches!(k.as_str(), "opus" | "sonnet" | "haiku") && v.is_string()),
+            .all(|(k, v)| matches!(k.as_str(), "opus" | "sonnet" | "haiku" | "subagent") && v.is_string()),
         _ => false,
     }
 }
@@ -100,7 +100,7 @@ pub async fn create_workspace(
         if !validate_tier_models(raw) {
             return (
                 StatusCode::BAD_REQUEST,
-                "claude_tier_models must be a JSON object with opus|sonnet|haiku keys and string values",
+                "claude_tier_models must be a JSON object with opus|sonnet|haiku|subagent keys and string values",
             )
                 .into_response();
         }
@@ -220,7 +220,7 @@ pub async fn update_workspace(
         if !validate_tier_models(raw) {
             return (
                 StatusCode::BAD_REQUEST,
-                "claude_tier_models must be a JSON object with opus|sonnet|haiku keys and string values",
+                "claude_tier_models must be a JSON object with opus|sonnet|haiku|subagent keys and string values",
             )
                 .into_response();
         }
@@ -1843,6 +1843,7 @@ mod tests {
         assert!(validate_tier_models(
             r#"{"opus":"model:x","sonnet":"group:y","haiku":"plain-alias"}"#
         ));
+        assert!(validate_tier_models(r#"{"subagent":"model:z"}"#));
         // 非法：白名单外 key / 非 string 值 / 非 object / 非法 JSON
         assert!(!validate_tier_models(r#"{"opusx":"model:x"}"#));
         assert!(!validate_tier_models(r#"{"opus":"a","b":"c"}"#));
