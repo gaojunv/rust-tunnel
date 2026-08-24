@@ -34,9 +34,31 @@ pub enum TunnelError {
 
     #[error("Mesh relay error: {0}")]
     MeshRelay(String),
+
+    /// 带底层错误源的场景：保留 source 链，Display 为 `context: source`
+    /// （替代 `format!("context: {e}")` 吞掉 source 的 String 包装用法）
+    #[error("{context}: {source}")]
+    WithSource {
+        context: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type TunnelResult<T> = Result<T, TunnelError>;
+
+impl TunnelError {
+    /// 构造带 source 链的错误（Display 为 `context: source`）
+    pub fn with_source(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::WithSource {
+            context: context.into(),
+            source: Box::new(source),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +193,34 @@ mod tests {
             assert_eq!(recovered.len(), 100);
         } else {
             panic!("Expected TrojanAuthFailed variant");
+        }
+    }
+
+    #[test]
+    fn test_with_source_display_and_chain() {
+        let io_err = std::io::Error::other("disk gone");
+        let err = TunnelError::with_source("Failed to load certificate", io_err);
+        assert_eq!(
+            format!("{err}"),
+            "Failed to load certificate: disk gone"
+        );
+        // source 链可达
+        let src = std::error::Error::source(&err);
+        assert!(src.is_some());
+        assert_eq!(format!("{}", src.unwrap()), "disk gone");
+    }
+
+    #[test]
+    fn test_with_source_accepts_string_context() {
+        let err = TunnelError::with_source(
+            format!("Invalid server name: {}", "bad..name"),
+            std::io::Error::other("dns error"),
+        );
+        assert!(format!("{err}").starts_with("Invalid server name: bad..name: "));
+        if let TunnelError::WithSource { context, .. } = &err {
+            assert!(context.contains("bad..name"));
+        } else {
+            panic!("Expected WithSource variant");
         }
     }
 }

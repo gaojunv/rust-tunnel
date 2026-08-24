@@ -106,7 +106,7 @@ pub async fn handle_ss_handshake(
     // Use ServerConfig to derive the key correctly to match shadowsocks-rust expectations
     let dummy_addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let svr_cfg = ServerConfig::new(dummy_addr, password, kind)
-        .map_err(|e| TunnelError::Protocol(format!("Failed to create server config: {}", e)))?;
+        .map_err(|e| TunnelError::with_source("Failed to create server config", e))?;
     let key = svr_cfg.key().to_vec();
 
     // Create proxy server stream that handles encryption/decryption
@@ -116,7 +116,7 @@ pub async fn handle_ss_handshake(
     let target_addr = proxy_stream
         .handshake()
         .await
-        .map_err(|e| TunnelError::Protocol(format!("Handshake failed: {}", e)))?;
+        .map_err(|e| TunnelError::with_source("Handshake failed", e))?;
 
     let target_addr_str = target_addr.to_string();
     debug!("Parsed SS target address: {}", target_addr_str);

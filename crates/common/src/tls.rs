@@ -100,7 +100,7 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
     let mut cert_reader = BufReader::new(cert_file);
     let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .collect::<Result<_, _>>()
-        .map_err(|e| TunnelError::Tls(format!("Failed to load certificate: {e}")))?;
+        .map_err(|e| TunnelError::with_source("Failed to load certificate", e))?;
 
     if certs.is_empty() {
         return Err(TunnelError::Tls("No certificates found in file".into()));
@@ -110,7 +110,7 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
     let key_file = fs::File::open(key_path).map_err(TunnelError::Io)?;
     let mut key_reader = BufReader::new(key_file);
     let item = rustls_pemfile::read_one(&mut key_reader)
-        .map_err(|e| TunnelError::Tls(format!("Failed to read private key: {e}")))?
+        .map_err(|e| TunnelError::with_source("Failed to read private key", e))?
         .ok_or_else(|| TunnelError::Tls("No private key found in file".into()))?;
 
     let key = match item {
@@ -132,7 +132,7 @@ pub fn create_server_config(cert_pair: TlsCertPair) -> TunnelResult<Arc<ServerCo
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_pair.certs, cert_pair.key)
-        .map_err(|e| TunnelError::Tls(format!("Failed to create server TLS config: {e}")))?;
+        .map_err(|e| TunnelError::with_source("Failed to create server TLS config", e))?;
 
     Ok(Arc::new(config))
 }
@@ -209,11 +209,11 @@ pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
 
     // Add system root certificates
     for cert in rustls_native_certs::load_native_certs()
-        .map_err(|e| TunnelError::Tls(format!("Failed to load system certificates: {e}")))?
+        .map_err(|e| TunnelError::with_source("Failed to load system certificates", e))?
     {
         root_store
             .add(cert)
-            .map_err(|e| TunnelError::Tls(format!("Failed to add root certificate: {e}")))?;
+            .map_err(|e| TunnelError::with_source("Failed to add root certificate", e))?;
     }
 
     let config = ClientConfig::builder()
@@ -239,12 +239,12 @@ pub async fn connect_tls_insecure(
     // Convert to owned String to get 'static lifetime
     let server_name_owned = server_name.to_string();
     let server_name = ServerName::try_from(server_name_owned)
-        .map_err(|_| TunnelError::Tls(format!("Invalid server name: {server_name}")))?;
+        .map_err(|e| TunnelError::with_source(format!("Invalid server name: {server_name}"), e))?;
 
     let tls_stream = connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {e}")))?;
+        .map_err(|e| TunnelError::with_source("TLS handshake failed", e))?;
 
     debug!("TLS connection established successfully");
     Ok(tls_stream)
@@ -265,12 +265,12 @@ pub async fn connect_tls_secure(
     // Convert to owned String to get 'static lifetime
     let server_name_owned = server_name.to_string();
     let server_name = ServerName::try_from(server_name_owned)
-        .map_err(|_| TunnelError::Tls(format!("Invalid server name: {server_name}")))?;
+        .map_err(|e| TunnelError::with_source(format!("Invalid server name: {server_name}"), e))?;
 
     let tls_stream = connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| TunnelError::Tls(format!("TLS handshake failed: {e}")))?;
+        .map_err(|e| TunnelError::with_source("TLS handshake failed", e))?;
 
     debug!("TLS connection established successfully");
     Ok(tls_stream)

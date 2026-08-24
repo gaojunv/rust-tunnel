@@ -83,7 +83,8 @@ async fn handle_client_connection(
                 message: err.to_string(),
             };
             let _ = resp.write_to_stream(&mut writer).await;
-            return Err(TunnelError::ControlChannel(err.to_string()));
+            // 包装为带 source 的错误（保留 RegisterError 链），不再吞成 String
+            return Err(TunnelError::with_source("register failed", err));
         }
     };
 
@@ -271,9 +272,9 @@ pub async fn run_server(
     let tls_acceptor = if tls_config_rx.is_none() && config.tls {
         info!("TLS ENABLED - generating/loading TLS certificates (static mode)");
         let cert_pair = load_or_generate_cert(&config.tls_cert, &config.tls_key)
-            .map_err(|e| TunnelError::Tls(format!("Failed to load TLS certificates: {}", e)))?;
+            .map_err(|e| TunnelError::with_source("Failed to load TLS certificates", e))?;
         let tls_config = create_server_config(cert_pair)
-            .map_err(|e| TunnelError::Tls(format!("Failed to create TLS config: {}", e)))?;
+            .map_err(|e| TunnelError::with_source("Failed to create TLS config", e))?;
         Some(TlsAcceptor::from(tls_config))
     } else if config.tls {
         info!("TLS ENABLED - using dynamic certificate watch channel");
