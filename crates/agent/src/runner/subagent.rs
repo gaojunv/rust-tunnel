@@ -497,3 +497,185 @@ pub(crate) fn truncate_summary(text: String) -> String {
     }
     format!("{}\n[... truncated]", &text[..cut])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subagent_schema_excludes_task_and_todo_write() {
+        // 子循环的工具 schema 应裁剪 task 与 todo_write
+        let all_tools = tools::agent_tools_schema("safe");
+        let filtered: Vec<&str> = all_tools
+            .iter()
+            .filter(|t| {
+                let name = t["function"]["name"].as_str().unwrap_or("");
+                name != "task" && name != "todo_write"
+            })
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(!filtered.contains(&"task"), "task should be filtered out");
+        assert!(!filtered.contains(&"todo_write"), "todo_write should be filtered out");
+        // 其他工具应保留
+        assert!(filtered.contains(&"shell"));
+        assert!(filtered.contains(&"read_file"));
+    }
+
+    #[test]
+    fn test_truncate_summary_short_unchanged() {
+        let text = "short summary".to_string();
+        assert_eq!(truncate_summary(text.clone()), text);
+    }
+
+    #[test]
+    fn test_truncate_summary_long_truncated() {
+        let text = "x".repeat(TASK_SUMMARY_MAX_CHARS + 100);
+        let result = truncate_summary(text);
+        assert!(result.len() < TASK_SUMMARY_MAX_CHARS + 100);
+        assert!(result.contains("[... truncated]"));
+        // 截断点在 UTF-8 边界
+        assert!(!result.ends_with('x') || result.ends_with("x\n[... truncated]"));
+    }
+
+    #[test]
+    fn test_truncate_summary_multibyte_safe() {
+        let text = "汉".repeat(TASK_SUMMARY_MAX_CHARS / 3 + 100);
+        let result = truncate_summary(text);
+        assert!(result.contains("[... truncated]"));
+    }
+
+    #[test]
+    fn test_subagent_compact_messages_clears_old_tool_msgs() {
+        let mut rt = crate::session::SessionRuntime {
+            session_id: "s1".into(),
+            workspace_id: "w1".into(),
+            client_id: "c1".into(),
+            runtime_type: "host".into(),
+            root_path: "/p".into(),
+            docker_container: None,
+            model: "m".into(),
+            approval_mode: "safe".into(),
+            todos: vec![],
+            agents_md: None,
+            memory_block: None,
+            skill_list_block: None,
+            wiki_list_block: None,
+            roles_block: None,
+            messages: vec![],
+            depth: 1,
+            parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
+            active_role: None,
+        };
+        // 添加 8 条 tool 消息
+        for i in 0..8 {
+            rt.messages.push(ChatMessage {
+                role: "tool".into(),
+                content: Some(format!("result_{i}")),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some(format!("c{i}")),
+                name: Some("shell".into()),
+            });
+        }
+        let did_compact = subagent_compact_messages(&mut rt);
+        assert!(did_compact);
+        // 前 4 条应被清空，后 4 条保留
+        assert_eq!(
+            rt.messages[0].content.as_deref(),
+            Some("[old tool output cleared]")
+        );
+        assert_eq!(
+            rt.messages[3].content.as_deref(),
+            Some("[old tool output cleared]")
+        );
+        assert_eq!(rt.messages[4].content.as_deref(), Some("result_4"));
+        assert_eq!(rt.messages[7].content.as_deref(), Some("result_7"));
+    }
+
+    #[test]
+    fn test_subagent_compact_messages_noop_when_few() {
+        let mut rt = crate::session::SessionRuntime {
+            session_id: "s1".into(),
+            workspace_id: "w1".into(),
+            client_id: "c1".into(),
+            runtime_type: "host".into(),
+            root_path: "/p".into(),
+            docker_container: None,
+            model: "m".into(),
+            approval_mode: "safe".into(),
+            todos: vec![],
+            agents_md: None,
+            memory_block: None,
+            skill_list_block: None,
+            wiki_list_block: None,
+            roles_block: None,
+            messages: vec![],
+            depth: 1,
+            parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
+            active_role: None,
+        };
+        for i in 0..3 {
+            rt.messages.push(ChatMessage {
+                role: "tool".into(),
+                content: Some(format!("result_{i}")),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some(format!("c{i}")),
+                name: Some("shell".into()),
+            });
+        }
+        let did_compact = subagent_compact_messages(&mut rt);
+        assert!(!did_compact, "should not compact when <= KEEP_RECENT_TOOL");
+        // 所有内容应保留
+        for i in 0..3 {
+            assert_eq!(
+                rt.messages[i].content.as_deref(),
+                Some(format!("result_{i}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn test_clone_sub_rt_copies_key_fields() {
+        let rt = crate::session::SessionRuntime {
+            session_id: "s1".into(),
+            workspace_id: "w1".into(),
+            client_id: "c1".into(),
+            runtime_type: "docker".into(),
+            root_path: "/container".into(),
+            docker_container: Some("ctr1".into()),
+            model: "gpt-4o".into(),
+            approval_mode: "full_auto".into(),
+            todos: vec![crate::tools::TodoItem {
+                content: "task1".into(),
+                status: "in_progress".into(),
+                active_form: None,
+            }],
+            agents_md: Some("agents".into()),
+            memory_block: None,
+            skill_list_block: None,
+            wiki_list_block: None,
+            roles_block: None,
+            messages: vec![ChatMessage::text("user", "hello")],
+            depth: 1,
+            parent_tool_call_id: Some("p1".into()),
+            file_hashes: std::collections::HashMap::new(),
+            active_role: None,
+        };
+        let cloned = clone_sub_rt(&rt);
+        assert_eq!(cloned.session_id, "s1");
+        assert_eq!(cloned.workspace_id, "w1");
+        assert_eq!(cloned.client_id, "c1");
+        assert_eq!(cloned.runtime_type, "docker");
+        assert_eq!(cloned.docker_container.as_deref(), Some("ctr1"));
+        assert_eq!(cloned.model, "gpt-4o");
+        assert_eq!(cloned.approval_mode, "full_auto");
+        assert_eq!(cloned.depth, 1);
+        assert_eq!(cloned.parent_tool_call_id.as_deref(), Some("p1"));
+        assert_eq!(cloned.todos.len(), 1);
+        assert_eq!(cloned.messages.len(), 1);
+    }
+
+}

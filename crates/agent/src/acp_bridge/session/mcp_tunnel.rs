@@ -12,7 +12,7 @@ use crate::mcp::McpHttpResponse;
 #[cfg(feature = "rag")]
 use crate::db::Database;
 #[cfg(feature = "rag")]
-use super::SpawnedAgent;
+use super::super::SpawnedAgent;
 
 /// 处理 ACP agent 经回环代理转发的 MCP 请求（`/mcp/<token>`）。
 ///
