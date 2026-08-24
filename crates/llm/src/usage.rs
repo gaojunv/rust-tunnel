@@ -12,7 +12,7 @@ use axum::response::Response;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::db::{Database, LlmUsageInsert};
+use rust_tunnel_persistence::{Database, LlmUsageInsert};
 
 /// 一次请求解析出的 token 用量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -580,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn test_failover_from_recorded() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         let ctx = UsageContext {

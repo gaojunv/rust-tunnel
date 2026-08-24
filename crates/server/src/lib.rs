@@ -15,7 +15,8 @@ pub use control_plane::client_registry;
 pub use control_plane::tunnel_stream;
 // 持久化层已拆分为独立 crate；`db` 路径保持兼容 re-export
 pub use rust_tunnel_persistence as db;
-pub mod llm;
+// LLM 网关已拆分为独立 crate；`llm` 路径保持兼容 re-export
+pub use rust_tunnel_llm as llm;
 pub mod net;
 pub use net::dns;
 pub use net::listener;

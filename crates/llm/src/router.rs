@@ -1,4 +1,4 @@
-use crate::llm::{LlmState, ProviderConfig};
+use crate::{LlmState, ProviderConfig};
 
 /// 模型上游协议类型。
 ///
@@ -85,7 +85,7 @@ pub struct CandidateChain {
 /// 解析顺序：`model_name` 精确 → `alias` → 组名（组 enabled）。
 /// 组成员中模型禁用或 provider 禁用者被过滤；过滤后为空视同 `ModelNotFound`。
 ///
-/// 全部走 [`crate::llm::route_cache::RouteCache`] 内存快照，不触碰 DB：
+/// 全部走 [`crate::route_cache::RouteCache`] 内存快照，不触碰 DB：
 /// 数据一致性由管理面写入后的 `invalidate` 保证（见 `mgmt/api/llm.rs`）。
 pub async fn resolve_with_failover(
     state: &LlmState,
@@ -232,7 +232,7 @@ pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::LlmState;
+    use crate::LlmState;
 
     #[test]
     fn test_resolve_without_db_returns_error() {
@@ -249,11 +249,11 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_decrypts_provider_api_key() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
-        let cipher = crate::llm::crypto::LlmCipher::from_master_key([7u8; 32]);
+        let cipher = crate::crypto::LlmCipher::from_master_key([7u8; 32]);
         let encrypted = cipher.encrypt("sk-real-upstream-key");
 
         let pid = uuid::Uuid::new_v4().to_string();
@@ -292,7 +292,7 @@ mod tests {
     async fn test_resolve_legacy_plaintext_key_passthrough() {
         // 历史明文（无 enc 前缀）应原样可用
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
@@ -315,7 +315,7 @@ mod tests {
 
         let state = LlmState::new(
             Some(db),
-            Some(crate::llm::crypto::LlmCipher::from_master_key([9u8; 32])),
+            Some(crate::crypto::LlmCipher::from_master_key([9u8; 32])),
         );
         let (provider, _, _) = resolve_model(&state, "deepseek-chat").await.unwrap();
         assert_eq!(provider.api_key, "sk-plain");
@@ -324,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_disabled_provider_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
@@ -353,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_unknown_model_is_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         let state = LlmState::new(Some(db), None);
@@ -366,7 +366,7 @@ mod tests {
         models: &[(&str, &str, &str)], // (model_id, model_name, alias)
     ) -> (tempfile::TempDir, LlmState) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         db.llm_save_provider(
@@ -588,7 +588,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_single_model_with_extra_config_protocol() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         db.llm_save_provider(
@@ -622,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_group_mixes_protocols() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         db.llm_save_provider(

@@ -601,7 +601,7 @@ mod tests {
     /// 返回 (state, 有效 API key, _tempdir 守卫)。
     async fn state_with_db() -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -623,7 +623,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (key, hash, prefix) = crate::llm::auth::generate_api_key();
+        let (key, hash, prefix) = crate::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
         db.llm_save_api_key(&kid, &hash, &prefix, "test", None)
             .await
@@ -647,7 +647,7 @@ mod tests {
     #[cfg(feature = "rag")]
     async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -707,7 +707,7 @@ mod tests {
         .unwrap();
 
         // API key 绑定该知识库
-        let (key, hash, prefix) = crate::llm::auth::generate_api_key();
+        let (key, hash, prefix) = crate::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
         db.llm_save_api_key(&kid, &hash, &prefix, "rag-test", Some(&kb_id))
             .await
@@ -721,7 +721,7 @@ mod tests {
             .upsert(
                 &kb_id,
                 8,
-                vec![crate::llm::rag::store::ChunkPoint {
+                vec![crate::rag::store::ChunkPoint {
                     id: chunk_id,
                     vector: vec![0.1f32; 8],
                     doc_id,
@@ -1206,7 +1206,7 @@ mod tests {
     async fn test_rewrite_pseudo_tool_calls_overflow_returns_502() {
         // 构造超过 MAX_UPSTREAM_BODY_BYTES 的响应体：to_bytes 超限必须返回 502，
         // 而非旧行为"200 + 空内容"的静默降级。
-        let big: Vec<u8> = vec![b'x'; crate::llm::upstream::MAX_UPSTREAM_BODY_BYTES + 1024];
+        let big: Vec<u8> = vec![b'x'; crate::upstream::MAX_UPSTREAM_BODY_BYTES + 1024];
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
@@ -1449,13 +1449,13 @@ mod tests {
             .body(Body::from(text.clone()))
             .unwrap();
         let anthropic_stream =
-            crate::llm::anthropic_handler::convert_openai_stream_to_anthropic_for_test(
+            crate::anthropic_handler::convert_openai_stream_to_anthropic_for_test(
                 anthropic_resp,
             );
         let anthropic_bytes = axum::body::to_bytes(anthropic_stream.into_body(), 1024 * 1024)
             .await
             .unwrap();
-        let mut scanner = crate::llm::usage::UsageSseScanner::new();
+        let mut scanner = crate::usage::UsageSseScanner::new();
         scanner.push(&anthropic_bytes);
         let u = scanner.finish();
         assert_eq!(u.prompt_tokens, 87, "端到端 prompt_tokens 不应为 0");
@@ -1728,7 +1728,7 @@ mod tests {
     #[test]
     fn multimodal_content_array_passes_through_when_no_rag_compat() {
         // 模块顶部 `use super::*` 已引入 ChatMessage（此处 struct 字面量经类型推断使用）。
-        use crate::llm::ChatCompletionRequest;
+        use crate::ChatCompletionRequest;
         let raw = serde_json::json!({
             "model": "alias",
             "messages": [{"role": "user", "content": [
@@ -1748,7 +1748,7 @@ mod tests {
             tool_choice: None,
             raw_body: Some(raw),
         };
-        let body = crate::llm::upstream::build_upstream_body(&req);
+        let body = crate::upstream::build_upstream_body(&req);
         // messages 保持客户端原样的数组（content 为数组）
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["content"][0]["type"], "text");

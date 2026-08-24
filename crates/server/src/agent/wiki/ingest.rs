@@ -296,6 +296,7 @@ async fn call_wiki_llm(llm: &LlmState, model: &str, batch_text: &str) -> Result<
     };
     let req_body = crate::llm::upstream::build_upstream_body(&request);
     let outcome = crate::llm::upstream::execute_with_failover(
+        &llm.upstream_client,
         &llm.breakers,
         &llm.known_failures,
         &chain,

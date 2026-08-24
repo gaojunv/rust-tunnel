@@ -1466,6 +1466,7 @@ pub async fn run_agent_turn(
         };
         let req_body = crate::llm::upstream::build_upstream_body(&request);
         let outcome = crate::llm::upstream::execute_with_failover(
+            &llm.upstream_client,
             &llm.breakers,
             &llm.known_failures,
             &chain,
@@ -1567,6 +1568,7 @@ pub async fn run_agent_turn(
                                 ctx.record_failure(db, 502, "stream_interrupted", started);
                             }
                             let retry = crate::llm::upstream::execute_with_failover(
+                                &llm.upstream_client,
                                 &llm.breakers,
                                 &llm.known_failures,
                                 &chain,

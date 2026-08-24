@@ -497,7 +497,7 @@ pub(crate) fn convert_openai_stream_to_anthropic_for_test(openai_resp: Response)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{LlmProtocol, LlmState};
+    use crate::{LlmProtocol, LlmState};
 
     #[test]
     fn test_anthropic_to_openai_conversion() {
@@ -624,7 +624,7 @@ mod tests {
         });
         let req = anthropic_to_openai(&body).unwrap();
         // ChatCompletionRequest 无 stop 字段,此处断言重构后的 build_upstream_body 输出。
-        let out = crate::llm::upstream::build_upstream_body(&req);
+        let out = crate::upstream::build_upstream_body(&req);
         assert_eq!(out["stop"], serde_json::json!(["\n\n", "</s>"]));
     }
 
@@ -640,7 +640,7 @@ mod tests {
             "tools": [{"type": "custom", "name": "t"}],
         });
         let req = anthropic_to_openai(&body).unwrap();
-        let out = crate::llm::upstream::build_upstream_body(&req);
+        let out = crate::upstream::build_upstream_body(&req);
         assert_eq!(out["max_tokens"], 100);
         assert_eq!(out["temperature"], 0.3);
         assert_eq!(out["top_p"], 0.9);
@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(asst.tool_calls.as_ref().unwrap().len(), 1);
 
         // 序列化进上游请求体时必须带 reasoning_content 字段
-        let out = crate::llm::upstream::build_upstream_body(&r);
+        let out = crate::upstream::build_upstream_body(&r);
         assert_eq!(
             out["messages"][1]["reasoning_content"].as_str(),
             Some("让我想想……"),
@@ -886,7 +886,7 @@ mod tests {
             ],
         });
         let r = anthropic_to_openai(&input).unwrap();
-        let out = crate::llm::upstream::build_upstream_body(&r);
+        let out = crate::upstream::build_upstream_body(&r);
         assert!(
             out["messages"][1].get("reasoning_content").is_none(),
             "无 thinking 时不得输出 reasoning_content: {out}"
@@ -958,7 +958,7 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&openai_body).unwrap()))
             .unwrap();
 
-        let converted = crate::llm::format::convert_openai_to_anthropic_response(resp).await;
+        let converted = crate::format::convert_openai_to_anthropic_response(resp).await;
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -979,7 +979,7 @@ mod tests {
             .body(Body::from(oversized))
             .unwrap();
 
-        let converted = crate::llm::format::convert_openai_to_anthropic_response(resp).await;
+        let converted = crate::format::convert_openai_to_anthropic_response(resp).await;
         assert_eq!(converted.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
@@ -1005,7 +1005,7 @@ mod tests {
             .body(Body::from(upstream_sse))
             .unwrap();
 
-        let converted = crate::llm::format::convert_openai_stream_to_anthropic(resp);
+        let converted = crate::format::convert_openai_stream_to_anthropic(resp);
         let bytes = axum::body::to_bytes(converted.into_body(), 1024 * 1024)
             .await
             .unwrap();
@@ -1034,7 +1034,7 @@ mod tests {
     /// 构造带真实临时 DB 的 LlmState，并插入一个启用的 provider+model+api_key。
     async fn state_with_db() -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -1056,7 +1056,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (key, hash, prefix) = crate::llm::auth::generate_api_key();
+        let (key, hash, prefix) = crate::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
         db.llm_save_api_key(&kid, &hash, &prefix, "test", None)
             .await
@@ -1431,7 +1431,7 @@ mod tests {
     #[cfg(feature = "rag")]
     async fn state_with_rag(emb_base_url: &str) -> (LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -1489,7 +1489,7 @@ mod tests {
         .unwrap();
 
         // API key 绑定该知识库
-        let (key, hash, prefix) = crate::llm::auth::generate_api_key();
+        let (key, hash, prefix) = crate::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
         db.llm_save_api_key(&kid, &hash, &prefix, "rag-test", Some(&kb_id))
             .await
@@ -1501,7 +1501,7 @@ mod tests {
             .upsert(
                 &kb_id,
                 8,
-                vec![crate::llm::rag::store::ChunkPoint {
+                vec![crate::rag::store::ChunkPoint {
                     id: chunk_id,
                     vector: vec![0.1f32; 8],
                     doc_id,

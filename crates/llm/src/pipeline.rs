@@ -18,7 +18,7 @@ use super::usage::UsageContext;
 #[cfg(feature = "rag")]
 use super::ChatMessage;
 use super::{ChatCompletionRequest, LlmState};
-use crate::db::Database;
+use rust_tunnel_persistence::Database;
 
 /// 取最后一条 user 消息的文本（RAG 检索的 query 来源）。
 #[cfg(feature = "rag")]
@@ -258,6 +258,7 @@ pub async fn run_execution(
     )
     .await;
     let outcome = super::upstream::execute_with_failover(
+        &state.llm.upstream_client,
         &state.llm.breakers,
         &state.llm.known_failures,
         chain,
@@ -365,18 +366,25 @@ pub async fn run_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::openai_handler::LlmHandlerState;
-    use crate::llm::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
+    use crate::openai_handler::LlmHandlerState;
+    use crate::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use serde_json::json;
     use std::sync::Arc;
+
+    /// 本地内存库 fixture（替代 server 侧 test_helpers::in_memory_db）。
+    async fn in_memory_db() -> rust_tunnel_persistence::Database {
+        rust_tunnel_persistence::Database::new(":memory:")
+            .await
+            .expect("in-memory db")
+    }
 
     fn handler_state(protocol: Option<LlmProtocol>) -> LlmHandlerState {
         let llm = Arc::new(LlmState::new(None, None));
         LlmHandlerState { llm, protocol }
     }
 
-    fn handler_state_with_db(db: crate::db::Database, protocol: Option<LlmProtocol>) -> LlmHandlerState {
+    fn handler_state_with_db(db: rust_tunnel_persistence::Database, protocol: Option<LlmProtocol>) -> LlmHandlerState {
         let llm = Arc::new(LlmState::new(Some(db), None));
         LlmHandlerState { llm, protocol }
     }
@@ -584,7 +592,7 @@ mod tests {
             vec![ChatMessage::text("user", "hi")],
             Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
         );
-        let mut ctx = crate::llm::usage::UsageContext {
+        let mut ctx = crate::usage::UsageContext {
             protocol: "openai".into(),
             ..Default::default()
         };
@@ -623,7 +631,7 @@ mod tests {
             ],
             Some(json!({"model":"m","messages":[]})),
         );
-        let mut ctx = crate::llm::usage::UsageContext {
+        let mut ctx = crate::usage::UsageContext {
             protocol: "openai".into(),
             ..Default::default()
         };
@@ -651,7 +659,7 @@ mod tests {
     async fn inject_rag_and_compat_writes_back_when_compat_enabled_without_raw_body() {
         let state = LlmState::new(None, None);
         let mut req = make_request("m", vec![ChatMessage::text("user", "hi")], None);
-        let mut ctx = crate::llm::usage::UsageContext {
+        let mut ctx = crate::usage::UsageContext {
             protocol: "openai".into(),
             ..Default::default()
         };
@@ -662,14 +670,14 @@ mod tests {
 
     #[tokio::test]
     async fn inject_rag_and_compat_with_db_but_no_kb_still_no_rag() {
-        let db = crate::test_helpers::in_memory_db().await;
-        let state = crate::llm::LlmState::new(Some(db.clone()), None);
+        let db = in_memory_db().await;
+        let state = crate::LlmState::new(Some(db.clone()), None);
         let mut req = make_request(
             "m",
             vec![ChatMessage::text("user", "hi")],
             Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
         );
-        let mut ctx = crate::llm::usage::UsageContext {
+        let mut ctx = crate::usage::UsageContext {
             protocol: "openai".into(),
             ..Default::default()
         };
@@ -680,14 +688,14 @@ mod tests {
 
     #[tokio::test]
     async fn inject_rag_and_compat_with_db_and_kb_id_noop_without_feature_or_data() {
-        let db = crate::test_helpers::in_memory_db().await;
-        let state = crate::llm::LlmState::new(Some(db.clone()), None);
+        let db = in_memory_db().await;
+        let state = crate::LlmState::new(Some(db.clone()), None);
         let mut req = make_request(
             "m",
             vec![ChatMessage::text("user", "hi")],
             Some(json!({"model":"m","messages":[{"role":"user","content":"hi"}]})),
         );
-        let mut ctx = crate::llm::usage::UsageContext {
+        let mut ctx = crate::usage::UsageContext {
             protocol: "openai".into(),
             ..Default::default()
         };
@@ -789,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_chain_or_reject_with_empty_db_returns_404_with_available_models() {
-        let db = crate::test_helpers::in_memory_db().await;
+        let db = in_memory_db().await;
         let state = handler_state_with_db(db, None);
         let res = resolve_chain_or_reject(&state, "no-such-model", "k1", "n1", "openai").await;
         let resp = res.unwrap_err();
@@ -813,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn llm_state_new_with_in_memory_db() {
-        let db = crate::test_helpers::in_memory_db().await;
+        let db = in_memory_db().await;
         let s = LlmState::new(Some(db), None);
         assert!(s.db.is_some());
     }

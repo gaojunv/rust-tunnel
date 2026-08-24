@@ -180,7 +180,7 @@ mod tests {
     /// 返回 (state, 有效 API key, _tempdir 守卫)。
     async fn state_with_db() -> (super::super::LlmState, String, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let db = crate::db::Database::new(tmp.path().join("t.db").to_str().unwrap())
+        let db = rust_tunnel_persistence::Database::new(tmp.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
 
@@ -202,7 +202,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (key, hash, prefix) = crate::llm::auth::generate_api_key();
+        let (key, hash, prefix) = crate::auth::generate_api_key();
         let kid = uuid::Uuid::new_v4().to_string();
         db.llm_save_api_key(&kid, &hash, &prefix, "test", None)
             .await

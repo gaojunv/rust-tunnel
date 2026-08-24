@@ -2933,7 +2933,7 @@ mod tests {
             .expect("missing response.completed");
         assert_eq!(completed.1["type"], "response.completed", "{text}");
 
-        let mut scanner = crate::llm::usage::UsageSseScanner::new();
+        let mut scanner = crate::usage::UsageSseScanner::new();
         scanner.push(text.as_bytes());
         let u = scanner.finish();
         assert_eq!(u.prompt_tokens, 87, "{text}");

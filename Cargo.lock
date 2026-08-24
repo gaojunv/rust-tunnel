@@ -4817,6 +4817,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-llm"
+version = "0.4.0"
+dependencies = [
+ "async-stream",
+ "axum 0.7.9",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "rand 0.8.6",
+ "reqwest",
+ "rust-tunnel-common",
+ "rust-tunnel-persistence",
+ "rust-tunnel-rag",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rust-tunnel-persistence"
 version = "0.4.0"
 dependencies = [
@@ -4893,6 +4918,7 @@ dependencies = [
  "reqwest",
  "rust-embed",
  "rust-tunnel-common",
+ "rust-tunnel-llm",
  "rust-tunnel-persistence",
  "rust-tunnel-rag",
  "rustls 0.22.4",

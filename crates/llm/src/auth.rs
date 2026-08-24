@@ -1,6 +1,6 @@
 use axum::http::{header, HeaderMap};
 
-use crate::llm::LlmState;
+use crate::LlmState;
 
 /// 从请求头提取网关 API Key：
 /// 优先 `Authorization: Bearer <key>`（OpenAI 风格），

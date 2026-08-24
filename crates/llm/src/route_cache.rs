@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use super::crypto::LlmCipher;
 use super::ProviderConfig;
-use crate::db::Database;
+use rust_tunnel_persistence::Database;
 
 /// 缓存中的模型条目。
 #[derive(Debug, Clone)]
@@ -289,7 +289,7 @@ impl RouteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use rust_tunnel_persistence::Database;
 
     async fn seeded_db() -> Database {
         let db = Database::new(":memory:").await.unwrap();

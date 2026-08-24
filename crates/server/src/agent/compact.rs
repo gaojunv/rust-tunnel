@@ -240,6 +240,7 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
     let req_body = crate::llm::upstream::build_upstream_body(&request);
     let started = std::time::Instant::now();
     let outcome = crate::llm::upstream::execute_with_failover(
+        &llm.upstream_client,
         &llm.breakers,
         &llm.known_failures,
         &chain,

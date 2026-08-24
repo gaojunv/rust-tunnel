@@ -1,3 +1,13 @@
+//! LLM 网关：OpenAI / Anthropic / Responses 三协议入口、模型路由与故障转移、
+//! 熔断与确定性失败缓存、用量日志、compat 工具调用改写。
+//!
+//! RAG 注入经 `rag` feature 挂接 [`rust_tunnel_rag`]；本 crate 不依赖 server
+//! 装配层类型（`DynamicConfig`/`ReverseProxyState`），接缝为 [`LlmGatewayRuleInput`]
+//! 与 [`LlmState::request_logging`] 原子开关。
+
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod anthropic_handler;
 pub mod auth;
 pub mod breaker;
@@ -23,7 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::db::Database;
+use rust_tunnel_persistence::Database;
 
 // ── Configuration types ───────────────────────────────────────
 
@@ -322,7 +332,7 @@ pub struct LlmState {
     /// Gateway config (domain, TLS settings).
     pub gateway_config: Arc<RwLock<Option<LlmGatewayConfig>>>,
     /// 字段加密器（提供商 API Key 等敏感字段的落库加密）；None 表示未配置主密钥。
-    pub cipher: Option<crate::llm::crypto::LlmCipher>,
+    pub cipher: Option<crate::crypto::LlmCipher>,
     /// RAG 向量存储（知识库检索）。
     #[cfg(feature = "rag")]
     pub rag_store: rag::store::VectorStore,
@@ -334,6 +344,9 @@ pub struct LlmState {
     pub request_logging: Arc<std::sync::atomic::AtomicBool>,
     /// 按模型粒度的熔断器（故障转移时跳过持续失败的候选）。
     pub breakers: breaker::ModelBreakers,
+    /// 上游 HTTP 客户端（连接池共享）。默认按 [`upstream::UpstreamClientConfig::default`]
+    /// 构建；测试可替换为自定义超时/连接池配置的实例。
+    pub upstream_client: reqwest::Client,
     /// 路由实体（provider/model/group）内存缓存，避免请求热路径的 DB 往返。
     pub route_cache: route_cache::RouteCache,
     /// 确定性失败缓存（401/403/404 等"必然失败"的候选，TTL 内跳过网络调用）。
@@ -343,7 +356,7 @@ pub struct LlmState {
 impl LlmState {
     /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
     /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录（仅 `rag` feature 启用时可用）。
-    pub fn new(db: Option<Database>, cipher: Option<crate::llm::crypto::LlmCipher>) -> Self {
+    pub fn new(db: Option<Database>, cipher: Option<crate::crypto::LlmCipher>) -> Self {
         Self {
             db,
             gateway_config: Arc::new(RwLock::new(None)),
@@ -354,6 +367,7 @@ impl LlmState {
             rag_tx: tokio::sync::broadcast::channel(256).0,
             request_logging: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             breakers: breaker::ModelBreakers::new(),
+            upstream_client: upstream::UpstreamClientConfig::default().build_client(),
             route_cache: route_cache::RouteCache::new(),
             known_failures: down::KnownFailures::new(),
         }
@@ -363,7 +377,7 @@ impl LlmState {
     #[cfg(feature = "rag")]
     pub fn new_with_rag(
         db: Option<Database>,
-        cipher: Option<crate::llm::crypto::LlmCipher>,
+        cipher: Option<crate::crypto::LlmCipher>,
         rag_data_dir: &Path,
     ) -> Self {
         Self {
@@ -374,6 +388,7 @@ impl LlmState {
             rag_tx: tokio::sync::broadcast::channel(256).0,
             request_logging: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             breakers: breaker::ModelBreakers::new(),
+            upstream_client: upstream::UpstreamClientConfig::default().build_client(),
             route_cache: route_cache::RouteCache::new(),
             known_failures: down::KnownFailures::new(),
         }
@@ -398,7 +413,7 @@ pub async fn init_llm_state(
     #[cfg_attr(not(feature = "rag"), allow(unused_variables))] rag_data_dir: &std::path::Path,
     request_logging_enabled: bool,
 ) -> Arc<LlmState> {
-    let cipher = master_key.map(crate::llm::crypto::LlmCipher::from_master_key);
+    let cipher = master_key.map(crate::crypto::LlmCipher::from_master_key);
     #[cfg(feature = "rag")]
     let llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
     #[cfg(not(feature = "rag"))]

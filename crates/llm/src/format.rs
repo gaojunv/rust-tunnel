@@ -22,7 +22,7 @@ pub fn map_stop_reason(openai: &str) -> String {
 
 /// 把 OpenAI usage 对象转成 Anthropic usage 对象，保留缓存与输入细分。
 ///
-/// 映射规则（与 [`crate::llm::usage::extract_usage`] 的解析口径互逆）：
+/// 映射规则（与 [`crate::usage::extract_usage`] 的解析口径互逆）：
 /// - `prompt_tokens` → `input_tokens`（新增未缓存输入 = prompt - cache_hit）
 /// - `prompt_cache_hit_tokens` → `cache_read_input_tokens`
 /// - `completion_tokens` → `output_tokens`
@@ -753,7 +753,7 @@ mod tests {
         assert!(tail.contains("\"output_tokens\":16"), "{tail}");
 
         // 端到端：翻译输出喂回 scanner，必须解析出完整 prompt/cache
-        let mut scanner = crate::llm::usage::UsageSseScanner::new();
+        let mut scanner = crate::usage::UsageSseScanner::new();
         scanner.push(text.as_bytes());
         let u = scanner.finish();
         assert_eq!(u.prompt_tokens, 87);

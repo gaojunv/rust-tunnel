@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -8,7 +6,10 @@ use reqwest::Client;
 
 use super::ChatCompletionRequest;
 
-/// Reusable HTTP client with connection pooling.
+/// 上游 HTTP 客户端配置（超时/连接池策略）。
+///
+/// [`LlmState`](crate::LlmState) 构造时按本配置构建 `reqwest::Client`；
+/// 测试可用激进超时构造独立 client 注入，替代原全局 static 单例。
 ///
 /// Timeout strategy:
 /// - `connect_timeout`: 30 s — fast failure when the upstream is unreachable.
@@ -27,16 +28,44 @@ use super::ChatCompletionRequest;
 /// 2. **Upstream compatibility**: Some LLM provider gateways have aggressive
 ///    idle timeouts (~120 s) on HTTP/2 connections. HTTP/1.1 with TCP keepalive
 ///    is more resilient to these middlebox timeouts.
-static UPSTREAM_CLIENT: LazyLock<Client> = LazyLock::new(|| {
-    Client::builder()
-        .http1_only()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(300))
-        .tcp_keepalive(std::time::Duration::from_secs(60))
-        .pool_max_idle_per_host(10)
-        .build()
-        .expect("failed to build upstream HTTP client")
-});
+#[derive(Debug, Clone)]
+pub struct UpstreamClientConfig {
+    pub connect_timeout: std::time::Duration,
+    pub read_timeout: std::time::Duration,
+    pub tcp_keepalive: std::time::Duration,
+    pub pool_max_idle_per_host: usize,
+}
+
+impl Default for UpstreamClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: std::time::Duration::from_secs(30),
+            read_timeout: std::time::Duration::from_mins(5),
+            tcp_keepalive: std::time::Duration::from_mins(1),
+            pool_max_idle_per_host: 10,
+        }
+    }
+}
+
+impl UpstreamClientConfig {
+    /// 按配置构建 reqwest 客户端（连接池随 client 句柄共享，clone 廉价）。
+    ///
+    /// # Panics
+    /// reqwest builder 内部 TLS/解析失败时 panic（与原全局 static 构建行为一致）。
+    #[must_use]
+    // builder 失败仅发生在 TLS 后端初始化等病态场景，与原 static 初始化的 expect 语义一致
+    #[allow(clippy::expect_used)]
+    pub fn build_client(&self) -> Client {
+        Client::builder()
+            .http1_only()
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
+            .tcp_keepalive(self.tcp_keepalive)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .build()
+            .expect("failed to build upstream HTTP client")
+    }
+}
 
 /// 非流式上游响应体的统一大小上限（16MB）。
 ///
@@ -188,12 +217,13 @@ pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value
 /// Call an upstream LLM provider with OpenAI-compatible format.
 /// Supports both streaming (SSE) and non-streaming modes.
 pub async fn call_upstream(
+    client: &Client,
     base_url: &str,
     api_key: &str,
     request: &ChatCompletionRequest,
 ) -> Result<Response, (StatusCode, String)> {
     let req_body = build_upstream_body(request);
-    call_upstream_with_body(base_url, api_key, &req_body, "v1/chat/completions").await
+    call_upstream_with_body(client, base_url, api_key, &req_body, "v1/chat/completions").await
 }
 
 /// 用已构造好的请求体调用上游。
@@ -202,13 +232,12 @@ pub async fn call_upstream(
 /// 调用方（handler）先用 `build_upstream_body` 构造 body、写入完整请求日志，
 /// 再走这里发送——保证日志内容与实际发送的请求体一致。
 pub async fn call_upstream_with_body(
+    client: &Client,
     base_url: &str,
     api_key: &str,
     req_body: &serde_json::Value,
     path: &str,
 ) -> Result<Response, (StatusCode, String)> {
-    let client = &*UPSTREAM_CLIENT;
-
     let url = format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
@@ -430,6 +459,7 @@ pub fn set_body_model(body: &mut serde_json::Value, model: &str) {
 ///
 /// 适用场景：模型组候选链——确保客户端收到首字节前可以换候选重发。
 pub async fn call_upstream_stream_guarded(
+    client: &Client,
     base_url: &str,
     api_key: &str,
     req_body: &serde_json::Value,
@@ -437,7 +467,6 @@ pub async fn call_upstream_stream_guarded(
 ) -> Result<Response, (StatusCode, String)> {
     use futures_util::StreamExt;
 
-    let client = &*UPSTREAM_CLIENT;
     let url = format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
@@ -543,7 +572,7 @@ pub enum FailoverOutcome {
         /// 上游响应（流式为首字节守卫后的拼接体）。
         resp: Response,
         /// 实际出账的候选（usage 落库以此为准）。
-        candidate: crate::llm::router::Candidate,
+        candidate: crate::router::Candidate,
         /// 是否发生过转移（首选不是出账候选）。
         failed_over: bool,
         /// 本次成功调用是否走了 Anthropic 直通（`call_upstream_raw` /v1/messages）。
@@ -568,10 +597,10 @@ pub enum FailoverOutcome {
 ///
 /// 其余 4xx（400/422…）**不**纳入：它们可能是请求内容相关（上下文超限、内容策略拒绝），
 /// 与具体请求强相关，转移到别的模型/提供商未必失败，缓存会导致错误地阻断后续请求。
-fn deterministic_failure(status: StatusCode) -> Option<crate::llm::down::FailureKind> {
+fn deterministic_failure(status: StatusCode) -> Option<crate::down::FailureKind> {
     match status.as_u16() {
-        401 | 403 => Some(crate::llm::down::FailureKind::ProviderAuth),
-        404 => Some(crate::llm::down::FailureKind::Model),
+        401 | 403 => Some(crate::down::FailureKind::ProviderAuth),
+        404 => Some(crate::down::FailureKind::Model),
         _ => None,
     }
 }
@@ -591,9 +620,10 @@ fn deterministic_failure(status: StatusCode) -> Option<crate::llm::down::Failure
 /// ChatCompletions / Responses 转换分支。直通失败的处理（retryable/确定性/4xx）
 /// 与转换分支完全一致——组内可混合直通与转换候选并互相故障转移。
 pub async fn execute_with_failover(
-    breakers: &crate::llm::breaker::ModelBreakers,
-    known: &crate::llm::down::KnownFailures,
-    chain: &crate::llm::router::CandidateChain,
+    client: &Client,
+    breakers: &crate::breaker::ModelBreakers,
+    known: &crate::down::KnownFailures,
+    chain: &crate::router::CandidateChain,
     req_body: &serde_json::Value,
     stream: bool,
     anthropic_body: Option<&serde_json::Value>,
@@ -657,19 +687,20 @@ pub async fn execute_with_failover(
                 let mut raw = raw.clone();
                 set_body_model(&mut raw, &cand.model_name);
                 (
-                    call_upstream_raw(url, &cand.provider.api_key, "/v1/messages", &raw, stream)
+                    call_upstream_raw(client, url, &cand.provider.api_key, "/v1/messages", &raw, stream)
                         .await,
                     true,
                 )
             } else {
                 // 按候选协议分支：ChatCompletions 走标准路径，Responses 先转换请求体再转换响应。
                 let result = match cand.upstream_protocol {
-                    crate::llm::router::UpstreamProtocol::ChatCompletions => {
+                    crate::router::UpstreamProtocol::ChatCompletions => {
                         // 首字节守卫仅用于有转移目标（链长 >1）的流式请求；
                         // 单元素链流式回到 relay 直通（响应头即放行），与改造前行为完全一致，
                         // 避免首 token 延迟 >30s 的合法请求（超长 prefill、推理模型）被守卫 504 打断。
                         if stream && chain.candidates.len() > 1 {
                             call_upstream_stream_guarded(
+                                client,
                                 &cand.provider.base_url,
                                 &cand.provider.api_key,
                                 &body,
@@ -678,6 +709,7 @@ pub async fn execute_with_failover(
                             .await
                         } else {
                             call_upstream_with_body(
+                                client,
                                 &cand.provider.base_url,
                                 &cand.provider.api_key,
                                 &body,
@@ -686,12 +718,13 @@ pub async fn execute_with_failover(
                             .await
                         }
                     }
-                    crate::llm::router::UpstreamProtocol::Responses => {
+                    crate::router::UpstreamProtocol::Responses => {
                         // 转换请求体：chat → Responses 格式
                         body = super::responses::chat_body_to_responses_body(&body);
                         // 首字节守卫仅用于有转移目标（链长 >1）的流式请求
                         let upstream_resp = if stream && chain.candidates.len() > 1 {
                             call_upstream_stream_guarded(
+                                client,
                                 &cand.provider.base_url,
                                 &cand.provider.api_key,
                                 &body,
@@ -700,6 +733,7 @@ pub async fn execute_with_failover(
                             .await
                         } else {
                             call_upstream_with_body(
+                                client,
                                 &cand.provider.base_url,
                                 &cand.provider.api_key,
                                 &body,
@@ -788,10 +822,10 @@ pub async fn execute_with_failover(
                 // 并继续尝试后续候选（组场景：dead key 不应再阻塞请求，应转移）。
                 if let Some(kind) = deterministic_failure(status) {
                     let key = match kind {
-                        crate::llm::down::FailureKind::ProviderAuth => {
+                        crate::down::FailureKind::ProviderAuth => {
                             format!("p:{}", cand.provider.id)
                         }
-                        crate::llm::down::FailureKind::Model => format!("m:{}", cand.model_id),
+                        crate::down::FailureKind::Model => format!("m:{}", cand.model_id),
                     };
                     known.record(&key, kind, status.as_u16(), &msg);
                     tracing::warn!(
@@ -846,13 +880,13 @@ pub async fn execute_with_failover(
 /// 认证策略：同时支持 `x-api-key`（Anthropic 原生）和 `Authorization: Bearer`（OpenAI 风格）。
 /// 先尝试 `x-api-key`，若返回 401 则回退到 Bearer 头重试。
 pub async fn call_upstream_raw(
+    client: &Client,
     base_url: &str,
     api_key: &str,
     path: &str,
     body: &serde_json::Value,
     is_stream: bool,
 ) -> Result<Response, (StatusCode, String)> {
-    let client = &*UPSTREAM_CLIENT;
     let url = format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
@@ -1028,8 +1062,13 @@ mod tests {
     use super::*;
 
     /// 共享空知道失败缓存：既有用例不产生确定性失败记录，静态共享无害。
-    static EMPTY_KNOWN: std::sync::LazyLock<crate::llm::down::KnownFailures> =
-        std::sync::LazyLock::new(crate::llm::down::KnownFailures::new);
+    static EMPTY_KNOWN: std::sync::LazyLock<crate::down::KnownFailures> =
+        std::sync::LazyLock::new(crate::down::KnownFailures::new);
+
+    /// 测试用上游 client（每用例独立构建，与生产共享连接池无交集）。
+    fn test_client() -> Client {
+        UpstreamClientConfig::default().build_client()
+    }
 
     #[test]
     fn test_error_response_contains_openai_format() {
@@ -1064,8 +1103,10 @@ mod tests {
         // rather than always returning 502 Bad Gateway
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
+            let client = test_client();
             // Call a URL that returns 404
             let result = call_upstream(
+                &client,
                 "http://127.0.0.1:1", // non-existent server
                 "test-key",
                 &ChatCompletionRequest {
@@ -1216,8 +1257,8 @@ mod tests {
 
     #[test]
     fn build_upstream_body_passthrough_unknown_params() {
-        use crate::llm::ChatCompletionRequest;
-        use crate::llm::ChatMessage;
+        use crate::ChatCompletionRequest;
+        use crate::ChatMessage;
         let raw = serde_json::json!({
             "model": "client-alias",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1251,8 +1292,8 @@ mod tests {
 
     #[test]
     fn build_upstream_body_passthrough_omitted_stream_defaults_to_false() {
-        use crate::llm::ChatCompletionRequest;
-        use crate::llm::ChatMessage;
+        use crate::ChatCompletionRequest;
+        use crate::ChatMessage;
         // 客户端省略 stream 字段：透传模式也必须发出显式布尔 false
         // （回归：此前透传原样返回 → stream 变 null，破坏非流式上游语义）。
         let raw = serde_json::json!({
@@ -1281,8 +1322,8 @@ mod tests {
 
     #[test]
     fn build_upstream_body_stream_injects_include_usage_keeps_client_fields() {
-        use crate::llm::ChatCompletionRequest;
-        use crate::llm::ChatMessage;
+        use crate::ChatCompletionRequest;
+        use crate::ChatMessage;
         let raw = serde_json::json!({
             "model": "alias",
             "messages": [],
@@ -1310,8 +1351,8 @@ mod tests {
 
     #[test]
     fn build_upstream_body_no_raw_body_rebuilds() {
-        use crate::llm::ChatCompletionRequest;
-        use crate::llm::ChatMessage;
+        use crate::ChatCompletionRequest;
+        use crate::ChatMessage;
         let req = ChatCompletionRequest {
             model: "m".into(),
             messages: vec![ChatMessage::text("user", "hi")],
@@ -1393,8 +1434,9 @@ mod tests {
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
 
+        let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
+        let resp = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1415,8 +1457,9 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap()
         };
+        let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
+        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
@@ -1440,8 +1483,9 @@ mod tests {
             );
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
+        let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
+        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1474,9 +1518,10 @@ mod tests {
             sock.write_all(b"data: [DONE]\r\n\r\n").await.unwrap();
         });
 
+        let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let started = std::time::Instant::now();
-        let resp = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
+        let resp = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap();
         let ttfb = started.elapsed();
@@ -1518,17 +1563,17 @@ mod tests {
     }
 
     /// 快速构造 CandidateChain（测试用）。
-    fn test_chain(specs: &[(&str, &str, &str)]) -> crate::llm::router::CandidateChain {
-        test_chain_with_protocol(specs, crate::llm::router::UpstreamProtocol::ChatCompletions)
+    fn test_chain(specs: &[(&str, &str, &str)]) -> crate::router::CandidateChain {
+        test_chain_with_protocol(specs, crate::router::UpstreamProtocol::ChatCompletions)
     }
 
     /// 快速构造 CandidateChain，指定上游协议（测试用）。
     fn test_chain_with_protocol(
         specs: &[(&str, &str, &str)],
-        protocol: crate::llm::router::UpstreamProtocol,
-    ) -> crate::llm::router::CandidateChain {
-        use crate::llm::router::{Candidate, CandidateChain};
-        use crate::llm::ProviderConfig;
+        protocol: crate::router::UpstreamProtocol,
+    ) -> crate::router::CandidateChain {
+        use crate::router::{Candidate, CandidateChain};
+        use crate::ProviderConfig;
         CandidateChain {
             candidates: specs
                 .iter()
@@ -1557,9 +1602,9 @@ mod tests {
     }
 
     /// 快速构造混合协议 CandidateChain（测试用）。
-    fn test_chain_mixed(specs: &[(&str, &str, &str, crate::llm::router::UpstreamProtocol)]) -> crate::llm::router::CandidateChain {
-        use crate::llm::router::{Candidate, CandidateChain};
-        use crate::llm::ProviderConfig;
+    fn test_chain_mixed(specs: &[(&str, &str, &str, crate::router::UpstreamProtocol)]) -> crate::router::CandidateChain {
+        use crate::router::{Candidate, CandidateChain};
+        use crate::ProviderConfig;
         CandidateChain {
             candidates: specs
                 .iter()
@@ -1630,11 +1675,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -1674,11 +1719,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad1, "m1", "id1"), (&bad2, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1723,11 +1768,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m1", "id1"), (&never, "m2", "id2")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1768,39 +1813,39 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         // 连续 5 次请求把 id-bad 打到熔断
         for _ in 0..5 {
-            let _ = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+            let _ = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         }
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5);
         assert_eq!(
             breakers.snapshot("id-bad").state,
-            crate::llm::breaker::BreakerStateView::Open
+            crate::breaker::BreakerStateView::Open
         );
         // 第 6 次：坏候选被跳过，直接打好候选
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(bad_hits.load(Ordering::SeqCst), 5, "熔断后不再请求坏候选");
     }
 
     #[tokio::test]
     async fn test_failover_all_candidates_circuit_open() {
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[
             ("http://127.0.0.1:1", "m1", "id1"),
             ("http://127.0.0.1:1", "m2", "id2"),
         ]);
         // 手动把两个候选打到熔断（5 连败）
-        for _ in 0..crate::llm::breaker::FAILURE_THRESHOLD {
+        for _ in 0..crate::breaker::FAILURE_THRESHOLD {
             breakers.record_failure("id1");
             breakers.record_failure("id2");
         }
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             message,
@@ -1839,12 +1884,12 @@ mod tests {
                 .await;
         });
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&format!("http://{}", addr), "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let started = std::time::Instant::now();
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let ttfb = started.elapsed();
         let FailoverOutcome::Success {
             resp, failed_over, ..
@@ -1881,9 +1926,9 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         // 手动机 5 连败把首选熔断
-        for _ in 0..crate::llm::breaker::FAILURE_THRESHOLD {
+        for _ in 0..crate::breaker::FAILURE_THRESHOLD {
             breakers.record_failure("id-broken");
         }
         let chain = test_chain(&[
@@ -1892,7 +1937,7 @@ mod tests {
         ]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status,
             failed_over,
@@ -1909,7 +1954,7 @@ mod tests {
         // 首选从未被请求（熔断跳过），备选被请求一次
         assert_eq!(
             breakers.snapshot("id-broken").state,
-            crate::llm::breaker::BreakerStateView::Open
+            crate::breaker::BreakerStateView::Open
         );
     }
 
@@ -1934,8 +1979,9 @@ mod tests {
             }
         });
 
+        let client = test_client();
         let req_body = serde_json::json!({"model": "m", "stream": true});
-        let err = call_upstream_stream_guarded(&format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
+        let err = call_upstream_stream_guarded(&client, &format!("http://{}", addr), "k", &req_body, "v1/chat/completions")
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
@@ -1964,8 +2010,9 @@ mod tests {
             }
         });
 
-        // 用共享上游 client 拿一个真实 2xx 响应（非流式直通路径的入参）
-        let resp = UPSTREAM_CLIENT
+        // 用本地构建的上游 client 拿一个真实 2xx 响应（非流式直通路径的入参）
+        let client = test_client();
+        let resp = client
             .post(format!("http://{}/v1/chat/completions", addr))
             .header("Content-Type", "application/json")
             .body("{}")
@@ -2018,13 +2065,13 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
-        let known = crate::llm::down::KnownFailures::new();
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
         let chain = test_chain(&[(&a, "m-a", "id-a"), (&b, "m-b", "id-b")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         // 第一次：A 401 → 记录并转移 → B 成功
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2039,7 +2086,7 @@ mod tests {
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
 
         // 第二次：A 被跳过（known 失败），B 再次成功
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Success { .. }));
         assert_eq!(
             a_hits.load(Ordering::SeqCst),
@@ -2067,13 +2114,13 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
-        let known = crate::llm::down::KnownFailures::new();
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
         let chain = test_chain(&[(&a, "m-a", "id-a")]);
         let body = serde_json::json!({"model": "single", "stream": false, "messages": []});
 
         // 第一次：网络调用 → 401
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted { status, .. } = out else {
             panic!("expected exhausted");
         };
@@ -2081,7 +2128,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // 第二次：known 命中，不发起网络调用，仍返回 401 错误
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status, message, ..
         } = out
@@ -2101,7 +2148,7 @@ mod tests {
 
         // 手动清除后立即恢复探测
         known.clear_all();
-        let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
         assert!(matches!(out, FailoverOutcome::Exhausted { .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
@@ -2124,13 +2171,13 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
-        let known = crate::llm::down::KnownFailures::new();
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
         let chain = test_chain(&[(&a, "m-a", "id-a"), ("http://127.0.0.1:1", "m-b", "id-b")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
         for _ in 0..2 {
-            let out = execute_with_failover(&breakers, &known, &chain, &body, false, None).await;
+            let out = execute_with_failover(&test_client(), &breakers, &known, &chain, &body, false, None).await;
             let FailoverOutcome::Exhausted { status, .. } = out else {
                 panic!("expected exhausted");
             };
@@ -2218,10 +2265,10 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain_with_protocol(
             &[(&upstream, "gpt-5-codex", "id-resp")],
-            crate::llm::router::UpstreamProtocol::Responses,
+            crate::router::UpstreamProtocol::Responses,
         );
         let body = serde_json::json!({
             "model": "router",
@@ -2229,7 +2276,7 @@ mod tests {
             "messages": [{ "role": "user", "content": "hi" }]
         });
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -2311,14 +2358,14 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain_with_protocol(
             &[(&upstream, "gpt-5", "id-sresp")],
-            crate::llm::router::UpstreamProtocol::Responses,
+            crate::router::UpstreamProtocol::Responses,
         );
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success { resp, .. } = out else {
             panic!("expected success");
         };
@@ -2408,24 +2455,24 @@ mod tests {
             .await
         };
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain_mixed(&[
             (
                 &responses_up,
                 "gpt-5-codex",
                 "id-resp",
-                crate::llm::router::UpstreamProtocol::Responses,
+                crate::router::UpstreamProtocol::Responses,
             ),
             (
                 &chat_up,
                 "gpt-4o",
                 "id-chat",
-                crate::llm::router::UpstreamProtocol::ChatCompletions,
+                crate::router::UpstreamProtocol::ChatCompletions,
             ),
         ]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -2477,9 +2524,9 @@ mod tests {
     /// 每个 spec 为 `(base_url, model_name, model_id, anthropic_base_url)`。
     fn test_chain_anthropic(
         specs: &[(&str, &str, &str, Option<&str>)],
-    ) -> crate::llm::router::CandidateChain {
-        use crate::llm::router::{Candidate, CandidateChain};
-        use crate::llm::ProviderConfig;
+    ) -> crate::router::CandidateChain {
+        use crate::router::{Candidate, CandidateChain};
+        use crate::ProviderConfig;
         CandidateChain {
             candidates: specs
                 .iter()
@@ -2500,7 +2547,7 @@ mod tests {
                     model_name: model_name.to_string(),
                     model_id: model_id.to_string(),
                     priority: i as i64,
-                    upstream_protocol: crate::llm::router::UpstreamProtocol::ChatCompletions,
+                    upstream_protocol: crate::router::UpstreamProtocol::ChatCompletions,
                 })
                 .collect(),
             group_name: Some("g".into()),
@@ -2567,7 +2614,7 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain_anthropic(&[("http://127.0.0.1:1", "m-a", "id-a", Some(&upstream))]);
         let req_body = serde_json::json!({"model": "router", "stream": false, "messages": []});
         let anthropic_body = serde_json::json!({
@@ -2577,6 +2624,7 @@ mod tests {
         });
 
         let out = execute_with_failover(
+            &test_client(),
             &breakers,
             &EMPTY_KNOWN,
             &chain,
@@ -2685,8 +2733,8 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
-        let known = crate::llm::down::KnownFailures::new();
+        let breakers = crate::breaker::ModelBreakers::new();
+        let known = crate::down::KnownFailures::new();
         let chain = test_chain_anthropic(&[
             ("http://127.0.0.1:1", "m-a", "id-a", Some(&a)),
             ("http://127.0.0.1:1", "m-b", "id-b", Some(&b)),
@@ -2700,6 +2748,7 @@ mod tests {
 
         // 第一次：首选直通 404 → 记录并转移 → 备选直通成功
         let out = execute_with_failover(
+            &test_client(),
             &breakers,
             &known,
             &chain,
@@ -2733,6 +2782,7 @@ mod tests {
 
         // 第二次：首选被跳过（known 命中），备选再次成功
         let out = execute_with_failover(
+            &test_client(),
             &breakers,
             &known,
             &chain,
@@ -2777,11 +2827,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             resp, failed_over, ..
         } = out
@@ -2826,11 +2876,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2875,11 +2925,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Success {
             candidate,
             failed_over,
@@ -2923,11 +2973,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&bad, "m-bad", "id-bad"), (&good, "m-good", "id-good")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success {
             resp,
             candidate,
@@ -2974,11 +3024,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, true, None).await;
         let FailoverOutcome::Success { resp, failed_over, .. } = out else {
             panic!("单候选链流式不走守卫，空流应保持放行（Ok）");
         };
@@ -3006,11 +3056,11 @@ mod tests {
         })
         .await;
 
-        let breakers = crate::llm::breaker::ModelBreakers::new();
+        let breakers = crate::breaker::ModelBreakers::new();
         let chain = test_chain(&[(&upstream, "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": false, "messages": []});
 
-        let out = execute_with_failover(&breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
+        let out = execute_with_failover(&test_client(), &breakers, &EMPTY_KNOWN, &chain, &body, false, None).await;
         let FailoverOutcome::Exhausted {
             status, message, ..
         } = out
