@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::acme::{CertCoverage, CertificateManager};
-use crate::control::ServerState;
+use rust_tunnel_pki::acme::{CertCoverage, CertificateManager};
 
 /// Load balancing algorithm
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,7 +193,8 @@ pub struct TrojanSniEntry {
     pub fallback: String,
     /// Trojan 的 TLS 配置 watch channel（证书热更新）
     pub tls_config_rx: tokio::sync::watch::Receiver<Arc<rustls::ServerConfig>>,
-    pub state: ServerState,
+    pub registry: std::sync::Arc<dyn crate::PortRegistry>,
+    pub stats: rust_tunnel_stats::StatsCollector,
 }
 
 /// Compute the cert coverage source for a rule at save time.

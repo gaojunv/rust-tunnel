@@ -595,8 +595,11 @@ rust_tunnel_server::acme::CertEvent::Expired { .. }) => {
                 }
 
                 tokio::spawn(async move {
+                    let stats = state_clone.stats_collector.clone();
+                    let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state_clone);
                     if let Err(e) = listener::start_shadowsocks_listener_with_abort(
-                        state_clone,
+                        registry,
+                        stats,
                         ss_port,
                         ss_cipher,
                         ss_password,

@@ -14,7 +14,7 @@ use crate::reverse_proxy::ReverseProxyState;
 use rust_tunnel_common::ControlMessage;
 
 use super::acme_config::{AcmeConfigInfo, AcmeFullConfig};
-use super::port_info::{ClientInfo, PortInfo, TrojanRuntimeStatus};
+use super::port_info::{ClientInfo, PortInfo as ServerPortInfo, TrojanRuntimeStatus};
 
 /// Sender for control messages - can be shared across tasks
 pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
@@ -23,7 +23,7 @@ pub type ControlMessageSender = mpsc::Sender<ControlMessage>;
 #[derive(Clone)]
 pub struct ServerState {
     /// Map from port to port info (Shadowsocks or Trojan)
-    ports: Arc<Mutex<HashMap<u16, PortInfo>>>,
+    ports: Arc<Mutex<HashMap<u16, ServerPortInfo>>>,
     /// Active Shadowsocks connections per port
     ss_active_connections: Arc<Mutex<HashMap<u16, usize>>>,
     /// Active Trojan connections per port
@@ -190,8 +190,9 @@ impl ServerState {
     /// has started. Called from `bin/server.rs` after `with_db()`.
     pub async fn wire_up_client_connector(&self) {
         if let Some(registry) = &self.client_registry {
+            let opener: std::sync::Arc<dyn rust_tunnel_protocols::TunnelOpener> = std::sync::Arc::new(registry.clone());
             let cc = std::sync::Arc::new(crate::reverse_proxy::connector::ClientConnector::new(
-                registry.clone(),
+                opener,
             ));
             self.proxy_state.set_client_connector(cc).await;
             info!("ClientConnector registered into ReverseProxyState");
@@ -241,7 +242,7 @@ impl ServerState {
         }
         ports.insert(
             port,
-            PortInfo::Shadowsocks {
+            ServerPortInfo::Shadowsocks {
                 port,
                 cipher,
                 password,
@@ -252,7 +253,7 @@ impl ServerState {
         true
     }
 
-    pub async fn get_port(&self, port: u16) -> Option<PortInfo> {
+    pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
         let ports = self.ports.lock().await;
         ports.get(&port).cloned()
     }
@@ -296,7 +297,7 @@ impl ServerState {
         }
         ports.insert(
             port,
-            PortInfo::Trojan {
+            ServerPortInfo::Trojan {
                 port,
                 password,
                 fallback,
@@ -313,7 +314,7 @@ impl ServerState {
         ports
             .iter()
             .filter_map(|(port, info)| match info {
-                PortInfo::Trojan { .. } => Some(*port),
+                ServerPortInfo::Trojan { .. } => Some(*port),
                 _ => None,
             })
             .collect()
@@ -322,7 +323,7 @@ impl ServerState {
     /// Check if a port is a Trojan port
     pub async fn is_trojan_port(&self, port: u16) -> bool {
         let ports = self.ports.lock().await;
-        matches!(ports.get(&port), Some(PortInfo::Trojan { .. }))
+        matches!(ports.get(&port), Some(ServerPortInfo::Trojan { .. }))
     }
 
     /// Increment active Trojan connections for a port
@@ -371,7 +372,7 @@ impl ServerState {
         ports
             .iter()
             .filter_map(|(port, info)| match info {
-                PortInfo::Shadowsocks { .. } => Some(*port),
+                ServerPortInfo::Shadowsocks { .. } => Some(*port),
                 _ => None,
             })
             .collect()
@@ -380,7 +381,7 @@ impl ServerState {
     /// Check if a port is a Shadowsocks port
     pub async fn is_shadowsocks_port(&self, port: u16) -> bool {
         let ports = self.ports.lock().await;
-        matches!(ports.get(&port), Some(PortInfo::Shadowsocks { .. }))
+        matches!(ports.get(&port), Some(ServerPortInfo::Shadowsocks { .. }))
     }
 
     /// Set the ACME client for this server state
@@ -420,6 +421,37 @@ impl ServerState {
     pub async fn set_dynamic_config(&self, config: DynamicConfig) {
         let mut dc = self.dynamic_config.write().await;
         *dc = config;
+    }
+}
+
+// ── PortRegistry impl — bridges ServerState to protocols crate ──
+#[async_trait::async_trait]
+impl rust_tunnel_protocols::PortRegistry for ServerState {
+    async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
+        ServerState::register_shadowsocks(self, port, cipher, password).await
+    }
+    async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
+        ServerState::register_trojan(self, port, password, fallback).await
+    }
+    async fn get_port(&self, port: u16) -> Option<rust_tunnel_protocols::PortInfo> {
+        let ports = self.ports.lock().await;
+        let p = ports.get(&port)?.clone();
+        Some(match p {
+            crate::control::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at } => rust_tunnel_protocols::PortInfo::Shadowsocks { port, cipher, password, enabled, created_at },
+            crate::control::PortInfo::Trojan { port, password, fallback, enabled, created_at } => rust_tunnel_protocols::PortInfo::Trojan { port, password, fallback, enabled, created_at },
+        })
+    }
+    async fn unregister_port(&self, port: u16) -> bool { ServerState::unregister_port(self, port).await }
+    async fn get_connection_count_for_port(&self, remote_port: u16) -> usize { ServerState::get_connection_count_for_port(self, remote_port).await }
+    async fn increment_ss_connections(&self, port: u16) { ServerState::increment_ss_connections(self, port).await }
+    async fn decrement_ss_connections(&self, port: u16) { ServerState::decrement_ss_connections(self, port).await }
+    async fn increment_trojan_connections(&self, port: u16) { ServerState::increment_trojan_connections(self, port).await }
+    async fn decrement_trojan_connections(&self, port: u16) { ServerState::decrement_trojan_connections(self, port).await }
+}
+
+impl std::fmt::Debug for ServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerState").finish_non_exhaustive()
     }
 }
 

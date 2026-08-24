@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 use tracing::debug;
 use tracing::{error, warn};
 
-use crate::control::ServerState;
-use crate::stats::EntityType;
+use crate::port_registry::PortRegistry;
+use rust_tunnel_stats::{EntityType, StatsCollector};
 
 // Re-export shadowsocks types
 pub use shadowsocks::{
@@ -138,11 +138,8 @@ pub async fn handle_ss_handshake(
 /// direction observes EOF, it calls `shutdown()` on the opposing writer so the other
 /// direction unblocks instead of hanging indefinitely.
 async fn copy_bidirectional_with_ss_crypto(
-    _connection_id: u64,
-    _port: u16,
     mut proxy_stream: ProxyServerStream<TcpStream>,
     mut target_stream: TcpStream,
-    _state: ServerState,
 ) -> TunnelResult<(u64, u64)> {
     use crate::shadowsocks::{copy_encrypted_bidirectional, CipherKind};
 
@@ -163,7 +160,8 @@ pub async fn proxy_ss_connection(
     ss_port: u16,
     proxy_stream: ProxyServerStream<TcpStream>,
     ss_ctx: SSConnectionContext,
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
 ) {
     debug!(
         "Starting SS proxy for connection {}, target {}",
@@ -171,12 +169,10 @@ pub async fn proxy_ss_connection(
     );
 
     // Increment active SS connection count
-    state.increment_ss_connections(ss_port).await;
+    registry.increment_ss_connections(ss_port).await;
     // 统一统计：shadowsocks 桶活跃连接 +1（entity_id 约定为 ss:{port}）
     let entity_id = format!("ss:{}", ss_port);
-    state
-        .stats_collector
-        .incr_conns(EntityType::Shadowsocks, &entity_id);
+    stats.incr_conns(EntityType::Shadowsocks, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
     let start = Instant::now();
@@ -186,11 +182,9 @@ pub async fn proxy_ss_connection(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to connect to target {}: {}", ss_ctx.target_addr, e);
-            state.decrement_ss_connections(ss_port).await;
+            registry.decrement_ss_connections(ss_port).await;
             // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
-            state
-                .stats_collector
-                .decr_conns(EntityType::Shadowsocks, &entity_id);
+            stats.decr_conns(EntityType::Shadowsocks, &entity_id);
             return;
         }
     };
@@ -203,21 +197,12 @@ pub async fn proxy_ss_connection(
     );
 
     let proxy_start = Instant::now();
-    let result = copy_bidirectional_with_ss_crypto(
-        connection_id,
-        ss_port,
-        proxy_stream,
-        target_stream,
-        state.clone(),
-    )
-    .await;
+    let result = copy_bidirectional_with_ss_crypto(proxy_stream, target_stream).await;
 
     // Decrement active SS connection count (always run)
-    state.decrement_ss_connections(ss_port).await;
+    registry.decrement_ss_connections(ss_port).await;
     // 统一统计：活跃连接 -1（覆盖正常与错误退出）
-    state
-        .stats_collector
-        .decr_conns(EntityType::Shadowsocks, &entity_id);
+    stats.decr_conns(EntityType::Shadowsocks, &entity_id);
 
     match result {
         Ok((uploaded, downloaded)) => {
@@ -229,7 +214,7 @@ pub async fn proxy_ss_connection(
             );
 
             // 统一统计：双向字节一次性入账（bytes_in = 客户端->目标，bytes_out = 目标->客户端）
-            state.stats_collector.record_bytes(
+            stats.record_bytes(
                 EntityType::Shadowsocks,
                 &entity_id,
                 uploaded,
@@ -382,8 +367,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use crate::control::ServerState;
+    use crate::port_registry::MockPortRegistry;
     use crate::listener;
+    use rust_tunnel_stats::StatsCollector;
+    use std::sync::Arc;
 
     // ---------------------------------------------------------------------------
     // helpers
@@ -567,12 +554,15 @@ mod tests {
             let (echo_port, echo_handle) = start_echo_server().await;
 
             // 2. SS listener
-            let state = ServerState::new();
+            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
-            let state_c = state.clone();
+            let reg_c = registry.clone();
+            let stats_c = stats.clone();
             tokio::spawn(async move {
                 let _ = listener::start_shadowsocks_listener(
-                    state_c,
+                    reg_c,
+                    stats_c,
                     ss_port,
                     "aes-256-gcm".into(),
                     "testpass".into(),
@@ -604,12 +594,15 @@ mod tests {
         async fn test_ss_chacha20_poly1305_via_ss_local() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let state = ServerState::new();
+            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
-            let state_c = state.clone();
+            let reg_c = registry.clone();
+            let stats_c = stats.clone();
             tokio::spawn(async move {
                 let _ = listener::start_shadowsocks_listener(
-                    state_c,
+                    reg_c,
+                    stats_c,
                     ss_port,
                     "chacha20-ietf-poly1305".into(),
                     "testpass".into(),
@@ -637,12 +630,15 @@ mod tests {
         async fn test_ss_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let state = ServerState::new();
+            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
-            let state_c = state.clone();
+            let reg_c = registry.clone();
+            let stats_c = stats.clone();
             tokio::spawn(async move {
                 let _ = listener::start_shadowsocks_listener(
-                    state_c,
+                    reg_c,
+                    stats_c,
                     ss_port,
                     "aes-256-gcm".into(),
                     "testpass".into(),
@@ -671,12 +667,15 @@ mod tests {
         async fn test_ss_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let state = ServerState::new();
+            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
-            let state_c = state.clone();
+            let reg_c = registry.clone();
+            let stats_c = stats.clone();
             tokio::spawn(async move {
                 let _ = listener::start_shadowsocks_listener(
-                    state_c,
+                    reg_c,
+                    stats_c,
                     ss_port,
                     "aes-256-gcm".into(),
                     "testpass".into(),
@@ -687,7 +686,7 @@ mod tests {
 
             // No active SS connections yet
             assert_eq!(
-                state.get_connection_count_for_port(ss_port).await,
+                registry.get_connection_count_for_port(ss_port).await,
                 0,
                 "expected 0 SS connections before any connection"
             );
@@ -703,7 +702,7 @@ mod tests {
 
             // After communicating, the SS connection counter should have been
             // incremented (the SS proxy calls increment_ss_connections on start).
-            let count = state.get_connection_count_for_port(ss_port).await;
+            let count = registry.get_connection_count_for_port(ss_port).await;
             assert!(
                 count >= 1,
                 "SS connection count should be >= 1 after data transfer, got {}",

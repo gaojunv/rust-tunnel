@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 
-use crate::acme::{CertificateManager, CertificateProvider};
-use crate::db::Database;
+use rust_tunnel_pki::acme::{CertificateManager, CertificateProvider};
+use rust_tunnel_persistence::Database;
 use super::llm_dispatch::LlmDispatcher;
 use crate::reverse_proxy::connector;
 use crate::reverse_proxy::rules::{
     resolve_cert_source_for_rule, Backend, BackendKind, CertSourceKind, ProxyRule, ProxyTlsConfig,
     RuleCertStatus, RuleType, TrojanSniEntry,
 };
-use crate::stats::StatsCollector;
+use rust_tunnel_stats::StatsCollector;
 
 /// State for the reverse proxy module
 #[derive(Clone)]
@@ -405,12 +405,12 @@ mod tests {
         };
         mgr.add_certificate(
             "*.example.com",
-            crate::acme::CertEntry {
+            rust_tunnel_pki::acme::CertEntry {
                 cert_pem,
                 key_pem,
                 chain_pem: None,
                 expires_at: None,
-                source: crate::acme::CertSource::Manual,
+                source: rust_tunnel_pki::acme::CertSource::Manual,
             },
         )
         .await
@@ -432,7 +432,7 @@ mod tests {
                 .with_no_client_auth()
                 .with_cert_resolver(Arc::new(
                     crate::reverse_proxy::sni_resolver::SniCertResolver::new(Arc::new(
-                        crate::acme::CertificateManager::new("/tmp/nonexistent-test-dir"),
+                        rust_tunnel_pki::acme::CertificateManager::new("/tmp/nonexistent-test-dir"),
                     )),
                 )),
         );
@@ -444,7 +444,8 @@ mod tests {
             password: "p".to_string(),
             fallback: "127.0.0.1:80".to_string(),
             tls_config_rx: rx,
-            state: crate::control::ServerState::new(),
+            registry: std::sync::Arc::new(crate::port_registry::MockPortRegistry::new()),
+            stats: rust_tunnel_stats::StatsCollector::new(None),
         }
     }
 

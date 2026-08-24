@@ -1,5 +1,5 @@
 use super::{Backend, ReverseProxyState};
-use crate::stats::EntityType;
+use rust_tunnel_stats::EntityType;
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};

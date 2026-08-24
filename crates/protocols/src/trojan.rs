@@ -5,8 +5,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, warn};
 
-use crate::control::ServerState;
-use crate::stats::EntityType;
+use crate::port_registry::PortRegistry;
+use rust_tunnel_stats::{EntityType, StatsCollector};
 use rust_tunnel_common::{TunnelError, TunnelResult};
 
 /// Trojan command types
@@ -505,7 +505,8 @@ pub async fn handle_udp_associate(
     trojan_port: u16,
     mut tls_stream: TlsStream<TcpStream>,
     initial_payload: Vec<u8>,
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
 ) {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -518,11 +519,9 @@ pub async fn handle_udp_associate(
         connection_id
     );
 
-    state.increment_trojan_connections(trojan_port).await;
+    registry.increment_trojan_connections(trojan_port).await;
     let entity_id = format!("trojan:{}", trojan_port);
-    state
-        .stats_collector
-        .incr_conns(EntityType::Trojan, &entity_id);
+    stats.incr_conns(EntityType::Trojan, &entity_id);
 
     let mut bytes_in: u64 = 0;
     let mut bytes_out: u64 = 0;
@@ -648,13 +647,9 @@ pub async fn handle_udp_associate(
         abort.abort();
     }
 
-    state.decrement_trojan_connections(trojan_port).await;
-    state
-        .stats_collector
-        .decr_conns(EntityType::Trojan, &entity_id);
-    state
-        .stats_collector
-        .record_bytes(EntityType::Trojan, &entity_id, bytes_in, bytes_out);
+    registry.decrement_trojan_connections(trojan_port).await;
+    stats.decr_conns(EntityType::Trojan, &entity_id);
+    stats.record_bytes(EntityType::Trojan, &entity_id, bytes_in, bytes_out);
 
     debug!(
         "Trojan UDP connection {} closed: sent {} bytes, received {} bytes",
@@ -785,7 +780,8 @@ pub async fn proxy_trojan_connection(
     mut tls_stream: TlsStream<TcpStream>,
     trojan_ctx: TrojanConnectionContext,
     initial_payload: Vec<u8>,
-    state: ServerState,
+    registry: std::sync::Arc<dyn PortRegistry>,
+    stats: StatsCollector,
 ) {
     debug!(
         "Starting Trojan proxy for connection {}, target {}",
@@ -794,24 +790,15 @@ pub async fn proxy_trojan_connection(
 
     // UDP ASSOCIATE: hand off to the UDP session handler
     if trojan_ctx.command == TrojanCommand::UdpAssociate {
-        handle_udp_associate(
-            connection_id,
-            trojan_port,
-            tls_stream,
-            initial_payload,
-            state,
-        )
-        .await;
+        handle_udp_associate(connection_id, trojan_port, tls_stream, initial_payload, registry, stats).await;
         return;
     }
 
     // Increment active Trojan connection count
-    state.increment_trojan_connections(trojan_port).await;
+    registry.increment_trojan_connections(trojan_port).await;
     // 统一统计：trojan 桶活跃连接 +1（entity_id 约定为 trojan:{port}）
     let entity_id = format!("trojan:{}", trojan_port);
-    state
-        .stats_collector
-        .incr_conns(EntityType::Trojan, &entity_id);
+    stats.incr_conns(EntityType::Trojan, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
     let start = Instant::now();
@@ -824,11 +811,9 @@ pub async fn proxy_trojan_connection(
                 "Failed to connect to target {}: {}",
                 trojan_ctx.target_addr, e
             );
-            state.decrement_trojan_connections(trojan_port).await;
+            registry.decrement_trojan_connections(trojan_port).await;
             // 统一统计：活跃连接 -1（覆盖目标连接失败的错误退出路径）
-            state
-                .stats_collector
-                .decr_conns(EntityType::Trojan, &entity_id);
+            stats.decr_conns(EntityType::Trojan, &entity_id);
             return;
         }
     };
@@ -848,11 +833,9 @@ pub async fn proxy_trojan_connection(
                 "Failed to write initial payload for Trojan connection {}: {}",
                 connection_id, e
             );
-            state.decrement_trojan_connections(trojan_port).await;
+            registry.decrement_trojan_connections(trojan_port).await;
             // 统一统计：活跃连接 -1（覆盖初始负载写失败的错误退出路径）
-            state
-                .stats_collector
-                .decr_conns(EntityType::Trojan, &entity_id);
+            stats.decr_conns(EntityType::Trojan, &entity_id);
             return;
         }
     }
@@ -863,11 +846,9 @@ pub async fn proxy_trojan_connection(
     let result = tokio::io::copy_bidirectional(&mut tls_stream, &mut target_stream).await;
 
     // Decrement active Trojan connection count
-    state.decrement_trojan_connections(trojan_port).await;
+    registry.decrement_trojan_connections(trojan_port).await;
     // 统一统计：活跃连接 -1（覆盖正常与错误退出）
-    state
-        .stats_collector
-        .decr_conns(EntityType::Trojan, &entity_id);
+    stats.decr_conns(EntityType::Trojan, &entity_id);
 
     match result {
         Ok((client_to_target, target_to_client)) => {
@@ -879,7 +860,7 @@ pub async fn proxy_trojan_connection(
             );
 
             // 统一统计：双向字节一次性入账（bytes_in = 客户端->目标，bytes_out = 目标->客户端）
-            state.stats_collector.record_bytes(
+            stats.record_bytes(
                 EntityType::Trojan,
                 &entity_id,
                 client_to_target,
@@ -1678,8 +1659,10 @@ mod legacy_tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::client::TlsStream;
 
-    use crate::control::ServerState;
+    use crate::port_registry::MockPortRegistry;
     use crate::listener;
+    use rust_tunnel_stats::StatsCollector;
+    use std::sync::Arc as StdArc;
     use crate::trojan::sha224_hex;
     use rust_tunnel_common::{
         create_insecure_client_config, create_server_config, load_or_generate_cert,
@@ -1771,7 +1754,8 @@ mod legacy_tests {
     /// (for reference), a `JoinHandle` for the listener task, and the `TempDir`
     /// that must be kept alive.
     async fn start_trojan_server(
-        state: ServerState,
+        registry: StdArc<dyn crate::port_registry::PortRegistry>,
+        stats: StatsCollector,
         port: u16,
         password: &str,
         fallback: &str,
@@ -1786,7 +1770,7 @@ mod legacy_tests {
         let fallback = fallback.to_string();
 
         let handle = tokio::spawn(async move {
-            let _ = listener::start_trojan_listener(state, port, password, fallback, rx).await;
+            let _ = listener::start_trojan_listener(registry, stats, port, password, fallback, rx).await;
         });
 
         // Return a dummy receiver for compatibility (tx keeps it alive)
@@ -2023,11 +2007,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_echo_basic() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let response =
@@ -2042,11 +2027,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_concurrent_connections() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut handles = Vec::new();
@@ -2072,7 +2058,7 @@ mod legacy_tests {
             // All connections should be cleaned up
             tokio::time::sleep(Duration::from_millis(200)).await;
             assert_eq!(
-                state.get_connection_count_for_port(trojan_port).await,
+                registry.get_connection_count_for_port(trojan_port).await,
                 0,
                 "Connection count should be 0 after all connections close"
             );
@@ -2085,11 +2071,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // 64 KB payload
@@ -2122,11 +2109,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_connection_retry() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // First connection
@@ -2169,11 +2157,13 @@ mod legacy_tests {
                 }
             });
 
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) = start_trojan_server(
-                state,
+                registry.clone(),
+                stats.clone(),
                 trojan_port,
                 "correctpass",
                 &format!("127.0.0.1:{}", fallback_port),
@@ -2232,11 +2222,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_long_lived_connection() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
@@ -2258,11 +2249,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_rapid_connect_disconnect() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             for _ in 0..20 {
@@ -2277,7 +2269,7 @@ mod legacy_tests {
             // Wait for all server-side cleanup
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(
-                state.get_connection_count_for_port(trojan_port).await,
+                registry.get_connection_count_for_port(trojan_port).await,
                 0,
                 "Connection count should be 0 after rapid connect/disconnect"
             );
@@ -2290,11 +2282,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_domain_and_ipv4_target() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Test IPv4 targeting
@@ -2329,11 +2322,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_udp_associate_echo() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // TLS connect + UDP ASSOCIATE handshake (target addr is advisory)
@@ -2380,11 +2374,12 @@ mod legacy_tests {
         async fn test_trojan_udp_associate_multi_target() {
             let (udp_port_a, udp_handle_a) = start_udp_echo_server().await;
             let (udp_port_b, udp_handle_b) = start_udp_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let config = create_insecure_client_config().unwrap();
@@ -2444,11 +2439,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_udp_associate_cleanup_on_close() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             {
@@ -2479,7 +2475,7 @@ mod legacy_tests {
 
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(
-                state.get_connection_count_for_port(trojan_port).await,
+                registry.get_connection_count_for_port(trojan_port).await,
                 0,
                 "Connection count should be 0 after UDP associate client disconnect"
             );
@@ -2492,15 +2488,16 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // No connections yet
-            assert_eq!(state.get_connection_count_for_port(trojan_port).await, 0);
+            assert_eq!(registry.get_connection_count_for_port(trojan_port).await, 0);
 
             // Open a connection and keep it alive
             let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
@@ -2511,14 +2508,14 @@ mod legacy_tests {
 
             // Wait for the server to increment the counter
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let count = state.get_connection_count_for_port(trojan_port).await;
+            let count = registry.get_connection_count_for_port(trojan_port).await;
             assert!(count >= 1, "Expected >= 1 active connection, got {}", count);
 
             // Close the connection
             drop(stream);
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            let count = state.get_connection_count_for_port(trojan_port).await;
+            let count = registry.get_connection_count_for_port(trojan_port).await;
             assert_eq!(
                 count, 0,
                 "Expected 0 connections after close, got {}",
@@ -2533,11 +2530,12 @@ mod legacy_tests {
         #[ignore]
         async fn test_trojan_initial_payload() {
             let (echo_port, echo_handle) = start_echo_server().await;
-            let state = ServerState::new();
+            let registry: StdArc<dyn crate::port_registry::PortRegistry> = StdArc::new(MockPortRegistry::new());
+            let stats = StatsCollector::new(None);
             let trojan_port = find_available_port().await;
 
             let (_acceptor, server_handle, _tmp_dir) =
-                start_trojan_server(state, trojan_port, "testpass", "127.0.0.1:1").await;
+                start_trojan_server(registry.clone(), stats.clone(), trojan_port, "testpass", "127.0.0.1:1").await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Connect and include initial payload in the Trojan header

@@ -6,7 +6,7 @@ description = "A simple intranet penetration tool with server and client"
 license = "MIT"
 
 [workspace]
-members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/pki", "crates/rag", "crates/server", "crates/stats"]
+members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crates/persistence", "crates/pki", "crates/protocols", "crates/rag", "crates/server", "crates/stats"]
 
 [workspace.lints.clippy]
 # 企业级 lint 基线：pedantic 组先 warn 基线运行，批次 9 清零后转 deny
@@ -113,6 +113,7 @@ rag = ["rust-tunnel-server/rag"]
 rust-tunnel-common = { path = "crates/common" }
 rust-tunnel-client = { path = "crates/client" }
 rust-tunnel-server = { path = "crates/server", features = ["rag"] }
+rust-tunnel-protocols = { path = "crates/protocols" }
 tokio.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

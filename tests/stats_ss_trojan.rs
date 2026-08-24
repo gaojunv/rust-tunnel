@@ -114,8 +114,11 @@ async fn ss_stats_appear_in_summary() {
         // 用 harness 的 ServerState 起 SS 监听器（共享同一 StatsCollector）。
         let state = harness.server_state.clone();
         tokio::spawn(async move {
+            let stats = state.stats_collector.clone();
+            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state);
             let _ = listener::start_shadowsocks_listener(
-                state,
+                registry,
+                stats,
                 ss_port,
                 "aes-256-gcm".into(),
                 password.into(),
@@ -204,8 +207,11 @@ async fn trojan_stats_appear_in_summary() {
         // 用 harness 的 ServerState 起 Trojan 监听器（共享同一 StatsCollector）。
         let state = harness.server_state.clone();
         tokio::spawn(async move {
+            let stats = state.stats_collector.clone();
+            let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state);
             let _ = listener::start_trojan_listener(
-                state,
+                registry,
+                stats,
                 trojan_port,
                 password.into(),
                 "127.0.0.1:1".into(),

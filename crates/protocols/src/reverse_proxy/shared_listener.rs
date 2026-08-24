@@ -28,7 +28,7 @@ use super::router::RouteTable;
 use super::sni_sniff;
 use super::upstream::UpstreamClient;
 use super::{ProxyRule, ReverseProxyState, RuleType, TrojanSniEntry};
-use crate::acme::CertificateManager;
+use rust_tunnel_pki::acme::CertificateManager;
 
 pub struct SharedListener {
     pub listen_addr: String,
@@ -198,7 +198,8 @@ async fn handle_one_connection(
                     entry.password.clone(),
                     entry.fallback.clone(),
                     entry.tls_config_rx.clone(),
-                    entry.state.clone(),
+                    entry.registry.clone(),
+                    entry.stats.clone(),
                 )
                 .await;
                 return;
@@ -1139,7 +1140,7 @@ mod alpn_tests {
     #[tokio::test]
     async fn manager_built_server_config_has_alpn() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let mgr = Arc::new(crate::acme::CertificateManager::new(
+        let mgr = Arc::new(rust_tunnel_pki::acme::CertificateManager::new(
             temp_dir.path().to_str().unwrap(),
         ));
 
@@ -1153,19 +1154,19 @@ mod alpn_tests {
         };
         mgr.add_certificate(
             "localhost",
-            crate::acme::CertEntry {
+            rust_tunnel_pki::acme::CertEntry {
                 cert_pem,
                 key_pem,
                 chain_pem: None,
                 expires_at: None,
-                source: crate::acme::CertSource::Manual,
+                source: rust_tunnel_pki::acme::CertSource::Manual,
             },
         )
         .await
         .unwrap();
 
         let cfg_arc: Arc<ServerConfig> = {
-            use crate::acme::CertificateProvider;
+            use rust_tunnel_pki::acme::CertificateProvider;
             mgr.get_tls_server_config("localhost").await.unwrap()
         };
         assert_eq!(

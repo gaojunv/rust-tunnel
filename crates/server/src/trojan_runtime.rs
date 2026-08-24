@@ -234,7 +234,8 @@ pub async fn apply_trojan_config(
                 password: cfg.password.clone(),
                 fallback: cfg.fallback.clone(),
                 tls_config_rx,
-                state: state.clone(),
+                registry: std::sync::Arc::new(state.clone()) as std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry>,
+                stats: state.stats_collector.clone(),
             }));
             // 确保共享监听器已按当前规则 reconcile（幂等，规则无变化时为热替换快路径）
             if let Err(e) = state.proxy_state.reconcile_http_listener(&addr).await {
@@ -248,8 +249,11 @@ pub async fn apply_trojan_config(
             let password = cfg.password.clone();
             let fallback = cfg.fallback.clone();
             tokio::spawn(async move {
+                let stats = state_clone.stats_collector.clone();
+                let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state_clone);
                 if let Err(e) = crate::listener::start_trojan_listener_with_abort(
-                    state_clone,
+                    registry,
+                    stats,
                     port,
                     password,
                     fallback,
