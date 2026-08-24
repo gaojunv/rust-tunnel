@@ -1,0 +1,21 @@
+[package]
+name = "rust-tunnel-stats"
+version = "0.4.0"
+edition = "2021"
+description = "rust-tunnel real-time connection quality stats collector (RTT/loss/throughput, scoring, alerts, history sampling)"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+rust-tunnel-common = { path = "../common" }
+rust-tunnel-persistence = { path = "../persistence" }
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

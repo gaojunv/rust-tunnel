@@ -7,7 +7,7 @@ pub use renewal::start_renewal_task;
 
 use super::storage::CertificateStorage;
 use super::{AcmeState, CertificateMetadata, CertificateStatus};
-use anyhow::{Context, Result};
+use crate::error::{AcmeError, AcmeResult};
 use instant_acme::{Account, AccountCredentials};
 use std::path::Path;
 use tokio::sync::RwLock;
@@ -47,31 +47,41 @@ impl AcmeClient {
     ///
     /// Creates the certificate directory if needed, then either loads existing
     /// account credentials from disk or registers a new account with the ACME server.
-    pub async fn initialize(&self) -> Result<()> {
+    pub async fn initialize(&self) -> AcmeResult<()> {
         info!("Initializing ACME client with server: {}", self.server_url);
 
         // Create cert directory if it doesn't exist
         let cert_dir = Path::new(&self.cert_dir);
         if !cert_dir.exists() {
-            std::fs::create_dir_all(cert_dir).context("Failed to create certificate directory")?;
+            std::fs::create_dir_all(cert_dir)
+                .map_err(AcmeError::storage("Failed to create certificate directory"))?;
         }
 
         // Try to load existing account credentials
         let account_path = cert_dir.join("account.json");
         if account_path.exists() {
             let data = std::fs::read_to_string(&account_path)
-                .context("Failed to read account credentials file")?;
-            let creds: AccountCredentials =
-                serde_json::from_str(&data).context("Failed to parse account credentials")?;
+                .map_err(AcmeError::storage("Failed to read account credentials file"))?;
+            let creds: AccountCredentials = serde_json::from_str(&data)
+                .map_err(|source| AcmeError::AccountSerde {
+                    context: "Failed to parse account credentials",
+                    source,
+                })?;
 
             // Re-parse credentials for from_credentials since AccountCredentials doesn't implement Clone
-            let creds_for_restore: AccountCredentials = serde_json::from_str(&data)
-                .context("Failed to parse account credentials for restore")?;
+            let creds_for_restore: AccountCredentials = serde_json::from_str(&data).map_err(
+                |source| AcmeError::AccountSerde {
+                    context: "Failed to parse account credentials for restore",
+                    source,
+                },
+            )?;
 
             let account = Account::builder()?
                 .from_credentials(creds_for_restore)
                 .await
-                .context("Failed to restore ACME account from saved credentials")?;
+                .map_err(AcmeError::protocol(
+                    "Failed to restore ACME account from saved credentials",
+                ))?;
 
             info!("Restored existing ACME account: {}", account.id());
             *self.account.write().await = Some(account);
@@ -92,13 +102,17 @@ impl AcmeClient {
                     None,
                 )
                 .await
-                .context("Failed to register new ACME account")?;
+                .map_err(AcmeError::protocol("Failed to register new ACME account"))?;
 
             // Save credentials to disk
-            let creds_json = serde_json::to_string_pretty(&credentials)
-                .context("Failed to serialize account credentials")?;
+            let creds_json = serde_json::to_string_pretty(&credentials).map_err(|source| {
+                AcmeError::AccountSerde {
+                    context: "Failed to serialize account credentials",
+                    source,
+                }
+            })?;
             std::fs::write(&account_path, creds_json)
-                .context("Failed to save account credentials to disk")?;
+                .map_err(AcmeError::storage("Failed to save account credentials to disk"))?;
 
             info!("Registered new ACME account: {}", account.id());
             *self.account.write().await = Some(account);
@@ -112,7 +126,7 @@ impl AcmeClient {
     pub async fn get_certificate_metadata(
         &self,
         domain: &str,
-    ) -> Result<Option<CertificateMetadata>> {
+    ) -> AcmeResult<Option<CertificateMetadata>> {
         if let Some(db) = self.state.db() {
             if let Some(record) = db.get_acme_certificate(domain).await? {
                 return Ok(Some(CertificateMetadata {
@@ -135,7 +149,7 @@ impl AcmeClient {
     }
 
     /// List all certificates
-    pub async fn list_certificates(&self) -> Result<Vec<CertificateMetadata>> {
+    pub async fn list_certificates(&self) -> AcmeResult<Vec<CertificateMetadata>> {
         let mut certificates = Vec::new();
 
         if let Some(db) = self.state.db() {
@@ -162,7 +176,7 @@ impl AcmeClient {
     }
 
     /// Renew a certificate
-    pub async fn renew_certificate(&self, domain: &str) -> Result<CertificateMetadata> {
+    pub async fn renew_certificate(&self, domain: &str) -> AcmeResult<CertificateMetadata> {
         info!("Renewing certificate for domain: {}", domain);
 
         // Update renewal attempt timestamp
@@ -174,7 +188,7 @@ impl AcmeClient {
     }
 
     /// Delete a certificate
-    pub async fn delete_certificate(&self, domain: &str) -> Result<()> {
+    pub async fn delete_certificate(&self, domain: &str) -> AcmeResult<()> {
         info!("Deleting certificate for domain: {}", domain);
 
         if let Some(db) = self.state.db() {
@@ -201,7 +215,7 @@ impl AcmeClient {
 mod tests {
     use super::*;
     use crate::acme::AcmeState;
-    use crate::db::Database;
+    use rust_tunnel_persistence::Database;
 
     #[tokio::test]
     async fn test_acme_client_new() {

@@ -3,7 +3,7 @@ use super::provider::{
     create_server_config_from_entry, CertEntry, CertSource, CertificateProvider,
 };
 use super::storage::CertificateStorage;
-use anyhow::{Context, Result};
+use crate::error::{AcmeError, AcmeResult};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rustls::server::ResolvesServerCert;
@@ -111,7 +111,7 @@ impl CertificateManager {
     /// # Errors
     ///
     /// Returns an error if the storage directory cannot be initialized or read.
-    pub async fn load_from_storage(&self) -> Result<()> {
+    pub async fn load_from_storage(&self) -> AcmeResult<()> {
         self.storage.initialize()?;
         let domains = self.storage.list_domains()?;
         info!("Loading {} certificates from storage", domains.len());
@@ -149,16 +149,16 @@ impl CertificateManager {
     }
 
     /// Build a `CachedCert` from disk storage for a given domain
-    fn build_cached_cert(&self, domain: &str) -> Result<CachedCert> {
+    fn build_cached_cert(&self, domain: &str) -> AcmeResult<CachedCert> {
         let cert_pem = self
             .storage
             .load_certificate(domain)?
-            .context("Certificate PEM not found")?;
+            .ok_or_else(|| AcmeError::msg("Certificate PEM not found"))?;
 
         let key_pem = self
             .storage
             .load_private_key(domain)?
-            .context("Private key PEM not found")?;
+            .ok_or_else(|| AcmeError::msg("Private key PEM not found"))?;
 
         let chain_pem = self.storage.load_chain(domain)?;
         let expires_at = parse_cert_expiry(&cert_pem).ok();
@@ -172,7 +172,7 @@ impl CertificateManager {
         };
 
         let tls_config = create_server_config_from_entry(&entry)
-            .context("Failed to create TLS server config")?;
+            .map_err(AcmeError::wrap("Failed to create TLS server config"))?;
 
         Ok(CachedCert { entry, tls_config })
     }
@@ -186,15 +186,15 @@ impl CertificateManager {
     ///
     /// Returns an error if the TLS server config cannot be created from the
     /// certificate entry, or if saving to disk fails.
-    pub async fn add_certificate(&self, domain: &str, entry: CertEntry) -> Result<()> {
+    pub async fn add_certificate(&self, domain: &str, entry: CertEntry) -> AcmeResult<()> {
         // Normalize to lowercase so lookups by SNI (which rustls lowercases
         // before delivering to the resolver) always match. Storage on disk
         // uses the same normalized key.
         let domain = domain.to_ascii_lowercase();
         let tls_config = create_server_config_from_entry(&entry)
-            .context("Failed to create TLS server config")?;
-        let certified_key =
-            super::provider::build_certified_key(&entry).context("Failed to build CertifiedKey")?;
+            .map_err(AcmeError::wrap("Failed to create TLS server config"))?;
+        let certified_key = super::provider::build_certified_key(&entry)
+            .map_err(AcmeError::wrap("Failed to build CertifiedKey"))?;
 
         // Save to disk
         self.storage.save_certificate(
@@ -233,7 +233,7 @@ impl CertificateManager {
     /// # Errors
     ///
     /// Returns an error if deleting the certificate from disk fails.
-    pub async fn remove_certificate(&self, domain: &str) -> Result<()> {
+    pub async fn remove_certificate(&self, domain: &str) -> AcmeResult<()> {
         let domain = domain.to_ascii_lowercase();
         {
             let mut cache = self.cache.write().await;
@@ -263,12 +263,12 @@ impl CertificateManager {
     ///
     /// Returns an error if the ACME client is not configured, the ACME request
     /// fails, or the issued certificate cannot be loaded from disk.
-    pub async fn request_acme_certificate(&self, domain: &str) -> Result<CertEntry> {
+    pub async fn request_acme_certificate(&self, domain: &str) -> AcmeResult<CertEntry> {
         let client = {
             let guard = self.acme_client.read().await;
             guard
                 .as_ref()
-                .context("ACME client not configured")?
+                .ok_or_else(|| AcmeError::msg("ACME client not configured"))?
                 .clone()
         };
 
@@ -276,7 +276,7 @@ impl CertificateManager {
         client
             .request_certificate(domain)
             .await
-            .context("ACME certificate request failed")?;
+            .map_err(AcmeError::wrap("ACME certificate request failed"))?;
 
         // Load the issued certificate from disk into cache + broadcast Issued
         self.load_issued_certificate(domain).await
@@ -354,7 +354,7 @@ impl CertificateManager {
         if let Some(k) = map.get(&sni) {
             return Some(k.clone());
         }
-        let wildcard = crate::reverse_proxy::sni_resolver::wildcard_for(&sni)?;
+        let wildcard = crate::wildcard_for(&sni)?;
         map.get(&wildcard).cloned()
     }
 
@@ -369,7 +369,7 @@ impl CertificateManager {
         if cache.contains_key(&domain) {
             return Some(super::provider::CertCoverage::Exact);
         }
-        let wildcard = crate::reverse_proxy::sni_resolver::wildcard_for(&domain)?;
+        let wildcard = crate::wildcard_for(&domain)?;
         if cache.contains_key(&wildcard) {
             return Some(super::provider::CertCoverage::Wildcard(wildcard));
         }
@@ -401,16 +401,16 @@ impl CertificateManager {
     /// # Errors
     ///
     /// Returns an error if the certificate cannot be loaded from disk or parsed.
-    pub async fn load_issued_certificate(&self, domain: &str) -> Result<CertEntry> {
+    pub async fn load_issued_certificate(&self, domain: &str) -> AcmeResult<CertEntry> {
         // 磁盘读取沿用传入域名（ACME 客户端按原样写盘）；
         // 缓存 key 与事件 domain 小写归一，与 add_certificate /
         // find_covering_cert / resolve_certified_key 的不变量一致，
         // 否则大小写混合域名签发后写入成功却永远查不到。
         let cached = self
             .build_cached_cert(domain)
-            .context("Failed to load issued certificate from storage")?;
+            .map_err(AcmeError::wrap("Failed to load issued certificate from storage"))?;
         let certified_key = super::provider::build_certified_key(&cached.entry)
-            .context("Failed to build CertifiedKey for issued cert")?;
+            .map_err(AcmeError::wrap("Failed to build CertifiedKey for issued cert"))?;
         let entry = cached.entry.clone();
         let domain = domain.to_ascii_lowercase();
         {
@@ -433,9 +433,7 @@ impl CertificateManager {
     /// Build a resolver for use with `rustls::ServerConfig::with_cert_resolver`.
     #[must_use]
     pub fn sni_resolver(self: Arc<Self>) -> Arc<dyn ResolvesServerCert> {
-        Arc::new(crate::reverse_proxy::sni_resolver::SniCertResolver::new(
-            self,
-        ))
+        Arc::new(crate::SniCertResolver::new(self))
     }
 }
 
@@ -453,17 +451,17 @@ impl CertificateProvider for CertificateManager {
 }
 
 /// Parse certificate expiry from PEM-encoded certificate data
-fn parse_cert_expiry(cert_pem: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+fn parse_cert_expiry(cert_pem: &str) -> AcmeResult<chrono::DateTime<chrono::Utc>> {
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes())
-        .context("Failed to parse certificate PEM")?;
+        .map_err(|_| AcmeError::msg("Failed to parse certificate PEM"))?;
 
-    let (_, cert) =
-        X509Certificate::from_der(&pem.contents).context("Failed to parse certificate DER")?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|_| AcmeError::msg("Failed to parse certificate DER"))?;
 
     let not_after = cert.validity.not_after.to_datetime();
     let ts = not_after.unix_timestamp();
     let naive = chrono::DateTime::from_timestamp(ts, 0)
-        .context("Failed to create DateTime from timestamp")?;
+        .ok_or_else(|| AcmeError::msg("Failed to create DateTime from timestamp"))?;
 
     Ok(naive)
 }

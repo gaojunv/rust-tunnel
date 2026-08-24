@@ -1,3 +1,4 @@
+use crate::error::{AcmeError, AcmeResult};
 use async_trait::async_trait;
 use rustls::pki_types::CertificateDer;
 use rustls::server::ServerConfig;
@@ -51,23 +52,23 @@ fn full_chain_pem(entry: &CertEntry) -> String {
 }
 
 /// Helper function to create ServerConfig from CertEntry
-pub fn create_server_config_from_entry(entry: &CertEntry) -> anyhow::Result<Arc<ServerConfig>> {
+pub fn create_server_config_from_entry(entry: &CertEntry) -> AcmeResult<Arc<ServerConfig>> {
     use rustls_pemfile::certs;
 
     // Parse certificate chain（叶子 + 中间证书）
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut full_chain_pem(entry).as_bytes())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
+        .map_err(|e| AcmeError::ParseCertificate(e.to_string()))?;
 
     // Parse private key
     let key_der = rustls_pemfile::private_key(&mut entry.key_pem.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+        .map_err(|e| AcmeError::ParsePrivateKey(e.to_string()))?
+        .ok_or(AcmeError::NoPrivateKey)?;
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_der)
-        .map_err(|e| anyhow::anyhow!("Failed to create server config: {}", e))?;
+        .map_err(|e| AcmeError::ServerConfig(e.to_string()))?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
@@ -94,7 +95,7 @@ pub enum CertCoverage {
 /// is unsupported by the crypto provider.
 pub fn build_certified_key(
     entry: &CertEntry,
-) -> anyhow::Result<std::sync::Arc<rustls::sign::CertifiedKey>> {
+) -> AcmeResult<std::sync::Arc<rustls::sign::CertifiedKey>> {
     use rustls::pki_types::CertificateDer;
     use rustls::sign::CertifiedKey;
     use rustls_pemfile::certs;
@@ -102,14 +103,14 @@ pub fn build_certified_key(
 
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut full_chain_pem(entry).as_bytes())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to parse certificate: {}", e))?;
+        .map_err(|e| AcmeError::ParseCertificate(e.to_string()))?;
 
     let key_der = rustls_pemfile::private_key(&mut entry.key_pem.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
-        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+        .map_err(|e| AcmeError::ParsePrivateKey(e.to_string()))?
+        .ok_or(AcmeError::NoPrivateKey)?;
 
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
-        .map_err(|e| anyhow::anyhow!("Unsupported key type: {}", e))?;
+        .map_err(|e| AcmeError::UnsupportedKeyType(e.to_string()))?;
 
     Ok(Arc::new(CertifiedKey::new(cert_chain, signing_key)))
 }

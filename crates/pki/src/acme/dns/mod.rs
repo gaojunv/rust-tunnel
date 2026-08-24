@@ -3,6 +3,7 @@ pub mod cloudflare;
 pub mod custom;
 pub mod tencent;
 
+use crate::error::AcmeResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -11,10 +12,10 @@ use std::time::Duration;
 #[async_trait]
 pub trait DnsChallengeSolver: Send + Sync {
     /// Create a TXT record for DNS-01 challenge
-    async fn create_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<()>;
+    async fn create_txt_record(&self, domain: &str, value: &str) -> AcmeResult<()>;
 
     /// Delete a TXT record after challenge completion
-    async fn delete_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<()>;
+    async fn delete_txt_record(&self, domain: &str, value: &str) -> AcmeResult<()>;
 
     /// Wait for DNS propagation
     async fn wait_for_propagation(
@@ -22,7 +23,7 @@ pub trait DnsChallengeSolver: Send + Sync {
         domain: &str,
         value: &str,
         timeout: Duration,
-    ) -> anyhow::Result<()>;
+    ) -> AcmeResult<()>;
 
     /// Get the provider name
     fn provider_name(&self) -> &str;

@@ -3,7 +3,7 @@ use super::super::storage::CertificateStorage;
 use super::cert_utils;
 use super::AcmeClient;
 use super::{CertificateMetadata, CertificateStatus};
-use anyhow::{Context, Result};
+use crate::error::{AcmeError, AcmeResult};
 use base64::Engine;
 use chrono::Utc;
 use instant_acme::{ChallengeType, Identifier, NewOrder, OrderStatus, RetryPolicy};
@@ -18,7 +18,7 @@ const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl AcmeClient {
     /// Request a new certificate for a domain
-    pub async fn request_certificate(&self, domain: &str) -> Result<CertificateMetadata> {
+    pub async fn request_certificate(&self, domain: &str) -> AcmeResult<CertificateMetadata> {
         info!("Requesting certificate for domain: {}", domain);
 
         // Check if we already have a valid certificate
@@ -34,7 +34,7 @@ impl AcmeClient {
             let guard = self.account.read().await;
             guard
                 .as_ref()
-                .context("ACME account not initialized. Call initialize() first.")?
+                .ok_or_else(|| AcmeError::msg("ACME account not initialized. Call initialize() first."))?
                 .clone()
         };
 
@@ -71,7 +71,7 @@ impl AcmeClient {
         let mut order = account
             .new_order(&order_params)
             .await
-            .context("Failed to create ACME order")?;
+            .map_err(AcmeError::protocol("Failed to create ACME order"))?;
 
         info!("Created ACME order for {}", domain);
 
@@ -79,12 +79,12 @@ impl AcmeClient {
         let mut challenge_tokens: Vec<String> = Vec::new();
         let mut authorizations = order.authorizations();
         while let Some(auth_result) = authorizations.next().await {
-            let mut auth_handle = auth_result.context("Failed to get order authorization")?;
+            let mut auth_handle = auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
 
             // Find the HTTP-01 challenge
             let mut challenge_handle = auth_handle
                 .challenge(ChallengeType::Http01)
-                .context(format!("No HTTP-01 challenge found for domain {}", domain))?;
+                .ok_or_else(|| AcmeError::msgf(format!("No HTTP-01 challenge found for domain {}", domain)))?;
 
             // Get the key authorization response
             let key_authorization = challenge_handle.key_authorization();
@@ -119,7 +119,7 @@ impl AcmeClient {
             challenge_handle
                 .set_ready()
                 .await
-                .context("Failed to set challenge ready")?;
+                .map_err(AcmeError::protocol("Failed to set challenge ready"))?;
 
             info!("Challenge ready for {}: {}", domain, challenge_handle.token);
         }
@@ -132,16 +132,16 @@ impl AcmeClient {
                 for token in &challenge_tokens {
                     self.state.remove_challenge(token).await;
                 }
-                anyhow::bail!(
+                return Err(AcmeError::msgf(format!(
                     "Challenge validation timed out for domain {} after {:?}",
                     domain,
                     CHALLENGE_POLL_TIMEOUT
-                );
+                )));
             }
 
             tokio::time::sleep(CHALLENGE_POLL_INTERVAL).await;
 
-            let state = order.refresh().await.context("Failed to refresh order")?;
+            let state = order.refresh().await.map_err(AcmeError::protocol("Failed to refresh order"))?;
             let status = state.status;
 
             match status {
@@ -167,11 +167,11 @@ impl AcmeClient {
                             .await?;
                     }
 
-                    anyhow::bail!(
+                    return Err(AcmeError::msgf(format!(
                         "ACME order became invalid for domain {}: {}",
                         domain,
                         error_detail
-                    );
+                    )));
                 }
                 _ => {
                     // Still pending or processing, keep polling
@@ -181,19 +181,19 @@ impl AcmeClient {
         };
 
         // Generate CSR using rcgen
-        let key_pair = rcgen::KeyPair::generate().context("Failed to generate key pair")?;
+        let key_pair = rcgen::KeyPair::generate().map_err(AcmeError::GenerateKeyPair)?;
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
-            .map_err(|e| anyhow::anyhow!("Failed to create certificate params: {}", e))?;
+            .map_err(|e| AcmeError::CertParams(e.to_string()))?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize CSR: {}", e))?;
+            .map_err(|e| AcmeError::SerializeCsr(e.to_string()))?;
 
         // Finalize the order with the CSR
         order
             .finalize_csr(csr.der())
             .await
-            .context("Failed to finalize ACME order")?;
+            .map_err(AcmeError::protocol("Failed to finalize ACME order"))?;
 
         info!("Finalized ACME order for {}", domain);
 
@@ -205,11 +205,11 @@ impl AcmeClient {
         let cert_chain = order
             .poll_certificate(&retry_policy)
             .await
-            .context("Failed to download certificate after finalization")?;
+            .map_err(AcmeError::protocol("Failed to download certificate after finalization"))?;
 
         // Parse the certificate to get expiry date
         let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)
-            .context("Failed to parse issued certificate")?;
+            .map_err(AcmeError::wrap("Failed to parse issued certificate"))?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = cert_utils::split_certificate_chain(&cert_chain);
@@ -221,10 +221,10 @@ impl AcmeClient {
         let storage = CertificateStorage::new(&self.cert_dir);
         storage
             .initialize()
-            .context("Failed to initialize certificate storage")?;
+            .map_err(AcmeError::wrap("Failed to initialize certificate storage"))?;
         storage
             .save_certificate(domain, &cert_pem, &key_pem, Some(&chain_pem))
-            .context("Failed to save certificate files")?;
+            .map_err(AcmeError::wrap("Failed to save certificate files"))?;
 
         // Update in-memory certificate cache
         {
@@ -285,7 +285,7 @@ impl AcmeClient {
         &self,
         domain: &str,
         dns_solver: Arc<dyn DnsChallengeSolver>,
-    ) -> Result<CertificateMetadata> {
+    ) -> AcmeResult<CertificateMetadata> {
         info!("Requesting certificate for domain with DNS-01: {}", domain);
 
         // Check if we already have a valid certificate
@@ -301,7 +301,7 @@ impl AcmeClient {
             let guard = self.account.read().await;
             guard
                 .as_ref()
-                .context("ACME account not initialized. Call initialize() first.")?
+                .ok_or_else(|| AcmeError::msg("ACME account not initialized. Call initialize() first."))?
                 .clone()
         };
 
@@ -338,7 +338,7 @@ impl AcmeClient {
         let mut order = account
             .new_order(&order_params)
             .await
-            .context("Failed to create ACME order")?;
+            .map_err(AcmeError::protocol("Failed to create ACME order"))?;
 
         info!("Created ACME order for {}", domain);
 
@@ -348,12 +348,12 @@ impl AcmeClient {
         let mut authorizations = order.authorizations();
 
         while let Some(auth_result) = authorizations.next().await {
-            let mut auth_handle = auth_result.context("Failed to get order authorization")?;
+            let mut auth_handle = auth_result.map_err(AcmeError::protocol("Failed to get order authorization"))?;
 
             // Find the DNS-01 challenge
             let mut challenge_handle = auth_handle
                 .challenge(ChallengeType::Dns01)
-                .context(format!("No DNS-01 challenge found for domain {}", domain))?;
+                .ok_or_else(|| AcmeError::msgf(format!("No DNS-01 challenge found for domain {}", domain)))?;
 
             // Get the key authorization
             let key_authorization = challenge_handle.key_authorization();
@@ -378,7 +378,7 @@ impl AcmeClient {
             dns_solver
                 .create_txt_record(&acme_domain, &txt_value)
                 .await
-                .context("Failed to create DNS TXT record")?;
+                .map_err(AcmeError::wrap("Failed to create DNS TXT record"))?;
 
             txt_records_to_cleanup.push((acme_domain.clone(), txt_value.clone()));
 
@@ -386,7 +386,7 @@ impl AcmeClient {
             dns_solver
                 .wait_for_propagation(&acme_domain, &txt_value, Duration::from_secs(600))
                 .await
-                .context("DNS propagation timeout")?;
+                .map_err(AcmeError::wrap("DNS propagation timeout"))?;
 
             // Save challenge to database
             if let Some(db) = self.state.db() {
@@ -405,7 +405,7 @@ impl AcmeClient {
             challenge_handle
                 .set_ready()
                 .await
-                .context("Failed to set challenge ready")?;
+                .map_err(AcmeError::protocol("Failed to set challenge ready"))?;
 
             info!(
                 "DNS-01 challenge ready for {}: {}",
@@ -424,16 +424,16 @@ impl AcmeClient {
                 for (acme_domain, txt_value) in &txt_records_to_cleanup {
                     let _ = dns_solver.delete_txt_record(acme_domain, txt_value).await;
                 }
-                anyhow::bail!(
+                return Err(AcmeError::msgf(format!(
                     "Challenge validation timed out for domain {} after {:?}",
                     domain,
                     CHALLENGE_POLL_TIMEOUT
-                );
+                )));
             }
 
             tokio::time::sleep(CHALLENGE_POLL_INTERVAL).await;
 
-            let state = order.refresh().await.context("Failed to refresh order")?;
+            let state = order.refresh().await.map_err(AcmeError::protocol("Failed to refresh order"))?;
             let status = state.status;
 
             match status {
@@ -461,11 +461,11 @@ impl AcmeClient {
                             .await?;
                     }
 
-                    anyhow::bail!(
+                    return Err(AcmeError::msgf(format!(
                         "ACME order became invalid for domain {}: {}",
                         domain,
                         error_detail
-                    );
+                    )));
                 }
                 _ => {
                     continue;
@@ -474,19 +474,19 @@ impl AcmeClient {
         };
 
         // Generate CSR using rcgen
-        let key_pair = rcgen::KeyPair::generate().context("Failed to generate key pair")?;
+        let key_pair = rcgen::KeyPair::generate().map_err(AcmeError::GenerateKeyPair)?;
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
-            .map_err(|e| anyhow::anyhow!("Failed to create certificate params: {}", e))?;
+            .map_err(|e| AcmeError::CertParams(e.to_string()))?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params
             .serialize_request(&key_pair)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize CSR: {}", e))?;
+            .map_err(|e| AcmeError::SerializeCsr(e.to_string()))?;
 
         // Finalize the order with the CSR
         order
             .finalize_csr(csr.der())
             .await
-            .context("Failed to finalize ACME order")?;
+            .map_err(AcmeError::protocol("Failed to finalize ACME order"))?;
 
         info!("Finalized ACME order for {}", domain);
 
@@ -498,11 +498,11 @@ impl AcmeClient {
         let cert_chain = order
             .poll_certificate(&retry_policy)
             .await
-            .context("Failed to download certificate after finalization")?;
+            .map_err(AcmeError::protocol("Failed to download certificate after finalization"))?;
 
         // Parse the certificate to get expiry date
         let expires_at = cert_utils::parse_certificate_expiry(&cert_chain)
-            .context("Failed to parse issued certificate")?;
+            .map_err(AcmeError::wrap("Failed to parse issued certificate"))?;
 
         // Split the certificate chain into cert and chain PEM
         let (cert_pem, chain_pem) = cert_utils::split_certificate_chain(&cert_chain);
@@ -514,10 +514,10 @@ impl AcmeClient {
         let storage = CertificateStorage::new(&self.cert_dir);
         storage
             .initialize()
-            .context("Failed to initialize certificate storage")?;
+            .map_err(AcmeError::wrap("Failed to initialize certificate storage"))?;
         storage
             .save_certificate(domain, &cert_pem, &key_pem, Some(&chain_pem))
-            .context("Failed to save certificate files")?;
+            .map_err(AcmeError::wrap("Failed to save certificate files"))?;
 
         // Update in-memory certificate cache
         {

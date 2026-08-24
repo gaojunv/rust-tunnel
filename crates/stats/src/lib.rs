@@ -13,7 +13,7 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::db::Database;
+use rust_tunnel_persistence::Database;
 
 // ── Entity type ──────────────────────────────────────────────────
 
@@ -431,7 +431,7 @@ mod tests {
     /// 报主键冲突（服务重启后启动 flush 与重启前同一分钟的行撞主键的场景）。
     #[tokio::test]
     async fn flush_twice_same_minute_replaces_row() {
-        let db = crate::db::Database::new(":memory:")
+        let db = rust_tunnel_persistence::Database::new(":memory:")
             .await
             .expect("in-memory db");
         let c = StatsCollector::new(Some(db.clone()));

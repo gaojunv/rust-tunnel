@@ -1,3 +1,4 @@
+use crate::error::{AcmeError, AcmeResult};
 use async_trait::async_trait;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -12,14 +13,14 @@ const ALIYUN_DNS_API: &str = "https://alidns.aliyuncs.com/";
 /// - `"test.example.com"` -> `("example.com", "test")`
 /// - `"example.com"`      -> `("example.com", "@")`
 /// - `"*.example.com"`    -> `("example.com", "*")`
-fn parse_domain(domain: &str) -> anyhow::Result<(String, String)> {
+fn parse_domain(domain: &str) -> AcmeResult<(String, String)> {
     // Strip wildcard prefix if present
     let clean_domain = domain.strip_prefix("*.").unwrap_or(domain);
 
     let parts: Vec<&str> = clean_domain.split('.').collect();
 
     if parts.len() < 2 {
-        return Err(anyhow::anyhow!("Invalid domain format: {}", domain));
+        return Err(AcmeError::Dns(format!("Invalid domain format: {}", domain)));
     }
 
     // Root domain is the last two parts (e.g., "example.com")
@@ -113,7 +114,7 @@ impl AliyunDnsSolver {
         &self,
         action: &str,
         extra_params: Vec<(String, String)>,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> AcmeResult<serde_json::Value> {
         let mut params = vec![("Action".to_string(), action.to_string())];
         params.extend(extra_params);
 
@@ -136,24 +137,24 @@ impl AliyunDnsSolver {
         let body: serde_json::Value = response.json().await?;
 
         if !status.is_success() {
-            return Err(anyhow::anyhow!("Aliyun API error: {} - {}", status, body));
+            return Err(AcmeError::Dns(format!("Aliyun API error: {} - {}", status, body)));
         }
 
         // Check for Aliyun business-level errors
         if let Some(error_code) = body.get("Code") {
-            return Err(anyhow::anyhow!(
+            return Err(AcmeError::Dns(format!(
                 "Aliyun API error: {} - {}",
                 error_code,
                 body.get("Message")
                     .unwrap_or(&serde_json::Value::String("Unknown error".to_string()))
-            ));
+            )));
         }
 
         Ok(body)
     }
 
     /// Find an existing TXT record by domain and value
-    async fn find_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<Option<String>> {
+    async fn find_txt_record(&self, domain: &str, value: &str) -> AcmeResult<Option<String>> {
         let (main_domain, rr) = parse_domain(domain)?;
 
         let params = vec![
@@ -186,7 +187,7 @@ impl AliyunDnsSolver {
 
 #[async_trait]
 impl DnsChallengeSolver for AliyunDnsSolver {
-    async fn create_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<()> {
+    async fn create_txt_record(&self, domain: &str, value: &str) -> AcmeResult<()> {
         let (main_domain, rr) = parse_domain(domain)?;
 
         info!(
@@ -211,7 +212,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         Ok(())
     }
 
-    async fn delete_txt_record(&self, domain: &str, value: &str) -> anyhow::Result<()> {
+    async fn delete_txt_record(&self, domain: &str, value: &str) -> AcmeResult<()> {
         let (_main_domain, _rr) = parse_domain(domain)?;
 
         // Find the existing record
@@ -241,7 +242,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         domain: &str,
         value: &str,
         timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> AcmeResult<()> {
         use trust_dns_resolver::config::{
             NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
         };
@@ -271,7 +272,10 @@ impl DnsChallengeSolver for AliyunDnsSolver {
             // Check deadline BEFORE sleeping
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                anyhow::bail!("DNS propagation timeout for {} after {:?}", domain, timeout);
+                return Err(AcmeError::Dns(format!(
+                    "DNS propagation timeout for {} after {:?}",
+                    domain, timeout
+                )));
             }
 
             match resolver.txt_lookup(domain).await {

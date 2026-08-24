@@ -1,3 +1,4 @@
+use crate::error::{AcmeError, AcmeResult};
 use super::AcmeState;
 use axum::{
     extract::{Path, State},
@@ -23,7 +24,7 @@ impl ChallengeServer {
     }
 
     /// Start the challenge server
-    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(&self) -> AcmeResult<()> {
         let state = self.state.clone();
 
         let app = Router::new()
@@ -31,7 +32,9 @@ impl ChallengeServer {
             .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(AcmeError::storage("Failed to bind ACME challenge server"))?;
 
         info!("ACME challenge server listening on {}", addr);
 

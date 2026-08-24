@@ -28,6 +28,8 @@ rust-tunnel-persistence = { path = "../persistence" }
 rust-tunnel-rag = { path = "../rag", optional = true }
 rust-tunnel-llm = { path = "../llm" }
 rust-tunnel-agent = { path = "../agent" }
+rust-tunnel-pki = { path = "../pki" }
+rust-tunnel-stats = { path = "../stats" }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

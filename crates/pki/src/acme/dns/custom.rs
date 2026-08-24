@@ -1,3 +1,4 @@
+use crate::error::AcmeResult;
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -19,11 +20,11 @@ impl CustomDnsSolver {
 
 #[async_trait]
 impl DnsChallengeSolver for CustomDnsSolver {
-    async fn create_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+    async fn create_txt_record(&self, _domain: &str, _value: &str) -> AcmeResult<()> {
         todo!("Custom DNS TXT record creation via webhook")
     }
 
-    async fn delete_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+    async fn delete_txt_record(&self, _domain: &str, _value: &str) -> AcmeResult<()> {
         todo!("Custom DNS TXT record deletion via webhook")
     }
 
@@ -32,7 +33,7 @@ impl DnsChallengeSolver for CustomDnsSolver {
         _domain: &str,
         _value: &str,
         _timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> AcmeResult<()> {
         todo!("Custom DNS propagation check")
     }
 

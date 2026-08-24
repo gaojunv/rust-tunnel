@@ -1,7 +1,7 @@
 // 测试代码豁免 panic 风险 lint（生产代码仍告警）
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-pub mod pki;
+pub use rust_tunnel_pki as pki;
 // 测试辅助设施（仅 cfg(test) 编译）
 #[cfg(test)]
 pub mod test_helpers;

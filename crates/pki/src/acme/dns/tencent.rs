@@ -1,3 +1,4 @@
+use crate::error::AcmeResult;
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -19,11 +20,11 @@ impl TencentDnsSolver {
 
 #[async_trait]
 impl DnsChallengeSolver for TencentDnsSolver {
-    async fn create_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+    async fn create_txt_record(&self, _domain: &str, _value: &str) -> AcmeResult<()> {
         todo!("Tencent DNS TXT record creation")
     }
 
-    async fn delete_txt_record(&self, _domain: &str, _value: &str) -> anyhow::Result<()> {
+    async fn delete_txt_record(&self, _domain: &str, _value: &str) -> AcmeResult<()> {
         todo!("Tencent DNS TXT record deletion")
     }
 
@@ -32,7 +33,7 @@ impl DnsChallengeSolver for TencentDnsSolver {
         _domain: &str,
         _value: &str,
         _timeout: Duration,
-    ) -> anyhow::Result<()> {
+    ) -> AcmeResult<()> {
         todo!("Tencent DNS propagation check")
     }
 

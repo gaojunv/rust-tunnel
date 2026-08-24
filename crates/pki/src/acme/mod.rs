@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::db::Database;
+use rust_tunnel_persistence::Database;
 
 /// ACME certificate status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1,23 +1,23 @@
-use anyhow::{Context, Result};
+use crate::error::{AcmeError, AcmeResult};
 use x509_parser::prelude::*;
 
 /// Parse a PEM certificate chain and extract the expiry date of the first (leaf) certificate
 pub(super) fn parse_certificate_expiry(
     cert_chain_pem: &str,
-) -> Result<chrono::DateTime<chrono::Utc>> {
+) -> AcmeResult<chrono::DateTime<chrono::Utc>> {
     // Parse the PEM data
     let (_, pem) = x509_parser::pem::parse_x509_pem(cert_chain_pem.as_bytes())
-        .context("Failed to parse certificate PEM")?;
+        .map_err(|_| AcmeError::msg("Failed to parse certificate PEM"))?;
 
     // Parse the DER-encoded certificate
-    let (_, cert) =
-        X509Certificate::from_der(&pem.contents).context("Failed to parse certificate DER")?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|_| AcmeError::msg("Failed to parse certificate DER"))?;
 
     // Extract the expiry date (x509-parser returns time::OffsetDateTime, convert to chrono)
     let not_after = cert.validity.not_after.to_datetime();
     let ts = not_after.unix_timestamp();
     let naive = chrono::DateTime::from_timestamp(ts, 0)
-        .context("Failed to create DateTime from timestamp")?;
+        .ok_or_else(|| AcmeError::msg("Failed to create DateTime from timestamp"))?;
 
     Ok(naive)
 }

@@ -2,4 +2,4 @@ pub mod api;
 pub mod auth;
 pub mod dynamic_config;
 pub mod logs;
-pub mod stats;
+pub use rust_tunnel_stats as stats;
