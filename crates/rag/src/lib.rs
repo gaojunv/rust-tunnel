@@ -1,3 +1,13 @@
+//! RAG 知识库：多格式文本提取（extractor）→ Markdown 分块（chunker）→
+//! 远端 embedding（embedder）→ qdrant-edge 向量 shard（store）→
+//! 检索与注入文本组装（retriever）→ 后台摄入任务（ingest）。
+//!
+//! 本 crate 不依赖 llm 协议类型；[`retrieve_context`] 返回结构化检索结果，
+//! 由调用方（llm pipeline）注入自己的请求消息类型。
+
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod chunker;
 pub mod embedder;
 pub mod extractor;
@@ -5,8 +15,8 @@ pub mod ingest;
 pub mod retriever;
 pub mod store;
 
-use crate::db::Database;
-use crate::llm::crypto::LlmCipher;
+use rust_tunnel_common::crypto::LlmCipher;
+use rust_tunnel_persistence::Database;
 use retriever::RetrievedChunk;
 use store::VectorStore;
 

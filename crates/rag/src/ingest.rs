@@ -6,8 +6,8 @@ use super::{
     extractor::{self, FileType},
     store::{ChunkPoint, VectorStore},
 };
-use crate::db::rag::RagKnowledgeBaseRecord;
-use crate::db::Database;
+use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
+use rust_tunnel_persistence::Database;
 use rust_tunnel_common::crypto::{decrypt_field, LlmCipher};
 use futures_util::FutureExt;
 use std::sync::Arc;
@@ -215,9 +215,9 @@ mod tests {
 
     use tokio::sync::broadcast;
 
-    use crate::db::rag::RagKnowledgeBaseRecord;
-    use crate::db::Database;
-    use crate::llm::rag::extractor::pdf::make_empty_page_pdf;
+    use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
+    use rust_tunnel_persistence::Database;
+    use crate::extractor::pdf::make_empty_page_pdf;
 
     use super::*;
 

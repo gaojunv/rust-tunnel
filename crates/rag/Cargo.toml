@@ -21,6 +21,9 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

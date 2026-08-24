@@ -8,8 +8,9 @@ pub mod format;
 pub mod openai_handler;
 pub mod pipeline;
 pub mod provider;
+// RAG 已拆分为独立 crate；`llm::rag` 路径经 re-export 保持兼容
 #[cfg(feature = "rag")]
-pub mod rag;
+pub use rust_tunnel_rag as rag;
 pub mod responses;
 pub mod responses_handler;
 pub mod route_cache;

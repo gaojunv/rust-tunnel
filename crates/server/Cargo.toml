@@ -20,11 +20,12 @@ path = "src/bin/checkdb.rs"
 [features]
 default = []
 embed-frontend = ["dep:rust-embed"]
-rag = ["dep:qdrant-edge"]
+rag = ["dep:rust-tunnel-rag"]
 
 [dependencies]
 rust-tunnel-common = { path = "../common" }
 rust-tunnel-persistence = { path = "../persistence" }
+rust-tunnel-rag = { path = "../rag", optional = true }
 tokio.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
@@ -52,7 +53,6 @@ jsonwebtoken.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-qdrant-edge = { workspace = true, optional = true }
 sqlx.workspace = true
 gethostname.workspace = true
 toml.workspace = true

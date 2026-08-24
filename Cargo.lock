@@ -4833,6 +4833,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-tunnel-rag"
+version = "0.4.0"
+dependencies = [
+ "axum 0.7.9",
+ "futures-util",
+ "lopdf",
+ "qdrant-edge",
+ "quick-xml",
+ "reqwest",
+ "rust-tunnel-common",
+ "rust-tunnel-persistence",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "rust-tunnel-server"
 version = "0.4.0"
 dependencies = [
@@ -4865,7 +4887,6 @@ dependencies = [
  "lopdf",
  "md-5",
  "mime_guess",
- "qdrant-edge",
  "quick-xml",
  "rand 0.8.6",
  "rcgen",
@@ -4873,6 +4894,7 @@ dependencies = [
  "rust-embed",
  "rust-tunnel-common",
  "rust-tunnel-persistence",
+ "rust-tunnel-rag",
  "rustls 0.22.4",
  "rustls-native-certs 0.7.3",
  "rustls-pemfile",

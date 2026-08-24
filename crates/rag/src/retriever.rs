@@ -2,8 +2,8 @@
 
 use super::embedder::Embedder;
 use super::store::VectorStore;
-use crate::db::rag::RagKnowledgeBaseRecord;
-use crate::db::Database;
+use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
+use rust_tunnel_persistence::Database;
 use rust_tunnel_common::crypto::decrypt_field;
 use rust_tunnel_common::crypto::LlmCipher;
 
