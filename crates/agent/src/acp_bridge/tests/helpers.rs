@@ -230,9 +230,7 @@ where
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, mut rx) = mpsc::channel(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let registry2 = registry.clone();
     tokio::spawn(async move {
         loop {
@@ -283,9 +281,7 @@ pub(super) async fn fs_test_env(
         .unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, mut rx) = mpsc::channel(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let registry2 = registry.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
@@ -301,7 +297,11 @@ pub(super) async fn fs_test_env(
     let mut agent = spawned_agent();
     agent.client_id = "nas".into();
     sessions.lock().await.insert("sess-1".into(), agent);
-    (db, AgentSpawner::new(std::sync::Arc::new(registry)), sessions)
+    (
+        db,
+        AgentSpawner::new(std::sync::Arc::new(registry)),
+        sessions,
+    )
 }
 
 /// 装配 MCP 隧道测试环境：注册客户端 + 可选会话条目（带 mcp_token）。
@@ -337,9 +337,7 @@ pub(super) async fn mcp_tunnel_env(
     }
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, rx) = mpsc::channel(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
     if let Some(t) = mcp_token {
         let mut agent = spawned_agent();
@@ -652,9 +650,7 @@ pub(super) async fn spawn_e2e_client(
     mcp_servers: Arc<Mutex<Vec<serde_json::Value>>>,
 ) {
     let (tx, mut rx) = mpsc::channel::<ControlMessage>(64);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let registry2 = registry.clone();
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(32);
     let (proc_stdout_tx, mut proc_stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -738,9 +734,7 @@ pub(super) async fn handshake_test_bridge() -> AcpBridge {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db)
 }
 
@@ -750,9 +744,7 @@ pub(super) async fn register_cancel_observer(
     registry: &crate::test_helpers::TestRegistry,
 ) -> Arc<Mutex<Vec<String>>> {
     let (client_tx, mut client_rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, client_tx)
-        .await;
+    registry.register("nas", None, client_tx).await;
     let cancels = Arc::new(Mutex::new(Vec::<String>::new()));
     let observer = cancels.clone();
     tokio::spawn(async move {

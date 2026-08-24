@@ -6,9 +6,7 @@ async fn test_handle_llm_proxy_request_unregistered_session_502() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, mut rx) = mpsc::channel(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     bridge

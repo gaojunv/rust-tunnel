@@ -418,8 +418,10 @@ pub async fn init_llm_state(
     let llm = LlmState::new_with_rag(db, cipher, rag_data_dir);
     #[cfg(not(feature = "rag"))]
     let llm = LlmState::new(db, cipher);
-    llm.request_logging
-        .store(request_logging_enabled, std::sync::atomic::Ordering::Relaxed);
+    llm.request_logging.store(
+        request_logging_enabled,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if let Some(rule) = gateway_rule {
         let (openai_domain, anthropic_domain) = if rule.domains.len() >= 2 {
@@ -582,7 +584,10 @@ pub fn sanitize_request_body(body: &serde_json::Value) -> serde_json::Value {
             return;
         }
         let head: String = chars.iter().take(MAX_LOG_STRING_CHARS).collect();
-        *s = format!("{head}…[truncated {} chars]", chars.len() - MAX_LOG_STRING_CHARS);
+        *s = format!(
+            "{head}…[truncated {} chars]",
+            chars.len() - MAX_LOG_STRING_CHARS
+        );
     }
     fn walk(v: &mut serde_json::Value) {
         match v {
@@ -624,7 +629,10 @@ pub async fn log_llm_request(
     elapsed_ms: u128,
     request_body: &serde_json::Value,
 ) {
-    if !llm.request_logging.load(std::sync::atomic::Ordering::Relaxed) {
+    if !llm
+        .request_logging
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     // 全部字段用 %（record_str）输出：LogLayer 只把 record_str 字段拼进 message，
@@ -672,7 +680,9 @@ mod tests {
         // 默认构造：request_logging 必须开启（生产路径由 init_llm_state 注入真实值覆盖）
         let state = LlmState::new(None, None);
         assert!(
-            state.request_logging.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .request_logging
+                .load(std::sync::atomic::Ordering::Relaxed),
             "default request_logging should be enabled"
         );
     }
@@ -735,7 +745,10 @@ mod tests {
             .unwrap()
             .ends_with("[truncated 1000 chars]"));
         // 原始 body 不受影响
-        assert_eq!(body["messages"][0]["content"].as_str().unwrap().len(), 10_000);
+        assert_eq!(
+            body["messages"][0]["content"].as_str().unwrap().len(),
+            10_000
+        );
     }
 
     #[test]

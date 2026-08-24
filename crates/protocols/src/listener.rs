@@ -6,12 +6,12 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::port_registry::{PortInfo, PortRegistry};
-use rust_tunnel_stats::StatsCollector;
+use crate::shadowsocks::handle_ss_handshake;
 use crate::shadowsocks::proxy_ss_connection;
 use crate::trojan::proxy_trojan_connection;
-use crate::shadowsocks::handle_ss_handshake;
 use crate::trojan::{handle_trojan_fallback, handle_trojan_handshake};
 use rust_tunnel_common::{TunnelError, TunnelResult};
+use rust_tunnel_stats::StatsCollector;
 
 /// Generate a unique connection ID
 fn generate_connection_id() -> u64 {
@@ -45,9 +45,7 @@ pub async fn start_shadowsocks_listener(
         let st = stats.clone();
         tokio::spawn(async move {
             let connection_id = generate_connection_id();
-            if let Err(e) =
-                handle_inbound_connection(reg, st, port, connection_id, inbound).await
-            {
+            if let Err(e) = handle_inbound_connection(reg, st, port, connection_id, inbound).await {
                 debug!("SS connection error: {}", e);
             }
         });
@@ -135,7 +133,16 @@ pub async fn handle_trojan_connection(
                 "Trojan authenticated: target={}, cmd={:?}",
                 ctx.target_addr, ctx.command
             );
-            proxy_trojan_connection(connection_id, port, tls_stream, ctx, payload, registry, stats).await;
+            proxy_trojan_connection(
+                connection_id,
+                port,
+                tls_stream,
+                ctx,
+                payload,
+                registry,
+                stats,
+            )
+            .await;
         }
         Err(e) => {
             warn!(
@@ -306,8 +313,15 @@ async fn handle_inbound_connection(
             .await
             {
                 Ok((ss_ctx, proxy_stream)) => {
-                    proxy_ss_connection(connection_id, remote_port, proxy_stream, ss_ctx, registry, stats)
-                        .await;
+                    proxy_ss_connection(
+                        connection_id,
+                        remote_port,
+                        proxy_stream,
+                        ss_ctx,
+                        registry,
+                        stats,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     warn!(

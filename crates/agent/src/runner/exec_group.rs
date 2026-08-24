@@ -1,13 +1,12 @@
 //! Read-only tool concurrency group (bounded parallel execution).
+use super::{
+    agent_result_to_text, client_supports_git_exec, client_supports_read_range,
+    client_supports_search_patch, ParsedToolCall, MIN_GIT_EXEC_CLIENT_VERSION,
+    MIN_READ_RANGE_CLIENT_VERSION, MIN_SEARCH_PATCH_CLIENT_VERSION, READONLY_CONCURRENCY,
+};
 use crate::session::SessionRuntime;
 use crate::{executor, tools, AgentState};
 use rust_tunnel_common::{AgentCommand, AgentResult};
-use super::{
-    agent_result_to_text, client_supports_git_exec, client_supports_read_range,
-    client_supports_search_patch, ParsedToolCall, READONLY_CONCURRENCY,
-    MIN_GIT_EXEC_CLIENT_VERSION, MIN_READ_RANGE_CLIENT_VERSION,
-    MIN_SEARCH_PATCH_CLIENT_VERSION,
-};
 
 pub async fn exec_readonly_group(
     agent: AgentState,
@@ -33,7 +32,17 @@ pub async fn exec_readonly_group(
             let c_name = call.name.clone();
             let c_args = call.args.clone();
             handles.push(tokio::spawn(async move {
-                exec_readonly_one(&agent, &cid, &wid, &rpath, dc.as_deref(), &rt_type, &c_name, &c_args).await
+                exec_readonly_one(
+                    &agent,
+                    &cid,
+                    &wid,
+                    &rpath,
+                    dc.as_deref(),
+                    &rt_type,
+                    &c_name,
+                    &c_args,
+                )
+                .await
             }));
         }
         for h in handles {
@@ -84,7 +93,11 @@ async fn exec_readonly_one(
         _ => None,
     };
     if let Some((min_version, supports)) = gated {
-        let version = agent.registry.client_handle(client_id).await.and_then(|h| h.client_version);
+        let version = agent
+            .registry
+            .client_handle(client_id)
+            .await
+            .and_then(|h| h.client_version);
         if !supports(version.as_deref()) {
             return format!(
                 "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
@@ -93,7 +106,9 @@ async fn exec_readonly_one(
         }
     }
     let result = if runtime_type == "docker" && docker_container.is_none() {
-        AgentResult::Error { message: "docker container not started".into() }
+        AgentResult::Error {
+            message: "docker container not started".into(),
+        }
     } else {
         executor::exec_on_client_readonly(
             agent,

@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-
 /// 按 agent 类型生成启动命令。agent_path 为 None 时依赖 PATH 查找。
 pub fn agent_command(
     agent_type: &str,
@@ -105,10 +104,7 @@ fn opencode_config_content(
         }
     }
     for name in &names {
-        models_map.insert(
-            (*name).to_string(),
-            serde_json::json!({"name": name}),
-        );
+        models_map.insert((*name).to_string(), serde_json::json!({"name": name}));
     }
     if models_map.is_empty() && default_model.is_none() {
         return None;
@@ -307,9 +303,8 @@ mod tests {
     /// `client_handle`/`send_*` 按离线语义返回。
     #[derive(Default)]
     struct MockExecutor {
-        responder: tokio::sync::Mutex<
-            Option<Box<dyn FnOnce(ControlMessage) -> ControlMessage + Send>>,
-        >,
+        responder:
+            tokio::sync::Mutex<Option<Box<dyn FnOnce(ControlMessage) -> ControlMessage + Send>>>,
     }
 
     #[async_trait::async_trait]
@@ -324,14 +319,9 @@ mod tests {
             request: ControlMessage,
             _timeout: Duration,
         ) -> std::io::Result<ControlMessage> {
-            let respond = self
-                .responder
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotConnected, "client offline")
-                })?;
+            let respond = self.responder.lock().await.take().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "client offline")
+            })?;
             Ok(respond(request))
         }
         async fn agent_exec(
@@ -344,16 +334,15 @@ mod tests {
             _command: rust_tunnel_common::AgentCommand,
             _timeout: Duration,
         ) -> std::io::Result<rust_tunnel_common::AgentResult> {
-            Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "client offline"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "client offline",
+            ))
         }
         async fn send_agent_cancel(&self, _client_id: &str, _request_id: &str) -> bool {
             false
         }
-        async fn send_control(
-            &self,
-            _client_id: &str,
-            _msg: ControlMessage,
-        ) -> bool {
+        async fn send_control(&self, _client_id: &str, _msg: ControlMessage) -> bool {
             false
         }
         async fn open_tunnel(
@@ -361,7 +350,10 @@ mod tests {
             _client_id: &str,
             _target_addr: &str,
         ) -> std::io::Result<crate::TunnelByteStream> {
-            Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "client offline"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "client offline",
+            ))
         }
     }
 
@@ -463,11 +455,13 @@ mod tests {
         let base = env.iter().find(|(k, _)| k == "OPENAI_BASE_URL").unwrap();
         assert_eq!(base.1, "http://127.0.0.1:45678/v1");
         assert!(
-            env.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "tunnel-injected"),
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "tunnel-injected"),
             "ANTHROPIC_API_KEY must be injected: {env:?}"
         );
         assert!(
-            env.iter().any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "tunnel-injected"),
+            env.iter()
+                .any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v == "tunnel-injected"),
             "ANTHROPIC_AUTH_TOKEN must be injected: {env:?}"
         );
         // 非 opencode agent 不注入 OPENCODE_CONFIG_CONTENT
@@ -518,7 +512,9 @@ mod tests {
             "@ai-sdk/openai-compatible"
         );
         // models map 含 available_models + default_model（去重）
-        let models_map = config["provider"]["rust-tunnel"]["models"].as_object().unwrap();
+        let models_map = config["provider"]["rust-tunnel"]["models"]
+            .as_object()
+            .unwrap();
         assert!(models_map.contains_key("gpt-4o-mini"));
         assert!(models_map.contains_key("claude-3-5-sonnet"));
         assert!(models_map.contains_key("gpt-4o"));
@@ -533,8 +529,14 @@ mod tests {
             .expect("provider should still be injected: {env_none:?}");
         let config_none: serde_json::Value =
             serde_json::from_str(content_none).expect("valid JSON");
-        assert!(config_none.get("model").is_none(), "no model key: {config_none}");
-        assert!(config_none.get("small_model").is_none(), "no small_model key");
+        assert!(
+            config_none.get("model").is_none(),
+            "no model key: {config_none}"
+        );
+        assert!(
+            config_none.get("small_model").is_none(),
+            "no small_model key"
+        );
         assert_eq!(
             config_none["provider"]["rust-tunnel"]["options"]["baseURL"],
             "http://127.0.0.1:45678/v1"
@@ -542,13 +544,17 @@ mod tests {
         // 空/None 模型不注入
         let env_blank = agent_env("opencode", 45678, Some("   "), &["gpt-4o".to_string()], &[]);
         assert!(
-            env_blank.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
+            env_blank
+                .iter()
+                .any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
             "blank model but available models -> still inject provider: {env_blank:?}"
         );
         // 空模型 + 空 available_models：无注入意义，返回 None → 不注入环境变量
         let env_empty = agent_env("opencode", 45678, None, &[], &[]);
         assert!(
-            !env_empty.iter().any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
+            !env_empty
+                .iter()
+                .any(|(k, _)| k == "OPENCODE_CONFIG_CONTENT"),
             "empty models + no default -> no injection: {env_empty:?}"
         );
     }
@@ -671,8 +677,7 @@ mod tests {
                     .find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
                     .map(|(_, v)| v.as_str())
                     .expect("OPENCODE_CONFIG_CONTENT should be injected: {env:?}");
-                let config: serde_json::Value =
-                    serde_json::from_str(content).expect("valid JSON");
+                let config: serde_json::Value = serde_json::from_str(content).expect("valid JSON");
                 assert!(
                     config["provider"]["rust-tunnel"]["options"]["baseURL"]
                         .as_str()

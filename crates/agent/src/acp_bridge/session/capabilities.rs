@@ -9,14 +9,11 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
-
-
-
 
 /// 本服务端声明的 ACP 客户端能力：fs 读写经隧道转发到客户端沙箱执行。
 /// 不声明则 agent 静默降级（如报「不支持」）。

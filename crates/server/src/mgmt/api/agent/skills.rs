@@ -19,13 +19,15 @@ use axum::{
 use serde::Deserialize;
 
 use crate::agent::memory::scope_coords;
-use crate::agent::skill::{SKILL_CONTENT_MAX_CHARS, SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_CHARS};
+use crate::agent::skill::{
+    SKILL_CONTENT_MAX_CHARS, SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_CHARS,
+};
 use crate::db::agent::normalize_db_datetime;
 use crate::db::skills::{AgentSkillRecord, AgentSkillSummary};
 use crate::mgmt::api::ApiState;
 
-use super::memory::validate_tags;
 use super::mem_runtime;
+use super::memory::validate_tags;
 
 const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
 
@@ -140,10 +142,7 @@ fn skill_summary_json(s: &AgentSkillSummary) -> serde_json::Value {
 // ── 校验 ─────────────────────────────────────────────────────────
 
 /// 校验 name（非空 + ≤64）与 content（非空 + ≤16KB）。
-fn validate_name_and_content(
-    name: &str,
-    content: &str,
-) -> Result<(), (StatusCode, String)> {
+fn validate_name_and_content(name: &str, content: &str) -> Result<(), (StatusCode, String)> {
     let name = name.trim();
     if name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name is required".to_string()));
@@ -288,7 +287,8 @@ pub async fn create_skill(
     if let Err(e) = validate_tags(&body.tags) {
         return e.into_response();
     }
-    let (scope_type, client_id, workspace_id) = scope_coords(scope, &body.client_id, &body.workspace_id);
+    let (scope_type, client_id, workspace_id) =
+        scope_coords(scope, &body.client_id, &body.workspace_id);
     match crate::agent::skill::upsert_skill_with_dedup(
         &mem,
         name,
@@ -312,10 +312,7 @@ pub async fn create_skill(
 }
 
 /// GET /api/agent/skills/:id — 详情（含 content 全文）。
-pub async fn get_skill(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+pub async fn get_skill(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
         Err(e) => return e.into_response(),
@@ -384,7 +381,10 @@ pub async fn update_skill(
         None => &existing_tags,
     };
     let base_client = body.client_id.as_deref().unwrap_or(&existing.client_id);
-    let base_workspace = body.workspace_id.as_deref().unwrap_or(&existing.workspace_id);
+    let base_workspace = body
+        .workspace_id
+        .as_deref()
+        .unwrap_or(&existing.workspace_id);
     let (scope_type, client_id, workspace_id) = scope_coords(scope, base_client, base_workspace);
     let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
     let normalized_name = crate::agent::skill::normalize_skill_name(name);
@@ -651,7 +651,11 @@ mod tests {
         // toggle
         let (status, _) = call(
             &app,
-            json_request(Method::POST, format!("/api/agent/skills/{id}/toggle"), &json!(null)),
+            json_request(
+                Method::POST,
+                format!("/api/agent/skills/{id}/toggle"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -664,7 +668,11 @@ mod tests {
         // enabled=false 过滤
         let (_, body) = call(
             &app,
-            json_request(Method::GET, "/api/agent/skills?enabled=false".to_string(), &json!(null)),
+            json_request(
+                Method::GET,
+                "/api/agent/skills?enabled=false".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(body["total"], json!(1));
@@ -672,7 +680,11 @@ mod tests {
         // delete → 404
         let (status, _) = call(
             &app,
-            json_request(Method::DELETE, format!("/api/agent/skills/{id}"), &json!(null)),
+            json_request(
+                Method::DELETE,
+                format!("/api/agent/skills/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);

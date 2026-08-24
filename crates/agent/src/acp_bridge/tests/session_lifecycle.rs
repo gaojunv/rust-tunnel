@@ -33,8 +33,18 @@ async fn test_ensure_session_restores_persisted_pending() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
     db.agent_create_workspace(
-        "w1", "proj", "nas", "host", "/workspace", None, None, "gemini",
-        None, Some("model-1"), None, None,
+        "w1",
+        "proj",
+        "nas",
+        "host",
+        "/workspace",
+        None,
+        None,
+        "gemini",
+        None,
+        Some("model-1"),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -92,8 +102,18 @@ async fn test_spawn_failure_persisted_with_stage_attribution() {
     // agent_sessions.last_spawn_error，重启后仍可追溯。
     let db = Database::new(":memory:").await.unwrap();
     db.agent_create_workspace(
-        "w1", "proj", "ghost", "host", "/workspace", None, None, "gemini",
-        None, Some("model-1"), None, None,
+        "w1",
+        "proj",
+        "ghost",
+        "host",
+        "/workspace",
+        None,
+        None,
+        "gemini",
+        None,
+        Some("model-1"),
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -113,7 +133,10 @@ async fn test_spawn_failure_persisted_with_stage_attribution() {
     assert!(err.starts_with("llm_proxy:"), "stage 前缀缺失: {err}");
     let s = db.agent_get_session("sess-1").await.unwrap().unwrap();
     let persisted = s.last_spawn_error.expect("spawn error should persist");
-    assert!(persisted.starts_with("llm_proxy:"), "persisted: {persisted}");
+    assert!(
+        persisted.starts_with("llm_proxy:"),
+        "persisted: {persisted}"
+    );
 }
 
 #[tokio::test]
@@ -185,9 +208,7 @@ async fn test_ensure_session_session_model_passes_gate() {
         .unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, mut rx) = mpsc::channel(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let registry2 = registry.clone();
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
@@ -246,12 +267,10 @@ async fn test_ensure_session_offline_client_fails() {
 async fn test_ensure_session_unsupported_agent_type() {
     // 模拟客户端应答 LLM 代理端口；agent_type 非法在本地报错（spawn 前）
     let bridge = mock_bridge(|req| match req {
-        ControlMessage::AgentLlmProxyStart { session_id } => {
-            ControlMessage::AgentLlmProxyReady {
-                session_id,
-                port: 45678,
-            }
-        }
+        ControlMessage::AgentLlmProxyStart { session_id } => ControlMessage::AgentLlmProxyReady {
+            session_id,
+            port: 45678,
+        },
         other => panic!("unexpected request: {other:?}"),
     })
     .await;

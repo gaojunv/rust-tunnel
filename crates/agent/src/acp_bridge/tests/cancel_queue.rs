@@ -9,9 +9,7 @@ async fn test_submit_prompt_queues_when_busy_and_drains() {
     db.save_server_auth("secret").await.unwrap();
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let (tx, _rx) = mpsc::channel::<ControlMessage>(32);
-    registry
-        .register("nas", None, tx)
-        .await;
+    registry.register("nas", None, tx).await;
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<serde_json::Value>(32);

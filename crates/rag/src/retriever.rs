@@ -2,10 +2,10 @@
 
 use super::embedder::Embedder;
 use super::store::VectorStore;
-use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
-use rust_tunnel_persistence::Database;
 use rust_tunnel_common::crypto::decrypt_field;
 use rust_tunnel_common::crypto::LlmCipher;
+use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
+use rust_tunnel_persistence::Database;
 
 #[derive(Debug, Clone)]
 pub struct RetrievedChunk {

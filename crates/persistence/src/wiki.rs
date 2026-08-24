@@ -181,8 +181,8 @@ pub struct WikiGraphEdge {
 // ── 容器 CRUD ───────────────────────────────────────────────────
 
 impl Database {
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_create(
         &self,
         id: &str,
@@ -206,16 +206,16 @@ impl Database {
         .await?;
         Ok(())
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get(&self, id: &str) -> Result<Option<AgentWikiRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiRecord>("SELECT * FROM agent_wikis WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_by_name_scope(
         &self,
         name: &str,
@@ -233,8 +233,8 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update(
         &self,
         id: &str,
@@ -251,8 +251,8 @@ impl Database {
         .await?;
         Ok(())
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         // Pages/Docs/Edges 经 FK CASCADE 清理；FTS 残留需显式清理（rowid 无 FK）
         let page_ids: Vec<(String,)> =
@@ -282,8 +282,8 @@ impl Database {
     }
 
     /// 列表（作用域 / q / status 过滤 + 分页）。`scope_type` 精确过滤；空串不过滤。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     #[allow(clippy::too_many_arguments)]
     pub async fn wiki_list(
         &self,
@@ -316,13 +316,16 @@ impl Database {
             qb.push(" AND status = ").push_bind(st);
         }
         qb.push(" ORDER BY updated_at DESC");
-        qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        qb.push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
         qb.build_query_as::<AgentWikiRecord>()
             .fetch_all(&self.pool)
             .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_count(
         &self,
         scope_type: Option<&str>,
@@ -355,8 +358,8 @@ impl Database {
     }
 
     /// 对账：把 `pending`/`processing` 的 wiki 置为 `failed`（启动时调用）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_fail_inflight(&self, error: &str) -> Result<u64, sqlx::Error> {
         let _ = error; // 容器无 error 列，仅复位状态（参数保留与 docs 对账签名一致）
         let r = sqlx::query(
@@ -368,8 +371,8 @@ impl Database {
     }
 
     /// 容器状态更新（摄入管线用：processing/ready/failed）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update_status(&self, id: &str, status: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE agent_wikis SET status = ?, updated_at = datetime('now') WHERE id = ?")
             .bind(status)
@@ -380,8 +383,8 @@ impl Database {
     }
 
     /// 原子 CAS：仅当 `pending` → `processing` 可抢占（摄入入口）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_mark_doc_processing_if_pending(&self, id: &str) -> Result<bool, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'processing', updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
@@ -393,8 +396,8 @@ impl Database {
     }
 
     // ── 文档 CRUD ────────────────────────────────────────────────
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_create_doc(
         &self,
         id: &str,
@@ -415,17 +418,20 @@ impl Database {
         .await?;
         Ok(())
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_doc(&self, id: &str) -> Result<Option<AgentWikiDocRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiDocRecord>("SELECT * FROM agent_wiki_docs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
-    pub async fn wiki_list_docs(&self, wiki_id: &str) -> Result<Vec<AgentWikiDocRecord>, sqlx::Error> {
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
+    pub async fn wiki_list_docs(
+        &self,
+        wiki_id: &str,
+    ) -> Result<Vec<AgentWikiDocRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiDocRecord>(
             "SELECT * FROM agent_wiki_docs WHERE wiki_id = ? ORDER BY created_at",
         )
@@ -433,8 +439,8 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_delete_doc(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_wiki_docs WHERE id = ?")
             .bind(id)
@@ -443,8 +449,8 @@ impl Database {
         // source_doc_id SET NULL 由 FK 负责，无需额外处理
         Ok(())
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_update_doc_status(
         &self,
         id: &str,
@@ -463,8 +469,8 @@ impl Database {
     }
 
     /// CAS：仅当 `pending`→`processing` 或 `ready`/`failed`→`pending` 的空闲态可抢占。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_mark_doc_pending_if_idle(&self, id: &str) -> Result<bool, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'pending', error = NULL, updated_at = datetime('now') \
@@ -475,8 +481,8 @@ impl Database {
         .await?;
         Ok(r.rows_affected() > 0)
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_fail_inflight_docs(&self, error: &str) -> Result<u64, sqlx::Error> {
         let r = sqlx::query(
             "UPDATE agent_wiki_docs SET status = 'failed', error = ?, updated_at = datetime('now') \
@@ -492,8 +498,8 @@ impl Database {
 
     /// 页面 upsert：`locked=1` 的页不被覆盖；同事务同步 FTS 与边。
     /// `source_doc_id` 可空（手动页为 `None`）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn wiki_upsert_page(
         &self,
@@ -506,13 +512,12 @@ impl Database {
         source_doc_id: Option<&str>,
     ) -> Result<String, sqlx::Error> {
         // 检查是否 locked
-        let existing: Option<AgentWikiPageRecord> = sqlx::query_as(
-            "SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND ref = ?",
-        )
-        .bind(wiki_id)
-        .bind(page_ref)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing: Option<AgentWikiPageRecord> =
+            sqlx::query_as("SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND ref = ?")
+                .bind(wiki_id)
+                .bind(page_ref)
+                .fetch_optional(&self.pool)
+                .await?;
         if let Some(ref row) = existing {
             if row.locked != 0 && !locked {
                 // ingest 不覆盖 locked 页：静默跳过，返回既有 id
@@ -530,9 +535,10 @@ impl Database {
             None
         };
 
-        let page_id = existing
-            .as_ref()
-            .map_or_else(|| format!("{:032x}", rand::random::<u128>()), |r| r.id.clone());
+        let page_id = existing.as_ref().map_or_else(
+            || format!("{:032x}", rand::random::<u128>()),
+            |r| r.id.clone(),
+        );
 
         let links = parse_wiki_links(content);
 
@@ -626,10 +632,11 @@ impl Database {
         .await?;
 
         // 更新容器 page_count/version
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = ?")
-            .bind(wiki_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = ?")
+                .bind(wiki_id)
+                .fetch_one(&mut *tx)
+                .await?;
         sqlx::query(
             "UPDATE agent_wikis SET page_count = ?, version = version + 1, updated_at = datetime('now') WHERE id = ?",
         )
@@ -641,8 +648,8 @@ impl Database {
         tx.commit().await?;
         Ok(page_id)
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_page(
         &self,
         wiki_id: &str,
@@ -656,9 +663,12 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
-    pub async fn wiki_get_page_by_id(&self, id: &str) -> Result<Option<AgentWikiPageRecord>, sqlx::Error> {
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
+    pub async fn wiki_get_page_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<AgentWikiPageRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWikiPageRecord>("SELECT * FROM agent_wiki_pages WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -666,16 +676,19 @@ impl Database {
     }
 
     /// 删除页面：同事务清 FTS、出边与入边悬空化。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
-    pub async fn wiki_delete_page(&self, wiki_id: &str, page_ref: &str) -> Result<bool, sqlx::Error> {
-        let existing: Option<AgentWikiPageRecord> = sqlx::query_as(
-            "SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND ref = ?",
-        )
-        .bind(wiki_id)
-        .bind(page_ref)
-        .fetch_optional(&self.pool)
-        .await?;
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
+    pub async fn wiki_delete_page(
+        &self,
+        wiki_id: &str,
+        page_ref: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let existing: Option<AgentWikiPageRecord> =
+            sqlx::query_as("SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND ref = ?")
+                .bind(wiki_id)
+                .bind(page_ref)
+                .fetch_optional(&self.pool)
+                .await?;
         let Some(row) = existing else {
             return Ok(false);
         };
@@ -705,10 +718,11 @@ impl Database {
             .bind(&row.id)
             .execute(&mut *tx)
             .await?;
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = ?")
-            .bind(wiki_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = ?")
+                .bind(wiki_id)
+                .fetch_one(&mut *tx)
+                .await?;
         sqlx::query("UPDATE agent_wikis SET page_count = ?, version = version + 1, updated_at = datetime('now') WHERE id = ?")
             .bind(count.0)
             .bind(wiki_id)
@@ -719,9 +733,13 @@ impl Database {
     }
 
     /// 清空某文档抽取的非 locked 页（reindex 用：清旧页+FTS+边）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
-    pub async fn wiki_clear_pages_by_doc(&self, wiki_id: &str, doc_id: &str) -> Result<u64, sqlx::Error> {
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
+    pub async fn wiki_clear_pages_by_doc(
+        &self,
+        wiki_id: &str,
+        doc_id: &str,
+    ) -> Result<u64, sqlx::Error> {
         let rows: Vec<AgentWikiPageRecord> = sqlx::query_as(
             "SELECT * FROM agent_wiki_pages WHERE wiki_id = ? AND source_doc_id = ? AND locked = 0",
         )
@@ -774,8 +792,8 @@ impl Database {
     }
 
     /// 页面列表（q/ref 前缀/locked 过滤+分页，摘要视图不含 content）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_list_pages(
         &self,
         wiki_id: &str,
@@ -791,9 +809,12 @@ impl Database {
         );
         qb.push_bind(wiki_id);
         if let Some(q) = q.filter(|q| !q.is_empty()) {
-            qb.push(" AND (title LIKE ").push_bind(format!("%{q}%"))
-                .push(" OR summary LIKE ").push_bind(format!("%{q}%"))
-                .push(" OR ref LIKE ").push_bind(format!("%{q}%"))
+            qb.push(" AND (title LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(" OR summary LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(" OR ref LIKE ")
+                .push_bind(format!("%{q}%"))
                 .push(")");
         }
         if let Some(prefix) = ref_prefix.filter(|p| !p.is_empty()) {
@@ -803,13 +824,16 @@ impl Database {
             qb.push(" AND locked = ").push_bind(i64::from(locked));
         }
         qb.push(" ORDER BY updated_at DESC");
-        qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        qb.push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
         qb.build_query_as::<AgentWikiPageSummary>()
             .fetch_all(&self.pool)
             .await
     }
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_bump_use(&self, page_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_wiki_pages SET use_count = use_count + 1, last_used_at = datetime('now') WHERE id = ?",
@@ -821,8 +845,8 @@ impl Database {
     }
 
     // ── Graph ──────────────────────────────────────────────────────
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_graph(&self, wiki_id: &str) -> Result<WikiGraph, sqlx::Error> {
         let nodes: Vec<AgentWikiPageSummary> = sqlx::query_as(
             "SELECT id, wiki_id, ref, title, summary, locked, source_doc_id, use_count, last_used_at, created_at, updated_at \
@@ -863,8 +887,8 @@ impl Database {
 
     /// 两段式检索：在 `visible_wiki_ids` 范围内检索（空表示全局）。
     /// 1) 短词直接 LIKE；2) 否则 FTS MATCH + bm25，零命中回退 LIKE。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_search(
         &self,
         visible_wiki_ids: &[String],
@@ -881,7 +905,9 @@ impl Database {
         }
         // FTS 路径
         let escaped = Self::escape_fts_query(q);
-        let hits = self.wiki_search_fts(visible_wiki_ids, &escaped, q, limit).await;
+        let hits = self
+            .wiki_search_fts(visible_wiki_ids, &escaped, q, limit)
+            .await;
         match hits {
             Ok(v) if !v.is_empty() => Ok(v),
             Ok(_) => self.wiki_search_like(visible_wiki_ids, q, limit).await,
@@ -926,9 +952,7 @@ impl Database {
                 .collect());
         }
         // 指定 wiki 集合：IN 过滤
-        let mut qb = sqlx::QueryBuilder::new(
-            "SELECT * FROM agent_wiki_pages WHERE wiki_id IN (",
-        );
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM agent_wiki_pages WHERE wiki_id IN (");
         let mut sep = qb.separated(", ");
         for id in visible_wiki_ids {
             sep.push_bind(id);
@@ -981,15 +1005,17 @@ impl Database {
             .await?;
             return Ok(rows
                 .into_iter()
-                .map(|(_, id, wiki_id, r, title, summary, _content, rank, snippet)| WikiSearchHit {
-                    page_id: id,
-                    wiki_id,
-                    page_ref: r,
-                    title,
-                    summary,
-                    snippet,
-                    rank,
-                })
+                .map(
+                    |(_, id, wiki_id, r, title, summary, _content, rank, snippet)| WikiSearchHit {
+                        page_id: id,
+                        wiki_id,
+                        page_ref: r,
+                        title,
+                        summary,
+                        snippet,
+                        rank,
+                    },
+                )
                 .collect());
         }
         let mut qb = sqlx::QueryBuilder::new(
@@ -1007,30 +1033,56 @@ impl Database {
         }
         qb.push(") ORDER BY rank LIMIT ").push_bind(limit);
         #[allow(clippy::type_complexity)]
-        let rows: Vec<(i64, String, String, String, String, String, String, f64, String)> = qb
-            .build_query_as::<(i64, String, String, String, String, String, String, f64, String)>()
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            String,
+        )> = qb
+            .build_query_as::<(
+                i64,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                f64,
+                String,
+            )>()
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
             .into_iter()
-            .map(|(_, id, wiki_id, r, title, summary, _content, rank, snippet)| {
-                let snippet = if snippet.is_empty() { summary.clone() } else { snippet };
-                WikiSearchHit {
-                    page_id: id,
-                    wiki_id,
-                    page_ref: r,
-                    title,
-                    summary,
-                    snippet,
-                    rank,
-                }
-            })
+            .map(
+                |(_, id, wiki_id, r, title, summary, _content, rank, snippet)| {
+                    let snippet = if snippet.is_empty() {
+                        summary.clone()
+                    } else {
+                        snippet
+                    };
+                    WikiSearchHit {
+                        page_id: id,
+                        wiki_id,
+                        page_ref: r,
+                        title,
+                        summary,
+                        snippet,
+                        rank,
+                    }
+                },
+            )
             .collect())
     }
 
     /// 可见 wiki 列表（scope 过滤，对齐 `skill_injectable` 的可见性语义）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_visible_ids(
         &self,
         client_id: &str,
@@ -1052,8 +1104,8 @@ impl Database {
     /// 可见 wiki 完整记录（清单注入用）：scope 过滤 + page_count DESC + limit。
     /// 与 [`Self::wiki_visible_ids`] 同一可见性语义，返回整行（name/summary/
     /// page_count 供 `<wikis>` 清单渲染）。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_visible_wikis(
         &self,
         client_id: &str,
@@ -1076,8 +1128,8 @@ impl Database {
 
     /// 大小写不敏感的同作用域容器名查找（agent 工具寻址用）。SQLite LIKE 对
     /// ASCII 不区分大小写，中文不受影响；`name` 必须已由调用方 normalize。
-/// # Errors
-/// 数据库错误：以 `sqlx::Error` 返回。
+    /// # Errors
+    /// 数据库错误：以 `sqlx::Error` 返回。
     pub async fn wiki_get_by_name_scope_ci(
         &self,
         name_lower: &str,
@@ -1113,7 +1165,10 @@ mod tests {
 
     #[test]
     fn normalize_wiki_ref_ok() {
-        assert_eq!(normalize_wiki_ref("Deploy/Prod-Checklist"), Some("deploy/prod-checklist".into()));
+        assert_eq!(
+            normalize_wiki_ref("Deploy/Prod-Checklist"),
+            Some("deploy/prod-checklist".into())
+        );
         assert_eq!(normalize_wiki_ref("  a_b-1  "), Some("a_b-1".into()));
         assert_eq!(normalize_wiki_ref("a"), Some("a".into()));
     }
@@ -1150,7 +1205,9 @@ mod tests {
     #[tokio::test]
     async fn wiki_container_crud_and_unique() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "my-wiki", "desc", "workspace", "c1", "ws1").await.unwrap();
+        db.wiki_create("w1", "my-wiki", "desc", "workspace", "c1", "ws1")
+            .await
+            .unwrap();
         let w = db.wiki_get("w1").await.unwrap().unwrap();
         assert_eq!(w.name, "my-wiki");
         assert_eq!(w.scope_type, "workspace");
@@ -1158,20 +1215,32 @@ mod tests {
         assert_eq!(w.version, 1);
 
         // 同名同 scope 冲突
-        let dup = db.wiki_create("w2", "my-wiki", "", "workspace", "c1", "ws1").await;
+        let dup = db
+            .wiki_create("w2", "my-wiki", "", "workspace", "c1", "ws1")
+            .await;
         assert!(dup.is_err(), "同名同 scope 应唯一冲突");
 
         // 异 scope 可同名
-        db.wiki_create("w3", "my-wiki", "", "global", "", "").await.unwrap();
+        db.wiki_create("w3", "my-wiki", "", "global", "", "")
+            .await
+            .unwrap();
 
-        db.wiki_update("w1", "renamed", "new summary").await.unwrap();
+        db.wiki_update("w1", "renamed", "new summary")
+            .await
+            .unwrap();
         let w = db.wiki_get("w1").await.unwrap().unwrap();
         assert_eq!(w.name, "renamed");
 
-        let list = db.wiki_list(None, None, None, None, None, 10, 0).await.unwrap();
+        let list = db
+            .wiki_list(None, None, None, None, None, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(list.len(), 2);
 
-        let filtered = db.wiki_list(Some("global"), None, None, None, None, 10, 0).await.unwrap();
+        let filtered = db
+            .wiki_list(Some("global"), None, None, None, None, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(filtered.len(), 1);
 
         db.wiki_delete("w1").await.unwrap();
@@ -1181,61 +1250,133 @@ mod tests {
     #[tokio::test]
     async fn wiki_page_upsert_and_locked_and_fts_sync() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "wiki", "", "global", "", "").await.unwrap();
+        db.wiki_create("w1", "wiki", "", "global", "", "")
+            .await
+            .unwrap();
 
-        db.wiki_create_doc("doc1", "w1", "a.md", "md", "sha256:x").await.unwrap();
-        db.wiki_create_doc("doc2", "w1", "b.md", "md", "sha256:y").await.unwrap();
+        db.wiki_create_doc("doc1", "w1", "a.md", "md", "sha256:x")
+            .await
+            .unwrap();
+        db.wiki_create_doc("doc2", "w1", "b.md", "md", "sha256:y")
+            .await
+            .unwrap();
         // ingest 页（非 locked）
-        db.wiki_upsert_page("w1", "deploy/prod", "部署", "摘要", "内容含 [[other/ref]]", false, Some("doc1"))
-            .await.unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "deploy/prod",
+            "部署",
+            "摘要",
+            "内容含 [[other/ref]]",
+            false,
+            Some("doc1"),
+        )
+        .await
+        .unwrap();
         // FTS 应命中
         let hits = db.wiki_search(&["w1".into()], "部署", 10).await.unwrap();
         assert!(!hits.is_empty(), "FTS/LIKE 应命中");
 
         // 手动页（locked=1）覆盖
-        db.wiki_upsert_page("w1", "deploy/prod", "部署-手动", "摘要2", "手动内容", true, None)
-            .await.unwrap();
-        let p = db.wiki_get_page("w1", "deploy/prod").await.unwrap().unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "deploy/prod",
+            "部署-手动",
+            "摘要2",
+            "手动内容",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let p = db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(p.title, "部署-手动");
         assert_eq!(p.locked, 1);
 
         // ingest 再次尝试覆盖 locked 页：应被保护
-        db.wiki_upsert_page("w1", "deploy/prod", "尝试覆盖", "x", "x", false, Some("doc2"))
-            .await.unwrap();
-        let p = db.wiki_get_page("w1", "deploy/prod").await.unwrap().unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "deploy/prod",
+            "尝试覆盖",
+            "x",
+            "x",
+            false,
+            Some("doc2"),
+        )
+        .await
+        .unwrap();
+        let p = db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(p.title, "部署-手动", "locked 页不应被 ingest 覆盖");
 
         // UNIQUE(wiki_id, ref) 冲突走 upsert，不会重复行
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = 'w1'")
-            .fetch_one(&db.pool).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_wiki_pages WHERE wiki_id = 'w1'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1);
 
         // FTS 同步一致性：fts 命中数 == 正表页数
         let fts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_wiki_pages_fts")
-            .fetch_one(&db.pool).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(fts_count, count, "fts 命中数应等于正表页数");
 
         // 删除后一致性
         db.wiki_delete_page("w1", "deploy/prod").await.unwrap();
         let fts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_wiki_pages_fts")
-            .fetch_one(&db.pool).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(fts_count, 0);
-        assert!(db.wiki_get_page("w1", "deploy/prod").await.unwrap().is_none());
+        assert!(db
+            .wiki_get_page("w1", "deploy/prod")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn wiki_search_like_fallback_and_escape() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "wiki", "", "global", "", "").await.unwrap();
-        db.wiki_upsert_page("w1", "p1", "部署文档", "摘要", "这里是部署相关内容", false, None).await.unwrap();
-        db.wiki_upsert_page("w1", "p2", "其他", "摘要", "完全不相关的内容", false, None).await.unwrap();
+        db.wiki_create("w1", "wiki", "", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "p1",
+            "部署文档",
+            "摘要",
+            "这里是部署相关内容",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        db.wiki_upsert_page("w1", "p2", "其他", "摘要", "完全不相关的内容", false, None)
+            .await
+            .unwrap();
 
         // 2 字中文：trigram LIKE 回退应命中
         let hits = db.wiki_search(&["w1".into()], "部署", 10).await.unwrap();
-        assert!(hits.iter().any(|h| h.page_ref == "p1"), "2字查询应 LIKE 回退命中");
+        assert!(
+            hits.iter().any(|h| h.page_ref == "p1"),
+            "2字查询应 LIKE 回退命中"
+        );
 
         // 3+ 字 FTS 命中（若 trigram 支持）
-        let hits = db.wiki_search(&["w1".into()], "部署相关", 10).await.unwrap();
+        let hits = db
+            .wiki_search(&["w1".into()], "部署相关", 10)
+            .await
+            .unwrap();
         // 至少 LIKE 回退也能命中
         assert!(hits.iter().any(|h| h.page_ref == "p1"));
 
@@ -1245,16 +1386,33 @@ mod tests {
         let _ = hits;
 
         // MATCH 零命中也回退 LIKE
-        let hits = db.wiki_search(&["w1".into()], "不存在的词xyz", 10).await.unwrap();
+        let hits = db
+            .wiki_search(&["w1".into()], "不存在的词xyz", 10)
+            .await
+            .unwrap();
         assert!(hits.is_empty());
     }
 
     #[tokio::test]
     async fn wiki_graph_dangling() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "wiki", "", "global", "", "").await.unwrap();
-        db.wiki_upsert_page("w1", "a", "A", "", "link to [[b]] and [[missing]]", false, None).await.unwrap();
-        db.wiki_upsert_page("w1", "b", "B", "", "no links", false, None).await.unwrap();
+        db.wiki_create("w1", "wiki", "", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_upsert_page(
+            "w1",
+            "a",
+            "A",
+            "",
+            "link to [[b]] and [[missing]]",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        db.wiki_upsert_page("w1", "b", "B", "", "no links", false, None)
+            .await
+            .unwrap();
 
         let g = db.wiki_graph("w1").await.unwrap();
         assert_eq!(g.nodes.len(), 2);
@@ -1270,10 +1428,18 @@ mod tests {
     #[tokio::test]
     async fn wiki_visible_ids_scope_filter() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("g1", "global-wiki", "", "global", "", "").await.unwrap();
-        db.wiki_create("c1", "client-wiki", "", "client", "c1", "").await.unwrap();
-        db.wiki_create("w1", "ws-wiki", "", "workspace", "c1", "w1").await.unwrap();
-        db.wiki_create("w2", "other-ws", "", "workspace", "c1", "w2").await.unwrap();
+        db.wiki_create("g1", "global-wiki", "", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_create("c1", "client-wiki", "", "client", "c1", "")
+            .await
+            .unwrap();
+        db.wiki_create("w1", "ws-wiki", "", "workspace", "c1", "w1")
+            .await
+            .unwrap();
+        db.wiki_create("w2", "other-ws", "", "workspace", "c1", "w2")
+            .await
+            .unwrap();
 
         let ids = db.wiki_visible_ids("c1", "w1").await.unwrap();
         assert!(ids.contains(&"g1".to_string()));
@@ -1285,32 +1451,58 @@ mod tests {
     #[tokio::test]
     async fn wiki_doc_cas_and_inflight() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "wiki", "", "global", "", "").await.unwrap();
-        db.wiki_create_doc("d1", "w1", "a.md", "md", "sha256:x").await.unwrap();
+        db.wiki_create("w1", "wiki", "", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_create_doc("d1", "w1", "a.md", "md", "sha256:x")
+            .await
+            .unwrap();
 
         // pending 状态：CAS 不抢
         assert!(!db.wiki_mark_doc_pending_if_idle("d1").await.unwrap());
-        db.wiki_update_doc_status("d1", "ready", None).await.unwrap();
+        db.wiki_update_doc_status("d1", "ready", None)
+            .await
+            .unwrap();
         assert!(db.wiki_mark_doc_pending_if_idle("d1").await.unwrap());
-        assert_eq!(db.wiki_get_doc("d1").await.unwrap().unwrap().status, "pending");
+        assert_eq!(
+            db.wiki_get_doc("d1").await.unwrap().unwrap().status,
+            "pending"
+        );
 
         // 对账
         let n = db.wiki_fail_inflight_docs("restart").await.unwrap();
         assert_eq!(n, 1);
-        assert_eq!(db.wiki_get_doc("d1").await.unwrap().unwrap().status, "failed");
+        assert_eq!(
+            db.wiki_get_doc("d1").await.unwrap().unwrap().status,
+            "failed"
+        );
     }
 
     #[tokio::test]
     async fn wiki_page_list_filters_and_bump() {
         let db = Database::new(":memory:").await.unwrap();
-        db.wiki_create("w1", "wiki", "", "global", "", "").await.unwrap();
-        db.wiki_upsert_page("w1", "deploy/a", "A", "s", "c", false, None).await.unwrap();
-        db.wiki_upsert_page("w1", "deploy/b", "B", "s", "c", true, None).await.unwrap();
-        db.wiki_upsert_page("w1", "other/c", "C", "s", "c", false, None).await.unwrap();
+        db.wiki_create("w1", "wiki", "", "global", "", "")
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1", "deploy/a", "A", "s", "c", false, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1", "deploy/b", "B", "s", "c", true, None)
+            .await
+            .unwrap();
+        db.wiki_upsert_page("w1", "other/c", "C", "s", "c", false, None)
+            .await
+            .unwrap();
 
-        let list = db.wiki_list_pages("w1", None, Some("deploy/"), None, 10, 0).await.unwrap();
+        let list = db
+            .wiki_list_pages("w1", None, Some("deploy/"), None, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(list.len(), 2);
-        let locked = db.wiki_list_pages("w1", None, None, Some(true), 10, 0).await.unwrap();
+        let locked = db
+            .wiki_list_pages("w1", None, None, Some(true), 10, 0)
+            .await
+            .unwrap();
         assert_eq!(locked.len(), 1);
         assert_eq!(locked[0].page_ref, "deploy/b");
 

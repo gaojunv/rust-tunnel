@@ -60,21 +60,21 @@ impl AcmeClient {
         // Try to load existing account credentials
         let account_path = cert_dir.join("account.json");
         if account_path.exists() {
-            let data = std::fs::read_to_string(&account_path)
-                .map_err(AcmeError::storage("Failed to read account credentials file"))?;
-            let creds: AccountCredentials = serde_json::from_str(&data)
-                .map_err(|source| AcmeError::AccountSerde {
+            let data = std::fs::read_to_string(&account_path).map_err(AcmeError::storage(
+                "Failed to read account credentials file",
+            ))?;
+            let creds: AccountCredentials =
+                serde_json::from_str(&data).map_err(|source| AcmeError::AccountSerde {
                     context: "Failed to parse account credentials",
                     source,
                 })?;
 
             // Re-parse credentials for from_credentials since AccountCredentials doesn't implement Clone
-            let creds_for_restore: AccountCredentials = serde_json::from_str(&data).map_err(
-                |source| AcmeError::AccountSerde {
+            let creds_for_restore: AccountCredentials =
+                serde_json::from_str(&data).map_err(|source| AcmeError::AccountSerde {
                     context: "Failed to parse account credentials for restore",
                     source,
-                },
-            )?;
+                })?;
 
             let account = Account::builder()?
                 .from_credentials(creds_for_restore)
@@ -111,8 +111,9 @@ impl AcmeClient {
                     source,
                 }
             })?;
-            std::fs::write(&account_path, creds_json)
-                .map_err(AcmeError::storage("Failed to save account credentials to disk"))?;
+            std::fs::write(&account_path, creds_json).map_err(AcmeError::storage(
+                "Failed to save account credentials to disk",
+            ))?;
 
             info!("Registered new ACME account: {}", account.id());
             *self.account.write().await = Some(account);

@@ -94,7 +94,8 @@ pub async fn update_shadowsocks_config(
             let ss_password = password.to_string();
             tokio::spawn(async move {
                 let stats = state_clone.stats_collector.clone();
-                let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> = std::sync::Arc::new(state_clone);
+                let registry: std::sync::Arc<dyn rust_tunnel_protocols::PortRegistry> =
+                    std::sync::Arc::new(state_clone);
                 if let Err(e) = crate::listener::start_shadowsocks_listener_with_abort(
                     registry,
                     stats,

@@ -251,7 +251,10 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
     .await;
     let (resp, candidate, failed_over) = match outcome {
         crate::llm::upstream::FailoverOutcome::Success {
-            resp, candidate, failed_over, ..
+            resp,
+            candidate,
+            failed_over,
+            ..
         } => (resp, candidate, failed_over),
         crate::llm::upstream::FailoverOutcome::Exhausted { message, .. } => {
             return Err(format!("summary LLM unavailable: {message}"));
@@ -267,9 +270,17 @@ async fn summarize(llm: &Arc<LlmState>, model: &str, rendered: &str) -> Result<S
         let ctx = super::runner::runner_usage_ctx(
             &candidate,
             model,
-            if failed_over { Some(chain.candidates[0].model_name.clone()) } else { None },
+            if failed_over {
+                Some(chain.candidates[0].model_name.clone())
+            } else {
+                None
+            },
         );
-        ctx.record_success(db, crate::llm::usage::extract_usage_from_body(&body), started);
+        ctx.record_success(
+            db,
+            crate::llm::usage::extract_usage_from_body(&body),
+            started,
+        );
     }
     match super::runner::parse_llm_turn(&body)? {
         super::runner::LlmTurn::Text(t) => Ok(t),
@@ -312,13 +323,22 @@ mod tests {
     #[test]
     fn test_is_context_overflow_matches_common_patterns() {
         // OpenAI 风格
-        assert!(is_context_overflow(400, "maximum context length is 128000 tokens"));
+        assert!(is_context_overflow(
+            400,
+            "maximum context length is 128000 tokens"
+        ));
         assert!(is_context_overflow(400, "context_length_exceeded"));
         // Anthropic 风格
-        assert!(is_context_overflow(400, "prompt is too long: 200000 tokens > 200000 maximum"));
+        assert!(is_context_overflow(
+            400,
+            "prompt is too long: 200000 tokens > 200000 maximum"
+        ));
         // DeepSeek 风格
         assert!(is_context_overflow(400, "Too many tokens in prompt: 16385"));
-        assert!(is_context_overflow(400, "Request too large for model: 16386 tokens"));
+        assert!(is_context_overflow(
+            400,
+            "Request too large for model: 16386 tokens"
+        ));
         // 大小写不敏感
         assert!(is_context_overflow(400, "Context Length Exceeded"));
         assert!(is_context_overflow(400, "PROMPT IS TOO LONG"));

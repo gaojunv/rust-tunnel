@@ -163,7 +163,6 @@ pub fn parse_llm_turn(body: &serde_json::Value) -> Result<LlmTurn, String> {
     Ok(LlmTurn::Text(content))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,7 +303,9 @@ mod tests {
             sse::SseFeed::Done => panic!("expected Content delta, got Done"),
             sse::SseFeed::Overflow => panic!("expected Content delta, got Overflow"),
             sse::SseFeed::Thought { .. } => panic!("expected Content delta, got Thought"),
-            sse::SseFeed::ToolCallDelta { .. } => panic!("expected Content delta, got ToolCallDelta"),
+            sse::SseFeed::ToolCallDelta { .. } => {
+                panic!("expected Content delta, got ToolCallDelta")
+            }
         }
     }
 
@@ -313,5 +314,4 @@ mod tests {
     // 帧 + 最终文本完整）与 `agent_stream_retry_exhausted_sends_error`（耗尽走
     // 错误路径）。本文件的旧 `test_retry_on_stream_read_failure` 只测本地闭包，
     // 零回归价值，已删除。
-
 }

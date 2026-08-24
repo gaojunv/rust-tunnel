@@ -406,11 +406,12 @@ impl CertificateManager {
         // 缓存 key 与事件 domain 小写归一，与 add_certificate /
         // find_covering_cert / resolve_certified_key 的不变量一致，
         // 否则大小写混合域名签发后写入成功却永远查不到。
-        let cached = self
-            .build_cached_cert(domain)
-            .map_err(AcmeError::wrap("Failed to load issued certificate from storage"))?;
-        let certified_key = super::provider::build_certified_key(&cached.entry)
-            .map_err(AcmeError::wrap("Failed to build CertifiedKey for issued cert"))?;
+        let cached = self.build_cached_cert(domain).map_err(AcmeError::wrap(
+            "Failed to load issued certificate from storage",
+        ))?;
+        let certified_key = super::provider::build_certified_key(&cached.entry).map_err(
+            AcmeError::wrap("Failed to build CertifiedKey for issued cert"),
+        )?;
         let entry = cached.entry.clone();
         let domain = domain.to_ascii_lowercase();
         {

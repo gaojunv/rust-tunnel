@@ -1258,16 +1258,12 @@ mod tests {
                 cmd: "x".into(),
                 cwd: None,
             },
-            AgentCommand::ReadFile {
-                path: "x".into(),
-            },
+            AgentCommand::ReadFile { path: "x".into() },
             AgentCommand::WriteFile {
                 path: "x".into(),
                 content: "x".into(),
             },
-            AgentCommand::ListDir {
-                path: "x".into(),
-            },
+            AgentCommand::ListDir { path: "x".into() },
             AgentCommand::GitStatus,
             AgentCommand::GitDiff { path: None },
             AgentCommand::GitCommit {
@@ -1297,9 +1293,7 @@ mod tests {
                 offset: None,
                 limit: None,
             },
-            AgentCommand::CodeOutline {
-                path: "x".into(),
-            },
+            AgentCommand::CodeOutline { path: "x".into() },
             AgentCommand::ReadSymbol {
                 path: "x".into(),
                 name: "x".into(),

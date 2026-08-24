@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use crate::tunnel_opener::TunnelOpener;
 use crate::reverse_proxy::Backend;
+use crate::tunnel_opener::TunnelOpener;
 use std::sync::Arc;
 
 /// Marker trait combining tokio's async read+write. Blanket-impl'd for any
@@ -75,10 +75,7 @@ impl Connector for ClientConnector {
                 "client backend missing client_name",
             )
         })?;
-        let stream = self
-            .opener
-            .open_tunnel(client_name, &backend.addr)
-            .await?;
+        let stream = self.opener.open_tunnel(client_name, &backend.addr).await?;
         Ok(Box::new(stream))
     }
 }
@@ -146,7 +143,11 @@ mod tests {
         struct EchoOpener;
         #[async_trait::async_trait]
         impl TunnelOpener for EchoOpener {
-            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+            async fn open_tunnel(
+                &self,
+                _client_name: &str,
+                _target_addr: &str,
+            ) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
                 let (a, b) = duplex(64);
                 // Echo task: copy a->b
                 tokio::spawn(async move {
@@ -166,7 +167,14 @@ mod tests {
                     loop {
                         match tokio::io::AsyncReadExt::read(&mut rs, &mut buf).await {
                             Ok(0) => break,
-                            Ok(n) => { if tokio::io::AsyncWriteExt::write_all(&mut ws, &buf[..n]).await.is_err() { break; } }
+                            Ok(n) => {
+                                if tokio::io::AsyncWriteExt::write_all(&mut ws, &buf[..n])
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -201,8 +209,15 @@ mod tests {
         struct OfflineOpener;
         #[async_trait::async_trait]
         impl TunnelOpener for OfflineOpener {
-            async fn open_tunnel(&self, _client_name: &str, _target_addr: &str) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
-                Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "offline"))
+            async fn open_tunnel(
+                &self,
+                _client_name: &str,
+                _target_addr: &str,
+            ) -> std::io::Result<crate::reverse_proxy::connector::BoxedStream> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "offline",
+                ))
             }
         }
 

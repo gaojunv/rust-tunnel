@@ -384,7 +384,10 @@ mod tests {
         LlmHandlerState { llm, protocol }
     }
 
-    fn handler_state_with_db(db: rust_tunnel_persistence::Database, protocol: Option<LlmProtocol>) -> LlmHandlerState {
+    fn handler_state_with_db(
+        db: rust_tunnel_persistence::Database,
+        protocol: Option<LlmProtocol>,
+    ) -> LlmHandlerState {
         let llm = Arc::new(LlmState::new(Some(db), None));
         LlmHandlerState { llm, protocol }
     }
@@ -491,10 +494,19 @@ mod tests {
     #[test]
     fn response_post_process_equality() {
         assert_eq!(ResponsePostProcess::None, ResponsePostProcess::None);
-        assert_eq!(ResponsePostProcess::ToAnthropic, ResponsePostProcess::ToAnthropic);
-        assert_eq!(ResponsePostProcess::ToResponses, ResponsePostProcess::ToResponses);
+        assert_eq!(
+            ResponsePostProcess::ToAnthropic,
+            ResponsePostProcess::ToAnthropic
+        );
+        assert_eq!(
+            ResponsePostProcess::ToResponses,
+            ResponsePostProcess::ToResponses
+        );
         assert_ne!(ResponsePostProcess::None, ResponsePostProcess::ToAnthropic);
-        assert_ne!(ResponsePostProcess::ToAnthropic, ResponsePostProcess::ToResponses);
+        assert_ne!(
+            ResponsePostProcess::ToAnthropic,
+            ResponsePostProcess::ToResponses
+        );
         assert_ne!(ResponsePostProcess::None, ResponsePostProcess::ToResponses);
     }
 
@@ -562,7 +574,9 @@ mod tests {
         let mut req = make_request(
             "m",
             vec![ChatMessage::text("user", "new")],
-            Some(json!({"model":"m","messages":[{"role":"user","content":"stale"}],"extra":"keep"})),
+            Some(
+                json!({"model":"m","messages":[{"role":"user","content":"stale"}],"extra":"keep"}),
+            ),
         );
         write_back_messages(&mut req);
         let raw = req.raw_body.unwrap();
@@ -641,16 +655,26 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.as_deref().unwrap_or("").contains("<tool_result"));
-        assert!(has_tool_result, "tool result should be rewritten: {:?}", req.messages);
+        assert!(
+            has_tool_result,
+            "tool result should be rewritten: {:?}",
+            req.messages
+        );
         let has_tool_call = req
             .messages
             .iter()
             .any(|m| m.content.as_deref().unwrap_or("").contains("<tool_call>"));
-        assert!(has_tool_call, "tool_calls should be rewritten: {:?}", req.messages);
+        assert!(
+            has_tool_call,
+            "tool_calls should be rewritten: {:?}",
+            req.messages
+        );
         let last = req.messages.last().unwrap();
         assert_eq!(last.role, "system");
         assert!(last.content.as_deref().unwrap().contains("<tool_call>"));
-        let raw_msgs = req.raw_body.as_ref().unwrap()["messages"].as_array().unwrap();
+        let raw_msgs = req.raw_body.as_ref().unwrap()["messages"]
+            .as_array()
+            .unwrap();
         assert_eq!(raw_msgs.len(), req.messages.len());
         assert!(ctx.rag_chunks_injected.is_none());
     }
@@ -699,7 +723,15 @@ mod tests {
             protocol: "openai".into(),
             ..Default::default()
         };
-        inject_rag_and_compat(&state, Some(&db), Some("kb-unknown".into()), false, &mut req, &mut ctx).await;
+        inject_rag_and_compat(
+            &state,
+            Some(&db),
+            Some("kb-unknown".into()),
+            false,
+            &mut req,
+            &mut ctx,
+        )
+        .await;
         assert!(ctx.rag_chunks_injected.is_none());
     }
 
@@ -713,7 +745,9 @@ mod tests {
         assert!(res.is_err());
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["error"]["type"], "authentication_error");
     }
@@ -734,7 +768,9 @@ mod tests {
         let res = authenticate_or_reject(&state, &headers, "anthropic").await;
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "authentication_error");
@@ -756,7 +792,9 @@ mod tests {
         assert!(res.is_err());
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
     }
@@ -768,7 +806,9 @@ mod tests {
         let res = extract_model_or_reject(&state, &body, "k1", "n1", "anthropic").await;
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "invalid_request_error");
@@ -790,7 +830,9 @@ mod tests {
         assert!(res.is_err());
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(v["error"]["type"].as_str().is_some());
     }
@@ -802,7 +844,9 @@ mod tests {
         let res = resolve_chain_or_reject(&state, "no-such-model", "k1", "n1", "openai").await;
         let resp = res.unwrap_err();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(
             v["error"]["available_models"].is_array(),

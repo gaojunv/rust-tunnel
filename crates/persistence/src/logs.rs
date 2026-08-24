@@ -22,10 +22,7 @@ impl Database {
     }
 
     /// Insert a batch of log entries
-    pub async fn insert_logs_batch(
-        &self,
-        entries: &[DbLogEntry],
-    ) -> Result<(), sqlx::Error> {
+    pub async fn insert_logs_batch(&self, entries: &[DbLogEntry]) -> Result<(), sqlx::Error> {
         if entries.is_empty() {
             return Ok(());
         }

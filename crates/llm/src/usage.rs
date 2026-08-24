@@ -326,12 +326,7 @@ impl UsageContext {
     ///
     /// 用于 runner 路径（直接调用 `execute_with_failover`，不经 HTTP 入口层）
     /// 的用量落库，与 `wrap_and_record` 共享相同的 `into_insert` 逻辑。
-    pub fn record_success(
-        self,
-        db: &Database,
-        usage: UsageInfo,
-        started_at: std::time::Instant,
-    ) {
+    pub fn record_success(self, db: &Database, usage: UsageInfo, started_at: std::time::Instant) {
         let insert = self.into_insert(
             usage,
             200,

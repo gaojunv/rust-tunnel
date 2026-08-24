@@ -1,6 +1,5 @@
 //! 会话配置项：set_config_option 与配置快照广播。
 
-
 #[allow(unused_imports)]
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
@@ -8,17 +7,15 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 
 use crate::db::agent::AgentWorkspaceRecord;
 
-use super::super::{
-    AcpBridge, CONFIG_OPTION_TIMEOUT,
-};
+use super::super::{AcpBridge, CONFIG_OPTION_TIMEOUT};
 
 use super::*;
 
@@ -103,9 +100,7 @@ impl AcpBridge {
     async fn broadcast_config_snapshot(&self, session_id: &str) {
         let options = {
             let sessions = self.sessions.lock().await;
-            sessions
-                .get(session_id)
-                .map(|a| a.config_options.clone())
+            sessions.get(session_id).map(|a| a.config_options.clone())
         };
         let Some(options) = options else { return };
         if options.is_empty() {
@@ -125,7 +120,11 @@ impl AcpBridge {
     /// session 级 config_state（用户显式选择）回放覆盖 workspace 默认。
     /// config_id 按字典序（`mode` 提前，与回放一致）逐项 set；agent 未暴露的
     /// config_id 或单条失败仅 warn 跳过，不阻断会话建立与其余项注入。
-    pub(crate) async fn apply_config_overrides(&self, session_id: &str, workspace: &AgentWorkspaceRecord) {
+    pub(crate) async fn apply_config_overrides(
+        &self,
+        session_id: &str,
+        workspace: &AgentWorkspaceRecord,
+    ) {
         let Some(raw) = workspace.agent_config_overrides.as_deref() else {
             return;
         };
@@ -183,5 +182,4 @@ impl AcpBridge {
             }
         }
     }
-
 }

@@ -98,10 +98,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn skill_get_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<AgentSkillRecord>, sqlx::Error> {
+    pub async fn skill_get_by_id(&self, id: &str) -> Result<Option<AgentSkillRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentSkillRecord>("SELECT * FROM agent_skills WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -202,7 +199,8 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<AgentSkillSummary>, sqlx::Error> {
         let mut qb = sqlx::QueryBuilder::new("SELECT ");
-        qb.push(SKILL_SUMMARY_COLS).push(" FROM agent_skills WHERE 1=1");
+        qb.push(SKILL_SUMMARY_COLS)
+            .push(" FROM agent_skills WHERE 1=1");
         if let Some(s) = scope_type.filter(|s| !s.is_empty()) {
             qb.push(" AND scope_type = ").push_bind(s);
         }
@@ -230,7 +228,10 @@ impl Database {
             _ => "updated_at DESC",
         };
         qb.push(" ORDER BY ").push(order_clause);
-        qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        qb.push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
         qb.build_query_as::<AgentSkillSummary>()
             .fetch_all(&self.pool)
             .await
@@ -281,7 +282,16 @@ mod tests {
 
     async fn seed(db: &Database, id: &str, name: &str, scope: &str, client: &str, ws: &str) {
         db.skill_insert(
-            id, name, "desc", "content", scope, client, ws, r#"["rust"]"#, "", "manual",
+            id,
+            name,
+            "desc",
+            "content",
+            scope,
+            client,
+            ws,
+            r#"["rust"]"#,
+            "",
+            "manual",
         )
         .await
         .unwrap();
@@ -320,22 +330,27 @@ mod tests {
         assert!(row.last_used_at.is_none());
 
         // 同名同作用域查重命中；异作用域未命中
-        assert!(
-            db.skill_get_by_name_scope("deploy-app", "workspace", "c1", "w1")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db.skill_get_by_name_scope("deploy-app", "global", "", "")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .skill_get_by_name_scope("deploy-app", "workspace", "c1", "w1")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .skill_get_by_name_scope("deploy-app", "global", "", "")
+            .await
+            .unwrap()
+            .is_none());
 
         // update：content/tags/scope 坐标同步，enabled/use_count 保持
         db.skill_update(
-            "s1", "deploy-app", "新描述", "新内容", "[]", "global", "", "", // scope 变更
+            "s1",
+            "deploy-app",
+            "新描述",
+            "新内容",
+            "[]",
+            "global",
+            "",
+            "", // scope 变更
         )
         .await
         .unwrap();
@@ -360,7 +375,10 @@ mod tests {
         assert_eq!(row.use_count, 1);
         assert!(row.last_used_at.is_some());
         db.skill_bump_use("s1").await.unwrap();
-        assert_eq!(db.skill_get_by_id("s1").await.unwrap().unwrap().use_count, 2);
+        assert_eq!(
+            db.skill_get_by_id("s1").await.unwrap().unwrap().use_count,
+            2
+        );
 
         // delete → 404 语义
         db.skill_delete("s1").await.unwrap();
@@ -394,7 +412,10 @@ mod tests {
         db.skill_bump_use("w1a").await.unwrap();
 
         // 全量（summary 序列化不含 content 字段）
-        let all = db.skill_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .skill_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 5);
         for s in &all {
             let json = serde_json::to_value(s).unwrap();
@@ -453,7 +474,10 @@ mod tests {
             .unwrap();
 
         // 分页
-        let page = db.skill_list(None, None, None, None, None, None, 2, 1).await.unwrap();
+        let page = db
+            .skill_list(None, None, None, None, None, None, 2, 1)
+            .await
+            .unwrap();
         assert_eq!(page.len(), 2);
     }
 

@@ -291,9 +291,10 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         state.register_exec_cancel(&request_id, cancel_tx).await;
                         tokio::spawn(async move {
                             let timeout = match &command {
-                                rust_tunnel_common::AgentCommand::ShellWithTimeout { timeout_secs, .. } => {
-                                    std::time::Duration::from_secs((*timeout_secs).clamp(1, 3600))
-                                }
+                                rust_tunnel_common::AgentCommand::ShellWithTimeout {
+                                    timeout_secs,
+                                    ..
+                                } => std::time::Duration::from_secs((*timeout_secs).clamp(1, 3600)),
                                 _ => std::time::Duration::from_mins(2),
                             };
                             let result = crate::agent::handle_exec_request(

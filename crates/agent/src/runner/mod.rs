@@ -26,7 +26,7 @@ mod version_gate;
 pub(crate) use blocks::{insert_block_before, remove_tagged_block, with_parent, ROLE_BLOCK_TAG};
 pub(crate) use parse::{is_sse_line, is_sse_response, LineBuf};
 pub use parse::{parse_llm_turn, LlmTurn, ParsedToolCall};
-pub use prompt::{compose_user_message, MAX_REFS, MAX_REF_FILE_BYTES, MAX_REFS_TOTAL_BYTES};
+pub use prompt::{compose_user_message, MAX_REFS, MAX_REFS_TOTAL_BYTES, MAX_REF_FILE_BYTES};
 pub(crate) use tool_calls::{handle_single_tool_call, handle_tool_calls, send_tool_call_delta};
 pub(crate) use tool_result_text::agent_result_to_text;
 pub(crate) use turn::{persist_message, record_tool_result};
@@ -50,4 +50,5 @@ const MAX_SUBAGENT_ROUNDS: usize = 15;
 const TASK_SUMMARY_MAX_CHARS: usize = 4096;
 
 /// 子 agent future 类型（join_all 并发 poll，需 Send 以满足 WS handler 约束）。
-type SubagentFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>;
+type SubagentFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>;

@@ -68,13 +68,7 @@ pub fn protected_router() -> Router<ApiState> {
 
 /// 取当前 LLM 运行时状态（未初始化时为 `None` → 请求失败）。
 async fn llm_state(state: &ApiState) -> Option<Arc<LlmState>> {
-    state
-        .server_state
-        .llm_state
-        .read()
-        .await
-        .as_ref()
-        .cloned()
+    state.server_state.llm_state.read().await.as_ref().cloned()
 }
 
 /// RAG handler 需要的运行时组件（从 `LlmState` 克隆，避免长持锁）。
@@ -109,13 +103,13 @@ async fn rag_rt(state: &ApiState) -> Result<RagRuntime, (StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use axum::body::Body;
     use axum::extract::DefaultBodyLimit;
     use axum::http::{header, Method, Request, StatusCode as HttpStatus};
     use axum::routing::{get, post};
     use axum::Router;
     use serde_json::{json, Value};
+    use std::time::Duration;
     use tower::ServiceExt;
 
     use crate::auth::AuthConfig;
@@ -1281,10 +1275,7 @@ mod tests {
         );
 
         let after = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
-        assert_ne!(
-            after.emb_api_key, before.emb_api_key,
-            "密钥密文应已替换"
-        );
+        assert_ne!(after.emb_api_key, before.emb_api_key, "密钥密文应已替换");
         assert_eq!(after.emb_base_url, before.emb_base_url);
         assert_eq!(after.emb_model, before.emb_model);
         assert_eq!(after.emb_dimension, before.emb_dimension);

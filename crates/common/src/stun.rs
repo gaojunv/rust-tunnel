@@ -22,7 +22,7 @@ pub struct StunMessage {
 
 /// Build a STUN Binding Request packet.
 /// Returns the raw packet bytes and the transaction ID for verification.
-#[must_use] 
+#[must_use]
 pub fn build_binding_request() -> ([u8; 20], [u8; 12]) {
     let mut rng = rand::thread_rng();
     let mut transaction_id = [0u8; 12];
@@ -45,7 +45,7 @@ pub fn build_binding_request() -> ([u8; 20], [u8; 12]) {
 
 /// Parse a STUN Binding Response and extract the XOR-MAPPED-ADDRESS.
 /// Returns None if the message is malformed, wrong type, or TID mismatch.
-#[must_use] 
+#[must_use]
 pub fn parse_binding_response(data: &[u8], expected_tid: &[u8; 12]) -> Option<StunMessage> {
     if data.len() < 20 {
         return None;

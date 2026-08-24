@@ -486,14 +486,12 @@ impl Database {
         used: Option<i64>,
         size: Option<i64>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE agent_sessions SET context_used = ?, context_size = ? WHERE id = ?",
-        )
-        .bind(used)
-        .bind(size)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE agent_sessions SET context_used = ?, context_size = ? WHERE id = ?")
+            .bind(used)
+            .bind(size)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

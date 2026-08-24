@@ -10,8 +10,8 @@ use rust_tunnel_common::AgentCommand;
 use rust_tunnel_common::AgentResult;
 
 use crate::agent::git_plan;
-use crate::mgmt::api::ApiState;
 use crate::db::agent::AgentWorkspaceRecord;
+use crate::mgmt::api::ApiState;
 
 use super::dto::{
     CreateWorkspaceRequest, FsPathQuery, GitApprovedBody, GitBranchDeleteRequest,
@@ -45,9 +45,9 @@ fn validate_tier_models(raw: &str) -> bool {
         return true;
     }
     match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::Object(map)) => map
-            .iter()
-            .all(|(k, v)| matches!(k.as_str(), "opus" | "sonnet" | "haiku" | "subagent") && v.is_string()),
+        Ok(serde_json::Value::Object(map)) => map.iter().all(|(k, v)| {
+            matches!(k.as_str(), "opus" | "sonnet" | "haiku" | "subagent") && v.is_string()
+        }),
         _ => false,
     }
 }
@@ -244,7 +244,7 @@ pub async fn update_workspace(
     let (agent_config_overrides, clear_overrides) = match &body.agent_config_overrides {
         None => (None, false),
         Some(None) => (None, true),
-        Some(Some(s)) if s.is_empty() => (None, true),  // 空串归一化为清空
+        Some(Some(s)) if s.is_empty() => (None, true), // 空串归一化为清空
         Some(Some(s)) => (Some(s.as_str()), false),
     };
     // claude_tier_models 同 overrides 三态语义：省略=保持、null/空串=清空、非空=写入。
@@ -1806,7 +1806,10 @@ mod tests {
         .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
-        assert_eq!(ws.agent_config_overrides, None, "null should clear overrides");
+        assert_eq!(
+            ws.agent_config_overrides, None,
+            "null should clear overrides"
+        );
 
         // 省略字段（None）→ 保持已清空的 NULL
         let resp = update_workspace(

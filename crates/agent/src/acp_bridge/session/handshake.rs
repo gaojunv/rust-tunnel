@@ -10,10 +10,10 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{ByteStreams, Client};
@@ -27,8 +27,8 @@ use super::super::store::persist_acp_frame;
 use super::super::{AcpBridge, ApprovalOption, SPAWN_TIMEOUT};
 use super::{
     acp_raw_to_string, approve_or_disconnect, broadcast_ws_frame, client_capabilities,
-    current_ws_channel, elicit_or_disconnect, exec_fs_read, exec_fs_write, permission_option_to_approval,
-    pick_option,
+    current_ws_channel, elicit_or_disconnect, exec_fs_read, exec_fs_write,
+    permission_option_to_approval, pick_option,
 };
 
 impl AcpBridge {
@@ -671,5 +671,4 @@ impl AcpBridge {
             Err(_) => Err("acp handshake timed out".into()),
         }
     }
-
 }

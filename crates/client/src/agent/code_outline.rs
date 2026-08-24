@@ -142,9 +142,7 @@ fn extract_symbol_name(node: tree_sitter::Node, source: &[u8]) -> String {
     }
     // 最终回退：取节点文本到第一个换行/空格/`{`/`(` 为止
     if let Ok(text) = node.utf8_text(source) {
-        let end = text
-            .find(['{', '(', '\n', ' '])
-            .unwrap_or(text.len());
+        let end = text.find(['{', '(', '\n', ' ']).unwrap_or(text.len());
         let candidate = text[..end].trim();
         if !candidate.is_empty() {
             return candidate.to_string();
@@ -156,7 +154,9 @@ fn extract_symbol_name(node: tree_sitter::Node, source: &[u8]) -> String {
 /// 格式化 kind 为简短标签
 fn kind_label(kind: &str) -> &str {
     match kind {
-        "function_definition" | "function_item" | "function_declaration" | "function_signature" => "fn",
+        "function_definition" | "function_item" | "function_declaration" | "function_signature" => {
+            "fn"
+        }
         "method_definition" | "method_declaration" | "abstract_method_declaration" => "fn",
         "struct_item" | "class_declaration" | "class_definition" => "struct",
         "impl_item" => "impl",
@@ -215,7 +215,9 @@ pub fn exec_outline(content: &str, path: &str, file_truncated: bool) -> AgentRes
         ));
     }
     if file_truncated {
-        output.push_str("[file truncated at read size cap; symbols beyond this point are not shown]\n");
+        output.push_str(
+            "[file truncated at read size cap; symbols beyond this point are not shown]\n",
+        );
     }
     AgentResult::FileContent {
         content: truncate_output_str(&output),
@@ -225,7 +227,12 @@ pub fn exec_outline(content: &str, path: &str, file_truncated: bool) -> AgentRes
 /// 执行 read_symbol：按名称精确匹配符号并返回源码。
 /// `file_truncated`：调用方读文件时触达大小上限（未命中提示中标注，符号可能在
 /// 截断区域之外）。
-pub fn exec_read_symbol(content: &str, path: &str, name: &str, file_truncated: bool) -> AgentResult {
+pub fn exec_read_symbol(
+    content: &str,
+    path: &str,
+    name: &str,
+    file_truncated: bool,
+) -> AgentResult {
     let ext = path.rsplit('.').next().unwrap_or("");
     let lang = match language_for_ext(ext) {
         Ok(l) => l,
@@ -457,7 +464,8 @@ trait Drawable {
 
     #[test]
     fn test_outline_go() {
-        let source = "package main\n\nfunc main() {\n}\n\ntype Config struct {\n    Name string\n}\n";
+        let source =
+            "package main\n\nfunc main() {\n}\n\ntype Config struct {\n    Name string\n}\n";
         let result = exec_outline(source, "main.go", false);
         match result {
             AgentResult::FileContent { content } => {

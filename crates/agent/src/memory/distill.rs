@@ -15,11 +15,11 @@ use super::{
     upsert_memory_with_dedup, MemoryEvent, MemoryState, MAX_TAGS, MEMORY_CONTENT_MAX_CHARS,
     TAG_MAX_CHARS,
 };
+use crate::db::agent::AgentMessageRecord;
+use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 use crate::skill::{
     DISTILL_SKILL_MAX, SKILL_CONTENT_MAX_CHARS, SKILL_DESCRIPTION_MAX_CHARS, SKILL_NAME_MAX_CHARS,
 };
-use crate::db::agent::AgentMessageRecord;
-use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 
 /// 蒸馏消息数下限：少于该条数的会话不蒸馏（太短无提炼价值）。
 pub const MIN_DISTILL_MESSAGES: usize = 4;
@@ -832,7 +832,11 @@ mod tests {
         assert_eq!(skills[0].scope, "workspace");
         assert_eq!(skills[0].tags, vec!["deploy"]);
         assert_eq!(skills[1].name, "超长描述");
-        assert_eq!(skills[1].description.chars().count(), SKILL_DESCRIPTION_MAX_CHARS, "描述截 200");
+        assert_eq!(
+            skills[1].description.chars().count(),
+            SKILL_DESCRIPTION_MAX_CHARS,
+            "描述截 200"
+        );
         assert_eq!(skills[1].scope, "workspace", "非法 scope 回落 workspace");
     }
 

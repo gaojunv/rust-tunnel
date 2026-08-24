@@ -168,7 +168,12 @@ mod tests {
     async fn plain_memory() -> (Database, MemoryState) {
         let db = Database::new(":memory:").await.unwrap();
         let (_dir, store) = crate::memory::test_store();
-        let memory = MemoryState::new(db.clone(), store, None, crate::llm::LlmState::new(None, None));
+        let memory = MemoryState::new(
+            db.clone(),
+            store,
+            None,
+            crate::llm::LlmState::new(None, None),
+        );
         (db, memory)
     }
 
@@ -189,7 +194,10 @@ mod tests {
         assert_eq!(v["id"], 1, "数字 id 原样回显");
         assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(v["result"]["serverInfo"]["name"], "rust-tunnel-memory");
-        assert!(!v["result"]["serverInfo"]["version"].as_str().unwrap().is_empty());
+        assert!(!v["result"]["serverInfo"]["version"]
+            .as_str()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -240,7 +248,10 @@ mod tests {
         let tools = v["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "remember");
-        assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["content"]));
+        assert_eq!(
+            tools[0]["inputSchema"]["required"],
+            serde_json::json!(["content"])
+        );
         assert_eq!(tools[0]["description"], REMEMBER_TOOL_DESCRIPTION);
     }
 

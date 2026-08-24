@@ -151,15 +151,20 @@ pub(crate) async fn handle_tool_calls(
                     // 并发执行子 agent 循环：join_all 在同一 task 内并发 poll，
                     // 无需 Send；外层 turn future 被 drop 时子 future 随之中止。
                     // 先收集 owned 数据（prompt、sub_rt、call_id、role），再创建借用它们的 future。
-                    let mut sub_owned: Vec<(String, SessionRuntime, String, Option<crate::db::roles::AgentRoleRecord>)> = Vec::new();
+                    let mut sub_owned: Vec<(
+                        String,
+                        SessionRuntime,
+                        String,
+                        Option<crate::db::roles::AgentRoleRecord>,
+                    )> = Vec::new();
                     let mut error_indices: Vec<(usize, String)> = Vec::new();
 
                     // 批处理前一次性查可见角色列表（避免每个 task 调用都查库）
-                    let visible_roles = agent.db.role_list_visible(
-                        &rt.client_id,
-                        &rt.workspace_id,
-                        Some("subagent"),
-                    ).await.unwrap_or_default();
+                    let visible_roles = agent
+                        .db
+                        .role_list_visible(&rt.client_id, &rt.workspace_id, Some("subagent"))
+                        .await
+                        .unwrap_or_default();
 
                     for (bi, call) in batch.iter().enumerate() {
                         match tools::parse_task_args(&call.args) {
@@ -171,7 +176,8 @@ pub(crate) async fn handle_tool_calls(
                                 // 未命中/禁用一律报错（明确告知模型无效角色）
                                 if let Some(ref name) = agent_name {
                                     if role.is_none() {
-                                        error_indices.push((bi, format!("unknown sub-agent role '{name}'")));
+                                        error_indices
+                                            .push((bi, format!("unknown sub-agent role '{name}'")));
                                         continue;
                                     }
                                 }
@@ -200,7 +206,9 @@ pub(crate) async fn handle_tool_calls(
                     // 按序遍历 batch：error_indices 或 join_all 结果
                     let mut fi = 0;
                     for (bi, call) in batch.iter().enumerate() {
-                        let text = if let Some(pos) = error_indices.iter().position(|(idx, _)| *idx == bi) {
+                        let text = if let Some(pos) =
+                            error_indices.iter().position(|(idx, _)| *idx == bi)
+                        {
                             let (_, e) = error_indices.remove(pos);
                             format!("error: {e}")
                         } else if fi < results.len() {
@@ -277,23 +285,42 @@ pub(crate) fn build_args_preview(tool_name: &str, command: &AgentCommand) -> Str
         }
     };
     let mut preview = match command {
-        AgentCommand::PatchFile { path, old_string, new_string } => {
-            format!("{path}\n--- old\n{}\n+++ new\n{}", truncate_lines(old_string, PREVIEW_MAX_LINES), truncate_lines(new_string, PREVIEW_MAX_LINES))
+        AgentCommand::PatchFile {
+            path,
+            old_string,
+            new_string,
+        } => {
+            format!(
+                "{path}\n--- old\n{}\n+++ new\n{}",
+                truncate_lines(old_string, PREVIEW_MAX_LINES),
+                truncate_lines(new_string, PREVIEW_MAX_LINES)
+            )
         }
         AgentCommand::EditFile { path, edits, .. } => {
             let mut parts = vec![path.clone()];
             for edit in edits.iter().take(5) {
-                parts.push(format!("--- old\n{}", truncate_lines(&edit.old_string, PREVIEW_MAX_LINES)));
-                parts.push(format!("+++ new\n{}", truncate_lines(&edit.new_string, PREVIEW_MAX_LINES)));
+                parts.push(format!(
+                    "--- old\n{}",
+                    truncate_lines(&edit.old_string, PREVIEW_MAX_LINES)
+                ));
+                parts.push(format!(
+                    "+++ new\n{}",
+                    truncate_lines(&edit.new_string, PREVIEW_MAX_LINES)
+                ));
             }
             if edits.len() > 5 {
                 parts.push(format!("... ({} more edits)", edits.len() - 5));
             }
             parts.join("\n")
         }
-        AgentCommand::WriteFile { path, content } | AgentCommand::WriteFile2 { path, content, .. } => {
+        AgentCommand::WriteFile { path, content }
+        | AgentCommand::WriteFile2 { path, content, .. } => {
             let total = content.lines().count();
-            format!("{path}\n--- new content ({} lines shown / {total} total)\n{}", PREVIEW_MAX_LINES.min(total), truncate_lines(content, PREVIEW_MAX_LINES))
+            format!(
+                "{path}\n--- new content ({} lines shown / {total} total)\n{}",
+                PREVIEW_MAX_LINES.min(total),
+                truncate_lines(content, PREVIEW_MAX_LINES)
+            )
         }
         _ => return tool_name.to_string(),
     };
@@ -303,17 +330,33 @@ pub(crate) fn build_args_preview(tool_name: &str, command: &AgentCommand) -> Str
 
 /// 为文件编辑工具从命令参数合成 diffs 数组（WS 帧落库用）。
 /// 成功时调用方已确认结果为 WriteOutcome 或 Success。
-pub(crate) fn synthesize_tool_diffs(tool_name: &str, command: &AgentCommand) -> Option<serde_json::Value> {
+pub(crate) fn synthesize_tool_diffs(
+    tool_name: &str,
+    command: &AgentCommand,
+) -> Option<serde_json::Value> {
     let diffs = match command {
-        AgentCommand::PatchFile { path, old_string, new_string } => {
+        AgentCommand::PatchFile {
+            path,
+            old_string,
+            new_string,
+        } => {
             serde_json::json!([{"path": path, "old_text": old_string, "new_text": new_string}])
         }
         AgentCommand::EditFile { path, edits, .. } => {
-            let old_text = edits.iter().map(|e| e.old_string.as_str()).collect::<Vec<_>>().join("\n...\n");
-            let new_text = edits.iter().map(|e| e.new_string.as_str()).collect::<Vec<_>>().join("\n...\n");
+            let old_text = edits
+                .iter()
+                .map(|e| e.old_string.as_str())
+                .collect::<Vec<_>>()
+                .join("\n...\n");
+            let new_text = edits
+                .iter()
+                .map(|e| e.new_string.as_str())
+                .collect::<Vec<_>>()
+                .join("\n...\n");
             serde_json::json!([{"path": path, "old_text": old_text, "new_text": new_text}])
         }
-        AgentCommand::WriteFile { path, content } | AgentCommand::WriteFile2 { path, content, .. } => {
+        AgentCommand::WriteFile { path, content }
+        | AgentCommand::WriteFile2 { path, content, .. } => {
             let truncated: String = content.lines().take(500).collect::<Vec<_>>().join("\n");
             serde_json::json!([{"path": path, "old_text": "", "new_text": truncated}])
         }
@@ -381,7 +424,10 @@ pub(crate) async fn handle_single_tool_call(
             false
         };
         if !allowed || denied {
-            let text = format!("error: tool '{}' is not allowed by the current role '{}'", tool_name, role.name);
+            let text = format!(
+                "error: tool '{}' is not allowed by the current role '{}'",
+                tool_name, role.name
+            );
             let mut result_frame = serde_json::json!({
                 "type": "tool_result",
                 "id": &call.id,
@@ -552,19 +598,35 @@ pub(crate) async fn handle_single_tool_call(
                 }
             }
             // write_file 升级映射：客户端 >=0.8.0 时映射为 WriteFile2（带 expected_hash）
-            let client_version = agent.registry.client_handle(&rt.client_id).await.and_then(|h| h.client_version);
-            if matches!(&command, AgentCommand::WriteFile { .. }) && client_supports_edit(client_version.as_deref()) {
+            let client_version = agent
+                .registry
+                .client_handle(&rt.client_id)
+                .await
+                .and_then(|h| h.client_version);
+            if matches!(&command, AgentCommand::WriteFile { .. })
+                && client_supports_edit(client_version.as_deref())
+            {
                 if let AgentCommand::WriteFile { path, content } = command {
                     let expected_hash = rt.file_hashes.get(&path).cloned();
-                    command = AgentCommand::WriteFile2 { path, content, expected_hash };
+                    command = AgentCommand::WriteFile2 {
+                        path,
+                        content,
+                        expected_hash,
+                    };
                 }
             }
             // stale hash 注入：EditFile/WriteFile2 发送前填入 expected_hash
             match &mut command {
-                AgentCommand::EditFile { path, expected_hash, .. }
-                | AgentCommand::WriteFile2 { path, expected_hash, .. }
-                    if expected_hash.is_none() =>
-                {
+                AgentCommand::EditFile {
+                    path,
+                    expected_hash,
+                    ..
+                }
+                | AgentCommand::WriteFile2 {
+                    path,
+                    expected_hash,
+                    ..
+                } if expected_hash.is_none() => {
                     *expected_hash = rt.file_hashes.get(path).cloned();
                 }
                 _ => {}
@@ -578,7 +640,14 @@ pub(crate) async fn handle_single_tool_call(
                 let summary = crate::approval::approval_summary(&command);
                 let args_preview = build_args_preview(&call.name, &command);
                 let approval = agent
-                    .request_approval(&rt.session_id, &call.name, &summary, &args_preview, &[], ws_tx)
+                    .request_approval(
+                        &rt.session_id,
+                        &call.name,
+                        &summary,
+                        &args_preview,
+                        &[],
+                        ws_tx,
+                    )
                     .await;
                 if !approval.approved() {
                     let text = "[denied by user]".to_string();
@@ -619,7 +688,11 @@ pub(crate) async fn handle_single_tool_call(
                 _ => None,
             };
             if let Some((min_version, supports)) = gated {
-                let version = agent.registry.client_handle(&rt.client_id).await.and_then(|h| h.client_version);
+                let version = agent
+                    .registry
+                    .client_handle(&rt.client_id)
+                    .await
+                    .and_then(|h| h.client_version);
                 if !supports(version.as_deref()) {
                     let text = format!(
                         "error: tool '{}' requires client >= {}.{}.{}; please upgrade the client",
@@ -639,9 +712,19 @@ pub(crate) async fn handle_single_tool_call(
             }
             // docker 运行时但容器未启动 → 报错
             let result = if rt.runtime_type == "docker" && rt.docker_container.is_none() {
-                AgentResult::Error { message: "docker container not started".into() }
+                AgentResult::Error {
+                    message: "docker container not started".into(),
+                }
             } else {
-                executor::exec_on_client(agent, &rt.workspace_id, &rt.client_id, &rt.root_path, rt.docker_container.as_deref(), command.clone()).await
+                executor::exec_on_client(
+                    agent,
+                    &rt.workspace_id,
+                    &rt.client_id,
+                    &rt.root_path,
+                    rt.docker_container.as_deref(),
+                    command.clone(),
+                )
+                .await
             };
             // stale hash 错误处理：客户端回 stale 错误时清除该 path 的记录
             if let AgentResult::Error { ref message } = result {
@@ -676,7 +759,10 @@ pub(crate) async fn handle_single_tool_call(
             }
             let text = agent_result_to_text(&result);
             // diffs 合成：文件编辑工具成功时附带 diffs 到 WS 帧
-            let diffs_value = if matches!(&result, AgentResult::WriteOutcome { .. } | AgentResult::Success) {
+            let diffs_value = if matches!(
+                &result,
+                AgentResult::WriteOutcome { .. } | AgentResult::Success
+            ) {
                 synthesize_tool_diffs(&call.name, &command)
             } else {
                 None
@@ -709,7 +795,6 @@ pub(crate) async fn handle_single_tool_call(
     record_tool_result(agent, rt, &call.id, &call.name, result_text, persist).await;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -845,7 +930,10 @@ mod tests {
 
     #[test]
     fn test_synthesize_diffs_non_file_tool_returns_none() {
-        let cmd = AgentCommand::Shell { cmd: "ls".into(), cwd: None };
+        let cmd = AgentCommand::Shell {
+            cmd: "ls".into(),
+            cwd: None,
+        };
         assert!(synthesize_tool_diffs("shell", &cmd).is_none());
     }
 
@@ -869,13 +957,11 @@ mod tests {
     fn test_build_args_preview_edit_file() {
         let cmd = AgentCommand::EditFile {
             path: "b.rs".into(),
-            edits: vec![
-                rust_tunnel_common::FileEdit {
-                    old_string: "aaa".into(),
-                    new_string: "bbb".into(),
-                    replace_all: false,
-                },
-            ],
+            edits: vec![rust_tunnel_common::FileEdit {
+                old_string: "aaa".into(),
+                new_string: "bbb".into(),
+                replace_all: false,
+            }],
             expected_hash: None,
         };
         let preview = build_args_preview("edit_file", &cmd);
@@ -897,7 +983,10 @@ mod tests {
 
     #[test]
     fn test_build_args_preview_non_file_tool() {
-        let cmd = AgentCommand::Shell { cmd: "ls".into(), cwd: None };
+        let cmd = AgentCommand::Shell {
+            cmd: "ls".into(),
+            cwd: None,
+        };
         let preview = build_args_preview("shell", &cmd);
         assert_eq!(preview, "shell");
     }

@@ -856,7 +856,10 @@ mod tests {
         let kb = db.rag_get_kb("kb-full").await.unwrap().unwrap();
         // emb 列被正确更新
         assert_eq!(kb.emb_base_url, "https://new.example.com");
-        assert_eq!(kb.emb_api_key, "enc:v1:newcipher", "api key 应是入参密文原样落库");
+        assert_eq!(
+            kb.emb_api_key, "enc:v1:newcipher",
+            "api key 应是入参密文原样落库"
+        );
         assert_eq!(kb.emb_model, "new-model");
         assert_eq!(kb.emb_dimension, 768);
         // 普通检索参数也同步更新（rag_update_kb_params 同口径）

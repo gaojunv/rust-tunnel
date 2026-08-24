@@ -20,7 +20,7 @@ pub struct ClientLogLayer {
 impl ClientLogLayer {
     /// Create a layer with no sender yet.  Call [`set_sender`](Self::set_sender)
     /// before (or after) registering this layer with `tracing_subscriber`.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tx: Arc::new(Mutex::new(None)),

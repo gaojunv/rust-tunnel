@@ -157,7 +157,12 @@ impl SseAggregator {
                     self.calls
                         .resize(index + 1, (String::new(), String::new(), String::new()));
                 }
-                let mut item = ToolCallDeltaItem { index, id: None, name: None, arguments: None };
+                let mut item = ToolCallDeltaItem {
+                    index,
+                    id: None,
+                    name: None,
+                    arguments: None,
+                };
                 {
                     let slot = &mut self.calls[index];
                     // 字段级借用（slot 持有 self.calls，bytes/limit 是独立字段），
@@ -200,7 +205,10 @@ impl SseAggregator {
         }
 
         // content 增量提取（非空时暂存，供 Thought 同帧携带）
-        let content_delta = delta.get("content").and_then(|c| c.as_str()).filter(|s| !s.is_empty());
+        let content_delta = delta
+            .get("content")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty());
         if let Some(s) = content_delta {
             if !self.reserve(s.len()) {
                 return SseFeed::Overflow;

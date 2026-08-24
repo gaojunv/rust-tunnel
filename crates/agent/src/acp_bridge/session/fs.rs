@@ -12,14 +12,14 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 
-use crate::spawner::AgentSpawner;
 use crate::db::Database;
+use crate::spawner::AgentSpawner;
 
 use super::super::SpawnedAgent;
 
@@ -124,8 +124,7 @@ pub(crate) async fn exec_fs_write(
         (ver, hash)
     };
 
-    let use_write_file2 =
-        crate::runner::client_supports_edit(client_version.as_deref());
+    let use_write_file2 = crate::runner::client_supports_edit(client_version.as_deref());
 
     let command = if use_write_file2 {
         rust_tunnel_common::AgentCommand::WriteFile2 {

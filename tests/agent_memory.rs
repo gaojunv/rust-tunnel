@@ -280,7 +280,9 @@ async fn memory_crud_roundtrip() {
         assert_eq!(body["tags"], json!(["rust", "clean", "tunnel"]));
 
         // DELETE → 列表为空
-        let status = api.delete_status(&format!("/api/agent/memories/{id}")).await;
+        let status = api
+            .delete_status(&format!("/api/agent/memories/{id}"))
+            .await;
         assert_eq!(status, StatusCode::OK);
         let (status, body) = api.get_json("/api/agent/memories").await;
         assert_eq!(status, StatusCode::OK);
@@ -327,9 +329,7 @@ async fn archive_distills_session_memories() {
                     return None;
                 }
                 let arr = body["memories"].as_array().cloned().unwrap_or_default();
-                let m = arr
-                    .iter()
-                    .find(|m| m["source_session_id"] == sid)?;
+                let m = arr.iter().find(|m| m["source_session_id"] == sid)?;
                 Some((
                     m["source_trigger"].as_str().unwrap_or("").to_string(),
                     m["content"].as_str().unwrap_or("").to_string(),

@@ -10,7 +10,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::agent::session::{DEFAULT_MODEL_KEY, SessionRuntime};
+use crate::agent::session::{SessionRuntime, DEFAULT_MODEL_KEY};
 use crate::auth::{validate_token, AuthConfig};
 use crate::llm::ChatMessage;
 use crate::mgmt::api::ApiState;
@@ -377,7 +377,12 @@ async fn refresh_session_state(
             .filter(|r| r.enabled == 1 && (r.mode == "primary" || r.mode == "all")),
         None => None,
     };
-    if let Some(m) = session.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(m) = session
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if m != rt_model {
             *rt_model = m.to_string();
         }
@@ -538,7 +543,8 @@ fn parse_ws_frame(msg: Message) -> WsFrame {
                 .to_string();
             // request_id 缺省或 action 非法 → Other（与 approval_response 同款
             // 容错：非法帧静默忽略，不 panic）。
-            if request_id.is_empty() || !["accept", "decline", "cancel"].contains(&action.as_str()) {
+            if request_id.is_empty() || !["accept", "decline", "cancel"].contains(&action.as_str())
+            {
                 return WsFrame::Other;
             }
             WsFrame::ElicitationResponse {
@@ -811,7 +817,10 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     return;
                 };
                 if use_acp_path(&workspace) {
-                    if let Err(e) = bridge.ensure_session(&sid, &workspace, ws_tx, conn_id).await {
+                    if let Err(e) = bridge
+                        .ensure_session(&sid, &workspace, ws_tx, conn_id)
+                        .await
+                    {
                         // info 级：预 spawn 失败此前只在 debug 可见，用户首条
                         // 消息只能拿到 wait_ready 的泛化错误，排查困难。
                         tracing::info!(session_id = %sid, "pre-spawn acp agent failed: {e}");
@@ -948,10 +957,24 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                 continue;
                             }
                         };
-                        if let Err(e) = agent.db.agent_update_workspace(
-                            &ws.id, &ws.name, &ws.root_path,
-                            None, Some(&mode), None, None, None, None, None, false, false,
-                        ).await {
+                        if let Err(e) = agent
+                            .db
+                            .agent_update_workspace(
+                                &ws.id,
+                                &ws.name,
+                                &ws.root_path,
+                                None,
+                                Some(&mode),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                false,
+                            )
+                            .await
+                        {
                             let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set mode failed: {e}")})).await;
                             continue;
                         }
@@ -960,7 +983,9 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     if let Some(rt) = rt_cache.as_mut() {
                         rt.approval_mode = mode.clone();
                     }
-                    let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
+                    let _ = event_tx
+                        .send(serde_json::json!({"type": "mode_updated", "mode": &mode}))
+                        .await;
                     continue;
                 }
                 WsFrame::SetRole { role_id } => {
@@ -968,8 +993,16 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                     // role_id 空串 = 清除角色。
                     if let Some(agent) = state.server_state.agent_state.as_ref() {
                         // 更新 DB（空串 → None）
-                        let db_role_id = if role_id.is_empty() { None } else { Some(role_id.as_str()) };
-                        if let Err(e) = agent.db.agent_update_session_role(&session_id, db_role_id).await {
+                        let db_role_id = if role_id.is_empty() {
+                            None
+                        } else {
+                            Some(role_id.as_str())
+                        };
+                        if let Err(e) = agent
+                            .db
+                            .agent_update_session_role(&session_id, db_role_id)
+                            .await
+                        {
                             let _ = event_tx.send(serde_json::json!({"type": "error", "message": format!("set role failed: {e}")})).await;
                             continue;
                         }
@@ -979,12 +1012,19 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                                 None
                             } else {
                                 match agent.db.role_get_by_id(&role_id).await {
-                                    Ok(Some(r)) if r.enabled == 1 && (r.mode == "primary" || r.mode == "all") => Some(r),
+                                    Ok(Some(r))
+                                        if r.enabled == 1
+                                            && (r.mode == "primary" || r.mode == "all") =>
+                                    {
+                                        Some(r)
+                                    }
                                     _ => None,
                                 }
                             };
                         }
-                        let _ = event_tx.send(serde_json::json!({"type": "role_updated", "role_id": &role_id})).await;
+                        let _ = event_tx
+                            .send(serde_json::json!({"type": "role_updated", "role_id": &role_id}))
+                            .await;
                     }
                     continue;
                 }
@@ -994,13 +1034,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
 
         let (agent, llm) = match (
             state.server_state.agent_state.clone(),
-            state
-                .server_state
-                .llm_state
-                .read()
-                .await
-                .as_ref()
-                .cloned(),
+            state.server_state.llm_state.read().await.as_ref().cloned(),
         ) {
             (Some(a), Some(l)) => (a, l),
             _ => {
@@ -1194,12 +1228,14 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
 
         // @role 前缀解析：content 以 @<name> 开头且 name 匹配可见角色（mode 含 primary/all）
         // → 设置 rt.active_role（本回合生效）+ 剥离前缀；未命中走原 @文件引用逻辑。
-        let visible_roles = agent.db.role_list_visible(
-            &rt.client_id,
-            &rt.workspace_id,
-            Some("primary"),
-        ).await.unwrap_or_default();
-        let content = if let Some((role_name, stripped)) = crate::agent::roles::parse_at_role_prefix(&content, &visible_roles) {
+        let visible_roles = agent
+            .db
+            .role_list_visible(&rt.client_id, &rt.workspace_id, Some("primary"))
+            .await
+            .unwrap_or_default();
+        let content = if let Some((role_name, stripped)) =
+            crate::agent::roles::parse_at_role_prefix(&content, &visible_roles)
+        {
             // 直接在可见角色列表中取记录（含 client/workspace 作用域）——不可按
             // global 作用域重查，否则非全局角色匹配上前缀却取不到记录。
             // parse_at_role_prefix 的名字来自同一列表，find 必然命中。
@@ -1674,9 +1710,7 @@ mod tests {
             _ => panic!("expected SetRole"),
         }
         // 空 role_id = 清除角色
-        let clear = parse_ws_frame(Message::Text(
-            r#"{"type":"set_role","role_id":""}"#.into(),
-        ));
+        let clear = parse_ws_frame(Message::Text(r#"{"type":"set_role","role_id":""}"#.into()));
         match clear {
             WsFrame::SetRole { role_id } => assert!(role_id.is_empty()),
             _ => panic!("expected SetRole with empty role_id"),
@@ -1737,8 +1771,7 @@ mod tests {
         // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
-            None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1771,8 +1804,7 @@ mod tests {
     async fn test_refresh_session_state_applies_patched_model() {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
-            None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
@@ -1811,12 +1843,13 @@ mod tests {
     async fn test_refresh_session_state_role_and_model_override() {
         let (_state, db) = test_state().await;
         db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None,
-            None,
+            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
         )
         .await
         .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
+        db.agent_create_session("s1", "w1", None, None)
+            .await
+            .unwrap();
         db.role_insert(
             "r1",
             "reviewer",
@@ -1834,7 +1867,9 @@ mod tests {
         .unwrap();
 
         // 绑定角色 + session.model 为空 → active_role 同步、角色 model_override 生效。
-        db.agent_update_session_role("s1", Some("r1")).await.unwrap();
+        db.agent_update_session_role("s1", Some("r1"))
+            .await
+            .unwrap();
         let mut rt_model = "default-model".to_string();
         let mut role = None;
         let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
@@ -1843,7 +1878,9 @@ mod tests {
         assert_eq!(role.as_ref().map(|r| r.name.as_str()), Some("reviewer"));
 
         // session.model 显式设置 → 优先于角色 model_override。
-        db.agent_update_session_model("s1", Some("gpt-4o")).await.unwrap();
+        db.agent_update_session_model("s1", Some("gpt-4o"))
+            .await
+            .unwrap();
         let explicit = refresh_session_state(&db, "s1", &mut rt_model, &mut role).await;
         assert!(explicit);
         assert_eq!(rt_model, "gpt-4o");
@@ -1854,7 +1891,9 @@ mod tests {
         assert!(role.is_none());
 
         // 禁用角色 → 视为无角色。
-        db.agent_update_session_role("s1", Some("r1")).await.unwrap();
+        db.agent_update_session_role("s1", Some("r1"))
+            .await
+            .unwrap();
         db.role_toggle_enabled("r1").await.unwrap();
         db.agent_update_session_model("s1", None).await.unwrap();
         let mut rt_model2 = "default-model".to_string();

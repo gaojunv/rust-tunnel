@@ -549,8 +549,14 @@ mod tests {
 
     #[test]
     fn parse_upstream_protocol_missing_returns_default() {
-        assert_eq!(parse_upstream_protocol(None), UpstreamProtocol::ChatCompletions);
-        assert_eq!(parse_upstream_protocol(Some("{}")), UpstreamProtocol::ChatCompletions);
+        assert_eq!(
+            parse_upstream_protocol(None),
+            UpstreamProtocol::ChatCompletions
+        );
+        assert_eq!(
+            parse_upstream_protocol(Some("{}")),
+            UpstreamProtocol::ChatCompletions
+        );
     }
 
     #[test]
@@ -609,9 +615,7 @@ mod tests {
             .unwrap();
 
         let state = LlmState::new(Some(db), None);
-        let chain = resolve_with_failover(&state, "gpt-5-codex")
-            .await
-            .unwrap();
+        let chain = resolve_with_failover(&state, "gpt-5-codex").await.unwrap();
         assert_eq!(chain.candidates.len(), 1);
         assert_eq!(
             chain.candidates[0].upstream_protocol,

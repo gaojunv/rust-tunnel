@@ -36,7 +36,6 @@ pub(crate) fn insert_block_before(content: &str, anchor_tag: &str, block: &str) 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,7 +43,8 @@ mod tests {
     #[test]
     fn test_remove_tagged_block_middle() {
         // 角色块在中间：前后块都保留，tag 自身的分隔符前缀不得被误判为下一个块。
-        let content = "base\n\n---\n\n# Role: explore\n只读\n提示词\n\n---\n\n# Plan Mode\nplan 内容";
+        let content =
+            "base\n\n---\n\n# Role: explore\n只读\n提示词\n\n---\n\n# Plan Mode\nplan 内容";
         let out = remove_tagged_block(content, ROLE_BLOCK_TAG);
         assert_eq!(out, "base\n\n---\n\n# Plan Mode\nplan 内容");
     }
@@ -61,7 +61,8 @@ mod tests {
     fn test_remove_tagged_block_self_match_trap() {
         // 回归：在 tag 起点处搜索分隔符会匹配到 tag 自身前缀（tag 以分隔符开头），
         // 必须从 tag 结束之后开始搜，否则移除失效（原样返回）。
-        let content = "base\n\n---\n\n# Role: a\n提示词\n\n---\n\n### Available Sub-Agent Roles\n- x";
+        let content =
+            "base\n\n---\n\n# Role: a\n提示词\n\n---\n\n### Available Sub-Agent Roles\n- x";
         let out = remove_tagged_block(content, ROLE_BLOCK_TAG);
         assert!(!out.contains("# Role:"), "角色块应被移除: {out}");
         assert!(out.contains("### Available Sub-Agent Roles"));
@@ -70,10 +71,23 @@ mod tests {
     #[test]
     fn test_insert_block_before_anchor() {
         let content = "base\n\n---\n\n# Plan Mode\nplan";
-        let out = insert_block_before(content, "\n\n---\n\n# Plan Mode\n", "\n\n---\n\n# Role: r\n提示词");
-        assert_eq!(out, "base\n\n---\n\n# Role: r\n提示词\n\n---\n\n# Plan Mode\nplan");
+        let out = insert_block_before(
+            content,
+            "\n\n---\n\n# Plan Mode\n",
+            "\n\n---\n\n# Role: r\n提示词",
+        );
+        assert_eq!(
+            out,
+            "base\n\n---\n\n# Role: r\n提示词\n\n---\n\n# Plan Mode\nplan"
+        );
         // 锚点不存在 → 追加
-        assert_eq!(insert_block_before("base", "\n\n---\n\n# Plan Mode\n", "\n\n---\n\n# Role: r\n提示词"), "base\n\n---\n\n# Role: r\n提示词");
+        assert_eq!(
+            insert_block_before(
+                "base",
+                "\n\n---\n\n# Plan Mode\n",
+                "\n\n---\n\n# Role: r\n提示词"
+            ),
+            "base\n\n---\n\n# Role: r\n提示词"
+        );
     }
-
 }

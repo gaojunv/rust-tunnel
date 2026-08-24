@@ -266,7 +266,11 @@ mod tests {
 
         // initially empty
         assert!(db.load_acme_certificates().await.unwrap().is_empty());
-        assert!(db.get_acme_certificate("example.com").await.unwrap().is_none());
+        assert!(db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .is_none());
 
         let issued = Utc::now() - Duration::days(10);
         let expires = Utc::now() + Duration::days(80);
@@ -285,7 +289,11 @@ mod tests {
         .await
         .unwrap();
 
-        let rec = db.get_acme_certificate("example.com").await.unwrap().unwrap();
+        let rec = db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.domain, "example.com");
         assert_eq!(rec.status, "pending");
         assert_eq!(rec.cert_pem.as_deref(), Some("cert-pem"));
@@ -314,7 +322,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let rec2 = db.get_acme_certificate("example.com").await.unwrap().unwrap();
+        let rec2 = db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec2.status, "active");
         assert_eq!(rec2.cert_pem.as_deref(), Some("cert-pem-v2"));
         assert_eq!(rec2.chain_pem, None);
@@ -324,7 +336,11 @@ mod tests {
         db.update_acme_certificate_status("example.com", "failed", Some("dns timeout"))
             .await
             .unwrap();
-        let rec3 = db.get_acme_certificate("example.com").await.unwrap().unwrap();
+        let rec3 = db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec3.status, "failed");
         assert_eq!(rec3.error_message.as_deref(), Some("dns timeout"));
 
@@ -332,7 +348,11 @@ mod tests {
         db.update_acme_certificate_status("example.com", "active", None)
             .await
             .unwrap();
-        let rec4 = db.get_acme_certificate("example.com").await.unwrap().unwrap();
+        let rec4 = db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec4.status, "active");
         assert!(rec4.error_message.is_none());
 
@@ -341,30 +361,58 @@ mod tests {
         db.update_acme_certificate_renewal_attempt("example.com")
             .await
             .unwrap();
-        let rec5 = db.get_acme_certificate("example.com").await.unwrap().unwrap();
+        let rec5 = db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(rec5.last_renewal_attempt.is_some());
 
         // delete
         db.delete_acme_certificate("example.com").await.unwrap();
-        assert!(db.get_acme_certificate("example.com").await.unwrap().is_none());
+        assert!(db
+            .get_acme_certificate("example.com")
+            .await
+            .unwrap()
+            .is_none());
         assert!(db.load_acme_certificates().await.unwrap().is_empty());
 
         // delete non-existent is no-op
-        db.delete_acme_certificate("no-such.example.com").await.unwrap();
+        db.delete_acme_certificate("no-such.example.com")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn certificate_save_with_null_fields_and_load_order() {
         let db = in_memory_db().await;
 
-        db.save_acme_certificate("a.example.com", "pending", None, None, None, None, None, true)
-            .await
-            .unwrap();
+        db.save_acme_certificate(
+            "a.example.com",
+            "pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
         // small delay to ensure created_at ordering is deterministic
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        db.save_acme_certificate("b.example.com", "pending", None, None, None, None, None, true)
-            .await
-            .unwrap();
+        db.save_acme_certificate(
+            "b.example.com",
+            "pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
 
         let all = db.load_acme_certificates().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -380,7 +428,11 @@ mod tests {
     async fn challenge_crud_save_get_update_delete() {
         let db = in_memory_db().await;
 
-        assert!(db.get_acme_challenge("tok-missing").await.unwrap().is_none());
+        assert!(db
+            .get_acme_challenge("tok-missing")
+            .await
+            .unwrap()
+            .is_none());
 
         let expires = Utc::now() + Duration::hours(1);
         db.save_acme_challenge("tok-1", "example.com", "auth-1", Some(expires))
@@ -394,9 +446,15 @@ mod tests {
         assert_eq!(ch.status, "pending");
 
         // upsert same token resets status to pending and updates fields
-        db.update_acme_challenge_status("tok-1", "valid").await.unwrap();
+        db.update_acme_challenge_status("tok-1", "valid")
+            .await
+            .unwrap();
         assert_eq!(
-            db.get_acme_challenge("tok-1").await.unwrap().unwrap().status,
+            db.get_acme_challenge("tok-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "valid"
         );
         // re-save same token should reset status to pending
@@ -410,9 +468,15 @@ mod tests {
         assert!(ch2.expires_at.is_none());
 
         // update status to invalid
-        db.update_acme_challenge_status("tok-1", "invalid").await.unwrap();
+        db.update_acme_challenge_status("tok-1", "invalid")
+            .await
+            .unwrap();
         assert_eq!(
-            db.get_acme_challenge("tok-1").await.unwrap().unwrap().status,
+            db.get_acme_challenge("tok-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
             "invalid"
         );
 
@@ -451,9 +515,17 @@ mod tests {
         let removed = db.cleanup_expired_acme_challenges().await.unwrap();
         assert_eq!(removed, 1);
 
-        assert!(db.get_acme_challenge("tok-expired").await.unwrap().is_none());
+        assert!(db
+            .get_acme_challenge("tok-expired")
+            .await
+            .unwrap()
+            .is_none());
         assert!(db.get_acme_challenge("tok-future").await.unwrap().is_some());
-        assert!(db.get_acme_challenge("tok-no-expiry").await.unwrap().is_some());
+        assert!(db
+            .get_acme_challenge("tok-no-expiry")
+            .await
+            .unwrap()
+            .is_some());
 
         // second cleanup removes nothing
         let removed2 = db.cleanup_expired_acme_challenges().await.unwrap();
@@ -572,18 +644,33 @@ mod tests {
         // 30-day window: soon (10d) and expired (-1d) match; far (90d) does not
         let needing = db.load_acme_certificates_needing_renewal(30).await.unwrap();
         let domains: Vec<&str> = needing.iter().map(|r| r.domain.as_str()).collect();
-        assert!(domains.contains(&"soon.example.com"), "domains: {domains:?}");
-        assert!(domains.contains(&"expired.example.com"), "domains: {domains:?}");
+        assert!(
+            domains.contains(&"soon.example.com"),
+            "domains: {domains:?}"
+        );
+        assert!(
+            domains.contains(&"expired.example.com"),
+            "domains: {domains:?}"
+        );
         assert_eq!(domains.len(), 2, "unexpected domains: {domains:?}");
 
         // 5-day window: expired (-1d) still matches (expired <= cutoff), soon (10d) does not
         let needing5 = db.load_acme_certificates_needing_renewal(5).await.unwrap();
         let domains5: Vec<&str> = needing5.iter().map(|r| r.domain.as_str()).collect();
-        assert!(domains5.contains(&"expired.example.com"), "domains5: {domains5:?}");
-        assert!(!domains5.contains(&"soon.example.com"), "domains5: {domains5:?}");
+        assert!(
+            domains5.contains(&"expired.example.com"),
+            "domains5: {domains5:?}"
+        );
+        assert!(
+            !domains5.contains(&"soon.example.com"),
+            "domains5: {domains5:?}"
+        );
 
         // 100-day window: soon, far (90d), expired all match
-        let needing100 = db.load_acme_certificates_needing_renewal(100).await.unwrap();
+        let needing100 = db
+            .load_acme_certificates_needing_renewal(100)
+            .await
+            .unwrap();
         let domains100: Vec<&str> = needing100.iter().map(|r| r.domain.as_str()).collect();
         assert!(domains100.contains(&"soon.example.com"));
         assert!(domains100.contains(&"far.example.com"));
@@ -601,6 +688,10 @@ mod tests {
         db.update_acme_certificate_renewal_attempt("ghost.example.com")
             .await
             .unwrap();
-        assert!(db.get_acme_certificate("ghost.example.com").await.unwrap().is_none());
+        assert!(db
+            .get_acme_certificate("ghost.example.com")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

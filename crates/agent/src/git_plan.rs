@@ -94,7 +94,10 @@ pub fn classify(args: &[String]) -> GitRisk {
         "branch" => {
             // list（--list/--format/-a/-r/-v 或纯 `branch`）保持 Read；创建（裸名）
             // 与 -d 为 SafeWrite；-D / --delete --force 为 DangerousWrite。
-            let has_force = args.iter().skip(1).any(|a| a == "-D" || a == "--force" || a == "-f");
+            let has_force = args
+                .iter()
+                .skip(1)
+                .any(|a| a == "-D" || a == "--force" || a == "-f");
             let has_delete = args
                 .iter()
                 .skip(1)
@@ -236,9 +239,7 @@ pub fn plan(args: &[String]) -> Result<PlannedGit, GitPlanError> {
             while i < rest.len() {
                 let t = &rest[i];
                 if t == "-n" || t == "--max-count" {
-                    let v = rest
-                        .get(i + 1)
-                        .ok_or(GitPlanError::MissingArg("-n"))?;
+                    let v = rest.get(i + 1).ok_or(GitPlanError::MissingArg("-n"))?;
                     if v.is_empty() || !v.chars().all(|c| c.is_ascii_digit()) {
                         return Err(GitPlanError::InvalidValue(v.clone(), "-n"));
                     }
@@ -432,7 +433,10 @@ pub fn plan(args: &[String]) -> Result<PlannedGit, GitPlanError> {
         "restore" => {
             let (flags, paths) = split_paths(rest);
             if flags.len() != 1 || flags[0] != "--staged" {
-                let t = flags.first().cloned().unwrap_or_else(|| "--staged".to_string());
+                let t = flags
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "--staged".to_string());
                 return Err(GitPlanError::UnknownArg(t));
             }
             if paths.is_empty() {
@@ -502,8 +506,14 @@ mod tests {
     fn test_plan_status_pull() {
         assert_eq!(ok(&["status"]).args, s(&["status"]));
         assert_eq!(ok(&["pull"]).args, s(&["pull"]));
-        assert!(matches!(err(&["status", "-v"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["pull", "origin"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["status", "-v"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["pull", "origin"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
@@ -534,13 +544,22 @@ mod tests {
     fn test_plan_log() {
         assert_eq!(ok(&["log"]).args, s(&["log"]));
         assert_eq!(ok(&["log", "-n", "50"]).args, s(&["log", "-n", "50"]));
-        assert_eq!(ok(&["log", "--format=%H", "-n", "5"]).args, s(&["log", "--format=%H", "-n", "5"]));
+        assert_eq!(
+            ok(&["log", "--format=%H", "-n", "5"]).args,
+            s(&["log", "--format=%H", "-n", "5"])
+        );
         assert!(matches!(
             err(&["log", "-n", "abc"]),
             GitPlanError::InvalidValue(_, _)
         ));
-        assert!(matches!(err(&["log", "--grep=x"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["log", "--", "a.txt"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["log", "--grep=x"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["log", "--", "a.txt"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
@@ -549,70 +568,151 @@ mod tests {
         assert_eq!(ok(&["show", "HEAD"]).args, s(&["show", "HEAD"]));
         assert_eq!(ok(&["show", "abc1234"]).args, s(&["show", "abc1234"]));
         assert_eq!(ok(&["show", "HEAD~2"]).args, s(&["show", "HEAD~2"]));
-        assert!(matches!(err(&["show", "--stat"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["show", "a", "b"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["show", "--stat"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["show", "a", "b"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_branch() {
         assert_eq!(ok(&["branch"]).args, s(&["branch"]));
         assert_eq!(ok(&["branch", "--list"]).args, s(&["branch", "--list"]));
-        assert_eq!(ok(&["branch", "--format=%(refname)"]).args, s(&["branch", "--format=%(refname)"]));
+        assert_eq!(
+            ok(&["branch", "--format=%(refname)"]).args,
+            s(&["branch", "--format=%(refname)"])
+        );
         assert_eq!(ok(&["branch", "feature"]).args, s(&["branch", "feature"]));
-        assert_eq!(ok(&["branch", "-d", "feature"]).args, s(&["branch", "-d", "feature"]));
-        assert_eq!(ok(&["branch", "-D", "feature"]).args, s(&["branch", "-D", "feature"]));
-        assert!(matches!(err(&["branch", "-d"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["branch", "--grep=x"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["branch", "a", "b"]), GitPlanError::UnknownArg(_)));
+        assert_eq!(
+            ok(&["branch", "-d", "feature"]).args,
+            s(&["branch", "-d", "feature"])
+        );
+        assert_eq!(
+            ok(&["branch", "-D", "feature"]).args,
+            s(&["branch", "-D", "feature"])
+        );
+        assert!(matches!(
+            err(&["branch", "-d"]),
+            GitPlanError::MissingArg(_)
+        ));
+        assert!(matches!(
+            err(&["branch", "--grep=x"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["branch", "a", "b"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_checkout() {
         assert_eq!(ok(&["checkout", "main"]).args, s(&["checkout", "main"]));
-        assert_eq!(ok(&["checkout", "-b", "feature"]).args, s(&["checkout", "-b", "feature"]));
+        assert_eq!(
+            ok(&["checkout", "-b", "feature"]).args,
+            s(&["checkout", "-b", "feature"])
+        );
         assert!(matches!(err(&["checkout"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["checkout", "-b"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["checkout", "--", "a.txt"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["checkout", "-b", "a", "b"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["checkout", "-b"]),
+            GitPlanError::MissingArg(_)
+        ));
+        assert!(matches!(
+            err(&["checkout", "--", "a.txt"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["checkout", "-b", "a", "b"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_push() {
         assert_eq!(ok(&["push"]).args, s(&["push"]));
-        assert_eq!(ok(&["push", "--force-with-lease"]).args, s(&["push", "--force-with-lease"]));
-        assert_eq!(ok(&["push", "--force-with-lease=main"]).args, s(&["push", "--force-with-lease=main"]));
-        assert!(matches!(err(&["push", "origin"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["push", "--delete"]), GitPlanError::UnknownArg(_)));
+        assert_eq!(
+            ok(&["push", "--force-with-lease"]).args,
+            s(&["push", "--force-with-lease"])
+        );
+        assert_eq!(
+            ok(&["push", "--force-with-lease=main"]).args,
+            s(&["push", "--force-with-lease=main"])
+        );
+        assert!(matches!(
+            err(&["push", "origin"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["push", "--delete"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_revert_reset() {
         assert_eq!(ok(&["revert", "abc123"]).args, s(&["revert", "abc123"]));
         assert!(matches!(err(&["revert"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["revert", "-m", "1"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["revert", "-m", "1"]),
+            GitPlanError::UnknownArg(_)
+        ));
 
         assert_eq!(ok(&["reset"]).args, s(&["reset"]));
         assert_eq!(ok(&["reset", "HEAD~1"]).args, s(&["reset", "HEAD~1"]));
         assert_eq!(ok(&["reset", "--hard"]).args, s(&["reset", "--hard"]));
-        assert_eq!(ok(&["reset", "--soft", "HEAD~2"]).args, s(&["reset", "--soft", "HEAD~2"]));
-        assert_eq!(ok(&["reset", "--mixed", "HEAD"]).args, s(&["reset", "--mixed", "HEAD"]));
-        assert!(matches!(err(&["reset", "--hardcore"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["reset", "a", "b"]), GitPlanError::UnknownArg(_)));
+        assert_eq!(
+            ok(&["reset", "--soft", "HEAD~2"]).args,
+            s(&["reset", "--soft", "HEAD~2"])
+        );
+        assert_eq!(
+            ok(&["reset", "--mixed", "HEAD"]).args,
+            s(&["reset", "--mixed", "HEAD"])
+        );
+        assert!(matches!(
+            err(&["reset", "--hardcore"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["reset", "a", "b"]),
+            GitPlanError::UnknownArg(_)
+        ));
         // pathspec 形态（git reset -- <path>）不开放：unstage 走 restore --staged
-        assert!(matches!(err(&["reset", "--", "a.txt"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["reset", "--", "a.txt"]),
+            GitPlanError::UnknownArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_stash() {
         assert_eq!(ok(&["stash", "list"]).args, s(&["stash", "list"]));
         assert_eq!(ok(&["stash", "push"]).args, s(&["stash", "push"]));
-        assert_eq!(ok(&["stash", "push", "-m", "wip"]).args, s(&["stash", "push", "-m", "wip"]));
-        assert_eq!(ok(&["stash", "apply", "stash@{1}"]).args, s(&["stash", "apply", "stash@{1}"]));
-        assert_eq!(ok(&["stash", "pop", "stash@{0}"]).args, s(&["stash", "pop", "stash@{0}"]));
+        assert_eq!(
+            ok(&["stash", "push", "-m", "wip"]).args,
+            s(&["stash", "push", "-m", "wip"])
+        );
+        assert_eq!(
+            ok(&["stash", "apply", "stash@{1}"]).args,
+            s(&["stash", "apply", "stash@{1}"])
+        );
+        assert_eq!(
+            ok(&["stash", "pop", "stash@{0}"]).args,
+            s(&["stash", "pop", "stash@{0}"])
+        );
         assert_eq!(ok(&["stash", "drop"]).args, s(&["stash", "drop"]));
-        assert_eq!(ok(&["stash", "drop", "stash@{3}"]).args, s(&["stash", "drop", "stash@{3}"]));
+        assert_eq!(
+            ok(&["stash", "drop", "stash@{3}"]).args,
+            s(&["stash", "drop", "stash@{3}"])
+        );
         assert!(matches!(err(&["stash"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["stash", "bogus"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["stash", "bogus"]),
+            GitPlanError::UnknownArg(_)
+        ));
         assert!(matches!(
             err(&["stash", "drop", "stash@{x}"]),
             GitPlanError::InvalidValue(_, _)
@@ -625,21 +725,36 @@ mod tests {
 
     #[test]
     fn test_plan_remote() {
-        assert_eq!(ok(&["remote", "get-url", "origin"]).args, s(&["remote", "get-url", "origin"]));
+        assert_eq!(
+            ok(&["remote", "get-url", "origin"]).args,
+            s(&["remote", "get-url", "origin"])
+        );
         assert_eq!(
             ok(&["remote", "add", "upstream", "https://github.com/o/r.git"]).args,
             s(&["remote", "add", "upstream", "https://github.com/o/r.git"])
         );
-        assert!(matches!(err(&["remote", "remove", "x"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["remote", "remove", "x"]),
+            GitPlanError::UnknownArg(_)
+        ));
         assert!(matches!(err(&["remote"]), GitPlanError::MissingArg(_)));
-        assert!(matches!(err(&["remote", "get-url"]), GitPlanError::MissingArg(_)));
+        assert!(matches!(
+            err(&["remote", "get-url"]),
+            GitPlanError::MissingArg(_)
+        ));
     }
 
     #[test]
     fn test_plan_commit_add_restore() {
-        assert_eq!(ok(&["commit", "-m", "fix"]).args, s(&["commit", "-m", "fix"]));
+        assert_eq!(
+            ok(&["commit", "-m", "fix"]).args,
+            s(&["commit", "-m", "fix"])
+        );
         assert!(matches!(err(&["commit"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["commit", "-a", "-m", "x"]), GitPlanError::UnknownArg(_)));
+        assert!(matches!(
+            err(&["commit", "-a", "-m", "x"]),
+            GitPlanError::UnknownArg(_)
+        ));
 
         assert_eq!(ok(&["add", "--", "a.rs"]).args, s(&["add", "--", "a.rs"]));
         assert_eq!(
@@ -649,15 +764,27 @@ mod tests {
         assert!(matches!(err(&["add"]), GitPlanError::MissingArg(_)));
         assert!(matches!(err(&["add", "a.rs"]), GitPlanError::UnknownArg(_)));
         assert!(matches!(err(&["add", "-A"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["add", "--", ".."]), GitPlanError::PathEscapes(_)));
+        assert!(matches!(
+            err(&["add", "--", ".."]),
+            GitPlanError::PathEscapes(_)
+        ));
 
         assert_eq!(
             ok(&["restore", "--staged", "--", "a.rs"]).args,
             s(&["restore", "--staged", "--", "a.rs"])
         );
-        assert!(matches!(err(&["restore", "--staged", "a.rs"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["restore", "--", "a.rs"]), GitPlanError::UnknownArg(_)));
-        assert!(matches!(err(&["restore", "--staged", "--"]), GitPlanError::MissingArg(_)));
+        assert!(matches!(
+            err(&["restore", "--staged", "a.rs"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["restore", "--", "a.rs"]),
+            GitPlanError::UnknownArg(_)
+        ));
+        assert!(matches!(
+            err(&["restore", "--staged", "--"]),
+            GitPlanError::MissingArg(_)
+        ));
     }
 
     #[test]
@@ -725,7 +852,11 @@ mod tests {
             &["push", "-f"][..],
             &["push", "--force-with-lease"][..],
         ] {
-            assert_eq!(classify(&s(args)), GitRisk::DangerousWrite, "args = {args:?}");
+            assert_eq!(
+                classify(&s(args)),
+                GitRisk::DangerousWrite,
+                "args = {args:?}"
+            );
         }
     }
 

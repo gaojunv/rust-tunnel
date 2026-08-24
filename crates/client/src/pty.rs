@@ -412,10 +412,9 @@ mod tests {
     fn negotiation_unknown_fields_ignored() {
         // Negotiation 无 deny_unknown_fields：旧客户端不发 id/resize_for 时
         // serde 默认忽略多余字段；新字段存在时正常解析。
-        let n: Negotiation = serde_json::from_str(
-            r#"{"rows":24,"cols":80,"shell":"bash","unknown":"ignored"}"#,
-        )
-        .unwrap();
+        let n: Negotiation =
+            serde_json::from_str(r#"{"rows":24,"cols":80,"shell":"bash","unknown":"ignored"}"#)
+                .unwrap();
         assert_eq!(n.rows, 24);
         assert!(n.id.is_none());
         assert!(n.resize_for.is_none());
@@ -440,13 +439,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         use tokio::io::AsyncWriteExt;
         client
-            .write_all(
-                format!(
-                    r#"{{"resize_for":"{}","rows":50,"cols":120}}"#,
-                    test_id
-                )
-                .as_bytes(),
-            )
+            .write_all(format!(r#"{{"resize_for":"{}","rows":50,"cols":120}}"#, test_id).as_bytes())
             .await
             .unwrap();
         client.write_all(b"\n").await.unwrap();

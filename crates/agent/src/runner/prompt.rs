@@ -36,7 +36,6 @@ pub fn compose_user_message(
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +73,4 @@ mod tests {
     }
 
     // ── task 工具 / 子 agent 相关测试 ──────────────────────────
-
 }

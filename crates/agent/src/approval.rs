@@ -94,9 +94,9 @@ fn is_dd_write(cmd_lower: &str) -> bool {
         .split_whitespace()
         .any(|t| t == "dd" || t.ends_with("/dd"));
     has_dd
-        && cmd_lower.split_whitespace().any(|t| {
-            t.starts_with("of=/dev/") && !t.starts_with("of=/dev/null")
-        })
+        && cmd_lower
+            .split_whitespace()
+            .any(|t| t.starts_with("of=/dev/") && !t.starts_with("of=/dev/null"))
 }
 
 /// 命令把 /dev/ 设备节点作为裸目标参数（如 `cp x /dev/sda`、`tee /dev/sda`、
@@ -115,20 +115,8 @@ fn writes_to_device(cmd_lower: &str) -> bool {
 /// 后跟以 `-` 开头的危险信号参数（-9 / -KILL / -SIGKILL / -SIGTERM / -STOP 等）。
 fn is_kill_dangerous(cmd_lower: &str) -> bool {
     const DANGEROUS_SIGNALS: &[&str] = &[
-        "-9",
-        "-sighup",
-        "-sigint",
-        "-sigkill",
-        "-sigterm",
-        "-sigstop",
-        "-sigcont",
-        "-hup",
-        "-int",
-        "-kill",
-        "-term",
-        "-stop",
-        "-abrt",
-        "-segv",
+        "-9", "-sighup", "-sigint", "-sigkill", "-sigterm", "-sigstop", "-sigcont", "-hup", "-int",
+        "-kill", "-term", "-stop", "-abrt", "-segv",
     ];
     let tokens: Vec<&str> = cmd_lower.split_whitespace().collect();
     for (i, t) in tokens.iter().enumerate() {
@@ -486,19 +474,34 @@ mod tests {
             assert!(!needs_approval(mode, &git_exec(&["show", "HEAD"])));
             assert!(!needs_approval(mode, &git_exec(&["branch", "--list"])));
             assert!(!needs_approval(mode, &git_exec(&["stash", "list"])));
-            assert!(!needs_approval(mode, &git_exec(&["remote", "get-url", "origin"])));
+            assert!(!needs_approval(
+                mode,
+                &git_exec(&["remote", "get-url", "origin"])
+            ));
         }
     }
 
     #[test]
     fn test_git_exec_safe_write_needs_safe_mode_only() {
         assert!(needs_approval("safe", &git_exec(&["commit", "-m", "x"])));
-        assert!(!needs_approval("auto_write", &git_exec(&["commit", "-m", "x"])));
-        assert!(!needs_approval("full_auto", &git_exec(&["commit", "-m", "x"])));
+        assert!(!needs_approval(
+            "auto_write",
+            &git_exec(&["commit", "-m", "x"])
+        ));
+        assert!(!needs_approval(
+            "full_auto",
+            &git_exec(&["commit", "-m", "x"])
+        ));
         assert!(needs_approval("safe", &git_exec(&["checkout", "-b", "f"])));
-        assert!(!needs_approval("auto_write", &git_exec(&["checkout", "-b", "f"])));
+        assert!(!needs_approval(
+            "auto_write",
+            &git_exec(&["checkout", "-b", "f"])
+        ));
         assert!(needs_approval("safe", &git_exec(&["add", "--", "a.rs"])));
-        assert!(!needs_approval("auto_write", &git_exec(&["add", "--", "a.rs"])));
+        assert!(!needs_approval(
+            "auto_write",
+            &git_exec(&["add", "--", "a.rs"])
+        ));
     }
 
     #[test]
@@ -516,7 +519,10 @@ mod tests {
                 needs_approval("auto_write", &git_exec(args)),
                 "auto_write args = {args:?}"
             );
-            assert!(!needs_approval("full_auto", &git_exec(args)), "args = {args:?}");
+            assert!(
+                !needs_approval("full_auto", &git_exec(args)),
+                "args = {args:?}"
+            );
         }
     }
 
@@ -538,12 +544,16 @@ mod tests {
         assert!(is_git_dangerous_subcommand("git clean -fd"));
         assert!(is_git_dangerous_subcommand("git clean -fdx"));
         assert!(is_git_dangerous_subcommand("git branch -D feature"));
-        assert!(is_git_dangerous_subcommand("git branch --delete --force feature"));
+        assert!(is_git_dangerous_subcommand(
+            "git branch --delete --force feature"
+        ));
         assert!(is_git_dangerous_subcommand("git stash drop stash@{0}"));
         assert!(is_git_dangerous_subcommand("git revert abc123"));
         assert!(is_git_dangerous_subcommand("git push --force origin main"));
         assert!(is_git_dangerous_subcommand("git reset --hard HEAD"));
-        assert!(is_git_dangerous_subcommand("git -C /repo reset --hard HEAD"));
+        assert!(is_git_dangerous_subcommand(
+            "git -C /repo reset --hard HEAD"
+        ));
         // 非危险形态不误伤
         assert!(!is_git_dangerous_subcommand("git status"));
         assert!(!is_git_dangerous_subcommand("git clean -n")); // 干跑
@@ -575,7 +585,10 @@ mod tests {
             );
         }
         // 安全形态不误伤
-        assert!(!needs_approval("auto_write", &shell("git branch -d merged")));
+        assert!(!needs_approval(
+            "auto_write",
+            &shell("git branch -d merged")
+        ));
         assert!(!needs_approval("auto_write", &shell("git status")));
         assert!(!needs_approval("auto_write", &shell("git clean -n")));
     }
@@ -633,7 +646,7 @@ mod tests {
         assert!(is_dangerous_shell("dd if=/dev/zero of=/dev/sda"));
         assert!(is_dangerous_shell("sudo dd bs=1M of=/dev/sda"));
         assert!(is_dangerous_shell("dd of=/dev/sda < /tmp/disk.img")); // 无 if=，stdin 进块设备
-        // 写普通文件不命中（仅凭 if= 不再触发）
+                                                                       // 写普通文件不命中（仅凭 if= 不再触发）
         assert!(!is_dangerous_shell("dd if=/dev/zero of=/tmp/out.img"));
         assert!(!is_dangerous_shell("sudo dd bs=1M if=x of=y"));
         // 非独立 token 或 of= 目标非设备不命中
@@ -651,7 +664,7 @@ mod tests {
         assert!(is_dangerous_shell("wipefs /dev/sda"));
         assert!(is_dangerous_shell("sudo wipefs -a /dev/sdb"));
         assert!(is_dangerous_shell("mkfs.ext4 /dev/sda")); // mkfs 模式
-        // 良性：/dev/null 数据黑洞豁免、普通文件目标不命中
+                                                           // 良性：/dev/null 数据黑洞豁免、普通文件目标不命中
         assert!(!is_dangerous_shell("cp /etc/hostname /dev/null"));
         assert!(!is_dangerous_shell("cp a b"));
         assert!(!is_dangerous_shell("npm run build > /dev/null 2>&1"));
@@ -726,7 +739,7 @@ mod tests {
         assert!(is_dangerous_shell("rm -R -f node_modules"));
         assert!(is_dangerous_shell("rm -r --force node_modules"));
         assert!(is_dangerous_shell("rm -rfv node_modules")); // 合并短选项含 r
-        // 非递归 rm / 非独立 token 不误伤
+                                                             // 非递归 rm / 非独立 token 不误伤
         assert!(!is_dangerous_shell("rm file.txt"));
         assert!(!is_dangerous_shell("rm -f file.txt"));
         assert!(!is_dangerous_shell("rmdir -r dir"));
@@ -755,16 +768,22 @@ mod tests {
         assert!(approval_summary(&long).chars().count() <= 121);
         // GitExec 摘要同样截断
         let long_args: Vec<String> = vec!["commit".into(), "-m".into(), "x".repeat(300)];
-        assert!(approval_summary(&AgentCommand::GitExec { args: long_args })
-            .chars()
-            .count()
-            <= 121);
+        assert!(
+            approval_summary(&AgentCommand::GitExec { args: long_args })
+                .chars()
+                .count()
+                <= 121
+        );
     }
 
     #[test]
     fn test_is_readonly_command() {
-        assert!(is_readonly_command(&AgentCommand::ReadFile { path: "a".into() }));
-        assert!(is_readonly_command(&AgentCommand::ListDir { path: ".".into() }));
+        assert!(is_readonly_command(&AgentCommand::ReadFile {
+            path: "a".into()
+        }));
+        assert!(is_readonly_command(&AgentCommand::ListDir {
+            path: ".".into()
+        }));
         assert!(is_readonly_command(&AgentCommand::Search {
             pattern: "x".into(),
             path: ".".into(),
@@ -778,8 +797,13 @@ mod tests {
         assert!(is_readonly_command(&git_exec(&["diff"])));
         // 写操作/危险操作
         assert!(!is_readonly_command(&shell("ls")));
-        assert!(!is_readonly_command(&AgentCommand::WriteFile { path: "a".into(), content: "x".into() }));
-        assert!(!is_readonly_command(&AgentCommand::GitCommit { message: "m".into() }));
+        assert!(!is_readonly_command(&AgentCommand::WriteFile {
+            path: "a".into(),
+            content: "x".into()
+        }));
+        assert!(!is_readonly_command(&AgentCommand::GitCommit {
+            message: "m".into()
+        }));
         assert!(!is_readonly_command(&AgentCommand::GitPush));
         // GitExec 写档
         assert!(!is_readonly_command(&git_exec(&["add", "--", "a.rs"])));
@@ -790,30 +814,55 @@ mod tests {
     fn test_read_file_range_readonly_free() {
         assert!(!needs_approval(
             "safe",
-            &AgentCommand::ReadFileRange { path: "a.rs".into(), offset: Some(1), limit: Some(100) }
+            &AgentCommand::ReadFileRange {
+                path: "a.rs".into(),
+                offset: Some(1),
+                limit: Some(100)
+            }
         ));
     }
 
     #[test]
     fn test_read_file_range_is_readonly() {
         assert!(is_readonly_command(&AgentCommand::ReadFileRange {
-            path: "a.rs".into(), offset: Some(10), limit: Some(20)
+            path: "a.rs".into(),
+            offset: Some(10),
+            limit: Some(20)
         }));
     }
 
     #[test]
     fn test_code_outline_read_symbol_readonly() {
-        assert!(!needs_approval("safe", &AgentCommand::CodeOutline { path: "a.rs".into() }));
-        assert!(!needs_approval("safe", &AgentCommand::ReadSymbol { path: "a.rs".into(), name: "main".into() }));
-        assert!(is_readonly_command(&AgentCommand::CodeOutline { path: "a.rs".into() }));
-        assert!(is_readonly_command(&AgentCommand::ReadSymbol { path: "a.rs".into(), name: "main".into() }));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::CodeOutline {
+                path: "a.rs".into()
+            }
+        ));
+        assert!(!needs_approval(
+            "safe",
+            &AgentCommand::ReadSymbol {
+                path: "a.rs".into(),
+                name: "main".into()
+            }
+        ));
+        assert!(is_readonly_command(&AgentCommand::CodeOutline {
+            path: "a.rs".into()
+        }));
+        assert!(is_readonly_command(&AgentCommand::ReadSymbol {
+            path: "a.rs".into(),
+            name: "main".into()
+        }));
     }
 
     #[test]
     fn test_partition_tool_calls() {
         let flags = [false, true, true, false, true];
         let segs = partition_tool_calls(&flags);
-        assert_eq!(segs, vec![(0, 1, false), (1, 3, true), (3, 4, false), (4, 5, true)]);
+        assert_eq!(
+            segs,
+            vec![(0, 1, false), (1, 3, true), (3, 4, false), (4, 5, true)]
+        );
 
         let flags2 = [true, true, true];
         let segs2 = partition_tool_calls(&flags2);
@@ -1050,15 +1099,27 @@ mod tests {
     #[test]
     fn test_plan_mode_readonly_free() {
         // plan 模式下只读工具免审
-        assert!(!needs_approval("plan", &AgentCommand::ReadFile { path: "a".into() }));
-        assert!(!needs_approval("plan", &AgentCommand::ListDir { path: ".".into() }));
-        assert!(!needs_approval("plan", &AgentCommand::Search {
-            pattern: "x".into(),
-            path: ".".into(),
-            include: None
-        }));
+        assert!(!needs_approval(
+            "plan",
+            &AgentCommand::ReadFile { path: "a".into() }
+        ));
+        assert!(!needs_approval(
+            "plan",
+            &AgentCommand::ListDir { path: ".".into() }
+        ));
+        assert!(!needs_approval(
+            "plan",
+            &AgentCommand::Search {
+                pattern: "x".into(),
+                path: ".".into(),
+                include: None
+            }
+        ));
         assert!(!needs_approval("plan", &AgentCommand::GitStatus));
-        assert!(!needs_approval("plan", &AgentCommand::GitDiff { path: None }));
+        assert!(!needs_approval(
+            "plan",
+            &AgentCommand::GitDiff { path: None }
+        ));
         assert!(!needs_approval("plan", &git_exec(&["status"])));
         assert!(!needs_approval("plan", &git_exec(&["log", "-n", "5"])));
     }
@@ -1072,21 +1133,30 @@ mod tests {
         assert!(!needs_approval("plan", &shell("ls")));
         assert!(!needs_approval("plan", &shell("git status")));
         assert!(!needs_approval("plan", &shell("echo x > file.txt"))); // 非危险 shell
-        // 危险 shell 需确认
+                                                                       // 危险 shell 需确认
         assert!(needs_approval("plan", &shell("rm -rf /")));
         // 写工具需确认
-        assert!(needs_approval("plan", &AgentCommand::WriteFile {
-            path: "a".into(),
-            content: "x".into()
-        }));
-        assert!(needs_approval("plan", &AgentCommand::PatchFile {
-            path: "a".into(),
-            old_string: "o".into(),
-            new_string: "n".into()
-        }));
-        assert!(needs_approval("plan", &AgentCommand::GitCommit {
-            message: "m".into()
-        }));
+        assert!(needs_approval(
+            "plan",
+            &AgentCommand::WriteFile {
+                path: "a".into(),
+                content: "x".into()
+            }
+        ));
+        assert!(needs_approval(
+            "plan",
+            &AgentCommand::PatchFile {
+                path: "a".into(),
+                old_string: "o".into(),
+                new_string: "n".into()
+            }
+        ));
+        assert!(needs_approval(
+            "plan",
+            &AgentCommand::GitCommit {
+                message: "m".into()
+            }
+        ));
         assert!(needs_approval("plan", &AgentCommand::GitPush));
     }
 
@@ -1095,64 +1165,122 @@ mod tests {
     #[test]
     fn test_edit_file_write_file2_approval_matrix() {
         // EditFile: safe 档需审，auto_write 免审，full_auto 免审
-        assert!(needs_approval("safe", &AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
-        }));
-        assert!(!needs_approval("auto_write", &AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
-        }));
-        assert!(!needs_approval("full_auto", &AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
-        }));
+        assert!(needs_approval(
+            "safe",
+            &AgentCommand::EditFile {
+                path: "a.rs".into(),
+                edits: vec![],
+                expected_hash: None,
+            }
+        ));
+        assert!(!needs_approval(
+            "auto_write",
+            &AgentCommand::EditFile {
+                path: "a.rs".into(),
+                edits: vec![],
+                expected_hash: None,
+            }
+        ));
+        assert!(!needs_approval(
+            "full_auto",
+            &AgentCommand::EditFile {
+                path: "a.rs".into(),
+                edits: vec![],
+                expected_hash: None,
+            }
+        ));
         // WriteFile2: 同 WriteFile 矩阵
-        assert!(needs_approval("safe", &AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
-        }));
-        assert!(!needs_approval("auto_write", &AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
-        }));
-        assert!(!needs_approval("full_auto", &AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
-        }));
+        assert!(needs_approval(
+            "safe",
+            &AgentCommand::WriteFile2 {
+                path: "a.rs".into(),
+                content: "x".into(),
+                expected_hash: None,
+            }
+        ));
+        assert!(!needs_approval(
+            "auto_write",
+            &AgentCommand::WriteFile2 {
+                path: "a.rs".into(),
+                content: "x".into(),
+                expected_hash: None,
+            }
+        ));
+        assert!(!needs_approval(
+            "full_auto",
+            &AgentCommand::WriteFile2 {
+                path: "a.rs".into(),
+                content: "x".into(),
+                expected_hash: None,
+            }
+        ));
     }
 
     #[test]
     fn test_edit_file_write_file2_plan_mode_needs_approval() {
-        assert!(needs_approval("plan", &AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
-        }));
-        assert!(needs_approval("plan", &AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
-        }));
+        assert!(needs_approval(
+            "plan",
+            &AgentCommand::EditFile {
+                path: "a.rs".into(),
+                edits: vec![],
+                expected_hash: None,
+            }
+        ));
+        assert!(needs_approval(
+            "plan",
+            &AgentCommand::WriteFile2 {
+                path: "a.rs".into(),
+                content: "x".into(),
+                expected_hash: None,
+            }
+        ));
     }
 
     #[test]
     fn test_edit_file_write_file2_not_readonly() {
         assert!(!is_readonly_command(&AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
+            path: "a.rs".into(),
+            edits: vec![],
+            expected_hash: None,
         }));
         assert!(!is_readonly_command(&AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+            path: "a.rs".into(),
+            content: "x".into(),
+            expected_hash: None,
         }));
     }
 
     #[test]
     fn test_edit_file_write_file2_not_destructive() {
         assert!(!command_is_destructive(&AgentCommand::EditFile {
-            path: "a.rs".into(), edits: vec![], expected_hash: None,
+            path: "a.rs".into(),
+            edits: vec![],
+            expected_hash: None,
         }));
         assert!(!command_is_destructive(&AgentCommand::WriteFile2 {
-            path: "a.rs".into(), content: "x".into(), expected_hash: None,
+            path: "a.rs".into(),
+            content: "x".into(),
+            expected_hash: None,
         }));
     }
 
     #[test]
     fn test_approval_summary_new_variants() {
-        assert_eq!(approval_summary(&AgentCommand::EditFile {
-            path: "src/main.rs".into(), edits: vec![], expected_hash: None,
-        }), "src/main.rs");
-        assert_eq!(approval_summary(&AgentCommand::WriteFile2 {
-            path: "out.txt".into(), content: "x".into(), expected_hash: None,
-        }), "out.txt");
+        assert_eq!(
+            approval_summary(&AgentCommand::EditFile {
+                path: "src/main.rs".into(),
+                edits: vec![],
+                expected_hash: None,
+            }),
+            "src/main.rs"
+        );
+        assert_eq!(
+            approval_summary(&AgentCommand::WriteFile2 {
+                path: "out.txt".into(),
+                content: "x".into(),
+                expected_hash: None,
+            }),
+            "out.txt"
+        );
     }
 }

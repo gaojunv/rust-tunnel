@@ -75,10 +75,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn role_get_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Option<AgentRoleRecord>, sqlx::Error> {
+    pub async fn role_get_by_id(&self, id: &str) -> Result<Option<AgentRoleRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentRoleRecord>("SELECT * FROM agent_roles WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -274,9 +271,7 @@ impl Database {
         workspace_id: &str,
         mode_filter: Option<&str>,
     ) -> Result<Vec<AgentRoleRecord>, sqlx::Error> {
-        let mut qb = sqlx::QueryBuilder::new(
-            "SELECT * FROM agent_roles WHERE enabled = 1 AND (",
-        );
+        let mut qb = sqlx::QueryBuilder::new("SELECT * FROM agent_roles WHERE enabled = 1 AND (");
         qb.push("scope_type = 'global'")
             .push(" OR (scope_type = 'client' AND client_id = ")
             .push_bind(client_id)
@@ -304,14 +299,7 @@ impl Database {
 mod tests {
     use super::*;
 
-    async fn seed_role(
-        db: &Database,
-        id: &str,
-        name: &str,
-        scope: &str,
-        client: &str,
-        ws: &str,
-    ) {
+    async fn seed_role(db: &Database, id: &str, name: &str, scope: &str, client: &str, ws: &str) {
         db.role_insert(
             id,
             name,
@@ -366,18 +354,16 @@ mod tests {
         assert_eq!(row.enabled, 1);
 
         // 同名同作用域查重命中；异作用域未命中
-        assert!(
-            db.role_get_by_name_scope("code-reviewer", "workspace", "c1", "w1")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db.role_get_by_name_scope("code-reviewer", "global", "", "")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .role_get_by_name_scope("code-reviewer", "workspace", "c1", "w1")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .role_get_by_name_scope("code-reviewer", "global", "", "")
+            .await
+            .unwrap()
+            .is_none());
 
         // update
         db.role_update(
@@ -430,7 +416,9 @@ mod tests {
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
-        db.agent_update_session_role("s1", Some("r1")).await.unwrap();
+        db.agent_update_session_role("s1", Some("r1"))
+            .await
+            .unwrap();
 
         // 删除角色 → session.role_id 置空
         db.role_delete("r1").await.unwrap();
@@ -455,7 +443,10 @@ mod tests {
         db.role_toggle_enabled("d1").await.unwrap();
 
         // 全量：2 builtin + 4 seeded + 1 disabled = 7
-        let all = db.role_list(None, None, None, None, None, None, 100, 0).await.unwrap();
+        let all = db
+            .role_list(None, None, None, None, None, None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 7);
 
         // scope 过滤
@@ -487,7 +478,17 @@ mod tests {
 
         // mode 过滤
         db.role_insert(
-            "p1", "primary-role", "", "", None, None, None, "primary", "global", "", "",
+            "p1",
+            "primary-role",
+            "",
+            "",
+            None,
+            None,
+            None,
+            "primary",
+            "global",
+            "",
+            "",
         )
         .await
         .unwrap();
@@ -526,8 +527,14 @@ mod tests {
         let rows = db.role_list_visible("c1", "w1", None).await.unwrap();
         // 可见：builtin general/explore + g1 + p1 + c1 + w1a；不可见：c2, w2, disabled
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"role-builtin-general-0000000000000000"), "builtin general 应可见: {ids:?}");
-        assert!(ids.contains(&"role-builtin-explore-0000000000000000"), "builtin explore 应可见: {ids:?}");
+        assert!(
+            ids.contains(&"role-builtin-general-0000000000000000"),
+            "builtin general 应可见: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"role-builtin-explore-0000000000000000"),
+            "builtin explore 应可见: {ids:?}"
+        );
         assert!(ids.contains(&"g1"), "global 应可见: {ids:?}");
         assert!(ids.contains(&"c1"), "client c1 应可见: {ids:?}");
         assert!(ids.contains(&"w1a"), "workspace w1a 应可见: {ids:?}");
@@ -537,9 +544,15 @@ mod tests {
         assert!(!ids.contains(&"d1"), "disabled 不应可见");
 
         // mode 过滤：只要 subagent
-        let sub = db.role_list_visible("c1", "w1", Some("subagent")).await.unwrap();
+        let sub = db
+            .role_list_visible("c1", "w1", Some("subagent"))
+            .await
+            .unwrap();
         let sub_ids: Vec<&str> = sub.iter().map(|r| r.id.as_str()).collect();
-        assert!(sub_ids.contains(&"role-builtin-general-0000000000000000"), "builtin general subagent 应可见");
+        assert!(
+            sub_ids.contains(&"role-builtin-general-0000000000000000"),
+            "builtin general subagent 应可见"
+        );
         assert!(sub_ids.contains(&"g1"), "global subagent 应可见");
         assert!(!sub_ids.contains(&"p1"), "primary 不应在 subagent 列表中");
     }

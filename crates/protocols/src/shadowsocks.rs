@@ -214,12 +214,7 @@ pub async fn proxy_ss_connection(
             );
 
             // 统一统计：双向字节一次性入账（bytes_in = 客户端->目标，bytes_out = 目标->客户端）
-            stats.record_bytes(
-                EntityType::Shadowsocks,
-                &entity_id,
-                uploaded,
-                downloaded,
-            );
+            stats.record_bytes(EntityType::Shadowsocks, &entity_id, uploaded, downloaded);
         }
         Err(e) => {
             warn!("SS connection {} error: {}", connection_id, e);
@@ -367,8 +362,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    use crate::port_registry::MockPortRegistry;
     use crate::listener;
+    use crate::port_registry::MockPortRegistry;
     use rust_tunnel_stats::StatsCollector;
     use std::sync::Arc;
 
@@ -554,7 +549,8 @@ mod tests {
             let (echo_port, echo_handle) = start_echo_server().await;
 
             // 2. SS listener
-            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let registry: Arc<dyn crate::port_registry::PortRegistry> =
+                Arc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
             let reg_c = registry.clone();
@@ -594,7 +590,8 @@ mod tests {
         async fn test_ss_chacha20_poly1305_via_ss_local() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let registry: Arc<dyn crate::port_registry::PortRegistry> =
+                Arc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
             let reg_c = registry.clone();
@@ -630,7 +627,8 @@ mod tests {
         async fn test_ss_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let registry: Arc<dyn crate::port_registry::PortRegistry> =
+                Arc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
             let reg_c = registry.clone();
@@ -667,7 +665,8 @@ mod tests {
         async fn test_ss_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
-            let registry: Arc<dyn crate::port_registry::PortRegistry> = Arc::new(MockPortRegistry::new());
+            let registry: Arc<dyn crate::port_registry::PortRegistry> =
+                Arc::new(MockPortRegistry::new());
             let stats = StatsCollector::new(None);
             let ss_port = find_available_port().await;
             let reg_c = registry.clone();

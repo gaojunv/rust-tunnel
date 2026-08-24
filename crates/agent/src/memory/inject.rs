@@ -136,7 +136,14 @@ mod tests {
     use crate::db::memory::AgentMemoryRecord;
     use crate::test_helpers::{in_memory_db, seed_workspace_and_session};
 
-    fn record(id: &str, scope: &str, client: &str, ws: &str, pinned: bool, content: &str) -> AgentMemoryRecord {
+    fn record(
+        id: &str,
+        scope: &str,
+        client: &str,
+        ws: &str,
+        pinned: bool,
+        content: &str,
+    ) -> AgentMemoryRecord {
         AgentMemoryRecord {
             id: id.into(),
             content: content.into(),
@@ -188,11 +195,23 @@ mod tests {
     fn build_memory_block_budget_clipping_keeps_complete_entries() {
         // 40 条 ~500 字符记忆 → 超出 1500 token 预算 → 只保留前若干完整条目
         let items: Vec<AgentMemoryRecord> = (0..40)
-            .map(|i| record(&format!("m{i}"), "global", "", "", false, &format!("z{i}-{}", "x".repeat(500))))
+            .map(|i| {
+                record(
+                    &format!("m{i}"),
+                    "global",
+                    "",
+                    "",
+                    false,
+                    &format!("z{i}-{}", "x".repeat(500)),
+                )
+            })
             .collect();
         let block = build_memory_block(&items, 1500).unwrap();
         assert!(block.contains(&items[0].content));
-        assert!(!block.contains(&items[39].content), "超预算条目应被整条截断");
+        assert!(
+            !block.contains(&items[39].content),
+            "超预算条目应被整条截断"
+        );
         assert!(
             block.chars().count() / 4 <= 1500 + 256,
             "结果近似 token 不应大幅超出预算"
@@ -258,13 +277,21 @@ mod tests {
         let sess_id = seed_workspace_and_session(&db).await;
         assert_eq!(sess_id, "sess-test");
         // 同时验证 DB 中 workspace/session 已创建
-        let ws: Option<String> = sqlx::query_scalar("SELECT id FROM agent_workspaces WHERE id='ws-test'")
-            .fetch_optional(&db.pool)
-            .await
-            .unwrap();
+        let ws: Option<String> =
+            sqlx::query_scalar("SELECT id FROM agent_workspaces WHERE id='ws-test'")
+                .fetch_optional(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(ws.as_deref(), Some("ws-test"));
         // build_memory_block 本身不依赖 DB，但此处展示 helpers 可用
-        let rec = record("m1", "workspace", "test-client", "ws-test", false, "seeded helper 事实");
+        let rec = record(
+            "m1",
+            "workspace",
+            "test-client",
+            "ws-test",
+            false,
+            "seeded helper 事实",
+        );
         let block = build_memory_block(&[rec], 1500).unwrap();
         assert!(block.contains("seeded helper 事实"));
     }
@@ -284,7 +311,11 @@ mod tests {
         let llm = crate::llm::LlmState::new(None, None);
         let memory = super::super::MemoryState::new(db.clone(), store, None, llm);
         // 默认 enabled=0
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "hello").await.is_none());
+        assert!(
+            retrieve_for_session(&memory, "test-client", "ws-test", "hello")
+                .await
+                .is_none()
+        );
         // 显式开启后再关闭
         let mut s = db.memory_get_settings().await.unwrap();
         s.enabled = 1;
@@ -296,7 +327,9 @@ mod tests {
         let mut s2 = db.memory_get_settings().await.unwrap();
         s2.enabled = 0;
         db.memory_upsert_settings(&s2).await.unwrap();
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "q").await.is_none());
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "q")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -314,9 +347,19 @@ mod tests {
         s.emb_model = "m".into();
         s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "").await.is_none());
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "   ").await.is_none());
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "\n\t ").await.is_none());
+        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "")
+            .await
+            .is_none());
+        assert!(
+            retrieve_for_session(&memory, "test-client", "ws-test", "   ")
+                .await
+                .is_none()
+        );
+        assert!(
+            retrieve_for_session(&memory, "test-client", "ws-test", "\n\t ")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -334,7 +377,11 @@ mod tests {
         s.emb_model = "m".into();
         s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "查询").await.is_none());
+        assert!(
+            retrieve_for_session(&memory, "test-client", "ws-test", "查询")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -354,7 +401,11 @@ mod tests {
         s.emb_model = "m".into();
         s.emb_dimension = 0; // 未配置
         db.memory_upsert_settings(&s).await.unwrap();
-        assert!(retrieve_for_session(&memory, "test-client", "ws-test", "hello").await.is_none());
+        assert!(
+            retrieve_for_session(&memory, "test-client", "ws-test", "hello")
+                .await
+                .is_none()
+        );
     }
 
     #[cfg(feature = "rag")]
@@ -369,7 +420,9 @@ mod tests {
     ) {
         memory
             .db
-            .memory_insert(id, content, scope, client, ws, "[]", 0.8, "", "manual", pinned)
+            .memory_insert(
+                id, content, scope, client, ws, "[]", 0.8, "", "manual", pinned,
+            )
             .await
             .unwrap();
         memory
@@ -394,9 +447,22 @@ mod tests {
     async fn retrieve_scope_filter_and_order_with_helpers() {
         let db = in_memory_db().await;
         let _sess = seed_workspace_and_session(&db).await;
-        db.agent_create_workspace("ws2", "ws2-name", "test-client", "host", "/tmp", None, None, "", None, None, None, None)
-            .await
-            .unwrap();
+        db.agent_create_workspace(
+            "ws2",
+            "ws2-name",
+            "test-client",
+            "host",
+            "/tmp",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let base = super::super::mock_embedding_server(8).await;
         let (_dir, store) = super::super::test_store();
         let llm = crate::llm::LlmState::new(None, None);
@@ -410,10 +476,46 @@ mod tests {
         db.memory_upsert_settings(&s).await.unwrap();
 
         seed_memory(&memory, "g1", "global", "", "", false, "全局事实").await;
-        seed_memory(&memory, "cl1", "client", "test-client", "", false, "客户端事实").await;
-        seed_memory(&memory, "w1a", "workspace", "test-client", "ws-test", false, "工作区事实A").await;
-        seed_memory(&memory, "w1p", "workspace", "test-client", "ws-test", true, "工作区置顶").await;
-        seed_memory(&memory, "w2", "workspace", "test-client", "ws2", false, "别的工作区").await;
+        seed_memory(
+            &memory,
+            "cl1",
+            "client",
+            "test-client",
+            "",
+            false,
+            "客户端事实",
+        )
+        .await;
+        seed_memory(
+            &memory,
+            "w1a",
+            "workspace",
+            "test-client",
+            "ws-test",
+            false,
+            "工作区事实A",
+        )
+        .await;
+        seed_memory(
+            &memory,
+            "w1p",
+            "workspace",
+            "test-client",
+            "ws-test",
+            true,
+            "工作区置顶",
+        )
+        .await;
+        seed_memory(
+            &memory,
+            "w2",
+            "workspace",
+            "test-client",
+            "ws2",
+            false,
+            "别的工作区",
+        )
+        .await;
 
         let block = retrieve_for_session(&memory, "test-client", "ws-test", "查询")
             .await
@@ -422,7 +524,10 @@ mod tests {
         assert!(block.contains("客户端事实"), "client 匹配可见");
         assert!(block.contains("工作区事实A"), "workspace 匹配可见");
         assert!(block.contains("工作区置顶"));
-        assert!(!block.contains("别的工作区"), "其他 workspace 应被作用域过滤");
+        assert!(
+            !block.contains("别的工作区"),
+            "其他 workspace 应被作用域过滤"
+        );
         assert!(
             block.find("工作区置顶").unwrap() < block.find("全局事实").unwrap(),
             "pinned 应排最前"
@@ -446,8 +551,26 @@ mod tests {
         s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
 
-        seed_memory(&memory, "w1a", "workspace", "test-client", "ws-test", false, "工作区事实A").await;
-        seed_memory(&memory, "w1p", "workspace", "test-client", "ws-test", true, "工作区置顶").await;
+        seed_memory(
+            &memory,
+            "w1a",
+            "workspace",
+            "test-client",
+            "ws-test",
+            false,
+            "工作区事实A",
+        )
+        .await;
+        seed_memory(
+            &memory,
+            "w1p",
+            "workspace",
+            "test-client",
+            "ws-test",
+            true,
+            "工作区置顶",
+        )
+        .await;
         let mut s = db.memory_get_settings().await.unwrap();
         s.score_threshold = 1.5;
         db.memory_upsert_settings(&s).await.unwrap();
@@ -486,17 +609,54 @@ mod tests {
         s.emb_dimension = 8;
         db.memory_upsert_settings(&s).await.unwrap();
 
-        seed_memory(&memory, "m1", "workspace", "test-client", "ws-test", false, "命中事实").await;
-        seed_memory(&memory, "m2", "workspace", "test-client", "ws2", false, "别的").await;
-        db.agent_create_workspace("ws2", "ws2-name", "test-client", "host", "/tmp", None, None, "", None, None, None, None)
-            .await
-            .ok();
+        seed_memory(
+            &memory,
+            "m1",
+            "workspace",
+            "test-client",
+            "ws-test",
+            false,
+            "命中事实",
+        )
+        .await;
+        seed_memory(
+            &memory,
+            "m2",
+            "workspace",
+            "test-client",
+            "ws2",
+            false,
+            "别的",
+        )
+        .await;
+        db.agent_create_workspace(
+            "ws2",
+            "ws2-name",
+            "test-client",
+            "host",
+            "/tmp",
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .ok();
 
         let block = retrieve_for_session(&memory, "test-client", "ws-test", "查询")
             .await
             .unwrap();
         assert!(block.contains("命中事实"));
-        assert_eq!(db.memory_get_by_id("m1").await.unwrap().unwrap().hit_count, 1);
-        assert_eq!(db.memory_get_by_id("m2").await.unwrap().unwrap().hit_count, 0);
+        assert_eq!(
+            db.memory_get_by_id("m1").await.unwrap().unwrap().hit_count,
+            1
+        );
+        assert_eq!(
+            db.memory_get_by_id("m2").await.unwrap().unwrap().hit_count,
+            0
+        );
     }
 }

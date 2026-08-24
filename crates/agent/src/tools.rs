@@ -574,11 +574,7 @@ fn arg_opt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
     args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
-fn arg_str_array(
-    args: &serde_json::Value,
-    key: &str,
-    tool: &str,
-) -> Result<Vec<String>, String> {
+fn arg_str_array(args: &serde_json::Value, key: &str, tool: &str) -> Result<Vec<String>, String> {
     let arr = args
         .get(key)
         .and_then(|v| v.as_array())
@@ -650,8 +646,8 @@ pub fn plan_mode_guard(tool_name: &str) -> Result<(), String> {
 /// 解析 todo_write 工具调用参数，返回验证后的 TodoItem 列表。
 /// 校验：todos 必须为数组、每项必须有 content 和合法 status。
 pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
-    let args: serde_json::Value =
-        serde_json::from_str(args_json).map_err(|e| format!("invalid todo_write arguments: {e}"))?;
+    let args: serde_json::Value = serde_json::from_str(args_json)
+        .map_err(|e| format!("invalid todo_write arguments: {e}"))?;
     let todos = args
         .get("todos")
         .and_then(|v| v.as_array())
@@ -753,7 +749,10 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                     cwd,
                     timeout_secs: secs.clamp(1, 3600),
                 }),
-                _ => Ok(AgentCommand::Shell { cmd: cmd.to_string(), cwd }),
+                _ => Ok(AgentCommand::Shell {
+                    cmd: cmd.to_string(),
+                    cwd,
+                }),
             }
         }
         "read_file" => {
@@ -805,9 +804,7 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         "git_commit" => {
             let message = arg_str(&args, "message", name)?;
             if message.len() > MAX_COMMIT_MSG_LEN {
-                return Err(format!(
-                    "message too long (>{MAX_COMMIT_MSG_LEN} bytes)"
-                ));
+                return Err(format!("message too long (>{MAX_COMMIT_MSG_LEN} bytes)"));
             }
             Ok(AgentCommand::GitCommit {
                 message: message.to_string(),
@@ -867,7 +864,10 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         }
         "git_checkout" => {
             let branch = arg_str(&args, "branch", name)?;
-            let create = args.get("create").and_then(|v| v.as_bool()).unwrap_or(false);
+            let create = args
+                .get("create")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let git_args = if create {
                 vec!["checkout".to_string(), "-b".to_string(), branch.to_string()]
             } else {
@@ -898,16 +898,17 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         "git_stash" => {
             let action = arg_str(&args, "action", name)?;
             let message = arg_opt_str(&args, "message");
-            let index = args.get("index").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let index = args
+                .get("index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let git_args = match action {
                 "list" => vec!["stash".to_string(), "list".to_string()],
                 "push" => {
                     let mut a = vec!["stash".to_string(), "push".to_string()];
                     if let Some(m) = message {
                         if m.len() > MAX_COMMIT_MSG_LEN {
-                            return Err(format!(
-                                "message too long (>{MAX_COMMIT_MSG_LEN} bytes)"
-                            ));
+                            return Err(format!("message too long (>{MAX_COMMIT_MSG_LEN} bytes)"));
                         }
                         a.push("-m".to_string());
                         a.push(m);
@@ -974,7 +975,9 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                 return Err("tool 'edit_file': edits must not be empty".to_string());
             }
             if args.to_string().len() > MAX_TOOL_INPUT {
-                return Err("edit_file payload too large (>900KB); use fewer/smaller edits".to_string());
+                return Err(
+                    "edit_file payload too large (>900KB); use fewer/smaller edits".to_string(),
+                );
             }
             let mut edits = Vec::with_capacity(edits_arr.len());
             for (i, e) in edits_arr.iter().enumerate() {
@@ -987,7 +990,9 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| format!("tool '{name}': edits[{i}] missing 'new_string'"))?;
                 if old_string.is_empty() {
-                    return Err(format!("tool '{name}': edits[{i}] old_string must not be empty"));
+                    return Err(format!(
+                        "tool '{name}': edits[{i}] old_string must not be empty"
+                    ));
                 }
                 let replace_all = e
                     .get("replace_all")
@@ -1291,11 +1296,8 @@ mod tests {
             list,
             AgentCommand::GitExec { args } if args == ["branch"]
         ));
-        let create = parse_tool_call(
-            "git_branch",
-            r#"{"action":"create","name":"feature"}"#,
-        )
-        .unwrap();
+        let create =
+            parse_tool_call("git_branch", r#"{"action":"create","name":"feature"}"#).unwrap();
         assert!(matches!(
             create,
             AgentCommand::GitExec { args } if args == ["branch", "feature"]
@@ -1379,11 +1381,8 @@ mod tests {
             push,
             AgentCommand::GitExec { args } if args == ["stash", "push"]
         ));
-        let push_msg = parse_tool_call(
-            "git_stash",
-            r#"{"action":"push","message":"wip"}"#,
-        )
-        .unwrap();
+        let push_msg =
+            parse_tool_call("git_stash", r#"{"action":"push","message":"wip"}"#).unwrap();
         assert!(matches!(
             push_msg,
             AgentCommand::GitExec { args } if args == ["stash", "push", "-m", "wip"]
@@ -1418,8 +1417,7 @@ mod tests {
         let err = parse_tool_call("read_file", &args).unwrap_err();
         assert!(err.contains("path too long"), "err: {err}");
         // write_file
-        let args =
-            serde_json::json!({"path": &big, "content": "x"}).to_string();
+        let args = serde_json::json!({"path": &big, "content": "x"}).to_string();
         let err = parse_tool_call("write_file", &args).unwrap_err();
         assert!(err.contains("path too long"), "err: {err}");
         // list_dir
@@ -1431,8 +1429,7 @@ mod tests {
         let err = parse_tool_call("git_diff", &args).unwrap_err();
         assert!(err.contains("path too long"), "err: {err}");
         // search path
-        let args =
-            serde_json::json!({"pattern": "x", "path": &big}).to_string();
+        let args = serde_json::json!({"pattern": "x", "path": &big}).to_string();
         let err = parse_tool_call("search", &args).unwrap_err();
         assert!(err.contains("path too long"), "err: {err}");
         // patch_file path
@@ -1465,8 +1462,7 @@ mod tests {
     #[test]
     fn test_parse_rejects_oversized_include() {
         let big = "x".repeat(MAX_PATH_LEN + 1);
-        let args =
-            serde_json::json!({"pattern": "x", "path": ".", "include": big}).to_string();
+        let args = serde_json::json!({"pattern": "x", "path": ".", "include": big}).to_string();
         let err = parse_tool_call("search", &args).unwrap_err();
         assert!(err.contains("include too long"), "err: {err}");
     }
@@ -1519,7 +1515,10 @@ mod tests {
             "git_branch",
             "todo_write",
         ] {
-            assert!(names.contains(&expected), "plan mode missing tool: {expected}");
+            assert!(
+                names.contains(&expected),
+                "plan mode missing tool: {expected}"
+            );
         }
         // plan 模式不暴露写工具
         for blocked in [
@@ -1536,15 +1535,26 @@ mod tests {
             "git_reset",
             "git_stash",
         ] {
-            assert!(!names.contains(&blocked), "plan mode should not expose: {blocked}");
+            assert!(
+                !names.contains(&blocked),
+                "plan mode should not expose: {blocked}"
+            );
         }
     }
 
     #[test]
     fn test_parse_read_file_with_range() {
-        let cmd = parse_tool_call("read_file", r#"{"path":"src/main.rs","offset":10,"limit":50}"#).unwrap();
+        let cmd = parse_tool_call(
+            "read_file",
+            r#"{"path":"src/main.rs","offset":10,"limit":50}"#,
+        )
+        .unwrap();
         match cmd {
-            AgentCommand::ReadFileRange { path, offset, limit } => {
+            AgentCommand::ReadFileRange {
+                path,
+                offset,
+                limit,
+            } => {
                 assert_eq!(path, "src/main.rs");
                 assert_eq!(offset, Some(10));
                 assert_eq!(limit, Some(50));
@@ -1580,7 +1590,10 @@ mod tests {
                 .iter()
                 .map(|t| t["function"]["name"].as_str().unwrap())
                 .collect();
-            assert!(names.contains(&"todo_write"), "todo_write missing in mode: {mode}");
+            assert!(
+                names.contains(&"todo_write"),
+                "todo_write missing in mode: {mode}"
+            );
         }
     }
 
@@ -1605,7 +1618,8 @@ mod tests {
 
     #[test]
     fn test_parse_todo_write_invalid_status() {
-        let err = parse_todo_write(r#"{"todos":[{"content":"x","status":"invalid"}]}"#).unwrap_err();
+        let err =
+            parse_todo_write(r#"{"todos":[{"content":"x","status":"invalid"}]}"#).unwrap_err();
         assert!(err.contains("invalid status"));
     }
 
@@ -1682,10 +1696,8 @@ mod tests {
 
     #[test]
     fn test_parse_task_args_with_agent() {
-        let (agent, prompt) = parse_task_args(
-            r#"{"prompt":"review code","agent":"explore"}"#,
-        )
-        .unwrap();
+        let (agent, prompt) =
+            parse_task_args(r#"{"prompt":"review code","agent":"explore"}"#).unwrap();
         assert_eq!(agent.as_deref(), Some("explore"));
         assert_eq!(prompt, "review code");
     }
@@ -1768,7 +1780,11 @@ mod tests {
     fn test_parse_edit_file_valid() {
         let args = r#"{"path":"src/a.rs","edits":[{"old_string":"fn old","new_string":"fn new"}]}"#;
         match parse_tool_call("edit_file", args).unwrap() {
-            AgentCommand::EditFile { path, edits, expected_hash } => {
+            AgentCommand::EditFile {
+                path,
+                edits,
+                expected_hash,
+            } => {
                 assert_eq!(path, "src/a.rs");
                 assert_eq!(edits.len(), 1);
                 assert_eq!(edits[0].old_string, "fn old");
@@ -1796,25 +1812,36 @@ mod tests {
     #[test]
     fn test_parse_edit_file_empty_edits_rejected() {
         let args = r#"{"path":"a.rs","edits":[]}"#;
-        assert!(parse_tool_call("edit_file", args).unwrap_err().contains("must not be empty"));
+        assert!(parse_tool_call("edit_file", args)
+            .unwrap_err()
+            .contains("must not be empty"));
     }
 
     #[test]
     fn test_parse_edit_file_empty_old_string_rejected() {
         let args = r#"{"path":"a.rs","edits":[{"old_string":"","new_string":"n"}]}"#;
-        assert!(parse_tool_call("edit_file", args).unwrap_err().contains("old_string must not be empty"));
+        assert!(parse_tool_call("edit_file", args)
+            .unwrap_err()
+            .contains("old_string must not be empty"));
     }
 
     #[test]
     fn test_parse_edit_file_oversized_rejected() {
         let big = "x".repeat(901 * 1024);
-        let args = serde_json::json!({"path":"a.rs","edits":[{"old_string":big,"new_string":"n"}]}).to_string();
-        assert!(parse_tool_call("edit_file", &args).unwrap_err().contains("too large"));
+        let args = serde_json::json!({"path":"a.rs","edits":[{"old_string":big,"new_string":"n"}]})
+            .to_string();
+        assert!(parse_tool_call("edit_file", &args)
+            .unwrap_err()
+            .contains("too large"));
     }
 
     #[test]
     fn test_parse_edit_file_missing_path() {
-        assert!(parse_tool_call("edit_file", r#"{"edits":[{"old_string":"a","new_string":"b"}]}"#).is_err());
+        assert!(parse_tool_call(
+            "edit_file",
+            r#"{"edits":[{"old_string":"a","new_string":"b"}]}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1825,18 +1852,36 @@ mod tests {
     #[test]
     fn test_edit_file_schema_in_safe_mode() {
         let schema = agent_tools_schema("safe");
-        let names: Vec<&str> = schema.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"edit_file"), "edit_file missing in safe mode");
-        assert!(names.contains(&"patch_file"), "patch_file still present in base schema");
+        let names: Vec<&str> = schema
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"edit_file"),
+            "edit_file missing in safe mode"
+        );
+        assert!(
+            names.contains(&"patch_file"),
+            "patch_file still present in base schema"
+        );
     }
 
     #[test]
     fn test_filter_tools_version_ge_080() {
         let tools = agent_tools_schema("safe");
         let filtered = filter_tools_for_client_version(tools, Some("0.8.0"));
-        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"edit_file"), "edit_file should be present for 0.8.0+");
-        assert!(!names.contains(&"patch_file"), "patch_file should be removed for 0.8.0+");
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"edit_file"),
+            "edit_file should be present for 0.8.0+"
+        );
+        assert!(
+            !names.contains(&"patch_file"),
+            "patch_file should be removed for 0.8.0+"
+        );
         assert!(names.contains(&"write_file"), "write_file always present");
     }
 
@@ -1844,18 +1889,36 @@ mod tests {
     fn test_filter_tools_version_lt_080() {
         let tools = agent_tools_schema("safe");
         let filtered = filter_tools_for_client_version(tools, Some("0.7.0"));
-        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"edit_file"), "edit_file should not be present for <0.8.0");
-        assert!(names.contains(&"patch_file"), "patch_file should be present for <0.8.0");
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"edit_file"),
+            "edit_file should not be present for <0.8.0"
+        );
+        assert!(
+            names.contains(&"patch_file"),
+            "patch_file should be present for <0.8.0"
+        );
     }
 
     #[test]
     fn test_filter_tools_version_none() {
         let tools = agent_tools_schema("safe");
         let filtered = filter_tools_for_client_version(tools, None);
-        let names: Vec<&str> = filtered.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"edit_file"), "edit_file should not be present when version unknown");
-        assert!(names.contains(&"patch_file"), "patch_file should be present when version unknown");
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"edit_file"),
+            "edit_file should not be present when version unknown"
+        );
+        assert!(
+            names.contains(&"patch_file"),
+            "patch_file should be present when version unknown"
+        );
     }
 
     #[test]

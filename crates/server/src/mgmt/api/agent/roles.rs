@@ -189,7 +189,11 @@ pub async fn update_role(
         Err(e) => return Err(ApiError::db(&e)),
     };
 
-    let name = body.name.as_deref().map(str::trim).unwrap_or(&existing.name);
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&existing.name);
     let description = body
         .description
         .as_deref()
@@ -485,7 +489,11 @@ mod tests {
         // toggle
         let (status, _) = call(
             &app,
-            json_request(Method::POST, &format!("/api/agent/roles/{id}/toggle"), &json!(null)),
+            json_request(
+                Method::POST,
+                &format!("/api/agent/roles/{id}/toggle"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -499,7 +507,11 @@ mod tests {
         // delete
         let (status, _) = call(
             &app,
-            json_request(Method::DELETE, &format!("/api/agent/roles/{id}"), &json!(null)),
+            json_request(
+                Method::DELETE,
+                &format!("/api/agent/roles/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -526,7 +538,11 @@ mod tests {
         // 非 kebab-case name（大写）
         let (status, _) = call(
             &app,
-            json_request(Method::POST, "/api/agent/roles", &json!({ "name": "MyRole" })),
+            json_request(
+                Method::POST,
+                "/api/agent/roles",
+                &json!({ "name": "MyRole" }),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
@@ -583,11 +599,7 @@ mod tests {
         // 内置角色（seed 后）存在
         let (status, body) = call(
             &app,
-            json_request(
-                Method::GET,
-                "/api/agent/roles?scope=global",
-                &json!(null),
-            ),
+            json_request(Method::GET, "/api/agent/roles?scope=global", &json!(null)),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);

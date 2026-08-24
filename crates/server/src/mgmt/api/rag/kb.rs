@@ -65,8 +65,14 @@ async fn resolve_kb_embedding(
     rt: &RagRuntime,
     body: &CreateKbRequest,
 ) -> Result<(String, String, String, i64), (StatusCode, String)> {
-    let explicit = body.emb_base_url.as_deref().is_some_and(|s| !s.trim().is_empty())
-        || body.emb_model.as_deref().is_some_and(|s| !s.trim().is_empty())
+    let explicit = body
+        .emb_base_url
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || body
+            .emb_model
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
         || body.emb_dimension.is_some();
     if explicit {
         // 任一显式提供即要求完整：避免「只填 model、漏 base_url」静默回退。
@@ -83,7 +89,10 @@ async fn resolve_kb_embedding(
             "emb_dimension must be >= 1 (probe it via /test-embedding)".to_string(),
         ))?;
         if base.trim().is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "emb_base_url is required".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "emb_base_url is required".to_string(),
+            ));
         }
         if model.trim().is_empty() {
             return Err((StatusCode::BAD_REQUEST, "emb_model is required".to_string()));

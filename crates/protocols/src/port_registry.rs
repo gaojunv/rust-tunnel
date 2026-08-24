@@ -90,7 +90,6 @@ pub trait PortRegistry: Send + Sync + Debug {
     async fn decrement_trojan_connections(&self, port: u16);
 }
 
-
 /// 内存版 PortRegistry，用于 protocols crate 内测试与 TrojanSniEntry 占位。
 /// （非 test 构建下未被构造属预期——供本 crate 测试及外部 crate 测试复用）
 #[allow(dead_code)]
@@ -103,32 +102,88 @@ pub struct MockPortRegistry {
 
 #[allow(dead_code)]
 impl MockPortRegistry {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[async_trait::async_trait]
 impl PortRegistry for MockPortRegistry {
     async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
         let mut ports = self.ports.lock().unwrap();
-        if ports.contains_key(&port) { return false; }
-        ports.insert(port, PortInfo::Shadowsocks { port, cipher, password, enabled: true, created_at: chrono::Utc::now().timestamp() });
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(
+            port,
+            PortInfo::Shadowsocks {
+                port,
+                cipher,
+                password,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
         true
     }
     async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
         let mut ports = self.ports.lock().unwrap();
-        if ports.contains_key(&port) { return false; }
-        ports.insert(port, PortInfo::Trojan { port, password, fallback, enabled: true, created_at: chrono::Utc::now().timestamp() });
+        if ports.contains_key(&port) {
+            return false;
+        }
+        ports.insert(
+            port,
+            PortInfo::Trojan {
+                port,
+                password,
+                fallback,
+                enabled: true,
+                created_at: chrono::Utc::now().timestamp(),
+            },
+        );
         true
     }
-    async fn get_port(&self, port: u16) -> Option<PortInfo> { self.ports.lock().unwrap().get(&port).cloned() }
-    async fn unregister_port(&self, port: u16) -> bool { self.ports.lock().unwrap().remove(&port).is_some() }
+    async fn get_port(&self, port: u16) -> Option<PortInfo> {
+        self.ports.lock().unwrap().get(&port).cloned()
+    }
+    async fn unregister_port(&self, port: u16) -> bool {
+        self.ports.lock().unwrap().remove(&port).is_some()
+    }
     async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
-        let ss = self.ss_conns.lock().unwrap().get(&remote_port).copied().unwrap_or(0);
-        let tj = self.trojan_conns.lock().unwrap().get(&remote_port).copied().unwrap_or(0);
+        let ss = self
+            .ss_conns
+            .lock()
+            .unwrap()
+            .get(&remote_port)
+            .copied()
+            .unwrap_or(0);
+        let tj = self
+            .trojan_conns
+            .lock()
+            .unwrap()
+            .get(&remote_port)
+            .copied()
+            .unwrap_or(0);
         ss + tj
     }
-    async fn increment_ss_connections(&self, port: u16) { *self.ss_conns.lock().unwrap().entry(port).or_insert(0) += 1; }
-    async fn decrement_ss_connections(&self, port: u16) { if let Some(c) = self.ss_conns.lock().unwrap().get_mut(&port) { if *c>0 { *c-=1; } } }
-    async fn increment_trojan_connections(&self, port: u16) { *self.trojan_conns.lock().unwrap().entry(port).or_insert(0) += 1; }
-    async fn decrement_trojan_connections(&self, port: u16) { if let Some(c) = self.trojan_conns.lock().unwrap().get_mut(&port) { if *c>0 { *c-=1; } } }
+    async fn increment_ss_connections(&self, port: u16) {
+        *self.ss_conns.lock().unwrap().entry(port).or_insert(0) += 1;
+    }
+    async fn decrement_ss_connections(&self, port: u16) {
+        if let Some(c) = self.ss_conns.lock().unwrap().get_mut(&port) {
+            if *c > 0 {
+                *c -= 1;
+            }
+        }
+    }
+    async fn increment_trojan_connections(&self, port: u16) {
+        *self.trojan_conns.lock().unwrap().entry(port).or_insert(0) += 1;
+    }
+    async fn decrement_trojan_connections(&self, port: u16) {
+        if let Some(c) = self.trojan_conns.lock().unwrap().get_mut(&port) {
+            if *c > 0 {
+                *c -= 1;
+            }
+        }
+    }
 }

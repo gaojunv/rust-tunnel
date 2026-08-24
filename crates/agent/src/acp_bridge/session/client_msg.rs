@@ -9,10 +9,10 @@ use agent_client_protocol::schema::v1::{
     InitializeRequest, McpServer, McpServerHttp, NewSessionRequest, PermissionOption,
     PermissionOptionId, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigValueId, SessionId, SessionNotification,
-    SetSessionConfigOptionRequest, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigValueId, SessionId, SessionNotification, SetSessionConfigOptionRequest,
+    TextContent, WriteTextFileRequest, WriteTextFileResponse,
 };
 
 use crate::llm_bridge;
@@ -21,7 +21,6 @@ use rust_tunnel_common::ControlMessage;
 use super::super::AcpBridge;
 #[cfg(feature = "rag")]
 use super::mcp_tunnel;
-
 
 impl AcpBridge {
     /// 路由客户端发来的 spawn/LLM 代理控制消息（server.rs 控制循环转交）。
@@ -142,7 +141,8 @@ impl AcpBridge {
                 let b = body;
                 tokio::spawn(async move {
                     let resp =
-                        mcp_tunnel::handle_mcp_tunnel(&sessions, memory.as_ref(), &db, &sid, &p, b).await;
+                        mcp_tunnel::handle_mcp_tunnel(&sessions, memory.as_ref(), &db, &sid, &p, b)
+                            .await;
                     let _ = control_tx
                         .send(ControlMessage::AgentLlmProxyChunk {
                             request_id,

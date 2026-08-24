@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 
 use crate::agent::memory::{
-    scope_coords, MemoryState, MEMORY_CONTENT_MAX_CHARS, MAX_TAGS, MEMORY_KB_ID, TAG_MAX_CHARS,
+    scope_coords, MemoryState, MAX_TAGS, MEMORY_CONTENT_MAX_CHARS, MEMORY_KB_ID, TAG_MAX_CHARS,
 };
 use crate::auth::validate_token;
 use crate::db::agent::normalize_db_datetime;
@@ -181,10 +181,7 @@ fn memory_json(m: &AgentMemoryRecord) -> serde_json::Value {
 }
 
 /// 校验 content（非空 + ≤2048 字符）与 scope_type（global|client|workspace）。
-fn validate_content_and_scope(
-    content: &str,
-    scope_type: &str,
-) -> Result<(), (StatusCode, String)> {
+fn validate_content_and_scope(content: &str, scope_type: &str) -> Result<(), (StatusCode, String)> {
     if content.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "content is required".to_string()));
     }
@@ -214,7 +211,10 @@ pub(crate) fn validate_tags(tags: &[String]) -> Result<(), (StatusCode, String)>
     }
     for t in tags {
         if t.trim().is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "tags must be non-empty".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "tags must be non-empty".to_string(),
+            ));
         }
         if t.chars().count() > TAG_MAX_CHARS {
             return Err((
@@ -518,7 +518,8 @@ pub async fn create_memory(
     if let Err(e) = validate_tags(&body.tags) {
         return e.into_response();
     }
-    let (scope_type, client_id, workspace_id) = scope_coords(scope, &body.client_id, &body.workspace_id);
+    let (scope_type, client_id, workspace_id) =
+        scope_coords(scope, &body.client_id, &body.workspace_id);
     let id = new_id();
     let tags = serde_json::to_string(&body.tags).unwrap_or_else(|_| "[]".to_string());
     let content = body.content.trim();
@@ -678,7 +679,11 @@ pub async fn delete_memory(
     // 空建目录；shard 不存在 / 维度失配由 store 内部降级或报错 → best-effort。
     let dim = mem.settings().await.emb_dimension;
     if dim > 0 {
-        if let Err(e) = mem.store.delete_by_doc(MEMORY_KB_ID, dim as usize, &id).await {
+        if let Err(e) = mem
+            .store
+            .delete_by_doc(MEMORY_KB_ID, dim as usize, &id)
+            .await
+        {
             tracing::warn!(memory_id = %id, error = %e, "memory vector delete failed");
         }
     }
@@ -801,7 +806,10 @@ pub fn protected_router() -> Router<ApiState> {
             post(crate::mgmt::api::rag::test_embedding),
         )
         .route("/api/agent/memory/clear", post(clear_memory))
-        .route("/api/agent/memories", get(list_memories).post(create_memory))
+        .route(
+            "/api/agent/memories",
+            get(list_memories).post(create_memory),
+        )
         .route(
             "/api/agent/memories/:id",
             get(get_memory).put(update_memory).delete(delete_memory),
@@ -879,10 +887,7 @@ mod tests {
     /// 覆盖本模块全部路由的测试 Router（免 JWT）：SSE 挂 public，其余挂 protected，
     /// 与生产路由链一致。
     fn test_router(state: ApiState) -> Router {
-        let public = Router::new().route(
-            "/api/agent/memory/events",
-            get(super::sse_memory_events),
-        );
+        let public = Router::new().route("/api/agent/memory/events", get(super::sse_memory_events));
         let protected = Router::new()
             .route(
                 "/api/agent/memory/settings",
@@ -972,7 +977,11 @@ mod tests {
         // 默认：disabled，无 key，密文不回传
         let (status, body) = call(
             &app,
-            json_request(Method::GET, "/api/agent/memory/settings".to_string(), &json!(null)),
+            json_request(
+                Method::GET,
+                "/api/agent/memory/settings".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -1031,7 +1040,11 @@ mod tests {
         // 默认：skill_enabled=false、skill_list_max=20
         let (status, body) = call(
             &app,
-            json_request(Method::GET, "/api/agent/memory/settings".to_string(), &json!(null)),
+            json_request(
+                Method::GET,
+                "/api/agent/memory/settings".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -1219,7 +1232,11 @@ mod tests {
         // get by id
         let (status, body) = call(
             &app,
-            json_request(Method::GET, format!("/api/agent/memories/{id}"), &json!(null)),
+            json_request(
+                Method::GET,
+                format!("/api/agent/memories/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -1249,24 +1266,40 @@ mod tests {
         // pin toggle
         let (status, _) = call(
             &app,
-            json_request(Method::POST, format!("/api/agent/memories/{id}/pin"), &json!(null)),
+            json_request(
+                Method::POST,
+                format!("/api/agent/memories/{id}/pin"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
         let (_, body) = call(
             &app,
-            json_request(Method::GET, format!("/api/agent/memories/{id}"), &json!(null)),
+            json_request(
+                Method::GET,
+                format!("/api/agent/memories/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(body["pinned"], json!(true));
         let (_, _) = call(
             &app,
-            json_request(Method::POST, format!("/api/agent/memories/{id}/pin"), &json!(null)),
+            json_request(
+                Method::POST,
+                format!("/api/agent/memories/{id}/pin"),
+                &json!(null),
+            ),
         )
         .await;
         let (_, body) = call(
             &app,
-            json_request(Method::GET, format!("/api/agent/memories/{id}"), &json!(null)),
+            json_request(
+                Method::GET,
+                format!("/api/agent/memories/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(body["pinned"], json!(false));
@@ -1274,13 +1307,21 @@ mod tests {
         // delete → 404
         let (status, _) = call(
             &app,
-            json_request(Method::DELETE, format!("/api/agent/memories/{id}"), &json!(null)),
+            json_request(
+                Method::DELETE,
+                format!("/api/agent/memories/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
         let (status, _) = call(
             &app,
-            json_request(Method::GET, format!("/api/agent/memories/{id}"), &json!(null)),
+            json_request(
+                Method::GET,
+                format!("/api/agent/memories/{id}"),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
@@ -1300,7 +1341,11 @@ mod tests {
         }
         let (status, _) = call(
             &app,
-            json_request(Method::POST, "/api/agent/memory/clear".to_string(), &json!(null)),
+            json_request(
+                Method::POST,
+                "/api/agent/memory/clear".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
@@ -1451,7 +1496,11 @@ mod tests {
             .with_state(state);
         let (status, _) = call(
             &app,
-            json_request(Method::GET, "/api/agent/memory/settings".to_string(), &json!(null)),
+            json_request(
+                Method::GET,
+                "/api/agent/memory/settings".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::SERVICE_UNAVAILABLE);
@@ -1504,10 +1553,14 @@ mod tests {
         let state = test_api_state(dir.path()).await;
         let db = state.server_state.db().unwrap().clone();
         // 先建 workspace + session（agent_sessions 有到 agent_workspaces 的 FK）
-        db.agent_create_workspace("w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None)
+        db.agent_create_workspace(
+            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
+        )
+        .await
+        .unwrap();
+        db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
-        db.agent_create_session("s1", "w1", None, None).await.unwrap();
         // 启用记忆（trigger_distill 的 enabled 检查通过）
         let mut s = AgentMemorySettingsRecord::default_disabled();
         s.enabled = 1;
@@ -1522,7 +1575,11 @@ mod tests {
         let app = test_router(state);
         let (status, body) = call(
             &app,
-            json_request(Method::POST, "/api/agent/sessions/s1/distill".to_string(), &json!(null)),
+            json_request(
+                Method::POST,
+                "/api/agent/sessions/s1/distill".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::OK, "manual distill: {body}");
@@ -1536,7 +1593,11 @@ mod tests {
         // 不存在的会话 → 404
         let (status, _) = call(
             &app,
-            json_request(Method::POST, "/api/agent/sessions/nope/distill".to_string(), &json!(null)),
+            json_request(
+                Method::POST,
+                "/api/agent/sessions/nope/distill".to_string(),
+                &json!(null),
+            ),
         )
         .await;
         assert_eq!(status, HttpStatus::NOT_FOUND);
