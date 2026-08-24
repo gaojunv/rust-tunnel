@@ -750,10 +750,10 @@ pub async fn sse_memory_events(
     }
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
-        Err((status, msg)) => {
+        Err(e) => {
             return axum::response::Response::builder()
-                .status(status)
-                .body(Body::from(msg))
+                .status(e.status())
+                .body(Body::from(e.message().to_string()))
                 .unwrap();
         }
     };

@@ -111,6 +111,194 @@ pub fn task_schema_roles_block(roles: &[AgentRoleRecord]) -> String {
     out
 }
 
+// ── 角色字段校验与视图（API handler 薄壳化的 service 层）──────────────
+//
+// 以下函数原位于 server 装配层 mgmt/api/agent/roles.rs，批次 8d 下沉。
+// 全部为纯函数：校验失败返回 Err(面向用户的消息文本)，由 handler 映射为
+// HTTP 400；不依赖 async/DB。
+
+/// 合法 scope_type 值。
+pub const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
+/// 合法 mode 值。
+pub const VALID_MODES: [&str; 3] = ["subagent", "primary", "all"];
+
+/// 合法工具名集合（与本 crate `tools` 实际注册的工具名为准）。
+/// 注意：`read_file_range` 不是独立工具（是 read_file 的行区间参数变体），不在此列。
+pub const VALID_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "read_file",
+    "write_file",
+    "patch_file",
+    "edit_file",
+    "list_dir",
+    "search",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_branch",
+    "git_commit",
+    "git_push",
+    "git_stage",
+    "git_unstage",
+    "git_checkout",
+    "git_pull",
+    "git_revert",
+    "git_reset",
+    "git_stash",
+    "code_outline",
+    "read_symbol",
+    "task",
+    "todo_write",
+    "remember",
+    "use_skill",
+];
+
+/// 校验 name 为合法 kebab-case（小写字母/数字/短横线，非空，≤64 字符）。
+///
+/// # Errors
+/// 校验失败时返回面向用户的消息文本。
+pub fn validate_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is required".to_string());
+    }
+    if name.chars().count() > 64 {
+        return Err("name must be at most 64 chars".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(
+            "name must be kebab-case (lowercase letters, digits, hyphens only)".to_string(),
+        );
+    }
+    // 不得以短横线开头或结尾
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err("name must not start or end with a hyphen".to_string());
+    }
+    Ok(())
+}
+
+/// 校验 mode 值。
+///
+/// # Errors
+/// 校验失败时返回面向用户的消息文本。
+pub fn validate_mode(mode: &str) -> Result<(), String> {
+    if !VALID_MODES.contains(&mode) {
+        return Err(format!("mode must be one of: {}", VALID_MODES.join(", ")));
+    }
+    Ok(())
+}
+
+/// 校验 scope_type 值。
+///
+/// # Errors
+/// 校验失败时返回面向用户的消息文本。
+pub fn validate_scope(scope: &str) -> Result<(), String> {
+    if !VALID_SCOPES.contains(&scope) {
+        return Err("scope_type must be one of: global, client, workspace".to_string());
+    }
+    Ok(())
+}
+
+/// 校验工具名列表：每个元素必须是合法工具名。
+///
+/// # Errors
+/// 含空名或非法工具名时返回面向用户的消息文本。
+pub fn validate_tool_list(tools: &[String], field_name: &str) -> Result<(), String> {
+    for tool in tools {
+        let t = tool.trim();
+        if t.is_empty() {
+            return Err(format!("{field_name} contains empty tool name"));
+        }
+        if !VALID_TOOL_NAMES.contains(&t) {
+            return Err(format!(
+                "{field_name} contains invalid tool name: '{t}'. Valid names: {}",
+                VALID_TOOL_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验创建/更新请求的公共字段。
+///
+/// # Errors
+/// 任一字段校验失败时返回面向用户的消息文本。
+pub fn validate_role_fields(
+    name: &str,
+    description: &str,
+    scope: &str,
+    mode: &str,
+    tools_allow: Option<&[String]>,
+    tools_deny: Option<&[String]>,
+) -> Result<(), String> {
+    validate_name(name)?;
+    validate_scope(scope)?;
+    validate_mode(mode)?;
+    if description.chars().count() > 500 {
+        return Err("description must be at most 500 chars".to_string());
+    }
+    if let Some(tools) = tools_allow {
+        validate_tool_list(tools, "tools_allow")?;
+    }
+    if let Some(tools) = tools_deny {
+        validate_tool_list(tools, "tools_deny")?;
+    }
+    Ok(())
+}
+
+/// scope 坐标归一化：global → (global, "", "")。
+#[must_use]
+pub fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String, String, String) {
+    match scope {
+        "global" => ("global".to_string(), String::new(), String::new()),
+        "client" => (
+            "client".to_string(),
+            client_id.to_string(),
+            String::new(),
+        ),
+        "workspace" => (
+            "workspace".to_string(),
+            client_id.to_string(),
+            workspace_id.to_string(),
+        ),
+        _ => (
+            scope.to_string(),
+            client_id.to_string(),
+            workspace_id.to_string(),
+        ),
+    }
+}
+
+/// 角色 JSON 视图（含全字段；tools_allow/tools_deny 从 JSON 字符串还原为数组）。
+#[must_use]
+pub fn role_json(r: &AgentRoleRecord) -> serde_json::Value {
+    let tools_allow: Option<Vec<String>> =
+        r.tools_allow.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let tools_deny: Option<Vec<String>> =
+        r.tools_deny.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    serde_json::json!({
+        "id": r.id,
+        "name": r.name,
+        "description": r.description,
+        "system_prompt": r.system_prompt,
+        "tools_allow": tools_allow,
+        "tools_deny": tools_deny,
+        "model_override": r.model_override,
+        "mode": r.mode,
+        "scope_type": r.scope_type,
+        "client_id": r.client_id,
+        "workspace_id": r.workspace_id,
+        "is_builtin": r.is_builtin != 0,
+        "enabled": r.enabled != 0,
+        "created_at": crate::db::agent::normalize_db_datetime(&r.created_at),
+        "updated_at": crate::db::agent::normalize_db_datetime(&r.updated_at),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

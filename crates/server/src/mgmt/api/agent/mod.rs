@@ -60,17 +60,15 @@ pub(crate) async fn agent_cipher(
 #[cfg(feature = "rag")]
 pub(crate) fn mem_runtime(
     state: &crate::mgmt::api::ApiState,
-) -> Result<crate::agent::memory::MemoryState, (axum::http::StatusCode, String)> {
+) -> Result<crate::agent::memory::MemoryState, crate::mgmt::api::error::ApiError> {
     let Some(agent) = &state.server_state.agent_state else {
-        return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "agent workbench not initialized".to_string(),
+        return Err(crate::mgmt::api::error::ApiError::unavailable(
+            "agent workbench not initialized",
         ));
     };
     let Some(mem) = &agent.memory else {
-        return Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "AI memory runtime not initialized".to_string(),
+        return Err(crate::mgmt::api::error::ApiError::unavailable(
+            "AI memory runtime not initialized",
         ));
     };
     Ok(mem.clone())

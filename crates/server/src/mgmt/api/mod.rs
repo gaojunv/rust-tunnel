@@ -17,6 +17,7 @@ pub mod agent;
 pub mod clients;
 pub mod dns;
 pub mod dto;
+pub mod error;
 pub mod llm;
 pub mod login;
 pub mod logs;

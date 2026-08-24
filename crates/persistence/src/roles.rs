@@ -224,6 +224,47 @@ impl Database {
             .await
     }
 
+    /// 与 [`Self::role_list`] 相同过滤条件的 COUNT 查询（供分页 total）。
+    ///
+    /// # Errors
+    /// 底层 SQL 执行失败时返回 `sqlx::Error`。
+    pub async fn role_count(
+        &self,
+        scope_type: Option<&str>,
+        client_id: Option<&str>,
+        workspace_id: Option<&str>,
+        q: Option<&str>,
+        enabled: Option<bool>,
+        mode: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM agent_roles WHERE 1=1");
+        if let Some(s) = scope_type.filter(|s| !s.is_empty()) {
+            qb.push(" AND scope_type = ").push_bind(s);
+        }
+        if let Some(c) = client_id.filter(|c| !c.is_empty()) {
+            qb.push(" AND client_id = ").push_bind(c);
+        }
+        if let Some(w) = workspace_id.filter(|w| !w.is_empty()) {
+            qb.push(" AND workspace_id = ").push_bind(w);
+        }
+        if let Some(q) = q.filter(|q| !q.is_empty()) {
+            qb.push(" AND (name LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(" OR description LIKE ")
+                .push_bind(format!("%{q}%"))
+                .push(")");
+        }
+        if enabled == Some(true) {
+            qb.push(" AND enabled = 1");
+        } else if enabled == Some(false) {
+            qb.push(" AND enabled = 0");
+        }
+        if let Some(m) = mode.filter(|m| !m.is_empty()) {
+            qb.push(" AND mode = ").push_bind(m);
+        }
+        qb.build_query_scalar::<i64>().fetch_one(&self.pool).await
+    }
+
     /// 可见性查询（供 task 调度与 @ 补全）：enabled=1 且对 (client_id, workspace_id)
     /// **作用域可见**（global 恒可见 / client 匹配 client_id / workspace 需
     /// client_id + workspace_id 都匹配），可选 mode 过滤。
