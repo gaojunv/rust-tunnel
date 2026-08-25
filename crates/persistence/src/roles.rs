@@ -124,6 +124,9 @@ pub struct RoleListFilter {
 
 impl Database {
     /// 插入一条角色。`enabled` 默认 1、`is_builtin` 默认 0（不显式提供）。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn role_insert(&self, opts: &RoleInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -150,6 +153,9 @@ impl Database {
     }
 
     /// 按 id 查询单条角色，不存在返回 None。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn role_get_by_id(&self, id: &str) -> Result<Option<AgentRoleRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentRoleRecord>("SELECT * FROM agent_roles WHERE id = ?")
             .bind(id)
@@ -158,6 +164,9 @@ impl Database {
     }
 
     /// 同作用域同名查重（去重用）。`name` 必须已由调用方归一化（trim + lowercase）。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn role_get_by_name_scope(
         &self,
         name: &str,
@@ -180,6 +189,9 @@ impl Database {
     /// 更新角色可变字段（name/description/system_prompt/tools_allow/tools_deny/
     /// model_override/mode/scope 坐标）。is_builtin 角色的 name 修改由 API 层拦截，
     /// DAO 层照常执行。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn role_update(&self, id: &str, opts: &RoleUpdateOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_roles SET name = ?, description = ?, system_prompt = ?, \
@@ -204,6 +216,9 @@ impl Database {
     }
 
     /// 删除角色，并将关联 `agent_sessions.role_id` 置空（同一事务内两条 SQL）。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn role_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE agent_sessions SET role_id = NULL WHERE role_id = ?")
@@ -219,6 +234,9 @@ impl Database {
     }
 
     /// 翻转 enabled（1 <-> 0）。不存在的 id 无副作用。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn role_toggle_enabled(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_roles SET enabled = 1 - enabled, updated_at = datetime('now') \
@@ -235,6 +253,9 @@ impl Database {
     /// `scope_type` 精确过滤；`client_id`/`workspace_id` 传空串等同不过滤；`q` 对
     /// `name`/`description` 做 LIKE 模糊匹配；`enabled`：Some(true) 只看启用、
     /// Some(false) 只看停用、None 不过滤。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn role_list(
         &self,
         filter: &RoleListFilter,
@@ -318,6 +339,9 @@ impl Database {
     /// 可见性查询（供 task 调度与 @ 补全）：enabled=1 且对 (client_id, workspace_id)
     /// **作用域可见**（global 恒可见 / client 匹配 client_id / workspace 需
     /// client_id + workspace_id 都匹配），可选 mode 过滤。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn role_list_visible(
         &self,
         client_id: &str,
@@ -503,6 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "角色列表过滤与分页的集成场景编排，拆分会打散断言")]
     async fn role_list_filters() {
         let db = Database::new(":memory:").await.unwrap();
         // 注意：Database::new 已 seed 2 个内置角色（general, explore）
@@ -641,6 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "可见性多作用域组合的集成场景编排，拆分无益")]
     async fn role_visible_scope_visibility() {
         let db = Database::new(":memory:").await.unwrap();
         // 注意：Database::new 已 seed 2 个内置 subagent 角色（general, explore）

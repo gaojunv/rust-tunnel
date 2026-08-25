@@ -31,11 +31,15 @@ const DISTILL_MAX_CHARS: usize = 32 * 1024;
 /// 蒸馏输入快照：调用方先同步收集（会话元数据 + 消息）。delete 路径在删行前
 /// 采集——FK 级联删会先删消息，异步蒸馏（spawn 后读 DB）会无料可用。
 pub struct DistillSnapshot {
+    /// 会话 id。
     pub session_id: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
     /// 会话模型（`settings.distill_model` 未配置时的回落）。
     pub model: Option<String>,
+    /// 会话消息列表（按时间顺序）。
     pub messages: Vec<AgentMessageRecord>,
 }
 
@@ -59,7 +63,7 @@ pub async fn trigger_distill(memory: &MemoryState, session_id: &str, trigger: &s
     let Some(snapshot) = load_snapshot(memory, session_id).await else {
         return;
     };
-    spawn_distill(memory, snapshot, trigger).await;
+    spawn_distill(memory, snapshot, trigger);
 }
 
 /// 蒸馏触发（delete 路径用）：调用方**先同步快照**再删行，然后调本函数。
@@ -106,7 +110,7 @@ pub async fn trigger_distill_with_snapshot(
     if snapshot.messages.len() < MIN_DISTILL_MESSAGES {
         return;
     }
-    spawn_distill(memory, snapshot, trigger).await;
+    spawn_distill(memory, snapshot, trigger);
 }
 
 /// 读蒸馏快照（会话 → workspace → 消息）。任一步失败/缺失返回 None。
@@ -134,7 +138,7 @@ pub async fn load_snapshot(memory: &MemoryState, session_id: &str) -> Option<Dis
 }
 
 /// 广播 running 事件并后台执行蒸馏。事件发送失败静默忽略（无订阅者）。
-async fn spawn_distill(memory: &MemoryState, snapshot: DistillSnapshot, trigger: &str) {
+fn spawn_distill(memory: &MemoryState, snapshot: DistillSnapshot, trigger: &str) {
     let _ = memory.events.send(MemoryEvent {
         session_id: snapshot.session_id.clone(),
         status: "running".into(),
@@ -146,6 +150,7 @@ async fn spawn_distill(memory: &MemoryState, snapshot: DistillSnapshot, trigger:
 
 /// 实际蒸馏：渲染 → LLM 非流式无 tools → JSON 解析 → 逐条 embed + 去重落库 →
 /// done 事件。任何一步失败仅广播 failed 事件 + warn，不 panic、不阻断调用方。
+#[allow(clippy::too_many_lines, reason = "蒸馏全流程顺序编排：渲染/LLM调用/解析/落库/Skill分支，拆分会打散状态")]
 async fn do_distill(memory: MemoryState, snapshot: DistillSnapshot, trigger: String) {
     let s = memory.settings().await;
     let rendered = render_distill_text(&snapshot.messages);
@@ -344,10 +349,13 @@ async fn call_distill_llm(llm: &LlmState, model: &str, rendered: &str) -> Result
 
 /// 一条待落库的蒸馏事实。
 pub struct DistillFact {
+    /// 事实正文（原子事实，≤2048 字符）。
     pub content: String,
-    /// `workspace` | `client` | `global`（parse 阶段已归一化）。
+    /// 作用域类型，`workspace` | `client` | `global`（parse 阶段已归一化）。
     pub scope: String,
+    /// 标签列表（最多 8 个，每项 ≤32 字符）。
     pub tags: Vec<String>,
+    /// 置信度（0.0–1.0）。
     pub confidence: f64,
 }
 
@@ -355,11 +363,15 @@ pub struct DistillFact {
 /// 不超限；`description` 已截 200；`scope` 已归一化。
 #[derive(Debug)]
 pub struct DistillSkill {
+    /// Skill 名称（动词短语，≤32 字符）。
     pub name: String,
+    /// Skill 触发边界描述（≤200 字符）。
     pub description: String,
+    /// Skill 全文（Markdown，800–2000 字符）。
     pub content: String,
-    /// `workspace` | `client` | `global`（parse 阶段已归一化）。
+    /// 作用域类型，`workspace` | `client` | `global`（parse 阶段已归一化）。
     pub scope: String,
+    /// 标签列表。
     pub tags: Vec<String>,
 }
 
@@ -522,6 +534,7 @@ fn strip_code_fence(raw: &str) -> String {
 /// 差异：tool 结果截断 600 chars、总量 ≤32KB、剥离 `<memory>` 块与 @引用包装块）。
 #[must_use]
 pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for m in messages {
         match (m.role.as_str(), m.tool_calls.as_deref()) {
@@ -540,7 +553,7 @@ pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
                 };
                 let sanitized = sanitize_distill_content(&content);
                 let truncated = truncate_chars(&sanitized, TOOL_RESULT_TRUNCATE_CHARS);
-                out.push_str(&format!("tool({name}): {truncated}\n"));
+                let _ = writeln!(out, "tool({name}): {truncated}");
             }
             (_, Some(calls)) if !calls.trim().is_empty() => {
                 let parsed: Vec<serde_json::Value> =
@@ -549,11 +562,11 @@ pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
                     .iter()
                     .filter_map(|c| c.pointer("/function/name").and_then(|n| n.as_str()))
                     .collect();
-                out.push_str(&format!("assistant called tools: {}\n", names.join(", ")));
+                let _ = writeln!(out, "assistant called tools: {}", names.join(", "));
             }
             (role, _) => {
                 let sanitized = sanitize_distill_content(&m.content);
-                out.push_str(&format!("{role}: {sanitized}\n"));
+                let _ = writeln!(out, "{role}: {sanitized}");
             }
         }
     }
@@ -759,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "测试断言：缺省 confidence 为字面量 0.8，精确比较即所需语义")]
     fn parse_facts_bare_object() {
         let raw = "{\"facts\": [{\"content\": \"机器是 linux\", \"scope\": \"client\"}]}";
         let facts = parse_facts(raw).unwrap();

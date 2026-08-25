@@ -1,6 +1,9 @@
 use super::super::*;
 use super::helpers::*;
 
+const OLD_CONN: u64 = 1;
+const NEW_CONN: u64 = 2;
+
 #[tokio::test]
 async fn test_detach_ws_tx_only_clears_own_connection() {
     // 刷新/重连竞态：旧连接 close 检测晚于新连接注册（ensure_session 已把
@@ -10,15 +13,13 @@ async fn test_detach_ws_tx_only_clears_own_connection() {
     let registry = crate::test_helpers::TestRegistry::new(&db);
     let bridge = AcpBridge::new(AgentSpawner::new(std::sync::Arc::new(registry)), db);
     let (tx, _rx) = mpsc::channel::<serde_json::Value>(16);
-    const OLD: u64 = 1;
-    const NEW: u64 = 2;
 
-    // 旧连接独占通道（ws_conn_id=OLD）：其 teardown 应清空
+    // 旧连接独占通道（ws_conn_id=OLD_CONN）：其 teardown 应清空
     let mut a = spawned_agent();
     a.ws_tx = Some(tx.clone());
-    a.ws_conn_id = OLD;
+    a.ws_conn_id = OLD_CONN;
     bridge.sessions.lock().await.insert("sess-1".into(), a);
-    bridge.detach_ws_tx("sess-1", OLD).await;
+    bridge.detach_ws_tx("sess-1", OLD_CONN).await;
     assert!(
         bridge
             .sessions
@@ -31,12 +32,12 @@ async fn test_detach_ws_tx_only_clears_own_connection() {
         "own detach should clear ws_tx"
     );
 
-    // 新连接已注册（ws_conn_id=NEW）：旧连接晚到的 teardown 不得清掉它
+    // 新连接已注册（ws_conn_id=NEW_CONN）：旧连接晚到的 teardown 不得清掉它
     let mut a = spawned_agent();
     a.ws_tx = Some(tx.clone());
-    a.ws_conn_id = NEW;
+    a.ws_conn_id = NEW_CONN;
     bridge.sessions.lock().await.insert("sess-1".into(), a);
-    bridge.detach_ws_tx("sess-1", OLD).await;
+    bridge.detach_ws_tx("sess-1", OLD_CONN).await;
     assert!(
         bridge
             .sessions
@@ -49,7 +50,7 @@ async fn test_detach_ws_tx_only_clears_own_connection() {
         "old connection teardown must not clear newer connection's ws_tx"
     );
     // 新连接自己的 teardown 仍能清空
-    bridge.detach_ws_tx("sess-1", NEW).await;
+    bridge.detach_ws_tx("sess-1", NEW_CONN).await;
     assert!(bridge
         .sessions
         .lock()

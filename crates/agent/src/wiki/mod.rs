@@ -14,10 +14,15 @@ use crate::llm::LlmState;
 #[cfg(feature = "rag")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WikiEvent {
+    /// 所属知识库标识。
     pub wiki_id: String,
+    /// 所属文档标识。
     pub doc_id: String,
+    /// 摄入状态。
     pub status: String,
+    /// 已生成页数。
     pub page_count: i64,
+    /// 失败原因（成功时 None）。
     pub error: Option<String>,
 }
 
@@ -28,7 +33,9 @@ pub struct WikiEvent {
 #[cfg(feature = "rag")]
 #[derive(Clone)]
 pub struct WikiState {
+    /// 数据库连接。
     pub db: Database,
+    /// LLM 状态。
     pub llm: LlmState,
     /// 摄入状态事件广播（订阅者即 `/api/agent/wiki/events`）。
     pub events: tokio::sync::broadcast::Sender<WikiEvent>,
@@ -48,6 +55,7 @@ impl std::fmt::Debug for WikiState {
 
 #[cfg(feature = "rag")]
 impl WikiState {
+    /// 创建 Wiki 运行时。
     #[must_use]
     pub fn new(db: Database, llm: LlmState) -> Self {
         // 容量 64：与 MemoryState / LlmState.rag_tx 一致，低频事件不阻塞调用方。
@@ -60,6 +68,7 @@ impl WikiState {
         }
     }
 
+    /// 订阅摄入事件。
     #[must_use]
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WikiEvent> {
         self.events.subscribe()
@@ -439,6 +448,8 @@ mod tests {
         assert_eq!(lines.len(), 1);
     }
 
+    // 参数校验与端到端检索的集成测试，断言分支多、准备数据多。
+    #[allow(clippy::too_many_lines, reason = "参数校验与端到端检索的集成测试，断言分支多、准备数据多")]
     #[tokio::test]
     async fn search_param_validation_and_e2e() {
         let (db, wiki) = wiki_state().await;

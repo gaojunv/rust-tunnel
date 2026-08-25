@@ -155,6 +155,9 @@ pub struct SkillListFilter {
 
 impl Database {
     /// 插入一条 Skill（全列）。`enabled` 默认 1、`use_count` 默认 0（不显式提供）。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_insert(&self, opts: &SkillInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -180,6 +183,9 @@ impl Database {
     }
 
     /// 按 id 查询单条技能（含 content 全文），不存在返回 None。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_get_by_id(&self, id: &str) -> Result<Option<AgentSkillRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentSkillRecord>("SELECT * FROM agent_skills WHERE id = ?")
             .bind(id)
@@ -189,6 +195,9 @@ impl Database {
 
     /// 同作用域同名查重（去重用）。`name` 必须已由调用方 normalize（trim + lowercase）——
     /// 本方法做精确匹配，不在此归一化。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn skill_get_by_name_scope(
         &self,
         name: &str,
@@ -211,6 +220,9 @@ impl Database {
     /// 更新可变字段：name / description / content / tags / scope 三元组（scope 变更
     /// 同步坐标，调用方已按 `scope_coords` 归一化）。**不动** enabled / use_count
     /// （去重 upsert 与手动编辑都不应重置使用统计与开关状态）。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_update(&self, id: &str, opts: &SkillUpdateOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_skills SET name = ?, description = ?, content = ?, tags = ?, \
@@ -231,6 +243,9 @@ impl Database {
     }
 
     /// 按 id 删除技能，不存在时无副作用。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_skills WHERE id = ?")
             .bind(id)
@@ -240,6 +255,9 @@ impl Database {
     }
 
     /// 翻转 enabled（1 ↔ 0）。不存在的 id 无副作用。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_toggle_enabled(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_skills SET enabled = 1 - enabled, updated_at = datetime('now') \
@@ -258,6 +276,9 @@ impl Database {
     /// `name`/`description` 做 `LIKE %q%` 模糊匹配；`enabled`：Some(true) 只看启用、
     /// Some(false) 只看停用、None 不过滤。`sort` 白名单："recent"（updated_at DESC，
     /// 默认）/ "created"（created_at DESC）/ "uses"（use_count DESC）。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn skill_list(
         &self,
         filter: &SkillListFilter,
@@ -302,6 +323,9 @@ impl Database {
     }
 
     /// use_skill 命中回写：+1 use_count 并刷新 last_used_at。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn skill_bump_use(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_skills SET use_count = use_count + 1, \
@@ -317,6 +341,9 @@ impl Database {
     /// **作用域可见**（global 恒可见 / client 匹配 client_id / workspace 需
     /// client_id + workspace_id 都匹配），按 use_count DESC 取前 `limit` 条。
     /// **不 SELECT content**（清单只需 name+description）。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn skill_injectable(
         &self,
         client_id: &str,
@@ -452,6 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "Skill 列表多维过滤与排序的集成场景编排，需集中断言")]
     async fn skill_list_filters_and_order() {
         let db = Database::new(":memory:").await.unwrap();
         seed(&db, "g1", "global-skill", "global", "", "").await;

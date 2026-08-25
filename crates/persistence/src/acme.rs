@@ -8,8 +8,12 @@ impl Database {
     // ACME Certificate methods
     // ============================================================
 
-    /// Save or update an ACME certificate
-    #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（25 处调用点），Opts 化成本高
+    /// 保存或更新 ACME 证书（按 domain 去重，存在则覆盖）。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或连接池已关闭时返回 `sqlx::Error`。
+    #[allow(clippy::too_many_arguments, reason = "证书保存需一次写入 8 个字段，拆 Opts 会增加调用方样板且调用点分散")] // 保留：多调用点方法，Opts 化成本高
     pub async fn save_acme_certificate(
         &self,
         domain: &str,
@@ -51,7 +55,11 @@ impl Database {
         Ok(())
     }
 
-    /// Load all ACME certificates
+    /// 加载全部 ACME 证书，按创建时间排序。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn load_acme_certificates(&self) -> Result<Vec<AcmeCertificateRecord>, sqlx::Error> {
         sqlx::query_as::<_, AcmeCertificateRecord>(
             r"
@@ -66,7 +74,11 @@ impl Database {
         .await
     }
 
-    /// Get an ACME certificate by domain
+    /// 按域名查询单张 ACME 证书，不存在返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn get_acme_certificate(
         &self,
         domain: &str,
@@ -85,7 +97,11 @@ impl Database {
         .await
     }
 
-    /// Update ACME certificate status
+    /// 更新证书状态与错误信息。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn update_acme_certificate_status(
         &self,
         domain: &str,
@@ -107,7 +123,11 @@ impl Database {
         Ok(())
     }
 
-    /// Update ACME certificate renewal attempt
+    /// 刷新证书的最近续期尝试时间为当前时间。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn update_acme_certificate_renewal_attempt(
         &self,
         domain: &str,
@@ -127,7 +147,11 @@ impl Database {
         Ok(())
     }
 
-    /// Delete an ACME certificate
+    /// 按域名删除证书，不存在时无副作用。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn delete_acme_certificate(&self, domain: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM acme_certificates WHERE domain = ?")
             .bind(domain)
@@ -136,7 +160,11 @@ impl Database {
         Ok(())
     }
 
-    /// Save an ACME challenge
+    /// 保存 ACME 验证挑战（按 token 去重，存在则重置为 pending）。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn save_acme_challenge(
         &self,
         token: &str,
@@ -166,7 +194,11 @@ impl Database {
         Ok(())
     }
 
-    /// Get an ACME challenge by token
+    /// 按 token 查询验证挑战，不存在返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn get_acme_challenge(
         &self,
         token: &str,
@@ -183,7 +215,11 @@ impl Database {
         .await
     }
 
-    /// Update ACME challenge status
+    /// 更新验证挑战的状态。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn update_acme_challenge_status(
         &self,
         token: &str,
@@ -203,7 +239,11 @@ impl Database {
         Ok(())
     }
 
-    /// Delete expired ACME challenges
+    /// 清理已过期的验证挑战，返回被删除的行数。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn cleanup_expired_acme_challenges(&self) -> Result<u64, sqlx::Error> {
         let now = Utc::now();
         let result = sqlx::query(
@@ -218,7 +258,11 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Delete an ACME challenge
+    /// 按 token 删除验证挑战，不存在时无副作用。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn delete_acme_challenge(&self, token: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM acme_challenges WHERE token = ?")
             .bind(token)
@@ -227,7 +271,11 @@ impl Database {
         Ok(())
     }
 
-    /// Load ACME certificates that need renewal
+    /// 加载需要续期的证书：状态为 active、启用自动续期且过期时间在阈值内的记录。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn load_acme_certificates_needing_renewal(
         &self,
         days_before_expiry: i64,
@@ -537,6 +585,7 @@ mod tests {
         assert_eq!(db.cleanup_expired_acme_challenges().await.unwrap(), 0);
     }
 
+    #[allow(clippy::too_many_lines, reason = "续期过滤的多场景分支测试需在一处串联 7 类证书状态与 3 档时间窗口，拆分会割裂断言上下文")]
     #[tokio::test]
     async fn load_certificates_needing_renewal_filters_correctly() {
         let db = in_memory_db().await;

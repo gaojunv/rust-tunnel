@@ -41,7 +41,7 @@ pub(super) async fn run_stdio_pump(
             // ACP → 进程 stdin。
             n = pump_rd.read(&mut buf) => {
                 match n {
-                    Ok(0) => break, // ACP 连接已关闭
+                    Ok(0) | Err(_) => break, // ACP 连接已关闭
                     Ok(n) => {
                         let msg = ControlMessage::AgentSpawnData {
                             session_id: session_id.clone(),
@@ -52,7 +52,6 @@ pub(super) async fn run_stdio_pump(
                             break; // 客户端断连
                         }
                     }
-                    Err(_) => break,
                 }
             }
         }

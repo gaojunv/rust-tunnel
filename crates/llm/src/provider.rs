@@ -26,6 +26,9 @@ pub fn is_valid_provider_type(provider_type: &str) -> bool {
 
 /// 解析创建/更新请求中的 base_url：为空时回落到该类型的默认端点。
 /// 无默认端点（mimo）且未提供时返回 Err。
+///
+/// # Errors
+/// `provider_type` 为 `mimo`（无默认端点）且 `base_url` 为空或全空白时返回 `Err`。
 pub fn resolve_base_url(provider_type: &str, base_url: &str) -> Result<String, String> {
     let trimmed = base_url.trim();
     if !trimmed.is_empty() {

@@ -133,6 +133,14 @@ async fn handle_llm_turn_json(
 /// Run one full agent turn: send current messages to the LLM, execute any tool
 /// calls over the tunnel, feed results back, repeat until the model stops
 /// calling tools. Progress is streamed to `ws_tx` as JSON messages.
+///
+/// # Errors
+/// - 模型解析失败（`resolve_with_failover`）时返回错误
+/// - 上游 LLM 不可用（`execute_with_failover` 耗尽）时返回错误并推送 error 帧
+/// - 流式传输中出现致命错误（读流失败/聚合超限）时返回错误
+/// - 工具调用轮次达到上限时返回错误
+#[allow(clippy::too_many_lines, reason = "LLM 回合的流式/非流式双路径、重试与压缩重试、用量记录与消息落库的顺序编排，共享大量局部状态")]
+#[allow(clippy::items_after_statements, reason = "plan/role 块常量与重试常量紧邻使用处定义，可读性更好，移至顶部会打散上下文")]
 pub async fn run_agent_turn(
     agent: AgentState,
     llm: Arc<LlmState>,
@@ -900,7 +908,7 @@ pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, conten
 mod tests {
     use super::*;
 
-    async fn test_agent_state(db: crate::db::Database) -> AgentState {
+    fn test_agent_state(db: crate::db::Database) -> AgentState {
         AgentState::new(
             std::sync::Arc::new(crate::test_helpers::TestRegistry::new(&db)),
             db,
@@ -930,7 +938,7 @@ mod tests {
             .await
             .unwrap();
 
-        let agent = test_agent_state(db.clone()).await;
+        let agent = test_agent_state(db.clone());
         persist_message(
             &agent,
             PersistMessageOpts {

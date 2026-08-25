@@ -97,20 +97,22 @@ pub fn subagent_system_prompt(role: Option<&AgentRoleRecord>) -> String {
 /// description 动态拼接。内容为角色名 + 描述的列表。
 #[must_use]
 pub fn task_schema_roles_block(roles: &[AgentRoleRecord]) -> String {
+    use std::fmt::Write as _;
     if roles.is_empty() {
         return String::new();
     }
     let mut out = String::from("### Available Sub-Agent Roles\n");
     for r in roles {
-        out.push_str(&format!(
-            "- **{}**: {}\n",
+        let _ = writeln!(
+            out,
+            "- **{}**: {}",
             r.name,
             if r.description.is_empty() {
                 "(no description)"
             } else {
                 &r.description
             }
-        ));
+        );
     }
     out
 }

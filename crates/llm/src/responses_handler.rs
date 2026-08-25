@@ -16,6 +16,7 @@ use super::pipeline::ResponsePostProcess;
 use super::responses;
 use super::usage::UsageContext;
 
+#[allow(clippy::too_many_lines, reason = "网关流水线：认证/路由/RAG/compat 全流程顺序编排，与 openai/anthropic 保持一致")]
 /// POST /v1/responses — Responses API request.
 ///
 /// 流程严格仿 `openai_handler::handle_chat_completions`，协议标识用 `"responses"`。
@@ -291,7 +292,7 @@ mod tests {
                         "id": "chatcmpl-resp-1",
                         "object": "chat.completion",
                         "model": "deepseek-chat",
-                        "created": 1700000000,
+                        "created": 1_700_000_000,
                         "choices": [{
                             "index": 0,
                             "message": {"role": "assistant", "content": "Hello from Responses"},

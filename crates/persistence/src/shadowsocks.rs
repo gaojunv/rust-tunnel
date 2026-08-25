@@ -5,6 +5,9 @@ use super::Database;
 
 impl Database {
     /// Save or update Shadowsocks configuration
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_shadowsocks_config(
         &self,
         port: u16,
@@ -42,6 +45,9 @@ impl Database {
     /// 运行时只支持单份 SS 配置（API/动态配置均如此），而按端口 upsert 的
     /// `save_shadowsocks_config` 在修改端口时会残留旧行，导致重启后读到旧配置。
     /// 配置更新接口应使用本方法：先清空再插入，保证表中始终只有一份配置。
+    ///
+    /// # Errors
+    /// 当事务开启、删除或插入执行失败时返回 `sqlx::Error`。
     pub async fn replace_shadowsocks_config(
         &self,
         port: u16,
@@ -75,6 +81,9 @@ impl Database {
     }
 
     /// Load all Shadowsocks configurations
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_shadowsocks_configs(
         &self,
     ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
@@ -92,6 +101,9 @@ impl Database {
     }
 
     /// Load enabled Shadowsocks configurations
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_enabled_shadowsocks_configs(
         &self,
     ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
@@ -110,6 +122,9 @@ impl Database {
     }
 
     /// Get Shadowsocks config for a specific port
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn get_shadowsocks_config(
         &self,
         port: u16,
@@ -129,6 +144,9 @@ impl Database {
     }
 
     /// Delete Shadowsocks configuration
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn delete_shadowsocks_config(&self, port: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"

@@ -257,6 +257,8 @@ pub struct LlmUsageSummary {
 
 impl Database {
     /// 列出所有 LLM 提供商（按创建时间排序）。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmProviderRecord>("SELECT * FROM llm_providers ORDER BY created_at")
             .fetch_all(&self.pool)
@@ -264,6 +266,8 @@ impl Database {
     }
 
     /// 列出已启用的 LLM 提供商。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_enabled_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmProviderRecord>(
             "SELECT * FROM llm_providers WHERE enabled = 1 ORDER BY created_at",
@@ -273,6 +277,8 @@ impl Database {
     }
 
     /// 按 id 查询单个提供商（不存在返回 None）。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_get_provider(
         &self,
         id: &str,
@@ -284,6 +290,8 @@ impl Database {
     }
 
     /// 新增或更新 LLM 提供商（按 id UPSERT）。
+    /// # Errors
+    /// 当数据库 `INSERT`/`UPSERT` 执行失败导致 `sqlx::Error` 时返回。
     #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_provider(
         &self,
@@ -325,6 +333,8 @@ impl Database {
     }
 
     /// 删除指定提供商（级联删除关联模型）。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_delete_provider(&self, id: &str) -> Result<(), sqlx::Error> {
         // Models are cascade-deleted via FK ON DELETE CASCADE
         sqlx::query("DELETE FROM llm_providers WHERE id = ?")
@@ -335,6 +345,8 @@ impl Database {
     }
 
     /// 启用/禁用指定提供商。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_toggle_provider(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE llm_providers SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
@@ -349,6 +361,8 @@ impl Database {
     // ── Model CRUD ───────────────────────────────────────────────
 
     /// 列出所有 LLM 模型。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_models(&self) -> Result<Vec<LlmModelRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models ORDER BY created_at")
             .fetch_all(&self.pool)
@@ -356,6 +370,8 @@ impl Database {
     }
 
     /// 列出指定提供商下的所有模型。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_models_for_provider(
         &self,
         provider_id: &str,
@@ -369,6 +385,8 @@ impl Database {
     }
 
     /// 按 id 取单个模型记录（llm_bridge 解析 workspace 的 llm_model_id 用）。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_get_model(&self, id: &str) -> Result<Option<LlmModelRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models WHERE id = ?")
             .bind(id)
@@ -377,6 +395,8 @@ impl Database {
     }
 
     /// 按模型名或别名查找已启用模型（优先精确匹配 model_name）。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_find_model_by_name_or_alias(
         &self,
         name_or_alias: &str,
@@ -393,6 +413,8 @@ impl Database {
     }
 
     /// 新增或更新 LLM 模型（按 id UPSERT）。
+    /// # Errors
+    /// 当数据库 `INSERT`/`UPSERT` 执行失败导致 `sqlx::Error` 时返回。
     #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_model(
         &self,
@@ -430,6 +452,8 @@ impl Database {
     }
 
     /// 更新指定模型的基本信息。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_update_model(
         &self,
         id: &str,
@@ -452,6 +476,8 @@ impl Database {
     }
 
     /// 删除指定模型。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_delete_model(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM llm_models WHERE id = ?")
             .bind(id)
@@ -463,6 +489,8 @@ impl Database {
     // ── API Key CRUD ─────────────────────────────────────────────
 
     /// 列出所有网关 API 密钥。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_api_keys(&self) -> Result<Vec<LlmApiKeyRecord>, sqlx::Error> {
         // 显式列：`SELECT *` 会在 ALTER TABLE 追加 kb_id 后命中 sqlx 语句缓存中的
         // 旧列元数据（7 列），与 8 字段的 FromRow 错位导致越界 panic。
@@ -475,6 +503,8 @@ impl Database {
     }
 
     /// 按哈希查找已启用的 API 密钥。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_find_api_key_by_hash(
         &self,
         hash: &str,
@@ -489,6 +519,8 @@ impl Database {
     }
 
     /// 新增网关 API 密钥。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败（主键冲突等）导致 `sqlx::Error` 时返回。
     pub async fn llm_save_api_key(
         &self,
         id: &str,
@@ -514,6 +546,8 @@ impl Database {
     }
 
     /// 启用/禁用指定 API 密钥。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_toggle_api_key(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET enabled = ? WHERE id = ?")
             .bind(i32::from(enabled))
@@ -524,6 +558,8 @@ impl Database {
     }
 
     /// 绑定/解绑 api key 的知识库（`None` 解绑）。KB 存在性由调用方负责校验。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_set_api_key_kb(
         &self,
         id: &str,
@@ -538,6 +574,8 @@ impl Database {
     }
 
     /// 删除指定 API 密钥。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_delete_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM llm_api_keys WHERE id = ?")
             .bind(id)
@@ -547,6 +585,8 @@ impl Database {
     }
 
     /// 更新 API 密钥的最后使用时间。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_touch_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET last_used_at = datetime('now') WHERE id = ?")
             .bind(id)
@@ -556,6 +596,8 @@ impl Database {
     }
 
     /// 查询某 api key 绑定的知识库 id（未绑定返回 None）。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn rag_get_kb_id_for_api_key(
         &self,
         key_id: &str,
@@ -571,6 +613,8 @@ impl Database {
     // ── Usage logs ────────────────────────────────────────────────
 
     /// 插入一条用量日志。timestamp 由 DB 用 datetime('now') 填充（UTC）。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_insert_usage_log(&self, u: &LlmUsageInsert) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -610,6 +654,8 @@ impl Database {
     }
 
     /// 时间范围内的用量总览。
+    /// # Errors
+    /// 当数据库聚合查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_usage_summary(
         &self,
         start: &str,
@@ -638,6 +684,8 @@ impl Database {
     }
 
     /// 按维度聚合用量。`group_by ∈ {"api_key", "model", "provider"}`。
+    /// # Errors
+    /// 当数据库聚合查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_aggregate_usage(
         &self,
         start: &str,
@@ -676,6 +724,8 @@ impl Database {
     }
 
     /// 分页明细日志（按时间倒序）。
+    /// # Errors
+    /// 当数据库分页查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_query_usage_logs(
         &self,
         start: &str,
@@ -705,6 +755,8 @@ impl Database {
     }
 
     /// 查询时间范围内的用量日志总数。
+    /// # Errors
+    /// 当数据库 `COUNT` 查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_count_usage_logs(&self, start: &str, end: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as(
             r"
@@ -722,6 +774,8 @@ impl Database {
     /// 删除早于 `before` 的用量日志，返回删除行数。
     /// 存储格式是 SQLite datetime（"YYYY-MM-DD HH:MM:SS"），必须转成同一格式
     /// 再做字符串比较，否则边界日当天（' ' < 'T'）的记录会被误删。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn cleanup_old_llm_usage_logs(
         &self,
         before: DateTime<Utc>,
@@ -737,6 +791,8 @@ impl Database {
     // ── Model groups (failover routing) ──────────────────────────
 
     /// 创建模型组。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_create_model_group(
         &self,
         id: &str,
@@ -753,6 +809,8 @@ impl Database {
     }
 
     /// 更新模型组名称与启用状态。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_update_model_group(
         &self,
         id: &str,
@@ -773,6 +831,8 @@ impl Database {
     /// 删除模型组。FK 级联（ON DELETE CASCADE）经 sqlx 默认的
     /// `PRAGMA foreign_keys=ON` 已生效；此处显式先删成员是防御性冗余，
     /// 防止未来池配置变更导致级联静默失效时残留孤儿成员行。
+    /// # Errors
+    /// 当事务开启、成员删除或组删除失败导致 `sqlx::Error` 时返回。
     pub async fn llm_delete_model_group(&self, id: &str) -> Result<(), sqlx::Error> {
         // 两条删除放同一事务：组删除失败时不残留"成员已清空、组仍在"的中间态
         let mut tx = self.pool.begin().await?;
@@ -788,6 +848,8 @@ impl Database {
     }
 
     /// 列出所有模型组。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_model_groups(&self) -> Result<Vec<LlmModelGroupRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelGroupRecord>(
             "SELECT * FROM llm_model_groups ORDER BY created_at ASC",
@@ -797,6 +859,8 @@ impl Database {
     }
 
     /// 按 id 查询模型组。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_get_model_group(
         &self,
         id: &str,
@@ -808,6 +872,8 @@ impl Database {
     }
 
     /// 按名称查询已启用的模型组。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_find_group_by_name(
         &self,
         name: &str,
@@ -821,6 +887,8 @@ impl Database {
     }
 
     /// 整体替换组成员（事务内 DELETE + INSERT）。members: [(model_id, priority)]。
+    /// # Errors
+    /// 当事务开启、删除旧成员或插入新成员失败导致 `sqlx::Error` 时返回。
     pub async fn llm_replace_group_members(
         &self,
         group_id: &str,
@@ -845,6 +913,8 @@ impl Database {
     }
 
     /// 组成员联查（按 priority 升序）。
+    /// # Errors
+    /// 当联查 `JOIN` 查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_list_group_members(
         &self,
         group_id: &str,
@@ -862,6 +932,8 @@ impl Database {
     }
 
     /// 查询模型组的成员数量。
+    /// # Errors
+    /// 当数据库 `COUNT` 查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_group_member_count(&self, group_id: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM llm_model_group_members WHERE group_id = ?")
@@ -873,6 +945,8 @@ impl Database {
 
     /// 组名冲突检测：与现有 model_name / alias / 其他组名比对。
     /// exclude_group_id 用于编辑组时排除自身。
+    /// # Errors
+    /// 当任一 `COUNT` 查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn llm_group_name_conflicts(
         &self,
         name: &str,

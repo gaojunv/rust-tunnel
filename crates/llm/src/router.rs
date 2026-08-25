@@ -88,6 +88,12 @@ pub struct CandidateChain {
 ///
 /// 全部走 [`crate::route_cache::RouteCache`] 内存快照，不触碰 DB：
 /// 数据一致性由管理面写入后的 `invalidate` 保证（见 `mgmt/api/llm.rs`）。
+///
+/// # Errors
+/// - `state.db` 为 `None` 时返回 `ResolveError::Db`。
+/// - 请求模型名未匹配任何 `model_name`/`alias`/组名时返回 `ResolveError::ModelNotFound`。
+/// - 命中模型但其 `provider` 禁用或缺失时返回 `ResolveError::ProviderDisabled` 或 `ModelNotFound`。
+/// - 组内全部成员被过滤（禁用/孤儿/provider 禁用）时返回 `ResolveError::ModelNotFound`。
 pub async fn resolve_with_failover(
     state: &LlmState,
     model: &str,
@@ -163,6 +169,10 @@ pub async fn resolve_with_failover(
 /// Returns (provider, actual_model_name, model_id) or a typed error.
 ///
 /// 单模型薄封装：内部走 `resolve_with_failover`，取候选链首元素。
+///
+/// # Errors
+/// - `resolve_with_failover` 失败时透传其 `ResolveError`（`Db`/`ModelNotFound`/`ProviderDisabled`）。
+/// - 候选链为空（组过滤后无可用成员）时返回 `ResolveError::ModelNotFound`。
 pub async fn resolve_model(
     state: &LlmState,
     model: &str,
@@ -221,6 +231,9 @@ pub async fn model_resolvable(state: &LlmState, name: &str) -> bool {
 
 /// Get list of all enabled models (for /v1/models).
 /// Only returns models whose provider is also enabled.
+///
+/// # Errors
+/// `state.db` 为 `None` 时返回 `Err("database not available")`。
 pub async fn list_available_models(state: &LlmState) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.as_ref().ok_or("database not available")?;
     let snap = state

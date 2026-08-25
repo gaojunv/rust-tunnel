@@ -13,6 +13,9 @@ pub const DEFAULT_MODEL_KEY: &str = "agent_default_model";
 /// - 历史裸值：命中 `llm_models.id` → model_name；未命中 → 原样直通（可能是
 ///   alias/model_name/组名，交给网关 `resolve_with_failover` 解析）。
 /// - `None`/空 → Ok(None)（未配置）。
+///
+/// # Errors
+/// 数据库读取失败、模型/组不存在或被禁用时返回错误。
 pub async fn resolve_workspace_model_ref(
     db: &Database,
     llm_model_id: Option<&str>,
@@ -62,6 +65,9 @@ pub async fn resolve_workspace_model_ref(
 /// → 全局默认（`agent_default_model`）→ 第一个可用模型。
 /// 返回网关可解析的模型引用（model_name / 别名 / 组名）。
 /// `llm` 用于「第一个可用」兜底；`None` 时该层跳过。
+///
+/// # Errors
+/// 数据库读取失败、会话/工作区不存在或所有层级均未配置模型时返回错误。
 pub async fn resolve_effective_model(
     db: &Database,
     llm: Option<&LlmState>,
@@ -114,6 +120,9 @@ pub async fn resolve_effective_model(
 /// 全局默认）。ACP `ensure_session` spawn 前门禁用——实际解析由
 /// [`resolve_effective_model`] 按 session 从 DB 完成，这里只防「spawn 后才发现
 /// 无模型」。session 不存在时视为无 session.model。
+///
+/// # Errors
+/// 数据库读取失败时返回错误。
 pub async fn has_any_model_config(
     db: &Database,
     session_id: &str,
@@ -197,6 +206,11 @@ pub struct SessionRuntime {
 impl SessionRuntime {
     /// Rebuild conversation state from the database.
     /// `default_model` is used when the session has no model set.
+    ///
+    /// # Errors
+    /// 数据库读取失败、会话/工作区不存在或模型解析失败时返回错误。
+    // DB 轮询与角色/消息重放的顺序编排，拆分会把相关状态散到多个签名里反而降低可读性。
+    #[allow(clippy::too_many_lines, reason = "DB 轮询与角色/消息重放的顺序编排，拆分会把相关状态散到多个签名里反而降低可读性")]
     pub async fn load(
         db: &Database,
         session_id: &str,
@@ -245,9 +259,11 @@ impl SessionRuntime {
                 // 旧格式（kind='tool' 的合并行、assistant tool_calls 未持久化）重放会产生
                 // 非法 OpenAI 序列（tool 消息无 tool_call_id），故跳过。新格式
                 // （tool_calls/tool_result 行）恢复完整结构；summary 行之后才是有效上下文。
+                #[allow(clippy::needless_continue, reason = "显式 continue 表意更清晰：跳过旧格式落库的非法序列")]
                 "tool" => continue,
                 // 迁移前遗留行：SQLite DEFAULT 使 role='tool' 的旧行 kind='message'，
                 // 不能落入 _ 分支被当作普通工具文本消息重放，同样跳过。
+                #[allow(clippy::needless_continue, reason = "显式 continue 表意更清晰：隔离 SQLite DEFAULT 遗留的非法序列")]
                 "message" if r.role == "tool" => continue,
                 // assistant 的工具调用记录：恢复原始 tool_calls JSON。
                 "tool_calls" => messages.push(ChatMessage {
@@ -278,6 +294,7 @@ impl SessionRuntime {
                 }),
                 // message / summary：普通文本消息。
                 // thought 行是 DeepSeek reasoning_content 落库，不回传上游 LLM 上下文。
+                #[allow(clippy::needless_continue, reason = "显式 continue 表意更清晰：过滤 reasoning 落库的非上下文行")]
                 "message" if r.name.as_deref() == Some("thought") => continue,
                 _ => messages.push(ChatMessage::text(&r.role, &r.content)),
             }

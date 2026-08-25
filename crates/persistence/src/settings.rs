@@ -4,6 +4,9 @@ use super::Database;
 
 impl Database {
     /// Load a server setting by key
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_server_setting(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query("SELECT value FROM server_settings WHERE key = ?")
             .bind(key)
@@ -13,6 +16,9 @@ impl Database {
     }
 
     /// Save a server setting (upsert)
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn save_server_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"

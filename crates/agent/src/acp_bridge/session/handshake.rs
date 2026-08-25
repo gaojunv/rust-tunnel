@@ -32,6 +32,7 @@ use super::{
 };
 
 impl AcpBridge {
+    #[allow(clippy::too_many_lines, reason = "ACP 连接任务的通知/权限/fs/表单处理器与握手流水线顺序编排，拆分会打散共享状态与闭包捕获")]
     pub(crate) async fn acp_handshake(
         &self,
         session_id: &str,
@@ -115,7 +116,7 @@ impl AcpBridge {
                                     upd,
                                 ) => {
                                     if let Some(a) = sessions.lock().await.get_mut(&sid) {
-                                        a.config_options = upd.config_options.clone();
+                                        a.config_options.clone_from(&upd.config_options);
                                     }
                                 }
                                 agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
@@ -142,7 +143,7 @@ impl AcpBridge {
                                     upd,
                                 ) => {
                                     if let Some(a) = sessions.lock().await.get_mut(&sid) {
-                                        a.available_commands = upd.available_commands.clone();
+                                        a.available_commands.clone_from(&upd.available_commands);
                                     }
                                 }
                                 _ => {}

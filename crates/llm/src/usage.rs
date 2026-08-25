@@ -330,7 +330,7 @@ impl UsageContext {
             UsageInfo::default(),
             status_code,
             false,
-            started_at.elapsed().as_millis() as i64,
+            i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
             Some(error_type.to_string()),
         );
         spawn_record(db.clone(), insert);
@@ -345,7 +345,7 @@ impl UsageContext {
             usage,
             200,
             true,
-            started_at.elapsed().as_millis() as i64,
+            i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
             None,
         );
         spawn_record(db.clone(), insert);
@@ -383,7 +383,7 @@ pub async fn wrap_and_record(
                     UsageInfo::default(),
                     status_code,
                     false,
-                    started_at.elapsed().as_millis() as i64,
+                    i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
                     Some(format!("body read error: {e}")),
                 );
                 spawn_record(db, insert);
@@ -403,7 +403,7 @@ pub async fn wrap_and_record(
             usage,
             status_code,
             status.is_success(),
-            started_at.elapsed().as_millis() as i64,
+            i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
             None,
         );
         spawn_record(db, insert);
@@ -433,7 +433,7 @@ pub async fn wrap_and_record(
             usage,
             status_code,
             status.is_success(),
-            started_at.elapsed().as_millis() as i64,
+            i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
             None,
         );
         spawn_record(db, insert);

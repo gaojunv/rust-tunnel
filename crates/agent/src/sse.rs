@@ -132,6 +132,8 @@ impl SseAggregator {
     }
 
     /// 喂入一行（不含 \n）。`data: ` 前缀可选空格；非 data 行/畸形 JSON 跳过。
+    // SSE delta 解析的顺序编排（tool_calls/content/reasoning/usage 多分支），拆分会把共享的 bytes/limit 状态散到多个签名里。
+    #[allow(clippy::too_many_lines, reason = "SSE delta 解析的顺序编排，拆分会把共享的 bytes/limit 状态散到多个签名里")]
     pub fn feed_line(&mut self, line: &str) -> SseFeed {
         let line = line.trim_end_matches('\r');
         let Some(data) = line.strip_prefix("data:") else {
@@ -169,7 +171,7 @@ impl SseAggregator {
                 let index = tc
                     .get("index")
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
+                    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX));
                 if index >= MAX_TOOL_CALLS {
                     continue; // 恶意/畸形 index：跳过该增量，不中断流
                 }
@@ -264,6 +266,9 @@ impl SseAggregator {
     }
 
     /// 流结束：聚合 tool_calls 为 ParsedToolCall + 重建原始 JSON。
+    ///
+    /// # Errors
+    /// 当前无失败路径，返回 Ok；保留 Result 以备未来校验失败。
     pub fn finish(self) -> Result<AggregatedTurn, String> {
         let mut tool_calls = Vec::new();
         let mut raw_tool_calls = Vec::new();

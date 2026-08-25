@@ -2,6 +2,7 @@ use super::Database;
 use sqlx::{Pool, Sqlite};
 
 impl Database {
+    #[allow(clippy::too_many_lines, reason = "建表与幂等迁移的顺序编排，需按依赖集中初始化，拆分会分散约束")]
     /// Initialize database tables
     pub(crate) async fn initialize_schema(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         // Enable WAL mode for concurrent reads/writes and set synchronous to NORMAL
@@ -1908,7 +1909,7 @@ mod tests {
         .unwrap();
         assert_eq!(scope, "workspace");
         assert_eq!(pin, 0);
-        assert_eq!(conf, 0.8);
+        assert!((conf - 0.8).abs() < f64::EPSILON);
         assert_eq!(trigger, "");
 
         // 索引存在

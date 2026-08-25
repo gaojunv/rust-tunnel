@@ -22,6 +22,8 @@ pub fn normalize_db_datetime(raw: &str) -> String {
 /// [`normalize_db_datetime`] 的 serde `serialize_with` 适配（String 字段）。
 /// `&String` 是 serde `serialize_with` 对 String 字段要求的固定签名（非可改写的
 /// `&str`），故 allow `ptr_arg`。
+/// # Errors
+/// 当底层序列化器写入失败时返回 `S::Error`。
 #[allow(clippy::ptr_arg)]
 pub fn ser_de_normalized_dt<S: serde::Serializer>(s: &String, ser: S) -> Result<S::Ok, S::Error> {
     ser.serialize_str(&normalize_db_datetime(s))
@@ -295,6 +297,8 @@ impl Database {
     /// `agent_path`/`llm_model_id`/`agent_config_overrides` 可空（后者为 ACP 引擎
     /// 选项覆盖，JSON map：config_id → value，None 表示未配置）。调用方暂未接入请求
     /// DTO 时传 `""` / `None` 占位。
+    /// # Errors
+    /// 当数据库连接不可用或 `INSERT` 执行失败（约束冲突、磁盘已满等）导致 `sqlx::Error` 时返回。
     pub async fn agent_create_workspace(
         &self,
         opts: &AgentWorkspaceCreateOpts,
@@ -325,6 +329,8 @@ impl Database {
     }
 
     /// 按 id 查询单个工作区，不存在返回 None。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_get_workspace(
         &self,
         id: &str,
@@ -336,6 +342,8 @@ impl Database {
     }
 
     /// 列出全部工作区，按创建时间升序。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_list_workspaces(&self) -> Result<Vec<AgentWorkspaceRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWorkspaceRecord>(
             "SELECT * FROM agent_workspaces ORDER BY created_at",
@@ -350,6 +358,8 @@ impl Database {
     /// map：config_id → value）；`clear_overrides=true` 时强制清空（设为 NULL），
     /// 否则按 COALESCE 语义处理。`claude_tier_models` 为 Claude Code tier 模型映射
     ///（JSON object），`clear_tier_models=true` 时强制清空（设为 NULL）。
+    /// # Errors
+    /// 当数据库连接不可用或 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_workspace(
         &self,
         id: &str,
@@ -412,6 +422,8 @@ impl Database {
 
     /// 单字段更新 workspace 的 `llm_model_id`。原为测试专用 helper，拆 crate 后
     /// server 侧测试跨 crate 调用，提升为正式方法（语义：直接覆盖）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_set_workspace_llm_model_id(
         &self,
         id: &str,
@@ -432,6 +444,8 @@ impl Database {
     /// owner/repo 明文）。写语义「空串 / 缺省（None）= 保持已存值，非空 = 更新」，
     /// 经 `COALESCE(NULLIF(?, ''), col)` 表达：空串归一化为 NULL 后取原列值，
     /// 非空直接覆盖。调用方（API 层）负责在传参前完成 token 加密。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_set_workspace_github(
         &self,
         id: &str,
@@ -457,6 +471,8 @@ impl Database {
     }
 
     /// 删除指定工作区（级联由外键/应用层处理）。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_delete_workspace(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_workspaces WHERE id = ?")
             .bind(id)
@@ -468,6 +484,8 @@ impl Database {
     // ── Session CRUD ────────────────────────────────────────────
 
     /// 创建 agent 会话。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败（外键约束、连接失败等）导致 `sqlx::Error` 时返回。
     pub async fn agent_create_session(
         &self,
         id: &str,
@@ -488,6 +506,8 @@ impl Database {
     }
 
     /// 按 id 查询单个会话，不存在返回 None。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_get_session(
         &self,
         id: &str,
@@ -499,6 +519,8 @@ impl Database {
     }
 
     /// 列出指定工作区下的全部会话，按创建时间倒序。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_list_sessions(
         &self,
         workspace_id: &str,
@@ -512,6 +534,8 @@ impl Database {
     }
 
     /// 更新会话标题。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_title(
         &self,
         id: &str,
@@ -528,6 +552,8 @@ impl Database {
     }
 
     /// 更新会话关联模型，None 表示清除。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_model(
         &self,
         id: &str,
@@ -544,6 +570,8 @@ impl Database {
     }
 
     /// 写入/清除 session 的角色绑定。role_id=None 清除（主会话回退默认行为）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_role(
         &self,
         id: &str,
@@ -561,6 +589,8 @@ impl Database {
 
     /// 写入/清除 session 的 ACP 会话 id（handshake 完成后落库，供断线重拉时
     /// `session/resume` 恢复上下文）。None 清空（如重拉后 session/delete 删除）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_set_acp_session_id(
         &self,
         id: &str,
@@ -578,6 +608,8 @@ impl Database {
 
     /// 写入 session 的上下文用量快照（ACP UsageUpdate 每次推送覆盖；用于
     /// 刷新/重连后恢复前端用量条，不做历史累计）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_context_usage(
         &self,
         id: &str,
@@ -596,6 +628,8 @@ impl Database {
     /// 写入/清空 session 的最近 spawn 失败归因（Some=失败描述带 stage 前缀，
     /// None=spawn 成功清空）。会话行不存在时静默无影响（预 spawn 可能先于
     /// session 行创建？否——session 行由 API 先建；防御性写法不校验行数）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_spawn_error(
         &self,
         id: &str,
@@ -612,6 +646,8 @@ impl Database {
     // ── ACP 排队 prompt 持久化（agent_pending_prompts） ─────────────
 
     /// 入队一条等待执行的 prompt（busy 时）。返回行 id（供取出执行后删除）。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_pending_enqueue(
         &self,
         id: &str,
@@ -632,6 +668,8 @@ impl Database {
     }
 
     /// 按 FIFO（rowid 升序 = 入队顺序）列出 session 的排队 prompt。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_pending_list(
         &self,
         session_id: &str,
@@ -645,6 +683,8 @@ impl Database {
     }
 
     /// 取出执行后删除对应行（best-effort 调用地不阻塞主流程）。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_pending_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_pending_prompts WHERE id = ?")
             .bind(id)
@@ -654,6 +694,8 @@ impl Database {
     }
 
     /// 清空 session 的全部排队 prompt（会话删除时级联清理）。
+    /// # Errors
+    /// 当数据库 `DELETE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_pending_clear_session(&self, session_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_pending_prompts WHERE session_id = ?")
             .bind(session_id)
@@ -664,6 +706,8 @@ impl Database {
 
     /// upsert/删除 session 的 ACP 配置项：value=Some 写入该 key，None 删除；
     /// map 为空时列置 NULL。config_state 非 JSON（历史脏数据）时视为空 map 重建。
+    /// # Errors
+    /// 当读取会话或后续 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_session_config_state(
         &self,
         id: &str,
@@ -703,6 +747,8 @@ impl Database {
     }
 
     /// 归档指定会话（status 置为 archived）。
+    /// # Errors
+    /// 当数据库 `UPDATE` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_archive_session(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_sessions SET status = 'archived', updated_at = datetime('now') WHERE id = ?",
@@ -714,6 +760,8 @@ impl Database {
     }
 
     /// 删除指定会话并级联清理排队 prompt。
+    /// # Errors
+    /// 当 `DELETE` 会话或级联清理排队 `prompt` 失败导致 `sqlx::Error` 时返回。
     pub async fn agent_delete_session(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_sessions WHERE id = ?")
             .bind(id)
@@ -727,6 +775,8 @@ impl Database {
     // ── Messages ────────────────────────────────────────────────
 
     /// 追加一条消息（旧接口，kind 由 role 推导；新代码优先用 `agent_add_message_v2`）。
+    /// # Errors
+    /// 当内部 `INSERT`（经 `agent_add_message_v2`）执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_add_message(
         &self,
         id: &str,
@@ -755,6 +805,8 @@ impl Database {
     /// 新格式消息写入（全列）。`kind` 取值：message / tool_calls / tool_result / summary。
     /// `parent_tool_call_id`：子 agent 归属（发起本消息的 Task 工具调用 id），
     /// 主 agent 消息传 None。
+    /// # Errors
+    /// 当数据库 `INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_add_message_v2(&self, opts: &AgentMessageOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO agent_messages \
@@ -783,6 +835,8 @@ impl Database {
     /// `session_id` 必须传入：部分 agent 用顺序 id（如 `call_1`），不同会话会出现
     /// 相同 tool_call_id，缺 session 约束会把会话 A 的 args 回填到会话 B 的
     /// tool_calls 行（跨会话历史卡片参数错乱），查询也退化为全表扫描。
+    /// # Errors
+    /// 当查询或更新 `agent_messages` 失败导致 `sqlx::Error` 时返回。
     pub async fn agent_update_tool_call_args(
         &self,
         session_id: &str,
@@ -832,6 +886,8 @@ impl Database {
     /// `parent_tool_call_id`：子 agent 归属（发起该调用的 Task 工具调用 id），
     /// 主 agent 调用传 None；更新路径以 COALESCE 补全（同一 tool_call_id 的归属
     /// 固定，先到者生效）。
+    /// # Errors
+    /// 当查询、删除多余行或 `UPDATE`/`INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_upsert_tool_call(
         &self,
         id: &str,
@@ -910,6 +966,8 @@ impl Database {
     /// 存量旧行是纯文本，读取方须向后兼容。中间态空占位（无产出、非异常终态）
     /// 传 ""，不覆盖已落库真实结果；failed 等异常终态即使 text 为空也须传非空
     /// JSON。装配见 [`crate::tool_result::tool_result_persist_content`]。
+    /// # Errors
+    /// 当查询、删除多余行或 `UPDATE`/`INSERT` 执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_upsert_tool_result(
         &self,
         id: &str,
@@ -976,6 +1034,8 @@ impl Database {
     }
 
     /// 列出指定会话的全部消息，按插入顺序（rowid）升序。
+    /// # Errors
+    /// 当数据库查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_list_messages(
         &self,
         session_id: &str,
@@ -1003,12 +1063,21 @@ impl Database {
     /// 游标语义：`before_id` 指向的消息本身**不**包含在返回里；指向不存在的 id
     /// 或不属于本会话的 id 时返回空页且 `has_more = false`。has_more 用「多取一条
     /// （limit+1）」判断：拿到 limit+1 条说明还有更早的没取完。
+    /// # Errors
+    /// 当游标查询或分页查询执行失败导致 `sqlx::Error` 时返回。
     pub async fn agent_list_messages_page(
         &self,
         session_id: &str,
         before_id: Option<&str>,
         limit: i64,
     ) -> Result<(Vec<AgentMessageRecord>, bool), sqlx::Error> {
+        // limit 由调用方 clamp（200/500）；此处对非法值做防御：≤0 视为「请求 0 条」，
+        // 直接返回空页且 has_more=false，避免出现 has_more=true 但结果为空的矛盾状态。
+        let limit = usize::try_from(limit).unwrap_or(0);
+        if limit == 0 {
+            return Ok((Vec::new(), false));
+        }
+
         // 游标解析：before_id → 该消息的 rowid（rowid < before 即「更早」）。
         let before_rowid = match before_id {
             Some(id) => {
@@ -1027,7 +1096,7 @@ impl Database {
             None => None,
         };
 
-        let fetch = limit + 1; // 多取一条判断 has_more
+        let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1); // 多取一条判断 has_more
         let rows: Vec<AgentMessageRecord> =
             match before_rowid {
                 Some(r) => {
@@ -1049,9 +1118,9 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await?,
             };
-        let has_more = rows.len() as i64 > limit;
+        let has_more = rows.len() > limit;
         let mut msgs = if has_more {
-            rows.into_iter().take(limit as usize).collect::<Vec<_>>()
+            rows.into_iter().take(limit).collect::<Vec<_>>()
         } else {
             rows
         };

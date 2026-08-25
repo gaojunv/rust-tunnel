@@ -28,13 +28,16 @@ use agent_client_protocol::schema::MaybeUndefined;
 /// 携带 `parentToolUseId`/`subagent` 时，tool_call / tool_result / assistant_chunk
 /// 帧额外输出 `parent_tool_call_id`（有值才输出）与 `is_subagent`（仅 true 时
 /// 输出），前端据此按父子关系分组渲染。无 `_meta` 的事件字段缺省，完全无感降级。
+// 对 9 个 ACP 帧变体的扁平派发，共享大量局部状态，拆分会把相关逻辑散到多个签名里反而降低可读性。
+#[allow(clippy::too_many_lines, reason = "对 9 个 ACP 帧变体的扁平派发，拆分会把相关逻辑散到多个签名里反而降低可读性")]
+#[allow(clippy::match_same_arms, reason = "UserMessageChunk 显式分支为文档目的，虽与通配分支同为 None，但中间夹着关键业务分支，合并会掩盖意图")]
 pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => {
-            map_text_chunk(&chunk.content, &chunk.meta, false)
+            map_text_chunk(&chunk.content, chunk.meta.as_ref(), false)
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
-            map_text_chunk(&chunk.content, &chunk.meta, true)
+            map_text_chunk(&chunk.content, chunk.meta.as_ref(), true)
         }
         SessionUpdate::UserMessageChunk(_) => None, // 用户消息前端自渲染，避免重复
         SessionUpdate::ToolCall(tc) => {
@@ -43,7 +46,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                 "id": tc.tool_call_id.to_string(),
                 "name": tc.title,
                 "status": status_str(Some(tc.status)),
-                "tool_kind": kind_str(&tc.kind),
+                "tool_kind": kind_str(tc.kind),
             });
             if let Some(args) = &tc.raw_input {
                 frame["args"] = serde_json::Value::String(encode_raw(args));
@@ -62,7 +65,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             if !locations.is_empty() {
                 frame["locations"] = serde_json::Value::Array(locations);
             }
-            apply_claude_code_meta(&mut frame, &tc.meta);
+            apply_claude_code_meta(&mut frame, tc.meta.as_ref());
             Some(frame)
         }
         SessionUpdate::ToolCallUpdate(upd) => {
@@ -82,7 +85,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                 let has_result = upd.fields.raw_output.is_some()
                     || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
                 if has_result {
-                    let (parent, is_subagent) = claude_code_meta(&upd.meta);
+                    let (parent, is_subagent) = claude_code_meta(upd.meta.as_ref());
                     if is_subagent && parent.is_none() {
                         "running"
                     } else {
@@ -100,7 +103,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             if let Some(title) = &upd.fields.title {
                 frame["name"] = serde_json::Value::String(title.clone());
             }
-            if let Some(kind) = &upd.fields.kind {
+            if let Some(kind) = upd.fields.kind {
                 frame["tool_kind"] = serde_json::Value::String(kind_str(kind).into());
             }
             // claude-code 的 ToolCall 首帧 rawInput 常是 {}（参数尚未到达），真正的
@@ -133,7 +136,7 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
                     frame["locations"] = serde_json::Value::Array(locations);
                 }
             }
-            apply_claude_code_meta(&mut frame, &upd.meta);
+            apply_claude_code_meta(&mut frame, upd.meta.as_ref());
             Some(frame)
         }
         SessionUpdate::Plan(plan) => Some(serde_json::json!({
@@ -183,7 +186,7 @@ fn encode_raw(value: &serde_json::Value) -> String {
 /// content 级 `_meta`（`TextContent.meta`）。子 agent 文本归属两级都查，优先 chunk 级。
 fn map_text_chunk(
     content: &ContentBlock,
-    chunk_meta: &Option<Meta>,
+    chunk_meta: Option<&Meta>,
     thought: bool,
 ) -> Option<serde_json::Value> {
     let ContentBlock::Text(text) = content else {
@@ -196,7 +199,7 @@ fn map_text_chunk(
     if thought {
         frame["thought"] = serde_json::Value::Bool(true);
     }
-    let (parent, is_subagent) = claude_code_meta_two(chunk_meta, &text.meta);
+    let (parent, is_subagent) = claude_code_meta_two(chunk_meta, text.meta.as_ref());
     if let Some(parent) = parent {
         frame["parent_tool_call_id"] = serde_json::Value::String(parent);
     }
@@ -262,9 +265,7 @@ fn map_attachment_chunk(content: &ContentBlock) -> Option<serde_json::Value> {
             // schema 标注 non_exhaustive：未来新增资源类型安全降级为无占位帧
             _ => return None,
         },
-        ContentBlock::Text(_) => return None,
-        // ContentBlock 同样 non_exhaustive
-        _ => return None,
+        ContentBlock::Text(_) | _ => return None,
     };
     let mut frame = serde_json::json!({
         "type": "attachment",
@@ -286,7 +287,7 @@ fn map_attachment_chunk(content: &ContentBlock) -> Option<serde_json::Value> {
 /// - `subagent`（布尔）：本事件由子 agent 产生（Task 工具调用自身）
 ///
 /// 返回 `(parent_tool_call_id, is_subagent)`；缺省时均为 `(None, false)`。
-fn claude_code_meta(meta: &Option<Meta>) -> (Option<String>, bool) {
+fn claude_code_meta(meta: Option<&Meta>) -> (Option<String>, bool) {
     let Some(meta) = meta else {
         return (None, false);
     };
@@ -305,7 +306,7 @@ fn claude_code_meta(meta: &Option<Meta>) -> (Option<String>, bool) {
 
 /// 两级 `_meta` 的 claudeCode 字段：primary（chunk 级）有任一字段时采用，否则
 /// 回退 fallback（content 级）。真实事件里两级不会同时携带不同归属，先到先得即可。
-fn claude_code_meta_two(primary: &Option<Meta>, fallback: &Option<Meta>) -> (Option<String>, bool) {
+fn claude_code_meta_two(primary: Option<&Meta>, fallback: Option<&Meta>) -> (Option<String>, bool) {
     let parsed = claude_code_meta(primary);
     if parsed.0.is_some() || parsed.1 {
         return parsed;
@@ -315,7 +316,7 @@ fn claude_code_meta_two(primary: &Option<Meta>, fallback: &Option<Meta>) -> (Opt
 
 /// 把 claude-code `_meta` 的父归属写入 WS 帧：`parent_tool_call_id` 有值才输出，
 /// `is_subagent` 仅 true 时输出——缺省帧字段不出现，对不支持 `_meta` 的引擎无感降级。
-fn apply_claude_code_meta(frame: &mut serde_json::Value, meta: &Option<Meta>) {
+fn apply_claude_code_meta(frame: &mut serde_json::Value, meta: Option<&Meta>) {
     let (parent, is_subagent) = claude_code_meta(meta);
     if let Some(parent) = parent {
         frame["parent_tool_call_id"] = serde_json::Value::String(parent);
@@ -326,7 +327,7 @@ fn apply_claude_code_meta(frame: &mut serde_json::Value, meta: &Option<Meta>) {
 }
 
 /// ACP `ToolKind` → 帧字符串（前端按此选图标/详情渲染）。
-fn kind_str(kind: &ToolKind) -> &'static str {
+fn kind_str(kind: ToolKind) -> &'static str {
     match kind {
         ToolKind::Read => "read",
         ToolKind::Edit => "edit",
@@ -843,12 +844,12 @@ mod tests {
         let u = update(serde_json::json!({
             "sessionUpdate": "usage_update",
             "used": 1234,
-            "size": 200000
+            "size": 200_000
         }));
         let frame = map_update(&u).expect("usage should map");
         assert_eq!(frame["type"], "usage");
         assert_eq!(frame["used"], 1234);
-        assert_eq!(frame["size"], 200000);
+        assert_eq!(frame["size"], 200_000);
     }
 
     #[test]

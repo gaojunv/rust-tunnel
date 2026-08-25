@@ -164,6 +164,10 @@ impl Database {
     // ── Settings（单行 id=1）─────────────────────────────────────
 
     /// 读取全局设置；无行（从未写入）时返回默认构造（enabled=false）。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_get_settings(&self) -> Result<AgentMemorySettingsRecord, sqlx::Error> {
         match sqlx::query_as::<_, AgentMemorySettingsRecord>(
             "SELECT * FROM agent_memory_settings WHERE id = 1",
@@ -179,6 +183,9 @@ impl Database {
     /// upsert 全局设置（单行 id=1）。`created_at` 由 DB 保持（INSERT OR REPLACE
     /// 下用 COALESCE 子查询保留首建时间，仅首次插入取 `datetime('now')`）；
     /// 记录里传入的 `created_at`/`updated_at` 字段被忽略，调用方可随便填。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_upsert_settings(
         &self,
         s: &AgentMemorySettingsRecord,
@@ -223,6 +230,9 @@ impl Database {
 
     /// 插入一条记忆（全列）。`pinned` 仅插入时生效（false）；后续用
     /// [`Self::memory_toggle_pin`] 翻转。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、约束冲突或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_insert(&self, opts: &MemoryInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -248,6 +258,9 @@ impl Database {
     }
 
     /// 按 id 查询单条记忆，不存在返回 None。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn memory_get_by_id(
         &self,
         id: &str,
@@ -259,6 +272,9 @@ impl Database {
     }
 
     /// 批量读取（注入回填用：向量检索命中后按 id 拉原文）。空切片返回空。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn memory_get_by_ids(
         &self,
         ids: &[String],
@@ -278,6 +294,9 @@ impl Database {
     }
 
     /// 更新可变字段：content / tags / scope_type / confidence。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_update(
         &self,
         id: &str,
@@ -301,6 +320,9 @@ impl Database {
     }
 
     /// 按 id 删除记忆，不存在时无副作用（向量删除由上层另行处理）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_memories WHERE id = ?")
             .bind(id)
@@ -310,6 +332,9 @@ impl Database {
     }
 
     /// 翻转 pinned（1 ↔ 0）。不存在的 id 无副作用。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_toggle_pin(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_memories SET pinned = 1 - pinned, updated_at = datetime('now') \
@@ -328,6 +353,9 @@ impl Database {
     /// `pinned`：Some(true) 只看置顶、Some(false) 只看未置顶、None 不过滤。
     /// `order` 白名单："recent"（updated_at DESC，默认）/ "created"（created_at DESC）/
     /// "confidence"（confidence DESC）/ "hits"（hit_count DESC）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn memory_list(
         &self,
         filter: &MemoryListFilter,
@@ -367,6 +395,9 @@ impl Database {
     }
 
     /// 批量 +1 hit_count 并刷新 last_hit_at（注入命中回写）。空切片直接返回。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_bump_hits(&self, ids: &[String]) -> Result<(), sqlx::Error> {
         if ids.is_empty() {
             return Ok(());
@@ -389,6 +420,9 @@ impl Database {
     /// 原子标记会话已蒸馏：`UPDATE agent_sessions SET distilled=1 WHERE id=? AND
     /// distilled=0`。返回 true 表示本次调用是赢家（可触发蒸馏）；false 表示已蒸馏过
     /// 或会话不存在。归档/删除/断线/idle 多路并发只会有一个赢家。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn memory_mark_distilled_if_not(
         &self,
         session_id: &str,
@@ -433,6 +467,7 @@ mod tests {
         "s1".to_string()
     }
 
+    #[allow(clippy::float_cmp, reason = "测试中对字面量阈值 0.40 做精确相等校验，值为写入前确定的常量，经 SQLite REAL 往返应逐位相等")] 
     #[tokio::test]
     async fn test_settings_default_and_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
@@ -487,6 +522,7 @@ mod tests {
         assert_eq!(s5.created_at, s3.created_at, "created_at 应保持首建时间");
     }
 
+    #[allow(clippy::float_cmp, reason = "测试中对字面量置信度做精确相等校验，值为写入前确定的常量，往返应相等")] 
     #[tokio::test]
     async fn test_memories_crud() {
         let db = Database::new(":memory:").await.unwrap();
@@ -585,6 +621,7 @@ mod tests {
         assert_eq!(v, 1);
     }
 
+    #[allow(clippy::too_many_lines, reason = "多作用域/标签/分页的串联断言测试，长但内聚，拆分会割裂用例")] 
     #[tokio::test]
     async fn test_memory_list_scope_filter() {
         let db = Database::new(":memory:").await.unwrap();
@@ -760,6 +797,7 @@ mod tests {
         assert_eq!(q[0].id, "m2");
     }
 
+    #[allow(clippy::float_cmp, reason = "测试中对字面量置信度 0.4 做精确相等校验，值为写入前确定的常量")] 
     #[tokio::test]
     async fn test_memory_list_order_and_paging() {
         let db = Database::new(":memory:").await.unwrap();
@@ -829,6 +867,7 @@ mod tests {
         assert_eq!(fallback.len(), 5);
     }
 
+    #[allow(clippy::float_cmp, reason = "测试中对置信度的精确写入/读回校验，往返应相等")] 
     #[tokio::test]
     async fn test_memory_batch_and_hits() {
         let db = Database::new(":memory:").await.unwrap();

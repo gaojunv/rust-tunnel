@@ -3,6 +3,9 @@ use super::Database;
 
 impl Database {
     /// Load DNS config (singleton)
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_dns_config(&self) -> Result<Option<DnsConfigRecord>, sqlx::Error> {
         sqlx::query_as::<_, DnsConfigRecord>(
             "SELECT tunnel_domain, mesh_domain FROM dns_config WHERE id = 1",
@@ -12,6 +15,9 @@ impl Database {
     }
 
     /// Save DNS config (singleton, upsert)
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_dns_config(
         &self,
         tunnel_domain: &str,

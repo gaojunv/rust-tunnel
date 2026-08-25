@@ -62,6 +62,9 @@ fn parse_remember_args(args_json: &str) -> Result<(String, String, Vec<String>),
 /// 处理一次 remember 工具调用。参数校验失败 / enabled 关闭 / embedding 失败 /
 /// 落库失败 → Err（错误文本由调用方喂回模型）；成功返回摘要文本。
 /// 与 agent 解耦：调用方只需提供 `MemoryState` 与会话三坐标（runner 与 MCP 共用）。
+///
+/// # Errors
+/// 参数非法、memory 未启用/关闭、embedding 未配置或失败、DB/向量写失败时返回 `Err`。
 pub async fn remember_execute(
     memory: &MemoryState,
     client_id: &str,
@@ -170,7 +173,7 @@ mod tests {
         .with_memory(memory)
     }
 
-    async fn agent_without_memory(db: Database) -> AgentState {
+    fn agent_without_memory(db: Database) -> AgentState {
         crate::AgentState::new(
             std::sync::Arc::new(crate::test_helpers::TestRegistry::new(&db)),
             db,
@@ -180,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn remember_requires_content() {
         let db = Database::new(":memory:").await.unwrap();
-        let agent = agent_without_memory(db).await;
+        let agent = agent_without_memory(db);
         let r = rt("s1", "c1", "w1");
         assert!(remember_from_agent(&agent, &r, r#"{"content": "  "}"#)
             .await
@@ -194,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn remember_rejects_oversized_and_bad_scope() {
         let db = Database::new(":memory:").await.unwrap();
-        let agent = agent_without_memory(db).await;
+        let agent = agent_without_memory(db);
         let r = rt("s1", "c1", "w1");
         let big = "x".repeat(MEMORY_CONTENT_MAX_CHARS + 1);
         let args = serde_json::json!({"content": big}).to_string();
@@ -212,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn remember_rejects_too_many_or_long_tags() {
         let db = Database::new(":memory:").await.unwrap();
-        let agent = agent_without_memory(db).await;
+        let agent = agent_without_memory(db);
         let r = rt("s1", "c1", "w1");
         let tags: Vec<&str> = (0..9)
             .map(|i| {
@@ -265,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn remember_without_memory_returns_err() {
         let db = Database::new(":memory:").await.unwrap();
-        let agent = agent_without_memory(db).await;
+        let agent = agent_without_memory(db);
         let r = rt("s1", "c1", "w1");
         let err = remember_from_agent(&agent, &r, r#"{"content": "x"}"#)
             .await

@@ -213,8 +213,8 @@ async fn test_ensure_session_session_model_passes_gate() {
     tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let sid = match &req {
-                ControlMessage::AgentSpawnRequest { session_id, .. } => session_id.clone(),
-                ControlMessage::AgentLlmProxyStart { session_id } => session_id.clone(),
+                ControlMessage::AgentSpawnRequest { session_id, .. }
+                | ControlMessage::AgentLlmProxyStart { session_id } => session_id.clone(),
                 // AgentLlmProxyStop 是单向清理消息（无响应、无等待者），跳过不协商。
                 ControlMessage::AgentLlmProxyStop { .. } => continue,
                 other => panic!("unexpected request: {other:?}"),

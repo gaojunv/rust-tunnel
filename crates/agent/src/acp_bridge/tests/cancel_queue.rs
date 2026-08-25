@@ -328,6 +328,7 @@ async fn test_cancel_queued_prompts_auto_send_after_graceful_stop() {
 /// `on_receiving_result`（PromptResponse 到达，含 cancelled）先 flush 已有缓冲
 /// ——用户能看到的那部分回合过程可追溯，且思考/正文顺序不被颠倒（M11 补测）。
 #[tokio::test]
+#[allow(clippy::too_many_lines, reason = "取消路径的缓冲 flush 时序验证，含多段状态断言与顺序校验，拆分无益")]
 async fn test_cancel_flushes_buffered_turn_segments() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();

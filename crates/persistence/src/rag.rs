@@ -155,6 +155,9 @@ impl Database {
 
     /// 创建知识库。emb_api_key 的加解密由调用方（mgmt api 层）用
     /// encrypt_field/decrypt_field 处理，本层只存取原始字符串。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、约束冲突或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_create_kb(&self, opts: &RagCreateKbOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -183,6 +186,9 @@ impl Database {
     }
 
     /// 按 id 查询知识库，不存在返回 None。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_get_kb(
         &self,
         id: &str,
@@ -196,6 +202,9 @@ impl Database {
     }
 
     /// 列出全部知识库，按创建时间排序。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_list_kbs(&self) -> Result<Vec<RagKnowledgeBaseRecord>, sqlx::Error> {
         sqlx::query_as::<_, RagKnowledgeBaseRecord>(
             "SELECT * FROM rag_knowledge_bases ORDER BY created_at",
@@ -206,6 +215,9 @@ impl Database {
 
     /// 更新知识库的「名称 + 检索/分块参数」。emb 配置（base_url/api_key/model/dimension）
     /// 建库后锁定不可改（qdrant shard 维度固定），需要改动时删除重建。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_update_kb_params(
         &self,
         id: &str,
@@ -235,6 +247,9 @@ impl Database {
     /// （调用方用 `encrypt_field` 处理），本层只存取原始字符串。用于编辑 KB 时全量保存
     /// （含可选的 emb 配置变更，与建库时同口径）。区别于 `rag_update_kb_params`——后者
     /// 不碰 emb 列（历史锁定语义），本方法提供可编辑 emb 的能力。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_update_kb_full(
         &self,
         id: &str,
@@ -266,6 +281,9 @@ impl Database {
     }
 
     /// 切换知识库启用状态。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_toggle_kb(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE rag_knowledge_bases SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
@@ -278,6 +296,9 @@ impl Database {
     }
 
     /// 删除知识库（文档与分块经 FK 级联删除）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_delete_kb(&self, id: &str) -> Result<(), sqlx::Error> {
         // 文档/分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_knowledge_bases WHERE id = ?")
@@ -290,6 +311,9 @@ impl Database {
     // ── Document CRUD ────────────────────────────────────────────
 
     /// 创建文档记录，status 初始为 'pending'（异步摄入开始前的占位）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、约束冲突或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_create_document(
         &self,
         id: &str,
@@ -316,6 +340,9 @@ impl Database {
 
     /// 测试/维护用：回填空 file_type 为 'md'（老数据落盘一律 .md，见 schema.rs
     /// `BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL` 注释）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn backfill_rag_document_file_type(&self) -> Result<(), sqlx::Error> {
         sqlx::query(Self::BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL)
             .execute(&self.pool)
@@ -324,6 +351,9 @@ impl Database {
     }
 
     /// 按 id 查询文档，不存在返回 None。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_get_document(
         &self,
         id: &str,
@@ -341,6 +371,9 @@ impl Database {
     }
 
     /// 列出某知识库下的全部文档，按创建时间排序。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_list_documents(
         &self,
         kb_id: &str,
@@ -356,6 +389,9 @@ impl Database {
     }
 
     /// 更新文档状态。`error` 传 None 清空失败原因（例如重索引成功时）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_update_document_status(
         &self,
         doc_id: &str,
@@ -382,6 +418,9 @@ impl Database {
     /// 原子 CAS：仅当文档处于 ready/failed（空闲态）时置回 pending 并清零 chunk_count。
     /// 返回 true = 抢占成功；false = 正在 pending/processing（在途），调用方应拒绝重索引。
     /// 解决 reindex 端点 check-then-act 竞态：两个并发请求只有一个能抢到。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_mark_document_pending_if_idle(
         &self,
         doc_id: &str,
@@ -403,6 +442,9 @@ impl Database {
     /// 服务器若在摄入中途崩溃/panic，这些 doc 永远停在在途态、UI 永久卡住；
     /// 启动时（API 服务开启前）复位后前端可感知失败并重试（reindex/上传走
     /// `rag_mark_document_pending_if_idle` CAS 抢占）。返回被复位的行数。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_fail_inflight_documents(&self, error: &str) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r"
@@ -418,6 +460,9 @@ impl Database {
     }
 
     /// 删除文档（分块经 FK 级联删除）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_delete_document(&self, id: &str) -> Result<(), sqlx::Error> {
         // 分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_documents WHERE id = ?")
@@ -432,6 +477,9 @@ impl Database {
     /// 事务批量插入分块（摄入完成、写向量后落库）。
     /// `rows` 的元素为元组 `(id, doc_id, kb_id, seq, heading_path, content, token_count)`，
     /// 与 rag_chunks 表列一一对应。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、约束冲突或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_insert_chunks(
         &self,
         rows: &[(String, String, String, i64, String, String, i64)],
@@ -460,6 +508,9 @@ impl Database {
 
     /// 按 id 批量取分块（检索命中后回填 content/heading_path）。
     /// 空列表直接返回空，避免生成非法 `IN ()` 语句。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_get_chunks_by_ids(
         &self,
         ids: &[String],
@@ -477,6 +528,9 @@ impl Database {
     }
 
     /// 删除某文档的全部分块（删除文档/重索引前清空旧索引时调用）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_delete_chunks_by_doc(&self, doc_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM rag_chunks WHERE doc_id = ?")
             .bind(doc_id)
@@ -487,6 +541,9 @@ impl Database {
 
     /// 删除某知识库的全部分块（全量重建前清空旧索引时调用）。文档/向量本体在别处清理，
     /// 本方法只清 SQLite 的 chunk 元数据行（按 `kb_id` 列聚合删除，不触碰文档行）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用或 SQL 执行失败时返回 `sqlx::Error`。
     pub async fn rag_delete_chunks_by_kb(&self, kb_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM rag_chunks WHERE kb_id = ?")
             .bind(kb_id)
@@ -498,6 +555,9 @@ impl Database {
     // ── Counts ───────────────────────────────────────────────────
 
     /// 知识库下的文档总数（含 pending/failed）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_count_kb_docs(&self, kb_id: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rag_documents WHERE kb_id = ?")
             .bind(kb_id)
@@ -507,6 +567,9 @@ impl Database {
     }
 
     /// 知识库下的分块总数（冗余 kb_id 列按库聚合）。
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或结果反序列化失败时返回 `sqlx::Error`。
     pub async fn rag_count_kb_chunks(&self, kb_id: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM rag_chunks WHERE kb_id = ?")
             .bind(kb_id)

@@ -58,6 +58,8 @@ pub async fn notify_title(
         .await;
 }
 
+// LLM 调用 + DB 轮询 + 竞态守卫的顺序编排，拆分会把相关状态散到多个签名里。
+#[allow(clippy::too_many_lines, reason = "LLM 调用 + DB 轮询 + 竞态守卫的顺序编排，拆分会把相关状态散到多个签名里")]
 async fn generate_title_inner(
     agent: &AgentState,
     llm: &Arc<LlmState>,

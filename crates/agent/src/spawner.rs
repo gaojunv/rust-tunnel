@@ -3,6 +3,9 @@
 use std::time::Duration;
 
 /// 按 agent 类型生成启动命令。agent_path 为 None 时依赖 PATH 查找。
+///
+/// # Errors
+/// 传入的 agent 类型不在支持列表时返回错误。
 pub fn agent_command(
     agent_type: &str,
     agent_path: Option<&str>,
@@ -159,6 +162,9 @@ impl AgentSpawner {
     }
 
     /// 启动客户端内嵌 LLM 代理，返回回环端口。
+    ///
+    /// # Errors
+    /// 客户端离线、协商超时或服务端未能绑定端口时返回错误。
     pub async fn start_llm_proxy(
         &self,
         client_id: &str,
@@ -193,6 +199,9 @@ impl AgentSpawner {
     /// 注入；claude-code 不用它，仍走 ACP set_config_option）。
     /// `available_models` 是服务端启用的网关模型 id 列表（仅 opencode 分支用于
     /// provider.models 枚举），其余 agent 传空切片。
+    ///
+    /// # Errors
+    /// agent 类型不支持、客户端离线或 spawn 协商失败时返回错误。
     // 9 个参数：每个语义单一，拆 struct 反而绕（brief 指定签名，仿 agent_exec 处理）。
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent(
@@ -248,6 +257,9 @@ impl AgentSpawner {
 
     /// 经控制通道在客户端执行一条 agent 命令（ACP `fs/read_text_file` /
     /// `fs/write_text_file` 转发用；runner 路径走 `executor::exec_on_client`）。
+    ///
+    /// # Errors
+    /// 客户端离线或命令执行失败时返回 IO 错误。
     #[allow(clippy::too_many_arguments)]
     pub async fn agent_exec(
         &self,
@@ -304,10 +316,11 @@ mod tests {
 
     /// 内存 mock：`spawn_negotiate` 用注入闭包即时应答；
     /// `client_handle`/`send_*` 按离线语义返回。
+    type Responder = Option<Box<dyn FnOnce(ControlMessage) -> ControlMessage + Send>>;
+
     #[derive(Default)]
     struct MockExecutor {
-        responder:
-            tokio::sync::Mutex<Option<Box<dyn FnOnce(ControlMessage) -> ControlMessage + Send>>>,
+        responder: tokio::sync::Mutex<Responder>,
     }
 
     #[async_trait::async_trait]

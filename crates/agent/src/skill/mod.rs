@@ -30,24 +30,35 @@ pub fn normalize_skill_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// 同作用域同名去重 upsert（distill 与手动共用）：
-/// 命中（name 已 normalize 后精确匹配 scope 三元组）→ 更新（content/description
-/// 以新为准、tags 并集、enabled/use_count 保持）；否则新建（id=uuid，enabled=1）。
-///
-/// 返回 Skill id。DB 写失败返回 Err（distill 静默跳过单条，手动创建把错误给 UI）。
+/// Skill 去重 upsert 参数包。
 #[derive(Debug, Clone, Default)]
 pub struct UpsertSkillOpts<'a> {
+    /// Skill 名称（归一化前原文）。
     pub name: &'a str,
+    /// Skill 触发边界描述。
     pub description: &'a str,
+    /// Skill 全文（Markdown）。
     pub content: &'a str,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: &'a str,
+    /// 所属客户端 id。
     pub client_id: &'a str,
+    /// 所属工作区 id。
     pub workspace_id: &'a str,
+    /// 标签列表。
     pub tags: &'a [String],
+    /// 来源会话 id。
     pub source_session_id: &'a str,
+    /// 来源触发器（distill|manual）。
     pub source_trigger: &'a str,
 }
 
+/// 同作用域同名去重 upsert（distill 与手动共用）：命中（name 已 normalize 后
+/// 精确匹配 scope 三元组）→ 更新（content/description 以新为准、tags 并集、enabled/use_count
+/// 保持）；否则新建（id=uuid，enabled=1）。
+///
+/// # Errors
+/// `skill name` 归一化后为空、DB 读写失败或向量相关错误时返回 `Err`。
 pub async fn upsert_skill_with_dedup(
     memory: &crate::memory::MemoryState,
     opts: UpsertSkillOpts<'_>,
@@ -125,16 +136,17 @@ pub async fn retrieve_skill_list_for_session(
     if s.skill_enabled == 0 {
         return None;
     }
-    let max = s.skill_list_max.clamp(1, 50) as usize;
+    let max_usize = usize::try_from(s.skill_list_max.clamp(1, 50)).unwrap_or(20);
+    let max_i64 = i64::try_from(max_usize).unwrap_or(20);
     let rows = memory
         .db
-        .skill_injectable(client_id, workspace_id, max as i64)
+        .skill_injectable(client_id, workspace_id, max_i64)
         .await
         .unwrap_or_default();
     if rows.is_empty() {
         return None;
     }
-    build_skill_list_block(&rows, max, SKILL_LIST_MAX_CHARS)
+    build_skill_list_block(&rows, max_usize, SKILL_LIST_MAX_CHARS)
 }
 
 /// 组装 `<skills>...</skills>` 清单块：按 use_count DESC 排序，预算（条数上限 +
@@ -174,6 +186,9 @@ pub fn build_skill_list_block(
 /// use_skill 工具短路：`{name}` → 作用域可见（workspace > client > global 优先级）、
 /// 大小写不敏感匹配 + enabled 的 Skill 全文，命中 bump_use。未匹配 / 禁用 / 未开启
 /// skill 库均返回 Err（错误文本由调用方喂回模型）；不进 AgentCommand 协议、不落审批。
+///
+/// # Errors
+/// 参数非法、skill 库未启用/关闭、未匹配、已禁用或 DB 查询失败时返回 `Err`。
 pub async fn use_skill_from_agent(
     agent: &AgentState,
     rt: &SessionRuntime,

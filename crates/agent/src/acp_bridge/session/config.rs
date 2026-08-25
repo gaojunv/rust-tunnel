@@ -24,6 +24,12 @@ impl AcpBridge {
     /// `session/set_config_option`。value 对 select 是 value-id 字符串，
     /// 对 boolean 是 "true"/"false"。成功后的状态更新以 agent 回推的
     /// config_option_update 为准（通知处理器全量替换快照）。
+    ///
+    /// # Errors
+    /// - 会话不存在或进程已退出时返回错误
+    /// - `config_id` 不在当前 `config_options` 中时返回错误
+    /// - ACP 握手未完成（`connection` 或 `acp_session_id` 为空）时返回错误
+    /// - 发送 `session/set_config_option` 超时或 agent 显式拒绝时返回错误并广播当前配置快照以对账
     pub async fn set_config_option(
         &self,
         session_id: &str,

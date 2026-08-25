@@ -10,6 +10,9 @@ impl Database {
 
     /// Save or update a proxy rule
     #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（16 处调用点），Opts 化成本高
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_proxy_rule(
         &self,
         id: &str,
@@ -70,6 +73,9 @@ impl Database {
     }
 
     /// Load all proxy rules
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r"
@@ -85,6 +91,9 @@ impl Database {
     }
 
     /// Load enabled proxy rules
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn load_enabled_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r"
@@ -101,6 +110,9 @@ impl Database {
     }
 
     /// Get a proxy rule by ID
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn get_proxy_rule(&self, id: &str) -> Result<Option<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
             r"
@@ -117,6 +129,9 @@ impl Database {
     }
 
     /// Delete a proxy rule
+    ///
+    /// # Errors
+    /// 当数据库删除执行失败时返回 `sqlx::Error`。
     pub async fn delete_proxy_rule(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM proxy_rules WHERE id = ?")
             .bind(id)

@@ -18,7 +18,9 @@ use super::memory::{remember_tool_schema, MemoryState, REMEMBER_TOOL_DESCRIPTION
 /// MCP HTTP 响应。调用方负责写 `content-type: application/json`（202 空 body 时
 /// 无所谓）。status 未含 `Content-Type`，由外层回环代理补全。
 pub struct McpHttpResponse {
+    /// HTTP 状态码。
     pub status: u16,
+    /// 响应体。
     pub data: Vec<u8>,
 }
 

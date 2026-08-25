@@ -123,6 +123,10 @@ impl std::fmt::Debug for LlmTurn {
 }
 
 /// Parse a non-streaming OpenAI chat.completion body into an LlmTurn.
+///
+/// # Errors
+/// - `body` 缺少 `choices[0].message` 时返回错误
+/// - `tool_calls` 数组中任一项缺少 `id` 或 `function.name` 时返回错误
 pub fn parse_llm_turn(body: &serde_json::Value) -> Result<LlmTurn, String> {
     let msg = body
         .get("choices")
@@ -182,7 +186,7 @@ mod tests {
         let turn = parse_llm_turn(&body).unwrap();
         match turn {
             LlmTurn::Text(t) => assert_eq!(t, "我来帮你看看"),
-            other => panic!("expected Text, got {other:?}"),
+            LlmTurn::ToolCalls(_) => panic!("expected Text, got ToolCalls"),
         }
     }
 
@@ -210,7 +214,7 @@ mod tests {
                 assert_eq!(calls[0].name, "shell");
                 assert_eq!(calls[0].args, r#"{"cmd":"ls"}"#);
             }
-            other => panic!("expected ToolCalls, got {other:?}"),
+            LlmTurn::Text(_) => panic!("expected ToolCalls, got Text"),
         }
     }
 

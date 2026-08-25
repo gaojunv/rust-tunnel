@@ -1,8 +1,14 @@
+use std::fmt::Write as _;
+
 use super::records::DbLogEntry;
 use super::Database;
 
 impl Database {
-    /// Insert a log entry into the database
+    /// 插入单条日志，返回自增 id。
+    ///
+    /// # Errors
+    ///
+    /// 数据库连接不可用、SQL 执行失败或连接池已关闭时返回 `sqlx::Error`。
     pub async fn insert_log(&self, entry: &DbLogEntry) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             r"
@@ -21,7 +27,11 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
-    /// Insert a batch of log entries
+    /// 批量插入日志，空切片直接返回。
+    ///
+    /// # Errors
+    ///
+    /// 事务开启、任一条插入执行或事务提交失败时返回 `sqlx::Error`。
     pub async fn insert_logs_batch(&self, entries: &[DbLogEntry]) -> Result<(), sqlx::Error> {
         if entries.is_empty() {
             return Ok(());
@@ -49,7 +59,15 @@ impl Database {
         Ok(())
     }
 
-    /// Query logs with filters
+    /// 按条件查询日志，返回按 id 升序（时间正序）排列的结果。
+    ///
+    /// `level` 为等级下界过滤（error/warn/info/debug/trace，未知值回退为全量）；
+    /// `source`/`search` 分别对 `source` 前缀和 `message` 模糊匹配；`before_id` 限制
+    /// `id < before_id` 的分页游标；`limit` 控制返回条数。
+    ///
+    /// # Errors
+    ///
+    /// SQL 构造或执行失败、数据库连接不可用时返回 `sqlx::Error`。
     pub async fn query_logs(
         &self,
         level: Option<&str>,
@@ -69,7 +87,6 @@ impl Database {
                 "warn" => vec!["ERROR", "WARN"],
                 "info" => vec!["ERROR", "WARN", "INFO"],
                 "debug" => vec!["ERROR", "WARN", "INFO", "DEBUG"],
-                "trace" => vec!["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
                 _ => vec!["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
             };
             let placeholders: Vec<String> = levels
@@ -77,28 +94,32 @@ impl Database {
                 .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
                 .collect();
-            query_str.push_str(&format!(" AND level IN ({})", placeholders.join(",")));
+            let _ = write!(query_str, " AND level IN ({})", placeholders.join(","));
             for l in levels {
                 params.push(l.to_string());
             }
         }
 
         if let Some(src) = source {
-            params.push(format!("{}%", &src));
-            query_str.push_str(&format!(" AND source LIKE ?{}", params.len()));
+            params.push(format!("{src}%"));
+            let idx = params.len();
+            let _ = write!(query_str, " AND source LIKE ?{idx}");
         }
 
         if let Some(s) = search {
-            params.push(format!("%{}%", &s));
-            query_str.push_str(&format!(" AND message LIKE ?{}", params.len()));
+            params.push(format!("%{s}%"));
+            let idx = params.len();
+            let _ = write!(query_str, " AND message LIKE ?{idx}");
         }
 
         if let Some(before) = before_id {
             params.push(before.to_string());
-            query_str.push_str(&format!(" AND id < ?{}", params.len()));
+            let idx = params.len();
+            let _ = write!(query_str, " AND id < ?{idx}");
         }
 
-        query_str.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", params.len() + 1));
+        let idx = params.len() + 1;
+        let _ = write!(query_str, " ORDER BY id DESC LIMIT ?{idx}");
         params.push(limit.to_string());
 
         // Build the dynamic query
@@ -113,7 +134,11 @@ impl Database {
         Ok(rows)
     }
 
-    /// Delete logs older than the given timestamp
+    /// 删除指定时间戳之前的旧日志，返回被删除的行数。
+    ///
+    /// # Errors
+    ///
+    /// SQL 执行失败或数据库连接不可用时返回 `sqlx::Error`。
     pub async fn cleanup_old_logs(&self, older_than_micros: i64) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r"
@@ -152,7 +177,7 @@ mod tests {
         let db = create_test_db().await;
         let entry = DbLogEntry {
             id: 0,
-            timestamp: 1000000,
+            timestamp: 1_000_000,
             level: "INFO".into(),
             source: "server".into(),
             target: "test::module".into(),
@@ -171,7 +196,7 @@ mod tests {
         let db = create_test_db().await;
         let info_entry = DbLogEntry {
             id: 0,
-            timestamp: 1000000,
+            timestamp: 1_000_000,
             level: "INFO".into(),
             source: "server".into(),
             target: "test".into(),
@@ -179,7 +204,7 @@ mod tests {
         };
         let error_entry = DbLogEntry {
             id: 0,
-            timestamp: 2000000,
+            timestamp: 2_000_000,
             level: "ERROR".into(),
             source: "server".into(),
             target: "test".into(),
@@ -202,7 +227,7 @@ mod tests {
         let db = create_test_db().await;
         let entry = DbLogEntry {
             id: 0,
-            timestamp: 1000000,
+            timestamp: 1_000_000,
             level: "INFO".into(),
             source: "server".into(),
             target: "test".into(),
@@ -211,7 +236,7 @@ mod tests {
         db.insert_log(&entry).await.unwrap();
 
         // Cleanup anything older than 2000000
-        let deleted = db.cleanup_old_logs(2000000).await.unwrap();
+        let deleted = db.cleanup_old_logs(2_000_000).await.unwrap();
         assert_eq!(deleted, 1);
 
         let results = db.query_logs(None, None, None, 10, None).await.unwrap();
@@ -224,7 +249,7 @@ mod tests {
         let entries: Vec<DbLogEntry> = (0..3)
             .map(|i| DbLogEntry {
                 id: 0,
-                timestamp: 1000000 + i * 1000,
+                timestamp: 1_000_000 + i * 1000,
                 level: "INFO".into(),
                 source: "server".into(),
                 target: "test".into(),

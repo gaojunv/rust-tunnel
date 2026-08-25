@@ -5,6 +5,9 @@ use super::Database;
 
 impl Database {
     /// Save or update Trojan configuration
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_trojan_config(
         &self,
         port: u16,
@@ -44,6 +47,9 @@ impl Database {
     ///
     /// 与 `replace_shadowsocks_config` 同理：修改端口时按端口 upsert 会残留旧行，
     /// 配置更新接口应使用本方法保证表中始终只有一份配置。
+    ///
+    /// # Errors
+    /// 当事务开启、删除或插入执行失败时返回 `sqlx::Error`。
     pub async fn replace_trojan_config(
         &self,
         port: u16,
@@ -79,6 +85,9 @@ impl Database {
     }
 
     /// Load all Trojan configurations
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_trojan_configs(&self) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, TrojanConfigRecord>(
             r"
@@ -94,6 +103,9 @@ impl Database {
     }
 
     /// Load enabled Trojan configurations
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_enabled_trojan_configs(
         &self,
     ) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
@@ -112,6 +124,9 @@ impl Database {
     }
 
     /// Get Trojan config for a specific port
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn get_trojan_config(
         &self,
         port: u16,
@@ -131,6 +146,9 @@ impl Database {
     }
 
     /// Delete Trojan configuration
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn delete_trojan_config(&self, port: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"

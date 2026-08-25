@@ -9,6 +9,9 @@ impl Database {
     // ============================================================
 
     /// 读取服务端鉴权 token（单行表 id=1，不存在则返回 None）。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_server_auth(&self) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query("SELECT client_token FROM server_auth WHERE id = 1")
             .fetch_optional(&self.pool)
@@ -17,6 +20,9 @@ impl Database {
     }
 
     /// 保存或更新服务端鉴权 token（upsert 语义，写入 id=1 单行）。
+    ///
+    /// # Errors
+    /// 当数据库操作执行失败时返回 `sqlx::Error`。
     pub async fn save_server_auth(&self, token: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"

@@ -126,6 +126,13 @@ async fn handle_subagent_tool_calls(
 /// 跑完只把摘要回填主上下文。子循环可用全量工具（除 task/todo_write，schema 裁剪）、
 /// 继承主会话 approval_mode 审批、执行过程通过 WS 帧带 parent_tool_call_id 透出。
 /// `role`：子 agent 角色（含 allow/deny/model_override/system_prompt），None 用默认。
+///
+/// # Errors
+/// - 模型解析失败时返回错误
+/// - 上游 LLM 不可用或流式传输致命错误时返回错误
+/// - 非流式响应体解析失败时返回错误
+/// - 轮数耗尽后最终摘要调用失败时返回错误
+#[allow(clippy::too_many_lines, reason = "子 agent 回合的流式聚合与重试回退完整流水线，共享聚合器与状态，拆分无益")]
 pub async fn run_subagent_loop(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -547,7 +554,7 @@ pub async fn run_subagent_loop(
             }
             let text = parse_llm_turn(&body).and_then(|turn| match turn {
                 LlmTurn::Text(t) => Ok(t),
-                _ => Err("expected text response".to_string()),
+                LlmTurn::ToolCalls(_) => Err("expected text response".to_string()),
             })?;
             Ok(truncate_summary(text))
         }

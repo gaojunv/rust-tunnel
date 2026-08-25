@@ -33,6 +33,12 @@ impl AcpBridge {
     ///
     /// `ws_tx` 是 WS 事件通道：handshake 建立后 ACP 事件流经
     /// [`crate::acp_events::map_update`] 推回前端。
+    ///
+    /// # Errors
+    /// - `workspace.runtime_type` 非 `host` 时返回错误（ACP 暂不支持 docker）
+    /// - LLM 网关未注入或模型配置缺失时返回带阶段前缀的错误
+    /// - `start_llm_proxy` / `spawn_agent` / `acp_handshake` 任一阶段失败时返回对应阶段错误并清理占位条目
+    #[allow(clippy::too_many_lines, reason = "spawn 流水线顺序编排含 LLM 代理/模型门禁/spawn/handshake/配置注入等多阶段共享状态，拆分会打散局部变量与错误归因")]
     pub async fn ensure_session(
         &self,
         session_id: &str,
@@ -196,7 +202,7 @@ impl AcpBridge {
                 .map_err(|e| format!("llm_proxy: {e}"))?;
             tracing::info!(
                 session_id,
-                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(pipeline_start.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "acp spawn stage: llm proxy ready (port {port})"
             );
             // 2) spawn agent 进程（env 注入 LLM 代理地址）。解析有效模型引用注入
@@ -312,7 +318,7 @@ impl AcpBridge {
                 .map_err(|e| format!("spawn_agent: {e}"))?;
             tracing::info!(
                 session_id,
-                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(pipeline_start.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "acp spawn stage: agent process spawned"
             );
             // 3) ACP handshake（stdio pump 已就绪，此步建立 ACP 连接 + WS 接线；
@@ -339,7 +345,7 @@ impl AcpBridge {
             .map_err(|e| format!("handshake: {e}"))?;
             tracing::info!(
                 session_id,
-                elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+                elapsed_ms = u64::try_from(pipeline_start.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "acp spawn stage: handshake complete"
             );
             Ok(())
@@ -384,7 +390,7 @@ impl AcpBridge {
         self.replay_config_state(session_id).await;
         tracing::info!(
             session_id,
-            elapsed_ms = pipeline_start.elapsed().as_millis() as u64,
+            elapsed_ms = u64::try_from(pipeline_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             "acp spawn stage: config injection complete"
         );
         // 配置注入完成后才放行 wait_ready：连接预 spawn（后台任务）场景下，
@@ -447,6 +453,11 @@ impl AcpBridge {
     /// 超时预算用 `READY_TIMEOUT` 而非 `SPAWN_TIMEOUT`：预 spawn 流水线
     /// （LLM 代理协商 → spawn 协商 → handshake → 配置注入）最坏耗时远超
     /// 30s，等待方必须覆盖整个在途尝试，否则冷启动慢时误报超时。
+    ///
+    /// # Errors
+    /// - 会话不存在且无失败缓存时返回 `session not spawned`
+    /// - 存在失败缓存（`spawn_errors`）时返回 `agent spawn failed: <原因>`
+    /// - 等待超时且通道未关闭时返回超时提示
     pub async fn wait_ready(&self, session_id: &str) -> Result<(), String> {
         let mut rx = {
             let sessions = self.sessions.lock().await;

@@ -59,9 +59,11 @@ pub fn remember_tool_schema() -> serde_json::Value {
 /// 蒸馏/注入过程广播给前端 SSE 的事件。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemoryEvent {
+    /// 关联会话 id。
     pub session_id: String,
     /// 判别字段：`distilled` / `failed` / `skipped` 等。
     pub status: String,
+    /// 蒸馏产出的事实条数。
     pub facts_found: usize,
     /// 蒸馏产出的 Skill 条数（二期新增）。`#[serde(default)]`：旧前端/旧事件
     /// 缺字段时反序列化为 0（向后兼容）。
@@ -74,9 +76,13 @@ pub struct MemoryEvent {
 /// 双 EdgeShard 对同一目录各自 flush 会竞态 panic）。
 #[derive(Clone)]
 pub struct MemoryState {
+    /// 持久化数据库句柄。
     pub db: Database,
+    /// 向量存储句柄（与 `LlmState.rag_store` 共享同一 shard）。
     pub store: VectorStore,
+    /// LLM 凭据加解密器，未配置时为 `None`。
     pub cipher: Option<LlmCipher>,
+    /// LLM 网关状态（模型路由、上游客户端等）。
     pub llm: LlmState,
     /// 蒸馏/注入事件广播（订阅者即后续的 SSE 端点）。
     pub events: broadcast::Sender<MemoryEvent>,
@@ -241,9 +247,12 @@ async fn best_scope_match(
 ///    content 以新为准，向量点同步覆盖）；
 /// 4. 否则新建（id=uuid，`ChunkPoint` 的 id 与 doc_id 均取记忆 id）。
 ///
-/// 返回记忆 id。embedding 失败 / 维度未配置 / DB 或向量写失败均返回 Err，由调用
-/// 方决定降级语义（distill 静默跳过单条，remember 把错误喂回模型）。
-#[allow(clippy::too_many_arguments)] // 保留：3 调用点方法，Opts 化成本高
+/// 返回记忆 id。
+///
+/// # Errors
+/// embedding 失败、维度未配置（`emb_dimension <= 0`）、DB 或向量写失败时返回 `Err`，
+/// 由调用方决定降级语义（distill 静默跳过单条，remember 把错误喂回模型）。
+#[allow(clippy::too_many_arguments, reason = "记忆写入参数包 10 项，Opts 化仅 3 调用点、收益低")] // 保留：3 调用点方法，Opts 化成本高
 pub async fn upsert_memory_with_dedup(
     memory: &MemoryState,
     s: &AgentMemorySettingsRecord,
@@ -265,10 +274,8 @@ pub async fn upsert_memory_with_dedup(
         .embed_one(content)
         .await
         .map_err(|e| format!("embedding failed: {e}"))?;
-    let hits = memory
-        .store
-        .search(MEMORY_KB_ID, dim as usize, &vec, DEDUP_TOP_K)
-        .await;
+    let dim_usize = usize::try_from(dim).unwrap_or(0);
+    let hits = memory.store.search(MEMORY_KB_ID, dim_usize, &vec, DEDUP_TOP_K).await;
     if let Some((score, id, existing)) =
         best_scope_match(memory, &hits, scope_type, client_id, workspace_id).await
     {
@@ -286,7 +293,7 @@ pub async fn upsert_memory_with_dedup(
                 .store
                 .upsert(
                     MEMORY_KB_ID,
-                    dim as usize,
+                    dim_usize,
                     vec![ChunkPoint {
                         id: id.clone(),
                         vector: vec,
@@ -323,7 +330,7 @@ pub async fn upsert_memory_with_dedup(
         .store
         .upsert(
             MEMORY_KB_ID,
-            dim as usize,
+            dim_usize,
             vec![ChunkPoint {
                 id: id.clone(),
                 vector: vec,
@@ -339,6 +346,9 @@ pub async fn upsert_memory_with_dedup(
 
 /// 测试用 VectorStore（临时目录）。返回 `(TempDir, store)`：析构顺序 store 先、
 /// TempDir 后（qdrant-edge 的 EdgeShard Drop 同步 flush，目录先删会 panic）。
+///
+/// # Panics
+/// 临时目录创建失败时 panic（测试环境必成功）。
 #[cfg(all(test, feature = "rag"))]
 #[must_use]
 pub fn test_store() -> (tempfile::TempDir, VectorStore) {
@@ -349,6 +359,9 @@ pub fn test_store() -> (tempfile::TempDir, VectorStore) {
 
 /// 起一个返回固定 embedding 的本地 HTTP server（照抄 ingest.rs:231 mock 模式）。
 /// 所有输入返回同一向量 → 检索 cosine=1.0，便于断言去重/阈值/作用域逻辑。
+///
+/// # Panics
+/// 绑定回环地址或启动 axum 服务失败时 panic（测试环境必成功）。
 #[cfg(all(test, feature = "rag"))]
 pub async fn mock_embedding_server(dim: usize) -> String {
     use axum::extract::Json;
@@ -374,7 +387,8 @@ pub async fn mock_embedding_server(dim: usize) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock embedding server");
-    let addr = listener.local_addr().unwrap();
+    #[allow(clippy::missing_panics_doc, reason = "测试代码：绑定回环随机端口必成功")]
+    let addr = listener.local_addr().expect("mock server local_addr");
     tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -385,6 +399,9 @@ pub async fn mock_embedding_server(dim: usize) -> String {
 
 /// 构造开启且 embedding 可达的 MemoryState（dim=8）。`base_url` 指向
 /// [`mock_embedding_server`]。
+///
+/// # Panics
+/// 数据库初始化失败时 panic（`:memory:` 内存库，测试环境必成功）。
 #[cfg(all(test, feature = "rag"))]
 pub async fn test_memory_with_embedding(base_url: &str) -> (Database, MemoryState) {
     let db = Database::new(":memory:").await.expect("in-memory db");
@@ -435,6 +452,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp, reason = "测试断言：confidence 取 max 后为字面量 1.0，精确比较即所需语义")]
     async fn dedup_same_scope_updates_not_duplicates() {
         let base = mock_embedding_server(8).await;
         let (db, memory) = test_memory_with_embedding(&base).await;

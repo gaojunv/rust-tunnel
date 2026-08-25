@@ -5,6 +5,9 @@ use super::Database;
 
 impl Database {
     /// Save a mesh network record
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_mesh_network(
         &self,
         id: &str,
@@ -27,6 +30,9 @@ impl Database {
     }
 
     /// Load all mesh networks
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_mesh_networks(&self) -> Result<Vec<MeshNetworkRecord>, sqlx::Error> {
         sqlx::query_as::<_, MeshNetworkRecord>(
             "SELECT id, created_at, description FROM mesh_networks ORDER BY id",
@@ -36,6 +42,9 @@ impl Database {
     }
 
     /// Save or update a mesh service
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn save_mesh_service(
         &self,
         mesh_id: &str,
@@ -68,6 +77,9 @@ impl Database {
     }
 
     /// Load services for a mesh
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn load_mesh_services(
         &self,
         mesh_id: &str,
@@ -82,6 +94,9 @@ impl Database {
     }
 
     /// Delete a mesh service
+    ///
+    /// # Errors
+    /// 当数据库删除执行失败时返回 `sqlx::Error`。
     pub async fn delete_mesh_service(
         &self,
         mesh_id: &str,

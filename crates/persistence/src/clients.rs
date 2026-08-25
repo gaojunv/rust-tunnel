@@ -5,7 +5,10 @@ use super::records::ClientRecord;
 use super::Database;
 
 impl Database {
-    /// Record client connection
+    /// 记录客户端连接会话（写入 `client_sessions`）。
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn record_client_connect(
         &self,
         port: u16,
@@ -28,7 +31,10 @@ impl Database {
         Ok(())
     }
 
-    /// Record client disconnection
+    /// 记录客户端断开（更新最近一条未断开会话的 `disconnected_at` 与时长）。
+    ///
+    /// # Errors
+    /// 当数据库查询或更新执行失败时返回 `sqlx::Error`。
     pub async fn record_client_disconnect(&self, port: u16) -> Result<(), sqlx::Error> {
         let now = Utc::now();
 
@@ -62,6 +68,9 @@ impl Database {
     // ============================================================
 
     /// 插入或更新客户端注册记录（按 name 去重，更新 hostname 与 last_seen_at）。
+    ///
+    /// # Errors
+    /// 当数据库写入或连接失败时返回 `sqlx::Error`。
     pub async fn upsert_client(
         &self,
         name: &str,
@@ -87,6 +96,9 @@ impl Database {
     }
 
     /// 刷新指定客户端的最后可见时间（更新 last_seen_at 为当前时间）。
+    ///
+    /// # Errors
+    /// 当数据库更新执行失败时返回 `sqlx::Error`。
     pub async fn touch_client_last_seen(&self, name: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE clients SET last_seen_at = ? WHERE name = ?")
             .bind(Utc::now())
@@ -97,6 +109,9 @@ impl Database {
     }
 
     /// 列出所有已注册的客户端记录（按名称排序）。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn list_clients(&self) -> Result<Vec<ClientRecord>, sqlx::Error> {
         let rows = sqlx::query_as::<_, ClientRecord>(
             "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients ORDER BY name",
@@ -107,6 +122,9 @@ impl Database {
     }
 
     /// 按名称查询单个客户端记录，不存在则返回 None。
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn get_client(&self, name: &str) -> Result<Option<ClientRecord>, sqlx::Error> {
         sqlx::query_as::<_, ClientRecord>(
             "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients WHERE name = ?",
@@ -117,6 +135,9 @@ impl Database {
     }
 
     /// 更新指定客户端的备注（None 表示清空备注）。
+    ///
+    /// # Errors
+    /// 当数据库更新执行失败时返回 `sqlx::Error`。
     pub async fn update_client_note(
         &self,
         name: &str,
@@ -131,6 +152,9 @@ impl Database {
     }
 
     /// 删除指定名称的客户端注册记录。
+    ///
+    /// # Errors
+    /// 当数据库删除执行失败时返回 `sqlx::Error`。
     pub async fn delete_client(&self, name: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM clients WHERE name = ?")
             .bind(name)
@@ -142,6 +166,9 @@ impl Database {
     /// Return `(rule_id, rule_name)` pairs for every proxy rule whose routes
     /// JSON contains a backend with `kind == "client"` and matching
     /// `client_name`. Used to enforce "reject delete when referenced" (spec §2.4).
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn rules_referencing_client(
         &self,
         client_name: &str,

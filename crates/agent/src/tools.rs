@@ -46,6 +46,8 @@ pub fn client_supports_edit_file(client_version: Option<&str>) -> bool {
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
 /// `mode` 为 `"plan"` 时只暴露只读工具子集 + `todo_write`（辅助出方案），
 /// 写类工具对模型不可见（模型不会调用，parse 层再兜底拒绝）。
+// 30+ 工具的扁平声明与 plan 模式裁剪，拆分反而让工具清单与裁剪逻辑分离。
+#[allow(clippy::too_many_lines, reason = "30+ 工具的扁平声明与 plan 模式裁剪，拆分反而让清单与裁剪逻辑分离")]
 #[must_use]
 pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     let file_props = |extra: &[(&str, serde_json::Value)]| {
@@ -580,7 +582,7 @@ fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
 fn arg_opt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(serde_json::Value::as_u64)
-        .map(|n| n as usize)
+        .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 fn arg_str_array(args: &serde_json::Value, key: &str, tool: &str) -> Result<Vec<String>, String> {
@@ -622,6 +624,7 @@ fn git_paths_cmd(tool: &str, prefix: &[&str], paths: &[String]) -> Result<Vec<St
 
 /// 把待校验的 git 参数经 git_plan 规划为可执行的 GitExec 命令。非法参数在此
 /// fail-closed 报错：模型在 parse 阶段即收到错误，而非隧道执行失败或注入风险。
+#[allow(clippy::needless_pass_by_value, reason = "Vec<String> 由调用方 git_paths_cmd 构造，传引用会增加借用复杂度")]
 fn plan_git_cmd(tool: &str, args: Vec<String>) -> Result<AgentCommand, String> {
     let planned = super::git_plan::plan(&args).map_err(|e| format!("tool '{tool}': {e}"))?;
     Ok(AgentCommand::GitExec { args: planned.args })
@@ -647,6 +650,9 @@ const PLAN_BLOCKED_TOOLS: &[&str] = &[
 
 /// Plan 模式下工具调用是否被禁止（写类工具）。返回 Ok(()) 表示允许，
 /// Err(msg) 表示被 plan 模式拦截。
+///
+/// # Errors
+/// 传入的工具名在 plan 模式黑名单中时返回拦截错误。
 pub fn plan_mode_guard(tool_name: &str) -> Result<(), String> {
     if PLAN_BLOCKED_TOOLS.contains(&tool_name) {
         Err("plan mode: 写操作不可用，当前为只读调研模式。用户确认方案后切换到执行模式即可使用写工具。".to_string())
@@ -657,6 +663,9 @@ pub fn plan_mode_guard(tool_name: &str) -> Result<(), String> {
 
 /// 解析 todo_write 工具调用参数，返回验证后的 TodoItem 列表。
 /// 校验：todos 必须为数组、每项必须有 content 和合法 status。
+///
+/// # Errors
+/// JSON 解析失败、todos 缺失/非数组、或任一项缺少 content/status 时返回错误。
 pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
     let args: serde_json::Value = serde_json::from_str(args_json)
         .map_err(|e| format!("invalid todo_write arguments: {e}"))?;
@@ -700,6 +709,9 @@ pub fn parse_todo_write(args_json: &str) -> Result<Vec<TodoItem>, String> {
 /// 解析 task 工具调用参数，返回 (agent_name, prompt)。
 /// `agent` 缺失/空串 → None（调用方解析为 "general" 默认角色）。
 /// 校验：prompt 必须存在、非空。
+///
+/// # Errors
+/// JSON 解析失败或 prompt 缺失/为空时返回错误。
 pub fn parse_task_args(args_json: &str) -> Result<(Option<String>, String), String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid task arguments: {e}"))?;
@@ -741,6 +753,11 @@ fn check_path_len(value: &str, arg: &str) -> Result<(), String> {
 }
 
 /// Convert an LLM function call into an AgentCommand. Errors are fed back to the model.
+///
+/// # Errors
+/// 参数缺失、类型错误、长度超限或 git 白名单校验失败时返回面向模型的错误文本。
+// 20+ 工具的扁平派发，共享多类局部状态，拆分会把相关逻辑与错误处理散到多个签名里反而降低可读性。
+#[allow(clippy::too_many_lines, reason = "20+ 工具的扁平派发，拆分会把相关逻辑与错误处理散到多个签名里反而降低可读性")]
 pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, String> {
     let args: serde_json::Value =
         serde_json::from_str(args_json).map_err(|e| format!("invalid tool arguments: {e}"))?;
@@ -913,10 +930,13 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         "git_stash" => {
             let action = arg_str(&args, "action", name)?;
             let message = arg_opt_str(&args, "message");
+            // 溢出按非法输入拒绝：饱和到 usize::MAX 只会拼出 `stash@{18446744073709551615}`
+            // 这种能过 check_stash_ref 的伪 ref，最终在 git 层才失败，错误信息更难懂。
             let index = args
                 .get("index")
                 .and_then(serde_json::Value::as_u64)
-                .map(|n| n as usize);
+                .map(|n| usize::try_from(n).map_err(|_| format!("index out of range: {n}")))
+                .transpose()?;
             let git_args = match action {
                 "list" => vec!["stash".to_string(), "list".to_string()],
                 "push" => {

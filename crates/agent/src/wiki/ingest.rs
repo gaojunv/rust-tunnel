@@ -126,6 +126,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// 提取→分块→LLM 批量抽取→落库的顺序编排，拆分会把相关状态散到多个签名里。
+#[allow(clippy::too_many_lines, reason = "提取→分块→LLM 批量抽取→落库的顺序编排，拆分会把相关状态散到多个签名里")]
 async fn do_ingest(
     db: &Database,
     llm: &LlmState,

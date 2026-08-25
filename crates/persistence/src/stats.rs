@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 
 use super::Database;
+use std::fmt::Write as _;
+
 use super::StatsSnapshotRow;
 
 impl Database {
@@ -9,6 +11,9 @@ impl Database {
     // ============================================================
 
     /// Query stats snapshots within a time range, optionally filtered.
+    ///
+    /// # Errors
+    /// 当数据库查询执行失败时返回 `sqlx::Error`。
     pub async fn query_stats_snapshots(
         &self,
         entity_types: &[String],
@@ -26,14 +31,14 @@ impl Database {
             let placeholders: Vec<String> = (0..entity_types.len())
                 .map(|i| format!("?{}", param_idx + i))
                 .collect();
-            sql.push_str(&format!(" AND entity_type IN ({})", placeholders.join(",")));
+            let _ = write!(sql, " AND entity_type IN ({})", placeholders.join(","));
             param_idx += entity_types.len();
         }
         if !entity_ids.is_empty() {
             let placeholders: Vec<String> = (0..entity_ids.len())
                 .map(|i| format!("?{}", param_idx + i))
                 .collect();
-            sql.push_str(&format!(" AND entity_id IN ({})", placeholders.join(",")));
+            let _ = write!(sql, " AND entity_id IN ({})", placeholders.join(","));
         }
         sql.push_str(" ORDER BY timestamp");
 
@@ -50,6 +55,9 @@ impl Database {
     }
 
     /// Delete stats snapshots older than the given timestamp.
+    ///
+    /// # Errors
+    /// 当数据库删除执行失败时返回 `sqlx::Error`。
     pub async fn cleanup_old_stats_snapshots(
         &self,
         before: DateTime<Utc>,

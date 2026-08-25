@@ -75,8 +75,7 @@ impl AcpBridge {
                     agent.last_activity = std::time::Instant::now();
                     agent.stdout_tx.clone()
                 }
-                Some(_) => None,
-                None => None,
+                Some(_) | None => None,
             }
         };
         if let Some(tx) = stdout_tx {

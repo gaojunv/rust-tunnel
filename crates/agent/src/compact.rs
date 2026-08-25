@@ -78,30 +78,35 @@ pub async fn context_limit_for(db: &crate::db::Database, model: &str) -> usize {
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.get("agent_context_limit")?.as_u64())
-        .map_or(DEFAULT_CONTEXT_LIMIT_CHARS, |n| n as usize)
+        .map_or(DEFAULT_CONTEXT_LIMIT_CHARS, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        })
 }
 
 /// 待压缩段渲染为纯文本（喂给摘要 LLM）。
 #[must_use]
 pub fn render_for_summary(messages: &[ChatMessage]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for m in messages {
         match (m.role.as_str(), &m.content, &m.tool_calls) {
             ("tool", Some(c), _) => {
-                out.push_str(&format!(
-                    "tool({}): {}\n",
-                    m.name.as_deref().unwrap_or("?"),
-                    c
-                ));
+                let _ = writeln!(
+                    out,
+                    "tool({}): {c}",
+                    m.name.as_deref().unwrap_or("?")
+                );
             }
             (_, _, Some(calls)) => {
                 let names: Vec<&str> = calls
                     .iter()
                     .filter_map(|c| c.pointer("/function/name").and_then(|n| n.as_str()))
                     .collect();
-                out.push_str(&format!("assistant called tools: {}\n", names.join(", ")));
+                let _ = writeln!(out, "assistant called tools: {}", names.join(", "));
             }
-            (_, Some(c), _) => out.push_str(&format!("{}: {}\n", m.role, c)),
+            (_, Some(c), _) => {
+                let _ = writeln!(out, "{}: {c}", m.role);
+            }
             _ => {}
         }
     }
@@ -112,6 +117,9 @@ const SUMMARY_PROMPT: &str = "Summarize the following conversation segment betwe
 
 /// 每轮 LLM 调用前检查：超限则压缩 rt.messages（并落库 summary 行）。
 /// 压缩失败降级为滑动截断，永不阻断回合。
+///
+/// # Errors
+/// `force_compact` 内部错误（数据库写入失败、LLM 调用失败等）会向上传播。
 pub async fn maybe_compact(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -130,6 +138,9 @@ pub async fn maybe_compact(
 /// context-length-exceeded）后的重试路径——可能低估了 token 阈值，需要主动压缩。
 /// 压缩失败降级为滑动截断，永不阻断回合。
 /// 返回 Ok(true) 表示真正执行了压缩；Ok(false) 表示历史太短无可压缩段。
+///
+/// # Errors
+/// 数据库读写失败、LLM 摘要失败等会返回 Err，但已压缩的上下文不会回滚。
 pub async fn force_compact(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -518,6 +529,8 @@ mod tests {
         assert_eq!(ids, ["old1", "sum1", "kept1", "kept2"]);
     }
 
+    // 完整压缩流程长（端到端验证 DB 顺序与重放），拆分会打断连贯性。
+    #[allow(clippy::too_many_lines, reason = "端到端压缩验证长（DB 顺序与重放），拆分会打断连贯性")]
     #[tokio::test]
     async fn test_maybe_compact_reinserts_kept_segment_after_summary() {
         // 端到端：per-model 极小阈值触发压缩；summarize 无 provider 可用 → 失败走

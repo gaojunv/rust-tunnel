@@ -140,6 +140,9 @@ impl GitHubClient {
     }
 
     /// GET /repos/{owner}/{repo} — 仓库元信息。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn get_repo(
         &self,
         owner: &str,
@@ -150,6 +153,9 @@ impl GitHubClient {
     }
 
     /// GET /repos/{owner}/{repo}/actions/workflows — 工作流列表。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn list_workflows(
         &self,
         owner: &str,
@@ -164,6 +170,9 @@ impl GitHubClient {
     }
 
     /// GET /repos/{owner}/{repo}/actions/runs[?workflow_id=&per_page=] — 工作流运行列表。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn list_workflow_runs(
         &self,
         owner: &str,
@@ -187,6 +196,9 @@ impl GitHubClient {
     }
 
     /// GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs — 某次运行的作业列表。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn list_run_jobs(
         &self,
         owner: &str,
@@ -207,6 +219,9 @@ impl GitHubClient {
     /// reqwest 默认跟随重定向（跨主机自动剥离 Authorization 头，token 不泄露给
     /// 签名 CDN）。响应体流式读取，**只保留尾部 [`JOB_LOG_MAX_BYTES`]**，返回
     /// `(logs, truncated)`。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或日志流读取失败时返回对应错误。
     pub async fn get_job_logs(
         &self,
         owner: &str,
@@ -259,6 +274,9 @@ impl GitHubClient {
 
     /// POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches
     /// body: {ref, inputs?} — 手动触发工作流。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn dispatch_workflow(
         &self,
         owner: &str,
@@ -269,7 +287,9 @@ impl GitHubClient {
     ) -> Result<serde_json::Value, GitHubError> {
         let body = serde_json::json!({
             "ref": ref_,
-            "inputs": inputs.unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+            // 注意：不能用 unwrap_or_default()，`Value::default()` 是 Null 而非 `{}`，
+            // GitHub 的 workflow-dispatch 端点会以 422 拒绝 "inputs": null。
+            "inputs": inputs.unwrap_or_else(|| serde_json::json!({})),
         });
         self.send_json(
             reqwest::Method::POST,
@@ -280,6 +300,9 @@ impl GitHubClient {
     }
 
     /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun — 重跑。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn rerun_workflow(
         &self,
         owner: &str,
@@ -295,6 +318,9 @@ impl GitHubClient {
     }
 
     /// POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel — 取消运行。
+    ///
+    /// # Errors
+    /// GitHub 上游返回非 2xx、网络失败或响应解析失败时返回对应错误。
     pub async fn cancel_run(
         &self,
         owner: &str,
@@ -316,7 +342,7 @@ impl std::fmt::Debug for GitHubClient {
         f.debug_struct("GitHubClient")
             .field("base_url", &self.base_url)
             .field("token", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -334,13 +360,16 @@ fn extract_github_message(raw: &str) -> String {
 /// 轻量 URL 编码（owner/repo 之外的 query 参数用；GitHub 名字本身是受限字符集，
 /// 这里只做防御性编码）。
 fn urlencode(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -366,7 +395,7 @@ mod tests {
     }
 
     /// 检查请求头里带了 Bearer token（模拟上游校验 Authorization）。
-    async fn assert_bearer(
+    fn assert_bearer(
         req: axum::http::Request<axum::body::Body>,
         expected: &str,
     ) -> axum::http::Request<axum::body::Body> {
@@ -385,7 +414,7 @@ mod tests {
         let base = spawn_mock(Router::new().route(
             "/repos/octo/repo",
             get(|req: axum::http::Request<axum::body::Body>| async move {
-                let req = assert_bearer(req, "ghp_test_token").await;
+                let req = assert_bearer(req, "ghp_test_token");
                 assert_eq!(
                     req.headers()
                         .get("user-agent")

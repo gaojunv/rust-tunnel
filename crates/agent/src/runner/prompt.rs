@@ -13,6 +13,7 @@ pub fn compose_user_message(
     content: &str,
     ref_files: &[(String, Result<String, String>)],
 ) -> String {
+    use std::fmt::Write as _;
     if ref_files.is_empty() {
         return content.to_string();
     }
@@ -29,11 +30,14 @@ pub fn compose_user_message(
                 } else {
                     text.clone()
                 };
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "\n\n--- 引用文件: {path} ---\n```\n{truncated}\n```"
-                ));
+                );
             }
-            Err(_) => out.push_str(&format!("\n\n[无法读取: {path}]")),
+            Err(_) => {
+                let _ = write!(out, "\n\n[无法读取: {path}]");
+            }
         }
     }
     out

@@ -205,13 +205,15 @@ impl AnthropicSseTranslator {
         out.into_bytes()
     }
 
+    #[allow(clippy::too_many_lines, reason = "Anthropic SSE 翻译的多阶段派发：usage 补发、message_start、reasoning/text/tool 增量与 finish 收尾，扁平分支可读性更高")]
     fn process_line(&mut self, line: &str, out: &mut String) {
         let Some(payload) = line.strip_prefix("data:") else {
             return; // event:/comment/空行一律忽略，事件类型由转换器自行生成
         };
         let payload = payload.trim();
         if payload == "[DONE]" {
-            self.close("end_turn", json!({ "output_tokens": 0 }), out);
+            let usage = json!({ "output_tokens": 0 });
+            self.close("end_turn", &usage, out);
             return;
         }
         let chunk: Value = match serde_json::from_str(payload) {
@@ -377,7 +379,7 @@ impl AnthropicSseTranslator {
         // 结束
         if let Some(reason) = chunk["choices"][0]["finish_reason"].as_str() {
             let usage = openai_usage_to_anthropic(&chunk["usage"]);
-            self.close(&map_stop_reason(reason), usage, out);
+            self.close(&map_stop_reason(reason), &usage, out);
         }
     }
 
@@ -386,7 +388,8 @@ impl AnthropicSseTranslator {
     /// `usage` 必须携带完整输入细分（input_tokens / cache_read_input_tokens），
     /// 而非仅 output_tokens —— 下游 usage 扫描器靠它命中「完整 usage」分支，
     /// 避免与 message_start 的空 input 合并后丢失 prompt/cache 统计。
-    fn close(&mut self, stop_reason: &str, usage: Value, out: &mut String) {
+    fn close(&mut self, stop_reason: &str, usage: &Value, out: &mut String) {
+        let usage = usage.clone();
         if self.closed || !self.started {
             return;
         }

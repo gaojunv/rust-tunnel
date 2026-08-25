@@ -39,11 +39,12 @@ pub async fn retrieve_for_session(
     }
     // over-fetch：单一全局 shard 不支持 payload 过滤，取 top_k×8（上限 50）后
     // 在 SQL 侧做作用域过滤，避免同作用域记忆因排到 top_k 之外被漏掉。
-    let over = (s.top_k as usize).saturating_mul(8).clamp(1, 50);
-    let hits = memory
-        .store
-        .search(MEMORY_KB_ID, dim as usize, &query_vec, over)
-        .await;
+    let over = usize::try_from(s.top_k)
+        .unwrap_or(0)
+        .saturating_mul(8)
+        .clamp(1, 50);
+    let dim_usize = usize::try_from(dim).unwrap_or(0);
+    let hits = memory.store.search(MEMORY_KB_ID, dim_usize, &query_vec, over).await;
     if hits.is_empty() {
         return None;
     }
@@ -76,6 +77,7 @@ pub async fn retrieve_for_session(
     });
     // 阈值过滤：pinned（且 pin_always_inject=1）恒注入；其余需 ≥ score_threshold。
     let pin_always = s.pin_always_inject != 0;
+    #[allow(clippy::cast_possible_truncation, reason = "score_threshold 为 0–1 配置值，精度损失可接受")]
     let threshold = s.score_threshold as f32;
     let items: Vec<AgentMemoryRecord> = candidates
         .into_iter()
@@ -85,7 +87,8 @@ pub async fn retrieve_for_session(
     if items.is_empty() {
         return None;
     }
-    let block = build_memory_block(&items, s.inject_budget_tokens as usize)?;
+    let budget = usize::try_from(s.inject_budget_tokens).unwrap_or(0);
+    let block = build_memory_block(&items, budget)?;
     // 命中回写（仅实际注入的条目）。
     let hit_ids: Vec<String> = items.iter().map(|r| r.id.clone()).collect();
     let _ = memory.db.memory_bump_hits(&hit_ids).await;
@@ -231,34 +234,35 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::many_single_char_names, reason = "测试中 g/c/w 对应三种 scope，单字母命名直观")]
     fn build_memory_block_record_fields_serialized() {
         // scope 映射
-        let g = record("m1", "global", "", "", false, "global内容");
-        let c = record("m2", "client", "c1", "", false, "client内容");
-        let w = record("m3", "workspace", "c1", "w1", false, "workspace内容");
-        let bg = build_memory_block(&[g], 1500).unwrap();
+        let global_rec = record("m1", "global", "", "", false, "global内容");
+        let client_rec = record("m2", "client", "c1", "", false, "client内容");
+        let ws_rec = record("m3", "workspace", "c1", "w1", false, "workspace内容");
+        let bg = build_memory_block(&[global_rec], 1500).unwrap();
         assert!(bg.contains("全局"), "global 应映射为 全局");
         assert!(bg.contains("global内容"));
-        let bc = build_memory_block(&[c], 1500).unwrap();
+        let bc = build_memory_block(&[client_rec], 1500).unwrap();
         assert!(bc.contains("客户端"), "client 应映射为 客户端");
         assert!(bc.contains("client内容"));
-        let bw = build_memory_block(&[w], 1500).unwrap();
+        let bw = build_memory_block(&[ws_rec], 1500).unwrap();
         assert!(bw.contains("工作区"), "workspace 应映射为 工作区");
         assert!(bw.contains("workspace内容"));
 
         // confidence 保留两位小数
-        let mut r = record("m4", "global", "", "", false, "conf");
-        r.confidence = 0.85;
-        let b = build_memory_block(&[r.clone()], 1500).unwrap();
-        assert!(b.contains("0.85"), "confidence 应格式化为 0.85");
-        r.confidence = 1.0;
-        let b2 = build_memory_block(&[r], 1500).unwrap();
-        assert!(b2.contains("1.00"));
+        let mut rec = record("m4", "global", "", "", false, "conf");
+        rec.confidence = 0.85;
+        let block = build_memory_block(&[rec.clone()], 1500).unwrap();
+        assert!(block.contains("0.85"), "confidence 应格式化为 0.85");
+        rec.confidence = 1.0;
+        let block2 = build_memory_block(&[rec], 1500).unwrap();
+        assert!(block2.contains("1.00"));
 
         // 内容原样保留，包含特殊字符
         let special = record("m5", "global", "", "", false, "特殊字符：\n换行\t制表");
-        let bs = build_memory_block(&[special], 1500).unwrap();
-        assert!(bs.contains("特殊字符：\n换行\t制表"));
+        let block_special = build_memory_block(&[special], 1500).unwrap();
+        assert!(block_special.contains("特殊字符：\n换行\t制表"));
 
         // <memory> 包裹
         let r2 = record("m6", "global", "", "", false, "x");

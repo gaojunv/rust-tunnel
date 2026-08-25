@@ -67,6 +67,9 @@ pub struct Database {
 
 impl Database {
     /// Create a new database instance and initialize schema
+    ///
+    /// # Errors
+    /// 当父目录创建、数据库连接或表结构初始化失败时返回 `sqlx::Error`。
     pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self, sqlx::Error> {
         let path = path.as_ref();
 
