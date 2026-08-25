@@ -88,6 +88,7 @@ impl fmt::Debug for VectorStore {
 }
 
 impl VectorStore {
+    #[must_use] 
     pub fn new(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
@@ -97,6 +98,7 @@ impl VectorStore {
 
     /// 数据根目录：`rag/<kb_id>/` 存向量 shard，`rag_docs/<kb_id>/` 存文档原文
     /// （管理 API 层读写原文用，见 `mgmt/api/rag.rs`）。
+    #[must_use] 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -218,9 +220,7 @@ impl VectorStore {
                         .payload
                         .as_ref()
                         .and_then(|p| p.0.get("id"))
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| s.id.to_string()),
+                        .and_then(|v| v.as_str()).map_or_else(|| s.id.to_string(), str::to_string),
                     score: s.score,
                 })
                 .collect(),
@@ -238,7 +238,7 @@ impl VectorStore {
         let shard = self.open_shard(kb_id, dim).await?;
         let key = "doc_id"
             .parse::<qdrant_edge::JsonPath>()
-            .map_err(|_| StoreError::Qdrant("invalid filter key 'doc_id'".into()))?;
+            .map_err(|()| StoreError::Qdrant("invalid filter key 'doc_id'".into()))?;
         let filter = qdrant_edge::Filter::new_must(qdrant_edge::Condition::Field(
             qdrant_edge::FieldCondition::new_match(
                 key,

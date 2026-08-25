@@ -114,9 +114,9 @@ impl TrojanAddress {
 impl std::fmt::Display for TrojanAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TrojanAddress::IPv4(addr) => write!(f, "{}", addr),
-            TrojanAddress::IPv6(addr) => write!(f, "{}", addr),
-            TrojanAddress::Domain(domain) => write!(f, "{}", domain),
+            TrojanAddress::IPv4(addr) => write!(f, "{addr}"),
+            TrojanAddress::IPv6(addr) => write!(f, "{addr}"),
+            TrojanAddress::Domain(domain) => write!(f, "{domain}"),
         }
     }
 }
@@ -139,6 +139,7 @@ pub enum ParseResult {
 }
 
 /// Compute SHA-224 hex hash of password (56 lowercase hex chars)
+#[must_use] 
 pub fn sha224_hex(password: &str) -> String {
     use sha2::{Digest, Sha224};
     let mut hasher = Sha224::new();
@@ -147,6 +148,7 @@ pub fn sha224_hex(password: &str) -> String {
 }
 
 /// Verify a received hash against an expected password using constant-time comparison
+#[must_use] 
 pub fn verify_password(received_hash: &str, expected_password: &str) -> bool {
     let expected_hash = sha224_hex(expected_password);
     constant_time_eq(received_hash.as_bytes(), expected_hash.as_bytes())
@@ -179,6 +181,7 @@ pub struct TrojanConnectionContext {
 
 /// Parse a Trojan request from a buffer
 /// Returns Complete if parsing succeeded, Incomplete if more data needed, Invalid on error
+#[must_use] 
 pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
     // Minimum: 56 (hash) + 2 (CRLF) + 1 (CMD) + 1 (ATYP) + 1 (min addr) + 2 (port) + 2 (CRLF) = 65
     // But realistically with IPv4: 56 + 2 + 1 + 1 + 4 + 2 + 2 = 68
@@ -204,7 +207,7 @@ pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
     let cmd_byte = buf[58];
     let command = match TrojanCommand::from_byte(cmd_byte) {
         Some(c) => c,
-        None => return ParseResult::Invalid(format!("Unsupported command: 0x{:02x}", cmd_byte)),
+        None => return ParseResult::Invalid(format!("Unsupported command: 0x{cmd_byte:02x}")),
     };
 
     // Parse address
@@ -260,6 +263,7 @@ pub enum PacketParseResult {
 
 /// Parse one Trojan UDP packet from the front of `buf`.
 /// Wire format: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
+#[must_use] 
 pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
     // Address (includes ATYP byte)
     let (address, addr_len) = match TrojanAddress::parse(buf, 0) {
@@ -318,6 +322,7 @@ pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
 
 impl UdpPacket {
     /// Encode the packet to wire bytes: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
+    #[must_use] 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload.len() + 32);
         self.address.encode(&mut out);
@@ -492,7 +497,7 @@ pub fn validate_trojan_domain(domain: &str) -> Result<(), String> {
 const UDP_READ_BUF_LIMIT: usize = 128 * 1024;
 
 /// Idle timeout for per-target UDP sockets.
-const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Handle a Trojan UDP ASSOCIATE session.
 ///
@@ -520,7 +525,7 @@ pub async fn handle_udp_associate(
     );
 
     registry.increment_trojan_connections(trojan_port).await;
-    let entity_id = format!("trojan:{}", trojan_port);
+    let entity_id = format!("trojan:{trojan_port}");
     stats.incr_conns(EntityType::Trojan, &entity_id);
 
     let mut bytes_in: u64 = 0;
@@ -613,23 +618,20 @@ pub async fn handle_udp_associate(
                 }
             }
             resp = resp_rx.recv() => {
-                match resp {
-                    Some((pkt, _from)) => {
-                        bytes_out += pkt.payload.len() as u64;
-                        if let Err(e) = tls_stream.write_all(&pkt.encode()).await {
-                            debug!(
-                                "Trojan UDP connection {} write error: {}",
-                                connection_id, e
-                            );
-                            break;
-                        }
+                if let Some((pkt, _from)) = resp {
+                    bytes_out += pkt.payload.len() as u64;
+                    if let Err(e) = tls_stream.write_all(&pkt.encode()).await {
+                        debug!(
+                            "Trojan UDP connection {} write error: {}",
+                            connection_id, e
+                        );
+                        break;
                     }
-                    None => {
-                        // All senders dropped (no targets left) — wait for client data only.
-                        // Yield to avoid busy-loop: recv() on empty-but-open channel pends,
-                        // so None only happens after targets cleared AND channel closed,
-                        // which cannot occur while resp_tx is alive. Unreachable in practice.
-                    }
+                } else {
+                    // All senders dropped (no targets left) — wait for client data only.
+                    // Yield to avoid busy-loop: recv() on empty-but-open channel pends,
+                    // so None only happens after targets cleared AND channel closed,
+                    // which cannot occur while resp_tx is alive. Unreachable in practice.
                 }
             }
             dead = dead_rx.recv() => {
@@ -683,15 +685,12 @@ async fn dispatch_udp_packet(
         TrojanAddress::IPv6(ip) => SocketAddr::new((*ip).into(), pkt.port),
         TrojanAddress::Domain(domain) => {
             match tokio::net::lookup_host((domain.as_str(), pkt.port)).await {
-                Ok(mut addrs) => match addrs.next() {
-                    Some(a) => a,
-                    None => {
-                        debug!(
-                            "UDP connection {}: no addresses for {}",
-                            connection_id, domain
-                        );
-                        return;
-                    }
+                Ok(mut addrs) => if let Some(a) = addrs.next() { a } else {
+                    debug!(
+                        "UDP connection {}: no addresses for {}",
+                        connection_id, domain
+                    );
+                    return;
                 },
                 Err(e) => {
                     debug!(
@@ -805,7 +804,7 @@ pub async fn proxy_trojan_connection(
     // Increment active Trojan connection count
     registry.increment_trojan_connections(trojan_port).await;
     // 统一统计：trojan 桶活跃连接 +1（entity_id 约定为 trojan:{port}）
-    let entity_id = format!("trojan:{}", trojan_port);
+    let entity_id = format!("trojan:{trojan_port}");
     stats.incr_conns(EntityType::Trojan, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
@@ -1055,10 +1054,10 @@ mod tests {
     #[test]
     fn test_trojan_address_display() {
         let v4 = TrojanAddress::IPv4(Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(format!("{}", v4), "192.168.1.1");
+        assert_eq!(format!("{v4}"), "192.168.1.1");
 
         let domain = TrojanAddress::Domain("example.com".to_string());
-        assert_eq!(format!("{}", domain), "example.com");
+        assert_eq!(format!("{domain}"), "example.com");
     }
 
     #[test]
@@ -1494,7 +1493,7 @@ mod tests {
         let buf = build_udp_packet(&[0x07, 1, 2, 3, 4], 53, b"x");
         match parse_udp_packet(&buf) {
             PacketParseResult::Invalid(msg) => {
-                assert!(msg.contains("address") || msg.contains("ATYP") || msg.contains("atyp"))
+                assert!(msg.contains("address") || msg.contains("ATYP") || msg.contains("atyp"));
             }
             _ => panic!("Expected Invalid for bad ATYP"),
         }
@@ -1736,9 +1735,7 @@ mod legacy_tests {
             if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return;
             }
-            if start.elapsed() >= dur {
-                panic!("Timed out waiting for port {}", port);
-            }
+            assert!(start.elapsed() < dur, "Timed out waiting for port {port}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -1836,7 +1833,7 @@ mod legacy_tests {
         trojan_connect_with_atype(
             trojan_port,
             password,
-            &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+            &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
             target_port,
         )
         .await
@@ -1852,7 +1849,7 @@ mod legacy_tests {
         let config = create_insecure_client_config().unwrap();
         let connector = tokio_rustls::TlsConnector::from(config);
 
-        let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+        let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
             .await
             .expect("Failed to connect to Trojan server");
 
@@ -1949,7 +1946,7 @@ mod legacy_tests {
             let header = build_trojan_header(
                 "testpass",
                 0x01,
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 443,
             );
 
@@ -1996,7 +1993,7 @@ mod legacy_tests {
             let header = build_trojan_header(
                 "mypassword",
                 0x01,
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 80,
             );
             let hash_part = std::str::from_utf8(&header[..56]).unwrap();
@@ -2063,7 +2060,7 @@ mod legacy_tests {
                 let port = trojan_port;
                 let echo = echo_port;
                 handles.push(tokio::spawn(async move {
-                    let payload = format!("conn-{}", i);
+                    let payload = format!("conn-{i}");
                     let mut stream = trojan_connect(port, "testpass", echo).await;
                     stream.write_all(payload.as_bytes()).await.unwrap();
                     let mut buf = vec![0u8; payload.len()];
@@ -2074,7 +2071,7 @@ mod legacy_tests {
 
             for (i, handle) in handles.into_iter().enumerate() {
                 let result = handle.await.unwrap();
-                let expected = format!("conn-{}", i);
+                let expected = format!("conn-{i}");
                 assert_eq!(&result[..], expected.as_bytes());
             }
 
@@ -2204,7 +2201,7 @@ mod legacy_tests {
                 stats.clone(),
                 trojan_port,
                 "correctpass",
-                &format!("127.0.0.1:{}", fallback_port),
+                &format!("127.0.0.1:{fallback_port}"),
             )
             .await;
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
@@ -2212,7 +2209,7 @@ mod legacy_tests {
             // Connect with wrong password
             let config = create_insecure_client_config().unwrap();
             let connector = tokio_rustls::TlsConnector::from(config);
-            let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+            let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
                 .await
                 .unwrap();
             let server_name =
@@ -2223,7 +2220,7 @@ mod legacy_tests {
             let header = build_trojan_header(
                 "wrongpass",
                 0x01,
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 80,
             );
             tls_stream.write_all(&header).await.unwrap();
@@ -2243,8 +2240,7 @@ mod legacy_tests {
                         response
                             .windows(b"FALLBACK_OK".len())
                             .any(|w| w == b"FALLBACK_OK"),
-                        "Expected FALLBACK_OK in response, got: {:?}",
-                        response
+                        "Expected FALLBACK_OK in response, got: {response:?}"
                     );
                 }
                 _ => {
@@ -2278,7 +2274,7 @@ mod legacy_tests {
             let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
 
             for i in 0..10 {
-                let payload = format!("round-{:03}-data", i);
+                let payload = format!("round-{i:03}-data");
                 stream.write_all(payload.as_bytes()).await.unwrap();
                 let mut buf = vec![0u8; payload.len()];
                 stream.read_exact(&mut buf).await.unwrap();
@@ -2399,7 +2395,7 @@ mod legacy_tests {
             // TLS connect + UDP ASSOCIATE handshake (target addr is advisory)
             let config = create_insecure_client_config().unwrap();
             let connector = tokio_rustls::TlsConnector::from(config);
-            let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+            let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
                 .await
                 .unwrap();
             let server_name =
@@ -2409,14 +2405,14 @@ mod legacy_tests {
             let header = build_trojan_header(
                 "testpass",
                 0x03, // UDP ASSOCIATE
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 udp_port,
             );
             tls_stream.write_all(&header).await.unwrap();
 
             // Send a UDP packet through the tunnel
             let packet =
-                build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"udp-echo-test");
+                build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port, b"udp-echo-test");
             tls_stream.write_all(&packet).await.unwrap();
             tls_stream.flush().await.unwrap();
 
@@ -2457,7 +2453,7 @@ mod legacy_tests {
 
             let config = create_insecure_client_config().unwrap();
             let connector = tokio_rustls::TlsConnector::from(config);
-            let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+            let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
                 .await
                 .unwrap();
             let server_name =
@@ -2467,14 +2463,14 @@ mod legacy_tests {
             let header = build_trojan_header(
                 "testpass",
                 0x03,
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 udp_port_a,
             );
             tls_stream.write_all(&header).await.unwrap();
 
             // Two packets to two different targets over the same associate connection
-            let pkt_a = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port_a, b"to-a");
-            let pkt_b = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port_b, b"to-b");
+            let pkt_a = build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port_a, b"to-a");
+            let pkt_b = build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port_b, b"to-b");
             tls_stream.write_all(&pkt_a).await.unwrap();
             tls_stream.write_all(&pkt_b).await.unwrap();
 
@@ -2530,7 +2526,7 @@ mod legacy_tests {
             {
                 let config = create_insecure_client_config().unwrap();
                 let connector = tokio_rustls::TlsConnector::from(config);
-                let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+                let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
                     .await
                     .unwrap();
                 let server_name =
@@ -2540,11 +2536,11 @@ mod legacy_tests {
                 let header = build_trojan_header(
                     "testpass",
                     0x03,
-                    &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                    &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                     udp_port,
                 );
                 tls_stream.write_all(&header).await.unwrap();
-                let packet = build_udp_packet_v4(Ipv4Addr::new(127, 0, 0, 1), udp_port, b"ping");
+                let packet = build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port, b"ping");
                 tls_stream.write_all(&packet).await.unwrap();
 
                 let mut buf = [0u8; 256];
@@ -2596,7 +2592,7 @@ mod legacy_tests {
             // Wait for the server to increment the counter
             tokio::time::sleep(Duration::from_millis(100)).await;
             let count = registry.get_connection_count_for_port(trojan_port).await;
-            assert!(count >= 1, "Expected >= 1 active connection, got {}", count);
+            assert!(count >= 1, "Expected >= 1 active connection, got {count}");
 
             // Close the connection
             drop(stream);
@@ -2605,8 +2601,7 @@ mod legacy_tests {
             let count = registry.get_connection_count_for_port(trojan_port).await;
             assert_eq!(
                 count, 0,
-                "Expected 0 connections after close, got {}",
-                count
+                "Expected 0 connections after close, got {count}"
             );
 
             server_handle.abort();
@@ -2635,7 +2630,7 @@ mod legacy_tests {
             // Connect and include initial payload in the Trojan header
             let config = create_insecure_client_config().unwrap();
             let connector = tokio_rustls::TlsConnector::from(config);
-            let stream = TcpStream::connect(format!("127.0.0.1:{}", trojan_port))
+            let stream = TcpStream::connect(format!("127.0.0.1:{trojan_port}"))
                 .await
                 .unwrap();
             let server_name =
@@ -2646,7 +2641,7 @@ mod legacy_tests {
             let mut request = build_trojan_header(
                 "testpass",
                 0x01,
-                &TestTargetAddr::Ipv4(Ipv4Addr::new(127, 0, 0, 1)),
+                &TestTargetAddr::Ipv4(Ipv4Addr::LOCALHOST),
                 echo_port,
             );
             request.extend_from_slice(b"INITIAL");
@@ -2676,8 +2671,7 @@ mod legacy_tests {
             // The echo should contain both payloads in order
             assert!(
                 response.starts_with(b"INITIAL"),
-                "Expected response starting with INITIAL, got: {:?}",
-                response
+                "Expected response starting with INITIAL, got: {response:?}"
             );
 
             server_handle.abort();

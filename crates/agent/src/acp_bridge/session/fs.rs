@@ -23,7 +23,7 @@ use crate::spawner::AgentSpawner;
 
 use super::super::SpawnedAgent;
 
-use super::*;
+use super::to_workspace_relative;
 
 /// fs 请求的公共上下文：session → workspace（root_path / docker）→ 活跃进程 client_id。
 struct FsContext {
@@ -80,7 +80,7 @@ pub(crate) async fn exec_fs_read(
             &ctx.root_path,
             ctx.docker_container.as_deref(),
             rust_tunnel_common::AgentCommand::ReadFile { path: rel },
-            Duration::from_secs(120),
+            Duration::from_mins(2),
         )
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;
@@ -148,7 +148,7 @@ pub(crate) async fn exec_fs_write(
             &ctx.root_path,
             ctx.docker_container.as_deref(),
             command,
-            Duration::from_secs(120),
+            Duration::from_mins(2),
         )
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;

@@ -23,7 +23,7 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO acme_certificates (domain, status, cert_pem, key_pem, chain_pem,
                 issued_at, expires_at, auto_renew, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -35,7 +35,7 @@ impl Database {
                 issued_at = excluded.issued_at,
                 expires_at = excluded.expires_at,
                 auto_renew = excluded.auto_renew
-            "#,
+            ",
         )
         .bind(domain)
         .bind(status)
@@ -44,7 +44,7 @@ impl Database {
         .bind(chain_pem)
         .bind(issued_at)
         .bind(expires_at)
-        .bind(auto_renew as i32)
+        .bind(i32::from(auto_renew))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -54,13 +54,13 @@ impl Database {
     /// Load all ACME certificates
     pub async fn load_acme_certificates(&self) -> Result<Vec<AcmeCertificateRecord>, sqlx::Error> {
         sqlx::query_as::<_, AcmeCertificateRecord>(
-            r#"
+            r"
             SELECT domain, status, cert_pem, key_pem, chain_pem,
                    issued_at, expires_at, auto_renew, last_renewal_attempt,
                    error_message, created_at
             FROM acme_certificates
             ORDER BY created_at
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -72,13 +72,13 @@ impl Database {
         domain: &str,
     ) -> Result<Option<AcmeCertificateRecord>, sqlx::Error> {
         sqlx::query_as::<_, AcmeCertificateRecord>(
-            r#"
+            r"
             SELECT domain, status, cert_pem, key_pem, chain_pem,
                    issued_at, expires_at, auto_renew, last_renewal_attempt,
                    error_message, created_at
             FROM acme_certificates
             WHERE domain = ?
-            "#,
+            ",
         )
         .bind(domain)
         .fetch_optional(&self.pool)
@@ -93,11 +93,11 @@ impl Database {
         error_message: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             UPDATE acme_certificates
             SET status = ?, error_message = ?
             WHERE domain = ?
-            "#,
+            ",
         )
         .bind(status)
         .bind(error_message)
@@ -114,11 +114,11 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             UPDATE acme_certificates
             SET last_renewal_attempt = ?
             WHERE domain = ?
-            "#,
+            ",
         )
         .bind(now)
         .bind(domain)
@@ -146,7 +146,7 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO acme_challenges (token, domain, authorization, status, created_at, expires_at)
             VALUES (?, ?, ?, 'pending', ?, ?)
             ON CONFLICT(token) DO UPDATE SET
@@ -154,7 +154,7 @@ impl Database {
                 authorization = excluded.authorization,
                 status = 'pending',
                 expires_at = excluded.expires_at
-            "#,
+            ",
         )
         .bind(token)
         .bind(domain)
@@ -172,11 +172,11 @@ impl Database {
         token: &str,
     ) -> Result<Option<AcmeChallengeRecord>, sqlx::Error> {
         sqlx::query_as::<_, AcmeChallengeRecord>(
-            r#"
+            r"
             SELECT token, domain, authorization, status, created_at, expires_at
             FROM acme_challenges
             WHERE token = ?
-            "#,
+            ",
         )
         .bind(token)
         .fetch_optional(&self.pool)
@@ -190,11 +190,11 @@ impl Database {
         status: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             UPDATE acme_challenges
             SET status = ?
             WHERE token = ?
-            "#,
+            ",
         )
         .bind(status)
         .bind(token)
@@ -207,10 +207,10 @@ impl Database {
     pub async fn cleanup_expired_acme_challenges(&self) -> Result<u64, sqlx::Error> {
         let now = Utc::now();
         let result = sqlx::query(
-            r#"
+            r"
             DELETE FROM acme_challenges
             WHERE expires_at IS NOT NULL AND expires_at < ?
-            "#,
+            ",
         )
         .bind(now)
         .execute(&self.pool)
@@ -234,7 +234,7 @@ impl Database {
     ) -> Result<Vec<AcmeCertificateRecord>, sqlx::Error> {
         let cutoff = Utc::now() + chrono::Duration::days(days_before_expiry);
         sqlx::query_as::<_, AcmeCertificateRecord>(
-            r#"
+            r"
             SELECT domain, status, cert_pem, key_pem, chain_pem,
                    issued_at, expires_at, auto_renew, last_renewal_attempt,
                    error_message, created_at
@@ -243,7 +243,7 @@ impl Database {
               AND auto_renew = 1
               AND expires_at IS NOT NULL
               AND expires_at <= ?
-            "#,
+            ",
         )
         .bind(cutoff)
         .fetch_all(&self.pool)

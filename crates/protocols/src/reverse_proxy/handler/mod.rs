@@ -1462,7 +1462,7 @@ mod http2_tests {
         let connector = tokio_rustls::TlsConnector::from(insecure_client_config_with_alpn());
         let sni = ServerName::try_from("test.local").unwrap();
         let tls = connector.connect(sni, tcp).await.unwrap();
-        let alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
         assert_eq!(
             alpn.as_deref(),
             Some(b"h2".as_slice()),

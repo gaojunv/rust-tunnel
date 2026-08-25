@@ -78,15 +78,14 @@ async fn test_ensure_session_production_config_injection_order() {
     );
     // 配置注入全部完成后 spawn_ready 才置位（wait_ready 依赖此信号，首条
     // prompt 不与在途 set_config_option 竞态）
-    let ready = bridge
+    let ready = *bridge
         .sessions
         .lock()
         .await
         .get("sess-1")
         .unwrap()
         .spawn_ready
-        .borrow()
-        .clone();
+        .borrow();
     assert!(ready, "spawn_ready 应在配置注入完成后置位");
     // config_options 快照已从 session/new 捕获
     assert_eq!(
@@ -163,8 +162,7 @@ async fn test_handshake_skips_mcp_injection_without_http_capability() {
     assert!(
         received[0]
             .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
+            .is_some_and(std::vec::Vec::is_empty),
         "无 http 能力时 mcpServers 应为空: {received:?}"
     );
     // 会话照常建立
@@ -199,8 +197,7 @@ async fn test_handshake_skips_mcp_injection_without_token() {
     assert!(
         received[0]
             .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(false),
+            .is_some_and(std::vec::Vec::is_empty),
         "无 token 时 mcpServers 应为空: {received:?}"
     );
 }
@@ -349,15 +346,14 @@ async fn test_ensure_session_injects_mcp_server_with_memory() {
     );
     // 配置注入全部完成后 spawn_ready 照常置位（MCP 注入不改变 spawn 完成信号）
     assert!(
-        bridge
+        *bridge
             .sessions
             .lock()
             .await
             .get("sess-1")
             .unwrap()
             .spawn_ready
-            .borrow()
-            .clone(),
+            .borrow(),
         "spawn_ready 应在注入后置位"
     );
 }

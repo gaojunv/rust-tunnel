@@ -171,6 +171,7 @@ fn redirects_to_device(cmd_lower: &str) -> bool {
 }
 
 /// 该 shell 命令是否命中危险模式。
+#[must_use] 
 pub fn is_dangerous_shell(cmd: &str) -> bool {
     // 空白归一化：任意连续空白（空格/tab/换行）折叠为单个空格，使 `rm  -rf /`、
     // `kill\t-9` 等空白变体无法绕过子串匹配。归一化后同一字符序列的语义不变。
@@ -194,6 +195,7 @@ pub fn is_dangerous_shell(cmd: &str) -> bool {
 /// allow_always 就静默放行）。Shell → 按危险命令判定；GitPush → 永远破坏性
 /// （推送不可撤销地改写远程，safe/auto_write 下都应确认）；其余工具（文件读写、
 /// 提交等）由审批矩阵单独覆盖，allow_always 记住后免审语义不受影响。
+#[must_use] 
 pub fn command_is_destructive(cmd: &AgentCommand) -> bool {
     match cmd {
         AgentCommand::Shell { cmd, .. } | AgentCommand::ShellWithTimeout { cmd, .. } => {
@@ -207,6 +209,7 @@ pub fn command_is_destructive(cmd: &AgentCommand) -> bool {
 /// 按审批模式判定工具调用是否需用户确认。非法 mode 按 "safe" 处理（保守）。
 /// `"plan"` 模式下：只读工具免审，写操作/危险 shell 一律需确认（模型理论上
 /// 看不到写工具 schema，此分支为防御性兜底）。
+#[must_use] 
 pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
     let mode = match mode {
         "safe" | "auto_write" | "full_auto" | "plan" => mode,
@@ -271,6 +274,7 @@ pub fn needs_approval(mode: &str, cmd: &AgentCommand) -> bool {
 /// 命令是否只读（可并发执行、不涉审批、无需 workspace_lock）：
 /// 与 needs_approval 对 ReadFile/ListDir/Search/GitStatus/GitDiff/GitExec(Read)
 /// 恒返回 false 的集合一致（full_auto 的全局放行不参与——写命令仍须串行保序）。
+#[must_use] 
 pub fn is_readonly_command(cmd: &AgentCommand) -> bool {
     match cmd {
         AgentCommand::ReadFile { .. }
@@ -291,6 +295,7 @@ pub fn is_readonly_command(cmd: &AgentCommand) -> bool {
 
 /// 把工具调用标记数组划分为「连续只读段」与「串行单调用」交替段。
 /// 纯函数便于单测（并发/顺序分组逻辑不依赖 I/O）。
+#[must_use] 
 pub fn partition_tool_calls(flags: &[bool]) -> Vec<(usize, usize, bool)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -310,6 +315,7 @@ pub fn partition_tool_calls(flags: &[bool]) -> Vec<(usize, usize, bool)> {
 }
 
 /// 审批卡片摘要（一行）：shell→cmd（截断）、文件类→path、git_commit→message、git_push→固定文案。
+#[must_use] 
 pub fn approval_summary(cmd: &AgentCommand) -> String {
     const MAX: usize = 120;
     let truncate = |s: &str| {
@@ -461,7 +467,7 @@ mod tests {
 
     fn git_exec(args: &[&str]) -> AgentCommand {
         AgentCommand::GitExec {
-            args: args.iter().map(|a| a.to_string()).collect(),
+            args: args.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 

@@ -327,6 +327,7 @@ impl SessionRuntime {
     /// 构造子 agent 运行时：复制父会话关键字段，messages 只含 system + user(prompt)，
     /// 不注入 AGENTS.md / memory / skill / wiki（子循环独立上下文）。
     /// `model_override`：角色有自定义模型时传入，覆盖父 model。
+    #[must_use] 
     pub fn subagent(
         parent: &SessionRuntime,
         system_prompt: String,
@@ -377,6 +378,7 @@ const SYSTEM_PROMPT: &str = "You are an AI programming assistant running inside 
 const AGENTS_MD_MAX_BYTES: usize = 20 * 1024;
 
 /// 截断 AGENTS.md 到注入上限（UTF-8 边界安全）。
+#[must_use] 
 pub fn truncate_agents_md(content: &str) -> String {
     if content.len() <= AGENTS_MD_MAX_BYTES {
         return content.to_string();

@@ -5,10 +5,10 @@ impl Database {
     /// Insert a log entry into the database
     pub async fn insert_log(&self, entry: &DbLogEntry) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
-            r#"
+            r"
             INSERT INTO server_logs (timestamp, level, source, target, message)
             VALUES (?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(entry.timestamp)
         .bind(&entry.level)
@@ -31,10 +31,10 @@ impl Database {
 
         for entry in entries {
             sqlx::query(
-                r#"
+                r"
                 INSERT INTO server_logs (timestamp, level, source, target, message)
                 VALUES (?, ?, ?, ?, ?)
-                "#,
+                ",
             )
             .bind(entry.timestamp)
             .bind(&entry.level)
@@ -83,13 +83,13 @@ impl Database {
             }
         }
 
-        if let Some(ref src) = source {
-            params.push(format!("{}%", src));
+        if let Some(src) = source {
+            params.push(format!("{}%", &src));
             query_str.push_str(&format!(" AND source LIKE ?{}", params.len()));
         }
 
-        if let Some(ref s) = search {
-            params.push(format!("%{}%", s));
+        if let Some(s) = search {
+            params.push(format!("%{}%", &s));
             query_str.push_str(&format!(" AND message LIKE ?{}", params.len()));
         }
 
@@ -116,10 +116,10 @@ impl Database {
     /// Delete logs older than the given timestamp
     pub async fn cleanup_old_logs(&self, older_than_micros: i64) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
-            r#"
+            r"
             DELETE FROM server_logs
             WHERE timestamp < ?
-            "#,
+            ",
         )
         .bind(older_than_micros)
         .execute(&self.pool)
@@ -228,7 +228,7 @@ mod tests {
                 level: "INFO".into(),
                 source: "server".into(),
                 target: "test".into(),
-                message: format!("msg {}", i),
+                message: format!("msg {i}"),
             })
             .collect();
         db.insert_logs_batch(&entries).await.unwrap();

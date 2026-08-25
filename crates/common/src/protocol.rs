@@ -634,7 +634,7 @@ mod tests {
 
             let mut reader = &buffer[..];
             let read_msg = ControlMessage::read_from_stream(&mut reader).await.unwrap();
-            assert!(read_msg.is_some(), "Failed to roundtrip {:?}", msg);
+            assert!(read_msg.is_some(), "Failed to roundtrip {msg:?}");
         }
     }
 

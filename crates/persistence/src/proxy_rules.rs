@@ -28,7 +28,7 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO proxy_rules (id, name, type, listen_addr, domains, routes,
                 tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
                 cert_source, cert_covering_domain, cert_status_updated_at)
@@ -47,7 +47,7 @@ impl Database {
                 cert_source = excluded.cert_source,
                 cert_covering_domain = excluded.cert_covering_domain,
                 cert_status_updated_at = excluded.cert_status_updated_at
-            "#,
+            ",
         )
         .bind(id)
         .bind(name)
@@ -55,10 +55,10 @@ impl Database {
         .bind(listen_addr)
         .bind(domains)
         .bind(routes)
-        .bind(tls_enabled as i32)
-        .bind(tls_acme as i32)
+        .bind(i32::from(tls_enabled))
+        .bind(i32::from(tls_acme))
         .bind(tls_domain)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(now)
         .bind(now)
         .bind(cert_source)
@@ -72,13 +72,13 @@ impl Database {
     /// Load all proxy rules
     pub async fn load_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
-            r#"
+            r"
             SELECT id, name, type, listen_addr, domains, routes,
                    tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
                    cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             ORDER BY created_at
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -87,14 +87,14 @@ impl Database {
     /// Load enabled proxy rules
     pub async fn load_enabled_proxy_rules(&self) -> Result<Vec<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
-            r#"
+            r"
             SELECT id, name, type, listen_addr, domains, routes,
                    tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
                    cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             WHERE enabled = 1
             ORDER BY created_at
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -103,13 +103,13 @@ impl Database {
     /// Get a proxy rule by ID
     pub async fn get_proxy_rule(&self, id: &str) -> Result<Option<ProxyRuleRecord>, sqlx::Error> {
         sqlx::query_as::<_, ProxyRuleRecord>(
-            r#"
+            r"
             SELECT id, name, type, listen_addr, domains, routes,
                    tls_enabled, tls_acme, tls_domain, enabled, created_at, updated_at,
                    cert_source, cert_covering_domain, cert_status_updated_at
             FROM proxy_rules
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -390,7 +390,7 @@ mod tests {
             "http",
             "0.0.0.0:8080",
             Some(r#"["b.com"]"#),
-            Some(r#"[]"#),
+            Some(r"[]"),
             true,
             true,
             Some("b.com"),
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(r.name, "v2-updated");
         assert_eq!(r.listen_addr, "0.0.0.0:8080");
         assert_eq!(r.domains.as_deref(), Some(r#"["b.com"]"#));
-        assert_eq!(r.routes.as_deref(), Some(r#"[]"#));
+        assert_eq!(r.routes.as_deref(), Some(r"[]"));
         assert_eq!(r.tls_enabled, 1);
         assert_eq!(r.tls_acme, 1);
         assert_eq!(r.tls_domain.as_deref(), Some("b.com"));

@@ -184,7 +184,7 @@ impl AcpBridge {
                                         if let Some(a) =
                                             frame.get("args").and_then(|v| v.as_str())
                                         {
-                                            tool_args.insert(id.to_string(), a.to_string());
+                                            tool_args.insert(id.clone(), a.to_string());
                                         }
                                     }
                                     ("tool_result", Some(id)) => {
@@ -261,9 +261,7 @@ impl AcpBridge {
                                 .tool_call
                                 .fields
                                 .raw_input
-                                .as_ref()
-                                .map(acp_raw_to_string)
-                                .unwrap_or_else(|| tool_name.clone());
+                                .as_ref().map_or_else(|| tool_name.clone(), acp_raw_to_string);
                             // 透传 agent 给出的权限选项：用户可从中选具体选项（如
                             // AskUserQuestion / plan 审批），而非服务端硬编码挑选。
                             // options 为空时审批卡片保持 approve/deny 二元按钮。
@@ -412,24 +410,21 @@ impl AcpBridge {
                         let sessions = sessions.clone();
                         let elicitation = elicitation.clone();
                         async move |request: CreateElicitationRequest, responder, _cx| {
-                            let schema = match &request.mode {
-                                ElicitationMode::Form(form) => {
-                                    serde_json::to_value(&form.requested_schema).unwrap_or_else(
-                                        |_| {
-                                            serde_json::json!({"type": "object", "properties": {}})
-                                        },
-                                    )
-                                }
-                                _ => {
-                                    tracing::warn!(
-                                        session_id = %sid,
-                                        "elicitation/create: unsupported mode, cancelling"
-                                    );
-                                    let _ = responder.respond(
-                                        CreateElicitationResponse::new(ElicitationAction::Cancel),
-                                    );
-                                    return Ok(());
-                                }
+                            let schema = if let ElicitationMode::Form(form) = &request.mode {
+                                serde_json::to_value(&form.requested_schema).unwrap_or_else(
+                                    |_| {
+                                        serde_json::json!({"type": "object", "properties": {}})
+                                    },
+                                )
+                            } else {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    "elicitation/create: unsupported mode, cancelling"
+                                );
+                                let _ = responder.respond(
+                                    CreateElicitationResponse::new(ElicitationAction::Cancel),
+                                );
+                                return Ok(());
                             };
                             // 动态解析当前 WS 通道 + 连接标识 + 连接变化 watch
                             // （同 request_permission，评审 Finding 1）。

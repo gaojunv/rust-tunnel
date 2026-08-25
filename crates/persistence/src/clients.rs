@@ -14,12 +14,12 @@ impl Database {
         let now = Utc::now();
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO client_sessions (port, hostname, connected_at, disconnected_at, duration_seconds)
             VALUES (?, ?, ?, NULL, NULL)
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .bind(hostname)
         .bind(now)
         .execute(&self.pool)
@@ -36,7 +36,7 @@ impl Database {
         // Use a subquery to find the latest session since SQLite < 3.33 doesn't support
         // UPDATE ... ORDER BY ... LIMIT
         sqlx::query(
-            r#"
+            r"
             UPDATE client_sessions
             SET disconnected_at = ?,
                 duration_seconds = CAST(strftime('%s', ?) AS INTEGER) - CAST(strftime('%s', connected_at) AS INTEGER)
@@ -46,11 +46,11 @@ impl Database {
                 ORDER BY connected_at DESC
                 LIMIT 1
             )
-            "#,
+            ",
         )
         .bind(now)
         .bind(now)
-        .bind(port as i32)
+        .bind(i32::from(port))
         .execute(&self.pool)
         .await?;
 
@@ -68,13 +68,13 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO clients (name, hostname, first_seen_at, last_seen_at)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 hostname = excluded.hostname,
                 last_seen_at = excluded.last_seen_at
-            "#,
+            ",
         )
         .bind(name)
         .bind(hostname)

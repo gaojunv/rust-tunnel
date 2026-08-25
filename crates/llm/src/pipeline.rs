@@ -52,23 +52,20 @@ pub async fn authenticate_or_reject(
     headers: &HeaderMap,
     protocol: &str,
 ) -> Result<(String, String), Response> {
-    match super::auth::authenticate(&state.llm, headers).await {
-        Some(a) => Ok(a),
-        None => {
-            // 记录认证失败
-            if let Some(ref db) = state.llm.db {
-                let ctx = UsageContext {
-                    protocol: protocol.into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
-            }
-            Err(state.error_for_protocol(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key".into(),
-                "authentication_error",
-            ))
+    if let Some(a) = super::auth::authenticate(&state.llm, headers).await { Ok(a) } else {
+        // 记录认证失败
+        if let Some(ref db) = state.llm.db {
+            let ctx = UsageContext {
+                protocol: protocol.into(),
+                ..Default::default()
+            };
+            ctx.record_failure(db, 401, "authentication_error", std::time::Instant::now());
         }
+        Err(state.error_for_protocol(
+            StatusCode::UNAUTHORIZED,
+            "Invalid API key".into(),
+            "authentication_error",
+        ))
     }
 }
 
@@ -80,25 +77,22 @@ pub async fn extract_model_or_reject(
     api_key_name: &str,
     protocol: &str,
 ) -> Result<String, Response> {
-    match body.get("model").and_then(Value::as_str) {
-        Some(m) => Ok(m.to_string()),
-        None => {
-            // 记录请求错误（缺少 model）
-            if let Some(ref db) = state.llm.db {
-                let ctx = UsageContext {
-                    api_key_id: Some(api_key_id.to_string()),
-                    api_key_name: api_key_name.to_string(),
-                    protocol: protocol.into(),
-                    ..Default::default()
-                };
-                ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
-            }
-            Err(state.error_for_protocol(
-                StatusCode::BAD_REQUEST,
-                "model is required".into(),
-                "invalid_request_error",
-            ))
+    if let Some(m) = body.get("model").and_then(Value::as_str) { Ok(m.to_string()) } else {
+        // 记录请求错误（缺少 model）
+        if let Some(ref db) = state.llm.db {
+            let ctx = UsageContext {
+                api_key_id: Some(api_key_id.to_string()),
+                api_key_name: api_key_name.to_string(),
+                protocol: protocol.into(),
+                ..Default::default()
+            };
+            ctx.record_failure(db, 400, "invalid_request_error", std::time::Instant::now());
         }
+        Err(state.error_for_protocol(
+            StatusCode::BAD_REQUEST,
+            "model is required".into(),
+            "invalid_request_error",
+        ))
     }
 }
 
@@ -356,7 +350,7 @@ pub async fn run_execution(
                 if failed_over {
                     ctx.failover_from = Some(first_candidate_model_name.to_string());
                 }
-                ctx.record_failure(db, status.as_u16() as i32, "upstream_error", started);
+                ctx.record_failure(db, i32::from(status.as_u16()), "upstream_error", started);
             }
             state.error_for_protocol(status, msg, "upstream_error")
         }
@@ -514,7 +508,7 @@ mod tests {
     fn response_post_process_clone_copy() {
         let a = ResponsePostProcess::ToAnthropic;
         let b = a;
-        let c = a.clone();
+        let c = a;
         assert_eq!(a, b);
         assert_eq!(a, c);
         let d: ResponsePostProcess = a;

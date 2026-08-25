@@ -20,7 +20,7 @@ fn parse_domain(domain: &str) -> AcmeResult<(String, String)> {
     let parts: Vec<&str> = clean_domain.split('.').collect();
 
     if parts.len() < 2 {
-        return Err(AcmeError::Dns(format!("Invalid domain format: {}", domain)));
+        return Err(AcmeError::Dns(format!("Invalid domain format: {domain}")));
     }
 
     // Root domain is the last two parts (e.g., "example.com")
@@ -47,6 +47,7 @@ pub struct AliyunDnsSolver {
 
 impl AliyunDnsSolver {
     /// Create a new Aliyun DNS solver
+    #[must_use] 
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {
             access_key_id: config.api_key.clone(),
@@ -126,7 +127,7 @@ impl AliyunDnsSolver {
             .collect::<Vec<_>>()
             .join("&");
 
-        let url = format!("{}?{}", ALIYUN_DNS_API, query_string);
+        let url = format!("{ALIYUN_DNS_API}?{query_string}");
 
         debug!("Calling Aliyun API: action={}", action);
         debug!("Request URL: {}", url);
@@ -138,8 +139,7 @@ impl AliyunDnsSolver {
 
         if !status.is_success() {
             return Err(AcmeError::Dns(format!(
-                "Aliyun API error: {} - {}",
-                status, body
+                "Aliyun API error: {status} - {body}"
             )));
         }
 
@@ -219,15 +219,12 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let (_main_domain, _rr) = parse_domain(domain)?;
 
         // Find the existing record
-        let record_id = match self.find_txt_record(domain, value).await? {
-            Some(id) => id,
-            None => {
-                warn!(
-                    "No matching Aliyun DNS TXT record found for domain {}",
-                    domain
-                );
-                return Ok(());
-            }
+        let record_id = if let Some(id) = self.find_txt_record(domain, value).await? { id } else {
+            warn!(
+                "No matching Aliyun DNS TXT record found for domain {}",
+                domain
+            );
+            return Ok(());
         };
 
         info!("Deleting Aliyun DNS TXT record: RecordId={}", record_id);
@@ -276,8 +273,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(AcmeError::Dns(format!(
-                    "DNS propagation timeout for {} after {:?}",
-                    domain, timeout
+                    "DNS propagation timeout for {domain} after {timeout:?}"
                 )));
             }
 
@@ -308,7 +304,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         }
     }
 
-    fn provider_name(&self) -> &str {
+    fn provider_name(&self) -> &'static str {
         "aliyun"
     }
 }
@@ -505,8 +501,7 @@ mod aliyun_tests {
                 dns_names
                     .iter()
                     .any(|n| n == "*.example.com" || n == "example.com"),
-                "Certificate SAN should contain *.example.com or example.com, got: {:?}",
-                dns_names
+                "Certificate SAN should contain *.example.com or example.com, got: {dns_names:?}"
             );
 
             // 验证证书未过期
@@ -537,7 +532,7 @@ mod aliyun_tests {
             assert!(account_path.exists(), "account.json should be saved");
 
             // 清理由 TempDir drop 自动处理
-            println!("✅ ACME DNS-01 e2e test passed for domain: {}", TEST_DOMAIN);
+            println!("✅ ACME DNS-01 e2e test passed for domain: {TEST_DOMAIN}");
         }
 
         /// 测试阿里云 DNS TXT 记录的创建和删除
@@ -560,7 +555,7 @@ mod aliyun_tests {
 
             // 等待传播
             solver
-                .wait_for_propagation(domain, value, std::time::Duration::from_secs(60))
+                .wait_for_propagation(domain, value, std::time::Duration::from_mins(1))
                 .await
                 .expect("DNS propagation failed");
 

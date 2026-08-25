@@ -22,7 +22,7 @@ use crate::db::agent::AgentWorkspaceRecord;
 use super::super::pump::run_stdio_pump;
 use super::super::{AcpBridge, SpawnedAgent, READY_TIMEOUT, SPAWN_TIMEOUT};
 
-use super::*;
+use super::current_ws_tx;
 
 impl AcpBridge {
     /// 惰性确保 session 就绪：stdio pump → LLM 代理 → agent 进程 → ACP handshake。

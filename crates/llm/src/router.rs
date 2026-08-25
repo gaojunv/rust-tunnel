@@ -17,6 +17,7 @@ pub enum UpstreamProtocol {
 ///
 /// - `"responses"` → [`UpstreamProtocol::Responses`]
 /// - 其余值 / 缺失 / JSON 解析失败 → [`UpstreamProtocol::ChatCompletions`]（默认）
+#[must_use] 
 pub fn parse_upstream_protocol(extra_config: Option<&str>) -> UpstreamProtocol {
     let Some(ec) = extra_config else {
         return UpstreamProtocol::ChatCompletions;
@@ -47,9 +48,9 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ModelNotFound(m) => write!(f, "model '{}' not found", m),
-            Self::ProviderDisabled(m) => write!(f, "provider for model '{}' is disabled", m),
-            Self::Db(e) => write!(f, "{}", e),
+            Self::ModelNotFound(m) => write!(f, "model '{m}' not found"),
+            Self::ProviderDisabled(m) => write!(f, "provider for model '{m}' is disabled"),
+            Self::Db(e) => write!(f, "{e}"),
         }
     }
 }
@@ -143,7 +144,7 @@ pub async fn resolve_with_failover(
             provider: provider.clone(),
             model_name: m.model_name.clone(),
             model_id: m.id.clone(),
-            priority: *priority as i64,
+            priority: i64::from(*priority),
             upstream_protocol: parse_upstream_protocol(m.extra_config.as_deref()),
         });
     }

@@ -92,7 +92,7 @@ async fn exec_on_client_impl(
             std::time::Duration::from_secs((timeout_secs + 30).min(3630))
         }
         AgentCommand::Shell { .. } => std::time::Duration::from_secs(150),
-        _ => std::time::Duration::from_secs(120),
+        _ => std::time::Duration::from_mins(2),
     };
     // 只读命令跳过 workspace_lock（锁保护 git 状态安全与写互斥，只读并发无此需要）。
     // 先获取 Mutex（保持存活），再 lock（Guard 取引用）：两层分离使

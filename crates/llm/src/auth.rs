@@ -71,6 +71,7 @@ fn sha256_hex(input: &str) -> String {
 
 /// Generate a new API key in sk- format.
 /// Returns (full_key, hash, prefix).
+#[must_use] 
 pub fn generate_api_key() -> (String, String, String) {
     let random_bytes: [u8; 24] = rand::random();
     let key = format!("sk-{}", hex::encode(random_bytes));

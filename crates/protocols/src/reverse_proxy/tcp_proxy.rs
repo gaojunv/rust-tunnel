@@ -13,6 +13,7 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     /// Create a new TCP proxy
+    #[must_use] 
     pub fn new(state: ReverseProxyState) -> Self {
         Self { state }
     }
@@ -43,36 +44,27 @@ impl TcpProxy {
                 rules.get(&rule_id).and_then(|r| r.domains.first().cloned())
             });
 
-            match domain {
-                Some(domain) => match self.state.cert_provider() {
-                    Some(provider) => match provider.get_tls_server_config(&domain).await {
-                        Some(config) => {
-                            info!("TCP proxy TLS enabled for domain '{}'", domain);
-                            Some(TlsAcceptor::from(config))
-                        }
-                        None => {
-                            warn!(
-                                "No certificate found for domain '{}' on rule {}, running without TLS",
-                                domain, rule_id
-                            );
-                            None
-                        }
-                    },
-                    None => {
-                        warn!(
-                            "TLS enabled for rule {} but no certificate provider configured, running without TLS",
-                            rule_id
-                        );
-                        None
-                    }
-                },
-                None => {
-                    warn!(
-                        "TLS enabled for rule {} but no domain configured, running without TLS",
-                        rule_id
-                    );
-                    None
-                }
+            if let Some(domain) = domain { if let Some(provider) = self.state.cert_provider() { if let Some(config) = provider.get_tls_server_config(&domain).await {
+                info!("TCP proxy TLS enabled for domain '{}'", domain);
+                Some(TlsAcceptor::from(config))
+            } else {
+                warn!(
+                    "No certificate found for domain '{}' on rule {}, running without TLS",
+                    domain, rule_id
+                );
+                None
+            } } else {
+                warn!(
+                    "TLS enabled for rule {} but no certificate provider configured, running without TLS",
+                    rule_id
+                );
+                None
+            } } else {
+                warn!(
+                    "TLS enabled for rule {} but no domain configured, running without TLS",
+                    rule_id
+                );
+                None
             }
         } else {
             None
@@ -196,6 +188,7 @@ pub struct UdpProxy {
 
 impl UdpProxy {
     /// Create a new UDP proxy
+    #[must_use] 
     pub fn new(state: ReverseProxyState) -> Self {
         Self { state }
     }
@@ -253,7 +246,7 @@ impl UdpProxy {
                                                 );
                                             }
                                         }
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                                             debug!("UDP response timeout from backend");
                                         }
                                     }

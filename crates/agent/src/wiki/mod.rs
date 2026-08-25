@@ -79,6 +79,7 @@ pub const WIKI_LIST_MAX_CHARS: usize = 4096;
 
 /// 归一化 Wiki 容器名：trim + to_lowercase（大小写不敏感，作用域去重与工具寻址都基于此）。
 #[cfg(feature = "rag")]
+#[must_use] 
 pub fn normalize_wiki_name(name: &str) -> String {
     name.trim().to_lowercase()
 }

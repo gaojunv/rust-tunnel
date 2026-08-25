@@ -66,7 +66,7 @@ pub async fn handle_responses(
 
     let stream = body
         .get("stream")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // RAG 知识库查询（同 openai_handler）

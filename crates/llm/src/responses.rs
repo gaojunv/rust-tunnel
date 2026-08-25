@@ -413,6 +413,7 @@ impl Default for ChatToResponsesSseTranslator {
 }
 
 impl ChatToResponsesSseTranslator {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -648,7 +649,7 @@ impl ChatToResponsesSseTranslator {
             .and_then(Value::as_str)
         {
             // 收集 usage（可能在 finish chunk 上）
-            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+            if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
                 self.usage = Some(chunk["usage"].clone());
             }
             self.finish_reason = Some(reason.to_string());
@@ -1384,6 +1385,7 @@ impl Default for ResponsesToChatSseTranslator {
 }
 
 impl ResponsesToChatSseTranslator {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -1578,12 +1580,11 @@ impl ResponsesToChatSseTranslator {
                 let has_fc = resp
                     .get("output")
                     .and_then(Value::as_array)
-                    .map(|arr| {
+                    .is_some_and(|arr| {
                         arr.iter().any(|item| {
                             item.get("type").and_then(Value::as_str) == Some("function_call")
                         })
-                    })
-                    .unwrap_or(false);
+                    });
                 let finish_reason = if status == "incomplete" {
                     "length"
                 } else if has_fc {
@@ -1716,6 +1717,7 @@ fn push_chat_chunk(out: &mut String, chunk: &Value) {
 /// 结构与 [`super::format::convert_openai_stream_to_anthropic`] 一致：
 /// 用 [`ChatToResponsesSseTranslator`] 包装字节流，每个上游字节块喂入翻译器，
 /// 返回的字节直接发给客户端。
+#[must_use] 
 pub fn convert_openai_stream_to_responses(
     openai_resp: axum::response::Response,
 ) -> axum::response::Response {

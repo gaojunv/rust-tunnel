@@ -19,6 +19,7 @@ pub struct ChallengeServer {
 
 impl ChallengeServer {
     /// Create a new challenge server
+    #[must_use] 
     pub fn new(state: AcmeState, port: u16) -> Self {
         Self { state, port }
     }
@@ -53,14 +54,11 @@ async fn handle_challenge(
     State(state): State<AcmeState>,
     Path(token): Path<String>,
 ) -> impl IntoResponse {
-    match state.get_challenge(&token).await {
-        Some(authorization) => {
-            info!("Serving ACME challenge for token: {}", token);
-            (StatusCode::OK, authorization)
-        }
-        None => {
-            warn!("ACME challenge not found for token: {}", token);
-            (StatusCode::NOT_FOUND, "Challenge not found".to_string())
-        }
+    if let Some(authorization) = state.get_challenge(&token).await {
+        info!("Serving ACME challenge for token: {}", token);
+        (StatusCode::OK, authorization)
+    } else {
+        warn!("ACME challenge not found for token: {}", token);
+        (StatusCode::NOT_FOUND, "Challenge not found".to_string())
     }
 }

@@ -21,7 +21,7 @@ impl Database {
         buffer_size: usize,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO reverse_proxy_config (id, max_connections, connection_timeout_secs, buffer_size, updated_at)
             VALUES (1, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
@@ -29,9 +29,9 @@ impl Database {
                 connection_timeout_secs = excluded.connection_timeout_secs,
                 buffer_size = excluded.buffer_size,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
-        .bind(max_connections as i64)
+        .bind(i64::from(max_connections))
         .bind(connection_timeout_secs as i64)
         .bind(buffer_size as i64)
         .execute(&self.pool)

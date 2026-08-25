@@ -113,8 +113,7 @@ pub(super) fn build_upstream_request(
     let pq = parts
         .uri
         .path_and_query()
-        .map(hyper::http::uri::PathAndQuery::as_str)
-        .unwrap_or("/");
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
     use super::super::{BackendProtocol, BackendScheme};
     let scheme = match backend.scheme {
         BackendScheme::Http => "http",

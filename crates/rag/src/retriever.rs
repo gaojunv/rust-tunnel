@@ -15,10 +15,11 @@ pub struct RetrievedChunk {
 }
 
 /// 丢弃低于阈值的命中。
+#[must_use] 
 pub fn filter_by_threshold(chunks: Vec<RetrievedChunk>, threshold: f64) -> Vec<RetrievedChunk> {
     chunks
         .into_iter()
-        .filter(|c| (c.score as f64) >= threshold)
+        .filter(|c| f64::from(c.score) >= threshold)
         .collect()
 }
 
@@ -57,8 +58,7 @@ pub async fn retrieve(
     let score_of = |id: &str| {
         hits.iter()
             .find(|h| h.id == id)
-            .map(|h| h.score)
-            .unwrap_or(0.0)
+            .map_or(0.0, |h| h.score)
     };
     let mut out: Vec<RetrievedChunk> = chunks
         .into_iter()
@@ -85,6 +85,7 @@ pub const MAX_SYSTEM_MESSAGE_TOKENS: usize = 8000;
 ///
 /// 按 `chars / 4` 近似累计 token，超过 [`MAX_SYSTEM_MESSAGE_TOKENS`] 后
 /// 停止追加后续 chunk（只保留完整 chunk，绝不切断某个 chunk 的内容）。
+#[must_use] 
 pub fn build_system_message(chunks: &[RetrievedChunk]) -> String {
     let mut s = String::from(
         "<knowledge_base>\n以下是可参考的背景资料，请优先依据它们回答；若与问题无关可忽略。\n",

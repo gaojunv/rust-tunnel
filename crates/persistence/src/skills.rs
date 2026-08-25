@@ -76,12 +76,12 @@ impl Database {
         source_trigger: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO agent_skills (
                 id, name, description, content, scope_type, client_id, workspace_id, tags,
                 source_session_id, source_trigger
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(id)
         .bind(name)

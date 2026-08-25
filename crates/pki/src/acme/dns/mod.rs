@@ -54,6 +54,7 @@ pub struct DnsProviderRegistry {
 }
 
 impl DnsProviderRegistry {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             providers: Vec::new(),
@@ -64,13 +65,15 @@ impl DnsProviderRegistry {
         self.providers.push(provider);
     }
 
+    #[must_use] 
     pub fn get_provider(&self, name: &str) -> Option<&dyn DnsChallengeSolver> {
         self.providers
             .iter()
             .find(|p| p.provider_name() == name)
-            .map(|p| p.as_ref())
+            .map(std::convert::AsRef::as_ref)
     }
 
+    #[must_use] 
     pub fn list_providers(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.provider_name()).collect()
     }

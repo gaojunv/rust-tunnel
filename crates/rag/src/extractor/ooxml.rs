@@ -90,17 +90,14 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
                 in_paragraph = false;
                 let text = para_text.trim();
                 if !text.is_empty() {
-                    match para_heading {
-                        Some(level) => {
-                            out.push_str(&"#".repeat(level.min(6)));
-                            out.push(' ');
-                            out.push_str(text);
-                            out.push_str("\n\n");
-                        }
-                        None => {
-                            out.push_str(text);
-                            out.push_str("\n\n");
-                        }
+                    if let Some(level) = para_heading {
+                        out.push_str(&"#".repeat(level.min(6)));
+                        out.push(' ');
+                        out.push_str(text);
+                        out.push_str("\n\n");
+                    } else {
+                        out.push_str(text);
+                        out.push_str("\n\n");
                     }
                 }
             }
@@ -133,7 +130,7 @@ fn apply_pstyle(para_heading: &mut Option<usize>, elem: &BytesStart<'_>) {
 /// "Heading1" → Some(1)；其余（含纯数字、中文样式名）→ None。
 /// w:pStyle 的 w:val 是内部 styleId（内置标题始终为 HeadingN，与 UI 语言无关）。
 fn parse_heading_level(style: &str) -> Option<usize> {
-    let digits: String = style.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits: String = style.chars().filter(char::is_ascii_digit).collect();
     if style.to_ascii_lowercase().starts_with("heading") {
         digits.parse().ok()
     } else {
@@ -229,7 +226,7 @@ fn read_sheet_names<R: Read + Seek>(
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.name().as_ref() == b"sheet" => {
+            Ok(Event::Start(e) | Event::Empty(e)) if e.name().as_ref() == b"sheet" => {
                 if let Some(name) = elem_attr(&e, b"name") {
                     names.push(name);
                 }

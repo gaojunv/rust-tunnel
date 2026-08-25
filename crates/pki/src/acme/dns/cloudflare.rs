@@ -11,6 +11,7 @@ pub struct CloudflareDnsSolver {
 }
 
 impl CloudflareDnsSolver {
+    #[must_use] 
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {
             config: config.clone(),
@@ -37,7 +38,7 @@ impl DnsChallengeSolver for CloudflareDnsSolver {
         todo!("Cloudflare DNS propagation check")
     }
 
-    fn provider_name(&self) -> &str {
+    fn provider_name(&self) -> &'static str {
         "cloudflare"
     }
 }

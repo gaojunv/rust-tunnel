@@ -67,19 +67,19 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = TunnelError::Protocol("test error".into());
-        assert_eq!(format!("{}", err), "Protocol error: test error");
+        assert_eq!(format!("{err}"), "Protocol error: test error");
 
         let err = TunnelError::Config("invalid config".into());
-        assert_eq!(format!("{}", err), "Configuration error: invalid config");
+        assert_eq!(format!("{err}"), "Configuration error: invalid config");
 
         let err = TunnelError::ControlChannel("channel failed".into());
-        assert_eq!(format!("{}", err), "Control channel error: channel failed");
+        assert_eq!(format!("{err}"), "Control channel error: channel failed");
 
         let err = TunnelError::ConnectionClosed;
-        assert_eq!(format!("{}", err), "Connection closed by peer");
+        assert_eq!(format!("{err}"), "Connection closed by peer");
 
         let err = TunnelError::Timeout;
-        assert_eq!(format!("{}", err), "Timeout");
+        assert_eq!(format!("{err}"), "Timeout");
     }
 
     #[test]
@@ -109,25 +109,25 @@ mod tests {
     #[test]
     fn test_protocol_error_display() {
         let err = TunnelError::Protocol("invalid message".into());
-        assert_eq!(format!("{}", err), "Protocol error: invalid message");
+        assert_eq!(format!("{err}"), "Protocol error: invalid message");
     }
 
     #[test]
     fn test_tls_error_display() {
         let err = TunnelError::Tls("handshake failed".into());
-        assert_eq!(format!("{}", err), "TLS error: handshake failed");
+        assert_eq!(format!("{err}"), "TLS error: handshake failed");
     }
 
     #[test]
     fn test_config_error_display() {
         let err = TunnelError::Config("missing field".into());
-        assert_eq!(format!("{}", err), "Configuration error: missing field");
+        assert_eq!(format!("{err}"), "Configuration error: missing field");
     }
 
     #[test]
     fn test_control_channel_error_display() {
         let err = TunnelError::ControlChannel("broken pipe".into());
-        assert_eq!(format!("{}", err), "Control channel error: broken pipe");
+        assert_eq!(format!("{err}"), "Control channel error: broken pipe");
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_error_debug() {
         let err = TunnelError::Protocol("test".into());
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("Protocol"));
     }
 
@@ -165,15 +165,15 @@ mod tests {
         ];
 
         for err in variants {
-            let display = format!("{}", err);
-            assert!(!display.is_empty(), "Empty display for {:?}", err);
+            let display = format!("{err}");
+            assert!(!display.is_empty(), "Empty display for {err:?}");
         }
     }
 
     #[test]
     fn test_trojan_auth_failed_display() {
         let err = TunnelError::TrojanAuthFailed(vec![1, 2, 3]);
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(display.contains("Trojan authentication failed"));
     }
 
@@ -181,7 +181,7 @@ mod tests {
     fn test_trojan_auth_failed_empty_data() {
         let err = TunnelError::TrojanAuthFailed(vec![]);
         assert!(matches!(err, TunnelError::TrojanAuthFailed(_)));
-        let display = format!("{}", err);
+        let display = format!("{err}");
         assert!(!display.is_empty());
     }
 

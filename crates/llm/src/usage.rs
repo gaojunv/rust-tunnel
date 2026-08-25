@@ -26,6 +26,7 @@ pub struct UsageInfo {
 
 impl UsageInfo {
     /// 是否解析到任何有效数据（用于判断流式是否拿到末尾 usage）。
+    #[must_use] 
     pub fn is_empty(&self) -> bool {
         self.total_tokens == 0 && self.prompt_tokens == 0 && self.completion_tokens == 0
     }
@@ -140,6 +141,7 @@ pub struct UsageSseScanner {
 }
 
 impl UsageSseScanner {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -213,24 +215,22 @@ impl UsageSseScanner {
         // ── Responses API 流式事件（response.completed / response.incomplete）──
         // data JSON 的 type 字段标识事件类型；response.completed 和 response.incomplete
         // 的 response 对象内含 usage，提取方式同非流式（openai_usage 兼容 responses 格式）。
-        match chunk.get("type").and_then(Value::as_str) {
-            Some("response.completed") | Some("response.incomplete") => {
-                if let Some(resp_usage) = chunk
-                    .get("response")
-                    .and_then(|r| r.get("usage"))
-                    .filter(|u| u.is_object())
-                {
-                    let u = extract_usage(resp_usage);
-                    if !u.is_empty() {
-                        self.latest = u;
-                    }
+        if let Some("response.completed" | "response.incomplete") = chunk.get("type").and_then(Value::as_str) {
+            if let Some(resp_usage) = chunk
+                .get("response")
+                .and_then(|r| r.get("usage"))
+                .filter(|u| u.is_object())
+            {
+                let u = extract_usage(resp_usage);
+                if !u.is_empty() {
+                    self.latest = u;
                 }
             }
-            _ => {}
         }
     }
 
     /// 结束扫描，返回收集到的 usage（可能为空）。
+    #[must_use] 
     pub fn finish(self) -> UsageInfo {
         self.latest
     }
@@ -356,7 +356,7 @@ pub async fn wrap_and_record(
 
     let status = resp.status();
     let is_stream = ctx.stream;
-    let status_code = status.as_u16() as i32;
+    let status_code = i32::from(status.as_u16());
 
     if !is_stream {
         // 缓冲整个 body（上限 16MB，与分发层一致）。

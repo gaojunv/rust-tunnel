@@ -205,42 +205,39 @@ async fn handle_one_connection(
         .fallback(any(llm_aware_proxy_dispatch))
         .with_state((source, upstream, proxy_state));
 
-    match acceptor {
-        Some(acc) => {
-            let tls_stream = match acc.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    debug!("TLS handshake failed: {}", e);
-                    return;
-                }
-            };
-            let alpn = tls_stream
-                .get_ref()
-                .1
-                .alpn_protocol()
-                .map(|p| String::from_utf8_lossy(p).into_owned());
-            debug!(peer = %peer, alpn = ?alpn, "tls handshake ok");
+    if let Some(acc) = acceptor {
+        let tls_stream = match acc.accept(stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("TLS handshake failed: {}", e);
+                return;
+            }
+        };
+        let alpn = tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).into_owned());
+        debug!(peer = %peer, alpn = ?alpn, "tls handshake ok");
 
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-            {
-                debug!("HTTPS connection error: {}", e);
-            }
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let service = hyper_util::service::TowerToHyperService::new(app.into_service());
+        if let Err(e) =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+        {
+            debug!("HTTPS connection error: {}", e);
         }
-        None => {
-            let io = hyper_util::rt::TokioIo::new(stream);
-            let service = hyper_util::service::TowerToHyperService::new(app.into_service());
-            if let Err(e) =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-            {
-                debug!("HTTP connection error: {}", e);
-            }
+    } else {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = hyper_util::service::TowerToHyperService::new(app.into_service());
+        if let Err(e) =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+        {
+            debug!("HTTP connection error: {}", e);
         }
     }
 }

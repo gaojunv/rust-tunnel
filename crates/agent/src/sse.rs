@@ -88,11 +88,13 @@ impl Default for SseAggregator {
 }
 
 impl SseAggregator {
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
 
     /// 用自定义上限构造聚合器（测试用小 limit，避免测试分配 10MB）。
+    #[must_use] 
     pub fn with_limit(limit: usize) -> Self {
         Self {
             limit,
@@ -110,6 +112,7 @@ impl SseAggregator {
     }
 
     /// 是否收到过 `data:` 前缀行（含畸形行与 [DONE]）。
+    #[must_use] 
     pub fn saw_data(&self) -> bool {
         self.saw_data
     }
@@ -149,7 +152,7 @@ impl SseAggregator {
         let mut tool_deltas: Vec<ToolCallDeltaItem> = Vec::new();
         if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in calls {
-                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let index = tc.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
                 if index >= MAX_TOOL_CALLS {
                     continue; // 恶意/畸形 index：跳过该增量，不中断流
                 }
@@ -220,7 +223,7 @@ impl SseAggregator {
         if !tool_deltas.is_empty() {
             return SseFeed::ToolCallDelta {
                 calls: tool_deltas,
-                content: content_delta.map(|s| s.to_string()),
+                content: content_delta.map(std::string::ToString::to_string),
             };
         }
 
@@ -233,7 +236,7 @@ impl SseAggregator {
                 self.reasoning.push_str(r);
                 SseFeed::Thought {
                     reasoning: r.to_string(),
-                    content: content_delta.map(|s| s.to_string()),
+                    content: content_delta.map(std::string::ToString::to_string),
                 }
             }
             _ => match content_delta {

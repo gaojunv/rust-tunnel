@@ -221,7 +221,7 @@ mod tests {
                 assert_eq!(entries.len(), 1);
                 assert_eq!(entries[0].message, "flush me");
             }
-            other => panic!("expected Some(LogBatch) within timeout, got {:?}", other),
+            other => panic!("expected Some(LogBatch) within timeout, got {other:?}"),
         }
     }
 
@@ -237,10 +237,10 @@ mod tests {
         for i in 0..50 {
             log_tx
                 .send(ClientLogEntry {
-                    timestamp: i as i64,
+                    timestamp: i64::from(i),
                     level: "INFO".into(),
                     target: "test".into(),
-                    message: format!("entry {}", i),
+                    message: format!("entry {i}"),
                 })
                 .ok();
         }
@@ -250,7 +250,7 @@ mod tests {
             Ok(Some(ControlMessage::LogBatch { entries })) => {
                 assert_eq!(entries.len(), 50);
             }
-            other => panic!("expected Some(LogBatch) within timeout, got {:?}", other),
+            other => panic!("expected Some(LogBatch) within timeout, got {other:?}"),
         }
     }
 

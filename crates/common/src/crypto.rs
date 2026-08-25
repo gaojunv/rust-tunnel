@@ -30,6 +30,7 @@ impl std::fmt::Debug for LlmCipher {
 }
 
 impl LlmCipher {
+    #[must_use] 
     pub fn from_master_key(key: [u8; 32]) -> Self {
         Self {
             cipher: Aes256Gcm::new((&key).into()),
@@ -37,6 +38,7 @@ impl LlmCipher {
     }
 
     /// 加密一个字段，返回带 `enc:v1:` 前缀的密文。
+    #[must_use] 
     pub fn encrypt(&self, plaintext: &str) -> String {
         let nonce_bytes: [u8; 12] = rand::random();
         let ciphertext = self
@@ -61,7 +63,7 @@ impl LlmCipher {
         };
         let blob = base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|e| format!("invalid ciphertext encoding: {}", e))?;
+            .map_err(|e| format!("invalid ciphertext encoding: {e}"))?;
         if blob.len() < 13 {
             return Err("ciphertext too short".into());
         }
@@ -70,16 +72,18 @@ impl LlmCipher {
             .cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
-        String::from_utf8(plaintext).map_err(|e| format!("plaintext is not UTF-8: {}", e))
+        String::from_utf8(plaintext).map_err(|e| format!("plaintext is not UTF-8: {e}"))
     }
 }
 
 /// 判断一个已存储的值是否为密文。
+#[must_use] 
 pub fn is_encrypted(stored: &str) -> bool {
     stored.starts_with(ENC_PREFIX)
 }
 
 /// 加密可选字段：有 cipher 就加密，否则原样返回（并调用方应记日志）。
+#[must_use] 
 pub fn encrypt_field(cipher: Option<&LlmCipher>, plaintext: &str) -> String {
     match cipher {
         Some(c) => c.encrypt(plaintext),

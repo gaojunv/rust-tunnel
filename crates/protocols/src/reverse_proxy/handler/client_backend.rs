@@ -153,8 +153,7 @@ pub(super) async fn handle_client_backend(
         let pq = upstream_req
             .uri()
             .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
+            .map_or("/", axum::http::uri::PathAndQuery::as_str);
         *upstream_req.uri_mut() = pq.parse().unwrap_or_else(|_| upstream_req.uri().clone());
     }
 

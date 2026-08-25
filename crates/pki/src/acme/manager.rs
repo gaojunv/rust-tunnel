@@ -852,7 +852,7 @@ mod tests {
         // 广播了 Issued 事件（tests mod 已 use super::*，CertEvent 直接在作用域内）
         match rx.try_recv() {
             Ok(CertEvent::Issued { domain }) => {
-                assert_eq!(domain, "new.example.com")
+                assert_eq!(domain, "new.example.com");
             }
             _ => panic!("expected Issued event"),
         }
@@ -886,7 +886,7 @@ mod tests {
         assert!(mgr.resolve_certified_key("mixed.example.com").is_some());
         match rx.try_recv() {
             Ok(CertEvent::Issued { domain }) => {
-                assert_eq!(domain, "mixed.example.com")
+                assert_eq!(domain, "mixed.example.com");
             }
             _ => panic!("expected Issued event"),
         }

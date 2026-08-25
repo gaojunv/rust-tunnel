@@ -439,7 +439,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         use tokio::io::AsyncWriteExt;
         client
-            .write_all(format!(r#"{{"resize_for":"{}","rows":50,"cols":120}}"#, test_id).as_bytes())
+            .write_all(format!(r#"{{"resize_for":"{test_id}","rows":50,"cols":120}}"#).as_bytes())
             .await
             .unwrap();
         client.write_all(b"\n").await.unwrap();

@@ -79,19 +79,16 @@ impl AcpBridge {
                 None => None,
             }
         };
-        match stdout_tx {
-            Some(tx) => {
-                tracing::trace!(
-                    session_id,
-                    len = data.len(),
-                    "acp spawn data routed to pump"
-                );
-                if tx.send(data).await.is_err() {
-                    tracing::debug!(session_id, "spawn data: pump closed, dropped");
-                }
+        if let Some(tx) = stdout_tx {
+            tracing::trace!(
+                session_id,
+                len = data.len(),
+                "acp spawn data routed to pump"
+            );
+            if tx.send(data).await.is_err() {
+                tracing::debug!(session_id, "spawn data: pump closed, dropped");
             }
-            None => tracing::debug!(session_id, "spawn data for missing/exited session, dropped"),
-        }
+        } else { tracing::debug!(session_id, "spawn data for missing/exited session, dropped") }
     }
 
     /// AgentSpawnExit（进程退出）：标记会话已退出；后续 prompt 报错。
@@ -99,15 +96,12 @@ impl AcpBridge {
     /// 最后），pump 排空残余字节后退出 → duplex EOF → ACP 连接随之关闭。
     async fn handle_spawn_exit(&self, session_id: &str, code: Option<i32>) {
         let mut sessions = self.sessions.lock().await;
-        match sessions.get_mut(session_id) {
-            Some(agent) => {
-                agent.exited = true;
-                agent.stdout_tx = None;
-                agent.last_activity = std::time::Instant::now();
-                tracing::info!(session_id, code, "acp agent process exited");
-            }
-            None => tracing::debug!(session_id, "spawn exit for unknown session"),
-        }
+        if let Some(agent) = sessions.get_mut(session_id) {
+            agent.exited = true;
+            agent.stdout_tx = None;
+            agent.last_activity = std::time::Instant::now();
+            tracing::info!(session_id, code, "acp agent process exited");
+        } else { tracing::debug!(session_id, "spawn exit for unknown session") }
     }
 
     /// AgentLlmProxyRequest：经内部 HTTP 回环调 LLM 网关入口（`/v1/messages`

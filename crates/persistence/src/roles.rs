@@ -52,12 +52,12 @@ impl Database {
         workspace_id: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO agent_roles (
                 id, name, description, system_prompt, tools_allow, tools_deny,
                 model_override, mode, scope_type, client_id, workspace_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(id)
         .bind(name)

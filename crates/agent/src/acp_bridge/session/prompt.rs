@@ -18,7 +18,7 @@ use agent_client_protocol::schema::v1::{
 use super::super::store::flush_acp_turn_buffers;
 use super::super::{AcpBridge, PendingPrompt, MAX_PENDING_PROMPTS};
 
-use super::*;
+use super::broadcast_ws_frame;
 
 impl AcpBridge {
     /// ACP handshake：initialize → 会话建立（session/new，或带持久化 id 时优先
@@ -431,10 +431,10 @@ impl AcpBridge {
         tokio::spawn(async move {
             tokio::select! {
                 // 优雅路径：终态回调清 busy 后 notify_waiters 唤醒，兜底不做任何事。
-                _ = cancel_notify.notified() => {}
+                () = cancel_notify.notified() => {}
                 // 超时：二次确认（仍 busy 且本代数仍被取消）才杀进程——避免误杀
                 // 已恢复的回合 / 终态回调已清 busy 的正常路径。
-                _ = tokio::time::sleep(grace) => {
+                () = tokio::time::sleep(grace) => {
                     let should_kill = {
                         let mut map = sessions.lock().await;
                         match map.get_mut(&sid) {

@@ -18,14 +18,14 @@ impl Database {
             "proxy_traffic",
             "connection_quality_history",
         ] {
-            sqlx::query(&format!("DROP TABLE IF EXISTS {}", tbl))
+            sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
                 .execute(pool)
                 .await?;
         }
 
         // Client session history
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS client_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 port INTEGER NOT NULL,
@@ -34,7 +34,7 @@ impl Database {
                 disconnected_at DATETIME,
                 duration_seconds INTEGER
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -45,7 +45,7 @@ impl Database {
             .await?;
         // Shadowsocks configuration table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS shadowsocks_config (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 port INTEGER NOT NULL UNIQUE,
@@ -55,14 +55,14 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // Trojan configuration table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS trojan_config (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 port INTEGER NOT NULL UNIQUE,
@@ -73,7 +73,7 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 updated_at DATETIME NOT NULL
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -92,7 +92,7 @@ impl Database {
 
         // Server logs table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS server_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
@@ -101,7 +101,7 @@ impl Database {
                 target TEXT NOT NULL,
                 message TEXT NOT NULL
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -115,20 +115,20 @@ impl Database {
 
         // Mesh networks table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS mesh_networks (
                 id TEXT PRIMARY KEY,
                 created_at DATETIME NOT NULL,
                 description TEXT
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // Mesh services table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS mesh_services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 mesh_id TEXT NOT NULL REFERENCES mesh_networks(id),
@@ -139,7 +139,7 @@ impl Database {
                 dns_record TEXT NOT NULL,
                 UNIQUE(mesh_id, service_name)
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -154,7 +154,7 @@ impl Database {
 
         // Proxy rules table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS proxy_rules (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -172,7 +172,7 @@ impl Database {
                 cert_covering_domain TEXT,
                 cert_status_updated_at DATETIME
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -204,7 +204,7 @@ impl Database {
 
         // ── Unified stats snapshots (replaces proxy_traffic / connection_quality_history) ──
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS stats_snapshots (
                 entity_type  TEXT NOT NULL,
                 entity_id    TEXT NOT NULL,
@@ -218,7 +218,7 @@ impl Database {
                 active_conns INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (entity_type, entity_id, timestamp)
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -239,7 +239,7 @@ impl Database {
 
         // ACME certificates table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS acme_certificates (
                 domain TEXT PRIMARY KEY,
                 status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'expired', 'failed')),
@@ -253,7 +253,7 @@ impl Database {
                 error_message TEXT,
                 created_at DATETIME NOT NULL
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -266,7 +266,7 @@ impl Database {
 
         // ACME challenges table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS acme_challenges (
                 token TEXT PRIMARY KEY,
                 domain TEXT NOT NULL,
@@ -275,7 +275,7 @@ impl Database {
                 created_at DATETIME NOT NULL,
                 expires_at DATETIME
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -297,7 +297,7 @@ impl Database {
 
         // Reverse proxy global config (singleton)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS reverse_proxy_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 max_connections INTEGER NOT NULL DEFAULT 10000,
@@ -305,41 +305,41 @@ impl Database {
                 buffer_size INTEGER NOT NULL DEFAULT 8192,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // DNS config (singleton)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS dns_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 tunnel_domain TEXT NOT NULL DEFAULT 'tunnel.local',
                 mesh_domain TEXT NOT NULL DEFAULT 'mesh.local',
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // General server settings (key-value)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS server_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // Client registry table (spec §2.1)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS clients (
                 name          TEXT PRIMARY KEY,
                 hostname      TEXT,
@@ -347,7 +347,7 @@ impl Database {
                 last_seen_at  DATETIME NOT NULL,
                 note          TEXT
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -357,13 +357,13 @@ impl Database {
 
         // Single-row server auth table (spec §2.2)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS server_auth (
                 id           INTEGER PRIMARY KEY CHECK(id = 1),
                 client_token TEXT NOT NULL,
                 updated_at   DATETIME NOT NULL
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -374,7 +374,7 @@ impl Database {
 
         // LLM providers table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_providers (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -387,14 +387,14 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // LLM models table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_models (
                 id TEXT PRIMARY KEY,
                 provider_id TEXT NOT NULL REFERENCES llm_providers(id) ON DELETE CASCADE,
@@ -405,7 +405,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -422,7 +422,7 @@ impl Database {
 
         // LLM API keys table (gateway-level keys for external callers)
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_api_keys (
                 id TEXT PRIMARY KEY,
                 key_hash TEXT NOT NULL UNIQUE,
@@ -432,7 +432,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_used_at TEXT
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -443,7 +443,7 @@ impl Database {
         // LLM usage logs table — one row per gateway request (usage stats).
         // 冗余存 *_name 列，使 Key/模型/供应商删除后历史记录仍可读。
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_usage_logs (
                 id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -466,7 +466,7 @@ impl Database {
                 latency_ms INTEGER NOT NULL DEFAULT 0,
                 error_type TEXT
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -492,7 +492,7 @@ impl Database {
 
         // LLM model groups (failover routing): 组聚合多个模型，按 priority 依次尝试
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_model_groups (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
@@ -500,28 +500,28 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // 组成员：一组多模型，priority 升序即故障转移尝试顺序
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS llm_model_group_members (
                 group_id TEXT NOT NULL REFERENCES llm_model_groups(id) ON DELETE CASCADE,
                 model_id TEXT NOT NULL REFERENCES llm_models(id) ON DELETE CASCADE,
                 priority INTEGER NOT NULL,
                 PRIMARY KEY (group_id, model_id)
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // RAG knowledge bases
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS rag_knowledge_bases (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -538,13 +538,13 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS rag_documents (
                 id TEXT PRIMARY KEY,
                 kb_id TEXT NOT NULL REFERENCES rag_knowledge_bases(id) ON DELETE CASCADE,
@@ -557,13 +557,13 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS rag_chunks (
                 id TEXT PRIMARY KEY,
                 doc_id TEXT NOT NULL REFERENCES rag_documents(id) ON DELETE CASCADE,
@@ -573,7 +573,7 @@ impl Database {
                 content TEXT NOT NULL,
                 token_count INTEGER NOT NULL DEFAULT 0
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -599,7 +599,7 @@ impl Database {
 
         // Agent workspaces
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_workspaces (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -613,14 +613,14 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
                 updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // Agent sessions
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_sessions (
                 id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL REFERENCES agent_workspaces(id) ON DELETE CASCADE,
@@ -631,14 +631,14 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
                 updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
 
         // Agent messages
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
@@ -647,7 +647,7 @@ impl Database {
                 tool_calls TEXT,
                 created_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -661,7 +661,7 @@ impl Database {
         // AI 记忆体全局设置（单行 id=1，CHECK 约束）。emb_api_key 用 LlmCipher
         // 加密存储；emb_dimension 首次 test-embedding 探测后固定，改动需清空重建。
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_memory_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 enabled INTEGER NOT NULL DEFAULT 0,
@@ -681,7 +681,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -690,7 +690,7 @@ impl Database {
         // 向量本体在 `<data_dir>/rag/memory/`（kb_id 常量 "memory"），ChunkPoint 的
         // id 与 doc_id 均取本表 id（删除走 delete_by_doc("memory", dim, memory_id)）。
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_memories (
                 id TEXT PRIMARY KEY,
                 content TEXT NOT NULL,
@@ -707,7 +707,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -730,7 +730,7 @@ impl Database {
         // （数量少、清单注入无需语义检索、按 name+scope 文本去重）——纯 SQLite + SQL，
         // embedding 未配置也能工作。作用域隔离对齐 agent_memories（global|client|workspace）。
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_skills (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -748,7 +748,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -770,7 +770,7 @@ impl Database {
         // Wiki: 容器 / 文档 / 页面 / 边 / FTS5
         // ============================================================
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_wikis (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -784,7 +784,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -800,7 +800,7 @@ impl Database {
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_wiki_docs (
                 id TEXT PRIMARY KEY,
                 wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
@@ -812,7 +812,7 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -824,7 +824,7 @@ impl Database {
             .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_wiki_pages (
                 id TEXT PRIMARY KEY,
                 wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
@@ -840,7 +840,7 @@ impl Database {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 UNIQUE(wiki_id, ref)
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -855,7 +855,7 @@ impl Database {
             .await?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_wiki_edges (
                 wiki_id TEXT NOT NULL REFERENCES agent_wikis(id) ON DELETE CASCADE,
                 src_page_id TEXT NOT NULL REFERENCES agent_wiki_pages(id) ON DELETE CASCADE,
@@ -864,7 +864,7 @@ impl Database {
                 dst_page_id TEXT REFERENCES agent_wiki_pages(id) ON DELETE SET NULL,
                 PRIMARY KEY (wiki_id, src_page_id, dst_ref)
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -920,7 +920,7 @@ impl Database {
     /// 取出执行即删行（消息本身已作为 user 消息落 agent_messages，不丢历史）。
     async fn migrate_agent_pending_prompts(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_pending_prompts (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -928,7 +928,7 @@ impl Database {
                 refs TEXT NOT NULL DEFAULT '[]',
                 created_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -1202,9 +1202,8 @@ impl Database {
                     .iter()
                     .max_by(|a, b| {
                         a.2.as_deref()
-                            .map(str::len)
-                            .unwrap_or(0)
-                            .cmp(&b.2.as_deref().map(str::len).unwrap_or(0))
+                            .map_or(0, str::len)
+                            .cmp(&b.2.as_deref().map_or(0, str::len))
                             .then(a.0.cmp(&b.0))
                     })
                     .map(|(rid, _, _)| *rid),
@@ -1319,7 +1318,7 @@ impl Database {
     /// 幂等：CREATE IF NOT EXISTS。
     async fn migrate_agent_roles(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_roles (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1337,7 +1336,7 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT (datetime('now')),
                 updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
             )
-            "#,
+            ",
         )
         .execute(pool)
         .await?;
@@ -1403,11 +1402,11 @@ impl Database {
     async fn seed_builtin_roles(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         // general：现有 SUBAGENT_SYSTEM_PROMPT 内容，全工具
         sqlx::query(
-            r#"INSERT OR IGNORE INTO agent_roles
+            r"INSERT OR IGNORE INTO agent_roles
                (id, name, description, system_prompt, mode, scope_type, is_builtin, enabled)
                VALUES (?, 'general', '通用子代理：全工具访问，适用于大多数任务',
                        'You are a helpful general-purpose AI assistant. Complete the user''s task thoroughly and accurately. Use the available tools to read, write, and modify files, run commands, and search the codebase as needed.',
-                       'subagent', 'global', 1, 1)"#,
+                       'subagent', 'global', 1, 1)",
         )
         .bind("role-builtin-general-0000000000000000")
         .execute(pool)
@@ -1469,7 +1468,7 @@ impl Database {
         let mut tx = pool.begin().await?;
         // Create new table with updated CHECK (including 'llm')
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE proxy_rules_new (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1487,7 +1486,7 @@ impl Database {
                 cert_covering_domain TEXT,
                 cert_status_updated_at DATETIME
             )
-            "#,
+            ",
         )
         .execute(&mut *tx)
         .await?;

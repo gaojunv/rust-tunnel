@@ -29,12 +29,12 @@ pub async fn start_shadowsocks_listener(
     if !registry.register_shadowsocks(port, cipher, password).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            format!("Port {} already in use", port),
+            format!("Port {port} already in use"),
         )
         .into());
     }
 
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Shadowsocks listener started on {}", bind_addr);
 
@@ -64,12 +64,12 @@ pub async fn start_shadowsocks_listener_with_abort(
     if !registry.register_shadowsocks(port, cipher, password).await {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            format!("Port {} already in use", port),
+            format!("Port {port} already in use"),
         )
         .into());
     }
 
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Shadowsocks listener started on {}", bind_addr);
 
@@ -180,12 +180,12 @@ pub async fn start_trojan_listener(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            format!("Port {} already in use", port),
+            format!("Port {port} already in use"),
         )
         .into());
     }
 
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Trojan TLS listener started on {}", bind_addr);
 
@@ -230,12 +230,12 @@ pub async fn start_trojan_listener_with_abort(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            format!("Port {} already in use", port),
+            format!("Port {port} already in use"),
         )
         .into());
     }
 
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Trojan TLS listener started on {}", bind_addr);
 
@@ -283,12 +283,9 @@ async fn handle_inbound_connection(
     user_stream: TcpStream,
 ) -> TunnelResult<()> {
     // Get port info
-    let port_info = match registry.get_port(remote_port).await {
-        Some(info) => info,
-        None => {
-            warn!("No port registered for {}, closing connection", remote_port);
-            return Ok(());
-        }
+    let port_info = if let Some(info) = registry.get_port(remote_port).await { info } else {
+        warn!("No port registered for {}, closing connection", remote_port);
+        return Ok(());
     };
 
     match port_info {

@@ -93,8 +93,8 @@ mod tests {
         let db = create_test_db().await;
         let now = chrono::Utc::now();
         let ts = now
-            - chrono::Duration::seconds(now.second() as i64)
-            - chrono::Duration::nanoseconds(now.nanosecond() as i64);
+            - chrono::Duration::seconds(i64::from(now.second()))
+            - chrono::Duration::nanoseconds(i64::from(now.nanosecond()));
         // Insert test data directly
         sqlx::query(
             "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -147,8 +147,8 @@ mod tests {
         let db = create_test_db().await;
         let now = chrono::Utc::now();
         let ts = now
-            - chrono::Duration::seconds(now.second() as i64)
-            - chrono::Duration::nanoseconds(now.nanosecond() as i64);
+            - chrono::Duration::seconds(i64::from(now.second()))
+            - chrono::Duration::nanoseconds(i64::from(now.nanosecond()));
         sqlx::query(
             "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -236,9 +236,9 @@ mod tests {
                 "INSERT INTO stats_snapshots (entity_type, entity_id, timestamp, bytes_in, bytes_out, bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind("proxy")
-            .bind(format!("rule{}", idx))
+            .bind(format!("rule{idx}"))
             .bind(ts)
-            .bind(idx as i64 * 100)
+            .bind(i64::from(idx) * 100)
             .bind(0_i64)
             .bind(0.0_f64)
             .bind(0.0_f64)

@@ -17,13 +17,13 @@ impl Database {
 
     pub async fn save_server_auth(&self, token: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO server_auth (id, client_token, updated_at)
             VALUES (1, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 client_token = excluded.client_token,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
         .bind(token)
         .bind(Utc::now())

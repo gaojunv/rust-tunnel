@@ -15,13 +15,13 @@ impl Database {
     /// Save a server setting (upsert)
     pub async fn save_server_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO server_settings (key, value, updated_at)
             VALUES (?, ?, datetime('now'))
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
         .bind(key)
         .bind(value)

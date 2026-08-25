@@ -27,6 +27,7 @@ pub struct AcmeClient {
 
 impl AcmeClient {
     /// Create a new ACME client
+    #[must_use] 
     pub fn new(
         state: AcmeState,
         server_url: String,

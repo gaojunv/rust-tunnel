@@ -8,6 +8,7 @@ pub const VALID_PROVIDER_TYPES: [&str; 4] = ["deepseek", "volcengine", "kimi", "
 
 /// 各 provider_type 的默认 Base URL。
 /// `mimo` 无默认端点，必须由用户提供。
+#[must_use] 
 pub fn default_base_url(provider_type: &str) -> Option<&'static str> {
     match provider_type {
         "deepseek" => Some("https://api.deepseek.com"),
@@ -17,6 +18,7 @@ pub fn default_base_url(provider_type: &str) -> Option<&'static str> {
     }
 }
 
+#[must_use] 
 pub fn is_valid_provider_type(provider_type: &str) -> bool {
     VALID_PROVIDER_TYPES.contains(&provider_type)
 }
@@ -30,7 +32,7 @@ pub fn resolve_base_url(provider_type: &str, base_url: &str) -> Result<String, S
     }
     default_base_url(provider_type)
         .map(str::to_string)
-        .ok_or_else(|| format!("base_url is required for provider_type '{}'", provider_type))
+        .ok_or_else(|| format!("base_url is required for provider_type '{provider_type}'"))
 }
 
 #[cfg(test)]

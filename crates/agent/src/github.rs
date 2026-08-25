@@ -51,6 +51,7 @@ pub struct GitHubClient {
 impl GitHubClient {
     /// 构造客户端。`base_url` 可注入覆盖（测试指向本地 axum mock）；
     /// `token` 为 GitHub fine-grained / classic PAT，仅进 Authorization 头。
+    #[must_use] 
     pub fn new(base_url: &str, token: &str) -> Self {
         Self {
             client: reqwest::Client::builder()
@@ -345,7 +346,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     fn client(base: &str) -> GitHubClient {

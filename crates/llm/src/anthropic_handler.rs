@@ -198,84 +198,80 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
             .to_string();
         let parsed = msg
             .get("content")
-            .map(parse_anthropic_content)
-            .unwrap_or(ParsedContent {
+            .map_or(ParsedContent {
                 text: String::new(),
                 thinking: String::new(),
                 tool_uses: Vec::new(),
                 tool_results: Vec::new(),
-            });
+            }, parse_anthropic_content);
 
-        match role.as_str() {
-            "assistant" => {
-                seen_non_system = true;
-                // assistant 消息：文本与 tool_use 可共存，映射到同一条 message。
-                let content = if parsed.text.is_empty() {
-                    None
-                } else {
-                    Some(parsed.text)
-                };
-                let reasoning_content = if parsed.thinking.is_empty() {
-                    None
-                } else {
-                    Some(parsed.thinking)
-                };
-                let tool_calls = if parsed.tool_uses.is_empty() {
-                    None
-                } else {
-                    Some(parsed.tool_uses)
-                };
-                // 只有当至少一个字段有值时才推入（防止全空消息）。
-                if content.is_some() || reasoning_content.is_some() || tool_calls.is_some() {
-                    all_messages.push(ChatMessage {
-                        role,
-                        content,
-                        reasoning_content,
-                        tool_calls,
-                        tool_call_id: None,
-                        name: None,
-                    });
-                }
+        if role.as_str() == "assistant" {
+            seen_non_system = true;
+            // assistant 消息：文本与 tool_use 可共存，映射到同一条 message。
+            let content = if parsed.text.is_empty() {
+                None
+            } else {
+                Some(parsed.text)
+            };
+            let reasoning_content = if parsed.thinking.is_empty() {
+                None
+            } else {
+                Some(parsed.thinking)
+            };
+            let tool_calls = if parsed.tool_uses.is_empty() {
+                None
+            } else {
+                Some(parsed.tool_uses)
+            };
+            // 只有当至少一个字段有值时才推入（防止全空消息）。
+            if content.is_some() || reasoning_content.is_some() || tool_calls.is_some() {
+                all_messages.push(ChatMessage {
+                    role,
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                    tool_call_id: None,
+                    name: None,
+                });
             }
-            _ => {
-                // user / 其它角色：tool_result 展开成独立 `role="tool"` 消息，
-                // 文本正常挂到 user 消息。
-                //
-                // 关键顺序：tool 消息必须先于 user 文本输出。
-                // OpenAI 要求 assistant(tool_calls) 后紧跟 tool 消息，
-                // 如果 text 先输出会插入一条 user 消息打断这个序列，
-                // 导致上游返回 400（"insufficient tool messages following
-                // tool_calls message"）。
-                //
-                // 中段 system（seen_non_system 之后）降级为 user，见上方注释。
-                let effective_role = if role == "system" && seen_non_system {
-                    "user"
-                } else {
-                    role.as_str()
-                };
-                if role != "system" {
-                    seen_non_system = true;
-                }
-                for tr in parsed.tool_results {
-                    all_messages.push(ChatMessage {
-                        role: "tool".to_string(),
-                        content: Some(tr.content),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: Some(tr.tool_call_id),
-                        name: None,
-                    });
-                }
-                if !parsed.text.is_empty() {
-                    all_messages.push(ChatMessage::text(effective_role, parsed.text));
-                }
+        } else {
+            // user / 其它角色：tool_result 展开成独立 `role="tool"` 消息，
+            // 文本正常挂到 user 消息。
+            //
+            // 关键顺序：tool 消息必须先于 user 文本输出。
+            // OpenAI 要求 assistant(tool_calls) 后紧跟 tool 消息，
+            // 如果 text 先输出会插入一条 user 消息打断这个序列，
+            // 导致上游返回 400（"insufficient tool messages following
+            // tool_calls message"）。
+            //
+            // 中段 system（seen_non_system 之后）降级为 user，见上方注释。
+            let effective_role = if role == "system" && seen_non_system {
+                "user"
+            } else {
+                role.as_str()
+            };
+            if role != "system" {
+                seen_non_system = true;
+            }
+            for tr in parsed.tool_results {
+                all_messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(tr.content),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: Some(tr.tool_call_id),
+                    name: None,
+                });
+            }
+            if !parsed.text.is_empty() {
+                all_messages.push(ChatMessage::text(effective_role, parsed.text));
             }
         }
     }
 
     let stream = body
         .get("stream")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     let tools = body
@@ -325,13 +321,13 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
         stream,
         max_tokens: body
             .get("max_tokens")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|v| v as u32),
         temperature: body
             .get("temperature")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .map(|v| v as f32),
-        top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+        top_p: body.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
         tools,
         tool_choice,
         raw_body: Some(passthrough),
@@ -392,7 +388,7 @@ pub async fn handle_messages(
 
     let is_stream = body
         .get("stream")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // 用量采集上下文
@@ -1528,7 +1524,7 @@ mod tests {
         let emb_app = Router::new().route(
             "/embeddings",
             post(|body: axum::Json<serde_json::Value>| async move {
-                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let n = body["input"].as_array().map_or(1, std::vec::Vec::len);
                 let data: Vec<_> = (0..n)
                     .map(|i| {
                         serde_json::json!({
@@ -1682,7 +1678,7 @@ mod tests {
                 });
             }
         });
-        (format!("http://{}", addr), captured, hits)
+        (format!("http://{addr}"), captured, hits)
     }
 
     /// 从捕获的原始 HTTP 请求文本提取 JSON body。

@@ -18,14 +18,14 @@ impl Database {
         mesh_domain: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO dns_config (id, tunnel_domain, mesh_domain, updated_at)
             VALUES (1, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
                 tunnel_domain = excluded.tunnel_domain,
                 mesh_domain = excluded.mesh_domain,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
         .bind(tunnel_domain)
         .bind(mesh_domain)

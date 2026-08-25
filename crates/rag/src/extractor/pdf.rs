@@ -77,7 +77,7 @@ mod tests {
     fn rejects_garbage() {
         assert!(matches!(
             pdf_to_markdown(b"not a pdf at all"),
-            Err(ExtractError::ParseFailed(_)) | Err(ExtractError::InvalidFormat(_))
+            Err(ExtractError::ParseFailed(_) | ExtractError::InvalidFormat(_))
         ));
     }
 

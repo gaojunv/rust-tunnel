@@ -55,7 +55,7 @@ impl UpstreamClient {
     /// Panics if the system's native root store cannot be loaded.
     #[must_use]
     pub fn new() -> Self {
-        let idle = Duration::from_secs(60);
+        let idle = Duration::from_mins(1);
         let ka = Duration::from_secs(30);
 
         let plain_conn = HttpConnector::new();

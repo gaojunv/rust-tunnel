@@ -27,6 +27,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
+    #[must_use] 
     pub fn as_str(&self) -> &'static str {
         match self {
             EntityType::Client => "client",
@@ -91,7 +92,7 @@ impl EntityStats {
         self.bytes_out += bytes_out;
         self.rate_window
             .push_back((Instant::now(), self.bytes_in, self.bytes_out));
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+        let cutoff = Instant::now().checked_sub(std::time::Duration::from_mins(1)).unwrap();
         while self
             .rate_window
             .front()
@@ -160,6 +161,7 @@ pub struct StatsCollector {
 
 impl StatsCollector {
     /// Create a new collector. `db` may be None for in-memory-only mode.
+    #[must_use] 
     pub fn new(db: Option<Database>) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -170,6 +172,7 @@ impl StatsCollector {
     }
 
     /// Get a receiver for SSE streaming.
+    #[must_use] 
     pub fn subscribe(&self) -> broadcast::Receiver<StatsSnapshot> {
         self.tx.subscribe()
     }
@@ -248,10 +251,10 @@ impl StatsCollector {
         if let Some(ref db) = self.db {
             for snap in &snapshots {
                 if let Err(e) = sqlx::query(
-                    r#"INSERT OR REPLACE INTO stats_snapshots
+                    r"INSERT OR REPLACE INTO stats_snapshots
                        (entity_type, entity_id, timestamp, bytes_in, bytes_out,
                         bytes_in_rate, bytes_out_rate, rtt_ms, loss_pct, active_conns)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&snap.entity_type)
                 .bind(&snap.entity_id)
@@ -282,6 +285,7 @@ impl StatsCollector {
     }
 
     /// Build a summary of current stats (in-memory only, no DB query).
+    #[must_use] 
     pub fn get_summary(&self) -> StatsSummary {
         let map = self.inner.lock().unwrap();
         let mut summary = StatsSummary::default();
@@ -355,7 +359,7 @@ mod tests {
             let mut map = c.inner.lock().unwrap();
             let key = (EntityType::Proxy, "r1".to_string());
             let entry = map.entry(key).or_insert_with(EntityStats::new);
-            let past = Instant::now() - std::time::Duration::from_secs(10);
+            let past = Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
             entry.rate_window.clear();
             entry.bytes_out = 10000;
             entry.rate_window.push_back((past, 0, 0));

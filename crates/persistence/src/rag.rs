@@ -67,13 +67,13 @@ impl Database {
         enabled: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO rag_knowledge_bases (
                 id, name, description, emb_base_url, emb_api_key, emb_model,
                 emb_dimension, top_k, chunk_size, chunk_overlap, score_threshold,
                 enabled, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-            "#,
+            ",
         )
         .bind(id)
         .bind(name)
@@ -86,7 +86,7 @@ impl Database {
         .bind(chunk_size)
         .bind(chunk_overlap)
         .bind(score_threshold)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -126,12 +126,12 @@ impl Database {
         score_threshold: f64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             UPDATE rag_knowledge_bases
             SET name = ?, description = ?, top_k = ?, chunk_size = ?, chunk_overlap = ?,
                 score_threshold = ?, updated_at = datetime('now')
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(name)
         .bind(description)
@@ -165,13 +165,13 @@ impl Database {
         emb_dimension: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             UPDATE rag_knowledge_bases
             SET name = ?, description = ?, top_k = ?, chunk_size = ?, chunk_overlap = ?,
                 score_threshold = ?, emb_base_url = ?, emb_api_key = ?, emb_model = ?,
                 emb_dimension = ?, updated_at = datetime('now')
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(name)
         .bind(description)
@@ -193,7 +193,7 @@ impl Database {
         sqlx::query(
             "UPDATE rag_knowledge_bases SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
         )
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -221,10 +221,10 @@ impl Database {
         file_type: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO rag_documents (id, kb_id, filename, file_type, content_hash, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))
-            "#,
+            ",
         )
         .bind(id)
         .bind(kb_id)
@@ -284,11 +284,11 @@ impl Database {
         error: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             UPDATE rag_documents
             SET status = ?, chunk_count = ?, error = ?, updated_at = datetime('now')
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(status)
         .bind(chunk_count)
@@ -307,11 +307,11 @@ impl Database {
         doc_id: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r#"
+            r"
             UPDATE rag_documents
             SET status = 'pending', chunk_count = 0, error = NULL, updated_at = datetime('now')
             WHERE id = ? AND status NOT IN ('pending', 'processing')
-            "#,
+            ",
         )
         .bind(doc_id)
         .execute(&self.pool)
@@ -325,11 +325,11 @@ impl Database {
     /// `rag_mark_document_pending_if_idle` CAS 抢占）。返回被复位的行数。
     pub async fn rag_fail_inflight_documents(&self, error: &str) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
-            r#"
+            r"
             UPDATE rag_documents
             SET status = 'failed', chunk_count = 0, error = ?, updated_at = datetime('now')
             WHERE status IN ('pending', 'processing')
-            "#,
+            ",
         )
         .bind(error)
         .execute(&self.pool)
@@ -358,10 +358,10 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         for (id, doc_id, kb_id, seq, heading_path, content, token_count) in rows {
             sqlx::query(
-                r#"
+                r"
                 INSERT INTO rag_chunks (id, doc_id, kb_id, seq, heading_path, content, token_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
+                ",
             )
             .bind(id)
             .bind(doc_id)
@@ -457,7 +457,7 @@ mod tests {
                     .fetch_one(db.pool())
                     .await
                     .unwrap();
-            assert_eq!(row.0, 1, "table {} should exist", t);
+            assert_eq!(row.0, 1, "table {t} should exist");
         }
         // llm_api_keys 有 kb_id 列
         let row: (i64,) = sqlx::query_as(

@@ -516,9 +516,7 @@ pub(super) async fn mock_acp_agent(
                     // SetSessionConfigOptionResponse 必填，缺则反序列化报错）。
                     let value = params.get("value").cloned().unwrap_or_default();
                     let value_str = value
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string());
+                        .as_str().map_or_else(|| value.to_string(), str::to_string);
                     applied.lock().await.push((config_id, value_str));
                     out_lines.push(serde_json::json!({
                         "jsonrpc": "2.0", "id": id,

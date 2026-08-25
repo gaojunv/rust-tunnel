@@ -16,7 +16,7 @@ impl Database {
         let now = Utc::now();
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO trojan_config (port, password, fallback, enabled, domain, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(port) DO UPDATE SET
@@ -25,12 +25,12 @@ impl Database {
                 enabled = excluded.enabled,
                 domain = excluded.domain,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .bind(password)
         .bind(fallback)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(domain)
         .bind(now)
         .bind(now)
@@ -59,15 +59,15 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            r#"
+            r"
             INSERT INTO trojan_config (port, password, fallback, enabled, domain, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .bind(password)
         .bind(fallback)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(domain)
         .bind(now)
         .bind(now)
@@ -81,11 +81,11 @@ impl Database {
     /// Load all Trojan configurations
     pub async fn load_trojan_configs(&self) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, TrojanConfigRecord>(
-            r#"
+            r"
             SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             ORDER BY port
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -98,12 +98,12 @@ impl Database {
         &self,
     ) -> Result<Vec<TrojanConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, TrojanConfigRecord>(
-            r#"
+            r"
             SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             WHERE enabled = 1
             ORDER BY port
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -117,13 +117,13 @@ impl Database {
         port: u16,
     ) -> Result<Option<TrojanConfigRecord>, sqlx::Error> {
         let record = sqlx::query_as::<_, TrojanConfigRecord>(
-            r#"
+            r"
             SELECT id, port, password, fallback, enabled, domain, created_at, updated_at
             FROM trojan_config
             WHERE port = ?
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .fetch_optional(&self.pool)
         .await?;
 
@@ -133,12 +133,12 @@ impl Database {
     /// Delete Trojan configuration
     pub async fn delete_trojan_config(&self, port: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             DELETE FROM trojan_config
             WHERE port = ?
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .execute(&self.pool)
         .await?;
 

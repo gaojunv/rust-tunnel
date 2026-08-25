@@ -39,6 +39,7 @@ pub struct SSConnectionContext {
 }
 
 /// Shared context for shadowsocks operations
+#[must_use] 
 pub fn create_shared_context() -> SharedContext {
     Context::new_shared(ServerType::Server)
 }
@@ -49,8 +50,7 @@ pub fn parse_cipher_kind(cipher: &str) -> TunnelResult<CipherKind> {
         "aes-256-gcm" => Ok(CipherKind::AES_256_GCM),
         "chacha20-ietf-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
         _ => Err(TunnelError::Protocol(format!(
-            "Unsupported cipher: {}",
-            cipher
+            "Unsupported cipher: {cipher}"
         ))),
     }
 }
@@ -171,7 +171,7 @@ pub async fn proxy_ss_connection(
     // Increment active SS connection count
     registry.increment_ss_connections(ss_port).await;
     // 统一统计：shadowsocks 桶活跃连接 +1（entity_id 约定为 ss:{port}）
-    let entity_id = format!("ss:{}", ss_port);
+    let entity_id = format!("ss:{ss_port}");
     stats.incr_conns(EntityType::Shadowsocks, &entity_id);
 
     // Record start time for measuring connection setup time (RTT estimate)
@@ -307,7 +307,7 @@ mod unit_tests {
             port: 8388,
         };
         // Should implement Debug
-        let debug_str = format!("{:?}", ctx);
+        let debug_str = format!("{ctx:?}");
         assert!(debug_str.contains("aes-256-gcm"));
         assert!(debug_str.contains("127.0.0.1:80"));
     }
@@ -443,9 +443,7 @@ mod tests {
             if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return;
             }
-            if start.elapsed() >= dur {
-                panic!("Timed out waiting for port {}", port);
-            }
+            assert!(start.elapsed() < dur, "Timed out waiting for port {port}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -488,7 +486,7 @@ mod tests {
         let bind_addr_len = match reply[3] {
             0x01 => 4,  // IPv4
             0x04 => 16, // IPv6
-            other => panic!("Unexpected ATYP: {}", other),
+            other => panic!("Unexpected ATYP: {other}"),
         };
         let mut bind_rest = vec![0u8; bind_addr_len + 2];
         stream.read_exact(&mut bind_rest).await.unwrap();
@@ -704,8 +702,7 @@ mod tests {
             let count = registry.get_connection_count_for_port(ss_port).await;
             assert!(
                 count >= 1,
-                "SS connection count should be >= 1 after data transfer, got {}",
-                count
+                "SS connection count should be >= 1 after data transfer, got {count}"
             );
 
             ss_local.kill().ok();

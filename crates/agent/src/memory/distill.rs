@@ -152,10 +152,10 @@ async fn do_distill(memory: MemoryState, snapshot: DistillSnapshot, trigger: Str
     if rendered.trim().is_empty() {
         return;
     }
-    let model = if !s.distill_model.trim().is_empty() {
-        s.distill_model.clone()
-    } else {
+    let model = if s.distill_model.trim().is_empty() {
         snapshot.model.clone().unwrap_or_default()
+    } else {
+        s.distill_model.clone()
     };
     let text = match call_distill_llm(&memory.llm, &model, &rendered).await {
         Ok(t) => t,
@@ -414,7 +414,7 @@ fn facts_from_value(value: &serde_json::Value) -> Result<Vec<DistillFact>, Strin
             .unwrap_or_default();
         let confidence = item
             .get("confidence")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .unwrap_or(0.8)
             .clamp(0.0, 1.0);
         facts.push(DistillFact {
@@ -445,24 +445,21 @@ fn skills_from_value(value: &serde_json::Value) -> Vec<DistillSkill> {
         let name = item
             .get("name")
             .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
+            .map_or("", str::trim);
         if name.is_empty() || name.len() > SKILL_NAME_MAX_CHARS {
             continue;
         }
         let content = item
             .get("content")
             .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
+            .map_or("", str::trim);
         if content.is_empty() || content.len() > SKILL_CONTENT_MAX_CHARS {
             continue;
         }
         let description: String = item
             .get("description")
             .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("")
+            .map_or("", str::trim)
             .chars()
             .take(SKILL_DESCRIPTION_MAX_CHARS)
             .collect();
@@ -521,6 +518,7 @@ fn strip_code_fence(raw: &str) -> String {
 
 /// 把消息列表渲染为蒸馏喂给 LLM 的纯文本（仿 compact.rs render_for_summary，
 /// 差异：tool 结果截断 600 chars、总量 ≤32KB、剥离 `<memory>` 块与 @引用包装块）。
+#[must_use] 
 pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
     let mut out = String::new();
     for m in messages {

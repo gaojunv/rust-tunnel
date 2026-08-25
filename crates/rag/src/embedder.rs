@@ -24,8 +24,8 @@ pub enum EmbedError {
 impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Http(e) => write!(f, "embedding http error: {}", e),
-            Self::Api(m) => write!(f, "embedding api error: {}", m),
+            Self::Http(e) => write!(f, "embedding http error: {e}"),
+            Self::Api(m) => write!(f, "embedding api error: {m}"),
             Self::EmptyResponse => write!(f, "embedding returned no data"),
         }
     }
@@ -45,10 +45,11 @@ pub struct Embedder {
 }
 
 impl Embedder {
+    #[must_use] 
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_mins(1))
             .build()
             .expect("failed to build embedding client");
         Self {
@@ -114,7 +115,7 @@ impl Embedder {
             let text = resp.text().await.unwrap_or_default();
             // char 安全截断：错误体可能含多字节 UTF-8，按字节切片会 panic
             let snippet = text.chars().take(300).collect::<String>();
-            return Err(EmbedError::Api(format!("status {}: {}", status, snippet)));
+            return Err(EmbedError::Api(format!("status {status}: {snippet}")));
         }
         let v: serde_json::Value = resp.json().await?;
         let mut data = v["data"]
@@ -126,7 +127,7 @@ impl Embedder {
         let mut out = Vec::with_capacity(data.len());
         for d in data {
             let vec: Vec<f32> = serde_json::from_value(d["embedding"].clone())
-                .map_err(|e| EmbedError::Api(format!("bad embedding vector: {}", e)))?;
+                .map_err(|e| EmbedError::Api(format!("bad embedding vector: {e}")))?;
             out.push(vec);
         }
         if out.is_empty() {
@@ -150,7 +151,7 @@ mod tests {
         let app = Router::new().route(
             "/embeddings",
             post(|body: Json<Value>| async move {
-                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let n = body["input"].as_array().map_or(1, std::vec::Vec::len);
                 let data: Vec<_> = (0..n)
                     .map(|i| {
                         json!({
@@ -168,7 +169,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     #[tokio::test]

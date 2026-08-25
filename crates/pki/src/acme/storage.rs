@@ -110,6 +110,7 @@ impl CertificateStorage {
     }
 
     /// Check if certificate exists for a domain
+    #[must_use] 
     pub fn has_certificate(&self, domain: &str) -> bool {
         self.domain_dir(domain).join("cert.pem").exists()
     }

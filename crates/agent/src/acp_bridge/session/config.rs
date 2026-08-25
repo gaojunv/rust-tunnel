@@ -17,7 +17,7 @@ use crate::db::agent::AgentWorkspaceRecord;
 
 use super::super::{AcpBridge, CONFIG_OPTION_TIMEOUT};
 
-use super::*;
+use super::current_ws_tx;
 
 impl AcpBridge {
     /// 切换 ACP 会话配置项：校验 config_id 在当前 options 中 → 发
@@ -138,19 +138,16 @@ impl AcpBridge {
         };
         let mut entries: Vec<(String, String)> = map
             .into_iter()
-            .filter_map(|(k, v)| match v.as_str() {
-                Some(s) => Some((k, s.to_string())),
-                None => {
-                    tracing::warn!(
-                        session_id,
-                        config_id = %k,
-                        "agent_config_overrides value not a string, skipped"
-                    );
-                    None
-                }
+            .filter_map(|(k, v)| if let Some(s) = v.as_str() { Some((k, s.to_string())) } else {
+                tracing::warn!(
+                    session_id,
+                    config_id = %k,
+                    "agent_config_overrides value not a string, skipped"
+                );
+                None
             })
             .collect();
-        entries.sort_by_key(|(k, _)| (if k == "mode" { 0 } else { 1 }, k.clone()));
+        entries.sort_by_key(|(k, _)| (i32::from(k != "mode"), k.clone()));
         for (config_id, value) in entries {
             if let Err(e) = self.set_config_option(session_id, &config_id, &value).await {
                 tracing::warn!(session_id, config_id, "apply config override skipped: {e}");
@@ -175,7 +172,7 @@ impl AcpBridge {
             .into_iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
             .collect();
-        entries.sort_by_key(|(k, _)| if k == "mode" { 0 } else { 1 });
+        entries.sort_by_key(|(k, _)| i32::from(k != "mode"));
         for (config_id, value) in entries {
             if let Err(e) = self.set_config_option(session_id, &config_id, &value).await {
                 tracing::warn!(session_id, config_id, "replay config_state skipped: {e}");

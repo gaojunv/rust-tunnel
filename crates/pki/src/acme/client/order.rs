@@ -14,7 +14,7 @@ use tracing::{info, warn};
 /// Challenge poll interval
 const CHALLENGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Maximum time to wait for challenge validation
-const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_mins(2);
 
 impl AcmeClient {
     /// Request a new certificate for a domain
@@ -89,7 +89,7 @@ impl AcmeClient {
                 auth_handle
                     .challenge(ChallengeType::Http01)
                     .ok_or_else(|| {
-                        AcmeError::msgf(format!("No HTTP-01 challenge found for domain {}", domain))
+                        AcmeError::msgf(format!("No HTTP-01 challenge found for domain {domain}"))
                     })?;
 
             // Get the key authorization response
@@ -139,8 +139,7 @@ impl AcmeClient {
                     self.state.remove_challenge(token).await;
                 }
                 return Err(AcmeError::msgf(format!(
-                    "Challenge validation timed out for domain {} after {:?}",
-                    domain, CHALLENGE_POLL_TIMEOUT
+                    "Challenge validation timed out for domain {domain} after {CHALLENGE_POLL_TIMEOUT:?}"
                 )));
             }
 
@@ -176,8 +175,7 @@ impl AcmeClient {
                     }
 
                     return Err(AcmeError::msgf(format!(
-                        "ACME order became invalid for domain {}: {}",
-                        domain, error_detail
+                        "ACME order became invalid for domain {domain}: {error_detail}"
                     )));
                 }
                 _ => {
@@ -208,7 +206,7 @@ impl AcmeClient {
         // to issue the certificate. poll_certificate handles the retry logic.
         let retry_policy = RetryPolicy::new()
             .initial_delay(Duration::from_secs(2))
-            .timeout(Duration::from_secs(120));
+            .timeout(Duration::from_mins(2));
         let cert_chain =
             order
                 .poll_certificate(&retry_policy)
@@ -366,7 +364,7 @@ impl AcmeClient {
             // Find the DNS-01 challenge
             let mut challenge_handle =
                 auth_handle.challenge(ChallengeType::Dns01).ok_or_else(|| {
-                    AcmeError::msgf(format!("No DNS-01 challenge found for domain {}", domain))
+                    AcmeError::msgf(format!("No DNS-01 challenge found for domain {domain}"))
                 })?;
 
             // Get the key authorization
@@ -388,7 +386,7 @@ impl AcmeClient {
             // For wildcard domains like *.example.com, the ACME challenge
             // domain should be _acme-challenge.example.com (without the *)
             let base_domain = domain.strip_prefix("*.").unwrap_or(domain);
-            let acme_domain = format!("_acme-challenge.{}", base_domain);
+            let acme_domain = format!("_acme-challenge.{base_domain}");
             dns_solver
                 .create_txt_record(&acme_domain, &txt_value)
                 .await
@@ -398,7 +396,7 @@ impl AcmeClient {
 
             // Wait for DNS propagation
             dns_solver
-                .wait_for_propagation(&acme_domain, &txt_value, Duration::from_secs(600))
+                .wait_for_propagation(&acme_domain, &txt_value, Duration::from_mins(10))
                 .await
                 .map_err(AcmeError::wrap("DNS propagation timeout"))?;
 
@@ -439,8 +437,7 @@ impl AcmeClient {
                     let _ = dns_solver.delete_txt_record(acme_domain, txt_value).await;
                 }
                 return Err(AcmeError::msgf(format!(
-                    "Challenge validation timed out for domain {} after {:?}",
-                    domain, CHALLENGE_POLL_TIMEOUT
+                    "Challenge validation timed out for domain {domain} after {CHALLENGE_POLL_TIMEOUT:?}"
                 )));
             }
 
@@ -478,8 +475,7 @@ impl AcmeClient {
                     }
 
                     return Err(AcmeError::msgf(format!(
-                        "ACME order became invalid for domain {}: {}",
-                        domain, error_detail
+                        "ACME order became invalid for domain {domain}: {error_detail}"
                     )));
                 }
                 _ => {
@@ -509,7 +505,7 @@ impl AcmeClient {
         // to issue the certificate. poll_certificate handles the retry logic.
         let retry_policy = RetryPolicy::new()
             .initial_delay(Duration::from_secs(2))
-            .timeout(Duration::from_secs(120));
+            .timeout(Duration::from_mins(2));
         let cert_chain =
             order
                 .poll_certificate(&retry_policy)

@@ -60,6 +60,7 @@ pub struct AcmeState {
 
 impl AcmeState {
     /// Create a new ACME state without database
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             challenges: Arc::new(RwLock::new(HashMap::new())),
@@ -69,6 +70,7 @@ impl AcmeState {
     }
 
     /// Create a new ACME state with database
+    #[must_use] 
     pub fn with_db(db: Database) -> Self {
         Self {
             challenges: Arc::new(RwLock::new(HashMap::new())),
@@ -96,6 +98,7 @@ impl AcmeState {
     }
 
     /// Get database reference
+    #[must_use] 
     pub fn db(&self) -> Option<&Database> {
         self.db.as_ref()
     }

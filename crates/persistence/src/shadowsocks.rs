@@ -15,7 +15,7 @@ impl Database {
         let now = Utc::now();
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO shadowsocks_config (port, cipher, password, enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(port) DO UPDATE SET
@@ -23,12 +23,12 @@ impl Database {
                 password = excluded.password,
                 enabled = excluded.enabled,
                 updated_at = excluded.updated_at
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .bind(cipher)
         .bind(password)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -56,15 +56,15 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            r#"
+            r"
             INSERT INTO shadowsocks_config (port, cipher, password, enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .bind(cipher)
         .bind(password)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
@@ -79,11 +79,11 @@ impl Database {
         &self,
     ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
-            r#"
+            r"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
             FROM shadowsocks_config
             ORDER BY port
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -96,12 +96,12 @@ impl Database {
         &self,
     ) -> Result<Vec<ShadowsocksConfigRecord>, sqlx::Error> {
         let records = sqlx::query_as::<_, ShadowsocksConfigRecord>(
-            r#"
+            r"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
             FROM shadowsocks_config
             WHERE enabled = 1
             ORDER BY port
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -115,13 +115,13 @@ impl Database {
         port: u16,
     ) -> Result<Option<ShadowsocksConfigRecord>, sqlx::Error> {
         let record = sqlx::query_as::<_, ShadowsocksConfigRecord>(
-            r#"
+            r"
             SELECT id, port, cipher, password, enabled, created_at, updated_at
             FROM shadowsocks_config
             WHERE port = ?
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .fetch_optional(&self.pool)
         .await?;
 
@@ -131,12 +131,12 @@ impl Database {
     /// Delete Shadowsocks configuration
     pub async fn delete_shadowsocks_config(&self, port: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             DELETE FROM shadowsocks_config
             WHERE port = ?
-            "#,
+            ",
         )
-        .bind(port as i32)
+        .bind(i32::from(port))
         .execute(&self.pool)
         .await?;
 

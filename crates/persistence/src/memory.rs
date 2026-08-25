@@ -41,6 +41,7 @@ pub struct AgentMemorySettingsRecord {
 impl AgentMemorySettingsRecord {
     /// 未配置时的默认构造（enabled=false，其余为表默认值）。`memory_get_settings`
     /// 无行时返回它；时间字段置空（表中无对应行，正常序列化为空串）。
+    #[must_use] 
     pub fn default_disabled() -> Self {
         Self {
             id: 1,
@@ -113,7 +114,7 @@ impl Database {
         // bind 序列（INSERT 列清单与下方 bind 一一对应），否则每次 upsert 会把
         // 新列重置为 DEFAULT。
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO agent_memory_settings (
                 id, enabled, emb_base_url, emb_api_key, emb_model, emb_dimension,
                 distill_model, top_k, score_threshold, inject_budget_tokens,
@@ -124,7 +125,7 @@ impl Database {
                 COALESCE((SELECT created_at FROM agent_memory_settings WHERE id = 1), datetime('now')),
                 datetime('now')
             )
-            "#,
+            ",
         )
         .bind(s.enabled)
         .bind(&s.emb_base_url)
@@ -164,12 +165,12 @@ impl Database {
         pinned: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO agent_memories (
                 id, content, scope_type, client_id, workspace_id, tags, confidence,
                 source_session_id, source_trigger, pinned
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(id)
         .bind(content)
@@ -180,7 +181,7 @@ impl Database {
         .bind(confidence)
         .bind(source_session_id)
         .bind(source_trigger)
-        .bind(pinned as i32)
+        .bind(i32::from(pinned))
         .execute(&self.pool)
         .await?;
         Ok(())

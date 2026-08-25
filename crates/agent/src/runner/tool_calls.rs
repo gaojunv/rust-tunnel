@@ -1,6 +1,6 @@
 //! 工具调用处理：参数预览/diff 合成、单调用执行、批量编排（含只读并发组）。
 
-use super::*;
+use super::{mpsc, sse, AgentState, Arc, LlmState, SessionRuntime, ParsedToolCall, with_parent, persist_message, ChatMessage, tools, subagent, SubagentFuture, record_tool_result, exec_group, AgentCommand, roles, client_supports_edit, MIN_SEARCH_PATCH_CLIENT_VERSION, client_supports_search_patch, MIN_EDIT_CLIENT_VERSION, MIN_GIT_EXEC_CLIENT_VERSION, client_supports_git_exec, MIN_READ_RANGE_CLIENT_VERSION, client_supports_read_range, AgentResult, executor, agent_result_to_text};
 
 /// 把 SseFeed::ToolCallDelta 的增量发送为 WS 帧（主循环与 flush 残留行共用）。
 /// `parent`：子 agent 归属的父 tool_call_id（主循环传 None）。

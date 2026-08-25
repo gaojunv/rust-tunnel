@@ -76,21 +76,18 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             // 的中间结果/文本），has_result ≠ 执行完成——误判 completed 会让前端
             // 在子 agent 未执行完时就打勾（问题②）。子 agent 内部工具
             // （parentToolUseId 有值）与普通工具保持原 heuristic（不回归 Bug 3）。
-            let status = match upd.fields.status {
-                Some(st) => status_str(Some(st)),
-                None => {
-                    let has_result = upd.fields.raw_output.is_some()
-                        || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
-                    if has_result {
-                        let (parent, is_subagent) = claude_code_meta(&upd.meta);
-                        if is_subagent && parent.is_none() {
-                            "running"
-                        } else {
-                            "completed"
-                        }
-                    } else {
+            let status = if let Some(st) = upd.fields.status { status_str(Some(st)) } else {
+                let has_result = upd.fields.raw_output.is_some()
+                    || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
+                if has_result {
+                    let (parent, is_subagent) = claude_code_meta(&upd.meta);
+                    if is_subagent && parent.is_none() {
                         "running"
+                    } else {
+                        "completed"
                     }
+                } else {
+                    "running"
                 }
             };
             let mut frame = serde_json::json!({
@@ -299,7 +296,7 @@ fn claude_code_meta(meta: &Option<Meta>) -> (Option<String>, bool) {
         .map(str::to_owned);
     let is_subagent = claude_code
         .and_then(|v| v.get("subagent"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     (parent, is_subagent)
 }

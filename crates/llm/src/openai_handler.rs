@@ -19,6 +19,7 @@ pub struct LlmHandlerState {
 
 impl LlmHandlerState {
     /// Return an error response in the format appropriate for the matched protocol.
+    #[must_use] 
     pub fn error_for_protocol(
         &self,
         status: StatusCode,
@@ -110,7 +111,7 @@ pub async fn handle_chat_completions(
     // Build unified request
     let stream = body
         .get("stream")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
     // api_key_id_for_rag 需在 api_key_id 稍后 move 进 ctx 之前 clone。
@@ -182,7 +183,7 @@ pub async fn handle_chat_completions(
                 }
                 return state.error_for_protocol(
                     StatusCode::BAD_REQUEST,
-                    format!("invalid messages: {}", e),
+                    format!("invalid messages: {e}"),
                     "invalid_request_error",
                 );
             }
@@ -195,13 +196,13 @@ pub async fn handle_chat_completions(
         stream,
         max_tokens: body
             .get("max_tokens")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .map(|v| v as u32),
         temperature: body
             .get("temperature")
-            .and_then(|v| v.as_f64())
+            .and_then(serde_json::Value::as_f64)
             .map(|v| v as f32),
-        top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|v| v as f32),
+        top_p: body.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
         // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
         tools: body.get("tools").and_then(|v| v.as_array()).cloned(),
         tool_choice: body.get("tool_choice").cloned(),
@@ -326,7 +327,13 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
             }
         }
 
-        if !calls.is_empty() {
+        if calls.is_empty() {
+            // 无工具调用但可能有剥离发生：仅在内容确实变化时回写
+            let joined = text_parts.join("\n");
+            if joined != content.trim() {
+                message["content"] = serde_json::Value::String(joined);
+            }
+        } else {
             let remaining = text_parts.join("\n");
             if remaining.is_empty() {
                 message["content"] = serde_json::Value::Null;
@@ -335,12 +342,6 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
             }
             message["tool_calls"] = serde_json::Value::Array(calls);
             choice["finish_reason"] = serde_json::Value::String("tool_calls".into());
-        } else {
-            // 无工具调用但可能有剥离发生：仅在内容确实变化时回写
-            let joined = text_parts.join("\n");
-            if joined != content.trim() {
-                message["content"] = serde_json::Value::String(joined);
-            }
         }
     }
 
@@ -492,7 +493,7 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                             st.id = chunk["id"].as_str().unwrap_or("").to_string();
                             st.model = chunk["model"].as_str().unwrap_or("").to_string();
                         }
-                        if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                        if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
                             st.usage_chunk = Some(chunk.clone());
                         }
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
@@ -512,7 +513,7 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                             st.queue
                                 .push_back(Bytes::from(format!("data: {payload}\n\n")));
                             // 如果原生 tool_calls chunk 也携带 usage，清除 usage_chunk 防止重复
-                            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                            if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
                                 st.usage_chunk = None;
                             }
                             continue;
@@ -523,7 +524,7 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                                 if !st.saw_finish {
                                     st.saw_finish = true;
                                     // 如果 finish chunk 已携带 usage，清除 usage_chunk 防止重复发出
-                                    if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+                                    if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
                                         st.usage_chunk = None;
                                     }
                                     st.queue
@@ -540,7 +541,7 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                         if chunk["choices"][0]["delta"]["content"].as_str().is_none()
                             && !chunk["choices"][0]["delta"]["tool_calls"].is_array()
                             && chunk["choices"][0]["finish_reason"].as_str().is_none()
-                            && !chunk.get("usage").map(|u| u.is_object()).unwrap_or(false)
+                            && !chunk.get("usage").is_some_and(serde_json::Value::is_object)
                         {
                             st.queue
                                 .push_back(Bytes::from(format!("data: {payload}\n\n")));
@@ -749,7 +750,7 @@ mod tests {
         let emb_app = Router::new().route(
             "/embeddings",
             post(|body: axum::Json<serde_json::Value>| async move {
-                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let n = body["input"].as_array().map_or(1, std::vec::Vec::len);
                 let data: Vec<_> = (0..n)
                     .map(|i| {
                         serde_json::json!({
@@ -1658,7 +1659,7 @@ mod tests {
         drop(tx);
         let mut rest = String::new();
         while let Some(item) = out.next().await {
-            rest.push_str(&String::from_utf8(item.unwrap().to_vec()).unwrap());
+            rest.push_str(core::str::from_utf8(&item.unwrap()).unwrap());
         }
         assert!(rest.contains("[DONE]"), "流应正常收尾: {rest}");
     }

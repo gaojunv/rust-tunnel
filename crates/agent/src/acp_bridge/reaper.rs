@@ -36,15 +36,15 @@ async fn broadcast_turn_timeout(sessions: &Arc<Mutex<HashMap<String, SpawnedAgen
 }
 
 /// 空闲 30 分钟杀进程（重挂 ACP 连接由客户端 spawn manager 处理）。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// reaper 检查间隔。
-const REAP_INTERVAL: Duration = Duration::from_secs(60);
+const REAP_INTERVAL: Duration = Duration::from_mins(1);
 /// 回合级看门狗：单回合超此时长即触发 session/cancel（agent 在
 /// `cancel_grace` 内不响应则复用 cancel 兜底杀进程）。模型/上游网络挂起
 /// 时避免会话永久 busy——此前只能靠 idle reaper（30min）兜底，且活动刷新
 /// 可能让挂起回合永远不被回收。10 分钟对长任务（大重构/批量文件生成）
 /// 足够宽容，对真挂起（无任何事件到达）足够快。
-const TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const TURN_TIMEOUT: Duration = Duration::from_mins(10);
 
 impl AcpBridge {
     /// 后台回收空闲 ACP agent：超 `IDLE_TIMEOUT` 未活动即移除会话表条目并

@@ -196,7 +196,7 @@ impl Database {
         enabled: bool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO llm_providers (id, name, provider_type, base_url, api_key, extra_config, anthropic_base_url, enabled, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
@@ -208,7 +208,7 @@ impl Database {
                 anthropic_base_url = excluded.anthropic_base_url,
                 enabled = excluded.enabled,
                 updated_at = datetime('now')
-            "#,
+            ",
         )
         .bind(id)
         .bind(name)
@@ -217,7 +217,7 @@ impl Database {
         .bind(api_key)
         .bind(extra_config)
         .bind(anthropic_base_url)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -236,7 +236,7 @@ impl Database {
         sqlx::query(
             "UPDATE llm_providers SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
         )
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -298,7 +298,7 @@ impl Database {
         extra_config: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO llm_models (id, provider_id, model_name, alias, tags, extra_config, enabled, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET
@@ -308,7 +308,7 @@ impl Database {
                 extra_config = excluded.extra_config,
                 enabled = excluded.enabled,
                 updated_at = datetime('now')
-            "#,
+            ",
         )
         .bind(id)
         .bind(provider_id)
@@ -316,7 +316,7 @@ impl Database {
         .bind(alias)
         .bind(tags)
         .bind(extra_config)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -386,10 +386,10 @@ impl Database {
         kb_id: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO llm_api_keys (id, key_hash, key_prefix, name, kb_id)
             VALUES (?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(id)
         .bind(key_hash)
@@ -403,7 +403,7 @@ impl Database {
 
     pub async fn llm_toggle_api_key(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET enabled = ? WHERE id = ?")
-            .bind(enabled as i32)
+            .bind(i32::from(enabled))
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -458,7 +458,7 @@ impl Database {
     /// 插入一条用量日志。timestamp 由 DB 用 datetime('now') 填充（UTC）。
     pub async fn llm_insert_usage_log(&self, u: &LlmUsageInsert) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO llm_usage_logs (
                 id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                 model_id, model_name, requested_model, protocol, stream, status_code,
@@ -466,7 +466,7 @@ impl Database {
                 completion_tokens, total_tokens, latency_ms, error_type,
                 rag_chunks_injected, failover_from
             ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(&u.api_key_id)
@@ -477,9 +477,9 @@ impl Database {
         .bind(&u.model_name)
         .bind(&u.requested_model)
         .bind(&u.protocol)
-        .bind(u.stream as i32)
+        .bind(i32::from(u.stream))
         .bind(u.status_code)
-        .bind(u.success as i32)
+        .bind(i32::from(u.success))
         .bind(u.prompt_tokens)
         .bind(u.cache_hit_tokens)
         .bind(u.cache_miss_tokens)
@@ -501,7 +501,7 @@ impl Database {
         end: &str,
     ) -> Result<LlmUsageSummary, sqlx::Error> {
         sqlx::query_as::<_, LlmUsageSummary>(
-            r#"
+            r"
             SELECT
                 COUNT(*) AS requests,
                 COALESCE(SUM(success), 0) AS success,
@@ -514,7 +514,7 @@ impl Database {
                     AS failover_count
             FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
-            "#,
+            ",
         )
         .bind(start)
         .bind(end)
@@ -536,7 +536,7 @@ impl Database {
             _ => ("api_key_id", "api_key_name"),
         };
         let sql = format!(
-            r#"
+            r"
             SELECT
                 {id_col} AS dimension_id,
                 COALESCE(MAX({name_col}), '') AS dimension_name,
@@ -551,7 +551,7 @@ impl Database {
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY {id_col}
             ORDER BY total_tokens DESC
-            "#
+            "
         );
         sqlx::query_as::<_, LlmUsageAggregateRow>(&sql)
             .bind(start)
@@ -569,7 +569,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<LlmUsageLogRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmUsageLogRecord>(
-            r#"
+            r"
             SELECT id, timestamp, api_key_id, api_key_name, provider_id, provider_name,
                    model_id, model_name, requested_model, protocol, stream, status_code,
                    success, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
@@ -579,7 +579,7 @@ impl Database {
             WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp DESC
             LIMIT ? OFFSET ?
-            "#,
+            ",
         )
         .bind(start)
         .bind(end)
@@ -592,10 +592,10 @@ impl Database {
     /// 查询时间范围内的用量日志总数。
     pub async fn llm_count_usage_logs(&self, start: &str, end: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) = sqlx::query_as(
-            r#"
+            r"
             SELECT COUNT(*) FROM llm_usage_logs
             WHERE timestamp >= ? AND timestamp <= ?
-            "#,
+            ",
         )
         .bind(start)
         .bind(end)
@@ -630,7 +630,7 @@ impl Database {
         sqlx::query("INSERT INTO llm_model_groups (id, name, enabled) VALUES (?, ?, ?)")
             .bind(id)
             .bind(name)
-            .bind(enabled as i32)
+            .bind(i32::from(enabled))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -646,7 +646,7 @@ impl Database {
             "UPDATE llm_model_groups SET name = ?, enabled = ?, updated_at = datetime('now') WHERE id = ?",
         )
         .bind(name)
-        .bind(enabled as i32)
+        .bind(i32::from(enabled))
         .bind(id)
         .execute(&self.pool)
         .await?;

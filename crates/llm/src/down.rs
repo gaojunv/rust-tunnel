@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 确定性失败条目的存活时间。到期后自动重新探测。
-pub const KNOWN_FAILURE_TTL: Duration = Duration::from_secs(300);
+pub const KNOWN_FAILURE_TTL: Duration = Duration::from_mins(5);
 
 /// 失败类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,7 @@ pub struct KnownFailures {
 
 impl KnownFailures {
     /// 新建空集合。
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -72,6 +73,7 @@ impl KnownFailures {
     }
 
     /// 查询该键对应的失败信息；超过 TTL 视为已恢复并清除（惰性过期）。
+    #[must_use] 
     pub fn lookup(&self, key: &str) -> Option<KnownFailureInfo> {
         let mut map = self.inner.lock().expect("known failures mutex poisoned");
         let entry = map.get(key)?;
@@ -147,7 +149,7 @@ mod tests {
         {
             let mut map = kf.inner.lock().unwrap();
             let entry = map.get_mut("p:p1").unwrap();
-            entry.recorded_at = Instant::now() - KNOWN_FAILURE_TTL - Duration::from_secs(1);
+            entry.recorded_at = Instant::now().checked_sub(KNOWN_FAILURE_TTL).unwrap() - Duration::from_secs(1);
         }
         assert!(kf.lookup("p:p1").is_none());
         // 惰性过期已清理

@@ -6,6 +6,7 @@ pub const MAX_REF_FILE_BYTES: usize = 50 * 1024;
 pub const MAX_REFS_TOTAL_BYTES: usize = 200 * 1024;
 
 /// 把用户消息与引用文件内容合成单条 user 消息（落库/进上下文的都是这条）。
+#[must_use] 
 pub fn compose_user_message(
     content: &str,
     ref_files: &[(String, Result<String, String>)],

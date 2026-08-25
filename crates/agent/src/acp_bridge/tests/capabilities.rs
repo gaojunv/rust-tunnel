@@ -16,7 +16,7 @@ fn test_client_capabilities_declare_subagent_transcript() {
     let caps = client_capabilities();
     let meta = caps.meta.expect("capabilities should carry _meta");
     assert_eq!(
-        meta.get("subagent-transcript").and_then(|v| v.as_bool()),
+        meta.get("subagent-transcript").and_then(serde_json::Value::as_bool),
         Some(true),
         "_meta.subagent-transcript must be true: {meta:?}"
     );

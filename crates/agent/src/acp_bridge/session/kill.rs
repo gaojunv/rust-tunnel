@@ -99,7 +99,7 @@ impl AcpBridge {
         // borrow 已看到新值，同样短路拒绝）。
         if a.ws_conn_id == my_conn_id {
             a.ws_tx = None;
-            a.ws_conn_id = a.ws_conns.last().map(|(id, _)| *id).unwrap_or(0);
+            a.ws_conn_id = a.ws_conns.last().map_or(0, |(id, _)| *id);
             if let Some(tx) = a
                 .ws_conns
                 .iter()

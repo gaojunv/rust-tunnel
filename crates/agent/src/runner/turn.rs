@@ -1,9 +1,10 @@
 //! 回合主循环：LLM 调用 → 工具执行 → 结果回灌，含消息落库与用量上下文。
 
-use super::*;
+use super::{AgentState, Arc, LlmState, SessionRuntime, mpsc, parse_llm_turn, LlmTurn, ChatMessage, handle_tool_calls, executor, AgentCommand, AgentResult, remove_tagged_block, ROLE_BLOCK_TAG, insert_block_before, roles, compact, ChatCompletionRequest, tools, is_sse_response, sse, LineBuf, is_sse_line, send_tool_call_delta};
 
 /// 构造 runner 路径的用量记录上下文：从候选链出账方提取 provider/model 信息，
 /// 供四处复用（主流式、流中断重试、compact 摘要、title 生成）。
+#[must_use] 
 pub fn runner_usage_ctx(
     candidate: &crate::llm::router::Candidate,
     requested_model: &str,
@@ -413,7 +414,7 @@ pub async fn run_agent_turn(
                 if let (Some(ctx), Some(db), Some(started)) =
                     (usage_ctx.take(), llm.db.as_ref(), usage_started.take())
                 {
-                    ctx.record_failure(db, status.as_u16() as i32, "exhausted", started);
+                    ctx.record_failure(db, i32::from(status.as_u16()), "exhausted", started);
                 }
                 let _ = ws_tx
                     .send(serde_json::json!({"type": "error", "message": format!("LLM unavailable: {message}")}))
@@ -548,7 +549,7 @@ pub async fn run_agent_turn(
                                     {
                                         ctx.record_failure(
                                             db,
-                                            status.as_u16() as i32,
+                                            i32::from(status.as_u16()),
                                             "retry_exhausted",
                                             started,
                                         );

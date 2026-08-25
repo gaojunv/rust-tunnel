@@ -212,6 +212,7 @@ fn split_paragraph(
 }
 
 /// 结构感知分块入口。
+#[must_use] 
 pub fn chunk_markdown(text: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
     let units = parse_units(text);
     if units.is_empty() {
@@ -285,7 +286,7 @@ mod tests {
     #[test]
     fn never_splits_code_block() {
         let code = "```rust\nfn a() {}\nfn b() {}\nfn c() {}\n```\n";
-        let md = format!("# T\n\n{}\n\n后续段落。\n", code);
+        let md = format!("# T\n\n{code}\n\n后续段落。\n");
         let chunks = chunk_markdown(&md, 20, 0); // 很小的 chunk_size
                                                  // 代码块完整存在于某个块中
         assert!(chunks

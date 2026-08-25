@@ -1727,7 +1727,7 @@ mod tests {
         assert!(content.len() <= MAX_OUTPUT + 64, "len = {}", content.len());
         assert!(content.contains("[truncated]"));
         assert!(content.starts_with("n0000-"));
-        assert!(content.ends_with("x"));
+        assert!(content.ends_with('x'));
     }
 
     #[tokio::test]
@@ -1778,39 +1778,35 @@ mod tests {
     /// 统计 `ps` 仍可见的 `sleep 30` 进程（用于断言进程组整体被杀）。
     /// 优先 `ps`；若环境无 `ps` 则回退到 `/proc` 扫描各进程 cmdline。
     fn leftover_sleep30_procs() -> Vec<String> {
-        match std::process::Command::new("ps")
+        if let Ok(out) = std::process::Command::new("ps")
             .args(["-eo", "pid,pgid,args"])
-            .output()
-        {
-            Ok(out) => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.contains("sleep 30"))
-                .map(str::to_string)
-                .collect(),
-            Err(_) => {
-                // /proc 回退：遍历 PID 目录读 cmdline，拼回整行后判断
-                let mut found = Vec::new();
-                if let Ok(entries) = std::fs::read_dir("/proc") {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name();
-                        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
-                            continue;
-                        };
-                        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-                            continue;
-                        };
-                        let joined = raw
-                            .split(|&b| b == 0)
-                            .filter(|c| !c.is_empty())
-                            .collect::<Vec<_>>()
-                            .join(&b' ');
-                        if String::from_utf8_lossy(&joined).contains("sleep 30") {
-                            found.push(pid.to_string());
-                        }
+            .output() { String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("sleep 30"))
+        .map(str::to_string)
+        .collect() } else {
+            // /proc 回退：遍历 PID 目录读 cmdline，拼回整行后判断
+            let mut found = Vec::new();
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+                        continue;
+                    };
+                    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                        continue;
+                    };
+                    let joined = raw
+                        .split(|&b| b == 0)
+                        .filter(|c| !c.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(&b' ');
+                    if String::from_utf8_lossy(&joined).contains("sleep 30") {
+                        found.push(pid.to_string());
                     }
                 }
-                found
             }
+            found
         }
     }
 
@@ -1824,7 +1820,7 @@ mod tests {
                 "sleep 30 & wait",
                 None,
                 None,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
                 Some(&mut rx),
             )
             .await
@@ -1836,7 +1832,7 @@ mod tests {
             .await
             .expect("cancel should not hang")
             .unwrap(); // 移除 JoinError 层，得到 run_host 的 Result
-        assert!(res.is_err(), "cancel should yield Err, got {:?}", res);
+        assert!(res.is_err(), "cancel should yield Err, got {res:?}");
 
         // cancel 返回后进程组已整体 SIGKILL；留 500ms 让 kill 生效并等 init 收割
         // 僵尸，再确认孙进程 `sleep 30` 无残留（在 Rust 里过滤 ps 输出，
@@ -2266,7 +2262,7 @@ mod tests {
         let result = search_exec(&root, "[unclosed", ".", None, None).await;
         match result {
             AgentResult::Error { message } => {
-                assert!(message.contains("grep"), "message = {message:?}")
+                assert!(message.contains("grep"), "message = {message:?}");
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -2402,8 +2398,8 @@ mod tests {
         };
         assert_eq!(content.lines().count(), SEARCH_MAX_HITS + 1);
         assert!(content.contains("f0.rs:1:hit"));
-        assert!(!content.contains(&format!("f{}.rs", SEARCH_MAX_HITS)));
-        assert!(content.ends_with(&format!("\n[truncated at {} hits]", SEARCH_MAX_HITS)));
+        assert!(!content.contains(&format!("f{SEARCH_MAX_HITS}.rs")));
+        assert!(content.ends_with(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]")));
     }
 
     #[test]

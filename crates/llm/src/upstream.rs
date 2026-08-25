@@ -161,6 +161,7 @@ fn sanitize_error_message(body: &str) -> String {
 ///
 /// 独立成公共函数是为了让调用方在发送前拿到完整请求体写日志
 /// （`log_llm_request` 记录的就是这个 body，与实际发送内容逐字节一致）。
+#[must_use] 
 pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value {
     // 透传模式：以原始请求体为基底，定点覆盖网关必须改写的字段。
     if let Some(mut raw) = request.raw_body.clone() {
@@ -246,14 +247,14 @@ pub async fn call_upstream_with_body(
 
     let req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(req_body);
 
     let resp = req.send().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
-            format!("Upstream connection failed: {}", e),
+            format!("Upstream connection failed: {e}"),
         )
     })?;
 
@@ -291,7 +292,7 @@ pub async fn call_upstream_with_body(
             target: "llm_upstream_debug",
             status = status.as_u16(),
             model = %req_body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
-            stream = req_body.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+            stream = req_body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false),
             message_count = req_body.get("messages").and_then(|m| m.as_array()).map_or(0, Vec::len),
             has_tools = req_body.get("tools").is_some(),
             full_request_body = %truncated_req,
@@ -307,7 +308,7 @@ pub async fn call_upstream_with_body(
 
     let is_stream = req_body
         .get("stream")
-        .and_then(|s| s.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if is_stream {
         relay_upstream_stream(resp).await
@@ -349,7 +350,7 @@ async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (Statu
         let chunk = chunk.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to read upstream response: {}", e),
+                format!("Failed to read upstream response: {e}"),
             )
         })?;
         body_bytes.extend_from_slice(&chunk);
@@ -357,8 +358,7 @@ async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (Statu
             return Err((
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "Upstream response exceeded {} byte limit",
-                    MAX_UPSTREAM_BODY_BYTES
+                    "Upstream response exceeded {MAX_UPSTREAM_BODY_BYTES} byte limit"
                 ),
             ));
         }
@@ -428,6 +428,7 @@ fn is_malformed_error(msg: &str) -> bool {
 ///
 /// 可转移：5xx（含连接/超时映射来的 502）、429（受 `failover_on_429` 开关控制）。
 /// 不可转移：其余 4xx（请求本身问题，换模型大概率同样失败）。
+#[must_use] 
 pub fn is_retryable(status: StatusCode, failover_on_429: bool) -> bool {
     if status.is_server_error() {
         return true;
@@ -436,6 +437,7 @@ pub fn is_retryable(status: StatusCode, failover_on_429: bool) -> bool {
 }
 
 /// 从 provider `extra_config` JSON 读 `failover_on_429` 开关（默认 true）。
+#[must_use] 
 pub fn failover_on_429_enabled(extra_config: Option<&str>) -> bool {
     let Some(ec) = extra_config else { return true };
     serde_json::from_str::<serde_json::Value>(ec)
@@ -474,7 +476,7 @@ pub async fn call_upstream_stream_guarded(
     );
     let resp = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(req_body)
         .send()
@@ -482,7 +484,7 @@ pub async fn call_upstream_stream_guarded(
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Upstream connection failed: {}", e),
+                format!("Upstream connection failed: {e}"),
             )
         })?;
 
@@ -508,7 +510,7 @@ pub async fn call_upstream_stream_guarded(
             let chunk = chunk.map_err(|e| {
                 (
                     StatusCode::BAD_GATEWAY,
-                    format!("Upstream stream read failed: {}", e),
+                    format!("Upstream stream read failed: {e}"),
                 )
             })?;
             prefix.extend_from_slice(&chunk);
@@ -767,13 +769,13 @@ pub async fn execute_with_failover(
             // 非流式：对 Ok(resp) 做 body 质量校验——200 空 body / 200 非 JSON
             // 这类"假成功"在状态码层面无法识别，统一归一为 Err(502) 走下方
             // 重试/转移判定。流式路径无法回读 body（响应头已发客户端），跳过。
-            let r = if !stream {
+            let r = if stream {
+                r
+            } else {
                 match r {
                     Ok(resp) => validate_response_body(resp).await,
                     Err(e) => Err(e),
                 }
-            } else {
-                r
             };
 
             // 畸形/空流类失败：同候选原地重试（上限 MAX_MALFORMED_RETRIES 次）。
@@ -911,7 +913,7 @@ pub async fn call_upstream_raw(
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("Upstream connection failed: {}", e),
+                format!("Upstream connection failed: {e}"),
             )
         })?;
 
@@ -919,7 +921,7 @@ pub async fn call_upstream_raw(
     let resp = if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
             .json(body)
@@ -928,7 +930,7 @@ pub async fn call_upstream_raw(
             .map_err(|e| {
                 (
                     StatusCode::BAD_GATEWAY,
-                    format!("Upstream connection failed: {}", e),
+                    format!("Upstream connection failed: {e}"),
                 )
             })?
     } else {
@@ -975,8 +977,7 @@ fn summarize_request_for_log(req_body: &serde_json::Value) -> String {
                                 let content_len = m
                                     .get("content")
                                     .and_then(|c| c.as_str())
-                                    .map(str::len)
-                                    .unwrap_or(0);
+                                    .map_or(0, str::len);
                                 let has_tool_calls = m.get("tool_calls").is_some();
                                 let tool_call_id = m.get("tool_call_id").is_some();
                                 json!({
@@ -1016,6 +1017,7 @@ fn summarize_request_for_log(req_body: &serde_json::Value) -> String {
 }
 
 /// Build an OpenAI-format error response.
+#[must_use] 
 pub fn error_response(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1031,6 +1033,7 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
 }
 
 /// Build an Anthropic-format error response for Anthropic-protocol domains.
+#[must_use] 
 pub fn error_response_anthropic(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
@@ -1048,6 +1051,7 @@ pub fn error_response_anthropic(status: StatusCode, message: String, error_type:
 
 /// Build a 404 "model not found" response that carries the available model list,
 /// per spec: 未匹配 → 返回 404，body 中包含可用模型列表。
+#[must_use] 
 pub fn model_not_found_response(message: String, available_models: Vec<String>) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1135,8 +1139,7 @@ mod tests {
             // Error message should NOT contain the API key
             assert!(
                 !msg.contains("test-key"),
-                "API key should not be in error message: {}",
-                msg
+                "API key should not be in error message: {msg}"
             );
         });
     }
@@ -1444,7 +1447,7 @@ mod tests {
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let resp = call_upstream_stream_guarded(
             &client,
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "k",
             &req_body,
             "v1/chat/completions",
@@ -1473,7 +1476,7 @@ mod tests {
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let err = call_upstream_stream_guarded(
             &client,
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "k",
             &req_body,
             "v1/chat/completions",
@@ -1505,7 +1508,7 @@ mod tests {
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let err = call_upstream_stream_guarded(
             &client,
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "k",
             &req_body,
             "v1/chat/completions",
@@ -1547,7 +1550,7 @@ mod tests {
         let started = std::time::Instant::now();
         let resp = call_upstream_stream_guarded(
             &client,
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "k",
             &req_body,
             "v1/chat/completions",
@@ -1558,8 +1561,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
             ttfb < std::time::Duration::from_secs(1),
-            "首事件即放行，实际耗时 {:?}（CRLF 识别失效？）",
-            ttfb
+            "首事件即放行，实际耗时 {ttfb:?}（CRLF 识别失效？）"
         );
         // 剩余流续传不丢字节：前缀已含第一段，续传含 [DONE]
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -1589,7 +1591,7 @@ mod tests {
                 on_conn(sock).await;
             }
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     /// 快速构造 CandidateChain（测试用）。
@@ -1610,8 +1612,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, (base, model_name, model_id))| Candidate {
                     provider: ProviderConfig {
-                        id: format!("p{}", i),
-                        name: format!("P{}", i),
+                        id: format!("p{i}"),
+                        name: format!("P{i}"),
                         provider_type: "deepseek".into(),
                         base_url: base.to_string(),
                         api_key: "k".into(),
@@ -1643,8 +1645,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, (base, model_name, model_id, proto))| Candidate {
                     provider: ProviderConfig {
-                        id: format!("p{}", i),
-                        name: format!("P{}", i),
+                        id: format!("p{i}"),
+                        name: format!("P{i}"),
                         provider_type: "deepseek".into(),
                         base_url: base.to_string(),
                         api_key: "k".into(),
@@ -1971,7 +1973,7 @@ mod tests {
         });
 
         let breakers = crate::breaker::ModelBreakers::new();
-        let chain = test_chain(&[(&format!("http://{}", addr), "m1", "id1")]);
+        let chain = test_chain(&[(&format!("http://{addr}"), "m1", "id1")]);
         let body = serde_json::json!({"model": "router", "stream": true, "messages": []});
 
         let started = std::time::Instant::now();
@@ -1996,8 +1998,7 @@ mod tests {
         assert!(!failed_over);
         assert!(
             ttfb < std::time::Duration::from_secs(1),
-            "单元素链流式应响应头即放行，实际耗时 {:?}（仍走首字节守卫？）",
-            ttfb
+            "单元素链流式应响应头即放行，实际耗时 {ttfb:?}（仍走首字节守卫？）"
         );
         // 剩余流透传完整（relay 直通，连接未截断）
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
@@ -2087,7 +2088,7 @@ mod tests {
         let req_body = serde_json::json!({"model": "m", "stream": true});
         let err = call_upstream_stream_guarded(
             &client,
-            &format!("http://{}", addr),
+            &format!("http://{addr}"),
             "k",
             &req_body,
             "v1/chat/completions",
@@ -2123,7 +2124,7 @@ mod tests {
         // 用本地构建的上游 client 拿一个真实 2xx 响应（非流式直通路径的入参）
         let client = test_client();
         let resp = client
-            .post(format!("http://{}/v1/chat/completions", addr))
+            .post(format!("http://{addr}/v1/chat/completions"))
             .header("Content-Type", "application/json")
             .body("{}")
             .send()
@@ -2724,8 +2725,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, (base, model_name, model_id, anthro))| Candidate {
                     provider: ProviderConfig {
-                        id: format!("p{}", i),
-                        name: format!("P{}", i),
+                        id: format!("p{i}"),
+                        name: format!("P{i}"),
                         provider_type: "deepseek".into(),
                         base_url: base.to_string(),
                         api_key: "k".into(),

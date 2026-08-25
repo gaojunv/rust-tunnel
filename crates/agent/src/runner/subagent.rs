@@ -12,6 +12,7 @@ use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 use crate::session::SessionRuntime;
 use crate::{roles, sse, tools, AgentState};
 
+#[must_use] 
 pub fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
     SessionRuntime {
         session_id: rt.session_id.clone(),

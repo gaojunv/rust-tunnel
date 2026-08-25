@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 /// OpenAI `finish_reason` → Anthropic `stop_reason` 映射。
+#[must_use] 
 pub fn map_stop_reason(openai: &str) -> String {
     match openai {
         "stop" => "end_turn".to_string(),
@@ -62,6 +63,7 @@ fn openai_usage_to_anthropic(usage: &Value) -> Value {
 ///
 /// 除了 `message.content` 转成 `text` 块外，`message.tool_calls` 数组会被展开为
 /// Anthropic 的 `tool_use` content 块（`arguments` 字符串 parse 回对象）。
+#[must_use] 
 pub fn openai_response_to_anthropic(openai: &Value) -> Value {
     let mut content: Vec<Value> = Vec::new();
 
@@ -169,6 +171,7 @@ enum BlockKind {
 }
 
 impl AnthropicSseTranslator {
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -219,7 +222,7 @@ impl AnthropicSseTranslator {
         // 之后）：补发一条带完整 input/output 细分的 message_delta，否则下游
         // UsageSseScanner 只能拿到 close() 时的空 usage，tokens 统计为 0。
         if self.closed && !self.late_usage_emitted {
-            if chunk.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+            if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
                 self.late_usage_emitted = true;
                 let usage = openai_usage_to_anthropic(&chunk["usage"]);
                 let stop_reason = self
@@ -257,21 +260,18 @@ impl AnthropicSseTranslator {
         // 思考增量（DeepSeek reasoning_content → Anthropic thinking 块）
         if let Some(reasoning) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
             if !reasoning.is_empty() {
-                let idx = match self.thinking_index {
-                    Some(idx) => idx,
-                    None => {
-                        let idx = self.next_block_index;
-                        self.next_block_index += 1;
-                        self.thinking_index = Some(idx);
-                        let block_start = json!({
-                            "type": "content_block_start",
-                            "index": idx,
-                            "content_block": {"type": "thinking", "thinking": ""},
-                        });
-                        push_event(out, "content_block_start", &block_start);
-                        self.open_block = Some(BlockKind::Thinking);
-                        idx
-                    }
+                let idx = if let Some(idx) = self.thinking_index { idx } else {
+                    let idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    self.thinking_index = Some(idx);
+                    let block_start = json!({
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    });
+                    push_event(out, "content_block_start", &block_start);
+                    self.open_block = Some(BlockKind::Thinking);
+                    idx
                 };
                 let delta = json!({
                     "type": "content_block_delta",
@@ -319,7 +319,7 @@ impl AnthropicSseTranslator {
         if let Some(calls) = chunk["choices"][0]["delta"]["tool_calls"].as_array() {
             for call in calls {
                 // 上游 index：OpenAI 流式规定用 index 标识哪个 tool_call；缺省当 0。
-                let up_idx = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let up_idx = call.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0);
                 // 首次出现：分配 anthropic block index 并发 content_block_start
                 let anthropic_idx = if let Some(idx) = self.tool_blocks.get(&up_idx) {
                     *idx
@@ -443,6 +443,7 @@ fn push_event(out: &mut String, event: &str, data: &Value) {
 /// 流式：把上游 OpenAI SSE 响应体逐 chunk 转换为 Anthropic SSE 事件流。
 ///
 /// 从 `anthropic_handler` 下沉（双协议入口共享的「回退路径」在成功时调用）。
+#[must_use] 
 pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
     let byte_stream = openai_resp.into_body().into_data_stream();
     let translator = std::sync::Arc::new(std::sync::Mutex::new(AnthropicSseTranslator::new()));
@@ -939,7 +940,7 @@ mod tests {
                 "finish_reason": finish
             }]
         });
-        format!("data: {}\n\n", chunk)
+        format!("data: {chunk}\n\n")
     }
 
     #[test]

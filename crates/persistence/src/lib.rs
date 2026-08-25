@@ -76,6 +76,7 @@ impl Database {
     }
 
     /// Return a reference to the connection pool
+    #[must_use] 
     pub fn pool(&self) -> &sqlx::SqlitePool {
         &self.pool
     }
@@ -124,7 +125,7 @@ mod cert_status_migration_tests {
             "http",
             "0.0.0.0:443",
             Some(r#"["a.example.com"]"#),
-            Some(r#"[]"#),
+            Some(r"[]"),
             true,
             true,
             Some("a.example.com"),
@@ -159,7 +160,7 @@ mod cert_status_migration_tests {
                 .create_if_missing(true);
             let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
             sqlx::query(
-                r#"
+                r"
                 CREATE TABLE proxy_rules (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -177,7 +178,7 @@ mod cert_status_migration_tests {
                     cert_covering_domain TEXT,
                     cert_status_updated_at DATETIME
                 )
-                "#,
+                ",
             )
             .execute(&pool)
             .await
@@ -231,7 +232,7 @@ mod cert_status_migration_tests {
                 .create_if_missing(true);
             let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
             sqlx::query(
-                r#"
+                r"
                 CREATE TABLE trojan_config (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     port INTEGER NOT NULL UNIQUE,
@@ -241,7 +242,7 @@ mod cert_status_migration_tests {
                     created_at DATETIME NOT NULL,
                     updated_at DATETIME NOT NULL
                 )
-                "#,
+                ",
             )
             .execute(&pool)
             .await

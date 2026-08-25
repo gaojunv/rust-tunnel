@@ -155,7 +155,7 @@ async fn do_ingest(
     if chunks.is_empty() {
         return Err("empty content".to_string());
     }
-    let api_key = decrypt_field(cipher, &kb.emb_api_key).map_err(|e| e.to_string())?;
+    let api_key = decrypt_field(cipher, &kb.emb_api_key).map_err(|e| e.clone())?;
     let embedder = Embedder::new(&kb.emb_base_url, &api_key, &kb.emb_model);
     let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let vectors = embedder.embed(&texts).await.map_err(|e| e.to_string())?;
@@ -280,7 +280,7 @@ mod tests {
         let app = Router::new().route(
             "/embeddings",
             post(move |body: Json<Value>| async move {
-                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let n = body["input"].as_array().map_or(1, std::vec::Vec::len);
                 let data: Vec<_> = (0..n)
                     .map(|i| {
                         json!({
@@ -298,7 +298,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     /// 起一个返回固定 embedding 的本地 HTTP server，但 data 比 input 少一条
@@ -311,7 +311,7 @@ mod tests {
         let app = Router::new().route(
             "/embeddings",
             post(move |body: Json<Value>| async move {
-                let n = body["input"].as_array().map(|a| a.len()).unwrap_or(1);
+                let n = body["input"].as_array().map_or(1, std::vec::Vec::len);
                 let data: Vec<_> = (0..n.saturating_sub(1))
                     .map(|i| {
                         json!({
@@ -329,7 +329,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     /// 等待下一条摄入事件（10s 超时，避免测试无限挂起）。

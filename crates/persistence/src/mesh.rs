@@ -12,11 +12,11 @@ impl Database {
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO mesh_networks (id, created_at, description)
             VALUES (?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET description = excluded.description
-            "#,
+            ",
         )
         .bind(id)
         .bind(now)
@@ -46,7 +46,7 @@ impl Database {
         dns_record: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO mesh_services (mesh_id, client_name, service_name, protocol, local_addr, dns_record)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(mesh_id, service_name) DO UPDATE SET
@@ -54,7 +54,7 @@ impl Database {
                 protocol = excluded.protocol,
                 local_addr = excluded.local_addr,
                 dns_record = excluded.dns_record
-            "#,
+            ",
         )
         .bind(mesh_id)
         .bind(client_name)
