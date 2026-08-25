@@ -87,20 +87,28 @@ pub(super) async fn handle_client_backend(
         Ok(c) => c,
         Err(e) => {
             stats.decr_conns(EntityType::Proxy, &rule_id);
+            let body = format!("connector unavailable: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("connector unavailable: {e}")))
-                .unwrap();
+                .body(Body::from(body.clone()))
+                .unwrap_or_else(|err| {
+                    tracing::warn!("failed to build response: {err}");
+                    Response::new(Body::from(body))
+                });
         }
     };
     let stream = match connector.connect(&backend).await {
         Ok(s) => s,
         Err(e) => {
             stats.decr_conns(EntityType::Proxy, &rule_id);
+            let body = format!("client backend dial failed: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("client backend dial failed: {e}")))
-                .unwrap();
+                .body(Body::from(body.clone()))
+                .unwrap_or_else(|err| {
+                    tracing::warn!("failed to build response: {err}");
+                    Response::new(Body::from(body))
+                });
         }
     };
     let io = TokioIo::new(stream);
@@ -115,10 +123,14 @@ pub(super) async fn handle_client_backend(
         Ok(pair) => pair,
         Err(e) => {
             stats.decr_conns(EntityType::Proxy, &rule_id);
+            let body = format!("http1 handshake failed: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("http1 handshake failed: {e}")))
-                .unwrap();
+                .body(Body::from(body.clone()))
+                .unwrap_or_else(|err| {
+                    tracing::warn!("failed to build response: {err}");
+                    Response::new(Body::from(body))
+                });
         }
     };
     let ws_potential = downstream_upgrade.is_some();
@@ -165,7 +177,15 @@ pub(super) async fn handle_client_backend(
                 // by `build_downstream_response` — same one-shot constraint
                 // as the downstream side.
                 let upstream_upgrade = hyper::upgrade::on(&mut resp);
-                let client_upgrade = downstream_upgrade.expect("checked above");
+                let Some(client_upgrade) = downstream_upgrade else {
+                    tracing::warn!("ws upgrade handle missing despite ws_potential");
+                    stats.decr_conns(EntityType::Proxy, &rule_id);
+                    return super::downstream_response::build_downstream_response(
+                        resp,
+                        stats.clone(),
+                        rule_id,
+                    );
+                };
                 let rid = rule_id.clone();
                 let sc = stats.clone();
                 tokio::spawn(async move {
@@ -202,10 +222,14 @@ pub(super) async fn handle_client_backend(
         }
         Err(e) => {
             stats.decr_conns(EntityType::Proxy, &rule_id);
+            let body = format!("upstream request failed: {e}");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("upstream request failed: {e}")))
-                .unwrap()
+                .body(Body::from(body.clone()))
+                .unwrap_or_else(|err| {
+                    tracing::warn!("failed to build response: {err}");
+                    Response::new(Body::from(body))
+                })
         }
     }
 }

@@ -12,7 +12,7 @@ pub struct TodoItem {
 
 impl TodoItem {
     /// 校验 status 值是否合法。
-    #[must_use] 
+    #[must_use]
     pub fn is_valid_status(s: &str) -> bool {
         matches!(s, "pending" | "in_progress" | "completed")
     }
@@ -43,7 +43,7 @@ pub fn client_supports_edit_file(client_version: Option<&str>) -> bool {
 /// OpenAI tools 格式的工具声明，透传给上游 LLM。
 /// `mode` 为 `"plan"` 时只暴露只读工具子集 + `todo_write`（辅助出方案），
 /// 写类工具对模型不可见（模型不会调用，parse 层再兜底拒绝）。
-#[must_use] 
+#[must_use]
 pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
     let file_props = |extra: &[(&str, serde_json::Value)]| {
         let mut props = serde_json::json!({
@@ -518,7 +518,7 @@ pub fn agent_tools_schema(mode: &str) -> Vec<serde_json::Value> {
 
 /// 按客户端版本裁剪工具列表：≥0.8.0 用 edit_file 替换 patch_file，
 /// <0.8.0 保持 patch_file（edit_file 不暴露）。write_file 两档都保留。
-#[must_use] 
+#[must_use]
 pub fn filter_tools_for_client_version(
     mut tools: Vec<serde_json::Value>,
     client_version: Option<&str>,
@@ -534,7 +534,7 @@ pub fn filter_tools_for_client_version(
 /// 角色级工具过滤：在现有 `agent_tools_schema(mode)` 基础上叠加 allow 白名单
 /// 与 deny 黑名单。allow 非空 → 只保留白名单内工具；deny 非空 → 剔除。
 /// plan 模式裁剪由底层 `agent_tools_schema(mode)` 完成，角色过滤叠加其上。
-#[must_use] 
+#[must_use]
 pub fn agent_tools_schema_filtered(
     mode: &str,
     allow: Option<&[String]>,
@@ -575,7 +575,9 @@ fn arg_opt_str(args: &serde_json::Value, key: &str) -> Option<String> {
 
 /// 取字符串数组参数（pathspec 用）；缺失或含非字符串元素报错。
 fn arg_opt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
-    args.get(key).and_then(serde_json::Value::as_u64).map(|n| n as usize)
+    args.get(key)
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
 }
 
 fn arg_str_array(args: &serde_json::Value, key: &str, tool: &str) -> Result<Vec<String>, String> {
@@ -606,7 +608,10 @@ fn git_paths_cmd(tool: &str, prefix: &[&str], paths: &[String]) -> Result<Vec<St
     if total > MAX_TOOL_INPUT {
         return Err("paths too large (>900KB)".to_string());
     }
-    let mut out: Vec<String> = prefix.iter().map(std::string::ToString::to_string).collect();
+    let mut out: Vec<String> = prefix
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
     out.push("--".to_string());
     out.extend(paths.iter().cloned());
     Ok(out)
@@ -841,7 +846,10 @@ pub fn parse_tool_call(name: &str, args_json: &str) -> Result<AgentCommand, Stri
         "git_branch" => {
             let action = arg_str(&args, "action", name)?;
             let branch_name = arg_opt_str(&args, "name");
-            let force = args.get("force").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let force = args
+                .get("force")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let git_args = match action {
                 "list" => vec!["branch".to_string()],
                 "create" => {

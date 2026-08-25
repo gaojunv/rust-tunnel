@@ -160,9 +160,7 @@ async fn test_handshake_skips_mcp_injection_without_http_capability() {
     let received = mcp_servers.lock().await.clone();
     assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
     assert!(
-        received[0]
-            .as_array()
-            .is_some_and(std::vec::Vec::is_empty),
+        received[0].as_array().is_some_and(std::vec::Vec::is_empty),
         "无 http 能力时 mcpServers 应为空: {received:?}"
     );
     // 会话照常建立
@@ -195,9 +193,7 @@ async fn test_handshake_skips_mcp_injection_without_token() {
     let received = mcp_servers.lock().await.clone();
     assert_eq!(received.len(), 1, "session/new 仍应记录（空）mcpServers");
     assert!(
-        received[0]
-            .as_array()
-            .is_some_and(std::vec::Vec::is_empty),
+        received[0].as_array().is_some_and(std::vec::Vec::is_empty),
         "无 token 时 mcpServers 应为空: {received:?}"
     );
 }

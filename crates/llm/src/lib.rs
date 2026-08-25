@@ -62,7 +62,7 @@ pub struct LlmGatewayConfig {
 impl LlmGatewayConfig {
     /// 校验配置合法性，返回 None 表示合法。
     /// enabled=true 时至少一个域名非空；两个域名都非空时必须不同。
-    #[must_use] 
+    #[must_use]
     pub fn validate(&self) -> Option<String> {
         if !self.enabled {
             return None;
@@ -81,7 +81,7 @@ impl LlmGatewayConfig {
     }
 
     /// 根据 host 匹配命中的协议入口；都不匹配返回 None。
-    #[must_use] 
+    #[must_use]
     pub fn match_protocol(&self, host: &str) -> Option<LlmProtocol> {
         if !self.enabled || host.is_empty() {
             return None;
@@ -102,7 +102,7 @@ impl LlmGatewayConfig {
     /// 收集所有已配置的域名（用于 ProxyRule.domains 持久化）。
     /// 始终返回两个元素：`[openai_domain, anthropic_domain]`，未配置的为空字符串。
     /// `init_llm_state` 按位置索引还原（domains[0] → openai, domains[1] → anthropic）。
-    #[must_use] 
+    #[must_use]
     pub fn configured_domains(&self) -> Vec<String> {
         vec![
             self.openai_domain.clone().unwrap_or_default(),
@@ -147,7 +147,7 @@ where
 /// 读侧（route_cache 快照构造 / provider 列表回显）防御性归一，使库里**已存的** `""`
 /// 脏数据不再触发 Anthropic 直通——`Some("")` 时 `is_some()` 为 true 会误走直通，
 /// 而前端输入框显示空、卡片也不渲染，用户完全看不出已配置。
-#[must_use] 
+#[must_use]
 pub fn normalize_anthropic_base_url(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
@@ -360,7 +360,7 @@ pub struct LlmState {
 impl LlmState {
     /// 便捷构造：rag_store 指向系统临时目录，仅用于测试/演示。
     /// 生产初始化请用 [`Self::new_with_rag`] 指定数据目录（仅 `rag` feature 启用时可用）。
-    #[must_use] 
+    #[must_use]
     pub fn new(db: Option<Database>, cipher: Option<crate::crypto::LlmCipher>) -> Self {
         Self {
             db,
@@ -380,7 +380,7 @@ impl LlmState {
 
     /// 指定 RAG 数据目录构造（知识库向量 shard 位于 `<rag_data_dir>/rag/<kb_id>/`）。
     #[cfg(feature = "rag")]
-    #[must_use] 
+    #[must_use]
     pub fn new_with_rag(
         db: Option<Database>,
         cipher: Option<crate::crypto::LlmCipher>,
@@ -583,7 +583,7 @@ const MAX_LOG_STRING_CHARS: usize = 4000;
 /// 脱敏请求体用于日志：递归截断超长字符串字段，避免完整用户内容（含可能的
 /// secrets）原样落盘。结构保留，只对超长文本做省略。修改不影响内存中的原始
 /// 请求体（clone 后处理）。
-#[must_use] 
+#[must_use]
 pub fn sanitize_request_body(body: &serde_json::Value) -> serde_json::Value {
     fn truncate(s: &mut String) {
         let chars: Vec<char> = s.chars().collect();

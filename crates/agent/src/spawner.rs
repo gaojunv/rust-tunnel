@@ -40,7 +40,7 @@ pub fn agent_command(
 ///
 /// `available_models` 是服务端启用的网关模型 id 列表（仅 opencode 分支用于
 /// provider.models 枚举），其余 agent 传空切片。
-#[must_use] 
+#[must_use]
 pub fn agent_env(
     agent_type: &str,
     port: u16,

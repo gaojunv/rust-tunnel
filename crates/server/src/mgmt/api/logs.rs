@@ -1,5 +1,4 @@
 use axum::{
-    body::Body,
     extract::{Query, State},
     http::StatusCode,
     response::{
@@ -34,20 +33,14 @@ pub async fn sse_log_stream(
         };
 
         if !is_valid {
-            return axum::response::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::from("Unauthorized"))
-                .unwrap();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
     let log_store = match &state.log_store {
         Some(store) => store.clone(),
         None => {
-            return axum::response::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Log store not initialized"))
-                .unwrap();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
         }
     };
 
@@ -127,10 +120,7 @@ pub async fn get_logs(
     let log_store = match &state.log_store {
         Some(store) => store,
         None => {
-            return axum::response::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Log store not initialized"))
-                .unwrap();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
         }
     };
 
@@ -238,10 +228,7 @@ pub async fn get_logs_level(State(state): State<ApiState>) -> impl IntoResponse 
     let log_store = match &state.log_store {
         Some(store) => store,
         None => {
-            return axum::response::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Log store not initialized"))
-                .unwrap();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
         }
     };
 
@@ -265,10 +252,7 @@ pub async fn put_logs_level(
     let log_store = match &state.log_store {
         Some(store) => store,
         None => {
-            return axum::response::Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Log store not initialized"))
-                .unwrap();
+            return (StatusCode::SERVICE_UNAVAILABLE, "Log store not initialized").into_response();
         }
     };
 
@@ -279,12 +263,11 @@ pub async fn put_logs_level(
         "warn" => 3,
         "error" => 4,
         _ => {
-            return axum::response::Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(
-                    "Invalid level. Use: trace, debug, info, warn, error",
-                ))
-                .unwrap();
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid level. Use: trace, debug, info, warn, error",
+            )
+                .into_response();
         }
     };
 

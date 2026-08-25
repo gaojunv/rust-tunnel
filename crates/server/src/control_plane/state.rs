@@ -306,7 +306,10 @@ impl ServerState {
             proxy_state: ReverseProxyState::with_db(db.clone()),
             llm_state: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             client_registry: Some(registry.clone()),
-            agent_state: Some(crate::agent::AgentState::new(std::sync::Arc::new(registry), db)),
+            agent_state: Some(crate::agent::AgentState::new(
+                std::sync::Arc::new(registry),
+                db,
+            )),
             acme: AcmeState::default(),
             dynamic_config: Arc::new(RwLock::new(DynamicConfig {
                 log_level: "info".to_string(),
@@ -382,7 +385,9 @@ impl ServerState {
     }
 
     pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
-        self.proxy_ports.register_shadowsocks(port, cipher, password).await
+        self.proxy_ports
+            .register_shadowsocks(port, cipher, password)
+            .await
     }
 
     pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
@@ -395,7 +400,9 @@ impl ServerState {
 
     /// Get the number of active connections for a specific port (SS/Trojan only)
     pub async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
-        self.proxy_ports.get_connection_count_for_port(remote_port).await
+        self.proxy_ports
+            .get_connection_count_for_port(remote_port)
+            .await
     }
 
     /// Increment active Shadowsocks connections for a port
@@ -409,7 +416,9 @@ impl ServerState {
     }
 
     pub async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
-        self.proxy_ports.register_trojan(port, password, fallback).await
+        self.proxy_ports
+            .register_trojan(port, password, fallback)
+            .await
     }
 
     /// Get all Trojan ports

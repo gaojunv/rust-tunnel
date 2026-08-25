@@ -39,7 +39,7 @@ pub struct SSConnectionContext {
 }
 
 /// Shared context for shadowsocks operations
-#[must_use] 
+#[must_use]
 pub fn create_shared_context() -> SharedContext {
     Context::new_shared(ServerType::Server)
 }

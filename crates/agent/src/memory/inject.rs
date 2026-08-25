@@ -61,10 +61,7 @@ pub async fn retrieve_for_session(
             ) {
                 return None;
             }
-            let score = hits
-                .iter()
-                .find(|h| h.id == r.id)
-                .map_or(0.0, |h| h.score);
+            let score = hits.iter().find(|h| h.id == r.id).map_or(0.0, |h| h.score);
             Some((score, r))
         })
         .collect();
@@ -98,7 +95,7 @@ pub async fn retrieve_for_session(
 /// 组装 `<memory>` 注入块。预算按 `chars / 4` ≈ tokens 近似（同 retriever.rs 的
 /// `MAX_SYSTEM_MESSAGE_TOKENS` 惯例）；超预算停止追加后续条目——只保留完整条目，
 /// 绝不半截切断某条记忆的内容。无条目 → None。
-#[must_use] 
+#[must_use]
 pub fn build_memory_block(items: &[AgentMemoryRecord], budget_tokens: usize) -> Option<String> {
     let mut s = String::from("<memory>\n以下是来自历史会话的记忆，可能与当前任务相关：\n");
     let mut approx_tokens = s.chars().count() / 4;

@@ -26,7 +26,7 @@ pub struct UsageInfo {
 
 impl UsageInfo {
     /// 是否解析到任何有效数据（用于判断流式是否拿到末尾 usage）。
-    #[must_use] 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.total_tokens == 0 && self.prompt_tokens == 0 && self.completion_tokens == 0
     }
@@ -141,7 +141,7 @@ pub struct UsageSseScanner {
 }
 
 impl UsageSseScanner {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -215,7 +215,9 @@ impl UsageSseScanner {
         // ── Responses API 流式事件（response.completed / response.incomplete）──
         // data JSON 的 type 字段标识事件类型；response.completed 和 response.incomplete
         // 的 response 对象内含 usage，提取方式同非流式（openai_usage 兼容 responses 格式）。
-        if let Some("response.completed" | "response.incomplete") = chunk.get("type").and_then(Value::as_str) {
+        if let Some("response.completed" | "response.incomplete") =
+            chunk.get("type").and_then(Value::as_str)
+        {
             if let Some(resp_usage) = chunk
                 .get("response")
                 .and_then(|r| r.get("usage"))
@@ -230,7 +232,7 @@ impl UsageSseScanner {
     }
 
     /// 结束扫描，返回收集到的 usage（可能为空）。
-    #[must_use] 
+    #[must_use]
     pub fn finish(self) -> UsageInfo {
         self.latest
     }
@@ -376,7 +378,10 @@ pub async fn wrap_and_record(
                 return Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
                     .body(Body::from("failed to read upstream response"))
-                    .unwrap();
+                    .unwrap_or_else(|e| {
+                        tracing::error!("failed to build error response: {}", e);
+                        Response::new(Body::from("failed to read upstream response"))
+                    });
             }
         };
         let usage = serde_json::from_slice::<Value>(&bytes)
@@ -400,14 +405,18 @@ pub async fn wrap_and_record(
 
     let data_stream = body.into_data_stream().map(move |chunk| {
         if let Ok(ref bytes) = chunk {
-            scanner_for_stream.lock().unwrap().push(bytes);
+            scanner_for_stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(bytes);
         }
         chunk
     });
 
     // 流耗尽时落库：追加一个末尾 future，消费完成后触发记录，且不产出额外字节。
     let tail_stream = futures_util::stream::once(async move {
-        let usage = std::mem::take(&mut *scanner.lock().unwrap()).finish();
+        let usage =
+            std::mem::take(&mut *scanner.lock().unwrap_or_else(|e| e.into_inner())).finish();
         let insert = ctx.into_insert(
             usage,
             status_code,

@@ -30,7 +30,7 @@ impl Claims {
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+            .unwrap_or(Duration::from_secs(0));
         let exp = now + Duration::from_secs(24 * 60 * 60); // 24 hours
         Self {
             sub: "admin".to_string(),

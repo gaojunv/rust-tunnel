@@ -76,7 +76,7 @@ impl Database {
     }
 
     /// Return a reference to the connection pool
-    #[must_use] 
+    #[must_use]
     pub fn pool(&self) -> &sqlx::SqlitePool {
         &self.pool
     }

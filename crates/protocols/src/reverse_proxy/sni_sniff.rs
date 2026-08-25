@@ -17,7 +17,7 @@ pub enum SniParse {
 }
 
 /// 从 TLS record 字节流解析 ClientHello 的 SNI。
-#[must_use] 
+#[must_use]
 pub fn parse_client_hello_sni(buf: &[u8]) -> SniParse {
     // TLS record header: type(1) version(2) length(2)
     if buf.len() < 5 {

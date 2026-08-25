@@ -413,7 +413,7 @@ impl Default for ChatToResponsesSseTranslator {
 }
 
 impl ChatToResponsesSseTranslator {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -1385,7 +1385,7 @@ impl Default for ResponsesToChatSseTranslator {
 }
 
 impl ResponsesToChatSseTranslator {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -1717,7 +1717,7 @@ fn push_chat_chunk(out: &mut String, chunk: &Value) {
 /// 结构与 [`super::format::convert_openai_stream_to_anthropic`] 一致：
 /// 用 [`ChatToResponsesSseTranslator`] 包装字节流，每个上游字节块喂入翻译器，
 /// 返回的字节直接发给客户端。
-#[must_use] 
+#[must_use]
 pub fn convert_openai_stream_to_responses(
     openai_resp: axum::response::Response,
 ) -> axum::response::Response {
@@ -1731,7 +1731,10 @@ pub fn convert_openai_stream_to_responses(
         async move {
             match chunk {
                 Ok(bytes) => {
-                    let converted = translator.lock().unwrap().push(&bytes);
+                    let converted = translator
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(&bytes);
                     if converted.is_empty() {
                         None
                     } else {
@@ -1749,7 +1752,10 @@ pub fn convert_openai_stream_to_responses(
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(axum::body::Body::from_stream(out))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build SSE response: {}", e);
+            axum::response::Response::new(axum::body::Body::empty())
+        })
 }
 
 /// 非流式：把 OpenAI chat completion 响应 JSON 转成 Responses API 响应。
@@ -1780,7 +1786,10 @@ pub async fn convert_openai_to_responses_response(
                 .body(Body::from(format!(
                     "failed to read upstream response (too large or read error): {e}"
                 )))
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to build error response: {}", e);
+                    Response::new(Body::from("failed to read upstream response"))
+                });
         }
     };
 
@@ -1790,8 +1799,11 @@ pub async fn convert_openai_to_responses_response(
             return Response::builder()
                 .status(status)
                 .header("Content-Type", "application/json")
-                .body(Body::from(body_bytes))
-                .unwrap();
+                .body(Body::from(body_bytes.clone()))
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to build response: {}", e);
+                    Response::new(Body::from(body_bytes))
+                });
         }
     };
 
@@ -1803,7 +1815,10 @@ pub async fn convert_openai_to_responses_response(
         .body(Body::from(
             serde_json::to_vec(&responses_resp).unwrap_or_else(|_| body_bytes.to_vec()),
         ))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build response: {}", e);
+            Response::new(Body::from(body_bytes))
+        })
 }
 
 // ── H. 上游 Responses → Chat 响应转换（failover 用） ──────────────
@@ -1848,7 +1863,10 @@ pub async fn convert_responses_to_chat_response(
         .body(Body::from(
             serde_json::to_vec(&chat_json).unwrap_or_else(|_| body_bytes.to_vec()),
         ))
-        .unwrap())
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build response: {}", e);
+            Response::new(Body::from(body_bytes))
+        }))
 }
 
 /// 流式：把上游 Responses SSE 字节流逐事件翻译成 Chat chunk SSE。
@@ -1871,7 +1889,10 @@ pub fn convert_responses_stream_to_chat(
         async move {
             match chunk {
                 Ok(bytes) => {
-                    let converted = translator.lock().unwrap().push(&bytes);
+                    let converted = translator
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(&bytes);
                     if converted.is_empty() {
                         None
                     } else {

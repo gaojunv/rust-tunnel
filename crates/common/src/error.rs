@@ -200,10 +200,7 @@ mod tests {
     fn test_with_source_display_and_chain() {
         let io_err = std::io::Error::other("disk gone");
         let err = TunnelError::with_source("Failed to load certificate", io_err);
-        assert_eq!(
-            format!("{err}"),
-            "Failed to load certificate: disk gone"
-        );
+        assert_eq!(format!("{err}"), "Failed to load certificate: disk gone");
         // source 链可达
         let src = std::error::Error::source(&err);
         assert!(src.is_some());

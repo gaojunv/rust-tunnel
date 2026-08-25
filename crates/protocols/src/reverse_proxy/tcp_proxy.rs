@@ -13,7 +13,7 @@ pub struct TcpProxy {
 
 impl TcpProxy {
     /// Create a new TCP proxy
-    #[must_use] 
+    #[must_use]
     pub fn new(state: ReverseProxyState) -> Self {
         Self { state }
     }
@@ -44,22 +44,26 @@ impl TcpProxy {
                 rules.get(&rule_id).and_then(|r| r.domains.first().cloned())
             });
 
-            if let Some(domain) = domain { if let Some(provider) = self.state.cert_provider() { if let Some(config) = provider.get_tls_server_config(&domain).await {
-                info!("TCP proxy TLS enabled for domain '{}'", domain);
-                Some(TlsAcceptor::from(config))
-            } else {
-                warn!(
-                    "No certificate found for domain '{}' on rule {}, running without TLS",
-                    domain, rule_id
-                );
-                None
-            } } else {
-                warn!(
+            if let Some(domain) = domain {
+                if let Some(provider) = self.state.cert_provider() {
+                    if let Some(config) = provider.get_tls_server_config(&domain).await {
+                        info!("TCP proxy TLS enabled for domain '{}'", domain);
+                        Some(TlsAcceptor::from(config))
+                    } else {
+                        warn!(
+                            "No certificate found for domain '{}' on rule {}, running without TLS",
+                            domain, rule_id
+                        );
+                        None
+                    }
+                } else {
+                    warn!(
                     "TLS enabled for rule {} but no certificate provider configured, running without TLS",
                     rule_id
                 );
-                None
-            } } else {
+                    None
+                }
+            } else {
                 warn!(
                     "TLS enabled for rule {} but no domain configured, running without TLS",
                     rule_id
@@ -188,7 +192,7 @@ pub struct UdpProxy {
 
 impl UdpProxy {
     /// Create a new UDP proxy
-    #[must_use] 
+    #[must_use]
     pub fn new(state: ReverseProxyState) -> Self {
         Self { state }
     }

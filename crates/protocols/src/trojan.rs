@@ -139,7 +139,7 @@ pub enum ParseResult {
 }
 
 /// Compute SHA-224 hex hash of password (56 lowercase hex chars)
-#[must_use] 
+#[must_use]
 pub fn sha224_hex(password: &str) -> String {
     use sha2::{Digest, Sha224};
     let mut hasher = Sha224::new();
@@ -148,7 +148,7 @@ pub fn sha224_hex(password: &str) -> String {
 }
 
 /// Verify a received hash against an expected password using constant-time comparison
-#[must_use] 
+#[must_use]
 pub fn verify_password(received_hash: &str, expected_password: &str) -> bool {
     let expected_hash = sha224_hex(expected_password);
     constant_time_eq(received_hash.as_bytes(), expected_hash.as_bytes())
@@ -181,7 +181,7 @@ pub struct TrojanConnectionContext {
 
 /// Parse a Trojan request from a buffer
 /// Returns Complete if parsing succeeded, Incomplete if more data needed, Invalid on error
-#[must_use] 
+#[must_use]
 pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
     // Minimum: 56 (hash) + 2 (CRLF) + 1 (CMD) + 1 (ATYP) + 1 (min addr) + 2 (port) + 2 (CRLF) = 65
     // But realistically with IPv4: 56 + 2 + 1 + 1 + 4 + 2 + 2 = 68
@@ -263,7 +263,7 @@ pub enum PacketParseResult {
 
 /// Parse one Trojan UDP packet from the front of `buf`.
 /// Wire format: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
-#[must_use] 
+#[must_use]
 pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
     // Address (includes ATYP byte)
     let (address, addr_len) = match TrojanAddress::parse(buf, 0) {
@@ -322,7 +322,7 @@ pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
 
 impl UdpPacket {
     /// Encode the packet to wire bytes: ATYP + ADDR + PORT(2) + LENGTH(2) + CRLF + PAYLOAD
-    #[must_use] 
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload.len() + 32);
         self.address.encode(&mut out);
@@ -685,13 +685,17 @@ async fn dispatch_udp_packet(
         TrojanAddress::IPv6(ip) => SocketAddr::new((*ip).into(), pkt.port),
         TrojanAddress::Domain(domain) => {
             match tokio::net::lookup_host((domain.as_str(), pkt.port)).await {
-                Ok(mut addrs) => if let Some(a) = addrs.next() { a } else {
-                    debug!(
-                        "UDP connection {}: no addresses for {}",
-                        connection_id, domain
-                    );
-                    return;
-                },
+                Ok(mut addrs) => {
+                    if let Some(a) = addrs.next() {
+                        a
+                    } else {
+                        debug!(
+                            "UDP connection {}: no addresses for {}",
+                            connection_id, domain
+                        );
+                        return;
+                    }
+                }
                 Err(e) => {
                     debug!(
                         "UDP connection {}: DNS lookup failed for {}: {}",
@@ -706,9 +710,9 @@ async fn dispatch_udp_packet(
     // Get or create the per-target socket
     if let std::collections::hash_map::Entry::Vacant(e) = targets.entry(target) {
         let bind_addr: SocketAddr = if target.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
         } else {
-            "[::]:0".parse().unwrap()
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         };
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => Arc::new(s),
@@ -2411,8 +2415,7 @@ mod legacy_tests {
             tls_stream.write_all(&header).await.unwrap();
 
             // Send a UDP packet through the tunnel
-            let packet =
-                build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port, b"udp-echo-test");
+            let packet = build_udp_packet_v4(Ipv4Addr::LOCALHOST, udp_port, b"udp-echo-test");
             tls_stream.write_all(&packet).await.unwrap();
             tls_stream.flush().await.unwrap();
 
@@ -2599,10 +2602,7 @@ mod legacy_tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
 
             let count = registry.get_connection_count_for_port(trojan_port).await;
-            assert_eq!(
-                count, 0,
-                "Expected 0 connections after close, got {count}"
-            );
+            assert_eq!(count, 0, "Expected 0 connections after close, got {count}");
 
             server_handle.abort();
             echo_handle.abort();

@@ -17,7 +17,7 @@ pub enum UpstreamProtocol {
 ///
 /// - `"responses"` → [`UpstreamProtocol::Responses`]
 /// - 其余值 / 缺失 / JSON 解析失败 → [`UpstreamProtocol::ChatCompletions`]（默认）
-#[must_use] 
+#[must_use]
 pub fn parse_upstream_protocol(extra_config: Option<&str>) -> UpstreamProtocol {
     let Some(ec) = extra_config else {
         return UpstreamProtocol::ChatCompletions;

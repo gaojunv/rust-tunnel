@@ -19,7 +19,7 @@ pub struct ChallengeServer {
 
 impl ChallengeServer {
     /// Create a new challenge server
-    #[must_use] 
+    #[must_use]
     pub fn new(state: AcmeState, port: u16) -> Self {
         Self { state, port }
     }

@@ -216,12 +216,13 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
     //    引号——但这是 JSON 字符串而非 shell 拼接，客户端 `sh -c` 自行处理，
     //    服务端原样透传即可。
     let shell: Option<String> = match ws.runtime_type.as_str() {
-        "docker" => Some(format!(
-            "docker exec -it {} sh",
-            ws.docker_container_id
-                .as_deref()
-                .expect("docker container id checked above")
-        )),
+        "docker" => {
+            let Some(container_id) = ws.docker_container_id.as_deref() else {
+                send_ws_error(&mut ws_sink, "docker container id missing").await;
+                return;
+            };
+            Some(format!("docker exec -it {container_id} sh"))
+        }
         _ => None,
     };
 
@@ -251,8 +252,13 @@ async fn handle_terminal_socket(state: ApiState, socket: WebSocket, params: Term
         shell: shell.as_deref(),
         id: Some(&terminal_id),
     };
-    let mut frame = serde_json::to_vec(&negotiation)
-        .expect("serde_json::to_vec on a flat struct is infallible");
+    let mut frame = match serde_json::to_vec(&negotiation) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("terminal ws: serialize PTY negotiation failed: {e}");
+            return;
+        }
+    };
     frame.push(b'\n');
     if let Err(e) = tunnel.write_all(&frame).await {
         tracing::warn!("terminal ws: write PTY negotiation frame failed: {e}");
@@ -1221,8 +1227,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                         continue;
                     }
                 }
-                rt_cache = Some(loaded);
-                rt_cache.as_mut().expect("rt_cache just assigned")
+                rt_cache.insert(loaded)
             }
         };
 

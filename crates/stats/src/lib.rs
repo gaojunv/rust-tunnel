@@ -1,3 +1,6 @@
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! Unified statistics collector for all connection types.
 //!
 //! Tracks bytes in/out, rate (sliding window), RTT/loss, and
@@ -27,7 +30,7 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    #[must_use] 
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             EntityType::Client => "client",
@@ -92,7 +95,12 @@ impl EntityStats {
         self.bytes_out += bytes_out;
         self.rate_window
             .push_back((Instant::now(), self.bytes_in, self.bytes_out));
-        let cutoff = Instant::now().checked_sub(std::time::Duration::from_mins(1)).unwrap();
+        let cutoff = Instant::now()
+            .checked_sub(std::time::Duration::from_mins(1))
+            .unwrap_or_else(|| {
+                tracing::warn!("Instant cutoff underflow");
+                Instant::now()
+            });
         while self
             .rate_window
             .front()
@@ -161,7 +169,7 @@ pub struct StatsCollector {
 
 impl StatsCollector {
     /// Create a new collector. `db` may be None for in-memory-only mode.
-    #[must_use] 
+    #[must_use]
     pub fn new(db: Option<Database>) -> Self {
         let (tx, _) = broadcast::channel(256);
         Self {
@@ -172,7 +180,7 @@ impl StatsCollector {
     }
 
     /// Get a receiver for SSE streaming.
-    #[must_use] 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<StatsSnapshot> {
         self.tx.subscribe()
     }
@@ -191,7 +199,10 @@ impl StatsCollector {
             return;
         }
         let key = (entity_type, entity_id.to_string());
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = map.entry(key).or_insert_with(EntityStats::new);
         entry.record_bytes(bytes_in, bytes_out);
     }
@@ -199,7 +210,10 @@ impl StatsCollector {
     /// Record an RTT sample (from client heartbeat or TCP_INFO).
     pub fn record_rtt(&self, entity_type: EntityType, entity_id: &str, rtt_ms: f64) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key)
             .or_insert_with(EntityStats::new)
             .push_rtt(rtt_ms);
@@ -208,14 +222,20 @@ impl StatsCollector {
     /// Increment active connection count.
     pub fn incr_conns(&self, entity_type: EntityType, entity_id: &str) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key).or_insert_with(EntityStats::new).active_conns += 1;
     }
 
     /// Decrement active connection count.
     pub fn decr_conns(&self, entity_type: EntityType, entity_id: &str) {
         let key = (entity_type, entity_id.to_string());
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(e) = map.get_mut(&key) {
             if e.active_conns > 0 {
                 e.active_conns -= 1;
@@ -226,7 +246,10 @@ impl StatsCollector {
     // ── Tick: recalc rates (every 5 seconds) ──────────────────────
 
     pub fn tick_rates(&self) {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for stats in map.values_mut() {
             stats.recalc_rate();
         }
@@ -242,7 +265,10 @@ impl StatsCollector {
             .unwrap_or(now);
 
         let snapshots: Vec<StatsSnapshot> = {
-            let map = self.inner.lock().unwrap();
+            let map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.iter()
                 .map(|((et, eid), stats)| stats.snapshot(*et, eid, snapshot_time))
                 .collect()
@@ -285,9 +311,12 @@ impl StatsCollector {
     }
 
     /// Build a summary of current stats (in-memory only, no DB query).
-    #[must_use] 
+    #[must_use]
     pub fn get_summary(&self) -> StatsSummary {
-        let map = self.inner.lock().unwrap();
+        let map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut summary = StatsSummary::default();
 
         for ((entity_type, _entity_id), stats) in map.iter() {
@@ -359,7 +388,9 @@ mod tests {
             let mut map = c.inner.lock().unwrap();
             let key = (EntityType::Proxy, "r1".to_string());
             let entry = map.entry(key).or_insert_with(EntityStats::new);
-            let past = Instant::now().checked_sub(std::time::Duration::from_secs(10)).unwrap();
+            let past = Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap();
             entry.rate_window.clear();
             entry.bytes_out = 10000;
             entry.rate_window.push_back((past, 0, 0));

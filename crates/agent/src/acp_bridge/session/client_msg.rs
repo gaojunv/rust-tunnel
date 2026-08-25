@@ -88,7 +88,9 @@ impl AcpBridge {
             if tx.send(data).await.is_err() {
                 tracing::debug!(session_id, "spawn data: pump closed, dropped");
             }
-        } else { tracing::debug!(session_id, "spawn data for missing/exited session, dropped") }
+        } else {
+            tracing::debug!(session_id, "spawn data for missing/exited session, dropped")
+        }
     }
 
     /// AgentSpawnExit（进程退出）：标记会话已退出；后续 prompt 报错。
@@ -101,7 +103,9 @@ impl AcpBridge {
             agent.stdout_tx = None;
             agent.last_activity = std::time::Instant::now();
             tracing::info!(session_id, code, "acp agent process exited");
-        } else { tracing::debug!(session_id, "spawn exit for unknown session") }
+        } else {
+            tracing::debug!(session_id, "spawn exit for unknown session")
+        }
     }
 
     /// AgentLlmProxyRequest：经内部 HTTP 回环调 LLM 网关入口（`/v1/messages`

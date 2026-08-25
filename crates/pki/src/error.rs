@@ -85,7 +85,7 @@ pub type AcmeResult<T> = Result<T, AcmeError>;
 
 impl AcmeError {
     /// 构造 [`AcmeError::Message`]（静态文案）。
-    #[must_use] 
+    #[must_use]
     pub fn msg(text: &'static str) -> Self {
         Self::Message(text.to_string())
     }

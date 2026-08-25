@@ -196,14 +196,15 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("user")
             .to_string();
-        let parsed = msg
-            .get("content")
-            .map_or(ParsedContent {
+        let parsed = msg.get("content").map_or(
+            ParsedContent {
                 text: String::new(),
                 thinking: String::new(),
                 tool_uses: Vec::new(),
                 tool_results: Vec::new(),
-            }, parse_anthropic_content);
+            },
+            parse_anthropic_content,
+        );
 
         if role.as_str() == "assistant" {
             seen_non_system = true;
@@ -327,7 +328,10 @@ fn anthropic_to_openai(body: &Value) -> Result<ChatCompletionRequest, String> {
             .get("temperature")
             .and_then(serde_json::Value::as_f64)
             .map(|v| v as f32),
-        top_p: body.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+        top_p: body
+            .get("top_p")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32),
         tools,
         tool_choice,
         raw_body: Some(passthrough),

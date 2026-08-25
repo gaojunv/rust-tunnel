@@ -11,7 +11,7 @@ pub const DEFAULT_CONTEXT_LIMIT_CHARS: usize = 1_048_576;
 pub const KEEP_RECENT_MESSAGES: usize = 6;
 
 /// 估算消息列表的字符量（content + tool_calls JSON + tool 结果）。
-#[must_use] 
+#[must_use]
 pub fn estimate_chars(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -27,7 +27,7 @@ pub fn estimate_chars(messages: &[ChatMessage]) -> usize {
 /// 确定压缩切割点：压缩段为 messages[1..cut]（跳过 system），保留 messages[cut..]。
 /// 返回 0 表示无可压缩段。切割点对齐 tool 配对边界：右边界不得落在 tool 序列
 /// 中间（右侧第一条若是 tool 消息则继续右移到该 tool 序列结束）。
-#[must_use] 
+#[must_use]
 pub fn find_cut_point(messages: &[ChatMessage], keep_recent: usize) -> usize {
     // messages[0] 是 system；压缩段至少留 1 条才有意义
     if messages.len() <= 1 + keep_recent + 1 {
@@ -50,7 +50,7 @@ pub fn find_cut_point(messages: &[ChatMessage], keep_recent: usize) -> usize {
 /// status 用于粗筛（4xx），message 子串匹配用于确认——不同 provider 措辞不一，
 /// 命中任一已知模式即视为溢出。仅凭 status 不够（400 也可能是参数错误），
 /// 但 message 命中且 status 为 4xx 即成立。
-#[must_use] 
+#[must_use]
 pub fn is_context_overflow(status: u16, message: &str) -> bool {
     if !(400..=499).contains(&status) {
         return false;
@@ -82,7 +82,7 @@ pub async fn context_limit_for(db: &crate::db::Database, model: &str) -> usize {
 }
 
 /// 待压缩段渲染为纯文本（喂给摘要 LLM）。
-#[must_use] 
+#[must_use]
 pub fn render_for_summary(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for m in messages {

@@ -33,7 +33,7 @@ use super::ChatMessage;
 
 /// 判断 provider 的 extra_config 是否开启工具历史兼容模式。
 /// extra_config 是 JSON 字符串，含 `"compat_tool_history": true` 即开启。
-#[must_use] 
+#[must_use]
 pub fn compat_tool_history_enabled(extra_config: Option<&str>) -> bool {
     extra_config
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -196,7 +196,7 @@ impl Default for TagScanner {
 }
 
 impl TagScanner {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             state: ScanState::Text,
@@ -206,7 +206,7 @@ impl TagScanner {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn has_tool_calls(&self) -> bool {
         !self.calls.is_empty()
     }
@@ -280,7 +280,7 @@ impl TagScanner {
     }
 
     /// 流结束：把残留缓冲清算为最终事件。
-    #[must_use] 
+    #[must_use]
     pub fn finish(mut self) -> Vec<ScanEvent> {
         let mut events = Vec::new();
         if self.buf.is_empty() {
@@ -338,7 +338,9 @@ impl TagScanner {
 
     /// 解析 <tool_call> 体内 JSON 并产出事件。
     fn emit_call(&mut self, body: &str, events: &mut Vec<ScanEvent>) {
-        if let Some((name, args)) = parse_tool_call_body(body) { self.push_call(&name, &args, events) } else {
+        if let Some((name, args)) = parse_tool_call_body(body) {
+            self.push_call(&name, &args, events)
+        } else {
             log_discard("tool_call JSON parse failed", body);
             events.push(ScanEvent::Discarded(body.to_string()));
         }

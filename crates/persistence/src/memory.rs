@@ -41,7 +41,7 @@ pub struct AgentMemorySettingsRecord {
 impl AgentMemorySettingsRecord {
     /// 未配置时的默认构造（enabled=false，其余为表默认值）。`memory_get_settings`
     /// 无行时返回它；时间字段置空（表中无对应行，正常序列化为空串）。
-    #[must_use] 
+    #[must_use]
     pub fn default_disabled() -> Self {
         Self {
             id: 1,

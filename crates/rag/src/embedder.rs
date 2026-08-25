@@ -45,13 +45,18 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    #[must_use] 
+    /// # Panics
+    /// reqwest Client 构建失败属构造期 fatal（TLS 后端不可用），无法恢复。
+    #[must_use]
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
+        // 构造期 fatal：TLS 后端初始化失败则 embedding 全不可用，
+        // 返回 Self 的签名无法传播错误，保持 panic 语义。
+        #[expect(clippy::panic)]
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_mins(1))
             .build()
-            .expect("failed to build embedding client");
+            .unwrap_or_else(|e| panic!("failed to build embedding client: {e}"));
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),

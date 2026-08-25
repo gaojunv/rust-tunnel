@@ -138,13 +138,17 @@ impl AcpBridge {
         };
         let mut entries: Vec<(String, String)> = map
             .into_iter()
-            .filter_map(|(k, v)| if let Some(s) = v.as_str() { Some((k, s.to_string())) } else {
-                tracing::warn!(
-                    session_id,
-                    config_id = %k,
-                    "agent_config_overrides value not a string, skipped"
-                );
-                None
+            .filter_map(|(k, v)| {
+                if let Some(s) = v.as_str() {
+                    Some((k, s.to_string()))
+                } else {
+                    tracing::warn!(
+                        session_id,
+                        config_id = %k,
+                        "agent_config_overrides value not a string, skipped"
+                    );
+                    None
+                }
             })
             .collect();
         entries.sort_by_key(|(k, _)| (i32::from(k != "mode"), k.clone()));

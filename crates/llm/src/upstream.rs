@@ -141,7 +141,7 @@ fn sanitize_error_message(body: &str) -> String {
         }
 
         // ── Regular character ──
-        let ch = truncated[pos..].chars().next().unwrap();
+        let ch = truncated[pos..].chars().next().unwrap_or_default();
         out.push(ch);
         pos += ch.len_utf8();
     }
@@ -161,7 +161,7 @@ fn sanitize_error_message(body: &str) -> String {
 ///
 /// 独立成公共函数是为了让调用方在发送前拿到完整请求体写日志
 /// （`log_llm_request` 记录的就是这个 body，与实际发送内容逐字节一致）。
-#[must_use] 
+#[must_use]
 pub fn build_upstream_body(request: &ChatCompletionRequest) -> serde_json::Value {
     // 透传模式：以原始请求体为基底，定点覆盖网关必须改写的字段。
     if let Some(mut raw) = request.raw_body.clone() {
@@ -336,7 +336,10 @@ async fn relay_upstream_stream(resp: reqwest::Response) -> Result<Response, (Sta
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(body)
-        .unwrap())
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build SSE response: {}", e);
+            Response::new(Body::empty())
+        }))
 }
 
 /// Relay a non-streaming upstream response body to the client.
@@ -357,19 +360,21 @@ async fn relay_upstream_body(resp: reqwest::Response) -> Result<Response, (Statu
         if body_bytes.len() > MAX_UPSTREAM_BODY_BYTES {
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!(
-                    "Upstream response exceeded {MAX_UPSTREAM_BODY_BYTES} byte limit"
-                ),
+                format!("Upstream response exceeded {MAX_UPSTREAM_BODY_BYTES} byte limit"),
             ));
         }
     }
 
+    let body_bytes_clone = body_bytes.clone();
     let body = Body::from(body_bytes);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(body)
-        .unwrap())
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build response: {}", e);
+            Response::new(Body::from(body_bytes_clone))
+        }))
 }
 
 /// 非流式响应体的质量校验：读 body → 校验非空 + 合法 JSON → 重建 Response。
@@ -406,8 +411,11 @@ async fn validate_response_body(resp: Response) -> Result<Response, (StatusCode,
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
-        .body(Body::from(body_bytes))
-        .unwrap())
+        .body(Body::from(body_bytes.clone()))
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build response: {}", e);
+            Response::new(Body::from(body_bytes))
+        }))
 }
 
 /// 判定错误消息是否为"上游 200 但空/畸形响应"类（可原地重试 + 可转移）。
@@ -428,7 +436,7 @@ fn is_malformed_error(msg: &str) -> bool {
 ///
 /// 可转移：5xx（含连接/超时映射来的 502）、429（受 `failover_on_429` 开关控制）。
 /// 不可转移：其余 4xx（请求本身问题，换模型大概率同样失败）。
-#[must_use] 
+#[must_use]
 pub fn is_retryable(status: StatusCode, failover_on_429: bool) -> bool {
     if status.is_server_error() {
         return true;
@@ -437,7 +445,7 @@ pub fn is_retryable(status: StatusCode, failover_on_429: bool) -> bool {
 }
 
 /// 从 provider `extra_config` JSON 读 `failover_on_429` 开关（默认 true）。
-#[must_use] 
+#[must_use]
 pub fn failover_on_429_enabled(extra_config: Option<&str>) -> bool {
     let Some(ec) = extra_config else { return true };
     serde_json::from_str::<serde_json::Value>(ec)
@@ -560,7 +568,10 @@ pub async fn call_upstream_stream_guarded(
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(body)
-        .unwrap())
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build SSE response: {}", e);
+            Response::new(Body::empty())
+        }))
 }
 
 /// 候选链执行循环的结果。
@@ -1017,7 +1028,7 @@ fn summarize_request_for_log(req_body: &serde_json::Value) -> String {
 }
 
 /// Build an OpenAI-format error response.
-#[must_use] 
+#[must_use]
 pub fn error_response(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1028,12 +1039,18 @@ pub fn error_response(status: StatusCode, message: String, error_type: &str) -> 
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_else(|e| {
+            tracing::warn!("failed to serialize error body: {}", e);
+            Vec::new()
+        })))
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build error response: {}", e);
+            Response::new(Body::empty())
+        })
 }
 
 /// Build an Anthropic-format error response for Anthropic-protocol domains.
-#[must_use] 
+#[must_use]
 pub fn error_response_anthropic(status: StatusCode, message: String, error_type: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
@@ -1045,13 +1062,19 @@ pub fn error_response_anthropic(status: StatusCode, message: String, error_type:
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_else(|e| {
+            tracing::warn!("failed to serialize error body: {}", e);
+            Vec::new()
+        })))
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build error response: {}", e);
+            Response::new(Body::empty())
+        })
 }
 
 /// Build a 404 "model not found" response that carries the available model list,
 /// per spec: 未匹配 → 返回 404，body 中包含可用模型列表。
-#[must_use] 
+#[must_use]
 pub fn model_not_found_response(message: String, available_models: Vec<String>) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -1063,8 +1086,14 @@ pub fn model_not_found_response(message: String, available_models: Vec<String>) 
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .body(Body::from(serde_json::to_vec(&body).unwrap_or_else(|e| {
+            tracing::warn!("failed to serialize error body: {}", e);
+            Vec::new()
+        })))
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build error response: {}", e);
+            Response::new(Body::empty())
+        })
 }
 
 #[cfg(test)]

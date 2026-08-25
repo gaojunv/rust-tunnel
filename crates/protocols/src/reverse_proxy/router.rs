@@ -15,7 +15,7 @@ pub struct RouteTable {
 
 impl RouteTable {
     /// Create a new empty route table
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             domain_rules: HashMap::new(),
@@ -25,7 +25,7 @@ impl RouteTable {
     }
 
     /// Build route table from a list of rules
-    #[must_use] 
+    #[must_use]
     pub fn from_rules(rules: Vec<ProxyRule>) -> Self {
         let mut table = Self::new();
         for rule in rules {
@@ -65,13 +65,13 @@ impl RouteTable {
     }
 
     /// Find a rule by ID
-    #[must_use] 
+    #[must_use]
     pub fn get_rule(&self, id: &str) -> Option<&ProxyRule> {
         self.rules.get(id)
     }
 
     /// Get all rules
-    #[must_use] 
+    #[must_use]
     pub fn get_all_rules(&self) -> Vec<&ProxyRule> {
         self.rules.values().collect()
     }
@@ -184,7 +184,7 @@ impl RouteTable {
     }
 
     /// Find a TCP/UDP rule by listen address
-    #[must_use] 
+    #[must_use]
     pub fn match_tcp_rule(&self, listen_addr: &str) -> Option<&ProxyRule> {
         self.rules.values().find(|rule| {
             rule.enabled

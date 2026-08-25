@@ -43,7 +43,7 @@ pub struct ReverseProxyState {
 
 impl ReverseProxyState {
     /// Create a new reverse proxy state without database
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
@@ -61,7 +61,7 @@ impl ReverseProxyState {
     }
 
     /// Create a new reverse proxy state with database
-    #[must_use] 
+    #[must_use]
     pub fn with_db(db: Database) -> Self {
         Self {
             rules: Arc::new(Mutex::new(HashMap::new())),
@@ -102,7 +102,7 @@ impl ReverseProxyState {
     }
 
     /// 取该监听地址生效的 Trojan 分流表项。
-    #[must_use] 
+    #[must_use]
     pub fn trojan_sni_entry(&self, listen_addr: &str) -> Option<Arc<TrojanSniEntry>> {
         let snap = self.trojan_sni.load();
         match snap.as_ref() {

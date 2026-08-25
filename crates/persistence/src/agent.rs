@@ -7,7 +7,7 @@ use super::Database;
 /// 数小时。已含 T/Z 或其它格式的字符串原样返回（其它写入方可能直接存 ISO）。
 /// 原子字符串：长度 ≥19 且第 11 个字符为空格即命中；带毫秒/偏移由 JS Date 宽容
 /// 解析，不在此处理。
-#[must_use] 
+#[must_use]
 pub fn normalize_db_datetime(raw: &str) -> String {
     if raw.len() >= 19 && raw.as_bytes().get(10) == Some(&b' ') {
         let mut s = raw.to_string();
@@ -74,7 +74,7 @@ pub struct AgentWorkspaceRecord {
 impl AgentWorkspaceRecord {
     /// 是否已配置 GitHub token（密文非空即视为已配置；密文可能是"明文降级"
     /// 路径下的原样 token，非 `enc:v1:` 前缀，同样按已配置处理）。
-    #[must_use] 
+    #[must_use]
     pub fn github_token_set(&self) -> bool {
         self.github_token.as_deref().is_some_and(|t| !t.is_empty())
     }

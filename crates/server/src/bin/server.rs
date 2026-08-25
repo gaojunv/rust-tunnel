@@ -1,6 +1,6 @@
 use rust_tunnel_common::{
     create_server_config, init_logging_with_layer, init_logging_with_level, load_or_generate_cert,
-    TunnelResult,
+    TunnelError, TunnelResult,
 };
 use rust_tunnel_server::acme::CertificateProvider;
 use rust_tunnel_server::logs::LogLayer;
@@ -211,7 +211,7 @@ async fn main() -> TunnelResult<()> {
         state.dns_registry = Some(dns_registry.clone());
 
         let dns_server = rust_tunnel_server::DnsServer::new(dns_registry, &config.dns_bind)
-            .expect("Failed to create DNS server");
+            .map_err(TunnelError::Config)?;
 
         tokio::spawn(async move {
             if let Err(e) = dns_server.run().await {
@@ -405,18 +405,14 @@ async fn main() -> TunnelResult<()> {
             let agent_state = agent_state.map(|a| {
                 if let Some(db) = state.db().cloned() {
                     let memory_state = rust_tunnel_server::agent::memory::MemoryState::new(
-                        db,
+                        db.clone(),
                         llm_state.rag_store.clone(),
                         llm_state.cipher.clone(),
                         (*llm_state).clone(),
                     );
                     tracing::info!("AI memory runtime injected into agent state");
                     a.with_memory(memory_state).with_wiki(
-                        rust_tunnel_server::agent::wiki::WikiState::new(
-                            // with_memory 已消费一份 db 克隆，这里再取一份
-                            state.db().cloned().expect("db checked above"),
-                            (*llm_state).clone(),
-                        ),
+                        rust_tunnel_server::agent::wiki::WikiState::new(db, (*llm_state).clone()),
                     )
                 } else {
                     tracing::warn!("no database; AI memory runtime not injected");
@@ -568,7 +564,9 @@ async fn main() -> TunnelResult<()> {
 
     // Spawn control server
     tokio::spawn(async move {
-        if let Err(e) = control_plane::run_server(control_config, control_state, control_tls_rx).await {
+        if let Err(e) =
+            control_plane::run_server(control_config, control_state, control_tls_rx).await
+        {
             tracing::error!("Control server error: {}", e);
         }
     });

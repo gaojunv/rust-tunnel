@@ -19,7 +19,7 @@ pub struct LlmHandlerState {
 
 impl LlmHandlerState {
     /// Return an error response in the format appropriate for the matched protocol.
-    #[must_use] 
+    #[must_use]
     pub fn error_for_protocol(
         &self,
         status: StatusCode,
@@ -161,7 +161,11 @@ pub async fn handle_chat_completions(
 
     let mut request_messages: Vec<ChatMessage> = Vec::new();
     if need_structured {
-        match serde_json::from_value(body.get("messages").unwrap().clone()) {
+        match serde_json::from_value(
+            body.get("messages")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ) {
             Ok(m) => request_messages = m,
             Err(e) => {
                 // 记录请求解析错误
@@ -202,7 +206,10 @@ pub async fn handle_chat_completions(
             .get("temperature")
             .and_then(serde_json::Value::as_f64)
             .map(|v| v as f32),
-        top_p: body.get("top_p").and_then(serde_json::Value::as_f64).map(|v| v as f32),
+        top_p: body
+            .get("top_p")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32),
         // OpenAI 兼容入口：tools / tool_choice 直接透传上游。
         tools: body.get("tools").and_then(|v| v.as_array()).cloned(),
         tool_choice: body.get("tool_choice").cloned(),
@@ -286,7 +293,10 @@ pub async fn rewrite_pseudo_tool_calls_in_response(resp: Response) -> Response {
                 .body(Body::from(format!(
                     "failed to read upstream response (too large or read error): {e}"
                 )))
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to build error response: {}", e);
+                    Response::new(Body::from("failed to read upstream response"))
+                });
         }
     };
 
@@ -497,16 +507,17 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                             st.usage_chunk = Some(chunk.clone());
                         }
                         if let Some(content) = chunk["choices"][0]["delta"]["content"].as_str() {
-                            drain_events!(
-                                st.scanner
-                                    .as_mut()
-                                    .expect("scanner alive until upstream ends")
-                                    .push(content),
-                                st.queue,
-                                st.id,
-                                st.model,
-                                st.pending_calls
-                            );
+                            if let Some(scanner) = st.scanner.as_mut() {
+                                drain_events!(
+                                    scanner.push(content),
+                                    st.queue,
+                                    st.id,
+                                    st.model,
+                                    st.pending_calls
+                                );
+                            } else {
+                                tracing::warn!("scanner unexpectedly None");
+                            }
                         }
                         // 上游原生 tool_calls（模型走了结构化路径）：原样透传
                         if chunk["choices"][0]["delta"]["tool_calls"].is_array() {
@@ -524,7 +535,8 @@ pub fn rewrite_pseudo_tool_calls_in_stream(resp: Response) -> Response {
                                 if !st.saw_finish {
                                     st.saw_finish = true;
                                     // 如果 finish chunk 已携带 usage，清除 usage_chunk 防止重复发出
-                                    if chunk.get("usage").is_some_and(serde_json::Value::is_object) {
+                                    if chunk.get("usage").is_some_and(serde_json::Value::is_object)
+                                    {
                                         st.usage_chunk = None;
                                     }
                                     st.queue

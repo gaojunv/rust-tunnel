@@ -48,6 +48,9 @@ pub(super) fn error_response(err: &ProxyError) -> Response {
     };
     Response::builder()
         .status(status)
-        .body(Body::from(body))
-        .unwrap()
+        .body(Body::from(body.clone()))
+        .unwrap_or_else(|err| {
+            tracing::warn!("failed to build error response: {err}");
+            Response::new(Body::from(body))
+        })
 }

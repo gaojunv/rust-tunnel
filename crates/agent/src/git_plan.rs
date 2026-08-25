@@ -80,7 +80,7 @@ fn is_push_force_flag(t: &str) -> bool {
 
 /// 按子命令 + 参数判定风险。未知子命令保守按 DangerousWrite（fail-closed，
 /// 审批兜底方向）。与 [`plan`] 共用 `SUB_TABLE` 单数据源。
-#[must_use] 
+#[must_use]
 pub fn classify(args: &[String]) -> GitRisk {
     let Some(sub) = args.first() else {
         return GitRisk::DangerousWrite;
@@ -458,7 +458,7 @@ pub fn plan(args: &[String]) -> Result<PlannedGit, GitPlanError> {
 /// 解析远端 URL 为 (owner, repo)（阶段 2「PR 关联」预备）。支持
 /// `https://github.com/o/r(.git)`、`http://...`、`git@github.com:o/r(.git)` 与
 /// `ssh://git@github.com/o/r(.git)` 形态；`.git` 后缀与尾部 `/` 剥离。
-#[must_use] 
+#[must_use]
 pub fn parse_remote_url(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     let path = if let Some(rest) = url.strip_prefix("https://") {

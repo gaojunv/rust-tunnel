@@ -110,7 +110,10 @@ impl MockPortRegistry {
 #[async_trait::async_trait]
 impl PortRegistry for MockPortRegistry {
     async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
-        let mut ports = self.ports.lock().unwrap();
+        let mut ports = self
+            .ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ports.contains_key(&port) {
             return false;
         }
@@ -127,7 +130,10 @@ impl PortRegistry for MockPortRegistry {
         true
     }
     async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
-        let mut ports = self.ports.lock().unwrap();
+        let mut ports = self
+            .ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ports.contains_key(&port) {
             return false;
         }
@@ -144,43 +150,71 @@ impl PortRegistry for MockPortRegistry {
         true
     }
     async fn get_port(&self, port: u16) -> Option<PortInfo> {
-        self.ports.lock().unwrap().get(&port).cloned()
+        self.ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&port)
+            .cloned()
     }
     async fn unregister_port(&self, port: u16) -> bool {
-        self.ports.lock().unwrap().remove(&port).is_some()
+        self.ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&port)
+            .is_some()
     }
     async fn get_connection_count_for_port(&self, remote_port: u16) -> usize {
         let ss = self
             .ss_conns
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&remote_port)
             .copied()
             .unwrap_or(0);
         let tj = self
             .trojan_conns
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&remote_port)
             .copied()
             .unwrap_or(0);
         ss + tj
     }
     async fn increment_ss_connections(&self, port: u16) {
-        *self.ss_conns.lock().unwrap().entry(port).or_insert(0) += 1;
+        *self
+            .ss_conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(port)
+            .or_insert(0) += 1;
     }
     async fn decrement_ss_connections(&self, port: u16) {
-        if let Some(c) = self.ss_conns.lock().unwrap().get_mut(&port) {
+        if let Some(c) = self
+            .ss_conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&port)
+        {
             if *c > 0 {
                 *c -= 1;
             }
         }
     }
     async fn increment_trojan_connections(&self, port: u16) {
-        *self.trojan_conns.lock().unwrap().entry(port).or_insert(0) += 1;
+        *self
+            .trojan_conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(port)
+            .or_insert(0) += 1;
     }
     async fn decrement_trojan_connections(&self, port: u16) {
-        if let Some(c) = self.trojan_conns.lock().unwrap().get_mut(&port) {
+        if let Some(c) = self
+            .trojan_conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&port)
+        {
             if *c > 0 {
                 *c -= 1;
             }

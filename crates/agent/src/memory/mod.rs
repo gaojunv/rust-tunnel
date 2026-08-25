@@ -43,7 +43,7 @@ pub const REMEMBER_TOOL_DESCRIPTION: &str = "Save a durable atomic fact about th
 
 /// remember 工具的 parameters JSON schema。`tools.rs` 的 OpenAI function schema 直接
 /// 内嵌此对象；MCP `tools/list` 的 `inputSchema` 同样取它（两者同构）。
-#[must_use] 
+#[must_use]
 pub fn remember_tool_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -94,7 +94,7 @@ impl std::fmt::Debug for MemoryState {
 
 impl MemoryState {
     /// 构造运行时。`store` 必须是 `llm.rag_store` 的克隆（同一底层 shard 缓存）。
-    #[must_use] 
+    #[must_use]
     pub fn new(db: Database, store: VectorStore, cipher: Option<LlmCipher>, llm: LlmState) -> Self {
         // 容量 64：事件低频（会话结束蒸馏一次），广播满时仅丢旧事件，不阻塞调用方。
         let (events, _rx) = broadcast::channel(64);
@@ -138,7 +138,7 @@ impl MemoryState {
     }
 
     /// 订阅记忆事件广播（SSE 端点用）。
-    #[must_use] 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<MemoryEvent> {
         self.events.subscribe()
     }
@@ -150,7 +150,7 @@ impl MemoryState {
 /// - `global` → 全部空
 /// - `client` → 客户端 id + 空 workspace
 /// - `workspace`（默认）→ 客户端 id + 工作区 id
-#[must_use] 
+#[must_use]
 pub fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String, String, String) {
     match scope {
         "global" => ("global".to_string(), String::new(), String::new()),
@@ -166,7 +166,7 @@ pub fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String
 /// 检索注入的作用域判定：记忆行（scope_type/client_id/workspace_id）对当前
 /// 会话（target_client/target_workspace）是否可见。global 恒可见；client 需
 /// 客户端匹配；workspace 需客户端 + 工作区都匹配。
-#[must_use] 
+#[must_use]
 pub fn scope_ok(
     scope_type: &str,
     client_id: &str,
@@ -182,14 +182,14 @@ pub fn scope_ok(
 }
 
 /// 解析 tags JSON 数组字符串（`'["a","b"]'`）；坏 JSON 返回空。
-#[must_use] 
+#[must_use]
 pub fn parse_tags(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
 /// tags 并集去重：旧 + 新，保留顺序，总量 ≤ `MAX_TAGS`（每项已由调用方保证 ≤
 /// `TAG_MAX_CHARS`）。
-#[must_use] 
+#[must_use]
 pub fn merge_tags(existing: &[String], new: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in existing.iter().chain(new.iter()) {
@@ -340,7 +340,7 @@ pub async fn upsert_memory_with_dedup(
 /// 测试用 VectorStore（临时目录）。返回 `(TempDir, store)`：析构顺序 store 先、
 /// TempDir 后（qdrant-edge 的 EdgeShard Drop 同步 flush，目录先删会 panic）。
 #[cfg(all(test, feature = "rag"))]
-#[must_use] 
+#[must_use]
 pub fn test_store() -> (tempfile::TempDir, VectorStore) {
     let dir = tempfile::tempdir().expect("tempdir for memory test store");
     let store = VectorStore::new(dir.path());

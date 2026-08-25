@@ -6,7 +6,7 @@ pub(crate) const MIN_SEARCH_PATCH_CLIENT_VERSION: (u64, u64, u64) = (0, 2, 0);
 /// 解析 "x.y.z"（允许 v 前缀）为数字三元组；非严格 semver 输入返回 None。
 /// 客户端在 agent 模式下上报 `{CARGO_PKG_VERSION}+agent`，故解析前须剥离
 /// semver 构建元数据（`+`）与预发布（`-`）后缀。
-#[must_use] 
+#[must_use]
 pub fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.strip_prefix('v').unwrap_or(s);
     // 顺序：先 strip 'v' 前缀，再切掉 +（构建元数据）/ -（预发布）后缀。

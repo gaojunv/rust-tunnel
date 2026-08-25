@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 /// OpenAI `finish_reason` → Anthropic `stop_reason` 映射。
-#[must_use] 
+#[must_use]
 pub fn map_stop_reason(openai: &str) -> String {
     match openai {
         "stop" => "end_turn".to_string(),
@@ -63,7 +63,7 @@ fn openai_usage_to_anthropic(usage: &Value) -> Value {
 ///
 /// 除了 `message.content` 转成 `text` 块外，`message.tool_calls` 数组会被展开为
 /// Anthropic 的 `tool_use` content 块（`arguments` 字符串 parse 回对象）。
-#[must_use] 
+#[must_use]
 pub fn openai_response_to_anthropic(openai: &Value) -> Value {
     let mut content: Vec<Value> = Vec::new();
 
@@ -171,7 +171,7 @@ enum BlockKind {
 }
 
 impl AnthropicSseTranslator {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             line_buf: Vec::new(),
@@ -260,7 +260,9 @@ impl AnthropicSseTranslator {
         // 思考增量（DeepSeek reasoning_content → Anthropic thinking 块）
         if let Some(reasoning) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
             if !reasoning.is_empty() {
-                let idx = if let Some(idx) = self.thinking_index { idx } else {
+                let idx = if let Some(idx) = self.thinking_index {
+                    idx
+                } else {
                     let idx = self.next_block_index;
                     self.next_block_index += 1;
                     self.thinking_index = Some(idx);
@@ -288,11 +290,13 @@ impl AnthropicSseTranslator {
                 if self.text_index.is_none() {
                     // thinking → text 切换：先关闭 thinking block，保持索引与顺序一致
                     if self.open_block == Some(BlockKind::Thinking) {
-                        let block_stop = json!({
-                            "type": "content_block_stop",
-                            "index": self.thinking_index.unwrap(),
-                        });
-                        push_event(out, "content_block_stop", &block_stop);
+                        if let Some(idx) = self.thinking_index {
+                            let block_stop = json!({
+                                "type": "content_block_stop",
+                                "index": idx,
+                            });
+                            push_event(out, "content_block_stop", &block_stop);
+                        }
                         self.open_block = None;
                     }
                     let idx = self.next_block_index;
@@ -306,9 +310,10 @@ impl AnthropicSseTranslator {
                     push_event(out, "content_block_start", &block_start);
                     self.open_block = Some(BlockKind::Text);
                 }
+                let text_idx = self.text_index.unwrap_or(0);
                 let delta = json!({
                     "type": "content_block_delta",
-                    "index": self.text_index.unwrap(),
+                    "index": text_idx,
                     "delta": {"type": "text_delta", "text": text},
                 });
                 push_event(out, "content_block_delta", &delta);
@@ -319,7 +324,10 @@ impl AnthropicSseTranslator {
         if let Some(calls) = chunk["choices"][0]["delta"]["tool_calls"].as_array() {
             for call in calls {
                 // 上游 index：OpenAI 流式规定用 index 标识哪个 tool_call；缺省当 0。
-                let up_idx = call.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let up_idx = call
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 // 首次出现：分配 anthropic block index 并发 content_block_start
                 let anthropic_idx = if let Some(idx) = self.tool_blocks.get(&up_idx) {
                     *idx
@@ -443,7 +451,7 @@ fn push_event(out: &mut String, event: &str, data: &Value) {
 /// 流式：把上游 OpenAI SSE 响应体逐 chunk 转换为 Anthropic SSE 事件流。
 ///
 /// 从 `anthropic_handler` 下沉（双协议入口共享的「回退路径」在成功时调用）。
-#[must_use] 
+#[must_use]
 pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
     let byte_stream = openai_resp.into_body().into_data_stream();
     let translator = std::sync::Arc::new(std::sync::Mutex::new(AnthropicSseTranslator::new()));
@@ -452,7 +460,10 @@ pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
         async move {
             match chunk {
                 Ok(bytes) => {
-                    let converted = translator.lock().unwrap().push(&bytes);
+                    let converted = translator
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(&bytes);
                     if converted.is_empty() {
                         None
                     } else {
@@ -470,7 +481,10 @@ pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
         .body(Body::from_stream(out))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build SSE response: {}", e);
+            Response::new(Body::empty())
+        })
 }
 
 /// 非流式：把 OpenAI chat completion 响应 JSON 转成 Anthropic Messages 响应。
@@ -495,7 +509,10 @@ pub async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Resp
                 .body(Body::from(format!(
                     "failed to read upstream response (too large or read error): {e}"
                 )))
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to build error response: {}", e);
+                    Response::new(Body::from("failed to read upstream response"))
+                });
         }
     };
 
@@ -505,8 +522,11 @@ pub async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Resp
             return Response::builder()
                 .status(status)
                 .header("Content-Type", "application/json")
-                .body(Body::from(body_bytes))
-                .unwrap();
+                .body(Body::from(body_bytes.clone()))
+                .unwrap_or_else(|e| {
+                    tracing::error!("failed to build response: {}", e);
+                    Response::new(Body::from(body_bytes))
+                });
         }
     };
 
@@ -516,8 +536,16 @@ pub async fn convert_openai_to_anthropic_response(openai_resp: Response) -> Resp
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&anthropic_resp).unwrap()))
-        .unwrap()
+        .body(Body::from(
+            serde_json::to_vec(&anthropic_resp).unwrap_or_else(|e| {
+                tracing::warn!("failed to serialize anthropic response: {}", e);
+                Vec::new()
+            }),
+        ))
+        .unwrap_or_else(|e| {
+            tracing::error!("failed to build response: {}", e);
+            Response::new(Body::empty())
+        })
 }
 
 #[cfg(test)]

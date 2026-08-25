@@ -407,7 +407,9 @@ impl ServerConfig {
                 return Err("ss_password is required when ss_enabled is true".to_string());
             }
             // Validate cipher method
-            let cipher = config.ss_cipher.as_ref().unwrap();
+            let Some(cipher) = config.ss_cipher.as_ref() else {
+                return Err("ss_cipher is required when ss_enabled is true".to_string());
+            };
             if cipher != "aes-256-gcm" && cipher != "chacha20-ietf-poly1305" {
                 return Err(format!(
                     "Unsupported cipher: {}. Supported: aes-256-gcm, chacha20-ietf-poly1305",

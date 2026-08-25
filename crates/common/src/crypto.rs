@@ -30,7 +30,7 @@ impl std::fmt::Debug for LlmCipher {
 }
 
 impl LlmCipher {
-    #[must_use] 
+    #[must_use]
     pub fn from_master_key(key: [u8; 32]) -> Self {
         Self {
             cipher: Aes256Gcm::new((&key).into()),
@@ -38,13 +38,18 @@ impl LlmCipher {
     }
 
     /// 加密一个字段，返回带 `enc:v1:` 前缀的密文。
-    #[must_use] 
+    ///
+    /// # Panics
+    /// AES-256-GCM encrypt 仅在 nonce 长度非法时失败；nonce 为固定 `[u8; 12]`，
+    /// 实际不可达，保持 panic 语义。
+    #[must_use]
     pub fn encrypt(&self, plaintext: &str) -> String {
         let nonce_bytes: [u8; 12] = rand::random();
+        #[expect(clippy::panic)]
         let ciphertext = self
             .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
-            .expect("AES-256-GCM encrypt is infallible for in-memory data");
+            .unwrap_or_else(|e| panic!("AES-256-GCM encrypt failed: {e}"));
 
         let mut blob = Vec::with_capacity(12 + ciphertext.len());
         blob.extend_from_slice(&nonce_bytes);
@@ -77,13 +82,13 @@ impl LlmCipher {
 }
 
 /// 判断一个已存储的值是否为密文。
-#[must_use] 
+#[must_use]
 pub fn is_encrypted(stored: &str) -> bool {
     stored.starts_with(ENC_PREFIX)
 }
 
 /// 加密可选字段：有 cipher 就加密，否则原样返回（并调用方应记日志）。
-#[must_use] 
+#[must_use]
 pub fn encrypt_field(cipher: Option<&LlmCipher>, plaintext: &str) -> String {
     match cipher {
         Some(c) => c.encrypt(plaintext),

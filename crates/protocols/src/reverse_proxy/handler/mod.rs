@@ -68,10 +68,14 @@ pub async fn handle_proxy_request_unified(
     let incoming_header_count = req.headers().len();
 
     let Some((rule_id, backend)) = resolve_backend(&source, &host, &path).await else {
+        let body = format!("No route for host '{host}'");
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(format!("No route for host '{host}'")))
-            .unwrap();
+            .body(Body::from(body.clone()))
+            .unwrap_or_else(|err| {
+                tracing::warn!("failed to build response: {err}");
+                Response::new(Body::from(body))
+            });
     };
 
     // Track connection for stats
@@ -89,7 +93,10 @@ pub async fn handle_proxy_request_unified(
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("HTTP/2 to client backend not yet supported"))
-                .unwrap();
+                .unwrap_or_else(|err| {
+                    tracing::warn!("failed to build response: {err}");
+                    Response::new(Body::from("HTTP/2 to client backend not yet supported"))
+                });
         }
         return handle_client_backend(proxy_state, req, backend, rule_id_for_decrement).await;
     }

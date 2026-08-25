@@ -212,7 +212,7 @@ fn split_paragraph(
 }
 
 /// 结构感知分块入口。
-#[must_use] 
+#[must_use]
 pub fn chunk_markdown(text: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
     let units = parse_units(text);
     if units.is_empty() {

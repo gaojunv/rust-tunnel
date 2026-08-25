@@ -29,7 +29,7 @@ pub enum FileType {
 
 impl FileType {
     /// 按扩展名判定（调用方传入小写），不在白名单返回 None。
-    #[must_use] 
+    #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
             "md" => Some(Self::Markdown),
@@ -43,7 +43,7 @@ impl FileType {
     }
 
     /// 该类型的大小上限（文本 2MB，二进制 20MB）。
-    #[must_use] 
+    #[must_use]
     pub fn max_bytes(self) -> usize {
         match self {
             Self::Markdown | Self::Text => MAX_TEXT_BYTES,
@@ -52,7 +52,7 @@ impl FileType {
     }
 
     /// DB 存储/落盘扩展名用的规范字符串。
-    #[must_use] 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Markdown => "md",

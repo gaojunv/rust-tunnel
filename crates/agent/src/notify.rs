@@ -21,7 +21,7 @@ pub struct AgentNotification {
 }
 
 impl AgentNotification {
-    #[must_use] 
+    #[must_use]
     pub fn turn_done(session_id: &str, workspace_id: &str) -> Self {
         Self {
             event: "turn_done",
@@ -33,7 +33,7 @@ impl AgentNotification {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn turn_error(session_id: &str, workspace_id: &str, message: &str) -> Self {
         Self {
             event: "turn_error",
@@ -45,7 +45,7 @@ impl AgentNotification {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn approval_needed(
         session_id: &str,
         workspace_id: &str,
@@ -62,7 +62,7 @@ impl AgentNotification {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn elicitation_needed(session_id: &str, workspace_id: &str, message: &str) -> Self {
         Self {
             event: "elicitation_needed",
@@ -83,7 +83,7 @@ impl AgentNotification {
 ///   更新回滚（非回合终态），不通知
 /// - `approval_request` / `elicitation_request` → 需用户干预
 /// - `stopped`（用户主动停止）与 `cancel_fallback`（停止超时兜底）不通知
-#[must_use] 
+#[must_use]
 pub fn notification_from_frame(
     ev: &serde_json::Value,
     session_id: &str,

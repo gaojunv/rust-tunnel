@@ -408,7 +408,13 @@ mod tests {
         apply_trojan_config(&state, &cfg).await.unwrap();
         // 启动时无 ACME 证书 → 自签名回退
         assert_eq!(
-            state.proxy_ports.trojan_runtime.read().await.cert_source.as_deref(),
+            state
+                .proxy_ports
+                .trojan_runtime
+                .read()
+                .await
+                .cert_source
+                .as_deref(),
             Some("self_signed")
         );
 
@@ -418,7 +424,15 @@ mod tests {
         // 热升级：watch 推送新配置（同一分支内）并把 cert_source 更新为 acme_exact
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if state.proxy_ports.trojan_runtime.read().await.cert_source.as_deref() == Some("acme_exact") {
+                if state
+                    .proxy_ports
+                    .trojan_runtime
+                    .read()
+                    .await
+                    .cert_source
+                    .as_deref()
+                    == Some("acme_exact")
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -564,6 +578,11 @@ mod tests {
             assert!(rt.cert_source.is_none());
             assert!(!rt.shared);
         }
-        assert!(state.proxy_ports.trojan_listener_abort.read().await.is_none());
+        assert!(state
+            .proxy_ports
+            .trojan_listener_abort
+            .read()
+            .await
+            .is_none());
     }
 }

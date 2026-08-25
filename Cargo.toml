@@ -13,10 +13,13 @@ members = ["crates/agent", "crates/common", "crates/client", "crates/llm", "crat
 pedantic = { level = "warn", priority = -1 }
 # doc_markdown 对中文注释误报率极高（863 条），自动修复会破坏中文文档
 doc_markdown = "allow"
-# panic 风险关键项（restriction 组）：生产代码 warn，测试经 cfg_attr(test) 豁免
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
+# panic 风险关键项（restriction 组）：生产代码 deny 硬门禁，测试经各 crate
+# lib.rs 头部 `#![cfg_attr(test, allow(...))]` 豁免；构造期 fatal 用语句级
+# `#[expect(...)]` 豁免（lint 不再触发时编译器会提醒移除）。根元包（e2e
+# tests/）无 `[lints] workspace = true`，天然不受此约束。
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 # 正确性兜底（默认 warn 提升为 deny，无存量风险）
 unwrap_in_result = "deny"
 

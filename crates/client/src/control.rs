@@ -603,7 +603,9 @@ pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
     let layer = ClientLogLayer::new();
     if LOG_LAYER.set(layer).is_ok() {
         // First connection: the layer was stored; now initialise logging with it.
-        let stored = LOG_LAYER.get().unwrap();
+        let Some(stored) = LOG_LAYER.get() else {
+            unreachable!("LOG_LAYER just set")
+        };
         init_logging_with_layer(&config.log, stored.clone());
     }
 

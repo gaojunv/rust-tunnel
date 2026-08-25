@@ -51,7 +51,9 @@ pub(super) async fn handle_mcp_tunnel(
     };
     // workspace 坐标：remember 落库需要（scope=workspace 时）。会话行缺失/DB 错误
     // 属服务端异常，500 防御。
-    let workspace_id = if let Ok(Some(s)) = db.agent_get_session(session_id).await { s.workspace_id } else {
+    let workspace_id = if let Ok(Some(s)) = db.agent_get_session(session_id).await {
+        s.workspace_id
+    } else {
         tracing::warn!(session_id, "mcp tunnel: agent session missing in db");
         return mcp_internal_error("agent session not found");
     };

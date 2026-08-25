@@ -52,7 +52,9 @@ pub async fn authenticate_or_reject(
     headers: &HeaderMap,
     protocol: &str,
 ) -> Result<(String, String), Response> {
-    if let Some(a) = super::auth::authenticate(&state.llm, headers).await { Ok(a) } else {
+    if let Some(a) = super::auth::authenticate(&state.llm, headers).await {
+        Ok(a)
+    } else {
         // 记录认证失败
         if let Some(ref db) = state.llm.db {
             let ctx = UsageContext {
@@ -77,7 +79,9 @@ pub async fn extract_model_or_reject(
     api_key_name: &str,
     protocol: &str,
 ) -> Result<String, Response> {
-    if let Some(m) = body.get("model").and_then(Value::as_str) { Ok(m.to_string()) } else {
+    if let Some(m) = body.get("model").and_then(Value::as_str) {
+        Ok(m.to_string())
+    } else {
         // 记录请求错误（缺少 model）
         if let Some(ref db) = state.llm.db {
             let ctx = UsageContext {
@@ -232,7 +236,14 @@ pub async fn run_execution(
             .first()
             .is_some_and(|c| c.provider.anthropic_base_url.is_some());
     let log_body = if first_is_direct_anthropic {
-        let mut raw = prepared.anthropic_body.clone().unwrap();
+        let Some(mut raw) = prepared.anthropic_body.clone() else {
+            tracing::error!("anthropic_body expected but missing");
+            return state.error_for_protocol(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "anthropic_body missing".into(),
+                "server_error",
+            );
+        };
         raw["model"] = request.model.clone().into();
         raw
     } else {

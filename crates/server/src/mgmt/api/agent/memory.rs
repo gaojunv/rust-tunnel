@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use axum::{
-    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{
@@ -734,10 +733,6 @@ pub async fn distill_session(
 
 /// GET /api/agent/memory/events — SSE 事件流（蒸馏/注入状态）。token 走 query 参数
 /// 认证（public 路由，照抄 sse_kb_events），事件名 "memory"，keep-alive 30s。
-///
-/// # Panics
-///
-/// 仅当构造错误响应（Response builder + body）时 `unwrap()`，属不可达路径。
 pub async fn sse_memory_events(
     State(state): State<ApiState>,
     Query(params): Query<SseQuery>,
@@ -747,19 +742,13 @@ pub async fn sse_memory_events(
         let is_valid =
             !token.is_empty() && validate_token(token, &state.auth_config.jwt_secret).is_ok();
         if !is_valid {
-            return axum::response::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::from("Unauthorized"))
-                .unwrap();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
     let mem = match mem_runtime(&state) {
         Ok(m) => m,
         Err(e) => {
-            return axum::response::Response::builder()
-                .status(e.status())
-                .body(Body::from(e.message().to_string()))
-                .unwrap();
+            return (e.status(), e.message().to_string()).into_response();
         }
     };
     let mut rx = mem.subscribe();

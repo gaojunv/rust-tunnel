@@ -100,10 +100,15 @@ impl DynamicConfig {
         // Shadowsocks
         let ss = match db.load_shadowsocks_configs().await {
             Ok(configs) if !configs.is_empty() => {
-                let c = configs
-                    .iter()
-                    .max_by_key(|c| (c.updated_at, c.id))
-                    .expect("non-empty configs");
+                let c = {
+                    let mut max = &configs[0];
+                    for cand in &configs[1..] {
+                        if (cand.updated_at, cand.id) > (max.updated_at, max.id) {
+                            max = cand;
+                        }
+                    }
+                    max
+                };
                 Some(ShadowsocksDynamicConfig {
                     enabled: c.enabled != 0,
                     port: c.port as u16,
@@ -139,10 +144,15 @@ impl DynamicConfig {
         // Trojan
         let trojan = match db.load_trojan_configs().await {
             Ok(configs) if !configs.is_empty() => {
-                let c = configs
-                    .iter()
-                    .max_by_key(|c| (c.updated_at, c.id))
-                    .expect("non-empty configs");
+                let c = {
+                    let mut max = &configs[0];
+                    for cand in &configs[1..] {
+                        if (cand.updated_at, cand.id) > (max.updated_at, max.id) {
+                            max = cand;
+                        }
+                    }
+                    max
+                };
                 Some(TrojanDynamicConfig {
                     enabled: c.enabled != 0,
                     port: c.port as u16,

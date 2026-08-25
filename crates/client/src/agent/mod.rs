@@ -1780,11 +1780,14 @@ mod tests {
     fn leftover_sleep30_procs() -> Vec<String> {
         if let Ok(out) = std::process::Command::new("ps")
             .args(["-eo", "pid,pgid,args"])
-            .output() { String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("sleep 30"))
-        .map(str::to_string)
-        .collect() } else {
+            .output()
+        {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains("sleep 30"))
+                .map(str::to_string)
+                .collect()
+        } else {
             // /proc 回退：遍历 PID 目录读 cmdline，拼回整行后判断
             let mut found = Vec::new();
             if let Ok(entries) = std::fs::read_dir("/proc") {

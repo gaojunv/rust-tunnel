@@ -145,10 +145,7 @@ pub async fn create_role(
         .map_err(|e| ApiError::db(&e))?;
 
     match agent.db.role_get_by_id(&id).await {
-        Ok(Some(r)) => Ok((
-            StatusCode::CREATED,
-            Json(role_service::role_json(&r)),
-        )),
+        Ok(Some(r)) => Ok((StatusCode::CREATED, Json(role_service::role_json(&r)))),
         _ => Err(ApiError::internal("failed to load created role")),
     }
 }
@@ -252,9 +249,7 @@ pub async fn update_role(
 
     // 内置角色不可改名
     if existing.is_builtin != 0 && name != existing.name {
-        return Err(ApiError::forbidden(
-            "builtin role name cannot be changed",
-        ));
+        return Err(ApiError::forbidden("builtin role name cannot be changed"));
     }
 
     let (scope_type, client_id, workspace_id) =
@@ -277,10 +272,8 @@ pub async fn update_role(
         }
     }
 
-    let tools_allow_json =
-        serde_json::to_string(tools_allow).unwrap_or_else(|_| "[]".to_string());
-    let tools_deny_json =
-        serde_json::to_string(tools_deny).unwrap_or_else(|_| "[]".to_string());
+    let tools_allow_json = serde_json::to_string(tools_allow).unwrap_or_else(|_| "[]".to_string());
+    let tools_deny_json = serde_json::to_string(tools_deny).unwrap_or_else(|_| "[]".to_string());
 
     agent
         .db

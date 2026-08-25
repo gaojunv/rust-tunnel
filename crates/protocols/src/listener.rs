@@ -283,7 +283,9 @@ async fn handle_inbound_connection(
     user_stream: TcpStream,
 ) -> TunnelResult<()> {
     // Get port info
-    let port_info = if let Some(info) = registry.get_port(remote_port).await { info } else {
+    let port_info = if let Some(info) = registry.get_port(remote_port).await {
+        info
+    } else {
         warn!("No port registered for {}, closing connection", remote_port);
         return Ok(());
     };

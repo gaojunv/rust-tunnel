@@ -2,7 +2,6 @@
 use std::time::{Duration, Instant};
 
 use axum::{
-    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{
@@ -107,10 +106,6 @@ pub async fn query_kb(
 
 /// GET /api/llm/kb/events — SSE 事件流（文档摄入状态）。token 走 query 参数认证
 /// （public 路由，参照 `/api/logs/stream`），keep-alive 30s。
-///
-/// # Panics
-///
-/// 仅当构造错误响应（Response builder + body）时 `unwrap()`，属不可达路径。
 pub async fn sse_kb_events(
     State(state): State<ApiState>,
     Query(params): Query<SseQuery>,
@@ -120,18 +115,16 @@ pub async fn sse_kb_events(
         let is_valid =
             !token.is_empty() && validate_token(token, &state.auth_config.jwt_secret).is_ok();
         if !is_valid {
-            return axum::response::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::from("Unauthorized"))
-                .unwrap();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
 
     let Some(llm) = llm_state(&state).await else {
-        return axum::response::Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body(Body::from("LLM gateway not initialized"))
-            .unwrap();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LLM gateway not initialized",
+        )
+            .into_response();
     };
     let mut rx = llm.rag_tx.subscribe();
     let stream = async_stream::stream! {

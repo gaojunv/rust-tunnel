@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::Database;
 use crate::config::ServerConfig;
+use crate::Database;
 
 /// ACME configuration summary for API responses
 #[derive(Debug, Clone)]

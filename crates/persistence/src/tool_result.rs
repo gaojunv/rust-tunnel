@@ -37,18 +37,18 @@ fn tool_result_content_json(
         "status".into(),
         Value::String(status.unwrap_or("").to_string()),
     );
-    if has_items(diffs) {
-        obj.insert("diffs".into(), diffs.unwrap().clone());
+    if let Some(v) = diffs.filter(|v| has_items(Some(v))) {
+        obj.insert("diffs".into(), v.clone());
     }
-    if has_items(locations) {
-        obj.insert("locations".into(), locations.unwrap().clone());
+    if let Some(v) = locations.filter(|v| has_items(Some(v))) {
+        obj.insert("locations".into(), v.clone());
     }
     serde_json::Value::Object(obj).to_string()
 }
 
 /// 由 tool_result WS 帧字段决定落库 content：空占位返回 ""（不覆盖已有真实结果），
 /// 否则返回结构化 JSON。`status` 是 frame["status"]（ACP 缺省时为空串）。
-#[must_use] 
+#[must_use]
 pub fn tool_result_persist_content(
     text: Option<&str>,
     status: Option<&str>,

@@ -76,7 +76,9 @@ pub fn map_update(update: &SessionUpdate) -> Option<serde_json::Value> {
             // 的中间结果/文本），has_result ≠ 执行完成——误判 completed 会让前端
             // 在子 agent 未执行完时就打勾（问题②）。子 agent 内部工具
             // （parentToolUseId 有值）与普通工具保持原 heuristic（不回归 Bug 3）。
-            let status = if let Some(st) = upd.fields.status { status_str(Some(st)) } else {
+            let status = if let Some(st) = upd.fields.status {
+                status_str(Some(st))
+            } else {
                 let has_result = upd.fields.raw_output.is_some()
                     || upd.fields.content.as_ref().is_some_and(|c| !c.is_empty());
                 if has_result {

@@ -21,7 +21,7 @@ pub const SUBAGENT_SYSTEM_PROMPT_SUFFIX: &str =
 
 /// 解析 DB 中的 JSON 数组字符串（`tools_allow` / `tools_deny`）为工具名列表。
 /// NULL/空字符串/非合法 JSON → None；空数组 `[]` → Some(空 vec)。
-#[must_use] 
+#[must_use]
 pub fn parse_tools_list(json: Option<&str>) -> Option<Vec<String>> {
     let raw = json?.trim();
     if raw.is_empty() || raw == "null" {
@@ -39,7 +39,7 @@ pub fn parse_tools_list(json: Option<&str>) -> Option<Vec<String>> {
 /// - `name` 匹配 `visible_roles` 中的某个角色（按 `name` 字段，大小写不敏感）。
 /// - 命中 → 返回 `Some((role_name, stripped_content))`（前缀 + 后续空白已剥离）。
 /// - 未命中（`@src/main.rs` 等文件路径） → `None`（调用方走原 @文件引用逻辑）。
-#[must_use] 
+#[must_use]
 pub fn parse_at_role_prefix<'a>(
     content: &'a str,
     visible_roles: &[AgentRoleRecord],
@@ -81,7 +81,7 @@ pub fn parse_at_role_prefix<'a>(
 
 /// 构建子 agent 系统提示词：角色有自定义 `system_prompt` 则用之，
 /// 追加委托说明后缀；无自定义则回退默认值。
-#[must_use] 
+#[must_use]
 pub fn subagent_system_prompt(role: Option<&AgentRoleRecord>) -> String {
     match role {
         Some(r) if !r.system_prompt.trim().is_empty() => {
@@ -95,7 +95,7 @@ pub fn subagent_system_prompt(role: Option<&AgentRoleRecord>) -> String {
 
 /// 生成注入 system prompt 的"可用子代理角色清单"块，供 task 工具
 /// description 动态拼接。内容为角色名 + 描述的列表。
-#[must_use] 
+#[must_use]
 pub fn task_schema_roles_block(roles: &[AgentRoleRecord]) -> String {
     if roles.is_empty() {
         return String::new();
@@ -259,11 +259,7 @@ pub fn validate_role_fields(
 pub fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String, String, String) {
     match scope {
         "global" => ("global".to_string(), String::new(), String::new()),
-        "client" => (
-            "client".to_string(),
-            client_id.to_string(),
-            String::new(),
-        ),
+        "client" => ("client".to_string(), client_id.to_string(), String::new()),
         "workspace" => (
             "workspace".to_string(),
             client_id.to_string(),
@@ -280,10 +276,14 @@ pub fn scope_coords(scope: &str, client_id: &str, workspace_id: &str) -> (String
 /// 角色 JSON 视图（含全字段；tools_allow/tools_deny 从 JSON 字符串还原为数组）。
 #[must_use]
 pub fn role_json(r: &AgentRoleRecord) -> serde_json::Value {
-    let tools_allow: Option<Vec<String>> =
-        r.tools_allow.as_deref().and_then(|s| serde_json::from_str(s).ok());
-    let tools_deny: Option<Vec<String>> =
-        r.tools_deny.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let tools_allow: Option<Vec<String>> = r
+        .tools_allow
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let tools_deny: Option<Vec<String>> = r
+        .tools_deny
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     serde_json::json!({
         "id": r.id,
         "name": r.name,

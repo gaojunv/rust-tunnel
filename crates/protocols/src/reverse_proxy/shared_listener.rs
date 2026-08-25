@@ -67,7 +67,12 @@ impl SharedListener {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         let tls_acceptor = if tls_enabled {
-            let mgr = cert_manager.expect("checked above");
+            let Some(mgr) = cert_manager else {
+                tracing::warn!("cert_manager missing despite tls_enabled");
+                return Err(ReconcileError::NoCertManager {
+                    listen_addr: listen_addr.clone(),
+                });
+            };
             let resolver = mgr.sni_resolver();
             let mut cfg = rustls::ServerConfig::builder()
                 .with_no_client_auth()
@@ -318,7 +323,10 @@ impl ReverseProxyState {
     /// Acquire the per-port reconcile lock.
     async fn acquire_reconcile_lock(&self, listen_addr: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let m = {
-            let mut map = self.reconcile_locks.lock().unwrap();
+            let mut map = self
+                .reconcile_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.entry(listen_addr.to_string())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()

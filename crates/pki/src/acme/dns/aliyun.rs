@@ -47,7 +47,7 @@ pub struct AliyunDnsSolver {
 
 impl AliyunDnsSolver {
     /// Create a new Aliyun DNS solver
-    #[must_use] 
+    #[must_use]
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {
             access_key_id: config.api_key.clone(),
@@ -100,8 +100,10 @@ impl AliyunDnsSolver {
 
         // Compute HMAC-SHA1 signature
         type HmacSha1 = Hmac<Sha1>;
+        // HMAC 接受任意长度 key，`new_from_slice` 实际不可失败，保持 panic 语义。
+        #[expect(clippy::panic)]
         let mut mac = HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
-            .expect("HMAC can take key of any size");
+            .unwrap_or_else(|e| panic!("HMAC key error: {e}"));
         mac.update(string_to_sign.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -219,7 +221,9 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let (_main_domain, _rr) = parse_domain(domain)?;
 
         // Find the existing record
-        let record_id = if let Some(id) = self.find_txt_record(domain, value).await? { id } else {
+        let record_id = if let Some(id) = self.find_txt_record(domain, value).await? {
+            id
+        } else {
             warn!(
                 "No matching Aliyun DNS TXT record found for domain {}",
                 domain
@@ -250,14 +254,12 @@ impl DnsChallengeSolver for AliyunDnsSolver {
 
         // Build resolver with Google DNS + Alibaba DNS
         let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig::new(
-            "8.8.8.8:53".parse().unwrap(),
-            Protocol::Udp,
-        ));
-        config.add_name_server(NameServerConfig::new(
-            "223.5.5.5:53".parse().unwrap(),
-            Protocol::Udp,
-        ));
+        if let Ok(addr) = "8.8.8.8:53".parse() {
+            config.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+        }
+        if let Ok(addr) = "223.5.5.5:53".parse() {
+            config.add_name_server(NameServerConfig::new(addr, Protocol::Udp));
+        }
         let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
 
         let deadline = tokio::time::Instant::now() + timeout;

@@ -518,7 +518,7 @@ fn strip_code_fence(raw: &str) -> String {
 
 /// 把消息列表渲染为蒸馏喂给 LLM 的纯文本（仿 compact.rs render_for_summary，
 /// 差异：tool 结果截断 600 chars、总量 ≤32KB、剥离 `<memory>` 块与 @引用包装块）。
-#[must_use] 
+#[must_use]
 pub fn render_distill_text(messages: &[AgentMessageRecord]) -> String {
     let mut out = String::new();
     for m in messages {

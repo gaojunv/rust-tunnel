@@ -37,19 +37,17 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (tests only)
-        # Suppress 18 pre-existing src/ warnings (deferred to cleanup PR).
-        # Scope: -A flags for known categories; --tests compiles lib as dependency.
-        run: >-
-          cargo clippy --workspace --tests -- -D warnings
-          -A clippy::collapsible_match
-          -A clippy::map_flatten
-          -A clippy::new_without_default
-          -A clippy::needless_borrows_for_generic_args
-          -A clippy::needless_borrow
-          -A clippy::io_other_error
-          -A clippy::bool_assert_comparison
-          -A clippy::zombie_processes
+      # 批次 9 门禁形态演进：原 `-D warnings -A <8 类存量抑制>` 在批次 0 引入
+      # pedantic warn 基线后已失真（存量警告类别完全变化，该步骤在 main 上持续红）。
+      # 现形态：workspace.lints.clippy 中 unwrap_used/expect_used/panic = deny，
+      # cargo clippy 本身即硬门禁（违反 deny lint → 非零退出）；其余 pedantic 存量
+      # 仍 warn（台账 docs/lint-baseline.md），随批次 9 后续收敛后恢复 -D warnings。
+      - name: Clippy（panic 风险 deny 门禁，默认组合）
+        run: cargo clippy --workspace --all-targets
+
+      # rag 为非默认 feature：rag-gated 代码须显式开启才被 lint 覆盖
+      - name: Clippy（rag 组合）
+        run: cargo clippy --workspace --all-targets --features rust-tunnel-server/rag
 
       - name: Build
         run: cargo build --workspace --tests

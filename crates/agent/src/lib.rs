@@ -160,7 +160,7 @@ pub enum ApprovalResult {
 
 impl ApprovalResult {
     /// 是否放行（runner 判断用；runner 不传 options，只产生 Approved/Denied）。
-    #[must_use] 
+    #[must_use]
     pub fn approved(&self) -> bool {
         matches!(self, Self::Approved)
     }
@@ -356,7 +356,7 @@ impl AgentState {
     }
 
     /// GitHub REST API base URL（默认 `https://api.github.com`）。
-    #[must_use] 
+    #[must_use]
     pub fn github_base_url(&self) -> &str {
         &self.github_base_url
     }
@@ -668,7 +668,7 @@ impl AgentState {
     }
 
     /// 订阅工作台通知广播（浏览器全局通知 WS 用）。
-    #[must_use] 
+    #[must_use]
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<notify::AgentNotification> {
         self.notifications.subscribe()
     }

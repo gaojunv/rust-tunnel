@@ -1,3 +1,6 @@
+// 测试代码豁免 panic 风险 lint（生产代码仍告警）
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 //! rust-tunnel 代理协议实现：Shadowsocks、Trojan、反向代理（HTTP/TCP 路由、
 //! SNI 分发、上游转发）、连接监听编排。
 //!

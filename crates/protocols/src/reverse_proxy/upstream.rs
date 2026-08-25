@@ -70,12 +70,17 @@ impl UpstreamClient {
             .pool_idle_timeout(idle)
             .build::<_, ProxyBody>(plain_conn);
 
+        // 系统根证书加载失败属构造期 fatal（无 root store 则 TLS 上游全不可用），
+        // 保持 panic 语义；改 Result 会扩散整条装配链而调用方同样无法恢复。
+        // #[expect] 而非 #[allow]：lint 不再触发时编译器会提醒移除此豁免。
+        #[expect(clippy::expect_used)]
         let tls_h1_conn = HttpsConnectorBuilder::new()
             .with_native_roots()
             .expect("system roots")
             .https_or_http()
             .enable_http1()
             .build();
+        #[expect(clippy::expect_used)]
         let tls_h2_conn = HttpsConnectorBuilder::new()
             .with_native_roots()
             .expect("system roots")

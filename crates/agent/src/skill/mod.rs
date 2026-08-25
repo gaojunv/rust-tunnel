@@ -25,7 +25,7 @@ pub(crate) const DISTILL_SKILL_MAX: usize = 3;
 
 /// 归一化 Skill 名：trim + to_lowercase（同作用域去重与 use_skill 匹配都基于
 /// 归一化名——大小写不敏感；中文名不受影响）。
-#[must_use] 
+#[must_use]
 pub fn normalize_skill_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
@@ -122,7 +122,7 @@ pub async fn retrieve_skill_list_for_session(
 
 /// 组装 `<skills>...</skills>` 清单块：按 use_count DESC 排序，预算（条数上限 +
 /// 字符上限）内只保留完整行，**绝不半截**某条 skill。无条目 → None。
-#[must_use] 
+#[must_use]
 pub fn build_skill_list_block(
     items: &[AgentSkillSummary],
     max_items: usize,

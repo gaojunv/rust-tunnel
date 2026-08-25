@@ -101,10 +101,7 @@ pub async fn sse_stats_stream(
         };
 
         if !is_valid {
-            return axum::response::Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(axum::body::Body::from("Unauthorized"))
-                .unwrap();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
     let entity_type_filter = params.entity_type;

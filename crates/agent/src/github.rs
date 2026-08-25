@@ -51,13 +51,19 @@ pub struct GitHubClient {
 impl GitHubClient {
     /// 构造客户端。`base_url` 可注入覆盖（测试指向本地 axum mock）；
     /// `token` 为 GitHub fine-grained / classic PAT，仅进 Authorization 头。
-    #[must_use] 
+    ///
+    /// # Panics
+    /// reqwest Client 构建失败属构造期 fatal（TLS 后端不可用），无法恢复。
+    #[must_use]
     pub fn new(base_url: &str, token: &str) -> Self {
         Self {
+            // 构造期 fatal：TLS 后端初始化失败则整个 GitHub 集成不可用，
+            // 返回 Self 的签名无法传播错误，保持 panic 语义。
+            #[expect(clippy::panic)]
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("reqwest Client builder is infallible"),
+                .unwrap_or_else(|e| panic!("reqwest Client builder failed: {e}")),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         }

@@ -53,20 +53,20 @@ pub struct RouteSnapshot {
 
 impl RouteSnapshot {
     /// 按 id 取 provider（含已解密的关键字段）。
-    #[must_use] 
+    #[must_use]
     pub fn provider(&self, id: &str) -> Option<&ProviderConfig> {
         self.providers.get(id)
     }
 
     /// 按 id 取模型（含被禁用的）。
-    #[must_use] 
+    #[must_use]
     pub fn model(&self, id: &str) -> Option<&CachedModel> {
         self.models.get(id)
     }
 
     /// 模型名/别名解析（语义与 `llm_find_model_by_name_or_alias` 一致）：
     /// 只命中已启用模型，且 `model_name` 精确匹配优先于 `alias` 匹配。
-    #[must_use] 
+    #[must_use]
     pub fn find_model_by_name_or_alias(&self, name: &str) -> Option<&CachedModel> {
         self.name_lookup
             .get(name)
@@ -75,7 +75,7 @@ impl RouteSnapshot {
     }
 
     /// 按组名解析（只命中已启用组）。
-    #[must_use] 
+    #[must_use]
     pub fn group_by_name(&self, name: &str) -> Option<&CachedGroup> {
         self.group_name_lookup
             .get(name)
@@ -84,7 +84,7 @@ impl RouteSnapshot {
     }
 
     /// 组内成员（`(model_id, priority)`，priority 升序）。
-    #[must_use] 
+    #[must_use]
     pub fn group_members(&self, group_id: &str) -> &[(String, i32)] {
         self.groups
             .get(group_id)
@@ -93,7 +93,7 @@ impl RouteSnapshot {
     }
 
     /// provider 显示名（/v1/models 的 owned_by 用）。
-    #[must_use] 
+    #[must_use]
     pub fn provider_name(&self, id: &str) -> &str {
         self.providers
             .get(id)
@@ -102,7 +102,7 @@ impl RouteSnapshot {
 
     /// 生成本网关可用的模型列表（OpenAI `/v1/models` 格式）。
     /// 仅包含已启用且所属 provider 已启用的模型；alias 非空时展示 alias；按装载顺序稳定排序。
-    #[must_use] 
+    #[must_use]
     pub fn available_models(&self) -> Vec<serde_json::Value> {
         self.model_order
             .iter()
@@ -254,7 +254,7 @@ impl Default for CacheInner {
 
 impl RouteCache {
     /// 新建空缓存（首次读取时才从 DB 装载）。
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
