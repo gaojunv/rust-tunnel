@@ -4,7 +4,7 @@ use super::embedder::Embedder;
 use super::store::VectorStore;
 use rust_tunnel_common::crypto::decrypt_field;
 use rust_tunnel_common::crypto::LlmCipher;
-use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
+use rust_tunnel_persistence::knowledge::KnowledgeSourceRecord;
 use rust_tunnel_persistence::Database;
 
 /// 向量检索命中的原文分块，含分数与标题路径。
@@ -32,7 +32,7 @@ pub async fn retrieve(
     db: &Database,
     store: &VectorStore,
     cipher: Option<&LlmCipher>,
-    kb: &RagKnowledgeBaseRecord,
+    kb: &KnowledgeSourceRecord,
     query_text: &str,
 ) -> Vec<RetrievedChunk> {
     // embedding 失败 → 空（降级）

@@ -1460,10 +1460,15 @@ mod tests {
 
         // 知识库 + 一个分块（向量随后 upsert 进 store）
         let kb_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_kb(&rust_tunnel_persistence::rag::RagCreateKbOpts {
+        db.ks_create(&rust_tunnel_persistence::knowledge::KsCreateOpts {
             id: kb_id.clone(),
             name: "rag-kb".to_owned(),
-            description: String::new(),
+            summary: String::new(),
+            index_vector: true,
+            index_pages: false,
+            scope_type: "global".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
             emb_base_url: emb_base_url.to_owned(),
             emb_api_key: "sk-emb".to_owned(),
             emb_model: "emb-model".to_owned(),
@@ -1478,7 +1483,7 @@ mod tests {
         .unwrap();
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let doc_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_document(&doc_id, &kb_id, "install.md", "hash", "md")
+        db.kdoc_create(&doc_id, &kb_id, "install.md", "md", "hash")
             .await
             .unwrap();
         db.rag_insert_chunks(&[(

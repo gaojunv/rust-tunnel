@@ -47,7 +47,7 @@ pub async fn retrieve_context(
     if query_text.trim().is_empty() {
         return None;
     }
-    let kb = match db.rag_get_kb(kb_id).await {
+    let kb = match db.ks_get(kb_id).await {
         Ok(Some(k)) if k.enabled != 0 => k,
         _ => return None,
     };
