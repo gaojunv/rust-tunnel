@@ -1581,9 +1581,16 @@ impl Database {
     /// 扩展名），故 legacy 行无条件回填 'md'。绝不能按 filename 扩展名推导——
     /// 否则 notes.txt 会被推导成 'txt'，reindex 找 `.txt` 原文 409、delete 孤儿化
     /// 真实的 `.md` 文件。
-    /// 与 `Database::backfill_rag_document_file_type`（db/rag.rs）共享，避免两份 SQL 漂移。
+    /// 与 `Database::kdoc_backfill_file_type`（`knowledge.rs`）共享，避免两份 SQL 漂移。
     pub(crate) const BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL: &str =
         "UPDATE rag_documents SET file_type = 'md' WHERE file_type = ''";
+
+    /// 统一回填 SQL（新表 `knowledge_docs`）：与上方 `BACKFILL_RAG_DOCUMENT_FILE_TYPE_SQL`
+    /// 同语义，**同样绝不能改成按 filename 扩展名推导**（理由见上方注释：会孤儿化真实
+    /// 的 `.md` 原文）。只作用于 legacy 空值——新表两侧的 file_type 都由迁移原值带过
+    /// （`rag_documents` 与 `agent_wiki_docs` 都有该列），正常写入路径也必填。
+    pub(crate) const BACKFILL_KNOWLEDGE_DOC_FILE_TYPE_SQL: &str =
+        "UPDATE knowledge_docs SET file_type = 'md' WHERE file_type = ''";
 
     /// Migration: old DBs lack `file_type` on `rag_documents`. Idempotent.
     /// 列添加成功后在同一函数内回填老数据为 'md'（老数据落盘一律 .md，见上方常量注释）。

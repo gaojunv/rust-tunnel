@@ -28,7 +28,12 @@ pub mod memory;
 pub mod mesh;
 /// 代理规则的持久化操作。
 pub mod proxy_rules;
-/// RAG 知识库、文档与分块的持久化操作。
+/// 统一知识容器与文档的持久化操作（双索引模型）。
+///
+/// 统一 `knowledge_sources` / `knowledge_docs` / `knowledge_doc_index` 三表，
+/// 容器 `index_vector` / `index_pages` 双开关区分索引侧。
+pub mod knowledge;
+/// RAG 向量分块的持久化操作（`knowledge_chunks`）。
 pub mod rag;
 /// 数据库行记录类型定义。
 pub mod records;
@@ -52,7 +57,7 @@ pub mod stats;
 pub mod tool_result;
 /// Trojan 配置的持久化操作。
 pub mod trojan;
-/// Wiki 容器、文档与页面的持久化操作。
+/// Wiki 页面/边/FTS 的持久化操作（`knowledge_pages` 系）。
 pub mod wiki;
 pub use llm::*;
 pub use records::*;
