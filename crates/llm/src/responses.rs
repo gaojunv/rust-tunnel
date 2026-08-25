@@ -1735,7 +1735,7 @@ pub fn convert_openai_stream_to_responses(
                 Ok(bytes) => {
                     let converted = translator
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(&bytes);
                     if converted.is_empty() {
                         None
@@ -1893,7 +1893,7 @@ pub fn convert_responses_stream_to_chat(
                 Ok(bytes) => {
                     let converted = translator
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(&bytes);
                     if converted.is_empty() {
                         None

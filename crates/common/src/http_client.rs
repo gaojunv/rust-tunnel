@@ -12,7 +12,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 默认档整体请求超时；慢端点（embedding 等）在 builder 上覆盖。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// TCP keepalive 间隔。
-pub const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+pub const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
 /// 每 host 连接池空闲连接上限。
 pub const POOL_MAX_IDLE_PER_HOST: usize = 32;
 /// 统一 User-Agent（workspace 版本号）。

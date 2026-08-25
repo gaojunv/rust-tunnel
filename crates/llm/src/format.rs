@@ -463,7 +463,7 @@ pub fn convert_openai_stream_to_anthropic(openai_resp: Response) -> Response {
                 Ok(bytes) => {
                     let converted = translator
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(&bytes);
                     if converted.is_empty() {
                         None

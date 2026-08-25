@@ -341,7 +341,7 @@ impl TagScanner {
     /// 解析 <tool_call> 体内 JSON 并产出事件。
     fn emit_call(&mut self, body: &str, events: &mut Vec<ScanEvent>) {
         if let Some((name, args)) = parse_tool_call_body(body) {
-            self.push_call(&name, &args, events)
+            self.push_call(&name, &args, events);
         } else {
             log_discard("tool_call JSON parse failed", body);
             events.push(ScanEvent::Discarded(body.to_string()));

@@ -707,7 +707,7 @@ pub(crate) mod test_helpers {
             root_path: "/tmp".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,

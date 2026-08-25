@@ -619,7 +619,7 @@ mod tests {
             .rag_create_kb(&RagCreateKbOpts {
                 id: "kb-1".to_owned(),
                 name: "x".to_owned(),
-                description: "".to_owned(),
+                description: String::new(),
                 emb_base_url: "https://api.example.com".to_owned(),
                 emb_api_key: "k".to_owned(),
                 emb_model: "m".to_owned(),
@@ -783,7 +783,7 @@ mod tests {
         db.rag_create_kb(&RagCreateKbOpts {
             id: "kb1".to_owned(),
             name: "n".to_owned(),
-            description: "".to_owned(),
+            description: String::new(),
             emb_base_url: "http://x".to_owned(),
             emb_api_key: "k".to_owned(),
             emb_model: "m".to_owned(),
@@ -809,7 +809,7 @@ mod tests {
         db.rag_create_kb(&RagCreateKbOpts {
             id: "kb1".to_owned(),
             name: "n".to_owned(),
-            description: "".to_owned(),
+            description: String::new(),
             emb_base_url: "http://x".to_owned(),
             emb_api_key: "k".to_owned(),
             emb_model: "m".to_owned(),
@@ -864,7 +864,7 @@ mod tests {
         db.rag_create_kb(&RagCreateKbOpts {
             id: "kb1".to_owned(),
             name: "n".to_owned(),
-            description: "".to_owned(),
+            description: String::new(),
             emb_base_url: "http://x".to_owned(),
             emb_api_key: "k".to_owned(),
             emb_model: "m".to_owned(),
@@ -939,7 +939,7 @@ mod tests {
         db.rag_create_kb(&RagCreateKbOpts {
             id: "kb2".to_owned(),
             name: "n".to_owned(),
-            description: "".to_owned(),
+            description: String::new(),
             emb_base_url: "http://x".to_owned(),
             emb_api_key: "k".to_owned(),
             emb_model: "m".to_owned(),
@@ -1068,7 +1068,7 @@ mod tests {
         db.rag_create_kb(&RagCreateKbOpts {
             id: "kb3".to_owned(),
             name: "n".to_owned(),
-            description: "".to_owned(),
+            description: String::new(),
             emb_base_url: "http://x".to_owned(),
             emb_api_key: "k".to_owned(),
             emb_model: "m".to_owned(),

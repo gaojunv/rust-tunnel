@@ -649,7 +649,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -835,7 +835,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -882,7 +882,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -920,7 +920,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1021,7 +1021,7 @@ mod tests {
         db.agent_add_message("m1", "s1", "user", "看下文件", None)
             .await
             .unwrap();
-        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m2".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: "".to_owned(), tool_calls: Some(r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m2".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: String::new(), tool_calls: Some(r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
         db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
@@ -1064,7 +1064,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1124,7 +1124,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1192,7 +1192,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1211,7 +1211,7 @@ mod tests {
             id: "m2".to_owned(),
             session_id: "s1".to_owned(),
             role: "assistant".to_owned(),
-            content: "".to_owned(),
+            content: String::new(),
             tool_calls: Some(
                 r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#
                     .to_owned(),
@@ -1237,7 +1237,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m4".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: "".to_owned(), tool_calls: Some(r#"[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m4".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: String::new(), tool_calls: Some(r#"[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
         db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
@@ -1283,7 +1283,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -1346,7 +1346,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,

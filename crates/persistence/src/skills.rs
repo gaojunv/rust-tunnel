@@ -354,7 +354,7 @@ mod tests {
             client_id: client.to_owned(),
             workspace_id: ws.to_owned(),
             tags: r#"["rust"]"#.to_owned(),
-            source_session_id: "".to_owned(),
+            source_session_id: String::new(),
             source_trigger: "manual".to_owned(),
         })
         .await
@@ -414,8 +414,8 @@ mod tests {
                 content: "新内容".to_owned(),
                 tags: "[]".to_owned(),
                 scope_type: "global".to_owned(),
-                client_id: "".to_owned(),
-                workspace_id: "".to_owned(),
+                client_id: String::new(),
+                workspace_id: String::new(),
             },
         )
         .await
@@ -465,10 +465,10 @@ mod tests {
             description: "desc".to_owned(),
             content: "content".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
             tags: "[]".to_owned(),
-            source_session_id: "".to_owned(),
+            source_session_id: String::new(),
             source_trigger: "manual".to_owned(),
         })
         .await

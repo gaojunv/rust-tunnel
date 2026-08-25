@@ -430,8 +430,8 @@ mod tests {
                 model_override: None,
                 mode: "primary".to_owned(),
                 scope_type: "global".to_owned(),
-                client_id: "".to_owned(),
-                workspace_id: "".to_owned(),
+                client_id: String::new(),
+                workspace_id: String::new(),
             },
         )
         .await
@@ -460,15 +460,15 @@ mod tests {
         db.role_insert(&RoleInsertOpts {
             id: "r1".to_owned(),
             name: "tmp".to_owned(),
-            description: "".to_owned(),
-            system_prompt: "".to_owned(),
+            description: String::new(),
+            system_prompt: String::new(),
             tools_allow: None,
             tools_deny: None,
             model_override: None,
             mode: "subagent".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
         })
         .await
         .unwrap();
@@ -481,7 +481,7 @@ mod tests {
             root_path: "/p".to_owned(),
             docker_image: None,
             docker_container_id: None,
-            agent_type: "".to_owned(),
+            agent_type: String::new(),
             agent_path: None,
             llm_model_id: None,
             agent_config_overrides: None,
@@ -514,15 +514,15 @@ mod tests {
         db.role_insert(&RoleInsertOpts {
             id: "d1".to_owned(),
             name: "disabled".to_owned(),
-            description: "".to_owned(),
-            system_prompt: "".to_owned(),
+            description: String::new(),
+            system_prompt: String::new(),
             tools_allow: None,
             tools_deny: None,
             model_override: None,
             mode: "subagent".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
         })
         .await
         .unwrap();
@@ -611,15 +611,15 @@ mod tests {
         db.role_insert(&RoleInsertOpts {
             id: "p1".to_owned(),
             name: "primary-role".to_owned(),
-            description: "".to_owned(),
-            system_prompt: "".to_owned(),
+            description: String::new(),
+            system_prompt: String::new(),
             tools_allow: None,
             tools_deny: None,
             model_override: None,
             mode: "primary".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
         })
         .await
         .unwrap();
@@ -653,15 +653,15 @@ mod tests {
         db.role_insert(&RoleInsertOpts {
             id: "d1".to_owned(),
             name: "disabled".to_owned(),
-            description: "".to_owned(),
-            system_prompt: "".to_owned(),
+            description: String::new(),
+            system_prompt: String::new(),
             tools_allow: None,
             tools_deny: None,
             model_override: None,
             mode: "subagent".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
         })
         .await
         .unwrap();
@@ -671,15 +671,15 @@ mod tests {
         db.role_insert(&RoleInsertOpts {
             id: "p1".to_owned(),
             name: "primary".to_owned(),
-            description: "".to_owned(),
-            system_prompt: "".to_owned(),
+            description: String::new(),
+            system_prompt: String::new(),
             tools_allow: None,
             tools_deny: None,
             model_override: None,
             mode: "primary".to_owned(),
             scope_type: "global".to_owned(),
-            client_id: "".to_owned(),
-            workspace_id: "".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
         })
         .await
         .unwrap();

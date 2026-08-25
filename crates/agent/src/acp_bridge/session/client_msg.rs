@@ -89,7 +89,7 @@ impl AcpBridge {
                 tracing::debug!(session_id, "spawn data: pump closed, dropped");
             }
         } else {
-            tracing::debug!(session_id, "spawn data for missing/exited session, dropped")
+            tracing::debug!(session_id, "spawn data for missing/exited session, dropped");
         }
     }
 
@@ -104,7 +104,7 @@ impl AcpBridge {
             agent.last_activity = std::time::Instant::now();
             tracing::info!(session_id, code, "acp agent process exited");
         } else {
-            tracing::debug!(session_id, "spawn exit for unknown session")
+            tracing::debug!(session_id, "spawn exit for unknown session");
         }
     }
 
