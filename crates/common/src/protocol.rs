@@ -451,9 +451,12 @@ pub enum ControlMessage {
 
 impl ControlMessage {
     /// 将消息序列化为带长度前缀的字节（大端 4 字节长度 + bincode 负载）。
+    ///
+    /// # Errors
+    /// 当 `bincode::serialize` 序列化失败时返回 `Err`。
     pub fn serialize(&self) -> TunnelResult<Vec<u8>> {
         let encoded = bincode::serialize(self)?;
-        let len = encoded.len() as u32;
+        let len = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
         let mut result = Vec::with_capacity(4 + encoded.len());
         result.extend_from_slice(&len.to_be_bytes());
         result.extend_from_slice(&encoded);
@@ -461,9 +464,14 @@ impl ControlMessage {
     }
 
     /// 从流中读取一条消息（处理长度前缀与 1MB 上限校验）。
+    ///
+    /// # Errors
+    /// 当底层 `read_exact` 发生非 `UnexpectedEof` 的 `IO` 错误、消息长度超过 1 MB、
+    /// 或 `bincode::deserialize` 失败时返回 `Err`。
     pub async fn read_from_stream<R: AsyncReadExt + Unpin>(
         stream: &mut R,
     ) -> TunnelResult<Option<Self>> {
+        const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
         let mut len_buf = [0u8; 4];
         match stream.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -474,8 +482,6 @@ impl ControlMessage {
         }
 
         let len = u32::from_be_bytes(len_buf) as usize;
-        // Maximum message size is 1MB to prevent OOM attacks or corrupted data
-        const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
         if len > MAX_MESSAGE_SIZE {
             return Err(TunnelError::Protocol(format!(
                 "Message too large: {len} bytes (max: {MAX_MESSAGE_SIZE})"
@@ -489,6 +495,9 @@ impl ControlMessage {
     }
 
     /// 将消息写入流（序列化后一次性写入并 flush）。
+    ///
+    /// # Errors
+    /// 当 `serialize` 失败或底层 `write_all`/`flush` 发生 `IO` 错误时返回 `Err`。
     pub async fn write_to_stream<W: AsyncWriteExt + Unpin>(
         &self,
         stream: &mut W,
@@ -500,6 +509,9 @@ impl ControlMessage {
     }
 
     /// 写入拆分后的流半端（write_to_stream 的别名）。
+    ///
+    /// # Errors
+    /// 同 `write_to_stream`。
     pub async fn write_to_split<W: AsyncWriteExt + Unpin>(
         &self,
         stream: &mut W,
@@ -659,13 +671,14 @@ mod tests {
         let mut buffer = Vec::new();
         let msg = ControlMessage::Ping {
             seq: 1,
-            timestamp_micros: 123456789,
+            timestamp_micros: 123_456_789,
         };
         // write_to_split is just an alias for write_to_stream
         msg.write_to_split(&mut buffer).await.unwrap();
         assert!(!buffer.is_empty());
     }
 
+    #[allow(clippy::too_many_lines, reason = "扁平枚举全变体回环，不拆分")]
     #[tokio::test]
     async fn test_roundtrip_all_message_types() {
         let messages = vec![
@@ -708,12 +721,12 @@ mod tests {
             },
             ControlMessage::Ping {
                 seq: 42,
-                timestamp_micros: 123456789,
+                timestamp_micros: 123_456_789,
             },
             ControlMessage::Pong {
                 seq: 42,
-                ping_timestamp_micros: 123456789,
-                pong_timestamp_micros: 123456795,
+                ping_timestamp_micros: 123_456_789,
+                pong_timestamp_micros: 123_456_795,
             },
             ControlMessage::MeshJoin {
                 mesh_id: "test-mesh".into(),
@@ -778,13 +791,13 @@ mod tests {
         let msg = ControlMessage::LogBatch {
             entries: vec![
                 ClientLogEntry {
-                    timestamp: 1234567890,
+                    timestamp: 1_234_567_890,
                     level: "INFO".into(),
                     target: "client::proxy".into(),
                     message: "Connection established".into(),
                 },
                 ClientLogEntry {
-                    timestamp: 1234567891,
+                    timestamp: 1_234_567_891,
                     level: "ERROR".into(),
                     target: "client::control".into(),
                     message: "Heartbeat timeout".into(),
@@ -903,7 +916,7 @@ mod tests {
     async fn test_read_from_stream_corrupted_length() {
         // Create a message with length prefix pointing to more data than available
         let mut buffer = Vec::new();
-        buffer.extend_from_slice(&100000u32.to_be_bytes()); // Claims 100KB payload
+        buffer.extend_from_slice(&100_000_u32.to_be_bytes()); // Claims 100KB payload
         buffer.extend_from_slice(&[1, 2, 3]); // Only 3 bytes
 
         let mut reader = &buffer[..];

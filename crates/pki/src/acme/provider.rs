@@ -59,7 +59,11 @@ fn full_chain_pem(entry: &CertEntry) -> String {
     }
 }
 
-/// Helper function to create ServerConfig from CertEntry
+/// 从证书条目创建 rustls `ServerConfig`。
+///
+/// # Errors
+///
+/// 当证书链/私钥 PEM 解析失败或 `ServerConfig` 构建失败时返回错误。
 pub fn create_server_config_from_entry(entry: &CertEntry) -> AcmeResult<Arc<ServerConfig>> {
     use rustls_pemfile::certs;
 

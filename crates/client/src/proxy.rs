@@ -5,8 +5,11 @@ use tracing::{debug, warn};
 pub use crate::control::ClientState;
 use rust_tunnel_common::{ControlMessage, TunnelError, TunnelResult};
 
-/// Handle an OpenTunnel request from server.
-/// Dials `target_addr`, sends TunnelOpenResult, then shuttles data.
+/// 处理服务端的 `OpenTunnel` 请求：拨号本地目标、回传 `TunnelOpenResult`，随后双向转发数据。
+///
+/// # Errors
+///
+/// 当向服务端回传 `TunnelOpenResult` 失败或本地拨号失败且回传失败时返回 `Err`。
 pub async fn handle_open_tunnel(
     state: ClientState,
     connection_id: u64,

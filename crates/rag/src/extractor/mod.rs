@@ -19,11 +19,17 @@ pub(crate) const MAX_EXTRACT_TEXT_BYTES: usize = 20 * 1024 * 1024;
 /// 支持摄入的文件类型。DB `rag_documents.file_type` 存 `as_str()` 值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
+    /// Markdown 文本（`.md`），按 UTF-8 直通提取。
     Markdown,
+    /// 纯文本（`.txt`），按 UTF-8 直通提取。
     Text,
+    /// PDF 文档（`.pdf`），提取文本层后按页拼接为 Markdown。
     Pdf,
+    /// Word 文档（`.docx`，OOXML），解包 `word/document.xml` 转 Markdown。
     Docx,
+    /// Excel 表格（`.xlsx`，OOXML），解析共享字符串与工作表转 Markdown 表格。
     Xlsx,
+    /// PowerPoint 演示（`.pptx`，OOXML），按幻灯片提取标题与正文。
     Pptx,
 }
 
@@ -66,6 +72,10 @@ impl FileType {
 
     /// 轻量探测：检查 magic bytes，明显损坏/货不对板返回 Err。
     /// 文本类无探测（UTF-8 校验在 extract 里做）。
+    ///
+    /// # Errors
+    ///
+    /// 当 `bytes` 与声明的 `FileType` 不匹配时返回 `ExtractError::InvalidFormat`（magic 头缺失）。
     pub fn probe(self, bytes: &[u8]) -> Result<(), ExtractError> {
         match self {
             Self::Markdown | Self::Text => Ok(()),
@@ -93,6 +103,12 @@ impl FileType {
 
 /// 统一提取入口：原始字节 → Markdown 文本。
 /// Markdown/Text 直通（UTF-8 校验）；二进制格式走各自解析器。
+///
+/// # Errors
+///
+/// - 文本类（Markdown/Text）当 `bytes` 非 UTF-8 时返回 `ExtractError::NotUtf8`
+/// - PDF 当载入失败或无文本层时返回 `ExtractError::ParseFailed` / `NoTextLayer`
+/// - OOXML（docx/xlsx/pptx）当 zip 结构缺失、部件超限或 XML 解析失败时返回 `ExtractError::ParseFailed`
 pub fn extract(bytes: &[u8], file_type: FileType) -> Result<String, ExtractError> {
     match file_type {
         FileType::Markdown | FileType::Text => {

@@ -18,7 +18,7 @@ pub fn start_renewal_task(
 
             if let Some(db) = client.state.db() {
                 match db
-                    .load_acme_certificates_needing_renewal(days_before_expiry as i64)
+                    .load_acme_certificates_needing_renewal(days_before_expiry.cast_signed())
                     .await
                 {
                     Ok(certs) => {

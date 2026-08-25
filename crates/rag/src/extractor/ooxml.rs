@@ -22,7 +22,11 @@ const MAX_PART_BYTES: u64 = 20 * 1024 * 1024;
 /// 解析时必须跳过（见 `push_cell`）。
 const MAX_XLSX_COLS: usize = 16_384;
 
-/// 打开 OOXML zip 容器。
+/// 打开 OOXML zip 容器（docx/xlsx/pptx 均为 zip 容器）。
+///
+/// # Errors
+///
+/// 当 `bytes` 不是合法 zip 格式时返回 `ExtractError::ParseFailed`。
 pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractError> {
     zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| ExtractError::ParseFailed(format!("zip open: {e}")))
@@ -34,6 +38,10 @@ pub fn open_zip(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>, ExtractE
 /// 的 zip 头部，可伪造为任意大（见模块注释）。改用 `Vec::new()` 按真实解压
 /// 字节增长，并用 `Read::take(MAX_PART_BYTES + 1)` 硬性封顶解压后大小：即使
 /// 头部伪造出超小尺寸，解压炸弹仍会在解压到上限后报 ParseFailed，绝不 OOM。
+///
+/// # Errors
+///
+/// 当部件不存在、解压后超过 `MAX_PART_BYTES`、IO 读取失败或内容非 UTF-8 时返回 `ExtractError::ParseFailed`。
 pub fn read_part<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
@@ -45,7 +53,7 @@ pub fn read_part<R: Read + Seek>(
     part.take(MAX_PART_BYTES + 1)
         .read_to_end(&mut buf)
         .map_err(|e| ExtractError::ParseFailed(format!("read part {name}: {e}")))?;
-    if buf.len() > MAX_PART_BYTES as usize {
+    if buf.len() > usize::try_from(MAX_PART_BYTES).unwrap_or(usize::MAX) {
         return Err(ExtractError::ParseFailed(format!(
             "part {name} exceeds {MAX_PART_BYTES} bytes"
         )));
@@ -54,6 +62,10 @@ pub fn read_part<R: Read + Seek>(
 }
 
 /// docx → Markdown：段落按 w:p 边界；带 HeadingN 样式的段落转 `#`*N 标题。
+///
+/// # Errors
+///
+/// 当 `bytes` 非合法 zip、缺 `word/document.xml`、部件超过 20MB、XML 解析失败或文档无文本时返回 `ExtractError::ParseFailed`。
 pub fn docx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let mut archive = open_zip(bytes)?;
     let xml = read_part(&mut archive, "word/document.xml")?;
@@ -143,6 +155,10 @@ fn parse_heading_level(style: &str) -> Option<usize> {
 /// 设计简化：sheet 名按 `xl/worksheets/sheet<N>.xml` 的序号直接对应 workbook
 /// `<sheet>` 声明序，不解析 `xl/_rels/workbook.xml.rels` 的 rId→目标文件映射
 /// （严格实现应走 rels）。若遇到实际 sheet 顺序错乱的文件再补 rels 解析。
+///
+/// # Errors
+///
+/// 当 `bytes` 非合法 zip、缺少工作簿信息、sheet 部件超限或 XML 解析失败，或全部 sheet 为空时返回 `ExtractError::ParseFailed`。
 pub fn xlsx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let mut archive = open_zip(bytes)?;
     let shared = read_shared_strings(&mut archive)?;
@@ -424,6 +440,10 @@ fn elem_attr(elem: &BytesStart<'_>, key: &[u8]) -> Option<String> {
 }
 
 /// pptx → Markdown：每页一个 `## 标题` section，页面备注作 blockquote。
+///
+/// # Errors
+///
+/// 当 `bytes` 非合法 zip、幻灯片 XML 解析失败，或全部幻灯片无文本时返回 `ExtractError::ParseFailed`。
 pub fn pptx_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let mut archive = open_zip(bytes)?;
     let mut out = String::new();

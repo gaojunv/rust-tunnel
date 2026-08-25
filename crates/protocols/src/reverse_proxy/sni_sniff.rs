@@ -69,23 +69,23 @@ pub fn parse_client_hello_sni(buf: &[u8]) -> SniParse {
     if body.len() < pos + 2 {
         return SniParse::Incomplete;
     }
-    let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+    let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
-    if body.len() < pos + cs_len {
+    if body.len() < pos + cipher_suites_len {
         return SniParse::Incomplete;
     }
-    pos += cs_len;
+    pos += cipher_suites_len;
 
     // compression_methods
     if body.len() < pos + 1 {
         return SniParse::Incomplete;
     }
-    let cm_len = body[pos] as usize;
+    let compression_methods_len = body[pos] as usize;
     pos += 1;
-    if body.len() < pos + cm_len {
+    if body.len() < pos + compression_methods_len {
         return SniParse::Incomplete;
     }
-    pos += cm_len;
+    pos += compression_methods_len;
 
     // extensions（可选）
     if body.len() < pos + 2 {
@@ -133,7 +133,7 @@ pub async fn sniff_sni(stream: &TcpStream) -> Option<String> {
     let mut buf = vec![0u8; 16384];
     loop {
         match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
-            Ok(Ok(0)) => return None, // 对端已关闭
+            Ok(Ok(0) | Err(_)) | Err(_) => return None,
             Ok(Ok(n)) => match parse_client_hello_sni(&buf[..n]) {
                 SniParse::Sni(name) => return Some(name),
                 SniParse::NoSni | SniParse::NotClientHello => return None,
@@ -142,8 +142,6 @@ pub async fn sniff_sni(stream: &TcpStream) -> Option<String> {
                     tokio::time::sleep(SNI_SNIFF_RETRY_INTERVAL).await;
                 }
             },
-            Ok(Err(_)) => return None,
-            Err(_) => return None, // 超时
         }
     }
 }
@@ -163,28 +161,28 @@ mod tests {
         let mut exts = Vec::new();
         if let Some(name) = sni {
             let mut sni_ext = Vec::new();
-            let list_len = (1 + 2 + name.len()) as u16;
+            let list_len = u16::try_from(1 + 2 + name.len()).unwrap_or(u16::MAX);
             sni_ext.extend_from_slice(&list_len.to_be_bytes());
             sni_ext.push(0); // name type: host_name
-            sni_ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            sni_ext.extend_from_slice(&u16::try_from(name.len()).unwrap_or(u16::MAX).to_be_bytes());
             sni_ext.extend_from_slice(name.as_bytes());
             exts.extend_from_slice(&0u16.to_be_bytes()); // ext type: server_name
-            exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&u16::try_from(sni_ext.len()).unwrap_or(u16::MAX).to_be_bytes());
             exts.extend_from_slice(&sni_ext);
         }
-        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&u16::try_from(exts.len()).unwrap_or(u16::MAX).to_be_bytes());
         body.extend_from_slice(&exts);
 
         let mut hs = Vec::new();
         hs.push(0x01); // handshake type: ClientHello
-        let len = body.len() as u32;
+        let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
         hs.extend_from_slice(&len.to_be_bytes()[1..]); // 3-byte length
         hs.extend_from_slice(&body);
 
         let mut rec = Vec::new();
         rec.push(0x16); // record type: handshake
         rec.extend_from_slice(&[0x03, 0x01]); // record version
-        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&u16::try_from(hs.len()).unwrap_or(u16::MAX).to_be_bytes());
         rec.extend_from_slice(&hs);
         rec
     }
@@ -222,6 +220,8 @@ mod tests {
 
     #[tokio::test]
     async fn sniff_peeks_without_consuming() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hello = build_client_hello(Some("trojan.example.com"));
@@ -229,11 +229,9 @@ mod tests {
 
         tokio::spawn(async move {
             let mut c = TcpStream::connect(addr).await.unwrap();
-            use tokio::io::AsyncWriteExt;
             c.write_all(&hello_for_client).await.unwrap();
             // 保持连接，等服务端 peek + read
             let mut buf = [0u8; 16];
-            use tokio::io::AsyncReadExt;
             let _ = c.read(&mut buf).await;
         });
 
@@ -242,7 +240,6 @@ mod tests {
         assert_eq!(sni, Some("trojan.example.com".to_string()));
 
         // peek 不消费：读出来的字节与原 ClientHello 完全一致
-        use tokio::io::AsyncReadExt;
         let mut got = vec![0u8; hello.len()];
         server.read_exact(&mut got).await.unwrap();
         assert_eq!(got, hello);

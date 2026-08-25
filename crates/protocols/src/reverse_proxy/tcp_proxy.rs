@@ -22,6 +22,10 @@ impl TcpProxy {
     }
 
     /// Start TCP proxy listener on the given address
+    ///
+    /// # Errors
+    ///
+    /// 当端口绑定失败时返回 `Err`。
     pub async fn start(
         &self,
         addr: SocketAddr,
@@ -201,6 +205,10 @@ impl UdpProxy {
     }
 
     /// Start UDP proxy on the given address
+    ///
+    /// # Errors
+    ///
+    /// 当 UDP 端口绑定失败时返回 `Err`。
     pub async fn start(
         &self,
         addr: SocketAddr,

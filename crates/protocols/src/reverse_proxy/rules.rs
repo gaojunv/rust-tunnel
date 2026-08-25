@@ -278,6 +278,11 @@ pub async fn resolve_cert_source_for_rule(
 
 /// Validate a rule about to be persisted. See spec §2.5.
 /// Returns Err(message) on the first failing constraint.
+///
+/// # Errors
+///
+/// 当规则不满足持久化约束时返回 `Err`：LLM 规则缺少域名、client 后端缺少 `client_name`、
+/// 地址非 `host:port`、UDP 规则使用 client 后端、或 client 后端声明为 HTTP/2。
 pub fn validate_rule_for_save(rule: &ProxyRule) -> Result<(), String> {
     // LLM rules have no routes/backends — skip route validation
     if rule.rule_type == RuleType::Llm {

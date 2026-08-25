@@ -8,8 +8,11 @@
 /// 一个分块：标题路径 + 原文 + token 近似数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
+    /// 标题路径，形如 `一级/二级`，无标题时为空字符串。
     pub heading_path: String,
+    /// 分块原文，已去首尾空白。
     pub content: String,
+    /// `content` 的 token 近似数（字符数 ÷ 4 向上取整）。
     pub token_count: usize,
 }
 
@@ -123,7 +126,7 @@ fn heading_level(line: &str) -> Option<u8> {
     let t = line.trim_start();
     let hashes = t.chars().take_while(|&c| c == '#').count();
     if (1..=6).contains(&hashes) && t.chars().nth(hashes) == Some(' ') {
-        Some(hashes as u8)
+        Some(u8::try_from(hashes).unwrap_or(u8::MAX))
     } else {
         None
     }
@@ -259,7 +262,7 @@ pub fn chunk_markdown(text: &str, chunk_size: usize, overlap: usize) -> Vec<Chun
             buf = tail;
         }
         if buf.is_empty() {
-            buf_path = cur_path.clone();
+            buf_path.clone_from(&cur_path);
         }
         if !buf.is_empty() {
             buf.push_str("\n\n");

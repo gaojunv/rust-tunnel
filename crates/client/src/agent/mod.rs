@@ -12,6 +12,8 @@ use tokio::sync::oneshot;
 
 use rust_tunnel_common::{AgentCommand, AgentResult, FileEdit};
 
+use std::fmt::Write as _;
+
 /// 单条命令输出上限（协议 1MB 消息上限内留足余量）
 const MAX_OUTPUT: usize = 100 * 1024;
 
@@ -22,6 +24,10 @@ const MAX_OUTPUT: usize = 100 * 1024;
 /// symlink）指向 root 外时拒绝——否则 `read_file link_to_etc_passwd` 可越界读。
 /// 目标不存在（待写入的新文件）时 canonicalize 最近存在的祖先再拼接校验。
 /// root canonicalize 失败（root 本身不存在等异常）时退回词法结果，不阻断既有行为。
+///
+/// # Errors
+///
+/// 当相对路径为绝对路径、包含上溢的 `..`、或经 symlink 规范化后逃逸沙箱根时返回 `Err`。
 pub fn resolve_sandboxed(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
@@ -137,7 +143,7 @@ fn grep_search_result(pattern: &str, shell_result: AgentResult) -> AgentResult {
                 .collect::<Vec<_>>()
                 .join("\n");
             if truncated {
-                content.push_str(&format!("\n[truncated at {SEARCH_MAX_HITS} hits]"));
+                let _ = write!(content, "\n[truncated at {SEARCH_MAX_HITS} hits]");
             }
             AgentResult::FileContent {
                 content: truncate_output(content),
@@ -496,10 +502,19 @@ struct CmdOutput {
     exit_code: i32,
 }
 
+#[cfg(unix)]
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // SAFETY: 只 kill 本次 spawn 建立的进程组，pid 为组长。
+        unsafe { libc::kill(-pid.cast_signed(), libc::SIGKILL) };
+    }
+}
+
 /// 通过宿主 `sh -c <cmd>` 执行一条命令。`cwd` 为宿主工作目录；docker 模式下传
 /// `None`（工作目录交给 `docker exec -w` 处理）。`stdin_data` 为 `Some` 时经 stdin
 /// 管道写入子进程。`cancel_rx` 为 `Some` 时支持中途取消：进程以进程组方式 spawn，
 /// 取消或超时都 SIGKILL 整个进程组（含孙进程，避免 `sh` 被杀而 `cargo build` 成孤儿）。
+#[allow(clippy::too_many_lines, reason = "宿主命令执行全流程编排：spawn/管道/超时/取消/回收，状态共享难以拆分")]
 async fn run_host(
     cmd: &str,
     cwd: Option<&Path>,
@@ -590,16 +605,6 @@ async fn run_host(
         })
     });
 
-    // 进程组 kill：取消/超时统一走这里。与 process_group(0) 一致，仅 unix 可用。
-    // 取 spawn 时捕获的 child_pid（wait 收割后 Child::id() 为 None）。
-    #[cfg(unix)]
-    fn kill_group(pid: Option<u32>) {
-        if let Some(pid) = pid {
-            // SAFETY: 只 kill 本次 spawn 建立的进程组，pid 为组长。
-            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        }
-    }
-
     // wait + stdout/stderr drain 纳入同一 deadline：`sh -c 'nohup server &'` 这类
     // 后台化孙进程继承管道时，sh 虽秒退，读 task 的 join 也不能拖过 timeout。
     let deadline = std::time::Instant::now() + timeout;
@@ -675,6 +680,7 @@ async fn run_host(
 ///
 /// 取消边界：仅 shell/search 可取消（走 `cancel_rx` 进程组 kill），其余命令
 /// （read/write/list/git）收到 AgentExecCancel 静默忽略、按原超时跑完。
+#[allow(clippy::too_many_lines, reason = "对全部 AgentCommand 变体的扁平派发，拆分会散落沙箱与容器分支")]
 pub async fn handle_exec_request(
     command: &AgentCommand,
     root_path: &Path,
@@ -1035,11 +1041,11 @@ async fn shell_exec(
         },
         None => root_path.to_path_buf(),
     };
-    let (host_cmd, host_cwd) = match docker_container {
+    let (host_cmd, host_dir) = match docker_container {
         Some(c) => (docker_shell_cmd(c, &workdir.to_string_lossy(), cmd), None),
         None => (cmd.to_string(), Some(workdir.as_path())),
     };
-    match run_host(&host_cmd, host_cwd, None, timeout, cancel_rx).await {
+    match run_host(&host_cmd, host_dir, None, timeout, cancel_rx).await {
         Ok(out) => AgentResult::Shell {
             stdout: out.stdout,
             stderr: out.stderr,
@@ -1076,7 +1082,7 @@ async fn list_dir(path: &Path) -> AgentResult {
     let truncated_entries = total > LIST_DIR_MAX_ENTRIES;
     let mut content = lines.join("\n");
     if truncated_entries {
-        content.push_str(&format!("\n[truncated, total {total} entries]"));
+        let _ = write!(content, "\n[truncated, total {total} entries]");
     }
     AgentResult::FileContent {
         content: truncate_output(content),
@@ -1170,7 +1176,10 @@ async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64
             Ok(0) => break,
             Ok(_) => {
                 total += 1;
-                if total >= start && selected.len() < max_lines as usize && !collect_truncated {
+                if total >= start
+                    && selected.len() < usize::try_from(max_lines).unwrap_or(usize::MAX)
+                    && !collect_truncated
+                {
                     if buf.len() <= byte_budget {
                         byte_budget -= buf.len();
                         let line = String::from_utf8_lossy(&buf);
@@ -1202,7 +1211,7 @@ async fn read_file_range_host(abs: &Path, offset: Option<u64>, limit: Option<u64
         result.push_str("\n[... window exceeded 100KB output budget, truncated ...]");
     }
     if end_line < total || start > 1 || collect_truncated {
-        result.push_str(&format!("\n[showing lines {start}-{end_line} of {total}]"));
+        let _ = write!(result, "\n[showing lines {start}-{end_line} of {total}]");
     }
     AgentResult::FileContent { content: result }
 }
@@ -1245,7 +1254,7 @@ async fn docker_read_file_range(
             let end_line = if shown == 0 { start } else { start + shown - 1 };
             let mut result = content.trim_end_matches('\n').to_string();
             if end_line < total || start > 1 {
-                result.push_str(&format!("\n[showing lines {start}-{end_line} of {total}]"));
+                let _ = write!(result, "\n[showing lines {start}-{end_line} of {total}]");
             }
             AgentResult::FileContent { content: result }
         }
@@ -3000,6 +3009,7 @@ mod tests {
     // ── 原子写测试 ──────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons, reason = "仅判断临时文件 .tmp 后缀，无需大小写无关比较")]
     async fn test_atomic_write_no_tmp_residual() {
         let dir = temp_workspace(&[]);
         let target = dir.join("file.txt");

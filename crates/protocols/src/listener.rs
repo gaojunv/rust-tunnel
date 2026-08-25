@@ -6,6 +6,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::port_registry::{PortInfo, PortRegistry};
+use crate::shadowsocks::create_shared_context;
 use crate::shadowsocks::handle_ss_handshake;
 use crate::shadowsocks::proxy_ss_connection;
 use crate::trojan::proxy_trojan_connection;
@@ -18,7 +19,11 @@ fn generate_connection_id() -> u64 {
     rand::thread_rng().gen()
 }
 
-/// Start Shadowsocks listener if enabled
+/// 启动 Shadowsocks 监听器（无外部停止信号，运行至进程结束）。
+///
+/// # Errors
+///
+/// 当端口已被占用、绑定失败或接受连接时发生 I/O 错误时返回 `Err`。
 pub async fn start_shadowsocks_listener(
     registry: std::sync::Arc<dyn PortRegistry>,
     stats: StatsCollector,
@@ -52,7 +57,11 @@ pub async fn start_shadowsocks_listener(
     }
 }
 
-/// Start Shadowsocks listener with abort support
+/// 启动支持外部停止的 Shadowsocks 监听器（通过 `abort_rx` 通知退出）。
+///
+/// # Errors
+///
+/// 当端口已被占用、绑定失败或接受连接时发生 I/O 错误时返回 `Err`。
 pub async fn start_shadowsocks_listener_with_abort(
     registry: std::sync::Arc<dyn PortRegistry>,
     stats: StatsCollector,
@@ -98,10 +107,12 @@ pub async fn start_shadowsocks_listener_with_abort(
     }
 }
 
-/// Handle one Trojan connection: TLS 终止 → Trojan 握手 → 代理/回退。
+/// 处理单条 Trojan 连接：TLS 终止 → Trojan 握手 → 代理/回退。
 ///
 /// 从独立 listener 的每连接逻辑提取，供独立监听模式与反代 SNI 分流模式共用。
 /// 每连接从 watch channel borrow 最新的 TLS 配置（证书热更新机制）。
+#[allow(clippy::too_many_arguments, reason = "Trojan 连接需端口/密码/回退/TLS 配置/注册表/统计六要素，拆分会割裂调用点")]
+#[allow(clippy::large_futures, reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估")]
 pub async fn handle_trojan_connection(
     inbound: TcpStream,
     client_addr: std::net::SocketAddr,
@@ -164,7 +175,11 @@ pub async fn handle_trojan_connection(
     }
 }
 
-/// Start Trojan listener with TLS
+/// 启动带 TLS 的 Trojan 监听器。
+///
+/// # Errors
+///
+/// 当端口已被占用或绑定失败时返回 `Err`。
 pub async fn start_trojan_listener(
     registry: std::sync::Arc<dyn PortRegistry>,
     stats: StatsCollector,
@@ -198,23 +213,30 @@ pub async fn start_trojan_listener(
         let fallback_clone = fallback.clone();
         let tls_config_rx_clone = tls_config_rx.clone();
 
-        tokio::spawn(async move {
-            handle_trojan_connection(
-                inbound,
-                client_addr,
-                port,
-                password_clone,
-                fallback_clone,
-                tls_config_rx_clone,
-                reg,
-                st,
-            )
-            .await;
-        });
+        tokio::spawn(
+            #[allow(clippy::large_futures, reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估")]
+            async move {
+                handle_trojan_connection(
+                    inbound,
+                    client_addr,
+                    port,
+                    password_clone,
+                    fallback_clone,
+                    tls_config_rx_clone,
+                    reg,
+                    st,
+                )
+                .await;
+            },
+        );
     }
 }
 
-/// Start Trojan listener with abort support
+/// 启动支持外部停止的 Trojan 监听器（TLS，`abort_rx` 触发退出）。
+///
+/// # Errors
+///
+/// 当端口已被占用或绑定失败时返回 `Err`。
 pub async fn start_trojan_listener_with_abort(
     registry: std::sync::Arc<dyn PortRegistry>,
     stats: StatsCollector,
@@ -250,19 +272,22 @@ pub async fn start_trojan_listener_with_abort(
                 let fallback_clone = fallback.clone();
                 let tls_config_rx_clone = tls_config_rx.clone();
 
-                tokio::spawn(async move {
-                    handle_trojan_connection(
-                        inbound,
-                        client_addr,
-                        port,
-                        password_clone,
-                        fallback_clone,
-                        tls_config_rx_clone,
-                        reg,
-                        st,
-                    )
-                    .await;
-                });
+                tokio::spawn(
+                    #[allow(clippy::large_futures, reason = "handler 状态机大但仅在请求路径构造一次，boxing 需单独性能评估")]
+                    async move {
+                        handle_trojan_connection(
+                            inbound,
+                            client_addr,
+                            port,
+                            password_clone,
+                            fallback_clone,
+                            tls_config_rx_clone,
+                            reg,
+                            st,
+                        )
+                        .await;
+                    },
+                );
             }
             _ = abort_rx.changed() => {
                 if *abort_rx.borrow() {
@@ -282,10 +307,7 @@ async fn handle_inbound_connection(
     connection_id: u64,
     user_stream: TcpStream,
 ) -> TunnelResult<()> {
-    // Get port info
-    let port_info = if let Some(info) = registry.get_port(remote_port).await {
-        info
-    } else {
+    let Some(port_info) = registry.get_port(remote_port).await else {
         warn!("No port registered for {}, closing connection", remote_port);
         return Ok(());
     };
@@ -298,7 +320,6 @@ async fn handle_inbound_connection(
             debug!("Handling Shadowsocks connection on port {}", remote_port);
 
             // Create SS context and handle handshake
-            use crate::shadowsocks::create_shared_context;
             let ss_context = create_shared_context();
 
             match handle_ss_handshake(

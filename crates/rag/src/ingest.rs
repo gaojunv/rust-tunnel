@@ -16,10 +16,15 @@ use tokio::sync::broadcast;
 /// 文档状态变更事件（SSE 推送给前端）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KbEvent {
+    /// 所属文档 ID。
     pub doc_id: String,
+    /// 所属知识库 ID。
     pub kb_id: String,
+    /// 目标状态：`processing`/`ready`/`failed`。
     pub status: String,
+    /// 已落库分块数，`processing` 阶段为 0。
     pub chunk_count: i64,
+    /// 失败原因，成功时为 `None`。
     pub error: Option<String>,
 }
 
@@ -150,8 +155,11 @@ async fn do_ingest(
     if content.trim().is_empty() {
         return Err("no text extracted from document".to_string());
     }
-    let chunks =
-        chunker::chunk_markdown(&content, kb.chunk_size as usize, kb.chunk_overlap as usize);
+    let chunks = chunker::chunk_markdown(
+        &content,
+        usize::try_from(kb.chunk_size).unwrap_or(usize::MAX),
+        usize::try_from(kb.chunk_overlap).unwrap_or(usize::MAX),
+    );
     if chunks.is_empty() {
         return Err("empty content".to_string());
     }
@@ -176,21 +184,25 @@ async fn do_ingest(
             id: cid.clone(),
             vector: v,
             doc_id: doc_id.to_string(),
-            seq: i as i64,
+            seq: i64::try_from(i).unwrap_or(i64::MAX),
             heading_path: c.heading_path.clone(),
         });
         rows.push((
             cid,
             doc_id.to_string(),
             kb.id.clone(),
-            i as i64,
+            i64::try_from(i).unwrap_or(i64::MAX),
             c.heading_path.clone(),
             c.content.clone(),
-            c.token_count as i64,
+            i64::try_from(c.token_count).unwrap_or(i64::MAX),
         ));
     }
     store
-        .upsert(&kb.id, kb.emb_dimension as usize, points)
+        .upsert(
+            &kb.id,
+            usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+            points,
+        )
         .await
         .map_err(|e| e.to_string())?;
     if let Err(e) = db.rag_insert_chunks(&rows).await {
@@ -199,14 +211,18 @@ async fn do_ingest(
         // 向量永久残留（chunk id 不在 rag_chunks 中，检索不可见，纯磁盘泄漏）。
         // best-effort：失败仅 warn，DB 仍是源，不影响错误上报。
         if let Err(se) = store
-            .delete_by_doc(&kb.id, kb.emb_dimension as usize, doc_id)
+            .delete_by_doc(
+                &kb.id,
+                usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+                doc_id,
+            )
             .await
         {
             tracing::warn!(kb_id = %kb.id, doc_id, error = %se, "rag ingest: vector rollback failed");
         }
         return Err(e.to_string());
     }
-    Ok(chunks.len() as i64)
+    Ok(i64::try_from(chunks.len()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
@@ -385,9 +401,14 @@ mod tests {
         // 向量已写入：同 kb search 能命中
         let query = [1.0f32; 8];
         let hits = store
-            .search(&kb.id, kb.emb_dimension as usize, &query, 5)
+            .search(
+                &kb.id,
+                usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+                &query,
+                5,
+            )
             .await;
-        assert_eq!(hits.len() as i64, doc.chunk_count);
+        assert_eq!(i64::try_from(hits.len()).unwrap_or(i64::MAX), doc.chunk_count);
         assert!(!hits.is_empty());
     }
 
@@ -506,7 +527,12 @@ mod tests {
 
         // 向量已回滚：同 kb search 应为空（不留孤儿向量），分块也未落库。
         let hits = store
-            .search(&kb.id, kb.emb_dimension as usize, &[1.0f32; 8], 10)
+            .search(
+                &kb.id,
+                usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
+                &[1.0f32; 8],
+                10,
+            )
             .await;
         assert!(hits.is_empty(), "insert 失败后应回滚本次写入的向量");
         assert_eq!(db.rag_count_kb_chunks(&kb.id).await.unwrap(), 0);

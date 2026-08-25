@@ -1,3 +1,5 @@
+//! rust-tunnel 客户端二进制：解析配置、启动 PTY 服务与控制通道重连循环。
+
 use std::io::IsTerminal;
 use std::time::Duration;
 

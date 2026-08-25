@@ -5,7 +5,7 @@ use hyper::header::{HeaderMap, HeaderValue};
 use hyper::Request;
 
 use super::super::upstream::{ProxyBody, ProxyError};
-use super::super::Backend;
+use super::super::{Backend, BackendProtocol, BackendScheme};
 use super::websocket::is_websocket_upgrade;
 use rust_tunnel_stats::{EntityType, StatsCollector};
 
@@ -114,7 +114,6 @@ pub(super) fn build_upstream_request(
         .uri
         .path_and_query()
         .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-    use super::super::{BackendProtocol, BackendScheme};
     let scheme = match backend.scheme {
         BackendScheme::Http => "http",
         BackendScheme::Https => "https",

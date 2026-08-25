@@ -17,6 +17,10 @@ fn accumulate_page(total: &mut usize, text: &str) -> Result<(), ExtractError> {
 }
 
 /// 提取 PDF 文本层，按页组织，页间空行分隔。
+///
+/// # Errors
+///
+/// 当 PDF 载入失败或累计文本超过 20MB 上限时返回 `ExtractError::ParseFailed`；当文档无文本层（扫描件）时返回 `ExtractError::NoTextLayer`。
 pub fn pdf_to_markdown(bytes: &[u8]) -> Result<String, ExtractError> {
     let doc = lopdf::Document::load_mem(bytes)
         .map_err(|e| ExtractError::ParseFailed(format!("pdf load: {e}")))?;
@@ -45,14 +49,14 @@ pub(crate) fn make_empty_page_pdf() -> Vec<u8> {
     use lopdf::{dictionary, Document, Object};
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
-    let page_id = doc.add_object(dictionary! {
+    let page_obj_id = doc.add_object(dictionary! {
         "Type" => "Page", "Parent" => pages_id,
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
     });
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
-            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Type" => "Pages", "Kids" => vec![page_obj_id.into()], "Count" => 1,
         }),
     );
     let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
@@ -128,14 +132,14 @@ mod tests {
         });
         let content = format!("BT /F1 24 Tf 100 700 Td ({text}) Tj ET");
         let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-        let page_id = doc.add_object(dictionary! {
+        let page_obj_id = doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
             "Contents" => content_id,
             "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
         });
         let pages = dictionary! {
-            "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            "Type" => "Pages", "Kids" => vec![page_obj_id.into()], "Count" => 1,
         };
         doc.objects.insert(pages_id, Object::Dictionary(pages));
         let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });

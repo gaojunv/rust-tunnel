@@ -154,6 +154,10 @@ impl ReverseProxyState {
 
     /// Pick the correct connector for a backend. Returns Err if kind=Client
     /// but no ClientConnector is registered yet.
+    ///
+    /// # Errors
+    ///
+    /// 当后端为 `Client` 但尚未注册 `ClientConnector` 时返回 `Unsupported` 的 `io::Error`。
     pub async fn connector_for(
         &self,
         backend: &Backend,
@@ -178,6 +182,10 @@ impl ReverseProxyState {
     }
 
     /// Load rules from database
+    ///
+    /// # Errors
+    ///
+    /// 当数据库查询或 JSON 反序列化失败时返回 `Err`。
     pub async fn load_from_db(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(db) = &self.db {
             let records = db.load_proxy_rules().await?;
@@ -251,6 +259,10 @@ impl ReverseProxyState {
     }
 
     /// Save a rule to database
+    ///
+    /// # Errors
+    ///
+    /// 当 JSON 序列化或数据库写入失败时返回 `Err`。
     pub async fn save_rule(&self, rule: &ProxyRule) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(db) = &self.db {
             let domains_json = if rule.domains.is_empty() {
@@ -299,6 +311,10 @@ impl ReverseProxyState {
     }
 
     /// Delete a rule from database
+    ///
+    /// # Errors
+    ///
+    /// 当数据库删除失败时返回 `Err`。
     pub async fn delete_rule(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(db) = &self.db {
             db.delete_proxy_rule(id).await?;

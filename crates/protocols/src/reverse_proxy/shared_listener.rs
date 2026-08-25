@@ -39,6 +39,10 @@ pub struct SharedListener {
 
 impl SharedListener {
     /// Spawn a new shared listener bound to `listen_addr`.
+    ///
+    /// # Errors
+    ///
+    /// 当 `tls_enabled` 为真但未提供证书管理器、或 `listen_addr` 非法、或端口绑定失败时返回 `Err`。
     pub async fn spawn(
         listen_addr: String,
         tls_enabled: bool,
@@ -123,10 +127,13 @@ impl SharedListener {
                         let ps = proxy_state.clone();
                         // 每连接取一次分流表项快照（ArcSwap 热替换，无需重建监听器）
                         let trojan_entry = proxy_state.trojan_sni_entry(&listen_addr_for_match);
-                        tokio::spawn(async move {
-                            handle_one_connection(stream, peer, acceptor, table, upstream_c, ps, trojan_entry)
-                                .await;
-                        });
+                        #[allow(clippy::large_futures, reason = "每连接任务状态机较大但仅在 accept 路径构造一次，boxing 需单独性能评估")]
+                        {
+                            tokio::spawn(async move {
+                                handle_one_connection(stream, peer, acceptor, table, upstream_c, ps, trojan_entry)
+                                    .await;
+                            });
+                        }
                     }
                 }
             }
@@ -177,7 +184,8 @@ impl SharedListener {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // 保留：tokio::spawn 闭包，纯基础设施参数
+#[allow(clippy::too_many_arguments, reason = "连接分发需携带全部路由与 TLS 上下文，拆分会割裂 spawn 闭包的共享状态")]
+#[allow(clippy::large_futures, reason = "handler 状态机大但仅在每连接路径构造一次，boxing 需单独性能评估")]
 async fn handle_one_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -288,6 +296,10 @@ async fn llm_aware_proxy_dispatch(
 /// - TLS consistency: all rules on the same port must have identical `tls.enabled`.
 ///
 /// The `listen_addr` parameter is only used for error reporting.
+///
+/// # Errors
+///
+/// 当同一端口上存在域名冲突或 TLS 开关不一致时返回对应的 `ReconcileError`。
 pub fn validate_rules_for_port(
     listen_addr: &str,
     rules: &[ProxyRule],
@@ -341,6 +353,10 @@ impl ReverseProxyState {
 
     /// Reconcile the shared HTTP listener for `listen_addr` with the current
     /// set of enabled HTTP rules. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// 当端口校验失败或重建监听器绑定失败时返回 `ReconcileError`。
     pub async fn reconcile_http_listener(&self, listen_addr: &str) -> Result<(), ReconcileError> {
         let _guard = self.acquire_reconcile_lock(listen_addr).await;
 

@@ -19,12 +19,14 @@ struct SpawnedProcess {
     kill_tx: tokio::sync::oneshot::Sender<()>,
 }
 
+/// 长生命周期进程管理器：维护 `session_id → stdin/kill` 句柄。
 #[derive(Clone, Default)]
 pub struct SpawnManager {
     processes: Arc<Mutex<HashMap<String, SpawnedProcess>>>,
 }
 
 impl SpawnManager {
+    /// 创建空的 `SpawnManager`。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -147,7 +149,11 @@ impl SpawnManager {
         Ok(())
     }
 
-    /// Write data to a spawned process's stdin (server -> client AgentSpawnData).
+    /// 向指定 spawn 进程的 stdin 写入数据。
+    ///
+    /// # Errors
+    ///
+    /// 当会话不存在或通道已关闭时返回 `Err`。
     pub async fn write_stdin(&self, session_id: &str, data: Vec<u8>) -> Result<(), String> {
         let tx = {
             let procs = self.processes.lock().await;

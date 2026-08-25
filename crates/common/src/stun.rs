@@ -6,7 +6,7 @@ pub const STUN_BINDING_REQUEST: u16 = 0x0001;
 /// STUN Binding Response 消息类型（RFC 5389，0x0101）。
 pub const STUN_BINDING_RESPONSE: u16 = 0x0101;
 /// STUN 魔数（RFC 5389 固定值 0x2112A442，用于校验与 XOR 解码）。
-pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
+pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 
 /// MAPPED-ADDRESS 属性类型（RFC 5389 Section 15.1）。
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_parse_xor_mapped_address_roundtrip() {
         // Build a valid XOR-MAPPED-ADDRESS attribute for 1.2.3.4:12345
-        let ip: u32 = 0x01020304; // 1.2.3.4
+        let ip: u32 = 0x0102_0304; // 1.2.3.4
         let port: u16 = 12345;
         let xor_ip = ip ^ STUN_MAGIC_COOKIE;
         let xor_port = port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);

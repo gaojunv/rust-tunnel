@@ -1,6 +1,8 @@
 //! Code structure analysis tools using tree-sitter.
 //! Provides `code_outline` (file structure overview) and `read_symbol` (extract named symbol).
 
+use std::fmt::Write as _;
+
 use rust_tunnel_common::AgentResult;
 
 /// 最大返回符号数（超出截断）
@@ -154,10 +156,13 @@ fn extract_symbol_name(node: tree_sitter::Node, source: &[u8]) -> String {
 /// 格式化 kind 为简短标签
 fn kind_label(kind: &str) -> &str {
     match kind {
-        "function_definition" | "function_item" | "function_declaration" | "function_signature" => {
-            "fn"
-        }
-        "method_definition" | "method_declaration" | "abstract_method_declaration" => "fn",
+        "function_definition"
+        | "function_item"
+        | "function_declaration"
+        | "function_signature"
+        | "method_definition"
+        | "method_declaration"
+        | "abstract_method_declaration" => "fn",
         "struct_item" | "class_declaration" | "class_definition" => "struct",
         "impl_item" => "impl",
         "trait_item" | "interface_declaration" => "trait",
@@ -202,17 +207,19 @@ pub fn exec_outline(content: &str, path: &str, file_truncated: bool) -> AgentRes
     for sym in display_symbols {
         let indent = "  ".repeat(sym.indent);
         let label = kind_label(&sym.kind);
-        output.push_str(&format!(
-            "{indent}[{label}] {} \u{2014} lines {}-{}\n",
+        let _ = writeln!(
+            output,
+            "{indent}[{label}] {} \u{2014} lines {}-{}",
             sym.name, sym.start_line, sym.end_line
-        ));
+        );
     }
     if over_symbol_cap {
-        output.push_str(&format!(
-            "[truncated at {} symbols, total {}]\n",
+        let _ = writeln!(
+            output,
+            "[truncated at {} symbols, total {}]",
             MAX_OUTLINE_SYMBOLS,
             symbols.len()
-        ));
+        );
     }
     if file_truncated {
         output.push_str(
@@ -282,8 +289,8 @@ pub fn exec_read_symbol(
         }
         1 => {
             let sym = matches[0];
-            let start = sym.start_line as usize;
-            let end = sym.end_line as usize;
+            let start = usize::try_from(sym.start_line).unwrap_or(usize::MAX);
+            let end = usize::try_from(sym.end_line).unwrap_or(usize::MAX);
             let lines: Vec<&str> = content.lines().collect();
             let slice = if start <= lines.len() && end <= lines.len() + 1 {
                 &lines[start - 1..end.min(lines.len())]
@@ -292,7 +299,7 @@ pub fn exec_read_symbol(
             };
             let mut source_code = slice.join("\n");
             let marker = format!("[lines {start}-{end} of {total_lines}]");
-            source_code.push_str(&format!("\n{marker}"));
+            let _ = write!(source_code, "\n{marker}");
             if source_code.len() > MAX_OUTPUT {
                 source_code = truncate_output_str(&source_code);
             }

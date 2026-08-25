@@ -63,6 +63,10 @@ impl LlmCipher {
     }
 
     /// 解密字段。无 `enc:v1:` 前缀的值视为历史明文，原样返回。
+    ///
+    /// # Errors
+    /// 当 `stored` 带 `enc:v1:` 前缀但 `base64` 解码失败、长度不足 13 字节、`AES-GCM` 解密失败
+    /// 或明文非 `UTF-8` 时返回 `Err`。
     pub fn decrypt(&self, stored: &str) -> Result<String, String> {
         let Some(encoded) = stored.strip_prefix(ENC_PREFIX) else {
             return Ok(stored.to_string());
@@ -98,6 +102,9 @@ pub fn encrypt_field(cipher: Option<&LlmCipher>, plaintext: &str) -> String {
 }
 
 /// 解密字段：无明文前缀时原样返回；有密文前缀但无 cipher 时报错。
+///
+/// # Errors
+/// 当 `stored` 已加密但 `cipher` 为 `None`，或底层 `LlmCipher::decrypt` 失败时返回 `Err`。
 pub fn decrypt_field(cipher: Option<&LlmCipher>, stored: &str) -> Result<String, String> {
     if !is_encrypted(stored) {
         return Ok(stored.to_string());
@@ -113,6 +120,9 @@ pub fn decrypt_field(cipher: Option<&LlmCipher>, stored: &str) -> Result<String,
 ///
 /// 该函数通过原子写-重读策略处理并发场景：当两个服务实例同时启动时，
 /// 只有一个能成功创建密钥文件，另一个会重新读取并使用相同的密钥。
+///
+/// # Errors
+/// 当创建密钥目录失败、读取/写入密钥文件失败，或已存在密钥文件长度不为 32 字节时返回 `Err`。
 pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
     let dir = std::path::Path::new(db_path)
         .parent()
@@ -168,23 +178,23 @@ pub fn load_or_create_master_key(db_path: &str) -> std::io::Result<[u8; 32]> {
 fn write_master_key(key_path: &std::path::Path, key: &[u8; 32]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(key_path)?;
-        use std::io::Write;
         f.write_all(key)?;
     }
     #[cfg(not(unix))]
     {
+        use std::io::Write;
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(key_path)
             .and_then(|mut f| {
-                use std::io::Write;
                 f.write_all(key)?;
                 Ok(())
             })?;

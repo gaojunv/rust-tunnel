@@ -109,7 +109,7 @@ impl TrojanAddress {
             }
             TrojanAddress::Domain(domain) => {
                 out.push(0x03);
-                out.push(domain.len() as u8);
+                out.push(u8::try_from(domain.len()).unwrap_or(u8::MAX));
                 out.extend_from_slice(domain.as_bytes());
             }
         }
@@ -220,15 +220,13 @@ pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
 
     // Parse command
     let cmd_byte = buf[58];
-    let command = match TrojanCommand::from_byte(cmd_byte) {
-        Some(c) => c,
-        None => return ParseResult::Invalid(format!("Unsupported command: 0x{cmd_byte:02x}")),
+    let Some(command) = TrojanCommand::from_byte(cmd_byte) else {
+        return ParseResult::Invalid(format!("Unsupported command: 0x{cmd_byte:02x}"));
     };
 
     // Parse address
-    let (address, addr_len) = match TrojanAddress::parse(buf, 59) {
-        Some(r) => r,
-        None => return ParseResult::Incomplete,
+    let Some((address, addr_len)) = TrojanAddress::parse(buf, 59) else {
+        return ParseResult::Incomplete;
     };
 
     let port_offset = 59 + addr_len;
@@ -286,32 +284,29 @@ pub enum PacketParseResult {
 #[must_use]
 pub fn parse_udp_packet(buf: &[u8]) -> PacketParseResult {
     // Address (includes ATYP byte)
-    let (address, addr_len) = match TrojanAddress::parse(buf, 0) {
-        Some(r) => r,
+    let Some((address, addr_len)) = TrojanAddress::parse(buf, 0) else {
         // First byte unknown ATYP is unrecoverable protocol error; otherwise insufficient data
-        None => {
-            return match buf.first() {
-                Some(&b) if !matches!(b, 0x01 | 0x03 | 0x04) => {
-                    PacketParseResult::Invalid(format!("Invalid ATYP in UDP packet: 0x{b:02x}"))
+        return match buf.first() {
+            Some(&b) if !matches!(b, 0x01 | 0x03 | 0x04) => {
+                PacketParseResult::Invalid(format!("Invalid ATYP in UDP packet: 0x{b:02x}"))
+            }
+            Some(0x03) if buf.len() >= 2 => {
+                let domain_len = buf[1] as usize;
+                if domain_len == 0 || domain_len > 253 {
+                    PacketParseResult::Invalid(format!(
+                        "Invalid domain length in UDP packet: {domain_len}"
+                    ))
+                } else if buf.len() >= 2 + domain_len {
+                    // Full domain present but parse still failed => invalid characters
+                    PacketParseResult::Invalid(
+                        "Invalid domain characters in UDP packet".to_string(),
+                    )
+                } else {
+                    PacketParseResult::Incomplete
                 }
-                Some(0x03) if buf.len() >= 2 => {
-                    let domain_len = buf[1] as usize;
-                    if domain_len == 0 || domain_len > 253 {
-                        PacketParseResult::Invalid(format!(
-                            "Invalid domain length in UDP packet: {domain_len}"
-                        ))
-                    } else if buf.len() >= 2 + domain_len {
-                        // Full domain present but parse still failed => invalid characters
-                        PacketParseResult::Invalid(
-                            "Invalid domain characters in UDP packet".to_string(),
-                        )
-                    } else {
-                        PacketParseResult::Incomplete
-                    }
-                }
-                _ => PacketParseResult::Incomplete,
-            };
-        }
+            }
+            _ => PacketParseResult::Incomplete,
+        };
     };
 
     let port_offset = addr_len;
@@ -347,14 +342,17 @@ impl UdpPacket {
         let mut out = Vec::with_capacity(self.payload.len() + 32);
         self.address.encode(&mut out);
         out.extend_from_slice(&self.port.to_be_bytes());
-        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&u16::try_from(self.payload.len()).unwrap_or(u16::MAX).to_be_bytes());
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.payload);
         out
     }
 }
-/// Handle Trojan handshake over TLS stream
-/// Returns (TrojanConnectionContext, remaining payload bytes) on success
+/// 在 TLS 流上完成 Trojan 握手，校验密码并解析目标地址。
+///
+/// # Errors
+///
+/// 当读取失败、请求不完整/非法或密码校验失败时返回 `Err`。
 pub async fn handle_trojan_handshake(
     tls_stream: &mut TlsStream<TcpStream>,
     password: &str,
@@ -436,7 +434,11 @@ pub async fn handle_trojan_handshake(
     }
 }
 
-/// Handle fallback: forward the connection to a fallback backend
+/// 认证失败回退：将已读数据转发至回退后端并双向透传。
+///
+/// # Errors
+///
+/// 当回退后端连接失败或转发写入失败时返回 `Err`。
 pub async fn handle_trojan_fallback(
     tls_stream: &mut TlsStream<TcpStream>,
     initial_data: &[u8],
@@ -482,6 +484,12 @@ pub async fn handle_trojan_fallback(
 
 /// 校验 Trojan 域名：必须是合法 DNS 域名（不含 `*`、端口或路径）。
 /// 调用方保证传入前已 trim + 转小写；空串由调用方自行处理（空 = 不配置域名）。
+///
+/// # Errors
+///
+/// 域名为空、超过 253 字符、含通配符 `*`、含端口/路径分隔符（`:` 或 `/`），
+/// 或任一 label 不符合 DNS 规则（空、超 63 字符、含非法字符、以 `-` 开头或结尾）时，
+/// 返回描述失败原因的 `Err(String)`。
 pub fn validate_trojan_domain(domain: &str) -> Result<(), String> {
     if domain.is_empty() {
         return Err("domain is empty".to_string());
@@ -519,12 +527,11 @@ const UDP_READ_BUF_LIMIT: usize = 128 * 1024;
 /// Idle timeout for per-target UDP sockets.
 const UDP_SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
-/// Handle a Trojan UDP ASSOCIATE session.
+/// 处理 Trojan UDP ASSOCIATE 会话：TLS 流承载 UDP 报文，按目标地址维护出站 `UdpSocket`。
 ///
-/// The TLS stream carries UDP packets (ATYP+ADDR+PORT+LEN+CRLF+payload) in both
-/// directions. Per target address we maintain one outbound UdpSocket; responses
-/// from all targets are multiplexed back onto the TLS stream through a single
-/// writer task via an mpsc channel.
+/// TLS 流双向承载 `ATYP+ADDR+PORT+LEN+CRLF+payload` 报文，每个目标地址维护一个出站
+/// `UdpSocket`，各目标的响应通过单一 writer 任务经 mpsc 复用到 TLS 流。
+#[allow(clippy::too_many_lines, reason = "UDP ASSOCIATE 主循环含握手附带包预处理与超时/回包/清理多分支，拆分会割裂状态")]
 pub async fn handle_udp_associate(
     connection_id: u64,
     trojan_port: u16,
@@ -563,6 +570,7 @@ pub async fn handle_udp_associate(
     let (dead_tx, mut dead_rx) = mpsc::channel::<SocketAddr>(64);
 
     let mut read_buf: Vec<u8> = initial_payload;
+    #[allow(clippy::large_stack_arrays, reason = "UDP 单次读取需容纳最大 65535 字节载荷，栈上缓冲避免重复分配")]
     let mut chunk = [0u8; 65536];
 
     // Process packets that arrived together with the handshake BEFORE entering
@@ -774,8 +782,7 @@ async fn dispatch_udp_packet(
                             break; // session closed
                         }
                     }
-                    Ok(Err(_)) => break, // socket error
-                    Err(_) => break,     // idle timeout
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
             // Notify the main loop that this read task has exited,
@@ -813,15 +820,18 @@ pub async fn proxy_trojan_connection(
 
     // UDP ASSOCIATE: hand off to the UDP session handler
     if trojan_ctx.command == TrojanCommand::UdpAssociate {
-        handle_udp_associate(
-            connection_id,
-            trojan_port,
-            tls_stream,
-            initial_payload,
-            registry,
-            stats,
-        )
-        .await;
+        #[allow(clippy::large_futures, reason = "UDP ASSOCIATE 需多路复用与超时状态机，仅在请求路径构造一次")]
+        {
+            handle_udp_associate(
+                connection_id,
+                trojan_port,
+                tls_stream,
+                initial_payload,
+                registry,
+                stats,
+            )
+            .await;
+        }
         return;
     }
 
@@ -849,7 +859,7 @@ pub async fn proxy_trojan_connection(
         }
     };
 
-    let connect_time_ms = start.elapsed().as_millis() as u64;
+    let connect_time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     debug!(
         "Connected to target {} for Trojan connection {} in {}ms",
         trojan_ctx.target_addr, connection_id, connect_time_ms
@@ -992,7 +1002,7 @@ mod tests {
         buf.extend_from_slice(b"\r\n");
         buf.push(0x01); // CONNECT
         buf.push(0x03); // Domain
-        buf.push(domain.len() as u8);
+        buf.push(u8::try_from(domain.len()).unwrap_or(u8::MAX));
         buf.extend_from_slice(domain);
         buf.extend_from_slice(&0x01BBu16.to_be_bytes()); // port 443
         buf.extend_from_slice(b"\r\n");
@@ -1144,7 +1154,7 @@ mod tests {
         buf.push(0x01); // CONNECT
         buf.push(0x03); // Domain
         let domain = b"sub.example.com";
-        buf.push(domain.len() as u8);
+        buf.push(u8::try_from(domain.len()).unwrap_or(u8::MAX));
         buf.extend_from_slice(domain);
         buf.extend_from_slice(&443u16.to_be_bytes());
         buf.extend_from_slice(b"\r\n");
@@ -1228,7 +1238,7 @@ mod tests {
         buf.push(0x01);
         buf.push(0x03);
         let domain = b"my-server.example.com";
-        buf.push(domain.len() as u8);
+        buf.push(u8::try_from(domain.len()).unwrap_or(u8::MAX));
         buf.extend_from_slice(domain);
         buf.extend_from_slice(&443u16.to_be_bytes());
         buf.extend_from_slice(b"\r\n");
@@ -1419,7 +1429,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(atyp_addr);
         buf.extend_from_slice(&port.to_be_bytes());
-        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&u16::try_from(payload.len()).unwrap_or(u16::MAX).to_be_bytes());
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(payload);
         buf
@@ -1442,7 +1452,7 @@ mod tests {
 
     #[test]
     fn test_udp_packet_parse_domain() {
-        let mut atyp_addr = vec![0x03, b"dns.google".len() as u8];
+        let mut atyp_addr = vec![0x03, u8::try_from(b"dns.google".len()).unwrap_or(u8::MAX)];
         atyp_addr.extend_from_slice(b"dns.google");
         let buf = build_udp_packet(&atyp_addr, 53, b"q");
         match parse_udp_packet(&buf) {
@@ -1727,22 +1737,20 @@ mod legacy_tests {
 
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(c) => c,
-                    Err(_) => break,
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
                 };
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = tokio::io::split(stream);
                     let mut buf = [0u8; 8192];
                     loop {
                         match reader.read(&mut buf).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 if writer.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
                 });
@@ -1782,7 +1790,7 @@ mod legacy_tests {
     /// Spawn the Trojan listener as a tokio task. Returns the `watch::Receiver`
     /// (for reference), a `JoinHandle` for the listener task, and the `TempDir`
     /// that must be kept alive.
-    async fn start_trojan_server(
+    fn start_trojan_server(
         registry: StdArc<dyn crate::port_registry::PortRegistry>,
         stats: StatsCollector,
         port: u16,
@@ -1835,7 +1843,7 @@ mod legacy_tests {
             }
             TestTargetAddr::Domain(domain) => {
                 buf.push(0x03); // ATYP = Domain
-                buf.push(domain.len() as u8);
+                buf.push(u8::try_from(domain.len()).unwrap_or(u8::MAX));
                 buf.extend_from_slice(domain.as_bytes());
             }
         }
@@ -1933,7 +1941,7 @@ mod legacy_tests {
         let mut buf = vec![0x01];
         buf.extend_from_slice(&ip.octets());
         buf.extend_from_slice(&port.to_be_bytes());
-        buf.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&u16::try_from(payload.len()).unwrap_or(u16::MAX).to_be_bytes());
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(payload);
         buf
@@ -2034,7 +2042,7 @@ mod legacy_tests {
         use super::*;
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_echo_basic() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2048,8 +2056,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let response =
@@ -2061,7 +2068,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_concurrent_connections() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2075,8 +2082,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut handles = Vec::new();
@@ -2112,7 +2118,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2126,8 +2132,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // 64 KB payload
@@ -2157,7 +2162,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_connection_retry() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2171,8 +2176,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // First connection
@@ -2201,7 +2205,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_auth_failure_fallback() {
             // The fallback server — a simple TCP listener that sends a known marker
             let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2226,8 +2230,7 @@ mod legacy_tests {
                 trojan_port,
                 "correctpass",
                 &format!("127.0.0.1:{fallback_port}"),
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Connect with wrong password
@@ -2277,7 +2280,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_long_lived_connection() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2291,8 +2294,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let mut stream = trojan_connect(trojan_port, "testpass", echo_port).await;
@@ -2311,7 +2313,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_rapid_connect_disconnect() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2325,8 +2327,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             for _ in 0..20 {
@@ -2351,7 +2352,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_domain_and_ipv4_target() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2365,8 +2366,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Test IPv4 targeting
@@ -2398,7 +2398,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_udp_associate_echo() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2412,8 +2412,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // TLS connect + UDP ASSOCIATE handshake (target addr is advisory)
@@ -2455,7 +2454,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_udp_associate_multi_target() {
             let (udp_port_a, udp_handle_a) = start_udp_echo_server().await;
             let (udp_port_b, udp_handle_b) = start_udp_echo_server().await;
@@ -2470,8 +2469,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             let config = create_insecure_client_config().unwrap();
@@ -2528,7 +2526,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_udp_associate_cleanup_on_close() {
             let (udp_port, udp_handle) = start_udp_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2542,8 +2540,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             {
@@ -2584,7 +2581,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2598,8 +2595,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // No connections yet
@@ -2629,7 +2625,7 @@ mod legacy_tests {
         }
 
         #[tokio::test]
-        #[ignore]
+        #[ignore = "needs trojan TLS + network, flaky in CI"]
         async fn test_trojan_initial_payload() {
             let (echo_port, echo_handle) = start_echo_server().await;
             let registry: StdArc<dyn crate::port_registry::PortRegistry> =
@@ -2643,8 +2639,7 @@ mod legacy_tests {
                 trojan_port,
                 "testpass",
                 "127.0.0.1:1",
-            )
-            .await;
+            );
             wait_for_port(trojan_port, Duration::from_secs(5)).await;
 
             // Connect and include initial payload in the Trojan header

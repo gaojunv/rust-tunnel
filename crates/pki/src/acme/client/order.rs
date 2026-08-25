@@ -7,6 +7,7 @@ use crate::error::{AcmeError, AcmeResult};
 use base64::Engine;
 use chrono::Utc;
 use instant_acme::{ChallengeType, Identifier, NewOrder, OrderStatus, RetryPolicy};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -17,7 +18,12 @@ const CHALLENGE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_mins(2);
 
 impl AcmeClient {
-    /// Request a new certificate for a domain
+    /// 通过 HTTP-01 挑战为域名申请证书。
+    ///
+    /// # Errors
+    ///
+    /// 当 ACME 账户未初始化、ACME 订单创建/挑战失败、挑战验证超时、CSR 生成或证书下载/解析/落盘失败时返回错误。
+    #[allow(clippy::too_many_lines, reason = "ACME 订单全流程顺序编排：建单、部署 HTTP-01 挑战、轮询校验、CSR 终结与落盘，共享大量局部状态，拆分会降低可读性")]
     pub async fn request_certificate(&self, domain: &str) -> AcmeResult<CertificateMetadata> {
         info!("Requesting certificate for domain: {}", domain);
 
@@ -178,10 +184,7 @@ impl AcmeClient {
                         "ACME order became invalid for domain {domain}: {error_detail}"
                     )));
                 }
-                _ => {
-                    // Still pending or processing, keep polling
-                    continue;
-                }
+                OrderStatus::Pending | OrderStatus::Processing | OrderStatus::Valid => {}
             }
         };
 
@@ -289,6 +292,11 @@ impl AcmeClient {
     /// 适用于：
     /// - 无法开放 80 端口的场景
     /// - 申请通配符证书（*.example.com）
+    ///
+    /// # Errors
+    ///
+    /// 当 ACME 账户未初始化、ACME 订单/DNS TXT 创建或传播失败、挑战验证超时、CSR 生成或证书落盘/解析失败时返回错误。
+    #[allow(clippy::too_many_lines, reason = "DNS-01 订单全流程顺序编排：建单、创建/等待 DNS TXT 传播、轮询校验、CSR 终结与落盘，共享大量状态，拆分会降低可读性")]
     pub async fn request_certificate_with_dns(
         &self,
         domain: &str,
@@ -371,7 +379,6 @@ impl AcmeClient {
             let key_authorization = challenge_handle.key_authorization();
 
             // Calculate DNS TXT record value: base64url(sha256(key_authorization))
-            use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(key_authorization.as_str().as_bytes());
             let hash = hasher.finalize();
@@ -478,9 +485,7 @@ impl AcmeClient {
                         "ACME order became invalid for domain {domain}: {error_detail}"
                     )));
                 }
-                _ => {
-                    continue;
-                }
+                OrderStatus::Pending | OrderStatus::Processing | OrderStatus::Valid => {}
             }
         };
 

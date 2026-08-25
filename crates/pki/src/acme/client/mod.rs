@@ -50,10 +50,11 @@ impl AcmeClient {
         }
     }
 
-    /// Initialize the ACME client
+    /// 初始化 ACME 客户端：创建证书目录并加载或注册 ACME 账户。
     ///
-    /// Creates the certificate directory if needed, then either loads existing
-    /// account credentials from disk or registers a new account with the ACME server.
+    /// # Errors
+    ///
+    /// 当证书目录创建失败、账户凭证文件读取/解析失败、ACME 服务器注册或凭证持久化失败时返回错误。
     pub async fn initialize(&self) -> AcmeResult<()> {
         info!("Initializing ACME client with server: {}", self.server_url);
 
@@ -130,7 +131,11 @@ impl AcmeClient {
         Ok(())
     }
 
-    /// Get certificate metadata for a domain
+    /// 查询单个域名的证书元数据。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库查询失败时返回错误。
     pub async fn get_certificate_metadata(
         &self,
         domain: &str,
@@ -140,10 +145,10 @@ impl AcmeClient {
                 return Ok(Some(CertificateMetadata {
                     domain: record.domain,
                     status: match record.status.as_str() {
-                        "pending" => CertificateStatus::Pending,
                         "active" => CertificateStatus::Active,
                         "expired" => CertificateStatus::Expired,
                         "failed" => CertificateStatus::Failed,
+                        #[allow(clippy::match_same_arms, reason = "pending 与未知状态同归 Pending，但显式列出 pending 更清晰")]
                         _ => CertificateStatus::Pending,
                     },
                     issued_at: record.issued_at.map(|dt| dt.to_rfc3339()),
@@ -156,7 +161,11 @@ impl AcmeClient {
         Ok(None)
     }
 
-    /// List all certificates
+    /// 列出所有证书。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库查询证书列表失败时返回错误。
     pub async fn list_certificates(&self) -> AcmeResult<Vec<CertificateMetadata>> {
         let mut certificates = Vec::new();
 
@@ -166,10 +175,10 @@ impl AcmeClient {
                 certificates.push(CertificateMetadata {
                     domain: record.domain,
                     status: match record.status.as_str() {
-                        "pending" => CertificateStatus::Pending,
                         "active" => CertificateStatus::Active,
                         "expired" => CertificateStatus::Expired,
                         "failed" => CertificateStatus::Failed,
+                        #[allow(clippy::match_same_arms, reason = "pending 与未知状态同归 Pending，但显式保留语义分支")]
                         _ => CertificateStatus::Pending,
                     },
                     issued_at: record.issued_at.map(|dt| dt.to_rfc3339()),
@@ -183,7 +192,11 @@ impl AcmeClient {
         Ok(certificates)
     }
 
-    /// Renew a certificate
+    /// 续签证书（更新续签时间戳后重新申请）。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库更新续签时间戳失败或重新申请证书失败时返回错误。
     pub async fn renew_certificate(&self, domain: &str) -> AcmeResult<CertificateMetadata> {
         info!("Renewing certificate for domain: {}", domain);
 
@@ -195,7 +208,11 @@ impl AcmeClient {
         self.request_certificate(domain).await
     }
 
-    /// Delete a certificate
+    /// 删除证书（数据库记录、内存缓存与磁盘文件）。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库删除失败时返回错误；磁盘文件删除失败仅告警，不视为错误。
     pub async fn delete_certificate(&self, domain: &str) -> AcmeResult<()> {
         info!("Deleting certificate for domain: {}", domain);
 

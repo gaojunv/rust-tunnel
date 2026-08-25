@@ -31,6 +31,9 @@ pub struct TlsCertPair {
 
 /// Generate a self-signed certificate for the server
 /// The certificate is valid for 1 year and uses common name "rust-tunnel-server"
+///
+/// # Errors
+/// 当创建证书参数失败、生成密钥对失败或自签名失败时返回 `Err(String)`。
 pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
     let mut params = CertificateParams::new(vec![
         "localhost".to_string(),
@@ -56,6 +59,9 @@ pub fn generate_self_signed_cert() -> Result<(Certificate, KeyPair), String> {
 }
 
 /// Load certificate and key from files, or generate and save them if they don't exist
+///
+/// # Errors
+/// 当证书文件不存在需生成但创建目录/写入文件失败、或加载已有证书失败时返回 `Err`。
 pub fn load_or_generate_cert(cert_path: &str, key_path: &str) -> TunnelResult<TlsCertPair> {
     let cert_path = Path::new(cert_path);
     let key_path = Path::new(key_path);
@@ -96,6 +102,9 @@ pub fn load_or_generate_cert(cert_path: &str, key_path: &str) -> TunnelResult<Tl
 }
 
 /// Load certificate and key from PEM files
+///
+/// # Errors
+/// 当证书/私钥文件不存在、为空、格式不支持或读取失败时返回 `Err`。
 pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<TlsCertPair> {
     // Load certificates
     let cert_file = fs::File::open(cert_path).map_err(TunnelError::Io)?;
@@ -130,6 +139,9 @@ pub fn load_cert_from_files(cert_path: &Path, key_path: &Path) -> TunnelResult<T
 }
 
 /// Create a server TLS config for the control channel
+///
+/// # Errors
+/// 当 `ServerConfig::with_single_cert` 构建失败时返回 `Err`。
 pub fn create_server_config(cert_pair: TlsCertPair) -> TunnelResult<Arc<ServerConfig>> {
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -141,6 +153,9 @@ pub fn create_server_config(cert_pair: TlsCertPair) -> TunnelResult<Arc<ServerCo
 
 /// Create a client TLS config (accepts any cert - TOFU style)
 /// This is for clients that auto-accept the server's certificate
+///
+/// # Errors
+/// 理论上此函数不会失败；保留 `TunnelResult` 以保持与其它 TLS 构造器签名一致。
 pub fn create_insecure_client_config() -> TunnelResult<Arc<ClientConfig>> {
     // Create a client config that accepts any certificate (TOFU - Trust On First Use)
     // In production, you should verify certificates properly
@@ -206,6 +221,9 @@ pub fn create_insecure_client_config() -> TunnelResult<Arc<ClientConfig>> {
 
 /// Create a secure client TLS config with root certificates
 /// Use this when you have proper CA certificates
+///
+/// # Errors
+/// 当加载系统根证书失败或将证书加入 `RootCertStore` 失败时返回 `Err`。
 pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
     let mut root_store = RootCertStore::empty();
 
@@ -227,6 +245,9 @@ pub fn create_secure_client_config() -> TunnelResult<Arc<ClientConfig>> {
 
 /// Establish a TLS connection to the server (insecure/TOFU mode)
 /// This will automatically accept any server certificate (for self-signed certs)
+///
+/// # Errors
+/// 当 `TCP` 连接失败、`ServerName` 非法或 `TLS` 握手失败时返回 `Err`。
 pub async fn connect_tls_insecure(
     addr: &str,
     server_name: &str,
@@ -253,6 +274,9 @@ pub async fn connect_tls_insecure(
 }
 
 /// Establish a TLS connection to the server (secure mode with CA verification)
+///
+/// # Errors
+/// 当 `TCP` 连接失败、`ServerName` 非法或 `TLS` 握手失败时返回 `Err`。
 pub async fn connect_tls_secure(
     addr: &str,
     server_name: &str,

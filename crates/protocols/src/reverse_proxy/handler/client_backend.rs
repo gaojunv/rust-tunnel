@@ -55,6 +55,8 @@ pub fn host_without_port(raw: &str) -> &str {
 /// WebSocket upgrades are supported: on a 101 the upgraded downstream and
 /// upstream IOs are bridged with `copy_bidirectional`, raw bytes flowing
 /// through the control-channel tunnel.
+/// HTTP 隧道握手、统计、WS 分支与错误回退的顺序编排，拆分会割裂共享的 `collector`/`connector` 状态。
+#[allow(clippy::too_many_lines, reason = "HTTP 隧道握手、统计、WS 分支与错误回退的顺序编排，拆分会割裂共享的 stats/connector 状态")]
 pub(super) async fn handle_client_backend(
     state: Arc<ReverseProxyState>,
     req: Request<Body>,
@@ -65,7 +67,7 @@ pub(super) async fn handle_client_backend(
     use hyper_util::rt::TokioIo;
 
     // 统一统计采集器（与 ReverseProxyState 共享）
-    let stats = state.stats_collector.clone();
+    let collector = state.stats_collector.clone();
 
     // Capture the downstream OnUpgrade future BEFORE `req` is consumed —
     // hyper's upgrade handle is one-shot per request. The handle is stored
@@ -79,14 +81,14 @@ pub(super) async fn handle_client_backend(
 
     // Wrap request body to count bytes_in
     let (parts, body) = req.into_parts();
-    let counted = Body::new(count_body(body, stats.clone(), rule_id.clone(), true));
+    let counted = Body::new(count_body(body, collector.clone(), rule_id.clone(), true));
     let req = Request::from_parts(parts, counted);
 
     // Dial via ClientConnector
     let connector = match state.connector_for(&backend).await {
         Ok(c) => c,
         Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
+            collector.decr_conns(EntityType::Proxy, &rule_id);
             let body = format!("connector unavailable: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -100,7 +102,7 @@ pub(super) async fn handle_client_backend(
     let stream = match connector.connect(&backend).await {
         Ok(s) => s,
         Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
+            collector.decr_conns(EntityType::Proxy, &rule_id);
             let body = format!("client backend dial failed: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -122,7 +124,7 @@ pub(super) async fn handle_client_backend(
     {
         Ok(pair) => pair,
         Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
+            collector.decr_conns(EntityType::Proxy, &rule_id);
             let body = format!("http1 handshake failed: {e}");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -154,7 +156,7 @@ pub(super) async fn handle_client_backend(
     let mut upstream_req = match build_upstream_request(req, &backend) {
         Ok(r) => r,
         Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
+            collector.decr_conns(EntityType::Proxy, &rule_id);
             return error_response(&e);
         }
     };
@@ -179,15 +181,15 @@ pub(super) async fn handle_client_backend(
                 let upstream_upgrade = hyper::upgrade::on(&mut resp);
                 let Some(client_upgrade) = downstream_upgrade else {
                     tracing::warn!("ws upgrade handle missing despite ws_potential");
-                    stats.decr_conns(EntityType::Proxy, &rule_id);
+                    collector.decr_conns(EntityType::Proxy, &rule_id);
                     return super::downstream_response::build_downstream_response(
                         resp,
-                        stats.clone(),
+                        collector.clone(),
                         rule_id,
                     );
                 };
                 let rid = rule_id.clone();
-                let sc = stats.clone();
+                let sc = collector.clone();
                 tokio::spawn(async move {
                     let (client_up, server_up) =
                         match tokio::try_join!(client_upgrade, upstream_upgrade) {
@@ -216,12 +218,12 @@ pub(super) async fn handle_client_backend(
                 });
             }
             if !is_ws {
-                stats.decr_conns(EntityType::Proxy, &rule_id);
+                collector.decr_conns(EntityType::Proxy, &rule_id);
             }
-            super::downstream_response::build_downstream_response(resp, stats.clone(), rule_id)
+            super::downstream_response::build_downstream_response(resp, collector.clone(), rule_id)
         }
         Err(e) => {
-            stats.decr_conns(EntityType::Proxy, &rule_id);
+            collector.decr_conns(EntityType::Proxy, &rule_id);
             let body = format!("upstream request failed: {e}");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)

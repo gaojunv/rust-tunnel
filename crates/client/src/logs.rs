@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 
+use std::fmt::Write as _;
+
 use crate::control::ControlSender;
 use rust_tunnel_common::protocol::ClientLogEntry;
 use rust_tunnel_common::ControlMessage;
@@ -48,15 +50,15 @@ impl<S> Layer<S> for ClientLogLayer
 where
     S: tracing::Subscriber,
 {
+    #[allow(clippy::items_after_statements, reason = "Visitor 定义紧邻使用点更易读，移至顶部反而割裂逻辑")]
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let metadata = event.metadata();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros() as i64);
+        let timestamp =
+            i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())).unwrap_or(i64::MAX);
 
         struct ClientFieldVisitor {
             message: String,
@@ -79,8 +81,7 @@ where
                     if !self.message.is_empty() {
                         self.message.push(' ');
                     }
-                    self.message
-                        .push_str(&format!("{}={}", field.name(), value));
+                    let _ = write!(self.message, "{}={}", field.name(), value);
                 }
             }
         }

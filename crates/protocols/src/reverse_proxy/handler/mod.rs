@@ -41,6 +41,7 @@ pub type ProxyState = (RouteSource, Arc<UpstreamClient>, Arc<ReverseProxyState>)
 
 /// Unified axum handler that replaces both the legacy per-rule handler and
 /// the shared-listener handler.
+#[allow(clippy::too_many_lines, reason = "代理主路径的路由、统计、WS 升级与错误回退的顺序编排，拆分会割裂共享的统计与连接状态")]
 pub async fn handle_proxy_request_unified(
     State((source, upstream, proxy_state)): State<ProxyState>,
     mut req: Request<Body>,
@@ -372,9 +373,11 @@ mod tests {
 
         // The first chunk should arrive well before the full 8*50ms = 400 ms
         // it would take if the body were buffered.
-        use futures_util::StreamExt;
         let mut body_stream = resp.bytes_stream();
-        let first = body_stream.next().await.unwrap().unwrap();
+        let first = {
+            use futures_util::StreamExt as _;
+            body_stream.next().await.unwrap().unwrap()
+        };
         let ttfb = started.elapsed();
         assert!(!first.is_empty());
         assert!(
@@ -666,6 +669,7 @@ mod tests {
     /// End-to-end: client → proxy → backend WebSocket upgrade + bidirectional
     /// byte echo through the tunnel. Uses raw TCP + a hand-written HTTP/1.1
     /// upgrade handshake so the test doesn't pull in tokio-tungstenite.
+    #[allow(clippy::too_many_lines, reason = "WS 握手与双向回显的端到端编排，含 mock backend 搭建与端口协商，拆分会割裂测试脚手架")]
     #[tokio::test]
     async fn websocket_upgrade_proxies_end_to_end() {
         use std::collections::HashSet;
@@ -857,6 +861,7 @@ mod tests {
     /// The fake client lives at the registry message level: it answers
     /// OpenTunnel, completes the WS handshake on the first Data frame, then
     /// echoes raw bytes.
+    #[allow(clippy::too_many_lines, reason = "Client 隧道 WS 端到端编排，含 mock TunnelOpener 与双向回显，拆分会割裂脚手架状态")]
     #[tokio::test]
     async fn websocket_upgrade_to_client_backend_end_to_end() {
         use std::net::SocketAddr;
@@ -1150,7 +1155,7 @@ mod tests {
         let source = RouteSource(Arc::new(ArcSwap::from_pointee(table)));
         let upstream = Arc::new(UpstreamClient::new());
         let proxy_state = Arc::new(ReverseProxyState::new());
-        let stats = proxy_state.stats_collector.clone();
+        let collector = proxy_state.stats_collector.clone();
 
         let req: AxumRequest<Body> = AxumRequest::builder()
             .method("POST")
@@ -1159,15 +1164,15 @@ mod tests {
             .body(Body::from("abc"))
             .unwrap();
 
-        let state = State((source, upstream, proxy_state));
-        let resp = handle_proxy_request_unified(state, req).await;
+        let axum_state = State((source, upstream, proxy_state));
+        let resp = handle_proxy_request_unified(axum_state, req).await;
         assert_eq!(resp.status(), 200);
 
         // Consume the response body so its bytes are counted
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"hello world");
 
-        let summary = stats.get_summary();
+        let summary = collector.get_summary();
         assert_eq!(
             summary.proxy.total_bytes_in, 3,
             "request body bytes counted"

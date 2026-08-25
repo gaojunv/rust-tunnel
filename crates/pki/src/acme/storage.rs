@@ -20,7 +20,11 @@ impl CertificateStorage {
         self.base_dir.join(domain)
     }
 
-    /// Initialize storage directory
+    /// 初始化证书存储目录（不存在则创建）。
+    ///
+    /// # Errors
+    ///
+    /// 当存储目录创建失败时返回错误。
     pub fn initialize(&self) -> AcmeResult<()> {
         if !self.base_dir.exists() {
             std::fs::create_dir_all(&self.base_dir).map_err(AcmeError::storage(
@@ -30,7 +34,11 @@ impl CertificateStorage {
         Ok(())
     }
 
-    /// Save certificate files for a domain
+    /// 保存域名的证书文件（cert/key/可选 chain）。
+    ///
+    /// # Errors
+    ///
+    /// 当域名目录创建或证书文件写入失败时返回错误。
     pub fn save_certificate(
         &self,
         domain: &str,
@@ -62,7 +70,11 @@ impl CertificateStorage {
         Ok(())
     }
 
-    /// Load certificate PEM for a domain
+    /// 读取域名的证书 PEM，不存在返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 当证书文件读取失败时返回错误。
     pub fn load_certificate(&self, domain: &str) -> AcmeResult<Option<String>> {
         let cert_path = self.domain_dir(domain).join("cert.pem");
         if cert_path.exists() {
@@ -74,7 +86,11 @@ impl CertificateStorage {
         }
     }
 
-    /// Load private key PEM for a domain
+    /// 读取域名的私钥 PEM，不存在返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 当私钥文件读取失败时返回错误。
     pub fn load_private_key(&self, domain: &str) -> AcmeResult<Option<String>> {
         let key_path = self.domain_dir(domain).join("key.pem");
         if key_path.exists() {
@@ -86,7 +102,11 @@ impl CertificateStorage {
         }
     }
 
-    /// Load certificate chain PEM for a domain
+    /// 读取域名的证书链 PEM，不存在返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 当证书链文件读取失败时返回错误。
     pub fn load_chain(&self, domain: &str) -> AcmeResult<Option<String>> {
         let chain_path = self.domain_dir(domain).join("chain.pem");
         if chain_path.exists() {
@@ -98,7 +118,11 @@ impl CertificateStorage {
         }
     }
 
-    /// Delete certificate files for a domain
+    /// 删除域名的证书目录及文件。
+    ///
+    /// # Errors
+    ///
+    /// 当证书目录删除失败时返回错误。
     pub fn delete_certificate(&self, domain: &str) -> AcmeResult<()> {
         let dir = self.domain_dir(domain);
         if dir.exists() {
@@ -115,7 +139,11 @@ impl CertificateStorage {
         self.domain_dir(domain).join("cert.pem").exists()
     }
 
-    /// List all domains with certificates
+    /// 列出所有已落盘证书的域名。
+    ///
+    /// # Errors
+    ///
+    /// 当存储目录读取或条目类型判断失败时返回错误。
     pub fn list_domains(&self) -> AcmeResult<Vec<String>> {
         let mut domains = Vec::new();
 

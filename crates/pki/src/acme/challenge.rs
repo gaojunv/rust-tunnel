@@ -24,7 +24,11 @@ impl ChallengeServer {
         Self { state, port }
     }
 
-    /// Start the challenge server
+    /// 启动 HTTP-01 挑战服务器并在后台运行。
+    ///
+    /// # Errors
+    ///
+    /// 当 `TcpListener::bind` 绑定端口失败时返回错误（端口被占用或权限不足）。
     pub async fn start(&self) -> AcmeResult<()> {
         let state = self.state.clone();
 

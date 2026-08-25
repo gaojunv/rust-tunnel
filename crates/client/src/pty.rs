@@ -22,11 +22,13 @@ pub use rust_tunnel_common::pty::DEFAULT_PTY_PORT;
 /// 协商帧首行最大长度：4KB 足够容纳 rows/cols/shell/id/resize_for，超限直接断开防畸形请求
 const MAX_NEGOTIATION_BYTES: usize = 4 * 1024;
 
+/// PTY 会话注册表类型别名。
+type PtyRegistry = LazyLock<Mutex<HashMap<String, mpsc::Sender<(u16, u16)>>>>;
+
 /// 全局 PTY 会话注册表：`id → resize 通道`。
 /// resize_for 协商帧到达时按 id 查找对应通道发送 (rows, cols)；
 /// 正常会话建立时注册，连接结束时移除。
-static PTY_REGISTRY: LazyLock<Mutex<HashMap<String, mpsc::Sender<(u16, u16)>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PTY_REGISTRY: PtyRegistry = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 首行 JSON 协商帧：`{"rows":24,"cols":80,"shell":"可选","id":"可选","resize_for":"可选"}`。
 /// rows/cols 缺省时取交互终端常见尺寸（serde default）；shell 为 None 时用系统
@@ -110,6 +112,7 @@ pub async fn serve_on(listener: TcpListener) -> std::io::Result<()> {
 /// （不建立新 shell）。正常会话：有 `id` 时注册到 PTY_REGISTRY，连接结束移除。
 /// resize 通道的接收端在 TCP→PTY 任务中以非阻塞方式轮询（`try_recv`），确保
 /// resize 不阻塞数据转发。
+#[allow(clippy::too_many_lines, reason = "PTY 会话生命周期：协商/resize/双向桥接/回收，状态机难以拆分")]
 async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut buf_reader = BufReader::new(read_half);
@@ -427,6 +430,7 @@ mod tests {
     // 不建立新 shell。由于 PTY_REGISTRY 是全局 static，此测试验证 resize_for
     // 解析和 registry 查找逻辑——真实 resize 通道传递需端到端测试覆盖。
     #[tokio::test]
+    #[allow(clippy::items_after_statements, reason = "测试内辅助逻辑紧邻使用点更清晰")]
     async fn resize_for_sends_signal_and_closes() {
         let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(8);
         let test_id = "test-resize-id".to_string();
@@ -440,7 +444,7 @@ mod tests {
             let _ = handle_connection(stream).await;
         });
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::AsyncWriteExt as _;
         client
             .write_all(format!(r#"{{"resize_for":"{test_id}","rows":50,"cols":120}}"#).as_bytes())
             .await

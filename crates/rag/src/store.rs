@@ -3,7 +3,7 @@
 //! 每个知识库一个 shard，目录 `<data_dir>/rag/<kb_id>/`，按需打开并缓存
 //! （`Arc<Mutex<HashMap<kb_id, EdgeShard>>>`），维度在首次打开时建立。
 //! 向量本体存于此；可检索原文与元数据在 SQLite（rag_chunks），此处 payload
-//! 只存定位信息（id/doc_id/seq/heading_path）。
+//! 只存定位信息（`id`/`doc_id`/`seq`/`heading_path`）。
 //!
 //! 注意：`EdgeShard` 析构时会同步 flush（内部 `expect()`，不可在包装层拦截）。
 //! 若 shard 目录已被删除（`delete_kb`）而仍有在途 `Arc` 克隆未析构，flush 会
@@ -13,7 +13,7 @@
 //! qdrant-edge 的 `PointStruct::new` 要求 id 为 `ExtendedPointId`（u64 或
 //! UUID），不接受任意字符串。因此 `ChunkPoint.id` 先映射为 PointId（数字/UUID
 //! 字符串原样解析，其余 FNV-1a 哈希落为 NumId），原始 id 字符串同时存入
-//! payload["id"]，检索时从 payload 原样返回 —— 保证 id 字符串无损往返。
+//! `payload["id"]`，检索时从 payload 原样返回 —— 保证 id 字符串无损往返。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,9 +22,12 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+/// 向量存储错误类型。
 #[derive(Debug)]
 pub enum StoreError {
+    /// qdrant-edge 操作失败。
     Qdrant(String),
+    /// 文件系统操作失败。
     Io(std::io::Error),
 }
 
@@ -58,16 +61,22 @@ impl StoreError {
 pub struct ChunkPoint {
     /// = rag_chunks.id（UUID）。
     pub id: String,
+    /// 分块向量（维度与知识库配置一致）。
     pub vector: Vec<f32>,
+    /// 所属文档 ID。
     pub doc_id: String,
+    /// 文档内分块序号。
     pub seq: i64,
+    /// 来源标题路径。
     pub heading_path: String,
 }
 
 /// 检索命中的点（只回传定位 id 与分数，原文按 id 回 SQLite 查）。
 #[derive(Debug, Clone)]
 pub struct ScoredPoint {
+    /// 命中的分块 ID（对应 `ChunkPoint.id`）。
     pub id: String,
+    /// 向量相似度分数。
     pub score: f32,
 }
 
@@ -88,6 +97,7 @@ impl fmt::Debug for VectorStore {
 }
 
 impl VectorStore {
+    /// 创建向量存储，`data_dir` 为数据根目录。
     #[must_use]
     pub fn new(data_dir: &Path) -> Self {
         Self {
@@ -145,6 +155,9 @@ impl VectorStore {
     }
 
     /// 批量写入（或覆盖）分块向量。
+    ///
+    /// # Errors
+    /// 当向量维度与 shard 维度不一致、或底层 `EdgeShard` 写入失败时返回 `Err`。
     pub async fn upsert(
         &self,
         kb_id: &str,
@@ -230,6 +243,9 @@ impl VectorStore {
     }
 
     /// 删除某文档在该知识库的所有分块（按 payload doc_id 过滤）。
+    ///
+    /// # Errors
+    /// 当 shard 打开或维度不匹配、或底层 `EdgeShard` 删除失败时返回 `Err`。
     pub async fn delete_by_doc(
         &self,
         kb_id: &str,
@@ -257,6 +273,9 @@ impl VectorStore {
     }
 
     /// 删除整个知识库：先从缓存移除（释放 shard 句柄），再删目录。
+    ///
+    /// # Errors
+    /// 当底层目录删除失败（`std::fs::remove_dir_all`）时返回 `Err`。
     ///
     /// # 并发约束
     ///

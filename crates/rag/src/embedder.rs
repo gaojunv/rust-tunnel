@@ -17,10 +17,14 @@ const EMBED_RETRY_BASE_MS: u64 = 500;
 /// embedding 整体请求超时：embedding 应秒级返回，1 分钟足够覆盖慢端点。
 const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// 向量化错误类型。
 #[derive(Debug)]
 pub enum EmbedError {
+    /// HTTP 传输失败。
     Http(reqwest::Error),
+    /// 上游 API 返回非成功状态或响应解析失败。
     Api(String),
+    /// 响应中未包含任何向量数据。
     EmptyResponse,
 }
 
@@ -40,6 +44,7 @@ impl From<reqwest::Error> for EmbedError {
     }
 }
 
+/// OpenAI 兼容 embedding 客户端，负责批量与单条向量化请求。
 pub struct Embedder {
     base_url: String,
     api_key: String,
@@ -64,7 +69,10 @@ impl Embedder {
 
     /// 批量向量化，返回向量顺序与输入一致。超过 [`EMBED_BATCH_SIZE`] 时内部
     /// 切多批逐个请求再拼接，对调用方透明；每批失败重试 [`EMBED_MAX_ATTEMPTS`]
-    /// 次（500ms/1s 退避），仍失败才返回 Err。
+    /// 次（500ms/1s 退避），仍失败才返回 `Err`。
+    ///
+    /// # Errors
+    /// 当上游 embedding API 返回非成功状态、网络请求失败或响应体解析失败时返回 `Err`。
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -77,6 +85,9 @@ impl Embedder {
     }
 
     /// 单条向量化（检索查询用）。
+    ///
+    /// # Errors
+    /// 当底层 [`Self::embed`] 调用失败或响应为空时返回 `Err`。
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         let mut v = self.embed(&[text.to_string()]).await?;
         v.pop().ok_or(EmbedError::EmptyResponse)
@@ -253,8 +264,12 @@ mod tests {
         let sizes = batch_sizes.lock().unwrap();
         assert_eq!(sizes.as_slice(), &[64, 64, 22]);
         // 跨批拼接顺序与输入一致
+        #[allow(clippy::cast_precision_loss, reason = "测试断言：索引 i 最大 150，远小于 f32 精确整数范围")]
         for (i, v) in out.iter().enumerate() {
-            assert_eq!(v[0], i as f32, "text {i} out of order");
+            #[allow(clippy::float_cmp, reason = "测试断言：上限位编码 0.0 exact 值，精确比较为所需语义")]
+            {
+                assert_eq!(v[0], i as f32, "text {i} out of order");
+            }
         }
     }
 

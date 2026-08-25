@@ -60,10 +60,16 @@ impl AliyunDnsSolver {
     }
 
     /// Generate Aliyun API signature parameters using HMAC-SHA1
-    fn sign_request(&self, params: &mut Vec<(String, String)>) {
+    ///
+    /// # Errors
+    ///
+    /// 当 HMAC-SHA1 无法以当前 `access_key_secret` 构造时返回 [`AcmeError::Dns`]。
+    fn sign_request(&self, params: &mut Vec<(String, String)>) -> AcmeResult<()> {
         use base64::Engine;
         use hmac::{Hmac, Mac};
         use sha1::Sha1;
+
+        type HmacSha1 = Hmac<Sha1>;
 
         // Add common parameters
         params.push(("Format".to_string(), "JSON".to_string()));
@@ -102,17 +108,17 @@ impl AliyunDnsSolver {
         debug!("String to sign: {}", string_to_sign);
 
         // Compute HMAC-SHA1 signature
-        type HmacSha1 = Hmac<Sha1>;
-        // HMAC 接受任意长度 key，`new_from_slice` 实际不可失败，保持 panic 语义。
-        #[expect(clippy::panic)]
+        // HMAC 接受任意长度 key，`new_from_slice` 实际不可失败；此处向上传播错误
+        // 而非兜底伪造签名，避免用错误 key 签出的请求在远端表现为难以定位的鉴权失败。
         let mut mac = HmacSha1::new_from_slice(format!("{}&", self.access_key_secret).as_bytes())
-            .unwrap_or_else(|e| panic!("HMAC key error: {e}"));
+            .map_err(|e| AcmeError::Dns(format!("failed to build HMAC-SHA1 signer: {e}")))?;
         mac.update(string_to_sign.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
         // Append signature
         params.push(("Signature".to_string(), signature));
+        Ok(())
     }
 
     /// Call the Aliyun DNS API with the given action and extra parameters
@@ -124,7 +130,7 @@ impl AliyunDnsSolver {
         let mut params = vec![("Action".to_string(), action.to_string())];
         params.extend(extra_params);
 
-        self.sign_request(&mut params);
+        self.sign_request(&mut params)?;
 
         let query_string: String = params
             .iter()
@@ -224,9 +230,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let (_main_domain, _rr) = parse_domain(domain)?;
 
         // Find the existing record
-        let record_id = if let Some(id) = self.find_txt_record(domain, value).await? {
-            id
-        } else {
+        let Some(record_id) = self.find_txt_record(domain, value).await? else {
             warn!(
                 "No matching Aliyun DNS TXT record found for domain {}",
                 domain
@@ -250,10 +254,10 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         value: &str,
         timeout: Duration,
     ) -> AcmeResult<()> {
+        use trust_dns_resolver::TokioAsyncResolver;
         use trust_dns_resolver::config::{
             NameServerConfig, Protocol, ResolverConfig, ResolverOpts,
         };
-        use trust_dns_resolver::TokioAsyncResolver;
 
         // Build resolver with Google DNS + Alibaba DNS
         let mut config = ResolverConfig::new();
@@ -428,7 +432,7 @@ mod aliyun_tests {
         /// 6. 验证证书文件存在且可解析
         /// 7. 验证 account.json 已保存
         #[tokio::test]
-        #[ignore]
+        #[ignore = "需真实阿里云与 Let's Encrypt staging 凭证，默认跳过"]
         async fn acme_dns01_wildcard_e2e() {
             // 1. 创建临时目录
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
@@ -544,7 +548,7 @@ mod aliyun_tests {
         ///
         /// 这是一个更轻量的测试，只验证 DNS 操作，不涉及 ACME。
         #[tokio::test]
-        #[ignore]
+        #[ignore = "需真实阿里云凭证，默认跳过"]
         async fn aliyun_dns_txt_record_lifecycle() {
             let dns_config = make_dns_config();
             let solver = AliyunDnsSolver::new(&dns_config);
@@ -575,7 +579,7 @@ mod aliyun_tests {
 
         /// 测试 AcmeClient 账号初始化和恢复
         #[tokio::test]
-        #[ignore]
+        #[ignore = "需真实阿里云与 ACME staging 凭证，默认跳过"]
         async fn acme_account_init_and_restore() {
             let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
             let cert_dir = temp_dir.path().to_str().unwrap().to_string();

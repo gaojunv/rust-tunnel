@@ -168,7 +168,7 @@ mod tests {
                     let mut buf = vec![0u8; 64];
                     loop {
                         match tokio::io::AsyncReadExt::read(&mut rs, &mut buf).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 if tokio::io::AsyncWriteExt::write_all(&mut ws, &buf[..n])
                                     .await
@@ -177,7 +177,6 @@ mod tests {
                                     break;
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
                 });

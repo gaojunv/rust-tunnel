@@ -7,10 +7,14 @@ use rust_tunnel_common::crypto::LlmCipher;
 use rust_tunnel_persistence::rag::RagKnowledgeBaseRecord;
 use rust_tunnel_persistence::Database;
 
+/// 向量检索命中的原文分块，含分数与标题路径。
 #[derive(Debug, Clone)]
 pub struct RetrievedChunk {
+    /// 来源标题路径（如 `指南/安装`），拼接标题栈形成。
     pub heading_path: String,
+    /// 分块原文内容。
     pub content: String,
+    /// 向量相似度分数（余弦相似度，越高越相关）。
     pub score: f32,
 }
 
@@ -41,9 +45,9 @@ pub async fn retrieve(
     let hits = store
         .search(
             &kb.id,
-            kb.emb_dimension as usize,
+            usize::try_from(kb.emb_dimension).unwrap_or(usize::MAX),
             &query_vec,
-            kb.top_k as usize,
+            usize::try_from(kb.top_k).unwrap_or(usize::MAX),
         )
         .await;
     if hits.is_empty() {
@@ -125,7 +129,10 @@ mod tests {
         ];
         let kept = filter_by_threshold(pts, 0.3);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].score, 0.9);
+        #[allow(clippy::float_cmp, reason = "测试断言：阈值过滤后保留的 0.9 为构造时精确值")]
+        {
+            assert_eq!(kept[0].score, 0.9);
+        }
     }
 
     #[test]

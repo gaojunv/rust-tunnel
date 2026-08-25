@@ -828,12 +828,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_issued_certificate_populates_cache_and_broadcasts() {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
         let mut rx = mgr.subscribe();
 
         // 模拟 ACME 客户端只写磁盘的结果
-        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
         let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let params = CertificateParams::new(vec!["new.example.com".to_string()]).unwrap();
         let cert = params.self_signed(&kp).unwrap();
@@ -862,12 +863,13 @@ mod tests {
     /// resolve_certified_key（查找一律 lowercase）能命中，事件 domain 同为小写。
     #[tokio::test]
     async fn load_issued_certificate_normalizes_mixed_case_domain() {
+        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mgr = CertificateManager::new(temp_dir.path().to_str().unwrap());
         let mut rx = mgr.subscribe();
 
         // ACME 客户端按传入域名原样写盘
-        use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
         let kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let params = CertificateParams::new(vec!["Mixed.Example.com".to_string()]).unwrap();
         let cert = params.self_signed(&kp).unwrap();

@@ -27,7 +27,9 @@ use store::VectorStore;
 /// 这是 rag 拆分为独立 crate 的接缝。
 #[derive(Debug, Clone)]
 pub struct RagContext {
+    /// 命中的向量块，含原文、标题路径与得分。
     pub chunks: Vec<RetrievedChunk>,
+    /// 注入 LLM 的系统提示词，由命中块组装而成。
     pub system_message: String,
 }
 

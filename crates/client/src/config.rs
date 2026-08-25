@@ -66,26 +66,43 @@ pub struct ClientCli {
     pub log: Option<String>,
 }
 
+/// 从 TOML 配置文件解析的客户端配置（全部字段可选，未填则回落至默认值/环境变量/CLI）。
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ClientConfigFile {
+    /// 服务端地址（`host:port`）
     pub server: Option<String>,
+    /// 客户端名称
     pub name: Option<String>,
+    /// 认证口令
     pub password: Option<String>,
+    /// 是否启用 TLS
     pub tls: Option<bool>,
+    /// TLS SNI 名称
     pub tls_server_name: Option<String>,
+    /// 是否跳过证书校验（TOFU 模式）
     pub tls_insecure: Option<bool>,
+    /// Mesh 网络 ID
     pub mesh: Option<String>,
+    /// Mesh 内显示名称
     pub mesh_name: Option<String>,
+    /// Mesh 服务定义列表
     pub mesh_services: Option<Vec<String>>,
+    /// 是否启用 agent 执行器
     pub enable_agent: Option<bool>,
+    /// Agent PTY 回环端口
     pub agent_pty_port: Option<u16>,
+    /// 日志级别
     pub log: Option<String>,
 }
 
+/// 归一化后的客户端配置（必填字段已校验，含默认值填充）。
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    /// 服务端地址（`host:port`），必填
     pub server: String,
+    /// 客户端名称，未指定时回落至系统 hostname
     pub name: Option<String>,
+    /// 认证口令，必填
     pub password: String,
     /// Mesh network ID to join
     pub mesh: Option<String>,
@@ -103,6 +120,7 @@ pub struct ClientConfig {
     pub enable_agent: bool,
     /// Agent PTY service loopback port
     pub agent_pty_port: u16,
+    /// 日志级别字符串
     pub log: String,
 }
 
@@ -126,11 +144,22 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
+    /// 从命令行与环境加载客户端配置（按三级优先级合并）。
+    ///
+    /// # Errors
+    ///
+    /// 当配置文件不存在或 TOML 解析失败时返回 `Err`；当必填字段 `server`/`password` 为空时也返回 `Err`。
     pub fn load() -> Result<Self, String> {
         let cli = ClientCli::parse();
         Self::from_cli(cli)
     }
 
+    /// 按三级优先级（配置文件 → 环境变量 → CLI 参数）合并为归一化配置。
+    ///
+    /// # Errors
+    ///
+    /// 当指定的配置文件不存在或解析失败时返回 `Err`；当 `server` 或 `password` 最终为空时返回 `Err`。
+    #[allow(clippy::too_many_lines, reason = "三级配置叠加（文件→环境变量→CLI）的顺序编排，含大量字段逐一覆盖分支，拆分无益")]
     pub fn from_cli(cli: ClientCli) -> Result<Self, String> {
         let mut config = Self::default();
 

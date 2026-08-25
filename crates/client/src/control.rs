@@ -39,11 +39,12 @@ struct ActiveLocalConnection {
     state: LocalConnectionState,
 }
 
-/// Client state shared between all tasks
+/// 多任务共享的客户端状态：连接表、取消句柄与 spawn 管理器等
 #[derive(Clone)]
 pub struct ClientState {
+    /// 归一化后的客户端配置
     pub config: ClientConfig,
-    /// Sender for control messages to server
+    /// 控制通道消息发送端（发往服务端的 `ControlMessage`）。
     pub control_sender: ControlSender,
     active_connections: Arc<Mutex<HashMap<u64, ActiveLocalConnection>>>,
     /// 进行中的 agent exec 取消句柄：request_id → cancel 信号发送端。
@@ -70,6 +71,7 @@ impl ClientState {
         }
     }
 
+    /// 注册一条待建立的本地连接（数据先缓冲，待拨号成功后刷出）。
     pub async fn add_pending_connection(&self, connection_id: u64) {
         let mut conns = self.active_connections.lock().await;
         conns.insert(
@@ -122,11 +124,17 @@ impl ClientState {
         }
     }
 
+    /// 移除一条连接（无论 pending 还是 active）。
     pub async fn remove_connection(&self, connection_id: u64) {
         let mut conns = self.active_connections.lock().await;
         conns.remove(&connection_id);
     }
 
+    /// 向指定连接投递数据；pending 时缓冲，active 时写入本地服务。
+    ///
+    /// # Errors
+    ///
+    /// 当底层 `write_all`/`flush` 发生 `I/O` 错误时返回 `Err`。
     pub async fn deliver_data(&self, connection_id: u64, data: Vec<u8>) -> TunnelResult<()> {
         let mut conns = self.active_connections.lock().await;
         if let Some(conn) = conns.get_mut(&connection_id) {
@@ -148,6 +156,7 @@ impl ClientState {
         }
     }
 
+    /// 关闭指定连接并从表中移除。
     pub async fn close_connection(&self, connection_id: u64) {
         self.remove_connection(connection_id).await;
     }
@@ -187,9 +196,8 @@ async fn start_heartbeat(sender: ControlSender) {
         if seq > 0 {
             interval.tick().await;
         }
-        let timestamp_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_micros() as u64);
+        let timestamp_micros =
+            u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())).unwrap_or(u64::MAX);
         seq = seq.wrapping_add(1);
         if let Err(e) = sender
             .send(ControlMessage::Ping {
@@ -205,7 +213,12 @@ async fn start_heartbeat(sender: ControlSender) {
     }
 }
 
-/// Process messages from server on control channel
+/// 处理控制通道消息分发（心跳、隧道、agent 等）；EOF 时正常结束，Disconnect 时返回错误。
+///
+/// # Errors
+///
+/// 当收到 `Disconnect` 或底层 `read_from_stream` 出错时返回 `Err`。
+#[allow(clippy::too_many_lines, reason = "对控制通道全部消息变体的扁平派发，共享状态与分支多，拆分无益")]
 async fn process_control_messages<R: AsyncRead + Unpin>(
     reader: &mut R,
     state: ClientState,
@@ -219,10 +232,13 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                         ping_timestamp_micros,
                         pong_timestamp_micros,
                     } => {
-                        let client_rtt_micros = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_micros() as u64)
-                            .wrapping_sub(ping_timestamp_micros);
+                        let client_rtt_micros = u64::try_from(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_micros()),
+                        )
+                        .unwrap_or(u64::MAX)
+                        .wrapping_sub(ping_timestamp_micros);
                         let server_processing_time =
                             pong_timestamp_micros.wrapping_sub(ping_timestamp_micros);
                         debug!(
@@ -467,7 +483,12 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Main client entry point
+/// 客户端主入口：建立控制通道、完成注册与消息循环。
+///
+/// # Errors
+///
+/// 当 TLS/TCP 连接失败、注册被拒绝或控制通道读写出错时返回 `Err`。
+#[allow(clippy::too_many_lines, reason = "客户端启动全流程：TLS/注册/mesh/通道/日志/心跳，顺序编排难以拆分")]
 pub async fn run_client(config: ClientConfig) -> TunnelResult<()> {
     // Connect to server with or without TLS
     let (mut reader, mut writer): (

@@ -49,7 +49,11 @@ pub fn create_shared_context() -> SharedContext {
     Context::new_shared(ServerType::Server)
 }
 
-/// Create cipher kind from config string
+/// 将配置字符串解析为 `CipherKind`。
+///
+/// # Errors
+///
+/// 当 `cipher` 不是 `aes-256-gcm` 或 `chacha20-ietf-poly1305` 时返回 `TunnelError::Protocol`。
 pub fn parse_cipher_kind(cipher: &str) -> TunnelResult<CipherKind> {
     match cipher {
         "aes-256-gcm" => Ok(CipherKind::AES_256_GCM),
@@ -60,7 +64,11 @@ pub fn parse_cipher_kind(cipher: &str) -> TunnelResult<CipherKind> {
     }
 }
 
-/// Derive encryption key from password using shadowsocks' EVP_BytesToKey
+/// 使用 Shadowsocks 的 `EVP_BytesToKey` 从密码派生加密密钥。
+///
+/// # Errors
+///
+/// 当 `cipher` 不受支持时返回 `TunnelError::Protocol`。
 pub fn derive_key(password: &str, cipher: &str) -> TunnelResult<Vec<u8>> {
     let kind = parse_cipher_kind(cipher)?;
     let mut key = vec![0u8; kind.key_len()];
@@ -92,7 +100,11 @@ fn openssl_bytes_to_key(password: &[u8], key: &mut [u8]) {
     }
 }
 
-/// Handle SS handshake using shadowsocks-rust ProxyServerStream
+/// 使用 `shadowsocks-rust` 的 `ProxyServerStream` 完成 SS 握手并解析目标地址。
+///
+/// # Errors
+///
+/// 当密码/加密方式无效、服务端配置创建失败或握手读取目标地址失败时返回 `Err`。
 pub async fn handle_ss_handshake(
     stream: TcpStream,
     cipher: &str,
@@ -194,8 +206,8 @@ pub async fn proxy_ss_connection(
         }
     };
 
-    // Calculate connection establishment time as RTT estimate
-    let connect_time_ms = start.elapsed().as_millis() as u64;
+    // 建立连接耗时作为 RTT 估算，u128→u64 截断饱和（物理不可达约 58 万年）
+    let connect_time_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     debug!(
         "Connected to target {} for SS connection {} in {}ms",
         ss_ctx.target_addr, connection_id, connect_time_ms
@@ -390,22 +402,20 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(c) => c,
-                    Err(_) => break,
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
                 };
                 tokio::spawn(async move {
                     let (mut reader, mut writer) = tokio::io::split(stream);
                     let mut buf = [0u8; 8192];
                     loop {
                         match reader.read(&mut buf).await {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(n) => {
                                 if writer.write_all(&buf[..n]).await.is_err() {
                                     break;
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
                 });
@@ -546,7 +556,7 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        #[ignore] // Requires ss-local from shadowsocks-libev
+        #[ignore = "Requires ss-local from shadowsocks-libev"]
         async fn test_ss_echo_aes256gcm_via_ss_local() {
             // 1. echo server
             let (echo_port, echo_handle) = start_echo_server().await;
@@ -589,7 +599,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Requires ss-local from shadowsocks-libev
+        #[ignore = "Requires ss-local from shadowsocks-libev"]
         async fn test_ss_chacha20_poly1305_via_ss_local() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
@@ -626,7 +636,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Requires ss-local from shadowsocks-libev
+        #[ignore = "Requires ss-local from shadowsocks-libev"]
         async fn test_ss_large_data_transfer() {
             let (echo_port, echo_handle) = start_echo_server().await;
 
@@ -664,7 +674,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore] // Requires ss-local from shadowsocks-libev
+        #[ignore = "Requires ss-local from shadowsocks-libev"]
         async fn test_ss_active_connection_count() {
             let (echo_port, echo_handle) = start_echo_server().await;
 

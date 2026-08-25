@@ -168,7 +168,10 @@ impl RouteTable {
 
                 let mut counters = self.rr_counters.lock().await;
                 let counter = counters.entry(route_key.to_string()).or_insert(0);
-                let target = (*counter as u32) % total_weight;
+                // 先在 usize 域取模再转 u32：结果必然 < total_weight ≤ u32::MAX，
+                // 转换恒成功，且计数器回绕时权重分布仍然均匀。
+                let modulus = usize::try_from(total_weight).unwrap_or(usize::MAX);
+                let target = u32::try_from(*counter % modulus).unwrap_or(0);
                 *counter = counter.wrapping_add(1);
 
                 let mut cumulative = 0;

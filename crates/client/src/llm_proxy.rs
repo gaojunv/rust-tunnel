@@ -16,6 +16,7 @@ const MAX_LLM_PROXY_BODY: usize = 900 * 1024;
 /// request_id -> 等待响应 chunk 的 HTTP 连接发送端
 pub type PendingMap = Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>;
 
+/// 创建空的待处理映射（`request_id → 响应通道`）。
 #[must_use]
 pub fn new_pending_map() -> PendingMap {
     Arc::new(Mutex::new(HashMap::new()))
@@ -43,6 +44,10 @@ pub async fn route_chunk(pending: &PendingMap, chunk: &ControlMessage) -> bool {
 /// 启动回环 HTTP 代理，返回绑定端口与 kill 信号发送端。
 /// 每个进入的请求经 control_tx 发 AgentLlmProxyRequest，响应从 pending 收集后写回。
 /// 调用方持有 kill_tx：发 `()` 即让 accept 循环退出（listener drop 释放端口）。
+///
+/// # Errors
+///
+/// 当回环端口绑定失败时返回 `Err`。
 pub async fn serve(
     session_id: String,
     control_tx: mpsc::Sender<ControlMessage>,
@@ -70,6 +75,7 @@ pub async fn serve(
     Ok((port, kill_tx))
 }
 
+#[allow(clippy::too_many_lines, reason = "HTTP 解析与控制通道转发的顺序编排，状态共享难以拆分")]
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     session_id: String,
