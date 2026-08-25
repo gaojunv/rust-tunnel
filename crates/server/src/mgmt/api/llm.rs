@@ -1246,20 +1246,20 @@ mod tests {
     /// 直接向内存 DB 建一个知识库，返回 kb_id。
     async fn seed_kb(db: &Database) -> String {
         let kb_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_kb(
-            &kb_id,
-            "测试库",
-            "",
-            "http://127.0.0.1:9999",
-            "sk-test",
-            "test-model",
-            8,
-            5,
-            1000,
-            0,
-            0.5,
-            true,
-        )
+        db.rag_create_kb(&rust_tunnel_persistence::rag::RagCreateKbOpts {
+            id: kb_id.clone(),
+            name: "测试库".to_owned(),
+            description: String::new(),
+            emb_base_url: "http://127.0.0.1:9999".to_owned(),
+            emb_api_key: "sk-test".to_owned(),
+            emb_model: "test-model".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 1000,
+            chunk_overlap: 0,
+            score_threshold: 0.5,
+            enabled: true,
+        })
         .await
         .expect("seed kb");
         kb_id

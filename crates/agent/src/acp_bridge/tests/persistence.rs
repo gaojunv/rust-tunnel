@@ -141,20 +141,20 @@ async fn test_acp_persistence_survives_ws_disconnect() {
     // guard 之前（评审修复）：断线点之后到达的帧同样落库。
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))

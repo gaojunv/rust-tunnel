@@ -273,7 +273,10 @@ mod tests {
         assert!(text.contains("memory saved (id="), "text: {text}");
         assert!(v["result"].get("isError").is_none(), "成功不置 isError");
         let all = db
-            .memory_list(None, None, None, None, None, None, 100, 0)
+            .memory_list(&rust_tunnel_persistence::memory::MemoryListFilter {
+                limit: 100,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 1, "DB 应有一条记忆");

@@ -128,17 +128,17 @@ pub(super) async fn persist_acp_frame(
             let msg_id = format!("{:032x}", rand::random::<u128>());
             let entries = frame["entries"].to_string();
             if let Err(e) = db
-                .agent_add_message_v2(
-                    &msg_id,
-                    sid,
-                    "assistant",
-                    &entries,
-                    None,
-                    None,
-                    Some("plan"),
-                    "message",
-                    None, // plan 不归属任何子 agent
-                )
+                .agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+                    id: msg_id,
+                    session_id: sid.to_owned(),
+                    role: "assistant".to_owned(),
+                    content: entries,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("plan".to_owned()),
+                    kind: "message".to_owned(),
+                    parent_tool_call_id: None, // plan 不归属任何子 agent
+                })
                 .await
             {
                 tracing::warn!(session_id = %sid, "persist plan failed: {e}");
@@ -165,17 +165,17 @@ pub(super) async fn persist_acp_frame(
             // 刷新后历史里以附件卡片回放。
             let msg_id = format!("{:032x}", rand::random::<u128>());
             if let Err(e) = db
-                .agent_add_message_v2(
-                    &msg_id,
-                    sid,
-                    "assistant",
-                    &frame.to_string(),
-                    None,
-                    None,
-                    Some("attachment"),
-                    "message",
-                    frame["parent_tool_call_id"].as_str(),
-                )
+                .agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+                    id: msg_id,
+                    session_id: sid.to_owned(),
+                    role: "assistant".to_owned(),
+                    content: frame.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("attachment".to_owned()),
+                    kind: "message".to_owned(),
+                    parent_tool_call_id: frame["parent_tool_call_id"].as_str().map(str::to_owned),
+                })
                 .await
             {
                 tracing::warn!(session_id = %sid, "persist attachment failed: {e}");
@@ -208,17 +208,17 @@ pub(super) async fn flush_acp_turn_buffers(
         let name = seg.thought.then_some("thought");
         let msg_id = format!("{:032x}", rand::random::<u128>());
         if let Err(e) = db
-            .agent_add_message_v2(
-                &msg_id,
-                sid,
-                "assistant",
-                &seg.content,
-                None,
-                None,
-                name,
-                "message",
-                seg.parent_tool_call_id.as_deref(),
-            )
+            .agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+                id: msg_id,
+                session_id: sid.to_owned(),
+                role: "assistant".to_owned(),
+                content: seg.content,
+                tool_calls: None,
+                tool_call_id: None,
+                name: name.map(str::to_owned),
+                kind: "message".to_owned(),
+                parent_tool_call_id: seg.parent_tool_call_id,
+            })
             .await
         {
             tracing::warn!(session_id = %sid, "persist turn text failed: {e}");

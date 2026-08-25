@@ -87,6 +87,32 @@ pub struct AgentMemoryRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MemoryInsertOpts {
+    pub id: String,
+    pub content: String,
+    pub scope_type: String,
+    pub client_id: String,
+    pub workspace_id: String,
+    pub tags: String,
+    pub confidence: f64,
+    pub source_session_id: String,
+    pub source_trigger: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MemoryListFilter {
+    pub scope_type: Option<String>,
+    pub client_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub q: Option<String>,
+    pub pinned: Option<bool>,
+    pub order: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 impl Database {
     // ── Settings（单行 id=1）─────────────────────────────────────
 
@@ -150,20 +176,7 @@ impl Database {
 
     /// 插入一条记忆（全列）。`pinned` 仅插入时生效（false）；后续用
     /// [`Self::memory_toggle_pin`] 翻转。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn memory_insert(
-        &self,
-        id: &str,
-        content: &str,
-        scope_type: &str,
-        client_id: &str,
-        workspace_id: &str,
-        tags: &str,
-        confidence: f64,
-        source_session_id: &str,
-        source_trigger: &str,
-        pinned: bool,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn memory_insert(&self, opts: &MemoryInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
             INSERT INTO agent_memories (
@@ -172,16 +185,16 @@ impl Database {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
-        .bind(id)
-        .bind(content)
-        .bind(scope_type)
-        .bind(client_id)
-        .bind(workspace_id)
-        .bind(tags)
-        .bind(confidence)
-        .bind(source_session_id)
-        .bind(source_trigger)
-        .bind(i32::from(pinned))
+        .bind(&opts.id)
+        .bind(&opts.content)
+        .bind(&opts.scope_type)
+        .bind(&opts.client_id)
+        .bind(&opts.workspace_id)
+        .bind(&opts.tags)
+        .bind(opts.confidence)
+        .bind(&opts.source_session_id)
+        .bind(&opts.source_trigger)
+        .bind(i32::from(opts.pinned))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -266,37 +279,29 @@ impl Database {
     /// `pinned`：Some(true) 只看置顶、Some(false) 只看未置顶、None 不过滤。
     /// `order` 白名单："recent"（updated_at DESC，默认）/ "created"（created_at DESC）/
     /// "confidence"（confidence DESC）/ "hits"（hit_count DESC）。
-    #[allow(clippy::too_many_arguments)]
     pub async fn memory_list(
         &self,
-        scope_type: Option<&str>,
-        client_id: Option<&str>,
-        workspace_id: Option<&str>,
-        q: Option<&str>,
-        pinned: Option<bool>,
-        order: Option<&str>,
-        limit: i64,
-        offset: i64,
+        filter: &MemoryListFilter,
     ) -> Result<Vec<AgentMemoryRecord>, sqlx::Error> {
         let mut qb = sqlx::QueryBuilder::new("SELECT * FROM agent_memories WHERE 1=1");
-        if let Some(s) = scope_type.filter(|s| !s.is_empty()) {
+        if let Some(s) = filter.scope_type.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND scope_type = ").push_bind(s);
         }
-        if let Some(c) = client_id.filter(|c| !c.is_empty()) {
+        if let Some(c) = filter.client_id.as_deref().filter(|c| !c.is_empty()) {
             qb.push(" AND client_id = ").push_bind(c);
         }
-        if let Some(w) = workspace_id.filter(|w| !w.is_empty()) {
+        if let Some(w) = filter.workspace_id.as_deref().filter(|w| !w.is_empty()) {
             qb.push(" AND workspace_id = ").push_bind(w);
         }
-        if let Some(q) = q.filter(|q| !q.is_empty()) {
+        if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
             qb.push(" AND content LIKE ").push_bind(format!("%{q}%"));
         }
-        if pinned == Some(true) {
+        if filter.pinned == Some(true) {
             qb.push(" AND pinned = 1");
-        } else if pinned == Some(false) {
+        } else if filter.pinned == Some(false) {
             qb.push(" AND pinned = 0");
         }
-        let order_clause = match order {
+        let order_clause = match filter.order.as_deref() {
             Some("created") => "created_at DESC",
             Some("confidence") => "confidence DESC",
             Some("hits") => "hit_count DESC",
@@ -304,9 +309,9 @@ impl Database {
         };
         qb.push(" ORDER BY ").push(order_clause);
         qb.push(" LIMIT ")
-            .push_bind(limit)
+            .push_bind(filter.limit)
             .push(" OFFSET ")
-            .push_bind(offset);
+            .push_bind(filter.offset);
         qb.build_query_as::<AgentMemoryRecord>()
             .fetch_all(&self.pool)
             .await
@@ -357,9 +362,20 @@ mod tests {
     /// 建一个 workspace + session，返回 session id（CAS 测试用，agent_sessions 有
     /// 到 agent_workspaces 的 FK）。
     async fn seed_session(db: &Database) -> String {
-        db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&crate::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "w".to_owned(),
+            client_id: "c1".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -425,18 +441,18 @@ mod tests {
     #[tokio::test]
     async fn test_memories_crud() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert(
-            "m1",
-            "用户喜欢简洁的代码",
-            "workspace",
-            "c1",
-            "w1",
-            r#"["rust"]"#,
-            0.9,
-            "s1",
-            "distill",
-            false,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m1".to_owned(),
+            content: "用户喜欢简洁的代码".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tags: r#"["rust"]"#.to_owned(),
+            confidence: 0.9,
+            source_session_id: "s1".to_owned(),
+            source_trigger: "distill".to_owned(),
+            pinned: false,
+        })
         .await
         .unwrap();
 
@@ -479,9 +495,18 @@ mod tests {
     #[tokio::test]
     async fn test_memory_pin_toggle() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert(
-            "m1", "fact", "global", "", "", "[]", 0.8, "s1", "remember", false,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m1".to_owned(),
+            content: "fact".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "s1".to_owned(),
+            source_trigger: "remember".to_owned(),
+            pinned: false,
+        })
         .await
         .unwrap();
         db.memory_toggle_pin("m1").await.unwrap();
@@ -514,73 +539,91 @@ mod tests {
     #[tokio::test]
     async fn test_memory_list_scope_filter() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert(
-            "m1",
-            "全局事实",
-            "global",
-            "",
-            "",
-            "[]",
-            0.8,
-            "",
-            "manual",
-            false,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m1".to_owned(),
+            content: "全局事实".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
         .await
         .unwrap();
-        db.memory_insert(
-            "m2",
-            "客户端 c1 事实",
-            "client",
-            "c1",
-            "",
-            "[]",
-            0.8,
-            "",
-            "manual",
-            false,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m2".to_owned(),
+            content: "客户端 c1 事实".to_owned(),
+            scope_type: "client".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
         .await
         .unwrap();
-        db.memory_insert(
-            "m3",
-            "工作区 w1 事实",
-            "workspace",
-            "c1",
-            "w1",
-            "[]",
-            0.8,
-            "",
-            "manual",
-            true,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m3".to_owned(),
+            content: "工作区 w1 事实".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: true,
+        })
         .await
         .unwrap();
-        db.memory_insert(
-            "m4",
-            "其他工作区事实",
-            "workspace",
-            "c1",
-            "w2",
-            "[]",
-            0.8,
-            "",
-            "manual",
-            false,
-        )
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m4".to_owned(),
+            content: "其他工作区事实".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w2".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
         .await
         .unwrap();
 
         // 全量
         let all = db
-            .memory_list(None, None, None, None, None, None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 4);
 
         // scope_type 过滤
         let ws = db
-            .memory_list(Some("workspace"), None, None, None, None, None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: Some("workspace".to_owned()),
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(ws.len(), 2);
@@ -588,7 +631,16 @@ mod tests {
 
         // workspace_id 过滤
         let w1 = db
-            .memory_list(None, None, Some("w1"), None, None, None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: Some("w1".to_owned()),
+                q: None,
+                pinned: None,
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(w1.len(), 1);
@@ -596,27 +648,63 @@ mod tests {
 
         // client_id 过滤（m2/m3/m4 均属 c1）
         let c1 = db
-            .memory_list(None, Some("c1"), None, None, None, None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: Some("c1".to_owned()),
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(c1.len(), 3);
 
         // pinned 过滤
         let pinned = db
-            .memory_list(None, None, None, None, Some(true), None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: Some(true),
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].id, "m3");
         let unpinned = db
-            .memory_list(None, None, None, None, Some(false), None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: Some(false),
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(unpinned.len(), 3);
 
         // content 模糊
         let q = db
-            .memory_list(None, None, None, Some("客户端"), None, None, 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: Some("客户端".to_owned()),
+                pinned: None,
+                order: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(q.len(), 1);
@@ -627,39 +715,66 @@ mod tests {
     async fn test_memory_list_order_and_paging() {
         let db = Database::new(":memory:").await.unwrap();
         for i in 0..5 {
-            db.memory_insert(
-                &format!("m{i}"),
-                &format!("fact {i}"),
-                "global",
-                "",
-                "",
-                "[]",
-                0.1 * f64::from(i),
-                "",
-                "manual",
-                false,
-            )
+            db.memory_insert(&MemoryInsertOpts {
+                id: format!("m{i}").to_owned(),
+                content: format!("fact {i}").to_owned(),
+                scope_type: "global".to_owned(),
+                client_id: "".to_owned(),
+                workspace_id: "".to_owned(),
+                tags: "[]".to_owned(),
+                confidence: 0.1 * f64::from(i),
+                source_session_id: "".to_owned(),
+                source_trigger: "manual".to_owned(),
+                pinned: false,
+            })
             .await
             .unwrap();
         }
 
         // limit/offset 分页
         let page = db
-            .memory_list(None, None, None, None, None, None, 2, 1)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: None,
+                limit: 2,
+                offset: 1,
+            })
             .await
             .unwrap();
         assert_eq!(page.len(), 2);
 
         // 排序白名单：hits / confidence 不 panic 且按各自键序
         let by_conf = db
-            .memory_list(None, None, None, None, None, Some("confidence"), 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: Some("confidence".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(by_conf[0].confidence, 0.4, "confidence DESC 首条应为 0.4");
 
         // 非法 order 回退默认（recent），不 panic
         let fallback = db
-            .memory_list(None, None, None, None, None, Some("bogus"), 100, 0)
+            .memory_list(&MemoryListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                pinned: None,
+                order: Some("bogus".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(fallback.len(), 5);
@@ -668,12 +783,34 @@ mod tests {
     #[tokio::test]
     async fn test_memory_batch_and_hits() {
         let db = Database::new(":memory:").await.unwrap();
-        db.memory_insert("m1", "a", "global", "", "", "[]", 0.8, "", "manual", false)
-            .await
-            .unwrap();
-        db.memory_insert("m2", "b", "global", "", "", "[]", 0.8, "", "manual", false)
-            .await
-            .unwrap();
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m1".to_owned(),
+            content: "a".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
+        .await
+        .unwrap();
+        db.memory_insert(&MemoryInsertOpts {
+            id: "m2".to_owned(),
+            content: "b".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            confidence: 0.8,
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
+        .await
+        .unwrap();
 
         // get_by_ids：含不存在的 id，只回存在的
         let rows = db

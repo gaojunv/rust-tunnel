@@ -686,20 +686,20 @@ mod tests {
 
         // 知识库：emb 指向 mock embedding server，维度 8（与 mock 返回一致）
         let kb_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_kb(
-            &kb_id,
-            "rag-kb",
-            "",
-            emb_base_url,
-            "sk-emb",
-            "emb-model",
-            8,
-            5,
-            1000,
-            0,
-            0.0,
-            true,
-        )
+        db.rag_create_kb(&rust_tunnel_persistence::rag::RagCreateKbOpts {
+            id: kb_id.clone(),
+            name: "rag-kb".to_owned(),
+            description: String::new(),
+            emb_base_url: emb_base_url.to_owned(),
+            emb_api_key: "sk-emb".to_owned(),
+            emb_model: "emb-model".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 1000,
+            chunk_overlap: 0,
+            score_threshold: 0.0,
+            enabled: true,
+        })
         .await
         .unwrap();
 

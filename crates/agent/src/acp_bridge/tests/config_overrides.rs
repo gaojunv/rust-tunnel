@@ -7,20 +7,22 @@ use super::helpers::*;
 async fn test_apply_config_overrides_on_handshake() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "claude-code",
-        None,
-        Some("model-1"),
-        Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "claude-code".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: Some(
+            r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#.to_owned(),
+        ),
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)

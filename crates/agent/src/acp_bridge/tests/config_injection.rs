@@ -8,20 +8,20 @@ use super::helpers::*;
 async fn test_ensure_session_production_config_injection_order() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        Some(r#"{"model":"sonnet","fast":"haiku"}"#),
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: Some(r#"{"model":"sonnet","fast":"haiku"}"#.to_owned()),
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)
@@ -247,20 +247,20 @@ async fn test_handshake_injects_mcp_for_opencode() {
 async fn test_ensure_session_injects_mcp_server_with_memory() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)
@@ -361,20 +361,22 @@ async fn test_ensure_session_injects_mcp_server_with_memory() {
 async fn test_config_injection_continues_after_hard_failure() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        Some(r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#),
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: Some(
+            r#"{"model":"sonnet","fast":"haiku","nonexistent":"x"}"#.to_owned(),
+        ),
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)
@@ -422,20 +424,20 @@ async fn test_config_injection_continues_after_hard_failure() {
 async fn test_replay_config_state_continues_after_hard_failure() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)

@@ -35,7 +35,7 @@ pub struct KbEvent {
 ///
 /// `sem` 为可选并发信号量：全量重建时由调用方注入 `Some(Arc<Semaphore(4)>)`，任务持有
 /// permit 直到结束，避免对远端 embedding 服务瞬时打满；`None` 表示不限（单文档上传/reindex）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：tokio::spawn 闭包，混合不同类型参数
 pub fn spawn_ingest(
     db: Database,
     store: VectorStore,
@@ -253,18 +253,12 @@ mod tests {
         dim: i64,
     ) -> RagKnowledgeBaseRecord {
         db.rag_create_kb(
-            id,
-            "测试库",
-            "描述",
-            emb_base_url,
-            "sk-plain",
-            "test-model",
-            dim,
-            5,   // top_k
-            512, // chunk_size
-            64,  // chunk_overlap
-            0.3, // score_threshold
-            true,
+            &rust_tunnel_persistence::rag::RagCreateKbOpts { id: id.to_owned(), name: "测试库".to_owned(), description: "描述".to_owned(), emb_base_url: emb_base_url.to_owned(), emb_api_key: "sk-plain".to_owned(), emb_model: "test-model".to_owned(), emb_dimension: dim, top_k: // top_k
+            5, chunk_size: // chunk_size
+            512, chunk_overlap: // chunk_overlap
+            64, score_threshold: // score_threshold
+            0.3, enabled:
+            true },
         )
         .await
         .unwrap();

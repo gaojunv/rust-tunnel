@@ -284,7 +284,7 @@ impl Database {
     /// 列表（作用域 / q / status 过滤 + 分页）。`scope_type` 精确过滤；空串不过滤。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 保留：查询 filter 模式，多调用点方法
     pub async fn wiki_list(
         &self,
         scope_type: Option<&str>,
@@ -500,7 +500,7 @@ impl Database {
     /// `source_doc_id` 可空（手动页为 `None`）。
     /// # Errors
     /// 数据库错误：以 `sqlx::Error` 返回。
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // 保留：单调用点方法，Opts 化成本高
     pub async fn wiki_upsert_page(
         &self,
         wiki_id: &str,

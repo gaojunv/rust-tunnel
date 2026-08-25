@@ -59,22 +59,46 @@ pub struct AgentSkillSummary {
 const SKILL_SUMMARY_COLS: &str = "id, name, description, scope_type, client_id, workspace_id, \
      tags, enabled, source_session_id, source_trigger, use_count, last_used_at, created_at, updated_at";
 
+#[derive(Debug, Clone, Default)]
+pub struct SkillInsertOpts {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub scope_type: String,
+    pub client_id: String,
+    pub workspace_id: String,
+    pub tags: String,
+    pub source_session_id: String,
+    pub source_trigger: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillUpdateOpts {
+    pub name: String,
+    pub description: String,
+    pub content: String,
+    pub tags: String,
+    pub scope_type: String,
+    pub client_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillListFilter {
+    pub scope_type: Option<String>,
+    pub client_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub q: Option<String>,
+    pub enabled: Option<bool>,
+    pub sort: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 impl Database {
     /// 插入一条 Skill（全列）。`enabled` 默认 1、`use_count` 默认 0（不显式提供）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn skill_insert(
-        &self,
-        id: &str,
-        name: &str,
-        description: &str,
-        content: &str,
-        scope_type: &str,
-        client_id: &str,
-        workspace_id: &str,
-        tags: &str,
-        source_session_id: &str,
-        source_trigger: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn skill_insert(&self, opts: &SkillInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
             INSERT INTO agent_skills (
@@ -83,16 +107,16 @@ impl Database {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
-        .bind(id)
-        .bind(name)
-        .bind(description)
-        .bind(content)
-        .bind(scope_type)
-        .bind(client_id)
-        .bind(workspace_id)
-        .bind(tags)
-        .bind(source_session_id)
-        .bind(source_trigger)
+        .bind(&opts.id)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(&opts.content)
+        .bind(&opts.scope_type)
+        .bind(&opts.client_id)
+        .bind(&opts.workspace_id)
+        .bind(&opts.tags)
+        .bind(&opts.source_session_id)
+        .bind(&opts.source_trigger)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -129,30 +153,19 @@ impl Database {
     /// 更新可变字段：name / description / content / tags / scope 三元组（scope 变更
     /// 同步坐标，调用方已按 `scope_coords` 归一化）。**不动** enabled / use_count
     /// （去重 upsert 与手动编辑都不应重置使用统计与开关状态）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn skill_update(
-        &self,
-        id: &str,
-        name: &str,
-        description: &str,
-        content: &str,
-        tags: &str,
-        scope_type: &str,
-        client_id: &str,
-        workspace_id: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn skill_update(&self, id: &str, opts: &SkillUpdateOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_skills SET name = ?, description = ?, content = ?, tags = ?, \
              scope_type = ?, client_id = ?, workspace_id = ?, updated_at = datetime('now') \
              WHERE id = ?",
         )
-        .bind(name)
-        .bind(description)
-        .bind(content)
-        .bind(tags)
-        .bind(scope_type)
-        .bind(client_id)
-        .bind(workspace_id)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(&opts.content)
+        .bind(&opts.tags)
+        .bind(&opts.scope_type)
+        .bind(&opts.client_id)
+        .bind(&opts.workspace_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -186,52 +199,44 @@ impl Database {
     /// `name`/`description` 做 `LIKE %q%` 模糊匹配；`enabled`：Some(true) 只看启用、
     /// Some(false) 只看停用、None 不过滤。`sort` 白名单："recent"（updated_at DESC，
     /// 默认）/ "created"（created_at DESC）/ "uses"（use_count DESC）。
-    #[allow(clippy::too_many_arguments)]
     pub async fn skill_list(
         &self,
-        scope_type: Option<&str>,
-        client_id: Option<&str>,
-        workspace_id: Option<&str>,
-        q: Option<&str>,
-        enabled: Option<bool>,
-        sort: Option<&str>,
-        limit: i64,
-        offset: i64,
+        filter: &SkillListFilter,
     ) -> Result<Vec<AgentSkillSummary>, sqlx::Error> {
         let mut qb = sqlx::QueryBuilder::new("SELECT ");
         qb.push(SKILL_SUMMARY_COLS)
             .push(" FROM agent_skills WHERE 1=1");
-        if let Some(s) = scope_type.filter(|s| !s.is_empty()) {
+        if let Some(s) = filter.scope_type.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND scope_type = ").push_bind(s);
         }
-        if let Some(c) = client_id.filter(|c| !c.is_empty()) {
+        if let Some(c) = filter.client_id.as_deref().filter(|c| !c.is_empty()) {
             qb.push(" AND client_id = ").push_bind(c);
         }
-        if let Some(w) = workspace_id.filter(|w| !w.is_empty()) {
+        if let Some(w) = filter.workspace_id.as_deref().filter(|w| !w.is_empty()) {
             qb.push(" AND workspace_id = ").push_bind(w);
         }
-        if let Some(q) = q.filter(|q| !q.is_empty()) {
+        if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
             qb.push(" AND (name LIKE ")
                 .push_bind(format!("%{q}%"))
                 .push(" OR description LIKE ")
                 .push_bind(format!("%{q}%"))
                 .push(")");
         }
-        if enabled == Some(true) {
+        if filter.enabled == Some(true) {
             qb.push(" AND enabled = 1");
-        } else if enabled == Some(false) {
+        } else if filter.enabled == Some(false) {
             qb.push(" AND enabled = 0");
         }
-        let order_clause = match sort {
+        let order_clause = match filter.sort.as_deref() {
             Some("created") => "created_at DESC",
             Some("uses") => "use_count DESC",
             _ => "updated_at DESC",
         };
         qb.push(" ORDER BY ").push(order_clause);
         qb.push(" LIMIT ")
-            .push_bind(limit)
+            .push_bind(filter.limit)
             .push(" OFFSET ")
-            .push_bind(offset);
+            .push_bind(filter.offset);
         qb.build_query_as::<AgentSkillSummary>()
             .fetch_all(&self.pool)
             .await
@@ -281,18 +286,18 @@ mod tests {
     use super::*;
 
     async fn seed(db: &Database, id: &str, name: &str, scope: &str, client: &str, ws: &str) {
-        db.skill_insert(
-            id,
-            name,
-            "desc",
-            "content",
-            scope,
-            client,
-            ws,
-            r#"["rust"]"#,
-            "",
-            "manual",
-        )
+        db.skill_insert(&SkillInsertOpts {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: "desc".to_owned(),
+            content: "content".to_owned(),
+            scope_type: scope.to_owned(),
+            client_id: client.to_owned(),
+            workspace_id: ws.to_owned(),
+            tags: r#"["rust"]"#.to_owned(),
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
     }
@@ -300,18 +305,18 @@ mod tests {
     #[tokio::test]
     async fn skills_crud_and_scope() {
         let db = Database::new(":memory:").await.unwrap();
-        db.skill_insert(
-            "s1",
-            "deploy-app",
-            "发布应用",
-            "## 发布步骤\n1. build",
-            "workspace",
-            "c1",
-            "w1",
-            r#"["deploy","linux"]"#,
-            "src-sess",
-            "distill",
-        )
+        db.skill_insert(&SkillInsertOpts {
+            id: "s1".to_owned(),
+            name: "deploy-app".to_owned(),
+            description: "发布应用".to_owned(),
+            content: "## 发布步骤\n1. build".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tags: r#"["deploy","linux"]"#.to_owned(),
+            source_session_id: "src-sess".to_owned(),
+            source_trigger: "distill".to_owned(),
+        })
         .await
         .unwrap();
 
@@ -344,13 +349,15 @@ mod tests {
         // update：content/tags/scope 坐标同步，enabled/use_count 保持
         db.skill_update(
             "s1",
-            "deploy-app",
-            "新描述",
-            "新内容",
-            "[]",
-            "global",
-            "",
-            "", // scope 变更
+            &SkillUpdateOpts {
+                name: "deploy-app".to_owned(),
+                description: "新描述".to_owned(),
+                content: "新内容".to_owned(),
+                tags: "[]".to_owned(),
+                scope_type: "global".to_owned(),
+                client_id: "".to_owned(),
+                workspace_id: "".to_owned(),
+            },
         )
         .await
         .unwrap();
@@ -393,18 +400,18 @@ mod tests {
         seed(&db, "w1a", "release-check", "workspace", "c1", "w1").await;
         seed(&db, "w2", "other-ws", "workspace", "c1", "w2").await;
         // 一个停用 + 高使用
-        db.skill_insert(
-            "c2",
-            "disabled-skill",
-            "desc",
-            "content",
-            "global",
-            "",
-            "",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&SkillInsertOpts {
+            id: "c2".to_owned(),
+            name: "disabled-skill".to_owned(),
+            description: "desc".to_owned(),
+            content: "content".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+            tags: "[]".to_owned(),
+            source_session_id: "".to_owned(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
         db.skill_toggle_enabled("c2").await.unwrap();
@@ -413,7 +420,16 @@ mod tests {
 
         // 全量（summary 序列化不含 content 字段）
         let all = db
-            .skill_list(None, None, None, None, None, None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 5);
@@ -424,7 +440,16 @@ mod tests {
 
         // scope 过滤（seed：2 个 workspace + 2 个 global + 1 个 client）
         let ws = db
-            .skill_list(Some("workspace"), None, None, None, None, None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: Some("workspace".to_owned()),
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(ws.len(), 2);
@@ -432,25 +457,61 @@ mod tests {
 
         // q 对 name / description 模糊
         let q = db
-            .skill_list(None, None, None, Some("release"), None, None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: Some("release".to_owned()),
+                enabled: None,
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].name, "release-check");
         let q_desc = db
-            .skill_list(None, None, None, Some("desc"), None, None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: Some("desc".to_owned()),
+                enabled: None,
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(q_desc.len(), 5, "所有 description 都是 'desc'");
 
         // enabled 过滤
         let en = db
-            .skill_list(None, None, None, None, Some(true), None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: Some(true),
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(en.len(), 4);
         let dis = db
-            .skill_list(None, None, None, None, Some(false), None, 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: Some(false),
+                sort: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(dis.len(), 1);
@@ -458,24 +519,60 @@ mod tests {
 
         // uses 排序：w1a use_count=2 最前
         let by_uses = db
-            .skill_list(None, None, None, None, None, Some("uses"), 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: Some("uses".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(by_uses[0].id, "w1a");
         // created 排序：created_at 同秒可能并列，不 panic 即可
         let _ = db
-            .skill_list(None, None, None, None, None, Some("created"), 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: Some("created".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         // 非法 sort 回退 recent，不 panic
         let _ = db
-            .skill_list(None, None, None, None, None, Some("bogus"), 100, 0)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: Some("bogus".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
 
         // 分页
         let page = db
-            .skill_list(None, None, None, None, None, None, 2, 1)
+            .skill_list(&SkillListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                sort: None,
+                limit: 2,
+                offset: 1,
+            })
             .await
             .unwrap();
         assert_eq!(page.len(), 2);

@@ -58,13 +58,15 @@ async fn handle_llm_turn_json(
                     .await;
                 persist_message(
                     agent,
-                    &rt.session_id,
-                    "assistant",
-                    reasoning,
-                    None,
-                    None,
-                    Some("thought"),
-                    "message",
+                    PersistMessageOpts {
+                        session_id: &rt.session_id,
+                        role: "assistant",
+                        content: reasoning,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: Some("thought"),
+                        kind: "message",
+                    },
                 )
                 .await;
             }
@@ -76,13 +78,15 @@ async fn handle_llm_turn_json(
             rt.messages.push(ChatMessage::text("assistant", &text));
             persist_message(
                 agent,
-                &rt.session_id,
-                "assistant",
-                &text,
-                None,
-                None,
-                None,
-                "message",
+                PersistMessageOpts {
+                    session_id: &rt.session_id,
+                    role: "assistant",
+                    content: &text,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    kind: "message",
+                },
             )
             .await;
             let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
@@ -108,13 +112,15 @@ async fn handle_llm_turn_json(
                     .await;
                 persist_message(
                     agent,
-                    &rt.session_id,
-                    "assistant",
-                    reasoning,
-                    None,
-                    None,
-                    Some("thought"),
-                    "message",
+                    PersistMessageOpts {
+                        session_id: &rt.session_id,
+                        role: "assistant",
+                        content: reasoning,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: Some("thought"),
+                        kind: "message",
+                    },
                 )
                 .await;
             }
@@ -725,13 +731,15 @@ pub async fn run_agent_turn(
                         .await;
                     persist_message(
                         &agent,
-                        &rt.session_id,
-                        "assistant",
-                        &turn.reasoning,
-                        None,
-                        None,
-                        Some("thought"),
-                        "message",
+                        PersistMessageOpts {
+                            session_id: &rt.session_id,
+                            role: "assistant",
+                            content: &turn.reasoning,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: Some("thought"),
+                            kind: "message",
+                        },
                     )
                     .await;
                 }
@@ -741,13 +749,15 @@ pub async fn run_agent_turn(
                 rt.messages.push(ChatMessage::text("assistant", &turn.text));
                 persist_message(
                     &agent,
-                    &rt.session_id,
-                    "assistant",
-                    &turn.text,
-                    None,
-                    None,
-                    None,
-                    "message",
+                    PersistMessageOpts {
+                        session_id: &rt.session_id,
+                        role: "assistant",
+                        content: &turn.text,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        kind: "message",
+                    },
                 )
                 .await;
                 let _ = ws_tx.send(serde_json::json!({"type": "done"})).await;
@@ -797,31 +807,35 @@ pub async fn run_agent_turn(
     Err("tool round limit reached".to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn persist_message(
-    agent: &AgentState,
-    session_id: &str,
-    role: &str,
-    content: &str,
-    tool_calls: Option<&str>,
-    tool_call_id: Option<&str>,
-    name: Option<&str>,
-    kind: &str,
-) {
+/// `persist_message` 参数包（批次 9d 收敛 too_many_arguments）：
+/// runner 路径落库一行的全部列，`id` 由函数内生成、`parent_tool_call_id`
+/// 固定 None（runner 无 ACP 子 agent 归属）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PersistMessageOpts<'a> {
+    pub session_id: &'a str,
+    pub role: &'a str,
+    pub content: &'a str,
+    pub tool_calls: Option<&'a str>,
+    pub tool_call_id: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub kind: &'a str,
+}
+
+pub(crate) async fn persist_message(agent: &AgentState, opts: PersistMessageOpts<'_>) {
     let id = format!("{:032x}", rand::random::<u128>());
     if let Err(e) = agent
         .db
-        .agent_add_message_v2(
-            &id,
-            session_id,
-            role,
-            content,
-            tool_calls,
-            tool_call_id,
-            name,
-            kind,
-            None, // runner 路径无 ACP 子 agent 归属
-        )
+        .agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id,
+            session_id: opts.session_id.to_owned(),
+            role: opts.role.to_owned(),
+            content: opts.content.to_owned(),
+            tool_calls: opts.tool_calls.map(str::to_owned),
+            tool_call_id: opts.tool_call_id.map(str::to_owned),
+            name: opts.name.map(str::to_owned),
+            kind: opts.kind.to_owned(),
+            parent_tool_call_id: None, // runner 路径无 ACP 子 agent 归属
+        })
         .await
     {
         tracing::warn!("failed to persist agent message: {}", e);
@@ -843,13 +857,15 @@ pub(crate) async fn record_tool_result(
     if persist {
         persist_message(
             agent,
-            &rt.session_id,
-            "tool",
-            &content,
-            None,
-            Some(call_id),
-            Some(call_name),
-            "tool_result",
+            PersistMessageOpts {
+                session_id: &rt.session_id,
+                role: "tool",
+                content: &content,
+                tool_calls: None,
+                tool_call_id: Some(call_id),
+                name: Some(call_name),
+                kind: "tool_result",
+            },
         )
         .await;
     }
@@ -866,7 +882,16 @@ pub(crate) async fn record_tool_result(
 /// 落库一行 kind='summary' 的消息（压缩模块用）。
 pub async fn runner_persist_summary(agent: &AgentState, session_id: &str, content: &str) {
     persist_message(
-        agent, session_id, "user", content, None, None, None, "summary",
+        agent,
+        PersistMessageOpts {
+            session_id,
+            role: "user",
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "summary",
+        },
     )
     .await;
 }
@@ -885,9 +910,20 @@ mod tests {
     #[tokio::test]
     async fn test_persist_message_v2_writes_all_columns() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -897,13 +933,15 @@ mod tests {
         let agent = test_agent_state(db.clone()).await;
         persist_message(
             &agent,
-            "s1",
-            "tool",
-            "exit_code=0",
-            None,
-            Some("call_1"),
-            Some("shell"),
-            "tool_result",
+            PersistMessageOpts {
+                session_id: "s1",
+                role: "tool",
+                content: "exit_code=0",
+                tool_calls: None,
+                tool_call_id: Some("call_1"),
+                name: Some("shell"),
+                kind: "tool_result",
+            },
         )
         .await;
 

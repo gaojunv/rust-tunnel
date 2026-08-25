@@ -633,9 +633,20 @@ mod tests {
     // ── resolve_effective_model 优先级 ──────────────────────────
 
     async fn seed_ws(db: &Database, ws_id: &str, llm_model_id: Option<&str>) {
-        db.agent_create_workspace(
-            ws_id, "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: ws_id.to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         if let Some(mid) = llm_model_id {
@@ -808,9 +819,20 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_rebuilds_history() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -844,9 +866,20 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_skips_tool_rows() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -871,9 +904,20 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_model_fallback() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -889,20 +933,20 @@ mod tests {
     async fn test_load_session_docker_workspace() {
         let db = Database::new(":memory:").await.unwrap();
         // docker 运行时，container 已启动并登记 id
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "docker",
-            "/container/work",
-            Some("node:20"),
-            Some("dev-ctr"),
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "docker".to_owned(),
+            root_path: "/container/work".to_owned(),
+            docker_image: Some("node:20".to_owned()),
+            docker_container_id: Some("dev-ctr".to_owned()),
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -914,20 +958,20 @@ mod tests {
         assert_eq!(rt.root_path, "/container/work");
 
         // docker 运行时但容器未启动（container_id 为空）
-        db.agent_create_workspace(
-            "w2",
-            "p",
-            "nas",
-            "docker",
-            "/x",
-            Some("node:20"),
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w2".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "docker".to_owned(),
+            root_path: "/x".to_owned(),
+            docker_image: Some("node:20".to_owned()),
+            docker_container_id: None,
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s2", "w2", None, None)
@@ -947,9 +991,20 @@ mod tests {
     #[tokio::test]
     async fn test_load_replays_new_format_tool_structure() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -958,30 +1013,20 @@ mod tests {
         db.agent_add_message("m1", "s1", "user", "看下文件", None)
             .await
             .unwrap();
-        db.agent_add_message_v2(
-            "m2",
-            "s1",
-            "assistant",
-            "",
-            Some(r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]"#),
-            None,
-            None,
-            "tool_calls",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m2".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: "".to_owned(), tool_calls: Some(r#"[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m3",
-            "s1",
-            "tool",
-            "fn main(){}",
-            None,
-            Some("c1"),
-            Some("read_file"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: "fn main(){}".to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("read_file".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         db.agent_add_message("m4", "s1", "assistant", "文件里是 main 函数", None)
@@ -1003,9 +1048,20 @@ mod tests {
     #[tokio::test]
     async fn test_load_resumes_from_last_summary() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1017,17 +1073,17 @@ mod tests {
         db.agent_add_message("m2", "s1", "assistant", "早期回复", None)
             .await
             .unwrap();
-        db.agent_add_message_v2(
-            "m3",
-            "s1",
-            "user",
-            "[上下文摘要] 之前讨论了 X",
-            None,
-            None,
-            None,
-            "summary",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "user".to_owned(),
+            content: "[上下文摘要] 之前讨论了 X".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "summary".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         db.agent_add_message("m4", "s1", "user", "近期问题", None)
@@ -1052,9 +1108,20 @@ mod tests {
         // 清洗后应为第 2 个补齐占位结果，序列合法（无 400）。
         // 取消链路（AgentExecCancel 停止回合）依赖 sanitize_tool_pairs 占位补齐。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1063,32 +1130,32 @@ mod tests {
         db.agent_add_message("m1", "s1", "user", "改两处", None)
             .await
             .unwrap();
-        db.agent_add_message_v2(
-            "m2",
-            "s1",
-            "assistant",
-            "",
-            Some(
-                r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#,
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m2".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "assistant".to_owned(),
+            content: String::new(),
+            tool_calls: Some(
+                r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#.to_owned(),
             ),
-            None,
-            None,
-            "tool_calls",
-            None,
-        )
+            tool_call_id: None,
+            name: None,
+            kind: "tool_calls".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m3",
-            "s1",
-            "tool",
-            "ok",
-            None,
-            Some("c1"),
-            Some("shell"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: "ok".to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("shell".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
 
@@ -1109,9 +1176,20 @@ mod tests {
         // `{"text","status","diffs"?,...}`——load 重放给 LLM 只取 text 字段
         // （否则把 JSON 壳当工具结果内容）；旧纯文本行原样使用（向后兼容）。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1121,56 +1199,50 @@ mod tests {
             .await
             .unwrap();
         // 新格式行 + 旧纯文本行各一
-        db.agent_add_message_v2(
-            "m2",
-            "s1",
-            "assistant",
-            "",
-            Some(r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#),
-            None,
-            None,
-            "tool_calls",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m2".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "assistant".to_owned(),
+            content: "".to_owned(),
+            tool_calls: Some(
+                r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#
+                    .to_owned(),
+            ),
+            tool_call_id: None,
+            name: None,
+            kind: "tool_calls".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m3",
-            "s1",
-            "tool",
-            r#"{"text":"a.rs","status":"failed","diffs":[{"old":"x","new":"y"}]}"#,
-            None,
-            Some("c1"),
-            Some("shell"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: r#"{"text":"a.rs","status":"failed","diffs":[{"old":"x","new":"y"}]}"#
+                .to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("shell".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m4",
-            "s1",
-            "assistant",
-            "",
-            Some(r#"[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#),
-            None,
-            None,
-            "tool_calls",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m4".to_owned(), session_id: "s1".to_owned(), role: "assistant".to_owned(), content: "".to_owned(), tool_calls: Some(r#"[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#.to_owned()), tool_call_id: None, name: None, kind: "tool_calls".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m5",
-            "s1",
-            "tool",
-            "旧格式纯文本",
-            None,
-            Some("c2"),
-            Some("read_file"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m5".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: "旧格式纯文本".to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c2".to_owned()),
+            name: Some("read_file".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
 
@@ -1195,9 +1267,20 @@ mod tests {
         // 压缩切割点落在 assistant tool_calls 行正后方：tool 结果保留但配对行被压掉。
         // 清洗后孤儿 tool 结果应被丢弃。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1207,30 +1290,30 @@ mod tests {
             .await
             .unwrap();
         // summary 之后只有孤儿 tool 结果（tool_calls 行落在 summary 之前被跳过）
-        db.agent_add_message_v2(
-            "m2",
-            "s1",
-            "user",
-            "[上下文摘要] ...",
-            None,
-            None,
-            None,
-            "summary",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m2".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "user".to_owned(),
+            content: "[上下文摘要] ...".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "summary".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
-        db.agent_add_message_v2(
-            "m3",
-            "s1",
-            "tool",
-            "ok",
-            None,
-            Some("c1"),
-            Some("shell"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: "ok".to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("shell".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         db.agent_add_message("m4", "s1", "assistant", "继续", None)
@@ -1247,9 +1330,20 @@ mod tests {
         // 迁移前遗留行：SQLite DEFAULT 把 kind 补成 'message'，role='tool' 的旧合并行
         // 必须被跳过（不能落入普通文本消息分支产生非法 OpenAI 序列）。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1258,9 +1352,19 @@ mod tests {
         db.agent_add_message("m1", "s1", "user", "改代码", None)
             .await
             .unwrap();
-        db.agent_add_message_v2("m2", "s1", "tool", "", None, None, None, "message", None)
-            .await
-            .unwrap();
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m2".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: String::new(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "message".to_owned(),
+            parent_tool_call_id: None,
+        })
+        .await
+        .unwrap();
         db.agent_add_message("m3", "s1", "assistant", "已完成", None)
             .await
             .unwrap();

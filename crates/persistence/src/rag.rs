@@ -45,27 +45,52 @@ pub struct RagChunkRecord {
     pub token_count: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RagCreateKbOpts {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub emb_base_url: String,
+    pub emb_api_key: String,
+    pub emb_model: String,
+    pub emb_dimension: i64,
+    pub top_k: i64,
+    pub chunk_size: i64,
+    pub chunk_overlap: i64,
+    pub score_threshold: f64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RagUpdateKbParamsOpts {
+    pub name: String,
+    pub description: String,
+    pub top_k: i64,
+    pub chunk_size: i64,
+    pub chunk_overlap: i64,
+    pub score_threshold: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RagUpdateKbFullOpts {
+    pub name: String,
+    pub description: String,
+    pub top_k: i64,
+    pub chunk_size: i64,
+    pub chunk_overlap: i64,
+    pub score_threshold: f64,
+    pub emb_base_url: String,
+    pub emb_api_key: String,
+    pub emb_model: String,
+    pub emb_dimension: i64,
+}
+
 impl Database {
     // ── Knowledge base CRUD ──────────────────────────────────────
 
     /// 创建知识库。emb_api_key 的加解密由调用方（mgmt api 层）用
     /// encrypt_field/decrypt_field 处理，本层只存取原始字符串。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn rag_create_kb(
-        &self,
-        id: &str,
-        name: &str,
-        description: &str,
-        emb_base_url: &str,
-        emb_api_key: &str,
-        emb_model: &str,
-        emb_dimension: i64,
-        top_k: i64,
-        chunk_size: i64,
-        chunk_overlap: i64,
-        score_threshold: f64,
-        enabled: bool,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn rag_create_kb(&self, opts: &RagCreateKbOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
             INSERT INTO rag_knowledge_bases (
@@ -75,18 +100,18 @@ impl Database {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ",
         )
-        .bind(id)
-        .bind(name)
-        .bind(description)
-        .bind(emb_base_url)
-        .bind(emb_api_key)
-        .bind(emb_model)
-        .bind(emb_dimension)
-        .bind(top_k)
-        .bind(chunk_size)
-        .bind(chunk_overlap)
-        .bind(score_threshold)
-        .bind(i32::from(enabled))
+        .bind(&opts.id)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(&opts.emb_base_url)
+        .bind(&opts.emb_api_key)
+        .bind(&opts.emb_model)
+        .bind(opts.emb_dimension)
+        .bind(opts.top_k)
+        .bind(opts.chunk_size)
+        .bind(opts.chunk_overlap)
+        .bind(opts.score_threshold)
+        .bind(i32::from(opts.enabled))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -114,16 +139,10 @@ impl Database {
 
     /// 更新知识库的「名称 + 检索/分块参数」。emb 配置（base_url/api_key/model/dimension）
     /// 建库后锁定不可改（qdrant shard 维度固定），需要改动时删除重建。
-    #[allow(clippy::too_many_arguments)]
     pub async fn rag_update_kb_params(
         &self,
         id: &str,
-        name: &str,
-        description: &str,
-        top_k: i64,
-        chunk_size: i64,
-        chunk_overlap: i64,
-        score_threshold: f64,
+        opts: &RagUpdateKbParamsOpts,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -133,12 +152,12 @@ impl Database {
             WHERE id = ?
             ",
         )
-        .bind(name)
-        .bind(description)
-        .bind(top_k)
-        .bind(chunk_size)
-        .bind(chunk_overlap)
-        .bind(score_threshold)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(opts.top_k)
+        .bind(opts.chunk_size)
+        .bind(opts.chunk_overlap)
+        .bind(opts.score_threshold)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -149,20 +168,10 @@ impl Database {
     /// （调用方用 `encrypt_field` 处理），本层只存取原始字符串。用于编辑 KB 时全量保存
     /// （含可选的 emb 配置变更，与建库时同口径）。区别于 `rag_update_kb_params`——后者
     /// 不碰 emb 列（历史锁定语义），本方法提供可编辑 emb 的能力。
-    #[allow(clippy::too_many_arguments)]
     pub async fn rag_update_kb_full(
         &self,
         id: &str,
-        name: &str,
-        description: &str,
-        top_k: i64,
-        chunk_size: i64,
-        chunk_overlap: i64,
-        score_threshold: f64,
-        emb_base_url: &str,
-        emb_api_key: &str, // 入参为已加密密文
-        emb_model: &str,
-        emb_dimension: i64,
+        opts: &RagUpdateKbFullOpts,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -173,16 +182,16 @@ impl Database {
             WHERE id = ?
             ",
         )
-        .bind(name)
-        .bind(description)
-        .bind(top_k)
-        .bind(chunk_size)
-        .bind(chunk_overlap)
-        .bind(score_threshold)
-        .bind(emb_base_url)
-        .bind(emb_api_key)
-        .bind(emb_model)
-        .bind(emb_dimension)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(opts.top_k)
+        .bind(opts.chunk_size)
+        .bind(opts.chunk_overlap)
+        .bind(opts.score_threshold)
+        .bind(&opts.emb_base_url)
+        .bind(&opts.emb_api_key)
+        .bind(&opts.emb_model)
+        .bind(opts.emb_dimension)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -504,20 +513,20 @@ mod tests {
 
     /// 构造一个最小可用的知识库 record 字段集。
     async fn create_sample_kb(db: &Database, id: &str) {
-        db.rag_create_kb(
-            id,
-            "测试库",
-            "描述",
-            "https://api.example.com",
-            "sk-encrypted",
-            "text-embedding-3-small",
-            1536,
-            5,
-            512,
-            64,
-            0.3,
-            true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: id.to_owned(),
+            name: "测试库".to_owned(),
+            description: "描述".to_owned(),
+            emb_base_url: "https://api.example.com".to_owned(),
+            emb_api_key: "sk-encrypted".to_owned(),
+            emb_model: "text-embedding-3-small".to_owned(),
+            emb_dimension: 1536,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
     }
@@ -535,27 +544,37 @@ mod tests {
 
         // 重复创建同一 id 覆盖（upsert 语义不要求，此处应报 primary key 冲突）
         let dup = db
-            .rag_create_kb(
-                "kb-1",
-                "x",
-                "",
-                "https://api.example.com",
-                "k",
-                "m",
-                10,
-                5,
-                512,
-                64,
-                0.3,
-                true,
-            )
+            .rag_create_kb(&RagCreateKbOpts {
+                id: "kb-1".to_owned(),
+                name: "x".to_owned(),
+                description: "".to_owned(),
+                emb_base_url: "https://api.example.com".to_owned(),
+                emb_api_key: "k".to_owned(),
+                emb_model: "m".to_owned(),
+                emb_dimension: 10,
+                top_k: 5,
+                chunk_size: 512,
+                chunk_overlap: 64,
+                score_threshold: 0.3,
+                enabled: true,
+            })
             .await;
         assert!(dup.is_err(), "同 id 重复创建应冲突");
 
         // update params：emb 配置不变
-        db.rag_update_kb_params("kb-1", "改名", "新描述", 8, 256, 32, 0.5)
-            .await
-            .unwrap();
+        db.rag_update_kb_params(
+            "kb-1",
+            &RagUpdateKbParamsOpts {
+                name: "改名".to_owned(),
+                description: "新描述".to_owned(),
+                top_k: 8,
+                chunk_size: 256,
+                chunk_overlap: 32,
+                score_threshold: 0.5,
+            },
+        )
+        .await
+        .unwrap();
         let kb = db.rag_get_kb("kb-1").await.unwrap().unwrap();
         assert_eq!(kb.name, "改名");
         assert_eq!(kb.description, "新描述");
@@ -689,9 +708,20 @@ mod tests {
     #[tokio::test]
     async fn document_roundtrip_carries_file_type() {
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb(
-            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: "kb1".to_owned(),
+            name: "n".to_owned(),
+            description: "".to_owned(),
+            emb_base_url: "http://x".to_owned(),
+            emb_api_key: "k".to_owned(),
+            emb_model: "m".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
         db.rag_create_document("d1", "kb1", "a.pdf", "sha256:x", "pdf")
@@ -704,9 +734,20 @@ mod tests {
     #[tokio::test]
     async fn mark_pending_if_idle_cas() {
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb(
-            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: "kb1".to_owned(),
+            name: "n".to_owned(),
+            description: "".to_owned(),
+            emb_base_url: "http://x".to_owned(),
+            emb_api_key: "k".to_owned(),
+            emb_model: "m".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
         db.rag_create_document("d1", "kb1", "a.md", "sha256:x", "md")
@@ -748,9 +789,20 @@ mod tests {
     #[tokio::test]
     async fn reconcile_fails_stale_inflight_docs() {
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb(
-            "kb1", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: "kb1".to_owned(),
+            name: "n".to_owned(),
+            description: "".to_owned(),
+            emb_base_url: "http://x".to_owned(),
+            emb_api_key: "k".to_owned(),
+            emb_model: "m".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
         db.rag_create_document("d-pending", "kb1", "a.md", "sha256:a", "md")
@@ -812,9 +864,20 @@ mod tests {
         // 验证老数据回填规则：插入 file_type='' 的行（模拟迁移前的老数据），
         // 跑回填方法后应无条件为 'md'（旧版所有上传一律落盘 .md）。
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb(
-            "kb2", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: "kb2".to_owned(),
+            name: "n".to_owned(),
+            description: "".to_owned(),
+            emb_base_url: "http://x".to_owned(),
+            emb_api_key: "k".to_owned(),
+            emb_model: "m".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
         db.rag_create_document("legacy", "kb2", "old.md", "sha256:y", "")
@@ -839,16 +902,18 @@ mod tests {
         // 全量更新（含改名 + 改 emb 配置；api_key 已是密文形式）
         db.rag_update_kb_full(
             "kb-full",
-            "改名库",
-            "新描述",
-            8,
-            256,
-            32,
-            0.5,
-            "https://new.example.com",
-            "enc:v1:newcipher",
-            "new-model",
-            768,
+            &RagUpdateKbFullOpts {
+                name: "改名库".to_owned(),
+                description: "新描述".to_owned(),
+                top_k: 8,
+                chunk_size: 256,
+                chunk_overlap: 32,
+                score_threshold: 0.5,
+                emb_base_url: "https://new.example.com".to_owned(),
+                emb_api_key: "enc:v1:newcipher".to_owned(),
+                emb_model: "new-model".to_owned(),
+                emb_dimension: 768,
+            },
         )
         .await
         .unwrap();
@@ -928,9 +993,20 @@ mod tests {
         // 扩展名）。若按 filename 扩展名推导，notes.txt 会被回填成 'txt'，
         // reindex 找 .txt 原文 409、delete 孤儿化真实 .md——回填必须锁定为 'md'。
         let db = Database::new(":memory:").await.unwrap();
-        db.rag_create_kb(
-            "kb3", "n", "", "http://x", "k", "m", 8, 5, 512, 64, 0.3, true,
-        )
+        db.rag_create_kb(&RagCreateKbOpts {
+            id: "kb3".to_owned(),
+            name: "n".to_owned(),
+            description: "".to_owned(),
+            emb_base_url: "http://x".to_owned(),
+            emb_api_key: "k".to_owned(),
+            emb_model: "m".to_owned(),
+            emb_dimension: 8,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
         .unwrap();
         db.rag_create_document("legacy-txt", "kb3", "notes.txt", "sha256:z", "")

@@ -29,7 +29,7 @@ pub use parse::{parse_llm_turn, LlmTurn, ParsedToolCall};
 pub use prompt::{compose_user_message, MAX_REFS, MAX_REFS_TOTAL_BYTES, MAX_REF_FILE_BYTES};
 pub(crate) use tool_calls::{handle_single_tool_call, handle_tool_calls, send_tool_call_delta};
 pub(crate) use tool_result_text::agent_result_to_text;
-pub(crate) use turn::{persist_message, record_tool_result};
+pub(crate) use turn::{persist_message, record_tool_result, PersistMessageOpts};
 pub use turn::{run_agent_turn, runner_persist_summary, runner_usage_ctx};
 pub use version_gate::{
     client_supports_cancel, client_supports_edit, client_supports_git_exec,

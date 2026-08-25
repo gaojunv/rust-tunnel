@@ -102,7 +102,7 @@ pub(super) async fn setup_handshake(bridge: &AcpBridge, ws_tx: mpsc::Sender<serd
 /// 用；None = 全新会话路径）。`resume_fails`：true 时 mock 的 `session/resume`
 /// 回 error（测回退 session/new）。`fail_config_id`：mock 对该 config_id 的
 /// `session/set_config_option` 回 JSON-RPC error（测「单条失败不阻断其余注入」）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：测试 helper，混合基础设施参数
 pub(super) async fn setup_handshake_with(
     bridge: &AcpBridge,
     ws_tx: mpsc::Sender<serde_json::Value>,
@@ -271,9 +271,20 @@ pub(super) async fn fs_test_env(
 ) {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None, None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/ws".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
@@ -315,20 +326,20 @@ pub(super) async fn mcp_tunnel_env(
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
     if seed_session {
-        db.agent_create_workspace(
-            "w1",
-            "proj",
-            "nas",
-            "host",
-            "/workspace",
-            None,
-            None,
-            "gemini",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/workspace".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
@@ -392,7 +403,7 @@ pub(super) async fn send_mcp_request(
 /// 通知，再等待一个许可才回 PromptResponse——队列/取消测试用。
 /// `recorded`（None 不记录）：收集收到的 method/通知名（如 `session/cancel`）。
 /// `resume_fails`：true 时 `session/resume` 回 JSON-RPC error（测回退 session/new）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：测试 helper，混合基础设施参数
 pub(super) async fn mock_acp_agent(
     mut stdin_rx: mpsc::Receiver<ControlMessage>,
     stdout_tx: mpsc::Sender<Vec<u8>>,
@@ -604,20 +615,20 @@ pub(super) async fn mock_acp_agent(
 /// 建一个含 workspace/session + 空会话表的 persist 环境。
 pub(super) async fn persist_env() -> (Database, Arc<Mutex<HashMap<String, SpawnedAgent>>>) {
     let db = Database::new(":memory:").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
@@ -638,7 +649,7 @@ pub(super) async fn persist_env() -> (Database, Arc<Mutex<HashMap<String, Spawne
 /// 经 `SpawnedAgent.stdout_tx` 送回 pump → ACP 连接。生产接线
 /// `ensure_session` 全链路（start_llm_proxy → spawn_agent → handshake → 配置注入）
 /// 不经此桥无法完成，测试由此验证真实调用顺序。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：测试 helper，混合基础设施参数
 pub(super) async fn spawn_e2e_client(
     registry: &crate::test_helpers::TestRegistry,
     sessions: &Arc<Mutex<HashMap<String, SpawnedAgent>>>,
@@ -777,9 +788,20 @@ where
 pub(super) async fn seeded_bridge() -> (AcpBridge, Database) {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1", "proj", "nas", "host", "/ws", None, None, "gemini", None, None, None, None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/ws".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))

@@ -243,7 +243,7 @@ async fn best_scope_match(
 ///
 /// 返回记忆 id。embedding 失败 / 维度未配置 / DB 或向量写失败均返回 Err，由调用
 /// 方决定降级语义（distill 静默跳过单条，remember 把错误喂回模型）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：3 调用点方法，Opts 化成本高
 pub async fn upsert_memory_with_dedup(
     memory: &MemoryState,
     s: &AgentMemorySettingsRecord,
@@ -305,18 +305,18 @@ pub async fn upsert_memory_with_dedup(
     let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
     memory
         .db
-        .memory_insert(
-            &id,
-            content,
-            scope_type,
-            client_id,
-            workspace_id,
-            &tags_json,
+        .memory_insert(&rust_tunnel_persistence::memory::MemoryInsertOpts {
+            id: id.clone(),
+            content: content.to_owned(),
+            scope_type: scope_type.to_owned(),
+            client_id: client_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            tags: tags_json,
             confidence,
-            source_session_id,
-            source_trigger,
-            false,
-        )
+            source_session_id: source_session_id.to_owned(),
+            source_trigger: source_trigger.to_owned(),
+            pinned: false,
+        })
         .await
         .map_err(|e| format!("memory insert failed: {e}"))?;
     memory
@@ -483,7 +483,10 @@ mod tests {
         );
 
         let all = db
-            .memory_list(None, None, None, None, None, None, 100, 0)
+            .memory_list(&rust_tunnel_persistence::memory::MemoryListFilter {
+                limit: 100,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 1, "不应产生重复记忆");
@@ -506,7 +509,10 @@ mod tests {
         .unwrap();
         assert_ne!(id1, id3, "不同作用域应新建");
         let all = db
-            .memory_list(None, None, None, None, None, None, 100, 0)
+            .memory_list(&rust_tunnel_persistence::memory::MemoryListFilter {
+                limit: 100,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 2);

@@ -183,7 +183,7 @@ impl Database {
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_provider(
         &self,
         id: &str,
@@ -286,7 +286,7 @@ impl Database {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_model(
         &self,
         id: &str,

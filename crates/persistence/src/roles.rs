@@ -34,23 +34,50 @@ pub struct AgentRoleRecord {
 /// 角色列表行（与完整行相同字段——角色数据量小，无需 Summary 分离）。
 pub type AgentRoleSummary = AgentRoleRecord;
 
+#[derive(Debug, Clone, Default)]
+pub struct RoleInsertOpts {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub system_prompt: String,
+    pub tools_allow: Option<String>,
+    pub tools_deny: Option<String>,
+    pub model_override: Option<String>,
+    pub mode: String,
+    pub scope_type: String,
+    pub client_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoleUpdateOpts {
+    pub name: String,
+    pub description: String,
+    pub system_prompt: String,
+    pub tools_allow: Option<String>,
+    pub tools_deny: Option<String>,
+    pub model_override: Option<String>,
+    pub mode: String,
+    pub scope_type: String,
+    pub client_id: String,
+    pub workspace_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoleListFilter {
+    pub scope_type: Option<String>,
+    pub client_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub q: Option<String>,
+    pub enabled: Option<bool>,
+    pub mode: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 impl Database {
     /// 插入一条角色。`enabled` 默认 1、`is_builtin` 默认 0（不显式提供）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn role_insert(
-        &self,
-        id: &str,
-        name: &str,
-        description: &str,
-        system_prompt: &str,
-        tools_allow: Option<&str>,
-        tools_deny: Option<&str>,
-        model_override: Option<&str>,
-        mode: &str,
-        scope_type: &str,
-        client_id: &str,
-        workspace_id: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn role_insert(&self, opts: &RoleInsertOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
             INSERT INTO agent_roles (
@@ -59,17 +86,17 @@ impl Database {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
-        .bind(id)
-        .bind(name)
-        .bind(description)
-        .bind(system_prompt)
-        .bind(tools_allow)
-        .bind(tools_deny)
-        .bind(model_override)
-        .bind(mode)
-        .bind(scope_type)
-        .bind(client_id)
-        .bind(workspace_id)
+        .bind(&opts.id)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(&opts.system_prompt)
+        .bind(&opts.tools_allow)
+        .bind(&opts.tools_deny)
+        .bind(&opts.model_override)
+        .bind(&opts.mode)
+        .bind(&opts.scope_type)
+        .bind(&opts.client_id)
+        .bind(&opts.workspace_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -105,37 +132,23 @@ impl Database {
     /// 更新角色可变字段（name/description/system_prompt/tools_allow/tools_deny/
     /// model_override/mode/scope 坐标）。is_builtin 角色的 name 修改由 API 层拦截，
     /// DAO 层照常执行。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn role_update(
-        &self,
-        id: &str,
-        name: &str,
-        description: &str,
-        system_prompt: &str,
-        tools_allow: Option<&str>,
-        tools_deny: Option<&str>,
-        model_override: Option<&str>,
-        mode: &str,
-        scope_type: &str,
-        client_id: &str,
-        workspace_id: &str,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn role_update(&self, id: &str, opts: &RoleUpdateOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_roles SET name = ?, description = ?, system_prompt = ?, \
              tools_allow = ?, tools_deny = ?, model_override = ?, mode = ?, \
              scope_type = ?, client_id = ?, workspace_id = ?, updated_at = datetime('now') \
              WHERE id = ?",
         )
-        .bind(name)
-        .bind(description)
-        .bind(system_prompt)
-        .bind(tools_allow)
-        .bind(tools_deny)
-        .bind(model_override)
-        .bind(mode)
-        .bind(scope_type)
-        .bind(client_id)
-        .bind(workspace_id)
+        .bind(&opts.name)
+        .bind(&opts.description)
+        .bind(&opts.system_prompt)
+        .bind(&opts.tools_allow)
+        .bind(&opts.tools_deny)
+        .bind(&opts.model_override)
+        .bind(&opts.mode)
+        .bind(&opts.scope_type)
+        .bind(&opts.client_id)
+        .bind(&opts.workspace_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -174,48 +187,40 @@ impl Database {
     /// `scope_type` 精确过滤；`client_id`/`workspace_id` 传空串等同不过滤；`q` 对
     /// `name`/`description` 做 LIKE 模糊匹配；`enabled`：Some(true) 只看启用、
     /// Some(false) 只看停用、None 不过滤。
-    #[allow(clippy::too_many_arguments)]
     pub async fn role_list(
         &self,
-        scope_type: Option<&str>,
-        client_id: Option<&str>,
-        workspace_id: Option<&str>,
-        q: Option<&str>,
-        enabled: Option<bool>,
-        mode: Option<&str>,
-        limit: i64,
-        offset: i64,
+        filter: &RoleListFilter,
     ) -> Result<Vec<AgentRoleSummary>, sqlx::Error> {
         let mut qb = sqlx::QueryBuilder::new("SELECT * FROM agent_roles WHERE 1=1");
-        if let Some(s) = scope_type.filter(|s| !s.is_empty()) {
+        if let Some(s) = filter.scope_type.as_deref().filter(|s| !s.is_empty()) {
             qb.push(" AND scope_type = ").push_bind(s);
         }
-        if let Some(c) = client_id.filter(|c| !c.is_empty()) {
+        if let Some(c) = filter.client_id.as_deref().filter(|c| !c.is_empty()) {
             qb.push(" AND client_id = ").push_bind(c);
         }
-        if let Some(w) = workspace_id.filter(|w| !w.is_empty()) {
+        if let Some(w) = filter.workspace_id.as_deref().filter(|w| !w.is_empty()) {
             qb.push(" AND workspace_id = ").push_bind(w);
         }
-        if let Some(q) = q.filter(|q| !q.is_empty()) {
+        if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
             qb.push(" AND (name LIKE ")
                 .push_bind(format!("%{q}%"))
                 .push(" OR description LIKE ")
                 .push_bind(format!("%{q}%"))
                 .push(")");
         }
-        if enabled == Some(true) {
+        if filter.enabled == Some(true) {
             qb.push(" AND enabled = 1");
-        } else if enabled == Some(false) {
+        } else if filter.enabled == Some(false) {
             qb.push(" AND enabled = 0");
         }
-        if let Some(m) = mode.filter(|m| !m.is_empty()) {
+        if let Some(m) = filter.mode.as_deref().filter(|m| !m.is_empty()) {
             qb.push(" AND mode = ").push_bind(m);
         }
         qb.push(" ORDER BY created_at DESC")
             .push(" LIMIT ")
-            .push_bind(limit)
+            .push_bind(filter.limit)
             .push(" OFFSET ")
-            .push_bind(offset);
+            .push_bind(filter.offset);
         qb.build_query_as::<AgentRoleSummary>()
             .fetch_all(&self.pool)
             .await
@@ -300,19 +305,19 @@ mod tests {
     use super::*;
 
     async fn seed_role(db: &Database, id: &str, name: &str, scope: &str, client: &str, ws: &str) {
-        db.role_insert(
-            id,
-            name,
-            "desc",
-            "system prompt",
-            None,
-            None,
-            None,
-            "subagent",
-            scope,
-            client,
-            ws,
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: "desc".to_owned(),
+            system_prompt: "system prompt".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "subagent".to_owned(),
+            scope_type: scope.to_owned(),
+            client_id: client.to_owned(),
+            workspace_id: ws.to_owned(),
+        })
         .await
         .unwrap();
     }
@@ -320,19 +325,19 @@ mod tests {
     #[tokio::test]
     async fn roles_crud_and_scope() {
         let db = Database::new(":memory:").await.unwrap();
-        db.role_insert(
-            "r1",
-            "code-reviewer",
-            "代码审查角色",
-            "Review code thoroughly",
-            Some(r#"["read_file","search"]"#),
-            None,
-            Some("sonnet"),
-            "subagent",
-            "workspace",
-            "c1",
-            "w1",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "r1".to_owned(),
+            name: "code-reviewer".to_owned(),
+            description: "代码审查角色".to_owned(),
+            system_prompt: "Review code thoroughly".to_owned(),
+            tools_allow: Some(r#"["read_file","search"]"#.to_owned()),
+            tools_deny: None,
+            model_override: Some("sonnet".to_owned()),
+            mode: "subagent".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+        })
         .await
         .unwrap();
 
@@ -368,16 +373,18 @@ mod tests {
         // update
         db.role_update(
             "r1",
-            "code-reviewer-v2",
-            "新描述",
-            "New prompt",
-            Some(r#"["read_file"]"#),
-            Some(r#"["shell"]"#),
-            None,
-            "primary",
-            "global",
-            "",
-            "",
+            &RoleUpdateOpts {
+                name: "code-reviewer-v2".to_owned(),
+                description: "新描述".to_owned(),
+                system_prompt: "New prompt".to_owned(),
+                tools_allow: Some(r#"["read_file"]"#.to_owned()),
+                tools_deny: Some(r#"["shell"]"#.to_owned()),
+                model_override: None,
+                mode: "primary".to_owned(),
+                scope_type: "global".to_owned(),
+                client_id: "".to_owned(),
+                workspace_id: "".to_owned(),
+            },
         )
         .await
         .unwrap();
@@ -402,15 +409,36 @@ mod tests {
     #[tokio::test]
     async fn role_delete_clears_session_role_id() {
         let db = Database::new(":memory:").await.unwrap();
-        db.role_insert(
-            "r1", "tmp", "", "", None, None, None, "subagent", "global", "", "",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "r1".to_owned(),
+            name: "tmp".to_owned(),
+            description: "".to_owned(),
+            system_prompt: "".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "subagent".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+        })
         .await
         .unwrap();
         // 创建 workspace + session + 绑定角色
-        db.agent_create_workspace(
-            "w1", "p", "c1", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&crate::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "c1".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -435,30 +463,67 @@ mod tests {
         seed_role(&db, "w1a", "ws-role", "workspace", "c1", "w1").await;
         seed_role(&db, "w2", "other-ws", "workspace", "c1", "w2").await;
         // 一个停用的
-        db.role_insert(
-            "d1", "disabled", "", "", None, None, None, "subagent", "global", "", "",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "d1".to_owned(),
+            name: "disabled".to_owned(),
+            description: "".to_owned(),
+            system_prompt: "".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "subagent".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+        })
         .await
         .unwrap();
         db.role_toggle_enabled("d1").await.unwrap();
 
         // 全量：2 builtin + 4 seeded + 1 disabled = 7
         let all = db
-            .role_list(None, None, None, None, None, None, 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                mode: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 7);
 
         // scope 过滤
         let ws = db
-            .role_list(Some("workspace"), None, None, None, None, None, 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: Some("workspace".to_owned()),
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                mode: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(ws.len(), 2);
 
         // q 模糊
         let q = db
-            .role_list(None, None, None, Some("client"), None, None, 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: Some("client".to_owned()),
+                enabled: None,
+                mode: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(q.len(), 1);
@@ -466,34 +531,61 @@ mod tests {
 
         // enabled 过滤：7 total - 1 disabled = 6
         let en = db
-            .role_list(None, None, None, None, Some(true), None, 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: Some(true),
+                mode: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(en.len(), 6);
         let dis = db
-            .role_list(None, None, None, None, Some(false), None, 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: Some(false),
+                mode: None,
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(dis.len(), 1);
 
         // mode 过滤
-        db.role_insert(
-            "p1",
-            "primary-role",
-            "",
-            "",
-            None,
-            None,
-            None,
-            "primary",
-            "global",
-            "",
-            "",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "p1".to_owned(),
+            name: "primary-role".to_owned(),
+            description: "".to_owned(),
+            system_prompt: "".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "primary".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+        })
         .await
         .unwrap();
         let primary = db
-            .role_list(None, None, None, None, None, Some("primary"), 100, 0)
+            .role_list(&RoleListFilter {
+                scope_type: None,
+                client_id: None,
+                workspace_id: None,
+                q: None,
+                enabled: None,
+                mode: Some("primary".to_owned()),
+                limit: 100,
+                offset: 0,
+            })
             .await
             .unwrap();
         assert_eq!(primary.len(), 1);
@@ -510,17 +602,37 @@ mod tests {
         seed_role(&db, "w1a", "ws-role", "workspace", "c1", "w1").await;
         seed_role(&db, "w2", "other-ws", "workspace", "c1", "w2").await;
         // 停用的不可见
-        db.role_insert(
-            "d1", "disabled", "", "", None, None, None, "subagent", "global", "", "",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "d1".to_owned(),
+            name: "disabled".to_owned(),
+            description: "".to_owned(),
+            system_prompt: "".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "subagent".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+        })
         .await
         .unwrap();
         db.role_toggle_enabled("d1").await.unwrap();
 
         // primary 模式单独过滤
-        db.role_insert(
-            "p1", "primary", "", "", None, None, None, "primary", "global", "", "",
-        )
+        db.role_insert(&RoleInsertOpts {
+            id: "p1".to_owned(),
+            name: "primary".to_owned(),
+            description: "".to_owned(),
+            system_prompt: "".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: None,
+            mode: "primary".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: "".to_owned(),
+            workspace_id: "".to_owned(),
+        })
         .await
         .unwrap();
 

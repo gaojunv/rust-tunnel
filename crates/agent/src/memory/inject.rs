@@ -417,9 +417,18 @@ mod tests {
     ) {
         memory
             .db
-            .memory_insert(
-                id, content, scope, client, ws, "[]", 0.8, "", "manual", pinned,
-            )
+            .memory_insert(&rust_tunnel_persistence::memory::MemoryInsertOpts {
+                id: id.to_owned(),
+                content: content.to_owned(),
+                scope_type: scope.to_owned(),
+                client_id: client.to_owned(),
+                workspace_id: ws.to_owned(),
+                tags: "[]".to_owned(),
+                confidence: 0.8,
+                source_session_id: String::new(),
+                source_trigger: "manual".to_owned(),
+                pinned,
+            })
             .await
             .unwrap();
         memory
@@ -444,20 +453,20 @@ mod tests {
     async fn retrieve_scope_filter_and_order_with_helpers() {
         let db = in_memory_db().await;
         let _sess = seed_workspace_and_session(&db).await;
-        db.agent_create_workspace(
-            "ws2",
-            "ws2-name",
-            "test-client",
-            "host",
-            "/tmp",
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "ws2".to_owned(),
+            name: "ws2-name".to_owned(),
+            client_id: "test-client".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let base = super::super::mock_embedding_server(8).await;
@@ -626,20 +635,20 @@ mod tests {
             "别的",
         )
         .await;
-        db.agent_create_workspace(
-            "ws2",
-            "ws2-name",
-            "test-client",
-            "host",
-            "/tmp",
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "ws2".to_owned(),
+            name: "ws2-name".to_owned(),
+            client_id: "test-client".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .ok();
 

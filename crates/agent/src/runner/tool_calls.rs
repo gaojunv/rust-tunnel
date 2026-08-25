@@ -4,8 +4,8 @@ use super::{
     agent_result_to_text, client_supports_edit, client_supports_git_exec,
     client_supports_read_range, client_supports_search_patch, exec_group, executor, mpsc,
     persist_message, record_tool_result, roles, sse, subagent, tools, with_parent, AgentCommand,
-    AgentResult, AgentState, Arc, ChatMessage, LlmState, ParsedToolCall, SessionRuntime,
-    SubagentFuture, MIN_EDIT_CLIENT_VERSION, MIN_GIT_EXEC_CLIENT_VERSION,
+    AgentResult, AgentState, Arc, ChatMessage, LlmState, ParsedToolCall, PersistMessageOpts,
+    SessionRuntime, SubagentFuture, MIN_EDIT_CLIENT_VERSION, MIN_GIT_EXEC_CLIENT_VERSION,
     MIN_READ_RANGE_CLIENT_VERSION, MIN_SEARCH_PATCH_CLIENT_VERSION,
 };
 
@@ -49,7 +49,7 @@ pub(crate) async fn send_tool_call_delta(
 /// 保持 tool_calls 原顺序。
 /// `persist`：false 时跳过 thought/assistant 行落库（子 agent 内存态）。
 /// `llm`：task 短路需要调 LLM。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：单调用点内部函数，混合基础设施参数
 pub(crate) async fn handle_tool_calls(
     agent: &AgentState,
     llm: &Arc<LlmState>,
@@ -73,13 +73,15 @@ pub(crate) async fn handle_tool_calls(
         if persist {
             persist_message(
                 agent,
-                &rt.session_id,
-                "assistant",
-                reasoning,
-                None,
-                None,
-                Some("thought"),
-                "message",
+                PersistMessageOpts {
+                    session_id: &rt.session_id,
+                    role: "assistant",
+                    content: reasoning,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: Some("thought"),
+                    kind: "message",
+                },
             )
             .await;
         }
@@ -103,13 +105,15 @@ pub(crate) async fn handle_tool_calls(
     if persist {
         persist_message(
             agent,
-            &rt.session_id,
-            "assistant",
-            "",
-            Some(&serde_json::to_string(&raw_calls).unwrap_or_default()),
-            None,
-            None,
-            "tool_calls",
+            PersistMessageOpts {
+                session_id: &rt.session_id,
+                role: "assistant",
+                content: "",
+                tool_calls: Some(&serde_json::to_string(&raw_calls).unwrap_or_default()),
+                tool_call_id: None,
+                name: None,
+                kind: "tool_calls",
+            },
         )
         .await;
     }
@@ -378,7 +382,7 @@ pub(crate) fn synthesize_tool_diffs(
 
 /// 串行执行单个工具调用并发送 WS 帧+落库（remember/use_skill 短路、审批、写操作）。
 /// `persist`：false 时跳过 DB 落库（子 agent 内存态）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：单调用点内部函数，混合基础设施参数
 pub(crate) async fn handle_single_tool_call(
     agent: &AgentState,
     _llm: &Arc<LlmState>,

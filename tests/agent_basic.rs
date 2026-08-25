@@ -441,35 +441,37 @@ async fn setup_approval_env(
     let db = harness.server_state.db().expect("harness db");
     let root = tempfile::tempdir().expect("tempdir");
     let root_str = root.path().to_string_lossy().to_string();
-    db.agent_create_workspace(
-        "ws-approval-e2e",
-        "approval-e2e",
-        client_name,
-        "host",
-        &root_str,
-        None,
-        None,
-        "",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_server::db::agent::AgentWorkspaceCreateOpts {
+        id: "ws-approval-e2e".to_owned(),
+        name: "approval-e2e".to_owned(),
+        client_id: client_name.to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: root_str.clone(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: String::new(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .expect("create workspace");
     db.agent_update_workspace(
         "ws-approval-e2e",
-        "approval-e2e",
-        &root_str,
-        None,
-        Some("safe"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-        false,
+        &rust_tunnel_server::db::agent::AgentWorkspaceUpdateOpts {
+            name: "approval-e2e".to_owned(),
+            root_path: root_str.clone(),
+            system_prompt: None,
+            approval_mode: Some("safe".to_owned()),
+            agent_type: None,
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+            clear_overrides: false,
+            clear_tier_models: false,
+        },
     )
     .await
     .expect("set approval_mode=safe");
@@ -778,20 +780,20 @@ async fn setup_text_turn_env(
     let db = harness.server_state.db().expect("harness db");
     let root = tempfile::tempdir().expect("tempdir");
     let root_str = root.path().to_string_lossy().to_string();
-    db.agent_create_workspace(
-        "ws-retry-e2e",
-        "retry-e2e",
-        client_name,
-        "host",
-        &root_str,
-        None,
-        None,
-        "",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_server::db::agent::AgentWorkspaceCreateOpts {
+        id: "ws-retry-e2e".to_owned(),
+        name: "retry-e2e".to_owned(),
+        client_id: client_name.to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: root_str.clone(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: String::new(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .expect("create workspace");
     let session_id = "sess-retry-e2e";

@@ -623,19 +623,20 @@ pub fn sanitize_request_body(body: &serde_json::Value) -> serde_json::Value {
 /// `request_body` 是发往上游的完整请求体，原样落地、不截断不简化——
 /// 该日志用于排查上游兼容问题，看不到正文就没有意义。
 /// 4xx/5xx 详细错误日志由 upstream.rs 的 llm_upstream/llm_upstream_debug 负责，不受此开关影响。
-#[allow(clippy::too_many_arguments)]
-pub async fn log_llm_request(
-    llm: &LlmState,
-    protocol: &str,
-    model: &str,
-    message_count: usize,
-    has_tools: bool,
-    stream: bool,
-    status: Option<u16>,
-    error: Option<&str>,
-    elapsed_ms: u128,
-    request_body: &serde_json::Value,
-) {
+/// `log_llm_request` 参数包（批次 9d 收敛 too_many_arguments）：纯数据参数。
+pub struct LogLlmRequestOpts {
+    pub protocol: String,
+    pub model: String,
+    pub message_count: usize,
+    pub has_tools: bool,
+    pub stream: bool,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+    pub elapsed_ms: u128,
+    pub request_body: serde_json::Value,
+}
+
+pub async fn log_llm_request(llm: &LlmState, opts: &LogLlmRequestOpts) {
     if !llm
         .request_logging
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -646,15 +647,15 @@ pub async fn log_llm_request(
     // 裸字段走 record_debug 会被丢弃（之前日志里只剩 protocol/model/error 就是这个原因）。
     tracing::info!(
         target: "llm_request",
-        protocol = %protocol,
-        model = %model,
-        message_count = %message_count,
-        has_tools = %has_tools,
-        stream = %stream,
-        status = %status.map_or(0, i64::from),
-        error = %error.unwrap_or(""),
-        elapsed_ms = %elapsed_ms,
-        request_body = %sanitize_request_body(request_body),
+        protocol = %opts.protocol,
+        model = %opts.model,
+        message_count = %opts.message_count,
+        has_tools = %opts.has_tools,
+        stream = %opts.stream,
+        status = %opts.status.map_or(0, i64::from),
+        error = %opts.error.as_deref().unwrap_or(""),
+        elapsed_ms = %opts.elapsed_ms,
+        request_body = %sanitize_request_body(&opts.request_body),
         "LLM request"
     );
 }
@@ -705,15 +706,17 @@ mod tests {
         let body = serde_json::json!({"model": "gpt-4", "messages": []});
         log_llm_request(
             &state,
-            "openai",
-            "gpt-4",
-            1,
-            false,
-            false,
-            Some(200),
-            None,
-            10,
-            &body,
+            &LogLlmRequestOpts {
+                protocol: "openai".to_owned(),
+                model: "gpt-4".to_owned(),
+                message_count: 1,
+                has_tools: false,
+                stream: false,
+                status: Some(200),
+                error: None,
+                elapsed_ms: 10,
+                request_body: body,
+            },
         )
         .await;
     }
@@ -776,15 +779,17 @@ mod tests {
             serde_json::json!({"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]});
         log_llm_request(
             &state,
-            "openai",
-            "gpt-4",
-            1,
-            false,
-            false,
-            Some(200),
-            None,
-            10,
-            &body,
+            &LogLlmRequestOpts {
+                protocol: "openai".to_owned(),
+                model: "gpt-4".to_owned(),
+                message_count: 1,
+                has_tools: false,
+                stream: false,
+                status: Some(200),
+                error: None,
+                elapsed_ms: 10,
+                request_body: body,
+            },
         )
         .await;
     }

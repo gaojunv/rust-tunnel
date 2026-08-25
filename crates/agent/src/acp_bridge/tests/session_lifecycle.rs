@@ -32,20 +32,20 @@ async fn test_ensure_session_restores_persisted_pending() {
     // 落库失败的纯内存降级项（persist_id=None）保留在队尾，不与 DB 行重复。
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)
@@ -101,20 +101,20 @@ async fn test_spawn_failure_persisted_with_stage_attribution() {
     // spawn 失败（llm_proxy 阶段：客户端离线）→ 归因带 stage 前缀持久化到
     // agent_sessions.last_spawn_error，重启后仍可追溯。
     let db = Database::new(":memory:").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "ghost",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        Some("model-1"),
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "ghost".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: Some("model-1".to_owned()),
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, None)
@@ -187,20 +187,20 @@ async fn test_ensure_session_session_model_passes_gate() {
     // 路径（此处 LLM 代理绑定失败 → 错误是 bind，而非「未配置」）。
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))

@@ -172,7 +172,7 @@ impl SharedListener {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：tokio::spawn 闭包，纯基础设施参数
 async fn handle_one_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,

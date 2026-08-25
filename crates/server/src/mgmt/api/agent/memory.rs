@@ -471,16 +471,16 @@ pub async fn list_memories(
     let offset = params.offset.unwrap_or(0).max(0);
     let rows = match mem
         .db
-        .memory_list(
-            params.scope.as_deref(),
-            params.client_id.as_deref(),
-            params.workspace_id.as_deref(),
-            params.q.as_deref(),
-            params.pinned,
-            params.sort.as_deref(),
+        .memory_list(&rust_tunnel_persistence::memory::MemoryListFilter {
+            scope_type: params.scope.clone(),
+            client_id: params.client_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            q: params.q.clone(),
+            pinned: params.pinned,
+            order: params.sort.clone(),
             limit,
             offset,
-        )
+        })
         .await
     {
         Ok(r) => r,
@@ -529,18 +529,18 @@ pub async fn create_memory(
     let content = body.content.trim();
     if let Err(e) = mem
         .db
-        .memory_insert(
-            &id,
-            content,
-            &scope_type,
-            &client_id,
-            &workspace_id,
-            &tags,
-            1.0,
-            "",
-            "manual",
-            false,
-        )
+        .memory_insert(&rust_tunnel_persistence::memory::MemoryInsertOpts {
+            id: id.clone(),
+            content: content.to_owned(),
+            scope_type: scope_type.clone(),
+            client_id: client_id.clone(),
+            workspace_id: workspace_id.clone(),
+            tags: tags.clone(),
+            confidence: 1.0,
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+            pinned: false,
+        })
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
@@ -1547,9 +1547,20 @@ mod tests {
         let state = test_api_state(dir.path()).await;
         let db = state.server_state.db().unwrap().clone();
         // 先建 workspace + session（agent_sessions 有到 agent_workspaces 的 FK）
-        db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "w".to_owned(),
+            client_id: "c1".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)

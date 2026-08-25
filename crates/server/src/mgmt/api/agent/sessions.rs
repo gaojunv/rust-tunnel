@@ -478,9 +478,20 @@ mod tests {
     #[tokio::test]
     async fn test_session_lifecycle() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
 
@@ -529,9 +540,20 @@ mod tests {
     #[tokio::test]
     async fn test_list_messages_pagination_api() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -629,9 +651,20 @@ mod tests {
     #[tokio::test]
     async fn test_list_messages_limit_clamped_to_500() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -663,9 +696,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model_endpoint() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -717,9 +761,20 @@ mod tests {
     #[tokio::test]
     async fn test_export_session_markdown() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s-export", "w1", Some("导出测试"), Some("m1"))
@@ -734,17 +789,17 @@ mod tests {
             .await
             .unwrap();
         // 思考（name=thought）
-        db.agent_add_message_v2(
-            "m3",
-            "s-export",
-            "assistant",
-            "先列目录",
-            None,
-            None,
-            Some("thought"),
-            "message",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "m3".to_owned(),
+            session_id: "s-export".to_owned(),
+            role: "assistant".to_owned(),
+            content: "先列目录".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: Some("thought".to_owned()),
+            kind: "message".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         // 工具调用
@@ -770,19 +825,11 @@ mod tests {
         .await
         .unwrap();
         // 计划
-        db.agent_add_message_v2(
-            "m6", "s-export", "assistant",
-            r#"[{"content":"第一步","status":"completed"},{"content":"第二步","status":"pending"}]"#,
-            None, None, Some("plan"), "message", None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m6".to_owned(), session_id: "s-export".to_owned(), role: "assistant".to_owned(), content: r#"[{"content":"第一步","status":"completed"},{"content":"第二步","status":"pending"}]"#.to_owned(), tool_calls: None, tool_call_id: None, name: Some("plan".to_owned()), kind: "message".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
         // 附件
-        db.agent_add_message_v2(
-            "m7", "s-export", "assistant",
-            r#"{"type":"attachment","media_kind":"image","name":"shot.png","uri":"file:///tmp/shot.png","mime":"image/png"}"#,
-            None, None, Some("attachment"), "message", None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts { id: "m7".to_owned(), session_id: "s-export".to_owned(), role: "assistant".to_owned(), content: r#"{"type":"attachment","media_kind":"image","name":"shot.png","uri":"file:///tmp/shot.png","mime":"image/png"}"#.to_owned(), tool_calls: None, tool_call_id: None, name: Some("attachment".to_owned()), kind: "message".to_owned(), parent_tool_call_id: None })
         .await
         .unwrap();
 

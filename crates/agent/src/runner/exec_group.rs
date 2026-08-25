@@ -57,7 +57,7 @@ pub async fn exec_readonly_group(
 
 /// 执行单个只读工具调用并返回结果文本（不抢 workspace_lock）。
 /// 解析错误/版本不足/docker 未启动等失败折叠为错误文本（与串行路径一致）。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：单调用点内部函数，混合基础设施参数
 async fn exec_readonly_one(
     agent: &AgentState,
     client_id: &str,

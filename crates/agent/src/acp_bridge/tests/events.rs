@@ -345,20 +345,20 @@ async fn test_cancel_then_immediate_new_prompt_not_suppressed() {
 async fn test_acp_events_persisted_to_db() {
     let db = Database::new(":memory:").await.unwrap();
     db.save_server_auth("secret").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
@@ -440,20 +440,20 @@ async fn test_flush_preserves_thought_before_text() {
     // 保持 thought 在正文之前。旧实现 text_buf/thought_buf 独立缓冲 + flush
     // 硬编码先正文后思考，DB rowid 反了 → 刷新后思考卡与回复顺序颠倒。
     let db = Database::new(":memory:").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))
@@ -514,20 +514,20 @@ async fn test_flush_preserves_interleaved_thought_text() {
     // 交错变体：正文先出、再思考、再正文（无工具边界）。每段独立落行，
     // 顺序严格按到达顺序保持，不能按类型归并重排。
     let db = Database::new(":memory:").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-2", "w1", None, Some("gpt-4o"))
@@ -576,20 +576,20 @@ async fn test_turn_segments_split_by_parent() {
     // 主 agent 文本与子 agent 文本交错到达：同一缓冲段内混入不同 parent 的
     // chunk 必须在 parent 变化处切分 segment，保证每行消息的父归属正确。
     let db = Database::new(":memory:").await.unwrap();
-    db.agent_create_workspace(
-        "w1",
-        "proj",
-        "nas",
-        "host",
-        "/workspace",
-        None,
-        None,
-        "gemini",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "w1".to_owned(),
+        name: "proj".to_owned(),
+        client_id: "nas".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/workspace".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "gemini".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .unwrap();
     db.agent_create_session("sess-1", "w1", None, Some("gpt-4o"))

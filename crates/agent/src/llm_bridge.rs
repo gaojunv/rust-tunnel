@@ -265,20 +265,20 @@ mod tests {
 
     /// 造 session → workspace(llm_model_id) → model → provider 全链路。
     async fn seed_configured_session(db: &Database, session_id: &str, model_id: &str) {
-        db.agent_create_workspace(
-            "w1",
-            "proj",
-            "nas",
-            "host",
-            "/workspace",
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/workspace".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_set_workspace_llm_model_id("w1", model_id)
@@ -336,20 +336,20 @@ mod tests {
     #[tokio::test]
     async fn test_forward_workspace_without_model_id_returns_502_done() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1",
-            "proj",
-            "nas",
-            "host",
-            "/workspace",
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/workspace".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("sess-1", "w1", None, None)

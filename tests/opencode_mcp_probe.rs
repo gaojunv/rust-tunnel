@@ -44,20 +44,20 @@ async fn opencode_mcp_inject_probe() {
             std::path::Path::new(&opencode_path).exists(),
             "opencode binary missing"
         );
-        db.agent_create_workspace(
-            "ws-oc",
-            "oc-probe",
-            "opencode-probe",
-            "host",
-            &root.path().to_string_lossy(),
-            None,
-            None,
-            "opencode",
-            Some(&opencode_path),
-            Some("fake-model-gate"), // 仅过门禁；本探针不跑回合
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_server::db::agent::AgentWorkspaceCreateOpts {
+            id: "ws-oc".to_owned(),
+            name: "oc-probe".to_owned(),
+            client_id: "opencode-probe".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: root.path().to_string_lossy().into_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "opencode".to_owned(),
+            agent_path: Some(opencode_path.clone()),
+            llm_model_id: Some("fake-model-gate".to_owned()), // 仅过门禁；本探针不跑回合
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .expect("create workspace");
         let ws = db

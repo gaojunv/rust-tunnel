@@ -27,7 +27,7 @@ use super::super::{ApproveFn, ElicitFn};
 /// approval 完成，或 `conn_rx` 变为 ≠ 捕获值（连接断开/重连 → 审批帧缓冲在
 /// 无人消费的旧 channel 里、新重连也收不到）→ 返回 `Denied`，避免
 /// `request_approval` 等满 5 分钟超时阻塞 agent 的下一个工具调用。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：混合基础设施参数（Arc 回调+channel），不适合 Opts 化
 pub(crate) async fn approve_or_disconnect(
     approval: Arc<ApproveFn>,
     sid: String,
@@ -56,7 +56,7 @@ pub(crate) async fn approve_or_disconnect(
 /// 独立成函数便于单元测试）。表单等待期间连接断开/重连（conn_rx 变为 ≠ 捕获的
 /// conn_id）→ 立即 `Cancel`，避免 `request_elicitation` 等满 5 分钟超时阻塞
 /// agent 的下一个工具调用。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：混合基础设施参数（Arc 回调+channel），不适合 Opts 化
 pub(crate) async fn elicit_or_disconnect(
     elicitation: Arc<ElicitFn>,
     sid: String,

@@ -128,20 +128,20 @@ pub async fn create_workspace(
     let id = new_id();
     match agent
         .db
-        .agent_create_workspace(
-            &id,
-            &body.name,
-            &body.client_id,
-            &body.runtime_type,
-            &body.root_path,
-            body.docker_image.as_deref(),
-            body.docker_container_id.as_deref(),
-            &body.agent_type,
-            agent_path,
-            llm_model_id,
-            agent_config_overrides,
-            claude_tier_models,
-        )
+        .agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: id.clone(),
+            name: body.name.clone(),
+            client_id: body.client_id.clone(),
+            runtime_type: body.runtime_type.clone(),
+            root_path: body.root_path.clone(),
+            docker_image: body.docker_image.clone(),
+            docker_container_id: body.docker_container_id.clone(),
+            agent_type: body.agent_type.clone(),
+            agent_path: agent_path.map(str::to_owned),
+            llm_model_id: llm_model_id.map(str::to_owned),
+            agent_config_overrides: agent_config_overrides.map(str::to_owned),
+            claude_tier_models: claude_tier_models.map(str::to_owned),
+        })
         .await
     {
         Ok(()) => {
@@ -266,17 +266,19 @@ pub async fn update_workspace(
         .db
         .agent_update_workspace(
             &id,
-            &body.name,
-            &body.root_path,
-            system_prompt,
-            body.approval_mode.as_deref(),
-            body.agent_type.as_deref(),
-            agent_path,
-            llm_model_id,
-            agent_config_overrides,
-            claude_tier_models,
-            clear_overrides,
-            clear_tier_models,
+            &rust_tunnel_persistence::agent::AgentWorkspaceUpdateOpts {
+                name: body.name.clone(),
+                root_path: body.root_path.clone(),
+                system_prompt: system_prompt.map(str::to_owned),
+                approval_mode: body.approval_mode.clone(),
+                agent_type: body.agent_type.clone(),
+                agent_path: agent_path.map(str::to_owned),
+                llm_model_id: llm_model_id.map(str::to_owned),
+                agent_config_overrides: agent_config_overrides.map(str::to_owned),
+                claude_tier_models: claude_tier_models.map(str::to_owned),
+                clear_overrides,
+                clear_tier_models,
+            },
         )
         .await
     {
@@ -1307,9 +1309,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_acp_fields() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let resp = update_workspace(
@@ -1423,9 +1436,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_github_keep_or_replace() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_set_workspace_github("w1", Some("ghp_existing"), Some("octo"), Some("repo"))
@@ -1499,20 +1523,20 @@ mod tests {
         // COALESCE 语义：缺省 ACP 字段（None）保持原值；agent_path/llm_model_id
         // 空串归一化为 None → 同样保持原值（本迭代不支持清空，见 brief）。
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "host",
-            "/p",
-            None,
-            None,
-            "gemini",
-            Some("/opt/gemini"),
-            Some("model-1"),
-            None,
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: Some("/opt/gemini".to_owned()),
+            llm_model_id: Some("model-1".to_owned()),
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let resp = update_workspace(
@@ -1546,9 +1570,20 @@ mod tests {
     async fn test_update_workspace_clears_agent_type_to_builtin() {
         // agent_type 空串合法：从 ACP 引擎切回内置 runner（与 path/model 不同，可清空）。
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "gemini", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let resp = update_workspace(
@@ -1657,20 +1692,20 @@ mod tests {
         // create 带 overrides 的 workspace → update 不传字段保持原值 → 传 "{}" 清空
         // → 传非法 JSON 400（断言经读库验证）。
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "host",
-            "/p",
-            None,
-            None,
-            "gemini",
-            None,
-            None,
-            Some(r#"{"mode":"plan"}"#),
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: Some(r#"{"mode":"plan"}"#.to_owned()),
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -1762,20 +1797,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_config_overrides_null_clears() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "host",
-            "/p",
-            None,
-            None,
-            "gemini",
-            None,
-            None,
-            Some(r#"{"mode":"plan"}"#),
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: Some(r#"{"mode":"plan"}"#.to_owned()),
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let ws = db.agent_get_workspace("w1").await.unwrap().unwrap();
@@ -1898,20 +1933,20 @@ mod tests {
         // 与 agent_config_overrides 同三态语义：省略（None）保持、显式 null / 空串
         // 清空（DB 列设为 NULL）、非空值写入、非法值 400 且原值不变。
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "host",
-            "/p",
-            None,
-            None,
-            "claude-code",
-            None,
-            None,
-            None,
-            Some(r#"{"opus":"model:x"}"#),
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "claude-code".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: Some(r#"{"opus":"model:x"}"#.to_owned()),
+        })
         .await
         .unwrap();
         let mk_update = |tier: Option<Option<String>>| UpdateWorkspaceRequest {
@@ -2029,20 +2064,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_workspace_empty_string_keeps_existing_value() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1",
-            "p",
-            "nas",
-            "host",
-            "/p",
-            None,
-            None,
-            "gemini",
-            Some("/opt/agent"),
-            Some("model-1"),
-            Some(r#"{"mode":"plan"}"#),
-            None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: Some("/opt/agent".to_owned()),
+            llm_model_id: Some("model-1".to_owned()),
+            agent_config_overrides: Some(r#"{"mode":"plan"}"#.to_owned()),
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let resp = update_workspace(
@@ -2096,9 +2131,20 @@ mod tests {
     #[tokio::test]
     async fn test_list_workspace_files_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 客户端不在线（未注册任何客户端到 registry）：exec_on_client 隧道层
@@ -2190,9 +2236,20 @@ mod tests {
     #[tokio::test]
     async fn test_fs_endpoints_client_offline_returns_503() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 客户端离线：所有面板端点统一 503（前端据此显示「客户端离线」而非空态）。
@@ -2281,9 +2338,20 @@ mod tests {
     #[tokio::test]
     async fn test_fs_file_requires_path() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let resp = get_fs_file(
@@ -2299,9 +2367,20 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_safe_mode_needs_approval_409() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 默认 approval_mode = safe：WriteFile 需确认。未确认 → 409 needs_approval，
@@ -2342,24 +2421,37 @@ mod tests {
     #[tokio::test]
     async fn test_put_fs_file_full_auto_skips_approval() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_update_workspace(
             "w1",
-            "proj",
-            "/p",
-            None,
-            Some("full_auto"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &rust_tunnel_persistence::agent::AgentWorkspaceUpdateOpts {
+                name: "proj".to_owned(),
+                root_path: "/p".to_owned(),
+                system_prompt: None,
+                approval_mode: Some("full_auto".to_owned()),
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -2421,9 +2513,20 @@ mod tests {
     #[tokio::test]
     async fn test_git_read_old_client_409_upgrade() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         register_client(&state, &db, "nas", Some("0.4.0")).await;
@@ -2443,9 +2546,20 @@ mod tests {
     async fn test_git_read_new_client_offline_after_exec_503() {
         // 客户端在线（0.5.0）但隧道执行失败（无人消费控制通道 → 超时）→ 503。
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         register_client(&state, &db, "nas", Some("0.5.0")).await;
@@ -2458,9 +2572,20 @@ mod tests {
     #[tokio::test]
     async fn test_git_write_safe_mode_approval_flow() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 默认 approval_mode=safe：git commit 属 SafeWrite → 未确认 409 needs_approval
@@ -2499,24 +2624,37 @@ mod tests {
     #[tokio::test]
     async fn test_git_write_dangerous_auto_write_approval() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_update_workspace(
             "w1",
-            "proj",
-            "/p",
-            None,
-            Some("auto_write"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &rust_tunnel_persistence::agent::AgentWorkspaceUpdateOpts {
+                name: "proj".to_owned(),
+                root_path: "/p".to_owned(),
+                system_prompt: None,
+                approval_mode: Some("auto_write".to_owned()),
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -2570,9 +2708,20 @@ mod tests {
     #[tokio::test]
     async fn test_git_write_plan_validation_400() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 路径注入在 plan 阶段 fail-closed → 400（不触碰隧道）
@@ -2617,9 +2766,20 @@ mod tests {
     #[tokio::test]
     async fn test_git_write_old_client_409_upgrade() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         register_client(&state, &db, "nas", Some("0.4.0")).await;
@@ -2644,9 +2804,20 @@ mod tests {
     #[tokio::test]
     async fn test_git_write_empty_body_pull() {
         let (state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         // 空 body（无 JSON）也能解出 GitApprovedBody（approved=None）

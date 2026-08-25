@@ -9,7 +9,7 @@ impl Database {
     // ============================================================
 
     /// Save or update a proxy rule
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（16 处调用点），Opts 化成本高
     pub async fn save_proxy_rule(
         &self,
         id: &str,

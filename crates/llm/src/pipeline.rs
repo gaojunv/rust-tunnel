@@ -17,6 +17,7 @@ use super::router::{resolve_with_failover, CandidateChain};
 use super::usage::UsageContext;
 #[cfg(feature = "rag")]
 use super::ChatMessage;
+use super::LogLlmRequestOpts;
 use super::{ChatCompletionRequest, LlmState};
 use rust_tunnel_persistence::Database;
 
@@ -200,7 +201,7 @@ pub enum ResponsePostProcess {
 ///
 /// 调用方负责协议特有的请求解析与 RAG/compat 改写（`PreparedRequest` 已含最终内容），
 /// 本函数只做与协议无关的执行与出账。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：内部执行函数，混合基础设施参数（state/chain/ctx/db）
 pub async fn run_execution(
     state: &LlmHandlerState,
     protocol: &'static str,
@@ -251,15 +252,17 @@ pub async fn run_execution(
     };
     super::log_llm_request(
         &state.llm,
-        protocol,
-        &request.model,
-        message_count,
-        has_tools,
-        request.stream,
-        None,
-        None,
-        0,
-        &log_body,
+        &LogLlmRequestOpts {
+            protocol: protocol.to_owned(),
+            model: request.model.clone(),
+            message_count,
+            has_tools,
+            stream: request.stream,
+            status: None,
+            error: None,
+            elapsed_ms: 0,
+            request_body: log_body.clone(),
+        },
     )
     .await;
     let outcome = super::upstream::execute_with_failover(
@@ -290,16 +293,17 @@ pub async fn run_execution(
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,
-                protocol,
-                &ctx.model_name,
-                message_count,
-                has_tools,
-                request.stream,
-                Some(200),
-                None,
-                elapsed_ms,
-                // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
-                &serde_json::Value::Null,
+                &LogLlmRequestOpts {
+                    protocol: protocol.to_owned(),
+                    model: ctx.model_name.clone(),
+                    message_count,
+                    has_tools,
+                    stream: request.stream,
+                    status: Some(200),
+                    error: None,
+                    elapsed_ms,
+                    request_body: serde_json::Value::Null,
+                },
             )
             .await;
             // 直通成功：响应已是 Anthropic 格式，跳过 compat 伪工具重写与
@@ -343,16 +347,17 @@ pub async fn run_execution(
             let elapsed_ms = started.elapsed().as_millis();
             super::log_llm_request(
                 &state.llm,
-                protocol,
-                &request.model,
-                message_count,
-                has_tools,
-                request.stream,
-                Some(status.as_u16()),
-                Some(&msg),
-                elapsed_ms,
-                // 完整请求体只在发送前日志落一次（sanitized），结果日志不重复
-                &serde_json::Value::Null,
+                &LogLlmRequestOpts {
+                    protocol: protocol.to_owned(),
+                    model: request.model.clone(),
+                    message_count,
+                    has_tools,
+                    stream: request.stream,
+                    status: Some(status.as_u16()),
+                    error: Some(msg.clone()),
+                    elapsed_ms,
+                    request_body: serde_json::Value::Null,
+                },
             )
             .await;
             // 记录失败请求到用量日志，确保请求明细中可见

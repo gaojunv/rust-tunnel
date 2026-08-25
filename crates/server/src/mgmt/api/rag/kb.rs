@@ -177,20 +177,20 @@ pub async fn create_kb(
     let id = uuid::Uuid::new_v4().to_string();
     if let Err(e) = rt
         .db
-        .rag_create_kb(
-            &id,
-            &body.name,
-            &body.description,
-            &emb_base_url,
-            &emb_api_key,
-            &emb_model,
-            emb_dimension,
-            top_k,
-            chunk_size,
-            chunk_overlap,
-            score_threshold,
-            enabled,
-        )
+        .rag_create_kb(&rust_tunnel_persistence::rag::RagCreateKbOpts {
+            id: id.clone(),
+            name: body.name.clone(),
+            description: body.description.clone(),
+            emb_base_url: emb_base_url.clone(),
+            emb_api_key: emb_api_key.clone(),
+            emb_model: emb_model.clone(),
+            emb_dimension: emb_dimension,
+            top_k: top_k,
+            chunk_size: chunk_size,
+            chunk_overlap: chunk_overlap,
+            score_threshold: score_threshold,
+            enabled: enabled,
+        })
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
@@ -294,12 +294,14 @@ pub async fn update_kb(
             .db
             .rag_update_kb_params(
                 &id,
-                &body.name,
-                &body.description,
-                top_k,
-                chunk_size,
-                chunk_overlap,
-                score_threshold,
+                &rust_tunnel_persistence::rag::RagUpdateKbParamsOpts {
+                    name: body.name.clone(),
+                    description: body.description.clone(),
+                    top_k: top_k,
+                    chunk_size: chunk_size,
+                    chunk_overlap: chunk_overlap,
+                    score_threshold: score_threshold,
+                },
             )
             .await
         {
@@ -324,16 +326,18 @@ pub async fn update_kb(
         .db
         .rag_update_kb_full(
             &id,
-            &body.name,
-            &body.description,
-            top_k,
-            chunk_size,
-            chunk_overlap,
-            score_threshold,
-            &new_base,
-            &new_api_key_enc,
-            &new_model,
-            new_dim,
+            &rust_tunnel_persistence::rag::RagUpdateKbFullOpts {
+                name: body.name.clone(),
+                description: body.description.clone(),
+                top_k: top_k,
+                chunk_size: chunk_size,
+                chunk_overlap: chunk_overlap,
+                score_threshold: score_threshold,
+                emb_base_url: new_base.clone(),
+                emb_api_key: new_api_key_enc.clone(),
+                emb_model: new_model.clone(),
+                emb_dimension: new_dim,
+            },
         )
         .await
     {

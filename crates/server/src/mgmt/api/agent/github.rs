@@ -511,9 +511,20 @@ mod tests {
         repo: Option<&str>,
     ) -> String {
         let id = "w1".to_string();
-        db.agent_create_workspace(
-            &id, "proj", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: id.clone(),
+            name: "proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: String::new(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_set_workspace_github(&id, token, owner, repo)

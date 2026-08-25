@@ -32,20 +32,20 @@ async fn seed_workspace(
     overrides: Option<&str>,
 ) -> rust_tunnel_server::db::agent::AgentWorkspaceRecord {
     let db = harness.server_state.db().expect("db").clone();
-    db.agent_create_workspace(
-        "ws-acp",
-        "acp-probe",
-        client_id,
-        "host",
-        &root.to_string_lossy(),
-        None,
-        None,
-        "claude-code",
-        Some("/usr/local/bin/claude-code-acp"),
-        Some("fake-model-gate"), // 仅过门禁；本探针不跑回合
-        overrides,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_server::db::agent::AgentWorkspaceCreateOpts {
+        id: "ws-acp".to_owned(),
+        name: "acp-probe".to_owned(),
+        client_id: client_id.to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: root.to_string_lossy().into_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "claude-code".to_owned(),
+        agent_path: Some("/usr/local/bin/claude-code-acp".to_owned()),
+        llm_model_id: Some("fake-model-gate".to_owned()), // 仅过门禁；本探针不跑回合
+        agent_config_overrides: overrides.map(|s| s.to_owned()),
+        claude_tier_models: None,
+    })
     .await
     .expect("create workspace");
     db.agent_get_workspace("ws-acp")

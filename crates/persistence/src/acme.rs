@@ -9,7 +9,7 @@ impl Database {
     // ============================================================
 
     /// Save or update an ACME certificate
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（25 处调用点），Opts 化成本高
     pub async fn save_acme_certificate(
         &self,
         domain: &str,

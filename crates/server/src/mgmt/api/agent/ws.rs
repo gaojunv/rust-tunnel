@@ -967,17 +967,19 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             .db
                             .agent_update_workspace(
                                 &ws.id,
-                                &ws.name,
-                                &ws.root_path,
-                                None,
-                                Some(&mode),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                false,
-                                false,
+                                &rust_tunnel_persistence::agent::AgentWorkspaceUpdateOpts {
+                                    name: ws.name.clone(),
+                                    root_path: ws.root_path.clone(),
+                                    system_prompt: None,
+                                    approval_mode: Some(mode.clone()),
+                                    agent_type: None,
+                                    agent_path: None,
+                                    llm_model_id: None,
+                                    agent_config_overrides: None,
+                                    claude_tier_models: None,
+                                    clear_overrides: false,
+                                    clear_tier_models: false,
+                                },
                             )
                             .await
                         {
@@ -1373,10 +1375,7 @@ async fn handle_agent_socket(state: ApiState, socket: WebSocket, session_id: Str
                             WsFrame::SetMode { mode } => {
                                 if let Some(agent) = state.server_state.agent_state.as_ref() {
                                     if let Ok(Some(ws)) = load_workspace_for_session(&agent.db, &session_id).await {
-                                        let _ = agent.db.agent_update_workspace(
-                                            &ws.id, &ws.name, &ws.root_path,
-                                            None, Some(&mode), None, None, None, None, None, false, false,
-                                        ).await;
+                                        let _ = agent.db.agent_update_workspace(&ws.id, &rust_tunnel_persistence::agent::AgentWorkspaceUpdateOpts { name: ws.name.clone(), root_path: ws.root_path.clone(), system_prompt: None, approval_mode: Some(mode.clone()), agent_type: None, agent_path: None, llm_model_id: None, agent_config_overrides: None, claude_tier_models: None, clear_overrides: false, clear_tier_models: false }).await;
                                     }
                                 }
                                 let _ = event_tx.send(serde_json::json!({"type": "mode_updated", "mode": &mode})).await;
@@ -1775,9 +1774,20 @@ mod tests {
         // 评审 Finding 3：session/workspace「不存在」是 Ok(None)（可回退 runner），
         // 与读库错误 Err 区分开——后者不应静默落到自研 runner（用错引擎）。
         let (_state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1808,9 +1818,20 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_session_state_applies_patched_model() {
         let (_state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -1847,27 +1868,38 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_session_state_role_and_model_override() {
         let (_state, db) = test_state().await;
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
             .await
             .unwrap();
-        db.role_insert(
-            "r1",
-            "reviewer",
-            "代码评审",
-            "prompt",
-            None,
-            None,
-            Some("role-model-x"),
-            "primary",
-            "global",
-            "",
-            "",
-        )
+        db.role_insert(&rust_tunnel_persistence::roles::RoleInsertOpts {
+            id: "r1".to_owned(),
+            name: "reviewer".to_owned(),
+            description: "代码评审".to_owned(),
+            system_prompt: "prompt".to_owned(),
+            tools_allow: None,
+            tools_deny: None,
+            model_override: Some("role-model-x".to_owned()),
+            mode: "primary".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
+        })
         .await
         .unwrap();
 

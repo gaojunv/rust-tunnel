@@ -232,16 +232,16 @@ pub async fn list_skills(
     let offset = params.offset.unwrap_or(0).max(0);
     let rows = match mem
         .db
-        .skill_list(
-            params.scope.as_deref(),
-            params.client_id.as_deref(),
-            params.workspace_id.as_deref(),
-            params.q.as_deref(),
-            params.enabled,
-            params.sort.as_deref(),
+        .skill_list(&rust_tunnel_persistence::skills::SkillListFilter {
+            scope_type: params.scope.clone(),
+            client_id: params.client_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            q: params.q.clone(),
+            enabled: params.enabled,
+            sort: params.sort.clone(),
             limit,
             offset,
-        )
+        })
         .await
     {
         Ok(r) => r,
@@ -291,15 +291,17 @@ pub async fn create_skill(
         scope_coords(scope, &body.client_id, &body.workspace_id);
     match crate::agent::skill::upsert_skill_with_dedup(
         &mem,
-        name,
-        description,
-        content,
-        &scope_type,
-        &client_id,
-        &workspace_id,
-        &body.tags,
-        "",
-        "manual",
+        crate::agent::skill::UpsertSkillOpts {
+            name,
+            description,
+            content,
+            scope_type: &scope_type,
+            client_id: &client_id,
+            workspace_id: &workspace_id,
+            tags: &body.tags,
+            source_session_id: "",
+            source_trigger: "manual",
+        },
     )
     .await
     {
@@ -392,13 +394,15 @@ pub async fn update_skill(
         .db
         .skill_update(
             &id,
-            &normalized_name,
-            description,
-            content,
-            &tags_json,
-            &scope_type,
-            &client_id,
-            &workspace_id,
+            &rust_tunnel_persistence::skills::SkillUpdateOpts {
+                name: normalized_name.clone(),
+                description: description.to_owned(),
+                content: content.to_owned(),
+                tags: tags_json.clone(),
+                scope_type: scope_type.clone(),
+                client_id: client_id.clone(),
+                workspace_id: workspace_id.clone(),
+            },
         )
         .await
     {

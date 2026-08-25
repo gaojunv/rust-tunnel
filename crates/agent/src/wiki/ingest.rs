@@ -46,7 +46,7 @@ const WIKI_EXTRACT_PROMPT: &str = r#"你是文档结构化抽取器。把以下 
 /// ready/failed 事件；`catch_unwind` 兜底 panic→failed（照 `rag/ingest.rs`）。
 ///
 /// `sem` 为可选并发信号量：调用方注入 `Some(Arc<Semaphore(2)>)` 限流；`None` 不限。
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // 保留：tokio::spawn 闭包 8 参，混合基础设施参数
 pub fn spawn_wiki_ingest(
     db: Database,
     llm: LlmState,

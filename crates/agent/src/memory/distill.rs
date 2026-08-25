@@ -228,15 +228,17 @@ async fn do_distill(memory: MemoryState, snapshot: DistillSnapshot, trigger: Str
                 super::scope_coords(&skill.scope, &snapshot.client_id, &snapshot.workspace_id);
             match crate::skill::upsert_skill_with_dedup(
                 &memory,
-                &skill.name,
-                &skill.description,
-                &skill.content,
-                &scope_type,
-                &client_id,
-                &workspace_id,
-                &skill.tags,
-                &snapshot.session_id,
-                &trigger,
+                crate::skill::UpsertSkillOpts {
+                    name: &skill.name,
+                    description: &skill.description,
+                    content: &skill.content,
+                    scope_type: &scope_type,
+                    client_id: &client_id,
+                    workspace_id: &workspace_id,
+                    tags: &skill.tags,
+                    source_session_id: &snapshot.session_id,
+                    source_trigger: &trigger,
+                },
             )
             .await
             {
@@ -893,9 +895,20 @@ mod tests {
         // LlmState::new(None, None) 无 DB → resolve_with_failover 失败 → failed 事件。
         // 覆盖「LLM 失败静默降级 + 事件广播」路径。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("no-such-model"))
@@ -934,9 +947,20 @@ mod tests {
         // 门闸回归：skill_enabled=1（enabled=0、无 embedding）也应触发蒸馏——
         // Skill 蒸馏仅需 LLM，不依赖 embedding。事件照常广播（LLM 不可达 → failed）。
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("no-such-model"))

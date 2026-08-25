@@ -177,6 +177,50 @@ pub struct AgentMessageRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentWorkspaceCreateOpts {
+    pub id: String,
+    pub name: String,
+    pub client_id: String,
+    pub runtime_type: String,
+    pub root_path: String,
+    pub docker_image: Option<String>,
+    pub docker_container_id: Option<String>,
+    pub agent_type: String,
+    pub agent_path: Option<String>,
+    pub llm_model_id: Option<String>,
+    pub agent_config_overrides: Option<String>,
+    pub claude_tier_models: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentWorkspaceUpdateOpts {
+    pub name: String,
+    pub root_path: String,
+    pub system_prompt: Option<String>,
+    pub approval_mode: Option<String>,
+    pub agent_type: Option<String>,
+    pub agent_path: Option<String>,
+    pub llm_model_id: Option<String>,
+    pub agent_config_overrides: Option<String>,
+    pub claude_tier_models: Option<String>,
+    pub clear_overrides: bool,
+    pub clear_tier_models: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentMessageOpts {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
+    pub kind: String,
+    pub parent_tool_call_id: Option<String>,
+}
+
 impl Database {
     // ── Workspace CRUD ──────────────────────────────────────────
 
@@ -184,21 +228,9 @@ impl Database {
     /// `agent_path`/`llm_model_id`/`agent_config_overrides` 可空（后者为 ACP 引擎
     /// 选项覆盖，JSON map：config_id → value，None 表示未配置）。调用方暂未接入请求
     /// DTO 时传 `""` / `None` 占位。
-    #[allow(clippy::too_many_arguments)]
     pub async fn agent_create_workspace(
         &self,
-        id: &str,
-        name: &str,
-        client_id: &str,
-        runtime_type: &str,
-        root_path: &str,
-        docker_image: Option<&str>,
-        docker_container_id: Option<&str>,
-        agent_type: &str,
-        agent_path: Option<&str>,
-        llm_model_id: Option<&str>,
-        agent_config_overrides: Option<&str>,
-        claude_tier_models: Option<&str>,
+        opts: &AgentWorkspaceCreateOpts,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"
@@ -208,18 +240,18 @@ impl Database {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ",
         )
-        .bind(id)
-        .bind(name)
-        .bind(client_id)
-        .bind(runtime_type)
-        .bind(root_path)
-        .bind(docker_image)
-        .bind(docker_container_id)
-        .bind(agent_type)
-        .bind(agent_path)
-        .bind(llm_model_id)
-        .bind(agent_config_overrides)
-        .bind(claude_tier_models)
+        .bind(&opts.id)
+        .bind(&opts.name)
+        .bind(&opts.client_id)
+        .bind(&opts.runtime_type)
+        .bind(&opts.root_path)
+        .bind(&opts.docker_image)
+        .bind(&opts.docker_container_id)
+        .bind(&opts.agent_type)
+        .bind(&opts.agent_path)
+        .bind(&opts.llm_model_id)
+        .bind(&opts.agent_config_overrides)
+        .bind(&opts.claude_tier_models)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -249,25 +281,14 @@ impl Database {
     /// map：config_id → value）；`clear_overrides=true` 时强制清空（设为 NULL），
     /// 否则按 COALESCE 语义处理。`claude_tier_models` 为 Claude Code tier 模型映射
     ///（JSON object），`clear_tier_models=true` 时强制清空（设为 NULL）。
-    #[allow(clippy::too_many_arguments)]
     pub async fn agent_update_workspace(
         &self,
         id: &str,
-        name: &str,
-        root_path: &str,
-        system_prompt: Option<&str>,
-        approval_mode: Option<&str>,
-        agent_type: Option<&str>,
-        agent_path: Option<&str>,
-        llm_model_id: Option<&str>,
-        agent_config_overrides: Option<&str>,
-        claude_tier_models: Option<&str>,
-        clear_overrides: bool,
-        clear_tier_models: bool,
+        opts: &AgentWorkspaceUpdateOpts,
     ) -> Result<(), sqlx::Error> {
         // tier 三态经 CASE WHEN 内联表达（clear=true → NULL；否则 COALESCE 保持/写入），
         // 避免与 clear_overrides 的组合再翻倍 SQL 分支。
-        if clear_overrides {
+        if opts.clear_overrides {
             sqlx::query(
                 "UPDATE agent_workspaces SET name = ?, root_path = ?, system_prompt = ?, \
                  approval_mode = COALESCE(?, approval_mode), \
@@ -279,15 +300,15 @@ impl Database {
                  ELSE COALESCE(?, claude_tier_models) END, \
                  updated_at = datetime('now') WHERE id = ?",
             )
-            .bind(name)
-            .bind(root_path)
-            .bind(system_prompt)
-            .bind(approval_mode)
-            .bind(agent_type)
-            .bind(agent_path)
-            .bind(llm_model_id)
-            .bind(clear_tier_models)
-            .bind(claude_tier_models)
+            .bind(&opts.name)
+            .bind(&opts.root_path)
+            .bind(&opts.system_prompt)
+            .bind(&opts.approval_mode)
+            .bind(&opts.agent_type)
+            .bind(&opts.agent_path)
+            .bind(&opts.llm_model_id)
+            .bind(opts.clear_tier_models)
+            .bind(&opts.claude_tier_models)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -303,16 +324,16 @@ impl Database {
                  ELSE COALESCE(?, claude_tier_models) END, \
                  updated_at = datetime('now') WHERE id = ?",
             )
-            .bind(name)
-            .bind(root_path)
-            .bind(system_prompt)
-            .bind(approval_mode)
-            .bind(agent_type)
-            .bind(agent_path)
-            .bind(llm_model_id)
-            .bind(agent_config_overrides)
-            .bind(clear_tier_models)
-            .bind(claude_tier_models)
+            .bind(&opts.name)
+            .bind(&opts.root_path)
+            .bind(&opts.system_prompt)
+            .bind(&opts.approval_mode)
+            .bind(&opts.agent_type)
+            .bind(&opts.agent_path)
+            .bind(&opts.llm_model_id)
+            .bind(&opts.agent_config_overrides)
+            .bind(opts.clear_tier_models)
+            .bind(&opts.claude_tier_models)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -639,42 +660,38 @@ impl Database {
         // 旧接口兼容：role=tool 的合并行推导 kind="tool"（重放时按旧格式跳过），
         // 其余为普通 message。
         let kind = if role == "tool" { "tool" } else { "message" };
-        self.agent_add_message_v2(
-            id, session_id, role, content, tool_calls, None, None, kind, None,
-        )
+        self.agent_add_message_v2(&AgentMessageOpts {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: tool_calls.map(|s| s.to_string()),
+            tool_call_id: None,
+            name: None,
+            kind: kind.to_string(),
+            parent_tool_call_id: None,
+        })
         .await
     }
 
     /// 新格式消息写入（全列）。`kind` 取值：message / tool_calls / tool_result / summary。
     /// `parent_tool_call_id`：子 agent 归属（发起本消息的 Task 工具调用 id），
     /// 主 agent 消息传 None。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn agent_add_message_v2(
-        &self,
-        id: &str,
-        session_id: &str,
-        role: &str,
-        content: &str,
-        tool_calls: Option<&str>,
-        tool_call_id: Option<&str>,
-        name: Option<&str>,
-        kind: &str,
-        parent_tool_call_id: Option<&str>,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn agent_add_message_v2(&self, opts: &AgentMessageOpts) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO agent_messages \
              (id, session_id, role, content, tool_calls, tool_call_id, name, kind, parent_tool_call_id) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .bind(id)
-        .bind(session_id)
-        .bind(role)
-        .bind(content)
-        .bind(tool_calls)
-        .bind(tool_call_id)
-        .bind(name)
-        .bind(kind)
-        .bind(parent_tool_call_id)
+        .bind(&opts.id)
+        .bind(&opts.session_id)
+        .bind(&opts.role)
+        .bind(&opts.content)
+        .bind(&opts.tool_calls)
+        .bind(&opts.tool_call_id)
+        .bind(&opts.name)
+        .bind(&opts.kind)
+        .bind(&opts.parent_tool_call_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -788,17 +805,17 @@ impl Database {
                 Ok(())
             }
             None => {
-                self.agent_add_message_v2(
-                    id,
-                    session_id,
-                    "assistant",
-                    "",
-                    Some(tool_calls_json),
-                    Some(tool_call_id),
-                    name,
-                    "tool_calls",
-                    parent_tool_call_id,
-                )
+                self.agent_add_message_v2(&AgentMessageOpts {
+                    id: id.to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(tool_calls_json.to_string()),
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    name: name.map(|s| s.to_string()),
+                    kind: "tool_calls".to_string(),
+                    parent_tool_call_id: parent_tool_call_id.map(|s| s.to_string()),
+                })
                 .await
             }
         }
@@ -864,17 +881,17 @@ impl Database {
                 Ok(())
             }
             None => {
-                self.agent_add_message_v2(
-                    id,
-                    session_id,
-                    "assistant",
-                    content,
-                    None,
-                    Some(tool_call_id),
-                    name,
-                    "tool_result",
-                    parent_tool_call_id,
-                )
+                self.agent_add_message_v2(&AgentMessageOpts {
+                    id: id.to_string(),
+                    session_id: session_id.to_string(),
+                    role: "assistant".to_string(),
+                    content: content.to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_call_id.to_string()),
+                    name: name.map(|s| s.to_string()),
+                    kind: "tool_result".to_string(),
+                    parent_tool_call_id: parent_tool_call_id.map(|s| s.to_string()),
+                })
                 .await
             }
         }
@@ -988,36 +1005,36 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_crud() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1",
-            "my-proj",
-            "nas",
-            "host",
-            "/home/user/proj",
-            None,
-            None,
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "my-proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/home/user/proj".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
-        db.agent_create_workspace(
-            "w2",
-            "dproj",
-            "nas",
-            "docker",
-            "/container/work",
-            Some("node:20"),
-            Some("dev-ctr"),
-            "",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w2".to_owned(),
+            name: "dproj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "docker".to_owned(),
+            root_path: "/container/work".to_owned(),
+            docker_image: Some("node:20".to_owned()),
+            docker_container_id: Some("dev-ctr".to_owned()),
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
 
@@ -1039,17 +1056,19 @@ mod tests {
 
         db.agent_update_workspace(
             "w1",
-            "renamed",
-            "/new/path",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "renamed".to_owned(),
+                root_path: "/new/path".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -1074,20 +1093,20 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_acp_fields_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1",
-            "acp-proj",
-            "nas",
-            "host",
-            "/workspace",
-            None,
-            None,
-            "gemini",
-            Some("/opt/acp-agent"),
-            Some("m1"),
-            None,
-            None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "acp-proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/workspace".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "gemini".to_owned(),
+            agent_path: Some("/opt/acp-agent".to_owned()),
+            llm_model_id: Some("m1".to_owned()),
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
 
@@ -1100,17 +1119,19 @@ mod tests {
         // 更新为另一组值（含改变 agent_type）
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            Some("claude"),
-            Some("/opt/acp-claude"),
-            Some("m2"),
-            None,
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: Some("claude".to_owned()),
+                agent_path: Some("/opt/acp-claude".to_owned()),
+                llm_model_id: Some("m2".to_owned()),
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -1122,17 +1143,19 @@ mod tests {
         // COALESCE：None 保持原值
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -1144,17 +1167,19 @@ mod tests {
         // 可空字段显式清空为 None
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            None,
-            None,
-            Some("m3"),
-            None,
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: Some("m3".to_owned()),
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -1167,9 +1192,20 @@ mod tests {
     #[tokio::test]
     async fn test_session_crud_and_archive() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", Some("fix bug"), Some("gpt-4o"))
@@ -1204,9 +1240,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_session_model() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("gpt-4o"))
@@ -1229,9 +1276,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_append_and_list() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1291,9 +1349,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_page_last_n_and_before() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1338,9 +1407,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_page_has_more_boundary() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1378,9 +1458,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_page_empty_and_missing_cursor() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1441,9 +1532,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_list_orders_by_rowid_not_created_at() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1481,9 +1583,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_tool_call_args() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1494,17 +1607,17 @@ mod tests {
             {"id": "c1", "name": "Terminal", "arguments": "{}", "tool_kind": "execute"},
             {"id": "c2", "name": "Read", "arguments": "{\"path\":\"a.rs\"}", "tool_kind": "read"},
         ]);
-        db.agent_add_message_v2(
-            "m1",
-            "s1",
-            "assistant",
-            "",
-            Some(&calls.to_string()),
-            Some("c1"),
-            Some("Terminal"),
-            "tool_calls",
-            None,
-        )
+        db.agent_add_message_v2(&AgentMessageOpts {
+            id: "m1".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "assistant".to_owned(),
+            content: "".to_owned(),
+            tool_calls: Some(calls.to_string()),
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("Terminal".to_owned()),
+            kind: "tool_calls".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
 
@@ -1538,9 +1651,20 @@ mod tests {
     #[tokio::test]
     async fn test_update_tool_call_args_scoped_to_session() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1553,17 +1677,17 @@ mod tests {
             {"id": "call_1", "name": "Terminal", "arguments": "{}", "tool_kind": "execute"},
         ]);
         for (sid, mid) in [("s1", "m1"), ("s2", "m2")] {
-            db.agent_add_message_v2(
-                mid,
-                sid,
-                "assistant",
-                "",
-                Some(&calls.to_string()),
-                Some("call_1"),
-                Some("Terminal"),
-                "tool_calls",
-                None,
-            )
+            db.agent_add_message_v2(&AgentMessageOpts {
+                id: mid.to_owned(),
+                session_id: sid.to_owned(),
+                role: "assistant".to_owned(),
+                content: "".to_owned(),
+                tool_calls: Some(calls.to_string()),
+                tool_call_id: Some("call_1".to_owned()),
+                name: Some("Terminal".to_owned()),
+                kind: "tool_calls".to_owned(),
+                parent_tool_call_id: None,
+            })
             .await
             .unwrap();
         }
@@ -1592,9 +1716,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_tool_result_dedup_content() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1622,9 +1757,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_tool_result_empty_does_not_clear() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1649,9 +1795,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_tool_result_stores_structured_json() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1688,9 +1845,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_tool_result_legacy_plain_text_compat() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1719,9 +1887,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_tool_call_keeps_longer_json() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1758,9 +1937,20 @@ mod tests {
     #[tokio::test]
     async fn test_delete_workspace_cascades() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1778,9 +1968,20 @@ mod tests {
     #[tokio::test]
     async fn test_message_v2_columns_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1788,31 +1989,34 @@ mod tests {
             .unwrap();
 
         // assistant tool_calls 行
-        db.agent_add_message_v2(
-            "m1",
-            "s1",
-            "assistant",
-            "",
-            Some(r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#),
-            None,
-            None,
-            "tool_calls",
-            None,
-        )
+        db.agent_add_message_v2(&AgentMessageOpts {
+            id: "m1".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "assistant".to_owned(),
+            content: "".to_owned(),
+            tool_calls: Some(
+                r#"[{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]"#
+                    .to_owned(),
+            ),
+            tool_call_id: None,
+            name: None,
+            kind: "tool_calls".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         // tool 结果行
-        db.agent_add_message_v2(
-            "m2",
-            "s1",
-            "tool",
-            "exit_code=0",
-            None,
-            Some("c1"),
-            Some("shell"),
-            "tool_result",
-            None,
-        )
+        db.agent_add_message_v2(&AgentMessageOpts {
+            id: "m2".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "tool".to_owned(),
+            content: "exit_code=0".to_owned(),
+            tool_calls: None,
+            tool_call_id: Some("c1".to_owned()),
+            name: Some("shell".to_owned()),
+            kind: "tool_result".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         // 旧接口写入 → kind 自动推导
@@ -1838,9 +2042,20 @@ mod tests {
     #[tokio::test]
     async fn test_parent_tool_call_id_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1848,17 +2063,17 @@ mod tests {
             .unwrap();
 
         // 子 agent 文本（v2 直写 parent）
-        db.agent_add_message_v2(
-            "m0",
-            "s1",
-            "assistant",
-            "子 agent 输出",
-            None,
-            None,
-            None,
-            "message",
-            Some("task_1"),
-        )
+        db.agent_add_message_v2(&AgentMessageOpts {
+            id: "m0".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "assistant".to_owned(),
+            content: "子 agent 输出".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "message".to_owned(),
+            parent_tool_call_id: Some("task_1".to_owned()),
+        })
         .await
         .unwrap();
         // 子 agent 内工具调用（upsert 携带 parent）
@@ -1907,9 +2122,20 @@ mod tests {
     #[tokio::test]
     async fn test_upsert_parent_backfilled_on_update() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1933,9 +2159,20 @@ mod tests {
     #[tokio::test]
     async fn test_config_state_upsert_and_clear() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "w".to_owned(),
+            client_id: "c1".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -1985,9 +2222,20 @@ mod tests {
     #[tokio::test]
     async fn test_session_context_usage_snapshot() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "w", "c1", "host", "/tmp", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "w".to_owned(),
+            client_id: "c1".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/tmp".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -2021,20 +2269,20 @@ mod tests {
     #[tokio::test]
     async fn test_workspace_config_overrides_roundtrip() {
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1",
-            "acp-proj",
-            "nas",
-            "host",
-            "/workspace",
-            None,
-            None,
-            "claude-code",
-            None,
-            None,
-            None,
-            None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "acp-proj".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/workspace".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "claude-code".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
 
@@ -2045,17 +2293,19 @@ mod tests {
         // 写入配置
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(r#"{"model":"sonnet","fast":"haiku"}"#),
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some(r#"{"model":"sonnet","fast":"haiku"}"#.to_owned()),
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -2068,17 +2318,19 @@ mod tests {
         // COALESCE：None 保持原值
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: None,
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -2092,17 +2344,19 @@ mod tests {
         // 表示清空——这里验证 DB 层忠实存储传入值
         db.agent_update_workspace(
             "w1",
-            "acp-proj",
-            "/workspace",
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("{}"),
-            None,
-            false,
-            false,
+            &AgentWorkspaceUpdateOpts {
+                name: "acp-proj".to_owned(),
+                root_path: "/workspace".to_owned(),
+                system_prompt: None,
+                approval_mode: None,
+                agent_type: None,
+                agent_path: None,
+                llm_model_id: None,
+                agent_config_overrides: Some("{}".to_owned()),
+                claude_tier_models: None,
+                clear_overrides: false,
+                clear_tier_models: false,
+            },
         )
         .await
         .unwrap();
@@ -2120,9 +2374,20 @@ mod tests {
         let stored = cipher.encrypt(token);
 
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
 
@@ -2183,9 +2448,20 @@ mod tests {
         let stored = cipher.encrypt(token);
 
         let db = Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_set_workspace_github("w1", Some(&stored), Some("octo"), Some("repo"))
@@ -2203,9 +2479,20 @@ mod tests {
         assert_eq!(json["github_owner"], "octo");
         assert_eq!(json["github_repo"], "repo");
         // 未配置时布尔位为 false
-        db.agent_create_workspace(
-            "w2", "q", "nas", "host", "/q", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&AgentWorkspaceCreateOpts {
+            id: "w2".to_owned(),
+            name: "q".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/q".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         let ws2 = db.agent_get_workspace("w2").await.unwrap().unwrap();

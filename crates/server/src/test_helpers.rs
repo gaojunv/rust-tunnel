@@ -25,20 +25,20 @@ pub async fn file_db() -> (Database, tempfile::TempDir) {
 /// 种子：创建 workspace + session，返回 session id。
 /// 满足 `agent_sessions` → `agent_workspaces` 的外键约束。
 pub async fn seed_workspace_and_session(db: &Database) -> String {
-    db.agent_create_workspace(
-        "ws-test",
-        "test-ws",
-        "test-client",
-        "host",
-        "/tmp",
-        None,
-        None,
-        "",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "ws-test".to_owned(),
+        name: "test-ws".to_owned(),
+        client_id: "test-client".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/tmp".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .expect("seed workspace");
     db.agent_create_session("sess-test", "ws-test", None, None)
@@ -49,20 +49,20 @@ pub async fn seed_workspace_and_session(db: &Database) -> String {
 
 /// 种子：仅创建 workspace（不建 session），返回 workspace id。
 pub async fn seed_workspace(db: &Database) -> String {
-    db.agent_create_workspace(
-        "ws-test",
-        "test-ws",
-        "test-client",
-        "host",
-        "/tmp",
-        None,
-        None,
-        "",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+        id: "ws-test".to_owned(),
+        name: "test-ws".to_owned(),
+        client_id: "test-client".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/tmp".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: "".to_owned(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .expect("seed workspace");
     "ws-test".to_string()

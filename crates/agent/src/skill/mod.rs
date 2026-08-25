@@ -35,19 +35,34 @@ pub fn normalize_skill_name(name: &str) -> String {
 /// 以新为准、tags 并集、enabled/use_count 保持）；否则新建（id=uuid，enabled=1）。
 ///
 /// 返回 Skill id。DB 写失败返回 Err（distill 静默跳过单条，手动创建把错误给 UI）。
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, Default)]
+pub struct UpsertSkillOpts<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub content: &'a str,
+    pub scope_type: &'a str,
+    pub client_id: &'a str,
+    pub workspace_id: &'a str,
+    pub tags: &'a [String],
+    pub source_session_id: &'a str,
+    pub source_trigger: &'a str,
+}
+
 pub async fn upsert_skill_with_dedup(
     memory: &crate::memory::MemoryState,
-    name: &str,
-    description: &str,
-    content: &str,
-    scope_type: &str,
-    client_id: &str,
-    workspace_id: &str,
-    tags: &[String],
-    source_session_id: &str,
-    source_trigger: &str,
+    opts: UpsertSkillOpts<'_>,
 ) -> Result<String, String> {
+    let UpsertSkillOpts {
+        name,
+        description,
+        content,
+        scope_type,
+        client_id,
+        workspace_id,
+        tags,
+        source_session_id,
+        source_trigger,
+    } = opts;
     let normalized = normalize_skill_name(name);
     if normalized.is_empty() {
         return Err("skill name must not be empty".into());
@@ -65,13 +80,15 @@ pub async fn upsert_skill_with_dedup(
             .db
             .skill_update(
                 &existing.id,
-                &normalized,
-                description,
-                content,
-                &merged_json,
-                scope_type,
-                client_id,
-                workspace_id,
+                &rust_tunnel_persistence::skills::SkillUpdateOpts {
+                    name: normalized.clone(),
+                    description: description.to_owned(),
+                    content: content.to_owned(),
+                    tags: merged_json,
+                    scope_type: scope_type.to_owned(),
+                    client_id: client_id.to_owned(),
+                    workspace_id: workspace_id.to_owned(),
+                },
             )
             .await
             .map_err(|e| format!("skill update failed: {e}"))?;
@@ -80,18 +97,18 @@ pub async fn upsert_skill_with_dedup(
     let id = format!("{:032x}", rand::random::<u128>());
     memory
         .db
-        .skill_insert(
-            &id,
-            &normalized,
-            description,
-            content,
-            scope_type,
-            client_id,
-            workspace_id,
-            &tags_json,
-            source_session_id,
-            source_trigger,
-        )
+        .skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: id.clone(),
+            name: normalized,
+            description: description.to_owned(),
+            content: content.to_owned(),
+            scope_type: scope_type.to_owned(),
+            client_id: client_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            tags: tags_json,
+            source_session_id: source_session_id.to_owned(),
+            source_trigger: source_trigger.to_owned(),
+        })
         .await
         .map_err(|e| format!("skill insert failed: {e}"))?;
     Ok(id)
@@ -305,15 +322,17 @@ mod tests {
         let (db, memory) = memory_state().await;
         let id1 = upsert_skill_with_dedup(
             &memory,
-            "Deploy-App",
-            "描述一",
-            "内容一",
-            "workspace",
-            "c1",
-            "w1",
-            &["deploy".into()],
-            "s1",
-            "distill",
+            UpsertSkillOpts {
+                name: "Deploy-App",
+                description: "描述一",
+                content: "内容一",
+                scope_type: "workspace",
+                client_id: "c1",
+                workspace_id: "w1",
+                tags: &["deploy".into()],
+                source_session_id: "s1",
+                source_trigger: "distill",
+            },
         )
         .await
         .unwrap();
@@ -323,15 +342,17 @@ mod tests {
         // use_count 保持
         let id2 = upsert_skill_with_dedup(
             &memory,
-            "deploy-app",
-            "描述二",
-            "内容二",
-            "workspace",
-            "c1",
-            "w1",
-            &["release".into()],
-            "s1",
-            "distill",
+            UpsertSkillOpts {
+                name: "deploy-app",
+                description: "描述二",
+                content: "内容二",
+                scope_type: "workspace",
+                client_id: "c1",
+                workspace_id: "w1",
+                tags: &["release".into()],
+                source_session_id: "s1",
+                source_trigger: "distill",
+            },
         )
         .await
         .unwrap();
@@ -350,21 +371,26 @@ mod tests {
         // 异作用域同名 → 新建
         let id3 = upsert_skill_with_dedup(
             &memory,
-            "deploy-app",
-            "全局",
-            "全局内容",
-            "global",
-            "",
-            "",
-            &[],
-            "s1",
-            "distill",
+            UpsertSkillOpts {
+                name: "deploy-app",
+                description: "全局",
+                content: "全局内容",
+                scope_type: "global",
+                client_id: "",
+                workspace_id: "",
+                tags: &[],
+                source_session_id: "s1",
+                source_trigger: "distill",
+            },
         )
         .await
         .unwrap();
         assert_ne!(id1, id3);
         let all = db
-            .skill_list(None, None, None, None, None, None, 100, 0)
+            .skill_list(&rust_tunnel_persistence::skills::SkillListFilter {
+                limit: 100,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
@@ -383,46 +409,46 @@ mod tests {
         s.skill_enabled = 1;
         db.memory_upsert_settings(&s).await.unwrap();
 
-        db.skill_insert(
-            "g1",
-            "global-skill",
-            "全局技能",
-            "内容",
-            "global",
-            "",
-            "",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "g1".to_owned(),
+            name: "global-skill".to_owned(),
+            description: "全局技能".to_owned(),
+            content: "内容".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
-        db.skill_insert(
-            "w1a",
-            "release-check",
-            "发布前检查",
-            "内容",
-            "workspace",
-            "c1",
-            "w1",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "w1a".to_owned(),
+            name: "release-check".to_owned(),
+            description: "发布前检查".to_owned(),
+            content: "内容".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
-        db.skill_insert(
-            "w2",
-            "other-ws",
-            "别的工作区",
-            "内容",
-            "workspace",
-            "c1",
-            "w2",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "w2".to_owned(),
+            name: "other-ws".to_owned(),
+            description: "别的工作区".to_owned(),
+            content: "内容".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w2".to_owned(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
         db.skill_bump_use("g1").await.unwrap();
@@ -452,46 +478,46 @@ mod tests {
         db.memory_upsert_settings(&s).await.unwrap();
 
         // 三个作用域同名（优先 workspace）
-        db.skill_insert(
-            "ws1",
-            "deploy-app",
-            "工作区",
-            "工作区内容",
-            "workspace",
-            "c1",
-            "w1",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "ws1".to_owned(),
+            name: "deploy-app".to_owned(),
+            description: "工作区".to_owned(),
+            content: "工作区内容".to_owned(),
+            scope_type: "workspace".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: "w1".to_owned(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
-        db.skill_insert(
-            "cl1",
-            "deploy-app",
-            "客户端",
-            "客户端内容",
-            "client",
-            "c1",
-            "",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "cl1".to_owned(),
+            name: "deploy-app".to_owned(),
+            description: "客户端".to_owned(),
+            content: "客户端内容".to_owned(),
+            scope_type: "client".to_owned(),
+            client_id: "c1".to_owned(),
+            workspace_id: String::new(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
-        db.skill_insert(
-            "g1",
-            "deploy-app",
-            "全局",
-            "全局内容",
-            "global",
-            "",
-            "",
-            "[]",
-            "",
-            "manual",
-        )
+        db.skill_insert(&rust_tunnel_persistence::skills::SkillInsertOpts {
+            id: "g1".to_owned(),
+            name: "deploy-app".to_owned(),
+            description: "全局".to_owned(),
+            content: "全局内容".to_owned(),
+            scope_type: "global".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
+            tags: "[]".to_owned(),
+            source_session_id: String::new(),
+            source_trigger: "manual".to_owned(),
+        })
         .await
         .unwrap();
 

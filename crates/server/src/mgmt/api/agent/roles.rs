@@ -39,16 +39,16 @@ pub async fn list_roles(
     let offset = params.offset.unwrap_or(0).max(0);
     let rows = agent
         .db
-        .role_list(
-            params.scope.as_deref(),
-            params.client_id.as_deref(),
-            params.workspace_id.as_deref(),
-            params.q.as_deref(),
-            params.enabled,
-            params.mode.as_deref(),
+        .role_list(&rust_tunnel_persistence::roles::RoleListFilter {
+            scope_type: params.scope.clone(),
+            client_id: params.client_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            q: params.q.clone(),
+            enabled: params.enabled,
+            mode: params.mode.clone(),
             limit,
             offset,
-        )
+        })
         .await
         .map_err(|e| ApiError::db(&e))?;
     let total = agent
@@ -128,19 +128,19 @@ pub async fn create_role(
 
     agent
         .db
-        .role_insert(
-            &id,
-            name,
-            description,
-            system_prompt,
-            tools_allow_json.as_deref(),
-            tools_deny_json.as_deref(),
-            body.model_override.as_deref(),
-            mode,
-            &scope_type,
-            &client_id,
-            &workspace_id,
-        )
+        .role_insert(&rust_tunnel_persistence::roles::RoleInsertOpts {
+            id: id.clone(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            system_prompt: system_prompt.to_owned(),
+            tools_allow: tools_allow_json,
+            tools_deny: tools_deny_json,
+            model_override: body.model_override.clone(),
+            mode: mode.to_owned(),
+            scope_type: scope_type.clone(),
+            client_id: client_id.clone(),
+            workspace_id: workspace_id.clone(),
+        })
         .await
         .map_err(|e| ApiError::db(&e))?;
 
@@ -279,16 +279,18 @@ pub async fn update_role(
         .db
         .role_update(
             &id,
-            name,
-            description,
-            system_prompt,
-            Some(&tools_allow_json),
-            Some(&tools_deny_json),
-            model_override,
-            mode,
-            &scope_type,
-            &client_id,
-            &workspace_id,
+            &rust_tunnel_persistence::roles::RoleUpdateOpts {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                system_prompt: system_prompt.to_owned(),
+                tools_allow: Some(tools_allow_json),
+                tools_deny: Some(tools_deny_json),
+                model_override: model_override.map(str::to_owned),
+                mode: mode.to_owned(),
+                scope_type: scope_type.clone(),
+                client_id: client_id.clone(),
+                workspace_id: workspace_id.clone(),
+            },
         )
         .await
         .map_err(|e| ApiError::db(&e))?;

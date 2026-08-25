@@ -162,20 +162,20 @@ async fn clear_memory(api: &ApiClient) {
 /// seed workspace + session + 5 条消息（≥ MIN_DISTILL_MESSAGES=4），返回 session id。
 async fn seed_session(harness: &TestHarness, model: Option<&str>) -> String {
     let db = harness.server_state.db().expect("harness db");
-    db.agent_create_workspace(
-        "ws-memory-e2e",
-        "memory-e2e",
-        "mem-e2e-client",
-        "host",
-        "/tmp",
-        None,
-        None,
-        "",
-        None,
-        None,
-        None,
-        None,
-    )
+    db.agent_create_workspace(&rust_tunnel_server::db::agent::AgentWorkspaceCreateOpts {
+        id: "ws-memory-e2e".to_owned(),
+        name: "memory-e2e".to_owned(),
+        client_id: "mem-e2e-client".to_owned(),
+        runtime_type: "host".to_owned(),
+        root_path: "/tmp".to_owned(),
+        docker_image: None,
+        docker_container_id: None,
+        agent_type: String::new(),
+        agent_path: None,
+        llm_model_id: None,
+        agent_config_overrides: None,
+        claude_tier_models: None,
+    })
     .await
     .expect("create workspace");
     db.agent_create_session("sess-memory-e2e", "ws-memory-e2e", None, model)

@@ -197,18 +197,18 @@ pub async fn force_compact(
         let id = format!("{:032x}", rand::random::<u128>());
         if let Err(e) = agent
             .db
-            .agent_add_message_v2(
-                &id,
-                &row.session_id,
-                &row.role,
-                &row.content,
-                row.tool_calls.as_deref(),
-                row.tool_call_id.as_deref(),
-                row.name.as_deref(),
-                &row.kind,
+            .agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+                id,
+                session_id: row.session_id.clone(),
+                role: row.role.clone(),
+                content: row.content.clone(),
+                tool_calls: row.tool_calls.clone(),
+                tool_call_id: row.tool_call_id.clone(),
+                name: row.name.clone(),
+                kind: row.kind.clone(),
                 // 压缩重插保留父子归属，刷新后子 agent 分组不丢失
-                row.parent_tool_call_id.as_deref(),
-            )
+                parent_tool_call_id: row.parent_tool_call_id.clone(),
+            })
             .await
         {
             tracing::warn!("failed to re-persist kept segment during compaction: {}", e);
@@ -463,9 +463,20 @@ mod tests {
         // 重插 kept 行同秒靠 rowid（自增）保证先后。故 DB 顺序恒为 [旧 kept, summary,
         // 重插 kept]，load 从最后一个 summary 起重放即可命中保留段。
         let db = crate::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, None)
@@ -482,17 +493,17 @@ mod tests {
         .await
         .unwrap();
         // summary + 重插 kept：当前秒插入，先后由 rowid 保证
-        db.agent_add_message_v2(
-            "sum1",
-            "s1",
-            "user",
-            "[上下文摘要] 概要",
-            None,
-            None,
-            None,
-            "summary",
-            None,
-        )
+        db.agent_add_message_v2(&rust_tunnel_persistence::agent::AgentMessageOpts {
+            id: "sum1".to_owned(),
+            session_id: "s1".to_owned(),
+            role: "user".to_owned(),
+            content: "[上下文摘要] 概要".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            kind: "summary".to_owned(),
+            parent_tool_call_id: None,
+        })
         .await
         .unwrap();
         db.agent_add_message("kept1", "s1", "assistant", "保留1", None)
@@ -514,9 +525,20 @@ mod tests {
         // 重放丢失整段（红）；修复后 DB 物理顺序 [..., summary, kept...]，重连/
         // 刷新后 kept 段完整重放。
         let db = crate::db::Database::new(":memory:").await.unwrap();
-        db.agent_create_workspace(
-            "w1", "p", "nas", "host", "/p", None, None, "", None, None, None, None,
-        )
+        db.agent_create_workspace(&rust_tunnel_persistence::agent::AgentWorkspaceCreateOpts {
+            id: "w1".to_owned(),
+            name: "p".to_owned(),
+            client_id: "nas".to_owned(),
+            runtime_type: "host".to_owned(),
+            root_path: "/p".to_owned(),
+            docker_image: None,
+            docker_container_id: None,
+            agent_type: "".to_owned(),
+            agent_path: None,
+            llm_model_id: None,
+            agent_config_overrides: None,
+            claude_tier_models: None,
+        })
         .await
         .unwrap();
         db.agent_create_session("s1", "w1", None, Some("big-model"))

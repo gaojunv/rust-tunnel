@@ -339,15 +339,17 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         crate::llm::log_llm_request(
             &state,
-            "openai",
-            "gpt-4",
-            3,
-            true,
-            false,
-            Some(200),
-            None,
-            42,
-            &body,
+            &crate::llm::LogLlmRequestOpts {
+                protocol: "openai".to_owned(),
+                model: "gpt-4".to_owned(),
+                message_count: 3,
+                has_tools: true,
+                stream: false,
+                status: Some(200),
+                error: None,
+                elapsed_ms: 42,
+                request_body: body,
+            },
         )
         .await;
 
