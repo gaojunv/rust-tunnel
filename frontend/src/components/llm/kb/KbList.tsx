@@ -45,8 +45,8 @@ export default function KbList({ kbs, selectedId, onSelect, onNew, onSettings }:
         <Input
           value={qInput}
           onChange={(e) => setQInput(e.target.value)}
-          placeholder={t('wiki.searchPlaceholder')}
-          aria-label={t('wiki.searchPlaceholder')}
+          placeholder={t('kb.searchPlaceholder')}
+          aria-label={t('kb.searchPlaceholder')}
           className="h-9 pl-8"
         />
       </div>

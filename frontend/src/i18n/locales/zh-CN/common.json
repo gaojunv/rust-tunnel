@@ -748,7 +748,8 @@
     "queryEmpty": "输入查询以预览检索到的分块。",
     "queryError": "检索失败。请检查 embedding 服务后重试。",
     "noResults": "未找到匹配的分块。",
-    "score": "分数"
+    "score": "分数",
+    "searchPlaceholder": "搜索知识库…"
   },
   "knowledge": {
     "title": "知识库与记忆",

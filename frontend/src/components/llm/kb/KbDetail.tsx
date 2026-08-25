@@ -22,7 +22,6 @@ import { ConfirmDialog, useConfirm } from '../confirm';
 import type { LlmKnowledgeBase, LlmKbDocument } from '@/types';
 import {
   ArrowLeft,
-  FileUp,
   Loader2,
   RefreshCw,
   Search,
@@ -32,19 +31,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
-
-const TEXT_MAX_BYTES = 2 * 1024 * 1024;
-const BINARY_MAX_BYTES = 20 * 1024 * 1024;
-const ACCEPTED_EXTENSIONS = ['md', 'txt', 'pdf', 'docx', 'xlsx', 'pptx'];
-const TEXT_EXTENSIONS = ['md', 'txt'];
-/** 「正在处理」覆盖状态的过期 TTL：SSE 终态事件丢失（断线/丢帧）时，processing
- *  override 会永久假卡。30s 后移除 override 并失效文档查询，让 UI 回退到服务端
- *  DB 状态（真实 status），用户也可手动重试/刷新。 */
-const PROCESSING_TTL_MS = 30_000;
-
-function maxBytesFor(ext: string): number {
-  return TEXT_EXTENSIONS.includes(ext) ? TEXT_MAX_BYTES : BINARY_MAX_BYTES;
-}
+import DocUploadZone, { PROCESSING_TTL_MS } from '@/components/knowledge/shared/DocUploadZone';
 
 interface Props {
   kb: LlmKnowledgeBase;
@@ -139,15 +126,12 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
 
   const [query, setQuery] = useState('');
   const ime = useImeGuard();
-  const [dragging, setDragging] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const [overrides, setOverrides] = useState<Record<string, DocOverride>>({});
-  const fileInputRef = useRef<HTMLInputElement>(null);
   // per-doc 的 processing 过期定时器（doc_id → timer）：SSE 终态事件丢失时解除
-  // 永久 processing 假卡（详见 PROCESSING_TTL_MS 注释）。
+  // 永久 processing 假卡（详见 DocUploadZone PROCESSING_TTL_MS 注释）。
   const overrideTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   // SSE 订阅：按 kb 过滤，即时更新文档状态并触发后台数据失效。
@@ -200,31 +184,6 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
     const o = overrides[d.id];
     return o ? { ...d, status: o.status as LlmKbDocument['status'], chunk_count: o.chunk_count, error: o.error } : d;
   });
-
-  const handleFiles = (list: FileList | null) => {
-    if (!list || list.length === 0) return;
-    let hasInvalid = false;
-    const accepted: File[] = [];
-    Array.from(list).forEach((f) => {
-      const ext = f.name.toLowerCase().split('.').pop() ?? '';
-      if (ACCEPTED_EXTENSIONS.includes(ext) && f.size <= maxBytesFor(ext)) {
-        accepted.push(f);
-      } else {
-        hasInvalid = true;
-      }
-    });
-    setUploadError(hasInvalid ? t('kb.fileInvalid') : null);
-    accepted.forEach((f) =>
-      uploadMutation.mutate(
-        { kbId: kb.id, file: f },
-        {
-          onError: (err) => {
-            setUploadError(t('kb.uploadError', { error: getApiErrorMessage(err) }));
-          },
-        },
-      ),
-    );
-  };
 
   const runQuery = () => {
     if (!query.trim()) return;
@@ -290,48 +249,12 @@ export default function KbDetail({ kb, onBack, onDeleted }: Props) {
         </div>
       )}
 
-      {/* 上传区 */}
-      <Card>
-        <CardContent className="p-4">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".md,.txt,.pdf,.docx,.xlsx,.pptx"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              handleFiles(e.target.files);
-              e.target.value = '';
-            }}
-          />
-          <div
-            className={`flex flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
-              dragging ? 'border-primary bg-primary/5' : 'border-border'
-            }`}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              handleFiles(e.dataTransfer.files);
-            }}
-            onClick={() => fileInputRef.current?.click()}
-            role="button"
-          >
-            {uploadMutation.isPending ? (
-              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-            ) : (
-              <FileUp className="h-6 w-6 text-muted-foreground" />
-            )}
-            <span className="text-sm font-medium">{t('kb.uploadHint')}</span>
-            <span className="text-xs text-muted-foreground">{t('kb.browse')}</span>
-            {uploadError && <span className="text-xs text-destructive">{uploadError}</span>}
-          </div>
-        </CardContent>
-      </Card>
+      <DocUploadZone
+        isUploading={uploadMutation.isPending}
+        labels={{ uploadHint: t('kb.uploadHint'), browse: t('kb.browse'), fileInvalid: t('kb.fileInvalid') }}
+        onUpload={(file) => uploadMutation.mutateAsync({ kbId: kb.id, file })}
+        formatUploadError={(err) => t('kb.uploadError', { error: getApiErrorMessage(err) })}
+      />
 
       {/* 文档列表 */}
       <Card>

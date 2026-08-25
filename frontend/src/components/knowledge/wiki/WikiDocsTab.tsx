@@ -4,25 +4,13 @@ import { useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { FileUp, FileText, Loader2, RefreshCw, Trash2, AlertTriangle } from 'lucide-react';
+import { FileText, Loader2, RefreshCw, Trash2, AlertTriangle } from 'lucide-react';
 import { getApiErrorMessage } from '@/api/client';
 import { wikiStream } from '@/api/wikiStream';
 import { useWikiDocs, useUploadWikiDoc, useDeleteWikiDoc, useReindexWikiDoc } from '@/api/hooks';
 import { ConfirmDialog, useConfirm } from '@/components/llm/confirm';
 import type { WikiDocument, WikiStatus } from '@/types';
-
-const TEXT_MAX_BYTES = 2 * 1024 * 1024;
-const BINARY_MAX_BYTES = 20 * 1024 * 1024;
-const ACCEPTED_EXTENSIONS = ['md', 'txt', 'pdf', 'docx', 'xlsx', 'pptx'];
-const TEXT_EXTENSIONS = ['md', 'txt'];
-/** 「正在处理」覆盖状态的过期 TTL：SSE 终态事件丢失（断线/丢帧）时，processing
- *  override 会永久假卡。30s 后移除 override 并失效文档查询，让 UI 回退到服务端
- *  DB 状态（真实 status），用户也可手动重试/刷新。（照 KbDetail PROCESSING_TTL_MS） */
-const PROCESSING_TTL_MS = 30_000;
-
-function maxBytesFor(ext: string): number {
-  return TEXT_EXTENSIONS.includes(ext) ? TEXT_MAX_BYTES : BINARY_MAX_BYTES;
-}
+import DocUploadZone, { PROCESSING_TTL_MS } from '../shared/DocUploadZone';
 
 function DocStatusBadge({ status }: { status: string }) {
   const { t } = useTranslation();
@@ -60,12 +48,10 @@ export default function WikiDocsTab({ wikiId }: { wikiId: string }) {
   const deleteMutation = useDeleteWikiDoc();
   const reindexMutation = useReindexWikiDoc();
 
-  const [dragging, setDragging] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const { open: confirmOpen, payload: confirmPayload, confirm, cancel: cancelConfirm, confirmAndClose } = useConfirm();
   const [overrides, setOverrides] = useState<Record<string, DocOverride>>({});
-  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // per-doc 的 processing 过期定时器（doc_id → timer）：SSE 终态事件丢失时解除
   // 永久 processing 假卡（详见 PROCESSING_TTL_MS 注释）。
   const overrideTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -128,75 +114,14 @@ export default function WikiDocsTab({ wikiId }: { wikiId: string }) {
     return o ? { ...d, status: o.status, error: o.error } : d;
   });
 
-  const handleFiles = (list: FileList | null) => {
-    if (!list || list.length === 0) return;
-    let hasInvalid = false;
-    const accepted: File[] = [];
-    Array.from(list).forEach((f) => {
-      const ext = f.name.toLowerCase().split('.').pop() ?? '';
-      if (ACCEPTED_EXTENSIONS.includes(ext) && f.size <= maxBytesFor(ext)) {
-        accepted.push(f);
-      } else {
-        hasInvalid = true;
-      }
-    });
-    setUploadError(hasInvalid ? t('wiki.fileInvalid') : null);
-    accepted.forEach((f) =>
-      uploadMutation.mutate(
-        { wikiId, file: f },
-        {
-          onError: (err) => {
-            setUploadError(t('wiki.uploadError', { error: getApiErrorMessage(err) }));
-          },
-        },
-      ),
-    );
-  };
-
   return (
     <div className="space-y-4">
-      {/* 上传区 */}
-      <Card>
-        <CardContent className="p-4">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".md,.txt,.pdf,.docx,.xlsx,.pptx"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              handleFiles(e.target.files);
-              e.target.value = '';
-            }}
-          />
-          <div
-            className={`flex flex-col items-center justify-center gap-1 rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
-              dragging ? 'border-primary bg-primary/5' : 'border-border'
-            }`}
-            onDragOver={(e) => {
-              e.preventDefault();
-              setDragging(true);
-            }}
-            onDragLeave={() => setDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setDragging(false);
-              handleFiles(e.dataTransfer.files);
-            }}
-            onClick={() => fileInputRef.current?.click()}
-            role="button"
-          >
-            {uploadMutation.isPending ? (
-              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-            ) : (
-              <FileUp className="h-6 w-6 text-muted-foreground" />
-            )}
-            <span className="text-sm font-medium">{t('wiki.uploadHint')}</span>
-            <span className="text-xs text-muted-foreground">{t('wiki.browse')}</span>
-            {uploadError && <span className="text-xs text-destructive">{uploadError}</span>}
-          </div>
-        </CardContent>
-      </Card>
+      <DocUploadZone
+        isUploading={uploadMutation.isPending}
+        labels={{ uploadHint: t('wiki.uploadHint'), browse: t('wiki.browse'), fileInvalid: t('wiki.fileInvalid') }}
+        onUpload={(file) => uploadMutation.mutateAsync({ wikiId, file })}
+        formatUploadError={(err) => t('wiki.uploadError', { error: getApiErrorMessage(err) })}
+      />
 
       {actionError && (
         <div className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">

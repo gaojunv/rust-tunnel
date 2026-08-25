@@ -748,7 +748,8 @@
     "queryEmpty": "Enter a query to preview retrieved chunks.",
     "queryError": "Query failed. Check the embedding service and try again.",
     "noResults": "No matching chunks found.",
-    "score": "Score"
+    "score": "Score",
+    "searchPlaceholder": "Search knowledge bases…"
   },
   "knowledge": {
     "title": "Knowledge & Memory",
