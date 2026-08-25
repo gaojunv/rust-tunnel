@@ -11,6 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
+/// PTY reader 任务超时：5s，兜底 kill 后仍占 fd 导致的悬挂。
+const PTY_READER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// PTY 服务固定回环端口。用固定端口而非随机端口，是为了让服务端在不新增协议
 /// 消息的前提下，仅凭 `open_tunnel(client_name, "127.0.0.1:45631")` 就能直连；
 /// 端口被占用时 listen 失败，调用方只 warn 不退出（服务端会按版本门控降级）。
@@ -251,7 +254,7 @@ async fn handle_connection(stream: TcpStream) -> std::io::Result<()> {
 
     // child 已死 → master reader EOF → reader 任务结束；写任务因通道关闭而结束。
     // 带超时兜底，防极端情况（kill 后子进程仍占着 slave fd）导致任务悬挂。
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reader_task).await;
+    let _ = tokio::time::timeout(PTY_READER_TIMEOUT, reader_task).await;
     let _ = pty_to_tcp.await;
 
     // 注销 PTY_REGISTRY（有 id 时）。

@@ -21,6 +21,9 @@ use crate::reverse_proxy::TrojanSniEntry;
 use rust_tunnel_common::error::TunnelResult;
 use rust_tunnel_common::tls::{create_server_config, load_or_generate_cert};
 
+/// Trojan 监听切换防竞态等待：100ms，待旧端口释放。
+const TROJAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Trojan 证书来源（与 API 响应 `cert_source` 字段一一对应）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrojanCertSource {
@@ -153,7 +156,7 @@ pub async fn apply_trojan_config(
     }
     state.proxy_state.set_trojan_sni(None);
     // 等旧 listener 释放端口注册/绑定（沿用现有 API 更新路径的等待时长）
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(TROJAN_RESTART_DELAY).await;
 
     if !cfg.enabled {
         *state.proxy_ports.trojan_runtime.write().await = Default::default();

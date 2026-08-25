@@ -52,6 +52,8 @@ use self::acp_bridge::AcpBridge;
 use self::llm_bridge::LlmGatewayEndpoint;
 use self::spawner::AgentSpawner;
 
+/// 审批等待超时：前端 5 分钟内未响应按拒绝处理，避免调用方阻塞。
+const APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
 /// elicitation 等待超时（与审批一致 5 分钟；超时按 `Cancel` 回 agent，前端表单
 /// 卡悬停过久同样取消，agent 不卡死）。
 const ELICITATION_TIMEOUT: Duration = Duration::from_mins(5);
@@ -463,7 +465,7 @@ impl AgentState {
             guard.disarm();
             return ApprovalResult::Denied;
         }
-        let result = match tokio::time::timeout(std::time::Duration::from_mins(5), rx).await {
+        let result = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             _ => ApprovalResult::Denied, // 超时 / sender 被 drop（取消）
         };

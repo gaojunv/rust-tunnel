@@ -18,6 +18,9 @@ use tokio::sync::broadcast;
 
 use rust_tunnel_persistence::Database;
 
+/// 速率计算滑动窗口长度：1 分钟，过期样本移出窗口。
+const RATE_WINDOW: std::time::Duration = std::time::Duration::from_mins(1);
+
 // ── Entity type ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,12 +98,10 @@ impl EntityStats {
         self.bytes_out += bytes_out;
         self.rate_window
             .push_back((Instant::now(), self.bytes_in, self.bytes_out));
-        let cutoff = Instant::now()
-            .checked_sub(std::time::Duration::from_mins(1))
-            .unwrap_or_else(|| {
-                tracing::warn!("Instant cutoff underflow");
-                Instant::now()
-            });
+        let cutoff = Instant::now().checked_sub(RATE_WINDOW).unwrap_or_else(|| {
+            tracing::warn!("Instant cutoff underflow");
+            Instant::now()
+        });
         while self
             .rate_window
             .front()

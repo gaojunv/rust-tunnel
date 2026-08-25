@@ -16,6 +16,11 @@ use super::{
     ApiState,
 };
 
+/// SSE 订阅等待与保活间隔：30s，超时发 ping 保活。
+const SSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// SSE KeepAlive 间隔：30s，与订阅超时对齐。
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
 // ── Log Viewer Endpoints ──────────────────────────────────────────
 
 pub async fn sse_log_stream(
@@ -58,7 +63,7 @@ pub async fn sse_log_stream(
     let mut rx = log_store.tx.subscribe();
     let stream = async_stream::stream! {
         loop {
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(entry)) => {
                     // Apply filters
                     let entry_level = match entry.level.as_str() {
@@ -109,7 +114,7 @@ pub async fn sse_log_stream(
     };
 
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
         .into_response()
 }
 

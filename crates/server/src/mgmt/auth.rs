@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// JWT 有效期：24 小时（24*60*60 秒）。
+const JWT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// JWT claims
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -31,7 +34,7 @@ impl Claims {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::from_secs(0));
-        let exp = now + Duration::from_secs(24 * 60 * 60); // 24 hours
+        let exp = now + JWT_EXPIRY; // 24 hours
         Self {
             sub: "admin".to_string(),
             exp: exp.as_secs() as usize,

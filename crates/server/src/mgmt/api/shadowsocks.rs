@@ -2,6 +2,9 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use super::{dto::ShadowsocksConfig, ApiState};
 
+/// SS 重启防竞态等待：100ms，待旧监听释放端口。
+const SS_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 // Get Shadowsocks configuration
 pub async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<ShadowsocksConfig> {
     // Get all SS ports
@@ -87,7 +90,7 @@ pub async fn update_shadowsocks_config(
         // Stop existing listener if any
         if let Some(tx) = abort.take() {
             let _ = tx.send(true);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(SS_RESTART_DELAY).await;
         }
 
         if enabled {

@@ -5,6 +5,7 @@
 //! 因此用独立的短超时 client（区别于上游 LLM 的长读超时）。
 
 use reqwest::Client;
+use rust_tunnel_common::http_client;
 
 /// 单次 embed 请求的批大小上限。上游 embedding API 通常限制单请求文本数，
 /// 超长请求会被拒（400/413）或超时；超出时内部切多批逐个请求再按序拼接。
@@ -13,6 +14,8 @@ const EMBED_BATCH_SIZE: usize = 64;
 const EMBED_MAX_ATTEMPTS: usize = 3;
 /// 重试基础退避（毫秒）：第 1 次重试 500ms、第 2 次 1s，避免瞬时故障集中重试。
 const EMBED_RETRY_BASE_MS: u64 = 500;
+/// embedding 整体请求超时：embedding 应秒级返回，1 分钟足够覆盖慢端点。
+const EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 #[derive(Debug)]
 pub enum EmbedError {
@@ -49,14 +52,8 @@ impl Embedder {
     /// reqwest Client 构建失败属构造期 fatal（TLS 后端不可用），无法恢复。
     #[must_use]
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
-        // 构造期 fatal：TLS 后端初始化失败则 embedding 全不可用，
-        // 返回 Self 的签名无法传播错误，保持 panic 语义。
-        #[expect(clippy::panic)]
-        let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_mins(1))
-            .build()
-            .unwrap_or_else(|e| panic!("failed to build embedding client: {e}"));
+        // embedding 属慢端点：整体超时放宽到 1 分钟，其余默认走统一工厂
+        let client = http_client::build(http_client::builder().timeout(EMBED_TIMEOUT));
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),

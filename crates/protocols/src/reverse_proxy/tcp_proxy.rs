@@ -6,6 +6,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
+/// UDP 回包等待超时：5s，超时即视为后端无响应。
+const UDP_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// TCP reverse proxy handler
 pub struct TcpProxy {
     state: ReverseProxyState,
@@ -250,7 +253,7 @@ impl UdpProxy {
                                                 );
                                             }
                                         }
-                                        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                        () = tokio::time::sleep(UDP_RESPONSE_TIMEOUT) => {
                                             debug!("UDP response timeout from backend");
                                         }
                                     }

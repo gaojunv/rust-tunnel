@@ -34,6 +34,11 @@ use crate::mgmt::api::ApiState;
 
 use super::{mem_runtime, new_id};
 
+/// 记忆 SSE 订阅超时与保活间隔：30s，超时发 ping。
+const MEMORY_SSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 记忆 SSE KeepAlive 间隔：30s。
+const MEMORY_SSE_KEEPALIVE: Duration = Duration::from_secs(30);
+
 // ── 请求体 DTO ──────────────────────────────────────────────────
 
 /// PUT /api/agent/memory/settings 请求体（部分更新：缺省字段沿用当前值）。
@@ -754,7 +759,7 @@ pub async fn sse_memory_events(
     let mut rx = mem.subscribe();
     let stream = async_stream::stream! {
         loop {
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(MEMORY_SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(ev)) => {
                     let json = serde_json::to_string(&ev).unwrap_or_default();
                     yield Ok::<_, std::convert::Infallible>(
@@ -777,7 +782,7 @@ pub async fn sse_memory_events(
         }
     };
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .keep_alive(KeepAlive::new().interval(MEMORY_SSE_KEEPALIVE))
         .into_response()
 }
 

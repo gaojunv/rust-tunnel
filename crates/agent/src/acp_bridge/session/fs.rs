@@ -25,6 +25,9 @@ use super::super::SpawnedAgent;
 
 use super::to_workspace_relative;
 
+/// fs 隧道执行超时：读写均 2 分钟，覆盖大文件往返。
+const FS_RPC_TIMEOUT: Duration = Duration::from_mins(2);
+
 /// fs 请求的公共上下文：session → workspace（root_path / docker）→ 活跃进程 client_id。
 struct FsContext {
     client_id: String,
@@ -80,7 +83,7 @@ pub(crate) async fn exec_fs_read(
             &ctx.root_path,
             ctx.docker_container.as_deref(),
             rust_tunnel_common::AgentCommand::ReadFile { path: rel },
-            Duration::from_mins(2),
+            FS_RPC_TIMEOUT,
         )
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;
@@ -148,7 +151,7 @@ pub(crate) async fn exec_fs_write(
             &ctx.root_path,
             ctx.docker_container.as_deref(),
             command,
-            Duration::from_mins(2),
+            FS_RPC_TIMEOUT,
         )
         .await
         .map_err(|e| format!("tunnel execution failed: {e}"))?;

@@ -6,6 +6,9 @@ use reqwest::Client;
 
 use super::ChatCompletionRequest;
 
+/// 流式首事件等待上限：30s，首个 SSE 事件未到即判超时以便故障转移。
+const FIRST_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 上游 HTTP 客户端配置（超时/连接池策略）。
 ///
 /// [`LlmState`](crate::LlmState) 构造时按本配置构建 `reqwest::Client`；
@@ -49,21 +52,20 @@ impl Default for UpstreamClientConfig {
 
 impl UpstreamClientConfig {
     /// 按配置构建 reqwest 客户端（连接池随 client 句柄共享，clone 廉价）。
+    /// 起点为 common 统一工厂（UA 等默认），四个动态字段在此覆盖。
     ///
     /// # Panics
     /// reqwest builder 内部 TLS/解析失败时 panic（与原全局 static 构建行为一致）。
     #[must_use]
-    // builder 失败仅发生在 TLS 后端初始化等病态场景，与原 static 初始化的 expect 语义一致
-    #[allow(clippy::expect_used)]
     pub fn build_client(&self) -> Client {
-        Client::builder()
-            .http1_only()
-            .connect_timeout(self.connect_timeout)
-            .read_timeout(self.read_timeout)
-            .tcp_keepalive(self.tcp_keepalive)
-            .pool_max_idle_per_host(self.pool_max_idle_per_host)
-            .build()
-            .expect("failed to build upstream HTTP client")
+        rust_tunnel_common::http_client::build(
+            rust_tunnel_common::http_client::builder()
+                .http1_only()
+                .connect_timeout(self.connect_timeout)
+                .read_timeout(self.read_timeout)
+                .tcp_keepalive(self.tcp_keepalive)
+                .pool_max_idle_per_host(self.pool_max_idle_per_host),
+        )
     }
 }
 
@@ -512,7 +514,7 @@ pub async fn call_upstream_stream_guarded(
     // 缓冲到第一个 SSE data 事件（含跨 chunk 到达的情况），30s 首字节超时。
     let mut stream = resp.bytes_stream();
     let mut prefix: Vec<u8> = Vec::new();
-    let first_event_deadline = std::time::Duration::from_secs(30);
+    let first_event_deadline = FIRST_EVENT_DEADLINE;
     let collect = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {

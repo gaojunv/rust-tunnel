@@ -15,6 +15,9 @@ use crate::agent::runner::client_supports_cancel;
 use crate::db::Database;
 use rust_tunnel_common::ControlMessage;
 
+/// OpenTunnel 建连等待超时：5s，客户端未响应即判超时。
+const OPEN_TUNNEL_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub type ControlSender = mpsc::Sender<ControlMessage>;
 
 /// Outcome of an `OpenTunnel` dial, delivered via a one-shot channel from the
@@ -212,7 +215,6 @@ impl ClientRegistry {
         target_addr: &str,
     ) -> std::io::Result<crate::control_plane::tunnel_stream::ClientTunnelStream> {
         use std::io::{Error, ErrorKind};
-        use std::time::Duration;
 
         let entry = self.get(client_name).await.ok_or_else(|| {
             Error::new(
@@ -248,7 +250,7 @@ impl ClientRegistry {
             .map_err(|_| Error::new(ErrorKind::BrokenPipe, "control channel closed"))?;
 
         // Await result with 5s timeout
-        let outcome = tokio::time::timeout(Duration::from_secs(5), open_rx).await;
+        let outcome = tokio::time::timeout(OPEN_TUNNEL_TIMEOUT, open_rx).await;
 
         // Handle timeout separately (needs async cleanup)
         let outcome = match outcome {

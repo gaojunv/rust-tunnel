@@ -3,6 +3,11 @@
 
 use tokio::net::TcpStream;
 
+/// SNI 嗅探总超时：3s，覆盖慢连接首包到达。
+const SNI_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// SNI 嗅探重试间隔：20ms，peek 未到齐时短暂等待。
+const SNI_SNIFF_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// ClientHello SNI 解析结果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SniParse {
@@ -124,7 +129,7 @@ pub fn parse_client_hello_sni(buf: &[u8]) -> SniParse {
 /// 只在每个新连接读取一次首包；超时、解析失败、非 TLS 一律返回 None，
 /// 由调用方继续走正常 HTTP 路径，避免慢连接占用 accept 循环。
 pub async fn sniff_sni(stream: &TcpStream) -> Option<String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + SNI_SNIFF_TIMEOUT;
     let mut buf = vec![0u8; 16384];
     loop {
         match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
@@ -134,7 +139,7 @@ pub async fn sniff_sni(stream: &TcpStream) -> Option<String> {
                 SniParse::NoSni | SniParse::NotClientHello => return None,
                 SniParse::Incomplete => {
                     // 数据未到齐，稍等重试（peek 不消费，重复解析无副作用）
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    tokio::time::sleep(SNI_SNIFF_RETRY_INTERVAL).await;
                 }
             },
             Ok(Err(_)) => return None,

@@ -7,6 +7,9 @@ use tracing_subscriber::Layer;
 
 use crate::db::Database;
 
+/// 日志落库批量刷盘间隔：500ms，平衡实时性与 DB 压力。
+const LOG_FLUSH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(500);
+
 /// A log entry captured from tracing events
 ///
 /// 与持久化层共享同一行类型（`DbLogEntry`），避免双类型逐字段拷贝。
@@ -58,8 +61,7 @@ impl LogStore {
         let inner = store.inner.clone();
         let tx = store.tx.clone();
         tokio::spawn(async move {
-            let mut db_flush_interval =
-                tokio::time::interval(tokio::time::Duration::from_millis(500));
+            let mut db_flush_interval = tokio::time::interval(LOG_FLUSH_INTERVAL);
 
             loop {
                 tokio::select! {

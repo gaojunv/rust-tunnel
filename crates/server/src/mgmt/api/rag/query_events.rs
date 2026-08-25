@@ -21,6 +21,11 @@ use crate::mgmt::api::ApiState;
 use super::dto::{QueryKbRequest, TestEmbeddingRequest};
 use super::{llm_state, rag_rt};
 
+/// SSE 订阅等待与保活间隔：30s，超时发 ping 保活。
+const SSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// SSE KeepAlive 间隔：30s，与订阅超时对齐。
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 探测 embedding 服务：向 `POST {base_url}/embeddings` 发一条探针文本，返回维度与耗时。
 /// 前端据此填写 KB 的 `emb_dimension`。
 ///
@@ -129,7 +134,7 @@ pub async fn sse_kb_events(
     let mut rx = llm.rag_tx.subscribe();
     let stream = async_stream::stream! {
         loop {
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(ev)) => {
                     let json = serde_json::to_string(&ev).unwrap_or_default();
                     yield Ok::<_, std::convert::Infallible>(
@@ -152,6 +157,6 @@ pub async fn sse_kb_events(
         }
     };
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
         .into_response()
 }

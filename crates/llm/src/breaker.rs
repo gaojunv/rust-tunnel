@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// 陈旧试探回收宽限：冷却期满后再过 5 分钟（上游读超时）视为陈旧，可重新夺取试探权。
+const STALE_PROBE_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+
 /// 连续失败多少次打开熔断。
 pub const FAILURE_THRESHOLD: u32 = 5;
 /// 首次冷却秒数。
@@ -88,7 +91,7 @@ impl ModelBreakers {
                     // 陈旧试探回收：试探请求被客户端断开时 record_* 不会执行，
                     // probe_in_flight 可能永真（单模型场景永久 503）。
                     // 超过冷却 + 上游读超时（300s）视为陈旧，允许重新夺取。
-                    if elapsed > open.cooldown + std::time::Duration::from_mins(5) {
+                    if elapsed > open.cooldown + STALE_PROBE_GRACE {
                         // 重新夺取：把 opened_at 重置到冷却刚满的锚点，开启新的试探窗口。
                         // 否则陈旧窗口（opened_at 仍在过去）对后续请求恒成立，单飞失效，
                         // 会同时放行多个并发试探冲击上游。

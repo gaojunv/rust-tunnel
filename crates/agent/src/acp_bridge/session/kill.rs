@@ -2,6 +2,9 @@
 
 use std::time::Duration;
 
+/// ACP 会话删除协商超时：5s 内未响应即放行，不阻塞本地会话清理。
+const DELETE_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[allow(unused_imports)]
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
@@ -69,7 +72,7 @@ impl AcpBridge {
         // 先让 agent 删除其持久化会话文件（best-effort，5s 超时防卡死）。
         if let (Some(cx), Some(sid)) = (connection, acp_sid) {
             let _ = tokio::time::timeout(
-                Duration::from_secs(5),
+                DELETE_SESSION_TIMEOUT,
                 cx.send_request(DeleteSessionRequest::new(sid)).block_task(),
             )
             .await;

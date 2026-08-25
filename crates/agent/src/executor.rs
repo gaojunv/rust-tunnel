@@ -2,6 +2,11 @@
 use super::AgentState;
 use rust_tunnel_common::{AgentCommand, AgentResult};
 
+/// Shell 命令的隧道等待超时：150s，覆盖常见编译/测试耗时。
+const SHELL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+/// 非 Shell/ShellWithTimeout 命令的默认隧道等待超时：2 分钟。
+const DEFAULT_EXEC_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
 /// Execute a command on the workspace's client, serialized per workspace.
 /// Never errors at the Rust level: transport failures become AgentResult::Error.
 /// request_id 由 AgentState 预生成并记入 inflight，供 WS cancel 分支下发真取消。
@@ -91,8 +96,8 @@ async fn exec_on_client_impl(
         AgentCommand::ShellWithTimeout { timeout_secs, .. } => {
             std::time::Duration::from_secs((timeout_secs + 30).min(3630))
         }
-        AgentCommand::Shell { .. } => std::time::Duration::from_secs(150),
-        _ => std::time::Duration::from_mins(2),
+        AgentCommand::Shell { .. } => SHELL_WAIT_TIMEOUT,
+        _ => DEFAULT_EXEC_WAIT_TIMEOUT,
     };
     // 只读命令跳过 workspace_lock（锁保护 git 状态安全与写互斥，只读并发无此需要）。
     // 先获取 Mutex（保持存活），再 lock（Guard 取引用）：两层分离使

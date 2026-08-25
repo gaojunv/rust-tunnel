@@ -6,6 +6,9 @@ use crate::control::ControlSender;
 use rust_tunnel_common::protocol::ClientLogEntry;
 use rust_tunnel_common::ControlMessage;
 
+/// 客户端日志批量上报刷新间隔：2s，或满 50 条立即刷。
+const LOG_FLUSH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+
 /// A tracing [`Layer`] that captures log events on the client and forwards them
 /// through an mpsc channel so they can be batched and sent to the server.
 ///
@@ -114,7 +117,7 @@ pub fn spawn_log_forwarder(
 ) {
     tokio::spawn(async move {
         let mut buffer: Vec<ClientLogEntry> = Vec::with_capacity(50);
-        let mut flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        let mut flush_interval = tokio::time::interval(LOG_FLUSH_INTERVAL);
 
         loop {
             tokio::select! {

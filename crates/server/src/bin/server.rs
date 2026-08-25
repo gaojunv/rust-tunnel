@@ -8,6 +8,13 @@ use rust_tunnel_server::{api, auth, control_plane, listener, Database, ServerCon
 use std::sync::Arc;
 use tokio::sync::watch;
 
+/// 统计速率重算间隔：5s，滑动窗口更新速率。
+const STATS_RATE_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+/// 统计快照落库与广播间隔：1 分钟，对齐 DB 分钟桶。
+const STATS_FLUSH_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_mins(1);
+/// 统计与日志清理间隔：30 分钟，清理 7 天前的快照与 30 天日志。
+const STATS_CLEANUP_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_mins(30);
+
 async fn disable_conflicting_rules_on_port(
     proxy_state: &rust_tunnel_server::reverse_proxy::ReverseProxyState,
     listen_addr: &str,
@@ -673,7 +680,7 @@ async fn main() -> TunnelResult<()> {
     // Task: rate recalculation every 5 seconds
     let sc_rates = sc.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(STATS_RATE_INTERVAL);
         loop {
             interval.tick().await;
             sc_rates.tick_rates();
@@ -683,7 +690,7 @@ async fn main() -> TunnelResult<()> {
     // Task: flush snapshots to DB + broadcast every 60 seconds
     let sc_flush = sc.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
+        let mut interval = tokio::time::interval(STATS_FLUSH_INTERVAL);
         loop {
             interval.tick().await;
             sc_flush.flush().await;
@@ -693,7 +700,7 @@ async fn main() -> TunnelResult<()> {
     // Task: cleanup old stats snapshots every 30 minutes
     let db_for_stats_cleanup = db.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(30));
+        let mut interval = tokio::time::interval(STATS_CLEANUP_INTERVAL);
         loop {
             interval.tick().await;
             let seven_days_ago = chrono::Utc::now() - chrono::Duration::days(7);

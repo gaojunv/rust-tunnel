@@ -5,6 +5,9 @@ use tracing::{debug, info, warn};
 
 use super::{DnsChallengeSolver, DnsProviderConfig};
 
+/// DNS 传播轮询间隔：5s，平衡及时性与 API 限频。
+const DNS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Aliyun DNS API base URL
 const ALIYUN_DNS_API: &str = "https://alidns.aliyuncs.com/";
 
@@ -52,7 +55,7 @@ impl AliyunDnsSolver {
         Self {
             access_key_id: config.api_key.clone(),
             access_key_secret: config.api_secret.clone().unwrap_or_default(),
-            client: reqwest::Client::new(),
+            client: rust_tunnel_common::http_client::default_client(),
         }
     }
 
@@ -263,7 +266,7 @@ impl DnsChallengeSolver for AliyunDnsSolver {
         let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
 
         let deadline = tokio::time::Instant::now() + timeout;
-        let poll_interval = Duration::from_secs(5);
+        let poll_interval = DNS_POLL_INTERVAL;
 
         info!(
             "Waiting for DNS propagation of TXT record for {} (timeout: {:?})",

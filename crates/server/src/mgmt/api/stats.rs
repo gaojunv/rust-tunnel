@@ -5,8 +5,14 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use std::time::Duration;
 
 use super::ApiState;
+
+/// SSE 订阅等待与保活间隔：30s，超时发 ping 保活。
+const SSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// SSE KeepAlive 间隔：30s，与订阅超时对齐。
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 pub struct StatsQueryParams {
@@ -108,7 +114,7 @@ pub async fn sse_stats_stream(
     let mut rx = state.server_state.stats_collector.subscribe();
     let stream = async_stream::stream! {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(snapshot)) => {
                     if let Some(ref et) = entity_type_filter {
                         if snapshot.entity_type != *et { continue; }
@@ -133,8 +139,6 @@ pub async fn sse_stats_stream(
         }
     };
     axum::response::sse::Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(30)),
-        )
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
         .into_response()
 }

@@ -35,6 +35,13 @@ use crate::mgmt::api::ApiState;
 
 use super::mem_runtime;
 
+/// Wiki SSE 保活与订阅超时：30s，与其他 SSE 对齐。
+const WIKI_SSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wiki SSE KeepAlive 间隔：30s。
+const WIKI_SSE_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Wiki 轮询等待：30s，与 SSE 超时同值。
+const WIKI_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 从 `ApiState` 取 Wiki 运行时；未注入（非 rag 构建 / 未初始化）→ 503。
 /// 与 `mem_runtime` 同模式，对齐 `MemoryState` 的挂载形态。
 pub(crate) fn wiki_runtime(state: &ApiState) -> Result<WikiState, (StatusCode, String)> {
@@ -854,11 +861,11 @@ pub async fn sse_wiki_events(
         loop {
             let Some(rx) = rx.as_mut() else {
                 // 无运行时：周期性 ping，事件永不到达。
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(WIKI_POLL_INTERVAL).await;
                 yield Ok::<_, std::convert::Infallible>(Event::default().event("ping").data(""));
                 continue;
             };
-            match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            match tokio::time::timeout(WIKI_SSE_TIMEOUT, rx.recv()).await {
                 Ok(Ok(ev)) => {
                     let json = serde_json::to_string(&ev).unwrap_or_default();
                     yield Ok::<_, std::convert::Infallible>(Event::default().event("wiki").data(json));
@@ -876,7 +883,7 @@ pub async fn sse_wiki_events(
         }
     };
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .keep_alive(KeepAlive::new().interval(WIKI_SSE_KEEPALIVE))
         .into_response()
 }
 

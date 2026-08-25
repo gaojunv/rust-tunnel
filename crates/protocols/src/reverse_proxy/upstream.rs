@@ -19,6 +19,11 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::time::Duration;
 
+/// 上游连接池空闲超时：1 分钟，复用兼及时回收。
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+/// 上游 HTTP/2 keepalive 间隔：30s，维持长连接活性。
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Body type carried through the proxy pipeline.
 ///
 /// Both hyper request bodies and axum request bodies are converted to this
@@ -55,8 +60,8 @@ impl UpstreamClient {
     /// Panics if the system's native root store cannot be loaded.
     #[must_use]
     pub fn new() -> Self {
-        let idle = Duration::from_mins(1);
-        let ka = Duration::from_secs(30);
+        let idle = UPSTREAM_IDLE_TIMEOUT;
+        let ka = UPSTREAM_KEEPALIVE_INTERVAL;
 
         let plain_conn = HttpConnector::new();
 

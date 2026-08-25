@@ -14,6 +14,11 @@ use rust_tunnel_common::{
     TunnelError, TunnelResult,
 };
 
+/// 控制通道心跳间隔：30s，兼顾 NAT 保活与服务端超时检测。
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// 隧道内命令默认等待超时：2 分钟，覆盖常规文件与 shell 执行。
+const DEFAULT_AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
 /// Stores the global log layer so it can be reused across reconnections.
 /// On reconnect the inner sender is hot-swapped via [`ClientLogLayer::set_sender`].
 static LOG_LAYER: std::sync::OnceLock<ClientLogLayer> = std::sync::OnceLock::new();
@@ -175,7 +180,7 @@ impl ClientState {
 
 /// Start the heartbeat task that sends periodic ping to keep connection alive
 async fn start_heartbeat(sender: ControlSender) {
-    let mut interval = time::interval(time::Duration::from_secs(30));
+    let mut interval = time::interval(HEARTBEAT_INTERVAL);
     let mut seq = 0u32;
     loop {
         // Skip first tick - send ping immediately on connection
@@ -295,7 +300,7 @@ async fn process_control_messages<R: AsyncRead + Unpin>(
                                     timeout_secs,
                                     ..
                                 } => std::time::Duration::from_secs((*timeout_secs).clamp(1, 3600)),
-                                _ => std::time::Duration::from_mins(2),
+                                _ => DEFAULT_AGENT_TIMEOUT,
                             };
                             let result = crate::agent::handle_exec_request(
                                 &command,

@@ -9,8 +9,6 @@
 //! - [`GitHubClient`] 的手写 `Debug` 会把 token 打码为 `<redacted>`；
 //! - 所有错误响应与日志消息都不包含 token 明文。
 
-use std::time::Duration;
-
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use thiserror::Error;
 
@@ -57,13 +55,8 @@ impl GitHubClient {
     #[must_use]
     pub fn new(base_url: &str, token: &str) -> Self {
         Self {
-            // 构造期 fatal：TLS 后端初始化失败则整个 GitHub 集成不可用，
-            // 返回 Self 的签名无法传播错误，保持 panic 语义。
-            #[expect(clippy::panic)]
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|e| panic!("reqwest Client builder failed: {e}")),
+            // 统一工厂默认档（30s 整体超时）；UA 被 headers() 的请求级值覆盖
+            client: rust_tunnel_common::http_client::default_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         }
