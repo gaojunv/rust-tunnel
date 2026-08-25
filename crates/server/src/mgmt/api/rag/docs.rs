@@ -8,7 +8,7 @@ use axum::{
     Json,
 };
 
-use crate::db::rag::{RagDocumentRecord, RagKnowledgeBaseRecord};
+use crate::db::knowledge::{IndexKind, KnowledgeDocIndexRecord, KnowledgeDocRecord, KnowledgeSourceRecord};
 use crate::llm::rag::extractor::FileType;
 use crate::llm::rag::ingest::spawn_ingest;
 use crate::llm::rag::store::VectorStore;
@@ -16,6 +16,24 @@ use crate::mgmt::api::ApiState;
 use sha2::Digest;
 
 use super::{rag_rt, RagRuntime};
+
+/// 文档视图 JSON：保持旧 `RagDocumentRecord` 的键名与结构不变（`kb_id`/`chunk_count` 等）。
+/// `KnowledgeDocRecord` 本身不含状态，状态由 `knowledge_doc_index` per-(doc,Vector) 提供。
+fn doc_json(doc: &KnowledgeDocRecord, idx: Option<&KnowledgeDocIndexRecord>) -> serde_json::Value {
+    serde_json::json!({
+        "id": doc.id,
+        "kb_id": doc.source_id,
+        "filename": doc.filename,
+        "file_type": doc.file_type,
+        "content_hash": doc.content_hash,
+        "status": idx.map(|i| i.status.as_str()).unwrap_or("pending"),
+        "chunk_count": idx.map(|i| i.item_count).unwrap_or(0),
+        "error": idx.and_then(|i| i.error.clone()),
+        "created_at": doc.created_at,
+        "updated_at": doc.updated_at,
+    })
+}
+
 
 /// 文档原文落盘路径：`<data_dir>/rag_docs/<kb_id>/<doc_id>.<ext>`（保留真实扩展名，
 /// 二进制原文 reindex 时按 file_type 重新解析）。`pub(crate)` 供 `kb.rs` 全量重建路径引用。
@@ -50,15 +68,15 @@ pub(crate) enum ReindexOutcome {
 /// `sem` 为可选并发信号量（全量重建时限流用，见 `spawn_ingest`）。
 pub(crate) async fn reindex_kb_doc(
     rt: &RagRuntime,
-    kb: &RagKnowledgeBaseRecord,
-    doc: &RagDocumentRecord,
+    kb: &KnowledgeSourceRecord,
+    doc: &KnowledgeDocRecord,
     sem: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<ReindexOutcome, (StatusCode, String)> {
     // 并发防护：pending/processing 表示原始摄入或上一次 reindex 仍在途，
     // 此时再 reindex 会与在途任务同时写向量+分块 → 重复数据。
     // 用原子 CAS 抢占（check-then-act 会让两个并发请求双双通过守卫），
     // 只有一个请求能把状态从 ready/failed 置回 pending。
-    match rt.db.rag_mark_document_pending_if_idle(&doc.id).await {
+    match rt.db.kdoc_mark_pending_if_idle(&doc.id, IndexKind::Vector).await {
         Ok(true) => {}
         Ok(false) => return Ok(ReindexOutcome::Skipped),
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))),
@@ -74,8 +92,9 @@ pub(crate) async fn reindex_kb_doc(
         tracing::warn!(kb_id = %kb.id, doc_id = %doc.id, path = %source_path.display(), "rag reindex: source file missing");
         if let Err(e) = rt
             .db
-            .rag_update_document_status(
+            .kdoc_update_index_status(
                 &doc.id,
+                IndexKind::Vector,
                 "failed",
                 0,
                 Some("original document missing; delete and re-upload it"),
@@ -128,7 +147,7 @@ pub async fn list_docs(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(_kb) = (match rt.db.rag_get_kb(&kb_id).await {
+    let Some(_kb) = (match rt.db.ks_get(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -136,13 +155,19 @@ pub async fn list_docs(
     }) else {
         return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
     };
-    let docs = match rt.db.rag_list_documents(&kb_id).await {
+    let docs = match rt.db.kdoc_list(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
-    Json(serde_json::json!({ "documents": docs })).into_response()
+    // per-kind 状态化：为每个文档取 Vector 索引，组装与旧形状一致的视图
+    let mut out = Vec::with_capacity(docs.len());
+    for d in &docs {
+        let idx = rt.db.kdoc_get_index(&d.id, IndexKind::Vector).await.unwrap_or(None);
+        out.push(doc_json(d, idx.as_ref()));
+    }
+    Json(serde_json::json!({ "documents": out })).into_response()
 }
 
 /// `GET /api/llm/kb/:id/docs/:doc_id` 获取单文档详情，校验归属后返回记录。
@@ -154,7 +179,7 @@ pub async fn get_doc(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(doc) = (match rt.db.rag_get_document(&doc_id).await {
+    let Some(doc) = (match rt.db.kdoc_get(&doc_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -162,13 +187,14 @@ pub async fn get_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     };
-    if doc.kb_id != kb_id {
+    if doc.source_id != kb_id {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     }
-    Json(serde_json::to_value(doc).unwrap_or_default()).into_response()
+    let idx = rt.db.kdoc_get_index(&doc.id, IndexKind::Vector).await.unwrap_or(None);
+    Json(doc_json(&doc, idx.as_ref())).into_response()
 }
 
-/// POST /api/llm/kb/:id/docs — multipart 上传文档（文本 ≤2MB、二进制 ≤20MB），
+ /// POST /api/llm/kb/:id/docs — multipart 上传文档（文本 ≤2MB、二进制 ≤20MB），
 /// 建 doc(pending) 后异步摄入并立即返回 doc 记录。摄入进度经
 /// `/api/llm/kb/events` SSE 推送。
 #[allow(clippy::too_many_lines, reason = "顺序编排：multipart 校验→落盘→入库→异步摄入，拆分会打散共享状态")]
@@ -181,7 +207,7 @@ pub async fn upload_doc(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(kb) = (match rt.db.rag_get_kb(&kb_id).await {
+    let Some(kb) = (match rt.db.ks_get(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -308,7 +334,7 @@ pub async fn upload_doc(
 
     if let Err(e) = rt
         .db
-        .rag_create_document(&doc_id, &kb_id, &name, &content_hash, file_type.as_str())
+        .kdoc_create(&doc_id, &kb_id, &name, file_type.as_str(), &content_hash)
         .await
     {
         // 清理已落盘的原文，避免孤儿文件
@@ -330,12 +356,15 @@ pub async fn upload_doc(
         None,
     );
 
-    match rt.db.rag_get_document(&doc_id).await {
-        Ok(Some(doc)) => (
-            StatusCode::CREATED,
-            Json(serde_json::to_value(doc).unwrap_or_default()),
-        )
-            .into_response(),
+    match rt.db.kdoc_get(&doc_id).await {
+        Ok(Some(doc)) => {
+            let idx = rt.db.kdoc_get_index(&doc.id, IndexKind::Vector).await.unwrap_or(None);
+            (
+                StatusCode::CREATED,
+                Json(doc_json(&doc, idx.as_ref())),
+            )
+                .into_response()
+        }
         _ => (
             StatusCode::CREATED,
             Json(serde_json::json!({
@@ -360,7 +389,7 @@ pub async fn delete_doc(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(kb) = (match rt.db.rag_get_kb(&kb_id).await {
+    let Some(kb) = (match rt.db.ks_get(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -368,7 +397,7 @@ pub async fn delete_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
     };
-    let Some(doc) = (match rt.db.rag_get_document(&doc_id).await {
+    let Some(doc) = (match rt.db.kdoc_get(&doc_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -376,7 +405,7 @@ pub async fn delete_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     };
-    if doc.kb_id != kb_id {
+    if doc.source_id != kb_id {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     }
 
@@ -393,7 +422,7 @@ pub async fn delete_doc(
     {
         tracing::warn!(kb_id = %kb_id, doc_id = %doc_id, error = %e, "rag: store delete_by_doc failed");
     }
-    if let Err(e) = rt.db.rag_delete_document(&doc_id).await {
+    if let Err(e) = rt.db.kdoc_delete(&doc_id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     // 清理原文文件（reindex 的真相源）。失败仅 warn：DB 是源，残留文件无害。
@@ -426,7 +455,7 @@ pub async fn reindex_doc(
         Ok(rt) => rt,
         Err(e) => return e.into_response(),
     };
-    let Some(kb) = (match rt.db.rag_get_kb(&kb_id).await {
+    let Some(kb) = (match rt.db.ks_get(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -434,7 +463,7 @@ pub async fn reindex_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "knowledge base not found").into_response();
     };
-    let Some(doc) = (match rt.db.rag_get_document(&doc_id).await {
+    let Some(doc) = (match rt.db.kdoc_get(&doc_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -442,7 +471,7 @@ pub async fn reindex_doc(
     }) else {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     };
-    if doc.kb_id != kb_id {
+    if doc.source_id != kb_id {
         return (StatusCode::NOT_FOUND, "document not found").into_response();
     }
 
@@ -467,12 +496,15 @@ pub async fn reindex_doc(
         Err(e) => return e.into_response(),
     }
 
-    match rt.db.rag_get_document(&doc_id).await {
-        Ok(Some(d)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(d).unwrap_or_default()),
-        )
-            .into_response(),
+    match rt.db.kdoc_get(&doc_id).await {
+        Ok(Some(d)) => {
+            let idx = rt.db.kdoc_get_index(&d.id, IndexKind::Vector).await.unwrap_or(None);
+            (
+                StatusCode::OK,
+                Json(doc_json(&d, idx.as_ref())),
+            )
+                .into_response()
+        }
         _ => (
             StatusCode::OK,
             Json(serde_json::json!({

@@ -369,7 +369,7 @@ async fn main() -> TunnelResult<()> {
     {
         if let Some(db) = state.db().cloned() {
             match db
-                .rag_fail_inflight_documents("interrupted by server restart")
+                .kdoc_fail_inflight(rust_tunnel_persistence::knowledge::IndexKind::Vector, "interrupted by server restart")
                 .await
             {
                 Ok(0) => {}
@@ -381,7 +381,7 @@ async fn main() -> TunnelResult<()> {
             }
             // Wiki 启动对账：同上，把卡死的 wiki doc 复位为 failed。
             match db
-                .wiki_fail_inflight_docs("interrupted by server restart")
+                .kdoc_fail_inflight(rust_tunnel_persistence::knowledge::IndexKind::Pages, "interrupted by server restart")
                 .await
             {
                 Ok(0) => {}

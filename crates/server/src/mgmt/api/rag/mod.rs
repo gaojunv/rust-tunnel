@@ -370,7 +370,7 @@ mod tests {
         assert!(!kb_id.is_empty());
 
         // emb_api_key 落库已加密（固定测试主密钥 → 密文前缀）
-        let stored = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let stored = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert!(
             stored.emb_api_key.starts_with("enc:v1:"),
             "emb_api_key should be encrypted, got: {}",
@@ -408,7 +408,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::OK, "update kb: {body}");
-        let updated = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let updated = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert_eq!(updated.top_k, 8);
         assert_eq!(
             updated.emb_base_url, stored.emb_base_url,
@@ -426,7 +426,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::OK);
-        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 0);
+        assert_eq!(db.ks_get(&kb_id).await.unwrap().unwrap().enabled, 0);
         let (status, _body) = call(
             &app,
             json_request(
@@ -589,7 +589,7 @@ mod tests {
             !dir.path().join("rag_docs").join(&kb_id).exists(),
             "kb doc source dir should be removed"
         );
-        assert!(db.rag_get_kb(&kb_id).await.unwrap().is_none());
+        assert!(db.ks_get(&kb_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -763,7 +763,7 @@ mod tests {
         );
         let kb_id = body["id"].as_str().expect("kb id").to_string();
 
-        let stored = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let stored = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert_eq!(stored.emb_base_url, base);
         assert_eq!(stored.emb_model, "global-model");
         assert_eq!(stored.emb_dimension, 8);
@@ -1029,7 +1029,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
-        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+        assert_eq!(db.ks_get(&kb_id).await.unwrap().unwrap().enabled, 1);
     }
 
     #[tokio::test]
@@ -1040,7 +1040,7 @@ mod tests {
         let db = state.server_state.db().unwrap().clone();
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
-        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+        assert_eq!(db.ks_get(&kb_id).await.unwrap().unwrap().enabled, 1);
 
         // 空体 {} → 400（不再静默禁用）
         let (status, _body) = call(
@@ -1050,7 +1050,7 @@ mod tests {
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
         assert_eq!(
-            db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled,
+            db.ks_get(&kb_id).await.unwrap().unwrap().enabled,
             1,
             "空 PATCH 不得把 KB 静默禁用"
         );
@@ -1066,7 +1066,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, HttpStatus::BAD_REQUEST);
-        assert_eq!(db.rag_get_kb(&kb_id).await.unwrap().unwrap().enabled, 1);
+        assert_eq!(db.ks_get(&kb_id).await.unwrap().unwrap().enabled, 1);
     }
 
     #[tokio::test]
@@ -1079,7 +1079,7 @@ mod tests {
         let kb_id = create_kb(&app, &base).await;
 
         // 软关 KB
-        db.rag_toggle_kb(&kb_id, false).await.unwrap();
+        db.ks_set_enabled(&kb_id, false).await.unwrap();
 
         // 上传 → 409 "knowledge base is disabled"（与 delete_kb 的软关配合）
         let boundary = "b-disabled";
@@ -1099,7 +1099,7 @@ mod tests {
             "禁用 KB 上传应提示 disabled, got: {body_text}"
         );
         // 未留下任何 doc 记录/原文文件
-        assert!(db.rag_list_documents(&kb_id).await.unwrap().is_empty());
+        assert!(db.kdoc_list(&kb_id).await.unwrap().is_empty());
         assert!(!dir.path().join("rag_docs").join(&kb_id).exists());
     }
 
@@ -1114,10 +1114,10 @@ mod tests {
 
         // 手工构造一个 status=processing 的 doc + 落盘原文（确定性，无时序竞态）
         let doc_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_document(&doc_id, &kb_id, "busy.md", "sha256:x", "md")
+        db.kdoc_create(&doc_id, &kb_id, "busy.md", "md", "sha256:x")
             .await
             .unwrap();
-        db.rag_update_document_status(&doc_id, "processing", 0, None)
+        db.kdoc_update_index_status(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector, "processing", 0, None)
             .await
             .unwrap();
         let source_path = dir
@@ -1146,7 +1146,7 @@ mod tests {
             "processing 中 reindex 应 409, got: {body_text}"
         );
         // pending 同样拒绝
-        db.rag_update_document_status(&doc_id, "pending", 0, None)
+        db.kdoc_update_index_status(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector, "pending", 0, None)
             .await
             .unwrap();
         let (status, _body) = call(
@@ -1192,7 +1192,7 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base8).await;
         let (doc_id, first) = upload_guide_and_wait(&app, &kb_id).await;
-        let before = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let before = db.ks_get(&kb_id).await.unwrap().unwrap();
 
         // PUT 新 embedding（换 base_url 到 16 维 mock + 新 model + 新维度），api_key 留空
         let base16 = mock_embedding_server(16).await;
@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(body["missing_source"].as_i64(), Some(0));
 
         // emb 已更新、密钥保留（留空 = 保持旧密文）、重建后恢复启用
-        let after = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let after = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert_eq!(after.emb_base_url, base16);
         assert_eq!(after.emb_model, "new-model");
         assert_eq!(after.emb_dimension, 16);
@@ -1256,7 +1256,7 @@ mod tests {
         let app = test_router(state);
         let kb_id = create_kb(&app, &base).await;
         let (doc_id, chunks) = upload_guide_and_wait(&app, &kb_id).await;
-        let before = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let before = db.ks_get(&kb_id).await.unwrap().unwrap();
 
         // 仅换 api_key → 只替换密文，不触发重建（无 reindexed 字段）
         let (status, body) = call(
@@ -1274,15 +1274,19 @@ mod tests {
             "仅换密钥不应触发重建: {body}"
         );
 
-        let after = db.rag_get_kb(&kb_id).await.unwrap().unwrap();
+        let after = db.ks_get(&kb_id).await.unwrap().unwrap();
         assert_ne!(after.emb_api_key, before.emb_api_key, "密钥密文应已替换");
         assert_eq!(after.emb_base_url, before.emb_base_url);
         assert_eq!(after.emb_model, before.emb_model);
         assert_eq!(after.emb_dimension, before.emb_dimension);
 
         // 文档保持 ready、分块未被清
-        let doc = db.rag_get_document(&doc_id).await.unwrap().unwrap();
-        assert_eq!(doc.status, "ready");
+        let idx = db
+            .kdoc_get_index(&doc_id, rust_tunnel_persistence::knowledge::IndexKind::Vector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx.status, "ready");
         assert_eq!(db.rag_count_kb_chunks(&kb_id).await.unwrap(), chunks);
     }
 

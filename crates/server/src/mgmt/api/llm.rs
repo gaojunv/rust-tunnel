@@ -597,7 +597,7 @@ async fn ensure_kb_exists(
     let Some(kb_id) = kb_id else {
         return Ok(());
     };
-    match db.rag_get_kb(kb_id).await {
+    match db.ks_get(kb_id).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err((StatusCode::BAD_REQUEST, "kb not found".to_string())),
         Err(e) => Err((
@@ -1253,10 +1253,15 @@ mod tests {
     /// 直接向内存 DB 建一个知识库，返回 kb_id。
     async fn seed_kb(db: &Database) -> String {
         let kb_id = uuid::Uuid::new_v4().to_string();
-        db.rag_create_kb(&rust_tunnel_persistence::rag::RagCreateKbOpts {
+        db.ks_create(&rust_tunnel_persistence::knowledge::KsCreateOpts {
             id: kb_id.clone(),
             name: "测试库".to_owned(),
-            description: String::new(),
+            summary: String::new(),
+            index_vector: true,
+            index_pages: false,
+            scope_type: "global".to_owned(),
+            client_id: String::new(),
+            workspace_id: String::new(),
             emb_base_url: "http://127.0.0.1:9999".to_owned(),
             emb_api_key: "sk-test".to_owned(),
             emb_model: "test-model".to_owned(),

@@ -25,10 +25,8 @@ use crate::agent::memory::scope_coords;
 use crate::agent::wiki::WikiState;
 use crate::auth::validate_token;
 use crate::db::agent::normalize_db_datetime;
-use crate::db::wiki::{
-    normalize_wiki_ref, AgentWikiDocRecord, AgentWikiPageRecord, AgentWikiPageSummary,
-    AgentWikiRecord,
-};
+use crate::db::knowledge::{IndexKind, KnowledgeDocIndexRecord, KnowledgeDocRecord, KnowledgeSourceRecord};
+use crate::db::wiki::{normalize_wiki_ref, AgentWikiPageRecord, AgentWikiPageSummary};
 use crate::llm::rag::extractor::FileType;
 use crate::mgmt::api::dto::SseQuery;
 use crate::mgmt::api::ApiState;
@@ -64,7 +62,7 @@ pub(crate) fn wiki_runtime(state: &ApiState) -> Result<WikiState, (StatusCode, S
 
 const VALID_SCOPES: [&str; 3] = ["global", "client", "workspace"];
 
-fn wiki_json(w: &AgentWikiRecord) -> serde_json::Value {
+fn wiki_json(w: &KnowledgeSourceRecord) -> serde_json::Value {
     serde_json::json!({
         "id": w.id,
         "name": w.name,
@@ -113,15 +111,15 @@ fn page_json(p: &AgentWikiPageRecord) -> serde_json::Value {
     })
 }
 
-fn doc_json(d: &AgentWikiDocRecord) -> serde_json::Value {
+fn doc_json(d: &KnowledgeDocRecord, idx: Option<&KnowledgeDocIndexRecord>) -> serde_json::Value {
     serde_json::json!({
         "id": d.id,
-        "wiki_id": d.wiki_id,
+        "wiki_id": d.source_id,
         "filename": d.filename,
         "file_type": d.file_type,
         "content_hash": d.content_hash,
-        "status": d.status,
-        "error": d.error,
+        "status": idx.map(|i| i.status.as_str()).unwrap_or("pending"),
+        "error": idx.and_then(|i| i.error.clone()),
         "created_at": normalize_db_datetime(&d.created_at),
         "updated_at": normalize_db_datetime(&d.updated_at),
     })
@@ -259,35 +257,22 @@ pub async fn list_wikis(
     };
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let offset = params.offset.unwrap_or(0).max(0);
-    let rows = match mem
-        .db
-        .wiki_list(
-            params.scope.as_deref(),
-            params.client_id.as_deref(),
-            params.workspace_id.as_deref(),
-            params.q.as_deref(),
-            params.status.as_deref(),
-            limit,
-            offset,
-        )
-        .await
-    {
+    let filter = crate::db::knowledge::KsListFilter {
+        scope_type: params.scope.clone(),
+        client_id: params.client_id.clone(),
+        workspace_id: params.workspace_id.clone(),
+        q: params.q.clone(),
+        status: params.status.clone(),
+        index_kind: Some(IndexKind::Pages),
+        enabled: None,
+    };
+    let rows = match mem.db.ks_list(&filter, limit, offset).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
         }
     };
-    let total = match mem
-        .db
-        .wiki_count(
-            params.scope.as_deref(),
-            params.client_id.as_deref(),
-            params.workspace_id.as_deref(),
-            params.q.as_deref(),
-            params.status.as_deref(),
-        )
-        .await
-    {
+    let total = match mem.db.ks_count(&filter).await {
         Ok(n) => n,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()
@@ -326,17 +311,28 @@ pub async fn create_wiki(
     let id = new_id();
     match mem
         .db
-        .wiki_create(
-            &id,
-            body.name.trim(),
-            body.summary.trim(),
-            &scope_type,
-            &client_id,
-            &workspace_id,
-        )
+        .ks_create(&crate::db::knowledge::KsCreateOpts {
+            id: id.clone(),
+            name: body.name.trim().to_string(),
+            summary: body.summary.trim().to_string(),
+            index_vector: false,
+            index_pages: true,
+            scope_type: scope_type.clone(),
+            client_id: client_id.clone(),
+            workspace_id: workspace_id.clone(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            enabled: true,
+        })
         .await
     {
-        Ok(()) => match mem.db.wiki_get(&id).await {
+        Ok(()) => match mem.db.ks_get(&id).await {
             Ok(Some(w)) => (StatusCode::CREATED, Json(wiki_json(&w))).into_response(),
             _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
@@ -355,7 +351,7 @@ pub async fn get_wiki(State(state): State<ApiState>, Path(id): Path<String>) -> 
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    match mem.db.wiki_get(&id).await {
+    match mem.db.ks_get(&id).await {
         Ok(Some(w)) => Json(wiki_json(&w)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
@@ -372,7 +368,7 @@ pub async fn update_wiki(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    let existing = match mem.db.wiki_get(&id).await {
+    let existing = match mem.db.ks_get(&id).await {
         Ok(Some(w)) => w,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -384,8 +380,19 @@ pub async fn update_wiki(
     if let Err(e) = validate_wiki_name(name) {
         return e.into_response();
     }
-    match mem.db.wiki_update(&id, name.trim(), summary.trim()).await {
-        Ok(()) => match mem.db.wiki_get(&id).await {
+    match mem
+        .db
+        .ks_update(
+            &id,
+            &crate::db::knowledge::KsUpdateOpts {
+                name: Some(name.trim().to_string()),
+                summary: Some(summary.trim().to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(()) => match mem.db.ks_get(&id).await {
             Ok(Some(w)) => Json(wiki_json(&w)).into_response(),
             _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
@@ -411,7 +418,7 @@ pub async fn delete_wiki(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    match mem.db.wiki_get(&id).await {
+    match mem.db.ks_get(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -419,7 +426,7 @@ pub async fn delete_wiki(
         }
     }
     // 先落库删，再清落盘目录（best-effort：DB 是源，残留文件无害）。
-    if let Err(e) = mem.db.wiki_delete(&id).await {
+    if let Err(e) = mem.db.ks_delete(&id).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
     }
     let data_dir = wiki_rt.llm.rag_store.data_dir().to_path_buf();
@@ -443,12 +450,16 @@ pub async fn list_docs(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match mem.db.wiki_list_docs(&wiki_id).await {
+    match mem.db.kdoc_list(&wiki_id).await {
         Ok(docs) => {
-            let v: Vec<_> = docs.iter().map(doc_json).collect();
+            let mut v = Vec::with_capacity(docs.len());
+            for d in &docs {
+                let idx = mem.db.kdoc_get_index(&d.id, IndexKind::Pages).await.unwrap_or(None);
+                v.push(doc_json(d, idx.as_ref()));
+            }
             Json(serde_json::json!({ "documents": v })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
@@ -464,13 +475,13 @@ pub async fn delete_doc(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    let Some(doc) = mem.db.wiki_get_doc(&doc_id).await.unwrap_or(None) else {
+    let Some(doc) = mem.db.kdoc_get(&doc_id).await.unwrap_or(None) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if doc.wiki_id != wiki_id {
+    if doc.source_id != wiki_id {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match mem.db.wiki_delete_doc(&doc_id).await {
+    match mem.db.kdoc_delete(&doc_id).await {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response(),
     }
@@ -489,15 +500,15 @@ pub async fn reindex_doc(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    let Some(doc) = mem.db.wiki_get_doc(&doc_id).await.unwrap_or(None) else {
+    let Some(doc) = mem.db.kdoc_get(&doc_id).await.unwrap_or(None) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if doc.wiki_id != wiki_id {
+    if doc.source_id != wiki_id {
         return StatusCode::NOT_FOUND.into_response();
     }
     if !mem
         .db
-        .wiki_mark_doc_pending_if_idle(&doc_id)
+        .kdoc_mark_pending_if_idle(&doc_id, IndexKind::Pages)
         .await
         .unwrap_or(false)
     {
@@ -506,7 +517,7 @@ pub async fn reindex_doc(
     let Some(ft) = FileType::from_extension(&doc.file_type) else {
         let _ = mem
             .db
-            .wiki_update_doc_status(&doc_id, "failed", Some("unsupported file type"))
+            .kdoc_update_index_status(&doc_id, IndexKind::Pages, "failed", 0, Some("unsupported file type"))
             .await;
         return (
             StatusCode::CONFLICT,
@@ -519,9 +530,11 @@ pub async fn reindex_doc(
     if tokio::fs::metadata(&source_path).await.is_err() {
         let _ = mem
             .db
-            .wiki_update_doc_status(
+            .kdoc_update_index_status(
                 &doc_id,
+                IndexKind::Pages,
                 "failed",
+                0,
                 Some("original document missing; delete and re-upload"),
             )
             .await;
@@ -569,7 +582,7 @@ pub async fn upload_doc(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -667,7 +680,7 @@ pub async fn upload_doc(
 
     if let Err(e) = mem
         .db
-        .wiki_create_doc(&doc_id, &wiki_id, &name, ft.as_str(), &content_hash)
+        .kdoc_create(&doc_id, &wiki_id, &name, ft.as_str(), &content_hash)
         .await
     {
         let _ = tokio::fs::remove_file(&source_path).await;
@@ -692,8 +705,11 @@ pub async fn upload_doc(
         Some(wiki_rt.ingest_sem.clone()),
     );
 
-    match mem.db.wiki_get_doc(&doc_id).await {
-        Ok(Some(doc)) => (StatusCode::CREATED, Json(doc_json(&doc))).into_response(),
+    match mem.db.kdoc_get(&doc_id).await {
+        Ok(Some(doc)) => {
+            let idx = mem.db.kdoc_get_index(&doc.id, IndexKind::Pages).await.unwrap_or(None);
+            (StatusCode::CREATED, Json(doc_json(&doc, idx.as_ref()))).into_response()
+        }
         _ => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "id": doc_id, "wiki_id": wiki_id, "status": "pending" })),
@@ -714,7 +730,7 @@ pub async fn list_pages(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
@@ -769,7 +785,7 @@ pub async fn put_page(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     // ref 来源：路径优先，其次 body.ref
@@ -838,7 +854,7 @@ pub async fn get_graph(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     match mem.db.wiki_graph(&wiki_id).await {
@@ -860,7 +876,7 @@ pub async fn search_wiki(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    if mem.db.wiki_get(&wiki_id).await.unwrap_or(None).is_none() {
+    if mem.db.ks_get(&wiki_id).await.unwrap_or(None).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     let limit = params.limit.unwrap_or(20).clamp(1, 20);

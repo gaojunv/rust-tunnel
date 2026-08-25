@@ -48,7 +48,7 @@ pub async fn test_embedding(
             Ok(rt) => rt,
             Err(e) => return e.into_response(),
         };
-        let Some(kb) = (match rt.db.rag_get_kb(kb_id).await {
+        let Some(kb) = (match rt.db.ks_get(kb_id).await {
             Ok(r) => r,
             Err(e) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
@@ -87,7 +87,7 @@ pub async fn query_kb(
     if body.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "text is required").into_response();
     }
-    let Some(kb) = (match rt.db.rag_get_kb(&kb_id).await {
+    let Some(kb) = (match rt.db.ks_get(&kb_id).await {
         Ok(r) => r,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response()

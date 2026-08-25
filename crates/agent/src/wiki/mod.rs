@@ -80,7 +80,7 @@ pub use crate::db::wiki::{normalize_wiki_ref, parse_wiki_links};
 // ── 清单注入与工具短路（仅 rag）────────────────────────────────────
 
 #[cfg(feature = "rag")]
-use crate::db::wiki::AgentWikiRecord;
+use crate::db::knowledge::KnowledgeSourceRecord;
 
 /// 清单块硬上限（字符，≈1K tokens），不暴露 UI。
 #[cfg(feature = "rag")]
@@ -107,7 +107,7 @@ pub async fn retrieve_wiki_list_for_session(
     let max = usize::try_from(s.wiki_list_max.clamp(1, 50)).unwrap_or(20);
     let rows = wiki_state
         .db
-        .wiki_visible_wikis(client_id, workspace_id, i64::try_from(max).unwrap_or(50))
+        .ks_visible_sources(client_id, workspace_id, i64::try_from(max).unwrap_or(50))
         .await
         .unwrap_or_default();
     if rows.is_empty() {
@@ -121,11 +121,11 @@ pub async fn retrieve_wiki_list_for_session(
 #[cfg(feature = "rag")]
 #[must_use]
 pub fn build_wiki_list_block(
-    items: &[AgentWikiRecord],
+    items: &[KnowledgeSourceRecord],
     max_items: usize,
     max_chars: usize,
 ) -> Option<String> {
-    let mut sorted: Vec<&AgentWikiRecord> = items.iter().collect();
+    let mut sorted: Vec<&KnowledgeSourceRecord> = items.iter().collect();
     sorted.sort_by_key(|w| std::cmp::Reverse(w.page_count));
     let mut s = String::from("<wikis>\n以下是本工作区可用的 Wiki 知识库清单（name + 摘要 + 页数）。需要时先调用 wiki_search 按关键词搜索，再用 wiki_read 按 ref 拉取全文：\n");
     let mut added = 0usize;
@@ -159,7 +159,7 @@ async fn resolve_wiki_by_name(
     name: &str,
     client_id: &str,
     workspace_id: &str,
-) -> Option<AgentWikiRecord> {
+) -> Option<KnowledgeSourceRecord> {
     let normalized = normalize_wiki_name(name);
     if normalized.is_empty() {
         return None;
@@ -168,7 +168,7 @@ async fn resolve_wiki_by_name(
         let (scope_type, cid, wid) = crate::memory::scope_coords(scope, client_id, workspace_id);
         if let Ok(Some(row)) = wiki_state
             .db
-            .wiki_get_by_name_scope_ci(&normalized, &scope_type, &cid, &wid)
+            .ks_get_by_name_scope_ci(&normalized, &scope_type, &cid, &wid)
             .await
         {
             return Some(row);
@@ -232,7 +232,7 @@ pub async fn wiki_search_from_agent(
     } else {
         wiki_state
             .db
-            .wiki_visible_ids(client_id, workspace_id)
+            .ks_visible_ids(client_id, workspace_id)
             .await
             .map_err(|e| format!("wiki lookup failed: {e}"))?
     };
@@ -342,17 +342,28 @@ mod tests {
     use crate::db::Database;
     use crate::llm::LlmState;
 
-    fn record(id: &str, name: &str, summary: &str, page_count: i64) -> AgentWikiRecord {
-        AgentWikiRecord {
+    fn record(id: &str, name: &str, summary: &str, page_count: i64) -> KnowledgeSourceRecord {
+        KnowledgeSourceRecord {
             id: id.into(),
             name: name.into(),
             summary: summary.into(),
-            status: "ready".into(),
-            version: 1,
-            page_count,
+            index_vector: 0,
+            index_pages: 1,
             scope_type: "workspace".into(),
             client_id: "c1".into(),
             workspace_id: "w1".into(),
+            emb_base_url: String::new(),
+            emb_api_key: String::new(),
+            emb_model: String::new(),
+            emb_dimension: 0,
+            top_k: 5,
+            chunk_size: 512,
+            chunk_overlap: 64,
+            score_threshold: 0.3,
+            status: "ready".into(),
+            version: 1,
+            page_count,
+            enabled: 1,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -400,13 +411,13 @@ mod tests {
             .await
             .is_none());
 
-        db.wiki_create("g1", "global-wiki", "全局", "global", "", "")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "g1".into(), name: "global-wiki".into(), summary: "全局".into(), index_vector: false, index_pages: true, scope_type: "global".into(), client_id: "".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create("w1a", "ws-wiki", "工作区", "workspace", "c1", "w1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1a".into(), name: "ws-wiki".into(), summary: "工作区".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create("w2", "other-ws", "其他", "workspace", "c1", "w2")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w2".into(), name: "other-ws".into(), summary: "其他".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w2".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
         // page_count 影响排序
@@ -453,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn search_param_validation_and_e2e() {
         let (db, wiki) = wiki_state().await;
-        db.wiki_create("w1", "my-wiki", "desc", "workspace", "c1", "w1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "my-wiki".into(), summary: "desc".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
         db.wiki_upsert_page(
@@ -512,13 +523,13 @@ mod tests {
             .unwrap();
         assert!(out.contains("deploy/prod"));
 
-        db.wiki_create("g1", "same-name", "全局", "global", "", "")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "g1".into(), name: "same-name".into(), summary: "全局".into(), index_vector: false, index_pages: true, scope_type: "global".into(), client_id: "".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create("c1w", "same-name", "客户端", "client", "c1", "")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "c1w".into(), name: "same-name".into(), summary: "客户端".into(), index_vector: false, index_pages: true, scope_type: "client".into(), client_id: "c1".into(), workspace_id: "".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create("w1b", "same-name", "工作区", "workspace", "c1", "w1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1b".into(), name: "same-name".into(), summary: "工作区".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
         db.wiki_upsert_page("w1b", "ws/page", "ws", "s", "ws content", false, None)
@@ -572,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn read_param_validation_and_bump() {
         let (db, wiki) = wiki_state().await;
-        db.wiki_create("w1", "my-wiki", "", "workspace", "c1", "w1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "my-wiki".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "w1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
         db.wiki_upsert_page("w1", "a/b", "A", "sum A", "content A", false, None)

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use futures_util::FutureExt;
 use tokio::sync::{broadcast, Semaphore};
 
+use crate::db::knowledge::IndexKind;
 use crate::db::Database;
 use crate::llm::rag::chunker;
 use crate::llm::rag::extractor::{self, FileType};
@@ -78,25 +79,25 @@ pub fn spawn_wiki_ingest(
             // upload 路径为新建 doc=pending，reindex 路径由 API 先 CAS pending，摄入在
             // 此再 pending→processing，二次 CAS 保证与并发 reindex 互斥。
             let moved = db
-                .wiki_mark_doc_processing_if_pending(&doc_id)
+                .kdoc_mark_processing_if_pending(&doc_id, IndexKind::Pages)
                 .await
                 .unwrap_or(false);
             if !moved {
                 // pending 为初始态：CAS 未命中说明 doc 不存在或已被抢占/在途，退出不误发事件。
                 return;
             }
-            let _ = db.wiki_update_status(&wiki_id, "processing").await;
+            let _ = db.ks_update_status(&wiki_id, "processing").await;
             emit("processing", 0, None);
 
             match do_ingest(&db, &llm, &wiki_id, &doc_id, &source_path, file_type).await {
                 Ok(count) => {
-                    let _ = db.wiki_update_doc_status(&doc_id, "ready", None).await;
-                    let _ = db.wiki_update_status(&wiki_id, "ready").await;
+                    let _ = db.kdoc_update_index_status(&doc_id, IndexKind::Pages, "ready", count, None).await;
+                    let _ = db.ks_update_status(&wiki_id, "ready").await;
                     emit("ready", count, None);
                 }
                 Err(e) => {
-                    let _ = db.wiki_update_doc_status(&doc_id, "failed", Some(&e)).await;
-                    let _ = db.wiki_update_status(&wiki_id, "failed").await;
+                    let _ = db.kdoc_update_index_status(&doc_id, IndexKind::Pages, "failed", 0, Some(&e)).await;
+                    let _ = db.ks_update_status(&wiki_id, "failed").await;
                     emit("failed", 0, Some(e));
                 }
             }
@@ -108,9 +109,9 @@ pub fn spawn_wiki_ingest(
             let msg = panic_message(&*payload);
             tracing::error!(wiki_id = %wiki_id, doc_id = %doc_id, panic = %msg, "wiki ingest task panicked");
             let _ = db
-                .wiki_update_doc_status(&doc_id, "failed", Some(&msg))
+                .kdoc_update_index_status(&doc_id, IndexKind::Pages, "failed", 0, Some(&msg))
                 .await;
-            let _ = db.wiki_update_status(&wiki_id, "failed").await;
+            let _ = db.ks_update_status(&wiki_id, "failed").await;
             emit("failed", 0, Some(msg));
         }
     });
@@ -563,10 +564,10 @@ mod tests {
         db.memory_upsert_settings(&settings).await.unwrap();
         let llm = LlmState::new(Some(db.clone()), Some(cipher));
 
-        db.wiki_create("w1", "ops", "", "workspace", "c1", "ws1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "ops".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "ws1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create_doc("d1", "w1", "ops.md", "md", "h1")
+        db.kdoc_create("d1", "w1", "ops.md", "md", "h1")
             .await
             .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -631,11 +632,11 @@ mod tests {
         assert!(graph.edges[0].to.is_some(), "闭合链接应回填 dst page id");
         assert!(!graph.edges[0].dangling);
 
-        let w = db.wiki_get(&wiki).await.unwrap().unwrap();
+        let w = db.ks_get(&wiki).await.unwrap().unwrap();
         assert_eq!(w.status, "ready");
         assert_eq!(w.page_count, 2);
-        let d = db.wiki_get_doc(&doc).await.unwrap().unwrap();
-        assert_eq!(d.status, "ready");
+        let idx = db.kdoc_get_index(&doc, crate::db::knowledge::IndexKind::Pages).await.unwrap().unwrap();
+        assert_eq!(idx.status, "ready");
     }
 
     #[tokio::test]
@@ -656,9 +657,9 @@ mod tests {
         let events = collect_events(&mut rx).await;
 
         assert_eq!(events.last().unwrap().status, "failed");
-        let d = db.wiki_get_doc(&doc).await.unwrap().unwrap();
-        assert_eq!(d.status, "failed");
-        assert!(d.error.is_some());
+        let idx = db.kdoc_get_index(&doc, crate::db::knowledge::IndexKind::Pages).await.unwrap().unwrap();
+        assert_eq!(idx.status, "failed");
+        assert!(idx.error.is_some());
     }
 
     #[tokio::test]
@@ -713,7 +714,7 @@ mod tests {
         let last = events.last().unwrap();
         assert_eq!(last.status, "ready");
         assert_eq!(last.page_count, 0);
-        let w = db.wiki_get(&wiki).await.unwrap().unwrap();
+        let w = db.ks_get(&wiki).await.unwrap().unwrap();
         assert_eq!(w.page_count, 0);
     }
 
@@ -761,10 +762,10 @@ mod tests {
     async fn pipeline_missing_model_config_fails_fast() {
         let db = crate::db::Database::new(":memory:").await.unwrap();
         let llm = LlmState::new(Some(db.clone()), None); // distill_model 未配置
-        db.wiki_create("w1", "ops", "", "workspace", "c1", "ws1")
+        db.ks_create(&crate::db::knowledge::KsCreateOpts { id: "w1".into(), name: "ops".into(), summary: "".into(), index_vector: false, index_pages: true, scope_type: "workspace".into(), client_id: "c1".into(), workspace_id: "ws1".into(), emb_base_url: String::new(), emb_api_key: String::new(), emb_model: String::new(), emb_dimension: 0, top_k: 5, chunk_size: 512, chunk_overlap: 64, score_threshold: 0.3, enabled: true, })
             .await
             .unwrap();
-        db.wiki_create_doc("d1", "w1", "ops.md", "md", "h1")
+        db.kdoc_create("d1", "w1", "ops.md", "md", "h1")
             .await
             .unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
