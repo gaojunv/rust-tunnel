@@ -36,6 +36,7 @@ struct StreamStats {
     entity_id: String,
 }
 
+/// 控制通道上的双向隧道流（`AsyncRead + AsyncWrite`）。
 pub struct ClientTunnelStream {
     connection_id: u64,
     control_sender: mpsc::Sender<ControlMessage>,
@@ -51,6 +52,7 @@ pub struct ClientTunnelStream {
 }
 
 impl ClientTunnelStream {
+    /// 创建新的隧道流。
     #[must_use]
     pub fn new(
         connection_id: u64,

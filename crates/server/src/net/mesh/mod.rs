@@ -1,3 +1,5 @@
+//! Mesh 网络管理：路由表、P2P 中继与客户端控制通道分发。
+
 pub mod relay;
 pub mod router;
 pub mod stun;
@@ -11,12 +13,14 @@ use rust_tunnel_common::{ControlMessage, MeshMember, MeshRoute, MeshService};
 use self::relay::MeshRelay;
 use self::router::MeshRouter;
 
-/// Central mesh manager: combines routing table + relay + per-client control channels
+/// Mesh 网络中心管理器：聚合路由表、中继与客户端控制通道。
 #[derive(Clone)]
 pub struct MeshManager {
+    /// 路由表。
     pub router: Arc<Mutex<MeshRouter>>,
+    /// P2P 中继。
     pub relay: MeshRelay,
-    /// client_name -> mpsc Sender for ControlMessage delivery
+    /// client_name -> 控制消息发送端
     clients: Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<ControlMessage>>>>,
 }
 
@@ -27,6 +31,7 @@ impl Default for MeshManager {
 }
 
 impl MeshManager {
+    /// 创建空 Mesh 管理器。
     pub fn new() -> Self {
         Self {
             router: Arc::new(Mutex::new(MeshRouter::new())),
@@ -35,7 +40,7 @@ impl MeshManager {
         }
     }
 
-    /// Register a client's control channel for mesh and relay communication
+    /// 注册客户端控制通道（同时注册到中继）。
     pub async fn register_client(&self, client_name: &str, tx: mpsc::Sender<ControlMessage>) {
         self.relay.register(client_name, tx.clone()).await;
         self.clients
@@ -44,26 +49,26 @@ impl MeshManager {
             .insert(client_name.to_string(), tx);
     }
 
-    /// Unregister a client from all meshes and relay
+    /// 从所有 mesh 与中继中注销客户端。
     pub async fn unregister_client(&self, client_name: &str) {
         self.relay.unregister(client_name).await;
         self.clients.lock().await.remove(client_name);
         self.router.lock().await.remove_client(client_name);
     }
 
-    /// Join a mesh. Returns the updated member list (excluding requester).
+    /// 加入 mesh，返回更新后的成员列表（不含请求者由调用方过滤）。
     pub async fn join_mesh(&self, mesh_id: &str, client_name: &str) -> Vec<MeshMember> {
         self.router.lock().await.join(mesh_id, client_name);
         self.get_members_for(mesh_id, client_name).await
     }
 
-    /// Leave a mesh. Returns the updated member list.
+    /// 离开 mesh，返回更新后的成员列表。
     pub async fn leave_mesh(&self, mesh_id: &str, client_name: &str) -> Vec<MeshMember> {
         self.router.lock().await.leave(mesh_id, client_name);
         self.get_members_for(mesh_id, client_name).await
     }
 
-    /// Register services for a client in a mesh
+    /// 为 mesh 中的客户端注册服务。
     pub async fn register_services(
         &self,
         mesh_id: &str,
@@ -76,7 +81,7 @@ impl MeshManager {
             .register_services(mesh_id, client_name, services);
     }
 
-    /// Build member list for broadcast (all members including requester)
+    /// 构造广播用成员列表（包含请求者）。
     async fn get_members_for(&self, mesh_id: &str, _exclude: &str) -> Vec<MeshMember> {
         let router = self.router.lock().await;
         router
@@ -90,7 +95,7 @@ impl MeshManager {
             .collect()
     }
 
-    /// Send message to a specific client by name
+    /// 向指定客户端发送控制消息，离线时返回 false。
     pub async fn send_to_client(&self, client_name: &str, msg: ControlMessage) -> bool {
         if let Some(tx) = self.clients.lock().await.get(client_name) {
             tx.send(msg).await.is_ok()
@@ -99,7 +104,7 @@ impl MeshManager {
         }
     }
 
-    /// Broadcast to all clients in a mesh (excluding the sender)
+    /// 向 mesh 内所有客户端广播（可排除发送者）。
     pub async fn broadcast_to_mesh(
         &self,
         mesh_id: &str,
@@ -120,7 +125,7 @@ impl MeshManager {
         }
     }
 
-    /// Get all mesh networks and their members (for API)
+    /// 列出所有 mesh 及其成员（供 API 使用）。
     pub async fn list_networks(&self) -> Vec<(String, Vec<MeshRoute>)> {
         let router = self.router.lock().await;
         router
@@ -133,7 +138,7 @@ impl MeshManager {
             .collect()
     }
 
-    /// Get a specific mesh's details
+    /// 查询单个 mesh 详情，不存在时返回 None。
     pub async fn get_mesh(&self, mesh_id: &str) -> Option<Vec<MeshRoute>> {
         let router = self.router.lock().await;
         if router.list_networks().contains(&mesh_id.to_string()) {
@@ -143,7 +148,7 @@ impl MeshManager {
         }
     }
 
-    /// Look up a service in a mesh. Returns (route, service) if found.
+    /// 在 mesh 中查找指定服务，返回 (路由, 服务)。
     pub async fn lookup_service(
         &self,
         mesh_id: &str,

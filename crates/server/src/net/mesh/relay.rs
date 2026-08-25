@@ -5,11 +5,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-/// Relay tunnel between two mesh clients via the server.
-/// Bi-directional: data from A is forwarded to B and vice versa.
+/// Mesh 客户端间中继：经服务端转发双向数据。
 #[derive(Clone)]
 pub struct MeshRelay {
-    /// Maps client_name -> mpsc Sender for delivering MeshRelay messages
+    /// client_name -> 控制消息发送端
     tunnels: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
 }
 
@@ -20,25 +19,26 @@ impl Default for MeshRelay {
 }
 
 impl MeshRelay {
+    /// 创建空的中继表。
     pub fn new() -> Self {
         Self {
             tunnels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Register a client's control channel for relay delivery
+    /// 注册客户端控制通道。
     pub async fn register(&self, client_name: &str, tx: mpsc::Sender<ControlMessage>) {
         let mut tunnels = self.tunnels.lock().await;
         tunnels.insert(client_name.to_string(), tx);
     }
 
-    /// Unregister a client
+    /// 注销客户端。
     pub async fn unregister(&self, client_name: &str) {
         let mut tunnels = self.tunnels.lock().await;
         tunnels.remove(client_name);
     }
 
-    /// Relay data from source to target
+    /// 将数据从 source 中继到 target。
     pub async fn relay_data(
         &self,
         source: &str,

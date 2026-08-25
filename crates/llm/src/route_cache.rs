@@ -19,19 +19,28 @@ use rust_tunnel_persistence::Database;
 /// 缓存中的模型条目。
 #[derive(Debug, Clone)]
 pub struct CachedModel {
+    /// 模型 id。
     pub id: String,
+    /// 所属提供商 id。
     pub provider_id: String,
+    /// 上游真实模型名。
     pub model_name: String,
+    /// 对外别名（为空则直接暴露 `model_name`）。
     pub alias: String,
+    /// 是否启用。
     pub enabled: bool,
+    /// per-model 额外配置 JSON。
     pub extra_config: Option<String>,
 }
 
 /// 缓存中的模型组（成员按 priority 升序）。
 #[derive(Debug, Clone)]
 pub struct CachedGroup {
+    /// 组 id。
     pub id: String,
+    /// 组名。
     pub name: String,
+    /// 是否启用。
     pub enabled: bool,
     /// `(model_id, priority)`，按 priority 升序。
     pub members: Vec<(String, i32)>,
@@ -40,12 +49,15 @@ pub struct CachedGroup {
 /// 一次全量装载的路由快照。
 #[derive(Debug, Clone, Default)]
 pub struct RouteSnapshot {
+    /// 提供商快照（`provider_id` → 配置）。
     pub providers: HashMap<String, ProviderConfig>,
+    /// 模型快照（`model_id` → 条目）。
     pub models: HashMap<String, CachedModel>,
     /// 模型装载顺序（对应 DB `ORDER BY created_at`，/v1/models 按此稳定排序）。
     pub model_order: Vec<String>,
     /// `model_name` 或 `alias` → model_id（仅收录已启用模型）。
     pub name_lookup: HashMap<String, String>,
+    /// 模型组快照（`group_id` → 组）。
     pub groups: HashMap<String, CachedGroup>,
     /// 组名 → group id（仅收录已启用组）。
     pub group_name_lookup: HashMap<String, String>,

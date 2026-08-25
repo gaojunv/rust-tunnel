@@ -23,10 +23,15 @@ use super::upstream::UpstreamClient;
 use super::{ProxyRule, ReverseProxyState, RuleType, TrojanSniEntry};
 use rust_tunnel_pki::acme::CertificateManager;
 
+/// 共享监听器：多规则共用同一端口的运行时句柄。
 pub struct SharedListener {
+    /// 监听地址。
     pub listen_addr: String,
+    /// 是否启用 TLS。
     pub tls_enabled: bool,
+    /// 路由表（热更新）。
     pub route_table: Arc<ArcSwap<RouteTable>>,
+    /// 当前生效的规则 ID 集合。
     pub active_rule_ids: HashSet<String>,
     handle: JoinHandle<()>,
     shutdown_tx: watch::Sender<bool>,

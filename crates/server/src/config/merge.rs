@@ -1,3 +1,5 @@
+//! 三级配置合并：默认值 → TOML 文件 → 环境变量 → CLI 参数，最终产出 `ServerConfig` 并校验。
+
 use super::cli::ServerCli;
 use super::file::ServerConfigFile;
 use super::ServerConfig;
@@ -9,11 +11,13 @@ use figment::{
 use std::path::Path;
 
 impl ServerConfig {
+    /// 从进程参数与环境加载完整配置（CLI 解析 + 三级合并 + 校验）。
     pub fn load() -> Result<Self, String> {
         let cli = ServerCli::parse();
         Self::from_cli(cli)
     }
 
+    /// 以给定的 CLI 快照为最高优先级合并配置，校验 Shadowsocks/Trojan/DNS/ACME 约束后返回。
     pub fn from_cli(cli: ServerCli) -> Result<Self, String> {
         let mut config = Self::default();
 

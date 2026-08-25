@@ -8,9 +8,13 @@
 //! - [`PortRegistry`]：端口注册/连接计数（server 侧 `ServerState` 实现）
 //! - [`TunnelOpener`]：隧道打开（server 侧 `ClientRegistry` 实现）
 
+/// TCP/TLS 监听器：Shadowsocks/Trojan/反代共享端口的接入与分发。
 pub mod listener;
+/// 反向代理子系统：规则/路由/共享监听/SNI/上游转发。
 pub mod reverse_proxy;
+/// Shadowsocks 协议：握手、密钥派生与加密转发。
 pub mod shadowsocks;
+/// Trojan 协议：握手、UDP ASSOCIATE 与转发。
 pub mod trojan;
 
 mod port_registry;

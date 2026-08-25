@@ -26,13 +26,23 @@ pub const JOB_LOG_MAX_BYTES: usize = 64 * 1024;
 pub enum GitHubError {
     /// 上游 4xx/5xx（除已单独分组的 401/403/429）。保留上游 message 供透传。
     #[error("GitHub API error (HTTP {status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        /// HTTP 状态码。
+        status: u16,
+        /// 错误消息。
+        message: String,
+    },
     /// 401：token 无效 / 已过期。API 层映射为 400。
     #[error("GitHub token 无效（401），请在 workspace 设置中检查 github_token")]
     Unauthorized,
     /// 403 / 429：限流或权限不足。API 层映射为 429 + 限流提示。
     #[error("GitHub 请求被限流（HTTP {status}）：{message}")]
-    RateLimited { status: u16, message: String },
+    RateLimited {
+        /// HTTP 状态码。
+        status: u16,
+        /// 错误消息。
+        message: String,
+    },
     /// 网络层错误（连接失败 / 超时 / 重定向过多）。API 层映射为 502。
     #[error("GitHub API 网络错误: {0}")]
     Network(String),
@@ -41,8 +51,11 @@ pub enum GitHubError {
 /// GitHub REST API 客户端。每请求持有一个 token；构造后仅经
 /// [`Self::headers`] 注入 Authorization 头，`Debug` 打码 token。
 pub struct GitHubClient {
+    /// 内部 HTTP 客户端。
     client: reqwest::Client,
+    /// API 根地址。
     base_url: String,
+    /// 访问令牌（仅经 Authorization 头发送）。
     token: String,
 }
 

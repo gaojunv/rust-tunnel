@@ -2,86 +2,151 @@
 
 use super::Database;
 
+/// RAG 知识库记录（rag_knowledge_bases 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct RagKnowledgeBaseRecord {
+    /// 知识库 id（主键）。
     pub id: String,
+    /// 知识库名称。
     pub name: String,
+    /// 知识库描述。
     pub description: String,
+    /// Embedding 服务地址。
     pub emb_base_url: String,
-    pub emb_api_key: String, // 加密存储
+    /// Embedding 服务密钥（加密存储）。
+    pub emb_api_key: String,
+    /// Embedding 模型名。
     pub emb_model: String,
+    /// 向量维度。
     pub emb_dimension: i64,
+    /// 检索返回条数。
     pub top_k: i64,
+    /// 分块大小（token）。
     pub chunk_size: i64,
+    /// 分块重叠大小（token）。
     pub chunk_overlap: i64,
+    /// 检索分数阈值。
     pub score_threshold: f64,
+    /// 是否启用（1 启用，0 禁用）。
     pub enabled: i32,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// RAG 文档记录（rag_documents 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct RagDocumentRecord {
+    /// 文档 id（主键）。
     pub id: String,
+    /// 所属知识库 id。
     pub kb_id: String,
+    /// 源文件名。
     pub filename: String,
+    /// 文件类型（如 md/pdf）。
     pub file_type: String,
+    /// 内容哈希。
     pub content_hash: String,
+    /// 处理状态（pending/processing/ready/failed）。
     pub status: String,
+    /// 分块数量。
     pub chunk_count: i64,
+    /// 错误信息，成功时为 None。
     pub error: Option<String>,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// RAG 分块记录（rag_chunks 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct RagChunkRecord {
+    /// 分块 id（主键）。
     pub id: String,
+    /// 所属文档 id。
     pub doc_id: String,
+    /// 所属知识库 id（冗余列，便于按库聚合）。
     pub kb_id: String,
+    /// 分块序号。
     pub seq: i64,
+    /// 标题路径（如 "## 概述 > ### 背景"）。
     pub heading_path: String,
+    /// 分块文本内容。
     pub content: String,
+    /// token 数量。
     pub token_count: i64,
 }
 
+/// `rag_create_kb` 参数包：知识库创建的全部字段（12 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RagCreateKbOpts {
+    /// 知识库 id。
     pub id: String,
+    /// 知识库名称。
     pub name: String,
+    /// 知识库描述。
     pub description: String,
+    /// Embedding 服务地址。
     pub emb_base_url: String,
+    /// Embedding 服务密钥（已加密密文）。
     pub emb_api_key: String,
+    /// Embedding 模型名。
     pub emb_model: String,
+    /// 向量维度。
     pub emb_dimension: i64,
+    /// 检索返回条数。
     pub top_k: i64,
+    /// 分块大小（token）。
     pub chunk_size: i64,
+    /// 分块重叠大小（token）。
     pub chunk_overlap: i64,
+    /// 检索分数阈值。
     pub score_threshold: f64,
+    /// 是否启用。
     pub enabled: bool,
 }
 
+/// `rag_update_kb_params` 参数包：知识库参数更新的全部字段（10 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RagUpdateKbParamsOpts {
+    /// 知识库名称。
     pub name: String,
+    /// 知识库描述。
     pub description: String,
+    /// 检索返回条数。
     pub top_k: i64,
+    /// 分块大小（token）。
     pub chunk_size: i64,
+    /// 分块重叠大小（token）。
     pub chunk_overlap: i64,
+    /// 检索分数阈值。
     pub score_threshold: f64,
 }
 
+/// `rag_update_kb_full` 参数包：知识库完整更新的全部字段（9 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RagUpdateKbFullOpts {
+    /// 知识库名称。
     pub name: String,
+    /// 知识库描述。
     pub description: String,
+    /// 检索返回条数。
     pub top_k: i64,
+    /// 分块大小（token）。
     pub chunk_size: i64,
+    /// 分块重叠大小（token）。
     pub chunk_overlap: i64,
+    /// 检索分数阈值。
     pub score_threshold: f64,
+    /// Embedding 服务地址。
     pub emb_base_url: String,
+    /// Embedding 服务密钥（已加密密文）。
     pub emb_api_key: String,
+    /// Embedding 模型名。
     pub emb_model: String,
+    /// 向量维度。
     pub emb_dimension: i64,
 }
 
@@ -117,6 +182,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询知识库，不存在返回 None。
     pub async fn rag_get_kb(
         &self,
         id: &str,
@@ -129,6 +195,7 @@ impl Database {
         .await
     }
 
+    /// 列出全部知识库，按创建时间排序。
     pub async fn rag_list_kbs(&self) -> Result<Vec<RagKnowledgeBaseRecord>, sqlx::Error> {
         sqlx::query_as::<_, RagKnowledgeBaseRecord>(
             "SELECT * FROM rag_knowledge_bases ORDER BY created_at",
@@ -198,6 +265,7 @@ impl Database {
         Ok(())
     }
 
+    /// 切换知识库启用状态。
     pub async fn rag_toggle_kb(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE rag_knowledge_bases SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
@@ -209,6 +277,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除知识库（文档与分块经 FK 级联删除）。
     pub async fn rag_delete_kb(&self, id: &str) -> Result<(), sqlx::Error> {
         // 文档/分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_knowledge_bases WHERE id = ?")
@@ -254,6 +323,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询文档，不存在返回 None。
     pub async fn rag_get_document(
         &self,
         id: &str,
@@ -270,6 +340,7 @@ impl Database {
         .await
     }
 
+    /// 列出某知识库下的全部文档，按创建时间排序。
     pub async fn rag_list_documents(
         &self,
         kb_id: &str,
@@ -346,6 +417,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    /// 删除文档（分块经 FK 级联删除）。
     pub async fn rag_delete_document(&self, id: &str) -> Result<(), sqlx::Error> {
         // 分块经 FK ON DELETE CASCADE 级联删除
         sqlx::query("DELETE FROM rag_documents WHERE id = ?")

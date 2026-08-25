@@ -1,8 +1,16 @@
+//! ACME 证书管理：状态、元数据与共享状态，子模块负责签发、挑战、存储与 DNS。
+
+/// ACME 挑战处理模块。
 pub mod challenge;
+/// ACME 客户端实现模块。
 pub mod client;
+/// DNS-01 挑战与 DNS 提供商集成。
 pub mod dns;
+/// 证书管理器与事件。
 pub mod manager;
+/// 证书提供与覆盖判定。
 pub mod provider;
+/// 证书持久化存储。
 pub mod storage;
 
 pub use manager::{CertEvent, CertificateManager};
@@ -19,9 +27,13 @@ use rust_tunnel_persistence::Database;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CertificateStatus {
+    /// 待签发/验证中。
     Pending,
+    /// 已签发且在有效期内。
     Active,
+    /// 已过期。
     Expired,
+    /// 签发失败。
     Failed,
 }
 
@@ -39,11 +51,17 @@ impl std::fmt::Display for CertificateStatus {
 /// ACME certificate metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateMetadata {
+    /// 证书域名。
     pub domain: String,
+    /// 证书状态。
     pub status: CertificateStatus,
+    /// 签发时间（RFC3339）。
     pub issued_at: Option<String>,
+    /// 过期时间（RFC3339）。
     pub expires_at: Option<String>,
+    /// 是否自动续签。
     pub auto_renew: bool,
+    /// 失败原因，无失败为 None。
     pub error: Option<String>,
 }
 

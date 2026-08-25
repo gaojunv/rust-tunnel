@@ -3,32 +3,38 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{TunnelError, TunnelResult};
 
-/// A log entry from a connected client
+/// 客户端上报的单条日志。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ClientLogEntry {
-    /// Microsecond timestamp
+    /// 微秒时间戳。
     pub timestamp: i64,
-    /// TRACE/DEBUG/INFO/WARN/ERROR
+    /// 日志级别：TRACE/DEBUG/INFO/WARN/ERROR。
     pub level: String,
-    /// tracing target (module path)
+    /// tracing target（模块路径）。
     pub target: String,
-    /// Log message content
+    /// 日志内容。
     pub message: String,
 }
 
-/// A member of a mesh network
+/// mesh 网络成员。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MeshMember {
+    /// 客户端名称。
     pub client_name: String,
+    /// 公网地址，None 表示未上报或不可达。
     pub public_addr: Option<String>,
+    /// 是否在线。
     pub online: bool,
 }
 
-/// A service exposed by a mesh client (used in protocol messages)
+/// mesh 客户端暴露的服务定义（用于协议消息）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MeshServiceDef {
+    /// 服务名。
     pub name: String,
+    /// 协议类型。
     pub protocol: String,
+    /// 本地监听地址（host:port）。
     pub local_addr: String,
 }
 
@@ -36,39 +42,59 @@ pub struct MeshServiceDef {
 /// replace_all=false 时 old_string 必须在文件中恰好出现一次。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEdit {
+    /// 待替换的锚点字符串。
     pub old_string: String,
+    /// 替换后的新字符串。
     pub new_string: String,
+    /// 是否替换全部匹配。
     #[serde(default)]
     pub replace_all: bool,
 }
 
-/// A command the AI agent asks a client to execute (server -> client)
+/// 服务端要求客户端执行的 AI agent 命令（server -> client）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AgentCommand {
+    /// 执行 shell 命令。
     Shell {
+        /// 待执行的 shell 命令。
         cmd: String,
+        /// 执行目录，None 表示使用 workspace 根目录。
         cwd: Option<String>,
     },
+    /// 读取文件内容。
     ReadFile {
+        /// 相对 workspace 根的文件路径。
         path: String,
     },
+    /// 写入文件（全量覆盖）。
     WriteFile {
+        /// 目标文件路径。
         path: String,
+        /// 写入的完整文件内容。
         content: String,
     },
+    /// 列目录。
     ListDir {
+        /// 待列出的目录路径。
         path: String,
     },
+    /// 查询 git 状态。
     GitStatus,
+    /// 查询 git 差异。
     GitDiff {
+        /// 限定 diff 的文件/目录，None 表示全量 diff。
         path: Option<String>,
     },
+    /// 创建 git 提交。
     GitCommit {
+        /// 提交信息。
         message: String,
     },
+    /// 推送到远端。
     GitPush,
     /// 在工作区内搜索文件内容（字面量子串匹配），返回 path:line:content 列表
     Search {
+        /// 搜索关键字（字面量子串）。
         pattern: String,
         /// 相对工作区根的起始目录（"." 表示根）
         path: String,
@@ -77,73 +103,102 @@ pub enum AgentCommand {
     },
     /// 锚点字符串替换：old_string 必须在文件中恰好出现一次
     PatchFile {
+        /// 目标文件路径。
         path: String,
+        /// 待替换的锚点字符串。
         old_string: String,
+        /// 替换后的新字符串。
         new_string: String,
     },
     /// 通用 git 命令：参数已由服务端 `git_plan::plan` 白名单校验（未知子命令/
     /// flag fail-closed，pathspec 防注入），客户端按 arg 向量直接执行（host/docker）。
     GitExec {
+        /// git 参数向量。
         args: Vec<String>,
     },
     /// 带超时的 shell 命令：timeout_secs 由 LLM 工具调用指定（上限 3600s）。
     ShellWithTimeout {
+        /// 待执行的 shell 命令。
         cmd: String,
+        /// 执行目录，None 表示使用 workspace 根目录。
         cwd: Option<String>,
+        /// 超时时间（秒）。
         timeout_secs: u64,
     },
     /// read_file 行区间变体：offset 1-based 起始行（缺省 1），limit 最大行数（缺省服务端默认）
     ReadFileRange {
+        /// 目标文件路径。
         path: String,
+        /// 起始行号（1-based），None 表示从首行开始。
         offset: Option<u64>,
+        /// 最大读取行数，None 表示使用服务端默认值。
         limit: Option<u64>,
     },
     /// 代码结构概览：tree-sitter 解析后输出函数/结构体/类等符号列表
     CodeOutline {
+        /// 目标文件路径。
         path: String,
     },
     /// 按符号名精确提取：返回符号完整源码
     ReadSymbol {
+        /// 目标文件路径。
         path: String,
+        /// 待提取的符号名。
         name: String,
     },
     /// 多编辑批量替换：edits 顺序应用（每条作用于前一条的结果），
     /// 任一失败则整体不写入。expected_hash 为 Some 时要求当前文件内容
     /// sha256(hex) 匹配，否则拒绝写入（stale 检测）。
     EditFile {
+        /// 目标文件路径。
         path: String,
+        /// 待应用的编辑列表，顺序执行。
         edits: Vec<FileEdit>,
+        /// 期望的文件内容哈希（sha256 hex），用于 stale 检测。
         expected_hash: Option<String>,
     },
     /// WriteFile 增强版：expected_hash 同 EditFile；返回 WriteOutcome。
     WriteFile2 {
+        /// 目标文件路径。
         path: String,
+        /// 写入的完整文件内容。
         content: String,
+        /// 期望的文件内容哈希（sha256 hex），用于 stale 检测。
         expected_hash: Option<String>,
     },
 }
 
-/// Result of an agent command executed on the client (client -> server)
+/// 客户端执行 agent 命令后的结果（client -> server）。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AgentResult {
+    /// shell 执行结果。
     Shell {
+        /// 标准输出。
         stdout: String,
+        /// 标准错误。
         stderr: String,
+        /// 退出码。
         exit_code: i32,
     },
-    /// Also used for ListDir / GitStatus / GitDiff textual output
+    /// 文件内容或文本类输出，也用于 ListDir / GitStatus / GitDiff 的文本结果。
     FileContent {
+        /// 文件或命令的文本内容。
         content: String,
     },
-    /// WriteFile / GitCommit / GitPush 等无返回值的命令
+    /// 无返回值命令的成功标记（WriteFile / GitCommit / GitPush 等）。
     Success,
+    /// 执行失败。
     Error {
+        /// 错误信息。
         message: String,
     },
     /// EditFile / WriteFile2 的富结果：写入统计 + unified diff（截断）+ 写后内容 hash。
     WriteOutcome {
+        /// 写入字节数。
         bytes_written: u64,
+        /// 新增行数。
         lines_added: u64,
+        /// 删除行数。
         lines_removed: u64,
         /// unified diff，客户端截断到 ~8KB
         diff: String,
@@ -152,170 +207,250 @@ pub enum AgentResult {
     },
 }
 
+/// 控制通道消息（client <-> server），经长度前缀 bincode 序列化传输。
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ControlMessage {
-    /// Client requests registration with protocol version, name, password, and client version
+    /// 客户端发起注册，携带协议版本、名称、密码与客户端版本。
     Register {
+        /// 协议版本。
         protocol_version: u32,
+        /// 客户端名称。
         client_name: String,
+        /// 鉴权密码/token。
         password: String,
+        /// 客户端版本号。
         client_version: String,
     },
-    /// Server response to registration
-    RegisterResponse { success: bool, message: String },
-    /// Server requests client to disconnect (web interface admin action / close reason)
-    Disconnect { reason: String },
-    /// Data transfer for a specific connection
-    Data { connection_id: u64, data: Vec<u8> },
-    /// Close a specific connection
-    Close { connection_id: u64 },
-    /// Heartbeat ping (client -> server)
+    /// 服务端对注册请求的响应。
+    RegisterResponse {
+        /// 是否注册成功。
+        success: bool,
+        /// 响应说明文本。
+        message: String,
+    },
+    /// 服务端要求客户端断开连接（管理面操作或关闭原因）。
+    Disconnect {
+        /// 断开原因。
+        reason: String,
+    },
+    /// 某条连接的数据透传。
+    Data {
+        /// 连接 ID。
+        connection_id: u64,
+        /// 透传数据。
+        data: Vec<u8>,
+    },
+    /// 关闭指定连接。
+    Close {
+        /// 待关闭的连接 ID。
+        connection_id: u64,
+    },
+    /// 心跳 ping（client -> server）。
     Ping {
-        /// Heartbeat sequence number (client increments)
+        /// 心跳序列号（客户端递增）。
         seq: u32,
-        /// Send timestamp (microseconds, client time)
+        /// 发送时间戳（微秒，客户端时钟）。
         timestamp_micros: u64,
     },
-    /// Heartbeat pong (server -> client)
+    /// 心跳 pong（server -> client）。
     Pong {
-        /// Corresponding Ping's sequence number
+        /// 对应 Ping 的序列号。
         seq: u32,
-        /// Ping timestamp (echoed back)
+        /// Ping 时间戳（原样回显）。
         ping_timestamp_micros: u64,
-        /// Pong send timestamp (server time)
+        /// Pong 发送时间戳（服务端时钟）。
         pong_timestamp_micros: u64,
     },
-    /// Client requests to open a tunnel to a local target
+    /// 客户端请求向本地目标地址打开隧道。
     OpenTunnel {
+        /// 连接 ID。
         connection_id: u64,
+        /// 目标地址（host:port）。
         target_addr: String,
     },
-    /// Server response to a tunnel open request
+    /// 服务端对隧道打开请求的响应。
     TunnelOpenResult {
+        /// 连接 ID。
         connection_id: u64,
+        /// 是否打开成功。
         success: bool,
+        /// 失败时的错误信息。
         error: Option<String>,
     },
-    /// Mesh network registration (client -> server)
+    /// mesh 网络加入（client -> server）。
     MeshJoin {
+        /// mesh 网络 ID。
         mesh_id: String,
+        /// 客户端名称。
         client_name: String,
     },
-    /// Leave a mesh network (client -> server)
-    MeshLeave { mesh_id: String },
-    /// Server sends mesh member list to clients (server -> client)
-    MeshMemberList {
+    /// 离开 mesh 网络（client -> server）。
+    MeshLeave {
+        /// mesh 网络 ID。
         mesh_id: String,
+    },
+    /// 服务端向客户端下发 mesh 成员列表（server -> client）。
+    MeshMemberList {
+        /// mesh 网络 ID。
+        mesh_id: String,
+        /// 成员列表。
         members: Vec<MeshMember>,
     },
-    /// Request to connect to a service on another mesh client (client -> server)
+    /// 请求连接到另一 mesh 客户端上的服务（client -> server）。
     MeshConnect {
+        /// 目标客户端名称。
         target_client: String,
+        /// 目标服务名。
         service_name: String,
     },
-    /// Request P2P hole punch with target (client -> server, contains own public address)
+    /// 请求与目标进行 P2P 打洞（client -> server，携带自身公网地址）。
     P2PRequest {
+        /// 目标客户端名称。
         target_client: String,
+        /// 本端公网地址。
         local_addr: String,
     },
-    /// Forward P2P response with remote address info (server -> client)
+    /// 转发 P2P 响应及对端地址信息（server -> client）。
     P2PResponse {
+        /// 目标客户端名称。
         target_client: String,
+        /// 对端公网地址。
         remote_addr: String,
     },
-    /// Report P2P hole punch result (client -> server)
+    /// 上报 P2P 打洞结果（client -> server）。
     P2PResult {
+        /// 目标客户端名称。
         target_client: String,
+        /// 是否打洞成功。
         success: bool,
     },
-    /// Relay data through server when P2P fails (client <-> server)
+    /// P2P 失败时经服务端中继数据（client <-> server）。
     MeshRelay {
+        /// 目标客户端名称。
         target_client: String,
+        /// 中继数据。
         data: Vec<u8>,
     },
-    /// Client registers mesh services (client -> server, sent after MeshJoin)
+    /// 客户端注册 mesh 服务（client -> server，MeshJoin 后发送）。
     MeshRegisterServices {
+        /// mesh 网络 ID。
         mesh_id: String,
+        /// 服务定义列表。
         services: Vec<MeshServiceDef>,
     },
-    /// Client sends a batch of log entries
-    LogBatch { entries: Vec<ClientLogEntry> },
-    /// Server asks an agent-capable client to execute a command
+    /// 客户端批量上报日志。
+    LogBatch {
+        /// 日志条目批量。
+        entries: Vec<ClientLogEntry>,
+    },
+    /// 服务端要求具备 agent 能力的客户端执行命令。
     AgentExecRequest {
+        /// 归属会话 ID。
         session_id: String,
+        /// 请求 ID。
         request_id: String,
-        /// Workspace root directory on the client; the executor sandboxes into it
-        /// (in docker mode this is the container-side path)
+        /// 客户端侧 workspace 根目录；执行器沙箱于此目录内（docker 模式为容器内路径）
         root_path: String,
-        /// When set, commands run via `docker exec <container>` instead of host shell
+        /// docker 容器名，Some 时经 `docker exec <container>` 执行而非宿主机 shell
         docker_container: Option<String>,
+        /// 待执行的 agent 命令。
         command: AgentCommand,
     },
-    /// Client returns the result of an agent command
+    /// 客户端返回 agent 命令执行结果。
     AgentExecResponse {
+        /// 归属会话 ID。
         session_id: String,
+        /// 请求 ID。
         request_id: String,
+        /// 执行结果。
         result: AgentResult,
     },
-    /// Server asks an agent-capable client to kill the running exec for a
-    /// request (真取消：停止回合时杀掉内网侧正在执行的命令)。
-    AgentExecCancel { request_id: String },
-    /// Server asks client to spawn a long-lived agent/LLM-proxy process.
-    /// stdio flows via AgentSpawnData; process exit reported via AgentSpawnExit.
+    /// 服务端要求客户端终止某次执行的 agent 命令（真取消：停止回合时杀掉内网侧正在执行的命令）。
+    AgentExecCancel {
+        /// 待取消的请求 ID。
+        request_id: String,
+    },
+    /// 服务端要求客户端常驻一个 agent/LLM-proxy 进程，stdio 经 AgentSpawnData 流转，退出经 AgentSpawnExit 上报。
     AgentSpawnRequest {
+        /// 归属会话 ID。
         session_id: String,
+        /// 可执行文件或命令。
         command: String,
+        /// 命令参数。
         args: Vec<String>,
+        /// 环境变量键值对。
         env: Vec<(String, String)>,
+        /// 工作目录，None 表示继承默认目录。
         cwd: Option<String>,
     },
-    /// Client reports spawn result
+    /// 客户端上报 spawn 结果。
     AgentSpawnResponse {
+        /// 归属会话 ID。
         session_id: String,
+        /// 是否 spawn 成功。
         success: bool,
+        /// 失败时的错误信息。
         error: Option<String>,
     },
-    /// Bidirectional stdio for a spawned process.
-    /// stdin=true: server -> client (write to process stdin);
-    /// stdin=false: client -> server (process stdout).
+    /// 常驻进程的双向 stdio 数据，stdin=true 为 server -> client（写入进程 stdin），stdin=false 为 client -> server（进程 stdout）。
     AgentSpawnData {
+        /// 归属会话 ID。
         session_id: String,
+        /// stdio 数据。
         data: Vec<u8>,
+        /// 是否为 stdin 方向。
         stdin: bool,
     },
-    /// Client reports spawned process exit
+    /// 客户端上报常驻进程退出。
     AgentSpawnExit {
+        /// 归属会话 ID。
         session_id: String,
+        /// 退出码，None 表示异常终止或未知。
         code: Option<i32>,
     },
-    /// Client-side LLM loop proxy forwards an LLM API request to the server
+    /// 客户端侧 LLM loop 代理向服务端转发 LLM API 请求。
     AgentLlmProxyRequest {
+        /// 请求 ID。
         request_id: String,
-        /// Owning ACP session; server uses it to resolve workspace -> model/key
+        /// 归属 ACP 会话，服务端据此解析 workspace -> 模型/密钥
         session_id: String,
-        /// e.g. "/v1/chat/completions" or "/v1/messages"
+        /// 请求路径，如 "/v1/chat/completions" 或 "/v1/messages"
         path: String,
+        /// 请求体（JSON，原样转发）。
         body: Vec<u8>,
     },
-    /// Server streams LLM response back (SSE chunks; done=true ends)
+    /// 服务端流式回传 LLM 响应（SSE 分片，done=true 表示结束）。
     AgentLlmProxyChunk {
+        /// 请求 ID。
         request_id: String,
+        /// 响应分片数据。
         data: Vec<u8>,
+        /// 是否为最后一片。
         done: bool,
+        /// HTTP 状态码。
         status: u16,
     },
-    /// Server asks client to start the embedded LLM loop proxy for a session.
-    /// Client reports the bound loopback port via AgentLlmProxyReady.
-    AgentLlmProxyStart { session_id: String },
-    /// Client reports the bound loopback port (0 = failure)
-    AgentLlmProxyReady { session_id: String, port: u16 },
-    /// Server asks client to stop the embedded LLM loop proxy for a session
-    /// (frees the loopback listener; no response expected).
-    AgentLlmProxyStop { session_id: String },
+    /// 服务端要求客户端为某会话启动内嵌 LLM loop 代理，客户端经 AgentLlmProxyReady 回报绑定的回环端口。
+    AgentLlmProxyStart {
+        /// 归属会话 ID。
+        session_id: String,
+    },
+    /// 客户端回报已绑定的回环端口（0 表示失败）。
+    AgentLlmProxyReady {
+        /// 归属会话 ID。
+        session_id: String,
+        /// 回环代理监听端口。
+        port: u16,
+    },
+    /// 服务端要求客户端停止某会话的内嵌 LLM loop 代理（释放回环监听，无需响应）。
+    AgentLlmProxyStop {
+        /// 归属会话 ID。
+        session_id: String,
+    },
 }
 
 impl ControlMessage {
-    /// Serialize message to bytes with length prefix
+    /// 将消息序列化为带长度前缀的字节（大端 4 字节长度 + bincode 负载）。
     pub fn serialize(&self) -> TunnelResult<Vec<u8>> {
         let encoded = bincode::serialize(self)?;
         let len = encoded.len() as u32;
@@ -325,7 +460,7 @@ impl ControlMessage {
         Ok(result)
     }
 
-    /// Deserialize message from stream
+    /// 从流中读取一条消息（处理长度前缀与 1MB 上限校验）。
     pub async fn read_from_stream<R: AsyncReadExt + Unpin>(
         stream: &mut R,
     ) -> TunnelResult<Option<Self>> {
@@ -353,7 +488,7 @@ impl ControlMessage {
         Ok(Some(msg))
     }
 
-    /// Write message to stream
+    /// 将消息写入流（序列化后一次性写入并 flush）。
     pub async fn write_to_stream<W: AsyncWriteExt + Unpin>(
         &self,
         stream: &mut W,
@@ -364,7 +499,7 @@ impl ControlMessage {
         Ok(())
     }
 
-    /// Write message to a split stream half (alias for write_to_stream)
+    /// 写入拆分后的流半端（write_to_stream 的别名）。
     pub async fn write_to_split<W: AsyncWriteExt + Unpin>(
         &self,
         stream: &mut W,

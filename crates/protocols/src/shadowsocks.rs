@@ -31,10 +31,15 @@ pub type SharedContext = Arc<Context>;
 /// Shadowsocks connection context holding encryption state and target info
 #[derive(Debug, Clone)]
 pub struct SSConnectionContext {
+    /// 加密方式（如 aes-256-gcm）。
     pub cipher_type: String,
+    /// 派生后的密钥。
     pub key: Vec<u8>,
+    /// 目标地址（host:port）。
     pub target_addr: String,
+    /// 连接 ID。
     pub connection_id: u64,
+    /// 监听端口。
     pub port: u16,
 }
 

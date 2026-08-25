@@ -1,37 +1,49 @@
 use thiserror::Error;
 
+/// 隧道统一错误类型。
 #[derive(Error, Debug)]
 pub enum TunnelError {
+    /// IO 错误。
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// 序列化错误。
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
 
+    /// 数据库错误。
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    /// 协议错误。
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// 对端已关闭连接。
     #[error("Connection closed by peer")]
     ConnectionClosed,
 
+    /// 超时。
     #[error("Timeout")]
     Timeout,
 
+    /// 配置错误。
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// 控制通道错误。
     #[error("Control channel error: {0}")]
     ControlChannel(String),
 
+    /// TLS 错误。
     #[error("TLS error: {0}")]
     Tls(String),
 
+    /// Trojan 认证失败（携带原始报文供回退判断）。
     #[error("Trojan authentication failed")]
     TrojanAuthFailed(Vec<u8>),
 
+    /// Mesh 中继错误。
     #[error("Mesh relay error: {0}")]
     MeshRelay(String),
 
@@ -39,12 +51,15 @@ pub enum TunnelError {
     /// （替代 `format!("context: {e}")` 吞掉 source 的 String 包装用法）
     #[error("{context}: {source}")]
     WithSource {
+        /// 上下文描述。
         context: String,
+        /// 底层错误源。
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
+/// 隧道结果别名。
 pub type TunnelResult<T> = Result<T, TunnelError>;
 
 impl TunnelError {

@@ -52,6 +52,7 @@ fn validate_tier_models(raw: &str) -> bool {
     }
 }
 
+/// `GET /api/agent/workspaces`：列出所有工作区。
 pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(agent) = &state.server_state.agent_state else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -62,6 +63,7 @@ pub async fn list_workspaces(State(state): State<ApiState>) -> impl IntoResponse
     }
 }
 
+/// `POST /api/agent/workspaces`：创建工作区。
 pub async fn create_workspace(
     State(state): State<ApiState>,
     Json(body): Json<CreateWorkspaceRequest>,
@@ -166,6 +168,7 @@ pub async fn create_workspace(
     }
 }
 
+/// `GET /api/agent/workspaces/:id`：查询单个工作区。
 pub async fn get_workspace(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -180,6 +183,7 @@ pub async fn get_workspace(
     }
 }
 
+/// `PUT /api/agent/workspaces/:id`：更新工作区。
 pub async fn update_workspace(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -302,6 +306,7 @@ pub async fn update_workspace(
     }
 }
 
+/// `DELETE /api/agent/workspaces/:id`：删除工作区。
 pub async fn delete_workspace(
     State(state): State<ApiState>,
     Path(id): Path<String>,

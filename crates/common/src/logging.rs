@@ -1,9 +1,11 @@
 use tracing_subscriber::{prelude::*, util::SubscriberInitExt, EnvFilter};
 
+/// 使用默认 `info` 级别初始化日志。
 pub fn init_logging() {
     init_logging_with_level("info");
 }
 
+/// 使用指定默认级别初始化日志（可被 `RUST_LOG` 环境变量覆盖）。
 pub fn init_logging_with_level(default_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));

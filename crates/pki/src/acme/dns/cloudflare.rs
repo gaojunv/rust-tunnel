@@ -11,6 +11,7 @@ pub struct CloudflareDnsSolver {
 }
 
 impl CloudflareDnsSolver {
+    /// 创建 Cloudflare DNS 求解器。
     #[must_use]
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {

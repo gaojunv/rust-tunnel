@@ -384,16 +384,19 @@ impl ServerState {
             Some(std::sync::Arc::new(LlmDispatcherAdapter::new(llm)));
     }
 
+    /// 注册 Shadowsocks 端口（通过 `ProxyPortsState` 委派）。
     pub async fn register_shadowsocks(&self, port: u16, cipher: String, password: String) -> bool {
         self.proxy_ports
             .register_shadowsocks(port, cipher, password)
             .await
     }
 
+    /// 查询端口信息。
     pub async fn get_port(&self, port: u16) -> Option<ServerPortInfo> {
         self.proxy_ports.get_port(port).await
     }
 
+    /// 注销端口。
     pub async fn unregister_port(&self, port: u16) -> bool {
         self.proxy_ports.unregister_port(port).await
     }
@@ -415,6 +418,7 @@ impl ServerState {
         self.proxy_ports.decrement_ss_connections(port).await;
     }
 
+    /// 注册 Trojan 端口（通过 `ProxyPortsState` 委派）。
     pub async fn register_trojan(&self, port: u16, password: String, fallback: String) -> bool {
         self.proxy_ports
             .register_trojan(port, password, fallback)

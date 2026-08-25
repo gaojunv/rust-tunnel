@@ -138,12 +138,14 @@ fn opencode_config_content(
     serde_json::to_string(&serde_json::Value::Object(config)).ok()
 }
 
+/// 客户端侧 agent 进程启动器。
 #[derive(Clone)]
 pub struct AgentSpawner {
     registry: std::sync::Arc<dyn crate::TunnelExecutor>,
 }
 
 impl AgentSpawner {
+    /// 创建启动器。
     pub fn new(registry: std::sync::Arc<dyn crate::TunnelExecutor>) -> Self {
         Self { registry }
     }

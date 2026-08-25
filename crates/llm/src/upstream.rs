@@ -33,9 +33,13 @@ const FIRST_EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs
 ///    is more resilient to these middlebox timeouts.
 #[derive(Debug, Clone)]
 pub struct UpstreamClientConfig {
+    /// 连接超时（TCP 握手等待上限，默认 30s）。
     pub connect_timeout: std::time::Duration,
+    /// 读超时（空闲连接检测，允许长流式响应，默认 5min）。
     pub read_timeout: std::time::Duration,
+    /// TCP keepalive 间隔（默认 1min）。
     pub tcp_keepalive: std::time::Duration,
+    /// 每主机最大空闲连接数（连接池复用上限）。
     pub pool_max_idle_per_host: usize,
 }
 

@@ -1,3 +1,5 @@
+//! 客户端接入 token 管理 API。
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -10,11 +12,16 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 
 #[derive(Debug, Serialize)]
+
+/// 客户端接入 token 视图（`GET /api/server-auth` 响应）。
 pub struct ServerAuthView {
+    /// 客户端连接用 token（与 `server_auth` 表一致）。
     pub client_token: String,
+    /// 视图生成时间（当前 DB 未持久化 updated_at，取 `Utc::now()`）。
     pub updated_at: DateTime<Utc>,
 }
 
+/// 读取服务端已持久化的客户端接入 token。
 pub async fn get_impl(db: &Database) -> Result<ServerAuthView, String> {
     let token = db
         .load_server_auth()
@@ -27,6 +34,7 @@ pub async fn get_impl(db: &Database) -> Result<ServerAuthView, String> {
     })
 }
 
+/// 随机生成新的客户端接入 token 并持久化。
 pub async fn rotate_impl(db: &Database) -> Result<String, String> {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -37,6 +45,7 @@ pub async fn rotate_impl(db: &Database) -> Result<String, String> {
     Ok(token)
 }
 
+/// 写入指定的客户端接入 token（空串拒绝）。
 pub async fn set_impl(db: &Database, token: &str) -> Result<(), String> {
     if token.trim().is_empty() {
         return Err("token cannot be empty".into());
@@ -50,6 +59,7 @@ pub async fn set_impl(db: &Database, token: &str) -> Result<(), String> {
 // ---- Axum handlers ----
 // Use ApiState from the parent module (consistent with existing handlers)
 
+/// `GET /api/server-auth`：返回当前 `client_token`。
 pub async fn get_auth(State(state): State<super::ApiState>) -> Response {
     let db = match state.server_state.db() {
         Some(db) => db.clone(),
@@ -63,6 +73,7 @@ pub async fn get_auth(State(state): State<super::ApiState>) -> Response {
     }
 }
 
+/// `POST /api/server-auth/rotate`：轮换 `client_token`。
 pub async fn rotate_auth(State(state): State<super::ApiState>) -> Response {
     let db = match state.server_state.db() {
         Some(db) => db.clone(),
@@ -77,10 +88,13 @@ pub async fn rotate_auth(State(state): State<super::ApiState>) -> Response {
 }
 
 #[derive(Deserialize)]
+/// `PUT /api/server-auth` 请求体。
 pub struct SetAuthBody {
+    /// 待写入的 `client_token`。
     pub token: String,
 }
 
+/// `PUT /api/server-auth`：写入指定的 `client_token`。
 pub async fn put_auth(
     State(state): State<super::ApiState>,
     Json(body): Json<SetAuthBody>,

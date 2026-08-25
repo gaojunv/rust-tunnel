@@ -103,9 +103,13 @@ pub enum LlmTurn {
     ToolCalls(Vec<ParsedToolCall>),
 }
 
+/// 解析后的工具调用。
 pub struct ParsedToolCall {
+    /// 工具调用标识。
     pub id: String,
+    /// 工具名。
     pub name: String,
+    /// 参数 JSON。
     pub args: String,
 }
 

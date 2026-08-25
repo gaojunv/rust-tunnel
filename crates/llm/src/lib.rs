@@ -8,24 +8,41 @@
 // 测试代码豁免 panic 风险 lint（生产代码仍告警）
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+/// Anthropic 协议处理器。
 pub mod anthropic_handler;
+/// 认证与鉴权。
 pub mod auth;
+/// 熔断器。
 pub mod breaker;
+/// 兼容性工具调用改写。
 pub mod compat;
+/// 字段加密。
 pub mod crypto;
+/// 确定性失败缓存。
 pub mod down;
+/// 格式转换与透传。
 pub mod format;
+/// OpenAI 协议处理器。
 pub mod openai_handler;
+/// 统一流水线与故障转移。
 pub mod pipeline;
+/// 提供商与模型管理。
 pub mod provider;
 // RAG 已拆分为独立 crate；`llm::rag` 路径经 re-export 保持兼容
+/// RAG 能力重导出（`rust-tunnel-rag`），保持 `llm::rag` 兼容路径。
 #[cfg(feature = "rag")]
 pub use rust_tunnel_rag as rag;
+/// Responses API 类型与转换。
 pub mod responses;
+/// Responses API 处理器。
 pub mod responses_handler;
+/// 路由缓存（provider/model/group 快照）。
 pub mod route_cache;
+/// 路由与故障转移。
 pub mod router;
+/// 上游 HTTP 客户端与错误映射。
 pub mod upstream;
+/// 用量采集与落库。
 pub mod usage;
 
 #[cfg(feature = "rag")]
@@ -40,13 +57,16 @@ use rust_tunnel_persistence::Database;
 /// 协议入口标识 — 双域名隔离用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmProtocol {
+    /// OpenAI 兼容协议入口。
     OpenAI,
+    /// Anthropic 原生协议入口。
     Anthropic,
 }
 
 /// Gateway-level configuration (persisted as part of the LLM ProxyRule).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LlmGatewayConfig {
+    /// 是否启用 LLM 网关。
     pub enabled: bool,
     /// OpenAI 协议入口域名；None/空 = 不开放 OpenAI 入口。
     #[serde(default, alias = "domain", skip_serializing_if = "Option::is_none")]
@@ -54,8 +74,11 @@ pub struct LlmGatewayConfig {
     /// Anthropic 协议入口域名；None/空 = 不开放 Anthropic 入口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_domain: Option<String>,
+    /// 监听地址（如 `0.0.0.0:443`）。
     pub listen: String,
+    /// 是否启用 TLS。
     pub tls_enabled: bool,
+    /// 是否通过 ACME 自动签发证书。
     pub tls_acme: bool,
 }
 
@@ -114,18 +137,26 @@ impl LlmGatewayConfig {
 /// Provider configuration (mirrors LlmProviderRecord for API responses).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConfig {
+    /// 提供商唯一标识。
     pub id: String,
+    /// 提供商展示名。
     pub name: String,
+    /// 提供商类型标识（如 openai、anthropic）。
     pub provider_type: String,
+    /// 上游 API 基地址。
     pub base_url: String,
     /// API key is NEVER returned in API responses. Set via update.
     #[serde(skip_serializing)]
     pub api_key: String,
+    /// 额外配置 JSON（加密存储）。
     pub extra_config: Option<String>,
     /// Anthropic Messages API base URL; `None` = 不支持 Anthropic 协议。
     pub anthropic_base_url: Option<String>,
+    /// 是否启用。
     pub enabled: bool,
+    /// 创建时间（ISO 8601）。
     pub created_at: String,
+    /// 更新时间（ISO 8601）。
     pub updated_at: String,
 }
 
@@ -152,12 +183,16 @@ pub fn normalize_anthropic_base_url(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Request body for creating/updating a provider.
+/// 创建/更新提供商的请求体。
 #[derive(Debug, serde::Deserialize)]
 pub struct ProviderRequest {
+    /// 提供商展示名。
     pub name: String,
+    /// 提供商类型标识。
     pub provider_type: String,
+    /// 上游 API 基地址。
     pub base_url: String,
+    /// 上游 API 密钥。
     pub api_key: String,
     /// 三态语义：缺失 = 不修改；`null` = 清除；字符串 = 覆盖。
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
@@ -169,60 +204,82 @@ pub struct ProviderRequest {
     pub anthropic_base_url: Option<Option<String>>,
 }
 
-/// Model configuration.
+/// 模型配置（`llm_models` 表的一行）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelConfig {
+    /// 模型唯一标识。
     pub id: String,
+    /// 所属提供商 id。
     pub provider_id: String,
+    /// 上游真实模型名。
     pub model_name: String,
+    /// 对外别名（为空则直接暴露 `model_name`）。
     pub alias: String,
+    /// 标签列表。
     pub tags: Vec<String>,
     /// per-model 配置（JSON 字符串，如 `{"agent_context_limit":200000}`）。非敏感，不加密。
     pub extra_config: Option<String>,
+    /// 是否启用。
     pub enabled: bool,
+    /// 创建时间（ISO 8601）。
     pub created_at: String,
+    /// 更新时间（ISO 8601）。
     pub updated_at: String,
 }
 
-/// Request body for creating/updating a model.
+/// 创建/更新模型的请求体。
 #[derive(Debug, serde::Deserialize)]
 pub struct ModelRequest {
+    /// 上游真实模型名。
     pub model_name: String,
+    /// 对外别名（为空则直接暴露 `model_name`）。
     pub alias: Option<String>,
+    /// 标签列表。
     pub tags: Option<Vec<String>>,
     /// per-model 配置（JSON 字符串）。缺省/`null` = 不设置（或覆盖为无配置）。
     pub extra_config: Option<String>,
 }
 
-/// API key view (returned to management UI).
+/// API key 视图（返回给管理界面，不含完整密钥）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ApiKeyView {
+    /// 记录 id。
     pub id: String,
+    /// 密钥前缀（用于展示，不含完整密钥）。
     pub key_prefix: String,
+    /// 密钥名称。
     pub name: String,
+    /// 是否启用。
     pub enabled: bool,
+    /// 创建时间（ISO 8601）。
     pub created_at: String,
+    /// 最后使用时间（未使用过为 None）。
     pub last_used_at: Option<String>,
     /// 绑定的 RAG 知识库 id（未绑定为 None）。
     #[serde(default)]
     pub kb_id: Option<String>,
 }
 
-/// Request body for creating an API key.
+/// 创建 API key 的请求体。
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateApiKeyRequest {
+    /// 密钥名称。
     pub name: String,
     /// 可选：创建时即绑定 RAG 知识库（不存在则 400）。
     #[serde(default)]
     pub kb_id: Option<String>,
 }
 
-/// Response for API key creation — full key shown only once.
+/// 创建 API key 的响应 — 完整密钥仅展示一次。
 #[derive(Debug, serde::Serialize)]
 pub struct CreateApiKeyResponse {
+    /// 记录 id。
     pub id: String,
+    /// 完整密钥（仅此次返回）。
     pub key: String, // full key — show once!
+    /// 密钥前缀。
     pub key_prefix: String,
+    /// 密钥名称。
     pub name: String,
 }
 
@@ -236,7 +293,9 @@ pub struct CreateApiKeyResponse {
 /// - `tool_call_id` / `name` 用于 `role="tool"` 的结果消息。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
+    /// 角色（`user` / `assistant` / `system` / `tool`）。
     pub role: String,
+    /// 文本内容；`None` 表示无文本（如纯工具调用消息）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// DeepSeek 思考模式的历史 `reasoning_content`：思考链开启后，上游（如
@@ -245,10 +304,13 @@ pub struct ChatMessage {
     /// 由 Anthropic 历史 `thinking` 块映射而来（thinking → reasoning_content）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// 工具调用列表（assistant 发起的调用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// 工具调用结果对应的调用 id（`role=tool` 时使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 工具名（`role=tool` 时使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -270,11 +332,17 @@ impl ChatMessage {
 /// Unified chat completion request.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatCompletionRequest {
+    /// 请求模型名或别名。
     pub model: String,
+    /// 对话消息列表。
     pub messages: Vec<ChatMessage>,
+    /// 是否流式响应。
     pub stream: bool,
+    /// 最大生成 token 数。
     pub max_tokens: Option<u32>,
+    /// 采样温度。
     pub temperature: Option<f32>,
+    /// 核采样阈值。
     pub top_p: Option<f32>,
     /// OpenAI functions 格式的工具声明；透传给上游。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,39 +357,58 @@ pub struct ChatCompletionRequest {
     pub raw_body: Option<serde_json::Value>,
 }
 
+/// Chat Completions 单个选项。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatCompletionChoice {
+    /// 选项序号。
     pub index: u32,
+    /// 选项消息。
     pub message: ChatMessage,
+    /// 结束原因（`stop` / `tool_calls` 等）。
     pub finish_reason: Option<String>,
 }
 
+/// Chat Completions 用量统计。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatCompletionUsage {
+    /// 输入 token 数。
     pub prompt_tokens: u32,
+    /// 输出 token 数。
     pub completion_tokens: u32,
+    /// 总 token 数。
     pub total_tokens: u32,
 }
 
+/// Chat Completions 响应。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatCompletionResponse {
+    /// 响应 id。
     pub id: String,
+    /// 对象类型（`chat.completion`）。
     pub object: String,
+    /// 创建时间戳（秒）。
     pub created: u64,
+    /// 实际使用的模型名。
     pub model: String,
+    /// 选项列表。
     pub choices: Vec<ChatCompletionChoice>,
+    /// 用量统计。
     pub usage: Option<ChatCompletionUsage>,
 }
 
 /// OpenAI-compatible error response.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LlmErrorResponse {
+    /// 错误详情。
     pub error: LlmErrorDetail,
 }
 
+/// OpenAI 兼容错误详情。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LlmErrorDetail {
+    /// 错误信息。
     pub message: String,
+    /// 错误类型。
     #[serde(rename = "type")]
     pub error_type: String,
 }
@@ -404,10 +491,15 @@ impl LlmState {
 /// LLM Gateway 规则输入（装配层从反代 `ProxyRule` 提取转换，llm 不依赖 protocols 类型）。
 #[derive(Debug, Clone)]
 pub struct LlmGatewayRuleInput {
+    /// 是否启用网关。
     pub enabled: bool,
+    /// 已配置域名列表（`[openai_domain, anthropic_domain]`，空字符串表示未配置）。
     pub domains: Vec<String>,
+    /// 监听地址。
     pub listen: String,
+    /// 是否启用 TLS。
     pub tls_enabled: bool,
+    /// 是否通过 ACME 自动签发证书。
     pub tls_acme: bool,
 }
 
@@ -625,17 +717,27 @@ pub fn sanitize_request_body(body: &serde_json::Value) -> serde_json::Value {
 /// 4xx/5xx 详细错误日志由 upstream.rs 的 llm_upstream/llm_upstream_debug 负责，不受此开关影响。
 /// `log_llm_request` 参数包（批次 9d 收敛 too_many_arguments）：纯数据参数。
 pub struct LogLlmRequestOpts {
+    /// 协议标识（`openai` / `anthropic`）。
     pub protocol: String,
+    /// 请求模型名。
     pub model: String,
+    /// 消息条数。
     pub message_count: usize,
+    /// 是否携带工具声明。
     pub has_tools: bool,
+    /// 是否流式请求。
     pub stream: bool,
+    /// 上游响应状态码。
     pub status: Option<u16>,
+    /// 错误信息。
     pub error: Option<String>,
+    /// 耗时（毫秒）。
     pub elapsed_ms: u128,
+    /// 发往上游的请求体。
     pub request_body: serde_json::Value,
 }
 
+/// 记录一条 LLM 请求日志（受 `LlmState::request_logging` 开关控制，关闭时直接返回）。
 pub async fn log_llm_request(llm: &LlmState, opts: &LogLlmRequestOpts) {
     if !llm
         .request_logging

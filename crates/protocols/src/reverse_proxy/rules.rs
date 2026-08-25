@@ -8,8 +8,10 @@ use rust_tunnel_pki::acme::{CertCoverage, CertificateManager};
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum LoadBalancing {
+    /// 轮询。
     #[default]
     RoundRobin,
+    /// 加权轮询。
     WeightedRoundRobin,
 }
 
@@ -17,9 +19,13 @@ pub enum LoadBalancing {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleType {
+    /// HTTP 反代。
     Http,
+    /// TCP 转发。
     Tcp,
+    /// UDP 转发。
     Udp,
+    /// LLM 网关。
     Llm,
 }
 
@@ -38,6 +44,7 @@ impl std::fmt::Display for RuleType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendProtocol {
+    /// HTTP/1.1。
     #[default]
     Http1,
     /// h2 over TLS (ALPN-negotiated) or h2c prior-knowledge over plain TCP.
@@ -48,8 +55,10 @@ pub enum BackendProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendScheme {
+    /// 明文 HTTP。
     #[default]
     Http,
+    /// HTTPS。
     Https,
 }
 
@@ -63,8 +72,10 @@ pub enum BackendScheme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
+    /// 直连外部地址。
     #[default]
     Direct,
+    /// 经客户端隧道拨号。
     Client,
 }
 
@@ -141,8 +152,11 @@ pub enum CertSourceKind {
 /// never accepted from client input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleCertStatus {
+    /// 证书来源类型。
     pub source: CertSourceKind,
+    /// 覆盖该规则主域名的证书域名。
     pub covering_domain: String,
+    /// 状态更新时间。
     pub last_updated: chrono::DateTime<chrono::Utc>,
 }
 
@@ -189,11 +203,15 @@ pub struct TrojanSniEntry {
     pub listen_addr: String,
     /// Trojan 端口（共享模式下不真实 bind，仅用于连接统计/流量记账）
     pub trojan_port: u16,
+    /// Trojan 密码。
     pub password: String,
+    /// 认证失败回退地址。
     pub fallback: String,
     /// Trojan 的 TLS 配置 watch channel（证书热更新）
     pub tls_config_rx: tokio::sync::watch::Receiver<Arc<rustls::ServerConfig>>,
+    /// 端口注册表（连接计数）。
     pub registry: std::sync::Arc<dyn crate::PortRegistry>,
+    /// 统计收集器。
     pub stats: rust_tunnel_stats::StatsCollector,
 }
 

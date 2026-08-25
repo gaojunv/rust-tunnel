@@ -1,8 +1,12 @@
+//! Trojan 代理配置 API。
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use super::ApiState;
 
 // Get Trojan configuration
+
+/// `GET /api/trojan`：读取 Trojan 配置。
 pub async fn get_trojan_config(State(state): State<ApiState>) -> Json<super::dto::TrojanConfig> {
     let (enabled, port, fallback, domain) = {
         let dc = state.server_state.dynamic_config.read().await;
@@ -28,6 +32,7 @@ pub async fn get_trojan_config(State(state): State<ApiState>) -> Json<super::dto
 }
 
 // Update Trojan configuration (start/stop/modify)
+/// `POST /api/trojan`：更新 Trojan 配置并应用监听。
 pub async fn update_trojan_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,

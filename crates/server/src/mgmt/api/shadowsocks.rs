@@ -1,3 +1,5 @@
+//! Shadowsocks 代理配置 API。
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use super::{dto::ShadowsocksConfig, ApiState};
@@ -6,6 +8,8 @@ use super::{dto::ShadowsocksConfig, ApiState};
 const SS_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 // Get Shadowsocks configuration
+
+/// `GET /api/shadowsocks`：读取 Shadowsocks 配置。
 pub async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<ShadowsocksConfig> {
     // Get all SS ports
     let ss_ports = state.server_state.get_shadowsocks_ports().await;
@@ -26,6 +30,7 @@ pub async fn get_shadowsocks_config(State(state): State<ApiState>) -> Json<Shado
 }
 
 // Update Shadowsocks configuration (start/stop/modify)
+/// `POST /api/shadowsocks`：更新 Shadowsocks 配置并重启监听。
 pub async fn update_shadowsocks_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,

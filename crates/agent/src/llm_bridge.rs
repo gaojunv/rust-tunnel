@@ -35,6 +35,7 @@ pub struct LlmGatewayEndpoint {
 /// 转换成 ControlMessage 下发到客户端控制通道。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLlmProxyChunk {
+    /// 代理请求标识。
     pub request_id: String,
     /// 原始响应字节（SSE 块或错误消息）
     pub data: Vec<u8>,

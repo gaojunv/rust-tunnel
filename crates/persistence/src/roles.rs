@@ -12,21 +12,36 @@ use super::Database;
 /// `model_override` 为网关模型引用（alias/model:/group:），NULL 继承 workspace 默认。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentRoleRecord {
+    /// 主键 id（UUID，内置角色为固定 id）。
     pub id: String,
+    /// 角色名称（归一化小写，同作用域唯一）。
     pub name: String,
+    /// 角色描述（一句话用途）。
     pub description: String,
+    /// 系统提示词（注入给 LLM 的 persona 全文）。
     pub system_prompt: String,
+    /// 工具白名单 JSON 数组字符串（`'["shell","read_file"]'`，NULL 不限制）。
     pub tools_allow: Option<String>,
+    /// 工具黑名单 JSON 数组字符串（`'["shell"]'`，NULL 无排除）。
     pub tools_deny: Option<String>,
+    /// 模型覆盖（网关引用 alias/model:/group:，NULL 继承 workspace 默认）。
     pub model_override: Option<String>,
+    /// 模式（subagent|primary|all）。
     pub mode: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id（global 时为空串）。
     pub client_id: String,
+    /// 所属工作区 id（非 workspace 作用域时为空串）。
     pub workspace_id: String,
+    /// 是否内置角色（1 内置，0 自定义）。
     pub is_builtin: i32,
+    /// 是否启用（1 启用，0 停用）。
     pub enabled: i32,
+    /// 创建时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
@@ -34,44 +49,76 @@ pub struct AgentRoleRecord {
 /// 角色列表行（与完整行相同字段——角色数据量小，无需 Summary 分离）。
 pub type AgentRoleSummary = AgentRoleRecord;
 
+/// `role_insert` 参数包：角色写入的全部字段（11 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RoleInsertOpts {
+    /// 角色主键 id。
     pub id: String,
+    /// 角色名称（归一化小写）。
     pub name: String,
+    /// 角色描述。
     pub description: String,
+    /// 系统提示词全文。
     pub system_prompt: String,
+    /// 工具白名单 JSON 数组字符串（None 不限制）。
     pub tools_allow: Option<String>,
+    /// 工具黑名单 JSON 数组字符串（None 无排除）。
     pub tools_deny: Option<String>,
+    /// 模型覆盖（None 继承 workspace 默认）。
     pub model_override: Option<String>,
+    /// 模式（subagent|primary|all）。
     pub mode: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
 }
 
+/// `role_update` 参数包：角色更新的全部字段（10 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RoleUpdateOpts {
+    /// 角色名称（归一化小写）。
     pub name: String,
+    /// 角色描述。
     pub description: String,
+    /// 系统提示词全文。
     pub system_prompt: String,
+    /// 工具白名单 JSON 数组字符串（None 不限制）。
     pub tools_allow: Option<String>,
+    /// 工具黑名单 JSON 数组字符串（None 无排除）。
     pub tools_deny: Option<String>,
+    /// 模型覆盖（None 继承 workspace 默认）。
     pub model_override: Option<String>,
+    /// 模式（subagent|primary|all）。
     pub mode: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
 }
 
+/// `role_list` 查询条件：角色列表的全部过滤参数（8 项）。
 #[derive(Debug, Clone, Default)]
 pub struct RoleListFilter {
+    /// 作用域类型过滤（global|client|workspace，None 不过滤）。
     pub scope_type: Option<String>,
+    /// 客户端 id 过滤（空串等同 None）。
     pub client_id: Option<String>,
+    /// 工作区 id 过滤（空串等同 None）。
     pub workspace_id: Option<String>,
+    /// 模糊搜索关键字（匹配 name/description，None 不过滤）。
     pub q: Option<String>,
+    /// 启用状态过滤（Some(true) 仅启用，Some(false) 仅停用，None 不过滤）。
     pub enabled: Option<bool>,
+    /// 模式过滤（subagent|primary|all，None 不过滤）。
     pub mode: Option<String>,
+    /// 分页条数。
     pub limit: i64,
+    /// 分页偏移。
     pub offset: i64,
 }
 
@@ -102,6 +149,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询单条角色，不存在返回 None。
     pub async fn role_get_by_id(&self, id: &str) -> Result<Option<AgentRoleRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentRoleRecord>("SELECT * FROM agent_roles WHERE id = ?")
             .bind(id)

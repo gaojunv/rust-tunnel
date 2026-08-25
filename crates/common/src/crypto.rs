@@ -30,6 +30,7 @@ impl std::fmt::Debug for LlmCipher {
 }
 
 impl LlmCipher {
+    /// 使用 32 字节主密钥构造加密器。
     #[must_use]
     pub fn from_master_key(key: [u8; 32]) -> Self {
         Self {

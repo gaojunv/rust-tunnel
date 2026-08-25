@@ -1,27 +1,40 @@
+//! ACME 配置的 DB 持久化与启动期种子逻辑。
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::ServerConfig;
 use crate::Database;
 
-/// ACME configuration summary for API responses
+/// ACME 配置摘要（API 概览用）。
 #[derive(Debug, Clone)]
 pub struct AcmeConfigInfo {
+    /// 是否启用 ACME。
     pub enabled: bool,
+    /// ACME 目录地址。
     pub server_url: String,
+    /// 证书存储目录。
     pub cert_dir: String,
 }
 
-/// Full ACME configuration for API access
+/// 完整 ACME 配置（API 读写用，对应 `server_settings.acme_config` JSON）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeFullConfig {
+    /// 是否启用 ACME。
     pub enabled: bool,
+    /// ACME 目录地址。
     pub server_url: String,
+    /// 注册邮箱。
     pub email: Option<String>,
+    /// 证书存储目录。
     pub cert_dir: String,
+    /// 是否自动续期。
     pub auto_renew: bool,
+    /// 续期检查间隔（小时）。
     pub renewal_check_interval: u64,
+    /// 到期前多少天触发续期。
     pub renewal_days_before_expiry: u64,
+    /// 是否已同意服务条款。
     pub tos_agreed: bool,
 }
 

@@ -12,6 +12,7 @@ use super::{ChatCompletionRequest, ChatMessage, LlmProtocol, LlmState};
 /// State for LLM request handlers.
 #[derive(Clone)]
 pub struct LlmHandlerState {
+    /// LLM 共享状态（数据库/网关配置/熔断器等）。
     pub llm: Arc<LlmState>,
     /// Which protocol matched this request; None means "not set" (shouldn't happen).
     pub protocol: Option<LlmProtocol>,

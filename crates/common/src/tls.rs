@@ -21,9 +21,11 @@ use tracing::{debug, info};
 
 use crate::{TunnelError, TunnelResult};
 
-/// Certificate and private key pair for TLS
+/// TLS 证书与私钥对。
 pub struct TlsCertPair {
+    /// 证书链（DER 形式，从 PEM 解析得到）。
     pub certs: Vec<CertificateDer<'static>>,
+    /// 私钥（支持 PKCS#8 / PKCS#1 / SEC1）。
     pub key: PrivateKeyDer<'static>,
 }
 

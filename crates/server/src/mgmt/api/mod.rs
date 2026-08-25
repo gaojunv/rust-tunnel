@@ -1,3 +1,5 @@
+//! 管理面 HTTP API — 路由装配与共享状态。
+
 use axum::{
     body::Body,
     http::StatusCode,
@@ -12,25 +14,44 @@ use axum::extract::State;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+/// ACME 证书管理路由。
 pub mod acme;
+/// Agent 工作台路由。
 pub mod agent;
+/// 客户端管理路由。
 pub mod clients;
+/// DNS 记录与配置路由。
 pub mod dns;
+/// API 通用 DTO 定义。
 pub mod dto;
+/// API 错误类型。
 pub mod error;
+/// LLM 网关与模型组路由。
 pub mod llm;
+/// 登录与健康检查路由。
 pub mod login;
+/// 日志查询与 SSE 路由。
 pub mod logs;
+/// Mesh 网络路由。
 pub mod mesh;
+/// 用户偏好路由。
 pub mod preferences;
+/// RAG 知识库路由（仅 rag feature）。
 #[cfg(feature = "rag")]
 pub mod rag;
+/// 反向代理规则与配置路由。
 pub mod reverse_proxy;
+/// 服务端接入 Token 管理路由。
 pub mod server_auth;
+/// 通用设置路由。
 pub mod settings;
+/// Shadowsocks 配置路由。
 pub mod shadowsocks;
+/// 前端静态资源服务。
 pub mod static_files;
+/// 统计查询与 SSE 路由。
 pub mod stats;
+/// Trojan 配置路由。
 pub mod trojan;
 
 pub use dto::*;
@@ -187,8 +208,11 @@ mod tests {
 /// API state shared across all handlers
 #[derive(Clone)]
 pub struct ApiState {
+    /// 共享的服务端状态。
     pub server_state: ServerState,
+    /// 鉴权配置。
     pub auth_config: Arc<AuthConfig>,
+    /// 日志存储（未启用时为 None）。
     pub log_store: Option<crate::logs::LogStore>,
 }
 

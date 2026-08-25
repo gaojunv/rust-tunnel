@@ -48,6 +48,7 @@ pub async fn put_default_model(
     }
 }
 
+/// `GET /api/agent/workspaces/:workspace_id/sessions`：列出工作区会话。
 pub async fn list_sessions(
     State(state): State<ApiState>,
     Path(workspace_id): Path<String>,
@@ -61,6 +62,7 @@ pub async fn list_sessions(
     }
 }
 
+/// `POST /api/agent/workspaces/:workspace_id/sessions`：创建会话。
 pub async fn create_session(
     State(state): State<ApiState>,
     Path(workspace_id): Path<String>,
@@ -93,6 +95,7 @@ pub async fn create_session(
     }
 }
 
+/// `PATCH /api/agent/sessions/:id`：更新会话标题。
 pub async fn update_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -107,6 +110,7 @@ pub async fn update_session(
     }
 }
 
+/// `PATCH /api/agent/sessions/:id/model`：更新会话模型。
 pub async fn update_session_model(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -129,6 +133,7 @@ pub async fn update_session_model(
     }
 }
 
+/// `POST /api/agent/sessions/:id/archive`：归档会话。
 pub async fn archive_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -155,6 +160,7 @@ pub async fn archive_session(
     }
 }
 
+/// `DELETE /api/agent/sessions/:id`：删除会话。
 pub async fn delete_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,

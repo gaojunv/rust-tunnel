@@ -11,6 +11,7 @@ pub struct TencentDnsSolver {
 }
 
 impl TencentDnsSolver {
+    /// 创建腾讯云 DNS 求解器。
     #[must_use]
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {

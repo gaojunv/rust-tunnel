@@ -25,24 +25,32 @@ pub enum GitRisk {
 pub struct PlannedGit {
     /// 可在客户端直接执行的 git 参数（首个元素为子命令）。
     pub args: Vec<String>,
+    /// 风险分级。
     pub risk: GitRisk,
 }
 
 /// git 参数规划错误（fail-closed 路径统一归一为 [`GitPlanError`]）。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GitPlanError {
+    /// 缺少 git 子命令。
     #[error("missing git subcommand")]
     MissingSubcommand,
+    /// 不支持的 git 子命令。
     #[error("unsupported git subcommand: {0}")]
     UnknownSubcommand(String),
+    /// 不支持的参数或 flag。
     #[error("unsupported git argument or flag: {0}")]
     UnknownArg(String),
+    /// 缺少必填参数。
     #[error("missing required argument for git {0}")]
     MissingArg(&'static str),
+    /// 非法参数值。
     #[error("invalid value '{0}' for {1}")]
     InvalidValue(String, &'static str),
+    /// 路径穿越工作区。
     #[error("pathspec '{0}' may escape the workspace")]
     PathEscapes(String),
+    /// 路径以 `-` 开头。
     #[error("pathspec '{0}' must not start with '-'")]
     PathStartsWithDash(String),
 }

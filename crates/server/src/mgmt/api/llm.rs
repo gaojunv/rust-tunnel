@@ -28,6 +28,7 @@ async fn llm_cipher(state: &ApiState) -> Option<LlmCipher> {
 
 // ── Gateway config ────────────────────────────────────────────
 
+/// 查询 LLM 网关配置（GET /api/llm/gateway）。
 pub async fn get_gateway_config(State(state): State<ApiState>) -> impl IntoResponse {
     let llm_guard = state.server_state.llm_state.read().await;
     match llm_guard.as_ref() {
@@ -39,6 +40,7 @@ pub async fn get_gateway_config(State(state): State<ApiState>) -> impl IntoRespo
     }
 }
 
+/// 更新 LLM 网关配置（PUT /api/llm/gateway）。
 pub async fn update_gateway_config(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -147,6 +149,7 @@ pub async fn update_gateway_config(
 
 // ── Provider CRUD ─────────────────────────────────────────────
 
+/// 列出全部 LLM Provider（GET /api/llm/providers）。
 pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse {
     let db = match state.server_state.db() {
         Some(db) => db,
@@ -203,6 +206,7 @@ pub async fn list_providers(State(state): State<ApiState>) -> impl IntoResponse 
     Json(serde_json::json!({"providers": providers})).into_response()
 }
 
+/// 创建 Provider（POST /api/llm/providers）。
 pub async fn create_provider(
     State(state): State<ApiState>,
     Json(body): Json<ProviderRequest>,
@@ -271,6 +275,7 @@ pub async fn create_provider(
         .into_response()
 }
 
+/// 更新 Provider（PUT /api/llm/providers/:id）。
 pub async fn update_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -354,6 +359,7 @@ pub async fn update_provider(
     Json(serde_json::json!({"status": "ok"})).into_response()
 }
 
+/// 启用/禁用 Provider（PATCH /api/llm/providers/:id）。
 pub async fn toggle_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -375,6 +381,7 @@ pub async fn toggle_provider(
     StatusCode::OK.into_response()
 }
 
+/// 删除 Provider（DELETE /api/llm/providers/:id）。
 pub async fn delete_provider(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -396,6 +403,7 @@ pub async fn delete_provider(
 
 // ── Model CRUD ─────────────────────────────────────────────────
 
+/// 列出指定 Provider 下的模型（GET /api/llm/providers/:provider_id/models）。
 pub async fn list_provider_models(
     State(state): State<ApiState>,
     Path(provider_id): Path<String>,
@@ -431,6 +439,7 @@ pub async fn list_provider_models(
     Json(serde_json::json!({"models": models})).into_response()
 }
 
+/// 列出全部模型（GET /api/llm/models）。
 pub async fn list_all_models(State(state): State<ApiState>) -> impl IntoResponse {
     let db = match state.server_state.db() {
         Some(db) => db,
@@ -463,6 +472,7 @@ pub async fn list_all_models(State(state): State<ApiState>) -> impl IntoResponse
     Json(serde_json::json!({"models": models})).into_response()
 }
 
+/// 为 Provider 添加模型（POST /api/llm/providers/:provider_id/models）。
 pub async fn add_model(
     State(state): State<ApiState>,
     Path(provider_id): Path<String>,
@@ -504,6 +514,7 @@ pub async fn add_model(
         .into_response()
 }
 
+/// 更新模型（PUT /api/llm/models/:id）。
 pub async fn update_model(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -536,6 +547,7 @@ pub async fn update_model(
     StatusCode::OK.into_response()
 }
 
+/// 删除模型（DELETE /api/llm/models/:id）。
 pub async fn delete_model(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -557,6 +569,7 @@ pub async fn delete_model(
 
 // ── API Key CRUD ───────────────────────────────────────────────
 
+/// 列出全部 API Key（GET /api/llm/api-keys）。
 pub async fn list_api_keys(State(state): State<ApiState>) -> impl IntoResponse {
     let db = match state.server_state.db() {
         Some(db) => db,
@@ -605,6 +618,7 @@ async fn ensure_kb_exists(
     }
 }
 
+/// 创建 API Key（POST /api/llm/api-keys）。
 pub async fn create_api_key(
     State(state): State<ApiState>,
     Json(body): Json<CreateApiKeyRequest>,
@@ -642,6 +656,7 @@ pub async fn create_api_key(
     (StatusCode::CREATED, Json(serde_json::json!(resp))).into_response()
 }
 
+/// 启用/禁用/绑定知识库到 API Key（PATCH /api/llm/api-keys/:id）。
 pub async fn toggle_api_key(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -693,6 +708,7 @@ pub async fn toggle_api_key(
     StatusCode::OK.into_response()
 }
 
+/// 删除 API Key（DELETE /api/llm/api-keys/:id）。
 pub async fn delete_api_key(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -716,12 +732,15 @@ pub async fn delete_api_key(
 /// 用量查询的时间范围参数（RFC3339）。缺省则回落到最近 24 小时。
 #[derive(Debug, serde::Deserialize)]
 pub struct UsageQueryParams {
+    /// 起始时间（RFC3339）。
     pub start: Option<String>,
+    /// 结束时间（RFC3339）。
     pub end: Option<String>,
     /// 聚合维度：`api_key` / `model` / `provider`（仅 aggregate 端点用）。
     pub group_by: Option<String>,
-    /// 明细分页（仅 logs 端点用）。
+    /// 明细分页大小（仅 logs 端点用）。
     pub limit: Option<i64>,
+    /// 明细分页偏移（仅 logs 端点用）。
     pub offset: Option<i64>,
 }
 
@@ -755,6 +774,7 @@ fn resolve_range(p: &UsageQueryParams) -> Result<(String, String), String> {
     Ok((start.format(fmt).to_string(), end.format(fmt).to_string()))
 }
 
+/// 查询用量总览（GET /api/llm/usage/summary）。
 pub async fn get_usage_summary(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
@@ -777,6 +797,7 @@ pub async fn get_usage_summary(
     }
 }
 
+/// 按维度聚合用量（GET /api/llm/usage/aggregate）。
 pub async fn get_usage_aggregate(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
@@ -807,6 +828,7 @@ pub async fn get_usage_aggregate(
     }
 }
 
+/// 查询用量明细日志（GET /api/llm/usage/logs）。
 pub async fn get_usage_logs(
     State(state): State<ApiState>,
     axum::extract::Query(params): axum::extract::Query<UsageQueryParams>,
@@ -866,6 +888,7 @@ async fn llm_invalidate(state: &ApiState) {
 }
 
 /// GET /api/llm/model-groups
+/// 列出全部模型组（GET /api/llm/model-groups）。
 pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoResponse {
     let db = match state.server_state.db() {
         Some(db) => db,
@@ -897,6 +920,7 @@ pub async fn list_model_groups(State(state): State<ApiState>) -> impl IntoRespon
 }
 
 /// POST /api/llm/model-groups
+/// 创建模型组（POST /api/llm/model-groups）。
 pub async fn create_model_group(
     State(state): State<ApiState>,
     Json(body): Json<ModelGroupRequest>,
@@ -945,6 +969,7 @@ pub async fn create_model_group(
 }
 
 /// GET /api/llm/model-groups/:id
+/// 查询模型组详情（GET /api/llm/model-groups/:id）。
 pub async fn get_model_group(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1016,6 +1041,8 @@ pub async fn get_model_group(
 }
 
 /// PUT /api/llm/model-groups/:id
+/// 更新模型（PUT /api/llm/models/:id）。
+/// 更新模型组（PUT /api/llm/model-groups/:id）。
 pub async fn update_model_group(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1069,6 +1096,8 @@ pub async fn update_model_group(
 }
 
 /// DELETE /api/llm/model-groups/:id
+/// 删除模型（DELETE /api/llm/models/:id）。
+/// 删除模型组（DELETE /api/llm/model-groups/:id）。
 pub async fn delete_model_group(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1100,6 +1129,7 @@ pub async fn delete_model_group(
 }
 
 /// PUT /api/llm/model-groups/:id/members（整体替换；priority 兜底重排为 1..N）
+/// 整体替换模型组成员（PUT /api/llm/model-groups/:id/members）。
 pub async fn replace_group_members(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1150,6 +1180,7 @@ pub async fn replace_group_members(
 }
 
 /// POST /api/llm/model-groups/:id/reset-breaker
+/// 重置模型组熔断器（POST /api/llm/model-groups/:id/reset-breaker）。
 pub async fn reset_group_breaker(
     State(state): State<ApiState>,
     Path(id): Path<String>,

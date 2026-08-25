@@ -33,14 +33,19 @@ const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// requires `Send + 'static` on the body.
 pub type ProxyBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
+/// 上游转发错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
+    /// 后端地址非法。
     #[error("invalid backend address: {0}")]
     BadBackendAddr(String),
+    /// 上游连接失败。
     #[error("upstream connect failed: {0}")]
     Connect(String),
+    /// 上游请求失败。
     #[error("upstream request failed: {0}")]
     Request(#[from] hyper_util::client::legacy::Error),
+    /// 请求体转发失败。
     #[error("body forward error: {0}")]
     Body(String),
 }

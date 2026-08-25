@@ -171,6 +171,7 @@ enum BlockKind {
 }
 
 impl AnthropicSseTranslator {
+    /// 创建空的 Anthropic SSE 翻译器。
     #[must_use]
     pub fn new() -> Self {
         Self {

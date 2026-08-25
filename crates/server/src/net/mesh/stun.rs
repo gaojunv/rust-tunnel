@@ -2,19 +2,19 @@ use rust_tunnel_common::{ATTR_XOR_MAPPED_ADDRESS, STUN_MAGIC_COOKIE};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 
-/// Lightweight STUN server that responds to Binding Requests
-/// with the client's observed public address (XOR-MAPPED-ADDRESS).
+/// 轻量 STUN 服务端：响应 Binding Request 并回传客户端公网地址（XOR-MAPPED-ADDRESS）。
 pub struct StunServer {
     socket: UdpSocket,
 }
 
 impl StunServer {
+    /// 绑定 UDP 地址创建 STUN 服务端。
     pub async fn bind(addr: &str) -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         Ok(Self { socket })
     }
 
-    /// Run the STUN server loop. Does not return.
+    /// 运行 STUN 服务循环（永不返回）。
     pub async fn run(self) -> anyhow::Result<()> {
         let mut buf = [0u8; 1500];
         loop {
@@ -26,6 +26,7 @@ impl StunServer {
         }
     }
 
+    /// 处理 Binding Request，返回 Binding Success Response。
     fn handle_binding_request(data: &[u8], src_addr: SocketAddr) -> Option<Vec<u8>> {
         if data.len() < 20 {
             return None;

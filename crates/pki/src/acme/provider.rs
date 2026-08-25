@@ -7,18 +7,26 @@ use std::sync::Arc;
 /// Certificate entry containing PEM-encoded certificate data
 #[derive(Debug, Clone)]
 pub struct CertEntry {
+    /// 叶子证书 PEM。
     pub cert_pem: String,
+    /// 私钥 PEM。
     pub key_pem: String,
+    /// 中间证书链 PEM，无则为 None。
     pub chain_pem: Option<String>,
+    /// 过期时间，无则为 None。
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 证书来源。
     pub source: CertSource,
 }
 
 /// Source of the certificate
 #[derive(Debug, Clone, PartialEq)]
 pub enum CertSource {
+    /// ACME 签发。
     Acme,
+    /// 自签名。
     SelfSigned,
+    /// 手动上传。
     Manual,
 }
 

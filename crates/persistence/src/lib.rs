@@ -1,6 +1,8 @@
 // 测试代码豁免 panic 风险 lint（生产代码仍告警）
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+//! 持久化层：基于 SQLite 的仓储实现，封装连接池、表结构初始化与各域数据的读写访问。
+
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     Pool, Sqlite,
@@ -8,27 +10,49 @@ use sqlx::{
 use std::path::Path;
 use std::str::FromStr;
 
+/// ACME 证书与挑战记录的持久化操作。
 pub mod acme;
+/// Agent 工作区、会话与消息的持久化操作。
 pub mod agent;
+/// 客户端注册表与连接会话历史的持久化操作。
 pub mod clients;
+/// DNS 配置的持久化操作。
 pub mod dns;
+/// LLM 网关（提供商、模型、密钥、用量）的持久化操作。
 pub mod llm;
+/// 服务端日志的持久化操作。
 pub mod logs;
+/// AI 记忆体的持久化操作。
 pub mod memory;
+/// Mesh 网络与服务的持久化操作。
 pub mod mesh;
+/// 代理规则的持久化操作。
 pub mod proxy_rules;
+/// RAG 知识库、文档与分块的持久化操作。
 pub mod rag;
+/// 数据库行记录类型定义。
 pub mod records;
+/// 反向代理全局配置的持久化操作。
 pub mod reverse_proxy;
+/// Agent 角色定义的持久化操作。
 pub mod roles;
+/// 数据库表结构初始化与迁移。
 pub mod schema;
+/// 服务端鉴权 token 的持久化操作。
 pub mod server_auth;
+/// 服务端通用键值设置的持久化操作。
 pub mod settings;
+/// Shadowsocks 配置的持久化操作。
 pub mod shadowsocks;
+/// Agent Skill 库的持久化操作。
 pub mod skills;
+/// 统计快照的持久化操作。
 pub mod stats;
+/// 工具调用结果的辅助持久化逻辑。
 pub mod tool_result;
+/// Trojan 配置的持久化操作。
 pub mod trojan;
+/// Wiki 容器、文档与页面的持久化操作。
 pub mod wiki;
 pub use llm::*;
 pub use records::*;

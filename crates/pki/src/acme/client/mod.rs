@@ -1,6 +1,12 @@
+//! ACME 客户端：账户、订单、挑战流程与续签。
+
+/// 证书工具（PEM 拆分等）。
 pub mod cert_utils;
+/// 挑战流程。
 pub mod challenge_flow;
+/// 订单管理。
 pub mod order;
+/// 自动续签任务。
 pub mod renewal;
 
 pub use renewal::start_renewal_task;

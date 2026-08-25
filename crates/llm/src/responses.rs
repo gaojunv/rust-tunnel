@@ -413,6 +413,7 @@ impl Default for ChatToResponsesSseTranslator {
 }
 
 impl ChatToResponsesSseTranslator {
+    /// 创建空的 Chat→Responses SSE 翻译器。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -1385,6 +1386,7 @@ impl Default for ResponsesToChatSseTranslator {
 }
 
 impl ResponsesToChatSseTranslator {
+    /// 创建空的 Responses→Chat SSE 翻译器。
     #[must_use]
     pub fn new() -> Self {
         Self {

@@ -18,20 +18,21 @@ use rust_tunnel_common::ControlMessage;
 /// OpenTunnel 建连等待超时：5s，客户端未响应即判超时。
 const OPEN_TUNNEL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 控制通道发送端类型别名。
 pub type ControlSender = mpsc::Sender<ControlMessage>;
 
-/// Outcome of an `OpenTunnel` dial, delivered via a one-shot channel from the
-/// main control loop to whoever asked (`ClientConnector` in a later task).
+/// `OpenTunnel` 拨号结果，经 oneshot 从控制循环投递给等待方。
 #[derive(Debug)]
 pub enum TunnelOpenOutcome {
+    /// 客户端建连成功。
     Ok,
+    /// 客户端建连失败，携带错误原因。
     Failed(String),
 }
 
-/// Per-tunnel state on the server side, indexed by `connection_id`.
+/// 服务端侧单条隧道连接状态，按 `connection_id` 索引。
 ///
-/// The `open_result` one-shot is populated when the control loop receives a
-/// `TunnelOpenResult` message; the reader task consumes it via `take()`.
+/// `open_result` 在收到 `TunnelOpenResult` 时填充，调用方通过 `take()` 消费。
 #[derive(Debug)]
 pub struct ActiveTunnelConnection {
     /// Server main loop pushes inbound `Data` payloads here; the
@@ -41,9 +42,12 @@ pub struct ActiveTunnelConnection {
     pub open_result: Option<oneshot::Sender<TunnelOpenOutcome>>,
 }
 
+/// 客户端注册失败原因。
 #[derive(Debug)]
 pub enum RegisterError {
+    /// 鉴权失败（密码与存储的 token 不一致）。
     AuthFailed,
+    /// 数据库错误。
     DbError(sqlx::Error),
 }
 
@@ -58,12 +62,18 @@ impl std::fmt::Display for RegisterError {
 
 impl std::error::Error for RegisterError {}
 
+/// 单个在线客户端的注册项。
 #[derive(Debug)]
 pub struct ClientEntry {
+    /// 客户端名称（唯一键）。
     pub name: String,
+    /// 客户端主机名。
     pub hostname: Option<String>,
+    /// 客户端版本号。
     pub client_version: Option<String>,
+    /// 控制通道发送端。
     pub control_sender: ControlSender,
+    /// 连接建立时间。
     pub connected_at: DateTime<Utc>,
     /// 最后一次心跳时间戳（微秒），用于超时检测（当前 Task 未使用，Task 12 心跳循环会更新）
     pub last_ping_micros: AtomicU64,
@@ -76,8 +86,7 @@ pub struct ClientEntry {
     pub agent_pending: Mutex<HashMap<String, oneshot::Sender<rust_tunnel_common::AgentResult>>>,
 }
 
-/// Global registry of online clients, keyed by name. Cloneable: internal state
-/// is `Arc`-shared.
+/// 在线客户端全局注册表，按名称索引。`Clone` 后内部状态 `Arc` 共享。
 #[derive(Clone)]
 pub struct ClientRegistry {
     entries: Arc<RwLock<HashMap<String, Arc<ClientEntry>>>>,
@@ -90,6 +99,7 @@ pub struct ClientRegistry {
 }
 
 impl ClientRegistry {
+    /// 创建空注册表。
     pub fn new(db: Database) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
@@ -170,11 +180,13 @@ impl ClientRegistry {
         Ok(entry)
     }
 
+    /// 按名称查询在线客户端。
     #[must_use]
     pub async fn get(&self, name: &str) -> Option<Arc<ClientEntry>> {
         self.entries.read().await.get(name).cloned()
     }
 
+    /// 列出所有在线客户端。
     #[must_use]
     pub async fn list_online(&self) -> Vec<Arc<ClientEntry>> {
         self.entries.read().await.values().cloned().collect()
@@ -195,6 +207,7 @@ impl ClientRegistry {
         }
     }
 
+    /// 返回底层数据库句柄。
     #[must_use]
     pub fn db(&self) -> &Database {
         &self.db
@@ -379,7 +392,7 @@ impl ClientRegistry {
         }
     }
 
-    /// Route an AgentExecResponse from the control loop to the waiter.
+    /// 将客户端回传的 `AgentExecResponse` 路由给等待方。
     pub async fn deliver_agent_response(
         &self,
         client_name: &str,

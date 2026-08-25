@@ -4,11 +4,17 @@ use serde::Deserialize;
 use crate::db::agent::AgentMessageRecord;
 
 #[derive(Debug, Deserialize)]
+/// 创建工作区的请求体。
 pub struct CreateWorkspaceRequest {
+    /// 名称。
     pub name: String,
+    /// 关联客户端 id。
     pub client_id: String,
+    /// 运行时类型（`host`/`docker`）。
     pub runtime_type: String, // "host" | "docker"
+    /// 工作区根路径。
     pub root_path: String,
+    /// Docker 镜像名。
     pub docker_image: Option<String>,
     /// Pre-started container to `docker exec` into. MVP: container lifecycle is
     /// out of scope — the user must start the container and supply its id here.
@@ -37,14 +43,20 @@ pub struct CreateWorkspaceRequest {
     #[serde(default)]
     pub github_owner: Option<String>,
     #[serde(default)]
+    /// GitHub 仓库名。
     pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 更新工作区的请求体。
 pub struct UpdateWorkspaceRequest {
+    /// 名称。
     pub name: String,
+    /// 工作区根路径。
     pub root_path: String,
+    /// 系统提示词。
     pub system_prompt: Option<String>,
+    /// 审批模式（`safe`/`auto_write`/`full_auto`/`plan`）。
     pub approval_mode: Option<String>,
     /// ACP 字段，COALESCE 语义：缺省 None 保持原值。`agent_type` 空串表示切回内置
     /// runner；`agent_path`/`llm_model_id` 空串视为忽略（本迭代不支持清空）；
@@ -52,8 +64,10 @@ pub struct UpdateWorkspaceRequest {
     #[serde(default)]
     pub agent_type: Option<String>,
     #[serde(default)]
+    /// ACP agent 可执行路径。
     pub agent_path: Option<String>,
     #[serde(default)]
+    /// 关联 LLM 模型 id。
     pub llm_model_id: Option<String>,
     /// ACP 引擎选项覆盖（JSON map：config_id → value）。
     /// 三态语义：`None`（字段省略）= 保留原值；`Some(None)`（显式 JSON null）=
@@ -71,30 +85,40 @@ pub struct UpdateWorkspaceRequest {
     #[serde(default)]
     pub github_token: Option<String>,
     #[serde(default)]
+    /// GitHub 仓库 owner。
     pub github_owner: Option<String>,
     #[serde(default)]
+    /// GitHub 仓库名。
     pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 创建会话的请求体。
 pub struct CreateSessionRequest {
+    /// 标题。
     pub title: Option<String>,
+    /// 模型 id。
     pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 更新会话模型的请求体。
 pub struct UpdateSessionModelRequest {
     /// 空串表示清除会话模型，回退到默认解析。
     pub model: String,
 }
 
 #[derive(Debug, serde::Serialize)]
+/// 默认模型响应。
 pub struct DefaultModelResponse {
+    /// 模型 id。
     pub model: String,
 }
 
 #[derive(Debug, Deserialize)]
+/// 更新会话标题的请求体。
 pub struct UpdateSessionRequest {
+    /// 标题。
     pub title: String,
 }
 
@@ -112,45 +136,63 @@ pub struct ListMessagesParams {
 /// `GET /api/agent/sessions/:id/messages` 的响应体：分页消息 + 是否还有更早。
 #[derive(Debug, serde::Serialize)]
 pub struct ListMessagesResponse {
+    /// 消息列表。
     pub messages: Vec<AgentMessageRecord>,
+    /// 是否还有更早消息。
     pub has_more: bool,
 }
 
 #[derive(Debug, Deserialize)]
+/// Agent WebSocket 连接的查询参数。
 pub struct AgentWsQuery {
+    /// 会话 id。
     pub session_id: String,
+    /// 鉴权 token（`?token=`）。
     pub token: Option<String>,
 }
 
 /// 全局通知 WS 的 query：无 session 维度，仅 JWT token（复用 `agent_ws` 的鉴权方式）。
 #[derive(Debug, Deserialize)]
 pub struct NotificationsWsQuery {
+    /// 鉴权 token（`?token=`）。
     pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 终端 WebSocket 的查询参数。
 pub struct TerminalWsQuery {
+    /// 工作区 id。
     pub workspace_id: String,
+    /// 终端列数。
     pub cols: Option<u16>,
+    /// 终端行数。
     pub rows: Option<u16>,
+    /// 鉴权 token（`?token=`）。
     pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 工作区文件列表的查询参数。
 pub struct WorkspaceFilesQuery {
+    /// 搜索关键字/前缀。
     pub q: String,
+    /// 返回条数限制。
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 工作区文件系统路径的查询参数。
 pub struct FsPathQuery {
     /// 相对工作区根的路径；tree 默认 "."，file 必填。
     pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+/// 写入工作区文件的请求体。
 pub struct PutFsFileRequest {
+    /// 文件路径。
     pub path: String,
+    /// 文件内容。
     pub content: String,
     /// 前端确认后重发携带：跳过审批检查（用户已在面板确认）。
     pub approved: Option<bool>,
@@ -160,20 +202,24 @@ pub struct PutFsFileRequest {
 #[derive(Debug, Default, Deserialize)]
 pub struct GitLogQuery {
     #[serde(default)]
+    /// 返回条数限制。
     pub limit: Option<usize>,
 }
 
 /// `GET /api/agent/workspaces/:id/git/diff` 的 query 参数（`cached=true` 取 staged diff）。
 #[derive(Debug, Default, Deserialize)]
 pub struct GitDiffQuery {
+    /// 文件路径。
     pub path: Option<String>,
     #[serde(default)]
+    /// 是否取 staged diff。
     pub cached: Option<bool>,
 }
 
 /// `GET /api/agent/workspaces/:id/git/show` 的 query 参数。
 #[derive(Debug, Default, Deserialize)]
 pub struct GitShowQuery {
+    /// 提交/分支标识。
     pub rev: Option<String>,
 }
 
@@ -181,6 +227,7 @@ pub struct GitShowQuery {
 #[derive(Debug, Default, Deserialize)]
 pub struct GitApprovedBody {
     #[serde(default)]
+    /// 是否已获审批确认。
     pub approved: Option<bool>,
 }
 
@@ -189,37 +236,51 @@ pub struct GitApprovedBody {
 macro_rules! git_write_body {
     ($name:ident { $($field:ident: $ty:ty),* $(,)? }) => {
         #[derive(Debug, Deserialize)]
+        #[allow(missing_docs)]
         pub struct $name {
-            $(pub $field: $ty,)*
+            $(
+                #[allow(missing_docs)]
+                pub $field: $ty,
+            )*
             #[serde(default)]
+            /// 是否已获审批确认（`true` 跳过二次确认）。
             pub approved: Option<bool>,
         }
     };
 }
 
+/// GitStageRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitStageRequest {
     paths: Vec<String>,
 });
+/// GitUnstageRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitUnstageRequest {
     paths: Vec<String>,
 });
+/// GitCommitRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitCommitRequest { message: String });
+/// GitCheckoutRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitCheckoutRequest {
     branch: String,
     create: Option<bool>,
 });
+/// GitBranchDeleteRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitBranchDeleteRequest {
     branch: String,
     force: Option<bool>,
 });
+/// GitRevertRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitRevertRequest { rev: String });
+/// GitResetRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitResetRequest {
     rev: Option<String>,
     mode: String,
 });
+/// GitStashPushRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitStashPushRequest {
     message: Option<String>,
 });
+/// GitStashIndexRequest 请求体（Git 写操作，含 approved 审批标记）。
 git_write_body!(GitStashIndexRequest { index: usize });
 
 // ── GitHub Actions 面板 ───────────────────────────────────────
@@ -229,6 +290,7 @@ git_write_body!(GitStashIndexRequest { index: usize });
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubRepoQuery {
     #[serde(default)]
+    /// 是否强制刷新（忽略缓存）。
     pub refresh: Option<bool>,
 }
 
@@ -236,8 +298,10 @@ pub struct GithubRepoQuery {
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubRunsQuery {
     #[serde(default)]
+    /// 工作流 id。
     pub workflow_id: Option<String>,
     #[serde(default)]
+    /// 每页条数。
     pub per_page: Option<usize>,
 }
 
@@ -259,6 +323,7 @@ pub struct GithubDispatchBody {
 #[derive(Debug, Default, Deserialize)]
 pub struct GithubApprovedBody {
     #[serde(default)]
+    /// 是否已获审批确认。
     pub approved: Option<bool>,
 }
 
@@ -267,24 +332,34 @@ pub struct GithubApprovedBody {
 /// POST /api/agent/roles 请求体。
 #[derive(Debug, Deserialize)]
 pub struct CreateRoleRequest {
+    /// 名称。
     pub name: String,
     #[serde(default)]
+    /// 描述。
     pub description: String,
     #[serde(default)]
+    /// 系统提示词。
     pub system_prompt: String,
     #[serde(default)]
+    /// 允许的工具列表。
     pub tools_allow: Option<Vec<String>>,
     #[serde(default)]
+    /// 禁止的工具列表。
     pub tools_deny: Option<Vec<String>>,
     #[serde(default)]
+    /// 模型覆盖。
     pub model_override: Option<String>,
     #[serde(default)]
+    /// 模式。
     pub mode: String,
     #[serde(default)]
+    /// 作用域类型。
     pub scope_type: String,
     #[serde(default)]
+    /// 关联客户端 id。
     pub client_id: String,
     #[serde(default)]
+    /// 工作区 id。
     pub workspace_id: String,
 }
 
@@ -292,24 +367,34 @@ pub struct CreateRoleRequest {
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateRoleRequest {
     #[serde(default)]
+    /// 名称。
     pub name: Option<String>,
     #[serde(default)]
+    /// 描述。
     pub description: Option<String>,
     #[serde(default)]
+    /// 系统提示词。
     pub system_prompt: Option<String>,
     #[serde(default)]
+    /// 允许的工具列表。
     pub tools_allow: Option<Vec<String>>,
     #[serde(default)]
+    /// 禁止的工具列表。
     pub tools_deny: Option<Vec<String>>,
     #[serde(default)]
+    /// 模型覆盖。
     pub model_override: Option<String>,
     #[serde(default)]
+    /// 模式。
     pub mode: Option<String>,
     #[serde(default)]
+    /// 作用域类型。
     pub scope_type: Option<String>,
     #[serde(default)]
+    /// 关联客户端 id。
     pub client_id: Option<String>,
     #[serde(default)]
+    /// 工作区 id。
     pub workspace_id: Option<String>,
 }
 
@@ -324,19 +409,27 @@ pub struct UpdateSessionRoleRequest {
 #[derive(Debug, Default, Deserialize)]
 pub struct ListRolesParams {
     #[serde(default)]
+    /// 作用域过滤。
     pub scope: Option<String>,
     #[serde(default)]
+    /// 关联客户端 id。
     pub client_id: Option<String>,
     #[serde(default)]
+    /// 工作区 id。
     pub workspace_id: Option<String>,
     #[serde(default)]
+    /// 搜索关键字/前缀。
     pub q: Option<String>,
     #[serde(default)]
+    /// 是否启用。
     pub enabled: Option<bool>,
     #[serde(default)]
+    /// 模式。
     pub mode: Option<String>,
     #[serde(default)]
+    /// 返回条数限制。
     pub limit: Option<i64>,
     #[serde(default)]
+    /// 偏移量。
     pub offset: Option<i64>,
 }

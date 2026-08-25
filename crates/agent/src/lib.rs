@@ -144,7 +144,9 @@ impl<T> TunnelAsyncReadWrite for T where T: tokio::io::AsyncRead + tokio::io::As
 /// 审批卡片上展示的选项（ACP `session/request_permission` 透传；runner 路径为空）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalOption {
+    /// 选项标识。
     pub id: String,
+    /// 选项展示文案。
     pub label: String,
     /// 选项类别：allow_once / allow_always / reject_once / reject_always / 自定义。
     /// 前端据此决定按钮样式；allow_always 点击时附带 remember 语义。
@@ -155,8 +157,11 @@ pub struct ApprovalOption {
 /// 具体选项时返回 `Selected(option_id)`，由调用方原样回传给 agent。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalResult {
+    /// 同意。
     Approved,
+    /// 拒绝。
     Denied,
+    /// 选中指定选项。
     Selected(String),
 }
 
@@ -232,6 +237,7 @@ impl<V: Send + 'static> Drop for PendingGuard<V> {
 pub struct AgentState {
     /// 隧道执行通道（依赖倒置：server 装配层注入 `ClientRegistry` 适配实现）。
     pub registry: Arc<dyn TunnelExecutor>,
+    /// 数据库句柄。
     pub db: Database,
     /// Per-workspace serialization of command execution (git state safety)
     workspace_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -275,6 +281,7 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    /// 创建工作台全局状态。
     pub fn new(registry: Arc<dyn TunnelExecutor>, db: Database) -> Self {
         // 通知广播先建（在 AcpBridge 构造之前，无循环依赖问题）；订阅者即浏览器的
         // 全局通知 WS。容量 256 足够覆盖短时突发（通知低频，只发不阻塞）。

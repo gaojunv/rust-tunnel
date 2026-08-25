@@ -1,3 +1,5 @@
+//! Mesh 网络管理 API。
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -13,6 +15,8 @@ use super::{
 // ── Mesh Network Endpoints ─────────────────────────────────────────
 
 // GET /api/mesh — list all meshes
+
+/// `GET /api/mesh`：列出所有 Mesh 网络。
 pub async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
     let networks = state.server_state.mesh_manager.list_networks().await;
     let response: Vec<MeshNetworkResponse> = networks
@@ -49,6 +53,7 @@ pub async fn list_meshes(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 // GET /api/mesh/:id — mesh detail
+/// `GET /api/mesh/:id`：查询单个 Mesh 详情。
 pub async fn get_mesh(
     State(state): State<ApiState>,
     Path(mesh_id): Path<String>,
@@ -87,6 +92,7 @@ pub async fn get_mesh(
 }
 
 // GET /api/mesh/:id/services — mesh services
+/// `GET /api/mesh/:id/services`：列出指定 Mesh 的服务。
 pub async fn get_mesh_services(
     State(state): State<ApiState>,
     Path(mesh_id): Path<String>,

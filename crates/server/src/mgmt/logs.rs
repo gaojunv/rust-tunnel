@@ -1,3 +1,5 @@
+//! 管理面日志收集与查询（环形缓冲 + broadcast + 批量落库 + tracing Layer）。
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -227,6 +229,7 @@ pub struct LogLayer {
 }
 
 impl LogLayer {
+    /// 创建 `LogLayer`。
     pub fn new(store: LogStore) -> Self {
         Self { store }
     }

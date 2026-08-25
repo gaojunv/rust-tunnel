@@ -290,6 +290,7 @@ pub struct AcpBridge {
     memory: Option<super::memory::MemoryState>,
 }
 impl AcpBridge {
+    /// 创建 ACP 会话桥。
     #[must_use]
     pub fn new(spawner: AgentSpawner, db: Database) -> Self {
         let bridge = Self {

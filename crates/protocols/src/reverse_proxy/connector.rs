@@ -29,6 +29,7 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
 /// so it can cross await points and be handed to `tokio::io::copy_bidirectional`.
 pub type BoxedStream = Box<dyn AsyncReadWrite + Unpin + Send>;
 
+/// 后端连接器：对上游建立双向流，屏蔽直连与隧道差异。
 #[async_trait]
 pub trait Connector: Send + Sync {
     /// Dial the backend and return a duplex stream ready for I/O.
@@ -53,6 +54,7 @@ pub struct ClientConnector {
 }
 
 impl ClientConnector {
+    /// 创建隧道连接器。
     #[must_use]
     pub fn new(opener: Arc<dyn TunnelOpener>) -> Self {
         Self { opener }

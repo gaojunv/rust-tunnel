@@ -27,24 +27,34 @@ pub fn ser_de_normalized_dt<S: serde::Serializer>(s: &String, ser: S) -> Result<
     ser.serialize_str(&normalize_db_datetime(s))
 }
 
+/// Agent 工作区记录（agent_workspaces 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AgentWorkspaceRecord {
+    /// 工作区 id。
     pub id: String,
+    /// 工作区名称。
     pub name: String,
+    /// 归属客户端 id。
     pub client_id: String,
+    /// 运行时类型（host/docker）。
     pub runtime_type: String,
+    /// 工作区根路径。
     pub root_path: String,
+    /// Docker 镜像，未使用容器为 None。
     pub docker_image: Option<String>,
+    /// Docker 容器 id，未使用容器为 None。
     pub docker_container_id: Option<String>,
+    /// 审批模式。
     pub approval_mode: String,
+    /// 系统提示词，未配置为 None。
     pub system_prompt: Option<String>,
-    // ACP 远程 agent 字段。列由 `migrate_agent_workspaces_v3`（schema.rs）落地；
-    // `#[sqlx(default)]` 保证旧库未跑 v3 迁移前 `SELECT *` 仍可解码（agent_type 为
-    // NOT NULL 列，默认空串）。`agent_create/update_workspace` 均已支持读写这三列。
+    /// ACP 远程 agent 类型。列由 `migrate_agent_workspaces_v3` 落地，未迁移前默认为空串。
     #[sqlx(default)]
     pub agent_type: String,
+    /// ACP agent 可执行文件路径，未配置为 None。
     #[sqlx(default)]
     pub agent_path: Option<String>,
+    /// 关联 LLM 模型 id，未配置为 None。
     #[sqlx(default)]
     pub llm_model_id: Option<String>,
     /// ACP 引擎选项覆盖（JSON map：config_id → value），会话建立时经
@@ -57,8 +67,10 @@ pub struct AgentWorkspaceRecord {
     /// 永不输出——DTO 只暴露 [`Self::github_token_set`]（见手写 `Serialize`）。
     #[sqlx(default)]
     pub github_token: Option<String>,
+    /// GitHub 仓库 owner，未配置为 None。
     #[sqlx(default)]
     pub github_owner: Option<String>,
+    /// GitHub 仓库名，未配置为 None。
     #[sqlx(default)]
     pub github_repo: Option<String>,
     /// Claude Code tier 模型映射（JSON object：key ∈ {opus,sonnet,haiku}，
@@ -67,7 +79,9 @@ pub struct AgentWorkspaceRecord {
     /// 保证旧库未跑 v6 迁移前 `SELECT *` 仍可解码。
     #[sqlx(default)]
     pub claude_tier_models: Option<String>,
+    /// 创建时间（SQLite datetime 字符串）。
     pub created_at: String,
+    /// 更新时间（SQLite datetime 字符串）。
     pub updated_at: String,
 }
 
@@ -110,12 +124,18 @@ impl serde::Serialize for AgentWorkspaceRecord {
     }
 }
 
+/// Agent 会话记录（agent_sessions 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentSessionRecord {
+    /// 会话 id。
     pub id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
+    /// 会话标题，未命名为 None。
     pub title: Option<String>,
+    /// 会话状态（active/archived 等）。
     pub status: String,
+    /// 关联模型，未指定为 None。
     pub model: Option<String>,
     /// ACP 会话配置状态（JSON map：config_id → value；仅用户显式切换过的项）
     pub config_state: Option<String>,
@@ -150,21 +170,32 @@ pub struct AgentSessionRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub last_spawn_error: Option<String>,
+    /// 创建时间（SQLite datetime 字符串，序列化时归一化为 ISO-8601）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间（SQLite datetime 字符串，序列化时归一化为 ISO-8601）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
 
+/// Agent 消息记录（agent_messages 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentMessageRecord {
+    /// 消息 id。
     pub id: String,
+    /// 所属会话 id。
     pub session_id: String,
+    /// 消息角色（user/assistant/tool 等）。
     pub role: String,
+    /// 消息正文。
     pub content: String,
+    /// 工具调用 JSON，未涉及工具为 None。
     pub tool_calls: Option<String>,
+    /// 关联工具调用 id，未关联为 None。
     pub tool_call_id: Option<String>,
+    /// 工具/调用名称，未涉及为 None。
     pub name: Option<String>,
+    /// 消息类型（message/tool_calls/tool_result/summary 等）。
     pub kind: String,
     /// 子 agent 归属：发起本消息的 Task 工具调用 id（claude-code-acp
     /// `_meta.claudeCode.parentToolUseId`）。主 agent 消息为 None。列由
@@ -173,51 +204,87 @@ pub struct AgentMessageRecord {
     #[sqlx(default)]
     #[serde(default)]
     pub parent_tool_call_id: Option<String>,
+    /// 创建时间（SQLite datetime 字符串，序列化时归一化为 ISO-8601）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
 }
 
+/// `agent_create_workspace` 参数包：创建 agent workspace 的全部字段（12 项）。
 #[derive(Debug, Clone, Default)]
 pub struct AgentWorkspaceCreateOpts {
+    /// 工作区 id。
     pub id: String,
+    /// 工作区名称。
     pub name: String,
+    /// 归属客户端 id。
     pub client_id: String,
+    /// 运行时类型（host/docker）。
     pub runtime_type: String,
+    /// 工作区根路径。
     pub root_path: String,
+    /// Docker 镜像，未使用容器为 None。
     pub docker_image: Option<String>,
+    /// Docker 容器 id，未使用容器为 None。
     pub docker_container_id: Option<String>,
+    /// ACP agent 类型。
     pub agent_type: String,
+    /// ACP agent 可执行文件路径，未配置为 None。
     pub agent_path: Option<String>,
+    /// 关联 LLM 模型 id，未配置为 None。
     pub llm_model_id: Option<String>,
+    /// ACP 引擎选项覆盖（JSON map），未配置为 None。
     pub agent_config_overrides: Option<String>,
+    /// Claude Code tier 模型映射（JSON object），未配置为 None。
     pub claude_tier_models: Option<String>,
 }
 
+/// `agent_update_workspace` 参数包：更新 agent workspace 的全部字段（11 项含 clear_overrides/clear_tier_models 布尔）。
 #[derive(Debug, Clone, Default)]
 pub struct AgentWorkspaceUpdateOpts {
+    /// 工作区名称。
     pub name: String,
+    /// 工作区根路径。
     pub root_path: String,
+    /// 系统提示词，None 保持原值。
     pub system_prompt: Option<String>,
+    /// 审批模式，None 保持原值。
     pub approval_mode: Option<String>,
+    /// ACP agent 类型，None 保持原值。
     pub agent_type: Option<String>,
+    /// ACP agent 可执行文件路径，None 保持原值。
     pub agent_path: Option<String>,
+    /// 关联 LLM 模型 id，None 保持原值。
     pub llm_model_id: Option<String>,
+    /// ACP 引擎选项覆盖（JSON map），None 保持原值。
     pub agent_config_overrides: Option<String>,
+    /// Claude Code tier 模型映射（JSON object），None 保持原值。
     pub claude_tier_models: Option<String>,
+    /// 是否清空引擎选项覆盖。
     pub clear_overrides: bool,
+    /// 是否清空 tier 模型映射。
     pub clear_tier_models: bool,
 }
 
+/// `agent_add_message_v2` 参数包：agent 消息落库一行的全部列（9 项，`parent_tool_call_id` 为 ACP 子 agent 归属）。
 #[derive(Debug, Clone, Default)]
 pub struct AgentMessageOpts {
+    /// 消息 id。
     pub id: String,
+    /// 所属会话 id。
     pub session_id: String,
+    /// 消息角色。
     pub role: String,
+    /// 消息正文。
     pub content: String,
+    /// 工具调用 JSON，未涉及工具为 None。
     pub tool_calls: Option<String>,
+    /// 关联工具调用 id，未关联为 None。
     pub tool_call_id: Option<String>,
+    /// 工具/调用名称，未涉及为 None。
     pub name: Option<String>,
+    /// 消息类型（message/tool_calls/tool_result 等）。
     pub kind: String,
+    /// 子 agent 归属（发起该消息的 Task 工具调用 id），主 agent 消息为 None。
     pub parent_tool_call_id: Option<String>,
 }
 
@@ -257,6 +324,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询单个工作区，不存在返回 None。
     pub async fn agent_get_workspace(
         &self,
         id: &str,
@@ -267,6 +335,7 @@ impl Database {
             .await
     }
 
+    /// 列出全部工作区，按创建时间升序。
     pub async fn agent_list_workspaces(&self) -> Result<Vec<AgentWorkspaceRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentWorkspaceRecord>(
             "SELECT * FROM agent_workspaces ORDER BY created_at",
@@ -387,6 +456,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定工作区（级联由外键/应用层处理）。
     pub async fn agent_delete_workspace(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_workspaces WHERE id = ?")
             .bind(id)
@@ -397,6 +467,7 @@ impl Database {
 
     // ── Session CRUD ────────────────────────────────────────────
 
+    /// 创建 agent 会话。
     pub async fn agent_create_session(
         &self,
         id: &str,
@@ -416,6 +487,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询单个会话，不存在返回 None。
     pub async fn agent_get_session(
         &self,
         id: &str,
@@ -426,6 +498,7 @@ impl Database {
             .await
     }
 
+    /// 列出指定工作区下的全部会话，按创建时间倒序。
     pub async fn agent_list_sessions(
         &self,
         workspace_id: &str,
@@ -438,6 +511,7 @@ impl Database {
         .await
     }
 
+    /// 更新会话标题。
     pub async fn agent_update_session_title(
         &self,
         id: &str,
@@ -453,6 +527,7 @@ impl Database {
         Ok(())
     }
 
+    /// 更新会话关联模型，None 表示清除。
     pub async fn agent_update_session_model(
         &self,
         id: &str,
@@ -627,6 +702,7 @@ impl Database {
         Ok(())
     }
 
+    /// 归档指定会话（status 置为 archived）。
     pub async fn agent_archive_session(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE agent_sessions SET status = 'archived', updated_at = datetime('now') WHERE id = ?",
@@ -637,6 +713,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定会话并级联清理排队 prompt。
     pub async fn agent_delete_session(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_sessions WHERE id = ?")
             .bind(id)
@@ -649,6 +726,7 @@ impl Database {
 
     // ── Messages ────────────────────────────────────────────────
 
+    /// 追加一条消息（旧接口，kind 由 role 推导；新代码优先用 `agent_add_message_v2`）。
     pub async fn agent_add_message(
         &self,
         id: &str,
@@ -897,6 +975,7 @@ impl Database {
         }
     }
 
+    /// 列出指定会话的全部消息，按插入顺序（rowid）升序。
     pub async fn agent_list_messages(
         &self,
         session_id: &str,

@@ -1,3 +1,5 @@
+//! 统计查询与 SSE 订阅 API。
+
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -15,22 +17,32 @@ const SSE_TIMEOUT: Duration = Duration::from_secs(30);
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
+
+/// 统计快照查询参数（`GET /api/stats/query` 的 query）。
 pub struct StatsQueryParams {
+    /// 实体类型过滤（可重复传参，如 `entity_type=tunnel&entity_type=mesh`；缺省全量）。
     pub entity_type: Option<Vec<String>>,
+    /// 实体 id 过滤（可重复传参；缺省全量）。
     pub entity_id: Option<Vec<String>>,
+    /// 查询区间起点（RFC3339，如 `2024-01-01T00:00:00Z`）。
     pub start: String,
+    /// 查询区间终点（RFC3339，需与起点同上；区间不超过 7 天）。
     pub end: String,
 }
 
 #[derive(Debug, Deserialize)]
+/// SSE 统计订阅参数（`GET /api/stats/stream` 的 query）。
 pub struct StatsStreamQuery {
+    /// 仅订阅该实体类型的快照（缺省全量）。
     pub entity_type: Option<String>,
+    /// 鉴权 token（启用密码时必填，经 `?token=` 传递）。
     pub token: Option<String>,
 }
 
 // GET /api/stats/query
 // 注意：必须使用 axum_extra 的 Query（serde_html_form），axum 自带的 Query
 // （serde_urlencoded）不支持重复的查询参数（entity_type=a&entity_type=b）。
+/// 统计快照查询：按实体类型/id 与时间区间返回快照列表。
 pub async fn get_stats_query(
     State(state): State<ApiState>,
     axum_extra::extract::Query(params): axum_extra::extract::Query<StatsQueryParams>,
@@ -88,11 +100,13 @@ pub async fn get_stats_query(
 }
 
 // GET /api/stats/summary
+/// 统计摘要：返回 `StatsCollector` 的聚合摘要。
 pub async fn get_stats_summary(State(state): State<ApiState>) -> impl IntoResponse {
     Json(state.server_state.stats_collector.get_summary()).into_response()
 }
 
 // GET /api/stats/stream
+/// SSE 统计订阅：`snapshot`/`sync`/`ping` 事件流，支持按 `entity_type` 过滤。
 pub async fn sse_stats_stream(
     State(state): State<ApiState>,
     Query(params): Query<StatsStreamQuery>,

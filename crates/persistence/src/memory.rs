@@ -13,16 +13,27 @@ use super::Database;
 /// 字符串；`emb_dimension` 首次 test-embedding 探测后固定，改动需清空重建。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentMemorySettingsRecord {
+    /// 主键 id（固定为 1，单行表）。
     pub id: i64,
+    /// 总开关（1 启用记忆体，0 关闭）。
     pub enabled: i32,
+    /// Embedding 服务 Base URL。
     pub emb_base_url: String,
+    /// Embedding API Key（LlmCipher 加密存储的原始字符串）。
     pub emb_api_key: String,
+    /// Embedding 模型名。
     pub emb_model: String,
+    /// Embedding 向量维度（0 表示未探测，首次 test-embedding 后固定）。
     pub emb_dimension: i64,
+    /// 蒸馏所用 LLM 模型（空串表示未配置）。
     pub distill_model: String,
+    /// 检索 top_k（默认 8）。
     pub top_k: i64,
+    /// 检索分数阈值（默认 0.40）。
     pub score_threshold: f64,
+    /// 注入 token 预算上限（默认 1500）。
     pub inject_budget_tokens: i64,
+    /// 是否总是注入置顶记忆（1 是，0 否，默认 1）。
     pub pin_always_inject: i32,
     /// Skill 库总闸（opt-in 默认关：避免零配置用户产生非预期蒸馏 LLM 开销）。
     pub skill_enabled: i32,
@@ -32,8 +43,10 @@ pub struct AgentMemorySettingsRecord {
     pub wiki_enabled: i32,
     /// 会话开始注入的 Wiki 清单条数上限（默认 20）。
     pub wiki_list_max: i64,
+    /// 创建时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
@@ -69,47 +82,81 @@ impl AgentMemorySettingsRecord {
 /// `scope_type` ∈ global|client|workspace。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentMemoryRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 记忆正文（原子事实）。
     pub content: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id（global 时为空串）。
     pub client_id: String,
+    /// 所属工作区 id（非 workspace 作用域时为空串）。
     pub workspace_id: String,
+    /// 标签 JSON 数组字符串（`'["rust","clean"]'`）。
     pub tags: String,
+    /// 置信度（0.0–1.0）。
     pub confidence: f64,
+    /// 来源会话 id（手动创建时为空）。
     pub source_session_id: String,
+    /// 来源触发器（distill|remember|manual 等）。
     pub source_trigger: String,
+    /// 是否置顶（1 置顶，0 未置顶）。
     pub pinned: i32,
+    /// 检索命中次数。
     pub hit_count: i64,
+    /// 最后命中时间（未命中过为 None）。
     pub last_hit_at: Option<String>,
+    /// 创建时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
 
+/// `memory_insert` 参数包：记忆写入的全部字段（10 项）。
 #[derive(Debug, Clone, Default)]
 pub struct MemoryInsertOpts {
+    /// 记忆主键 id。
     pub id: String,
+    /// 记忆正文（原子事实）。
     pub content: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
+    /// 标签 JSON 数组字符串。
     pub tags: String,
+    /// 置信度（0.0–1.0）。
     pub confidence: f64,
+    /// 来源会话 id。
     pub source_session_id: String,
+    /// 来源触发器（distill|remember|manual）。
     pub source_trigger: String,
+    /// 是否置顶（仅插入时生效，后续用 toggle 翻转）。
     pub pinned: bool,
 }
 
+/// `memory_list` 查询条件：记忆列表的全部过滤参数（8 项）。
 #[derive(Debug, Clone, Default)]
 pub struct MemoryListFilter {
+    /// 作用域类型过滤（global|client|workspace，None 不过滤）。
     pub scope_type: Option<String>,
+    /// 客户端 id 过滤（空串等同 None）。
     pub client_id: Option<String>,
+    /// 工作区 id 过滤（空串等同 None）。
     pub workspace_id: Option<String>,
+    /// 模糊搜索关键字（匹配 content，None 不过滤）。
     pub q: Option<String>,
+    /// 置顶过滤（Some(true) 仅置顶，Some(false) 仅未置顶，None 不过滤）。
     pub pinned: Option<bool>,
+    /// 排序方式（recent|created|confidence|hits，None 取 recent）。
     pub order: Option<String>,
+    /// 分页条数。
     pub limit: i64,
+    /// 分页偏移。
     pub offset: i64,
 }
 
@@ -200,6 +247,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询单条记忆，不存在返回 None。
     pub async fn memory_get_by_id(
         &self,
         id: &str,
@@ -252,6 +300,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 删除记忆，不存在时无副作用（向量删除由上层另行处理）。
     pub async fn memory_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_memories WHERE id = ?")
             .bind(id)

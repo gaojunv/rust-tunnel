@@ -18,6 +18,7 @@ pub fn default_base_url(provider_type: &str) -> Option<&'static str> {
     }
 }
 
+/// 校验 provider_type 是否为合法类型（deepseek/volcengine/kimi/mimo 之一）。
 #[must_use]
 pub fn is_valid_provider_type(provider_type: &str) -> bool {
     VALID_PROVIDER_TYPES.contains(&provider_type)

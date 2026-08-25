@@ -30,8 +30,11 @@ pub enum FailureKind {
 /// 一次查询可见的失败信息（TTL 有效期内）。
 #[derive(Debug, Clone)]
 pub struct KnownFailureInfo {
+    /// 失败类别。
     pub kind: FailureKind,
+    /// HTTP 状态码（如 401/403/404）。
     pub status: u16,
+    /// 上游错误消息（已脱敏截断）。
     pub message: String,
 }
 

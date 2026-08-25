@@ -141,15 +141,22 @@ pub async fn has_any_model_config(
     Ok(false)
 }
 
+/// 会话运行时（从 DB 重建的对话状态）。
 pub struct SessionRuntime {
+    /// 会话标识。
     pub session_id: String,
+    /// 工作区标识。
     pub workspace_id: String,
+    /// 客户端标识。
     pub client_id: String,
+    /// 运行时类型。
     pub runtime_type: String,
+    /// 工作区根路径。
     pub root_path: String,
     /// Container to exec into when `runtime_type == "docker"`; None means the
     /// workspace is docker-typed but has no container yet (or host runtime).
     pub docker_container: Option<String>,
+    /// 当前模型引用。
     pub model: String,
     /// `workspace` 审批模式（`safe`/`auto_write`/`full_auto`/`plan`），`load` 时从 workspace `record` 读取。
     pub approval_mode: String,
@@ -172,6 +179,7 @@ pub struct SessionRuntime {
     /// 可用子代理角色清单块缓存：None = 尚未检索；Some("") = 无可用角色；
     /// Some(非空) = 已注入 `roles_block` 到 task 工具 description。
     pub roles_block: Option<String>,
+    /// 对话消息列表。
     pub messages: Vec<ChatMessage>,
     /// 子 agent 深度：0 = 主循环，1 = 子 agent（防止递归委托）。
     pub depth: u8,

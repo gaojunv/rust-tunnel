@@ -11,6 +11,7 @@ pub struct CustomDnsSolver {
 }
 
 impl CustomDnsSolver {
+    /// 创建自定义 DNS 求解器。
     #[must_use]
     pub fn new(config: &DnsProviderConfig) -> Self {
         Self {

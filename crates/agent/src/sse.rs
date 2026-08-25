@@ -13,9 +13,11 @@ pub const MAX_STREAM_BYTES: usize = 10 * 1024 * 1024;
 
 /// 一个回合的聚合结果。
 pub struct AggregatedTurn {
+    /// 聚合的文本。
     pub text: String,
     /// reasoning_content 增量聚合（DeepSeek thinking 模式）；无思考输出为空串。
     pub reasoning: String,
+    /// 聚合的工具调用。
     pub tool_calls: Vec<ParsedToolCall>,
     /// 重建的 OpenAI tool_calls JSON（rt.messages 回填与落库用）。
     pub raw_tool_calls: Vec<serde_json::Value>,
@@ -24,20 +26,25 @@ pub struct AggregatedTurn {
 }
 
 #[derive(Debug)]
+/// SSE 增量解析结果。
 pub enum SseFeed {
     /// content 增量
     Content(String),
     /// reasoning_content 增量；`content` 为同行 delta 携带的正文增量
     /// （同帧同时含 reasoning + content 时两个 WS 帧都要发，正文不丢）。
     Thought {
+        /// 推理增量。
         reasoning: String,
+        /// 同行正文增量。
         content: Option<String>,
     },
     /// tool_calls 增量透传：`calls` 为一行内出现的各 index 增量；
     /// `content` 为同行 delta 携带的正文增量（同帧 tool_calls + content
     /// 时两个 WS 帧都要发，正文不丢）。
     ToolCallDelta {
+        /// 工具增量列表。
         calls: Vec<ToolCallDeltaItem>,
+        /// 同行正文增量。
         content: Option<String>,
     },
     /// 该行无产出（role delta、空行、注释、畸形行跳过）
@@ -51,13 +58,19 @@ pub enum SseFeed {
 
 /// tool_calls 增量单条透传（一行可含多个 index 的增量；各字段单独出现才携带）。
 #[derive(Debug, Clone)]
+/// 工具调用增量项。
 pub struct ToolCallDeltaItem {
+    /// 工具调用索引。
     pub index: usize,
+    /// 工具调用标识。
     pub id: Option<String>,
+    /// 工具名。
     pub name: Option<String>,
+    /// 参数增量。
     pub arguments: Option<String>,
 }
 
+/// SSE 流聚合器。
 pub struct SseAggregator {
     text: String,
     /// reasoning_content 聚合桶（DeepSeek thinking 模式）。
@@ -88,6 +101,7 @@ impl Default for SseAggregator {
 }
 
 impl SseAggregator {
+    /// 创建聚合器。
     #[must_use]
     pub fn new() -> Self {
         Self::default()

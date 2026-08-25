@@ -1,54 +1,72 @@
-//! Dynamic configuration management — DB-backed runtime config.
+//! 动态配置管理 — 基于数据库的运行时配置。
 
 use crate::config::ServerConfig;
 use crate::db::Database;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-/// Shadowsocks dynamic config
+/// Shadowsocks 动态配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowsocksDynamicConfig {
+    /// 是否启用 Shadowsocks。
     pub enabled: bool,
+    /// 监听端口。
     pub port: u16,
+    /// 加密方式。
     pub cipher: String,
+    /// 连接密码。
     pub password: String,
 }
 
-/// Trojan dynamic config
+/// Trojan 动态配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrojanDynamicConfig {
+    /// 是否启用 Trojan。
     pub enabled: bool,
+    /// 监听端口。
     pub port: u16,
+    /// 连接密码。
     pub password: String,
+    /// 认证失败时的回落地址。
     pub fallback: String,
     /// SNI/ACME 域名；空串 = 不用 ACME 证书、不参与反代 SNI 分流
     pub domain: String,
 }
 
-/// Reverse proxy dynamic settings
+/// 反向代理动态配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReverseProxySettings {
+    /// 最大并发连接数。
     pub max_connections: u32,
+    /// 连接超时时间（秒）。
     pub connection_timeout_secs: u64,
+    /// 转发缓冲区大小（字节）。
     pub buffer_size: usize,
 }
 
-/// DNS dynamic settings
+/// DNS 动态配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsSettings {
+    /// 隧道域名后缀。
     pub tunnel_domain: String,
+    /// Mesh 域名后缀。
     pub mesh_domain: String,
 }
 
-/// All dynamic configuration loaded from DB
+/// 全量动态配置（从数据库加载）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicConfig {
+    /// 日志级别。
     pub log_level: String,
     /// LLM 请求摘要日志开关：关闭时跳过正常请求日志（错误日志不受影响）。
     pub llm_request_logging: bool,
+    /// Shadowsocks 配置（None 表示未启用）。
     pub ss: Option<ShadowsocksDynamicConfig>,
+    /// Trojan 配置（None 表示未启用）。
     pub trojan: Option<TrojanDynamicConfig>,
+    /// 反向代理配置。
     pub reverse_proxy: ReverseProxySettings,
+    /// DNS 配置。
     pub dns: DnsSettings,
 }
 
@@ -73,7 +91,7 @@ impl DynamicConfig {
         }
     }
 
-    /// Load dynamic config from DB. If DB has no records, seed from ServerConfig (first run).
+    /// 从数据库加载动态配置；若无记录则以 ServerConfig 为种子写入首行。
     ///
     /// 表中若存在多行（旧版本按端口 upsert 可能残留多份配置），取最近更新的一行——
     /// 那是用户最近一次通过 API 保存的配置。

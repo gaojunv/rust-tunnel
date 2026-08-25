@@ -14,6 +14,7 @@ use axum::{body::Body, http::Request, response::Response};
 /// `try_handle` 返回 `Ok(response)` 表示 host 命中 LLM Gateway 且已处理；
 /// 返回 `Err(req)` 表示 host 不命中，原始请求返回给调用方继续走普通反代。
 pub trait LlmDispatcher: Send + Sync {
+    /// 尝试由 LLM 网关处理请求；命中返回响应，未命中返回原请求。
     fn try_handle(
         self: Arc<Self>,
         host: String,

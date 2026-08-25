@@ -1,55 +1,89 @@
+//! 服务端配置聚合模块：合并 CLI、TOML 文件与环境变量三级配置。
+
+/// CLI 参数定义（Clap）。
 pub mod cli;
+/// TOML 配置文件结构。
 pub mod file;
+/// 三级配置合并与校验逻辑。
 pub mod merge;
 
 pub use cli::ServerCli;
 pub use file::ServerConfigFile;
 
+/// 最终生效的服务端配置（合并后的只读快照，由 `ServerConfig::from_cli` 产出）。
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
+    /// 控制通道监听地址。
     pub control_addr: String,
+    /// API 服务监听地址。
     pub api_addr: String,
+    /// 管理后台密码（None 表示未设置）。
     pub admin_password: Option<String>,
+    /// JWT 签名密钥（None 时自动生成）。
     pub jwt_secret: Option<String>,
-    /// Authentication token for client connections
-    /// If Some, clients must provide this token to register
+    /// 客户端接入鉴权 Token（None 表示不校验）。
     pub client_auth_token: Option<String>,
-    /// Enable TLS encryption for control channel
+    /// 是否启用控制通道 TLS。
     pub tls: bool,
-    /// Path to TLS certificate file (PEM format)
+    /// TLS 证书路径（PEM）。
     pub tls_cert: String,
-    /// Path to TLS private key file (PEM format)
+    /// TLS 私钥路径（PEM）。
     pub tls_key: String,
+    /// 日志级别字符串。
     pub log: String,
+    /// SQLite 数据库路径。
     pub db_path: String,
+    /// 是否启用 Shadowsocks。
     pub ss_enabled: bool,
+    /// Shadowsocks 监听端口。
     pub ss_port: Option<u16>,
+    /// Shadowsocks 加密算法。
     pub ss_cipher: Option<String>,
+    /// Shadowsocks 密码。
     pub ss_password: Option<String>,
+    /// 是否启用 Trojan。
     pub trojan_enabled: bool,
+    /// Trojan 监听端口。
     pub trojan_port: Option<u16>,
+    /// Trojan 密码。
     pub trojan_password: Option<String>,
+    /// Trojan 认证失败回退地址。
     pub trojan_fallback: String,
+    /// 是否启用内置 DNS。
     pub dns_enabled: bool,
+    /// DNS 监听地址。
     pub dns_bind: String,
+    /// Tunnel 域后缀。
     pub dns_tunnel_domain: String,
+    /// Mesh 域后缀。
     pub dns_mesh_domain: String,
-    // Reverse Proxy configuration
+    /// 是否启用反向代理。
     pub reverse_proxy_enabled: bool,
+    /// 反向代理最大连接数。
     pub reverse_proxy_max_connections: u32,
+    /// 反向代理连接超时（秒）。
     pub reverse_proxy_connection_timeout: u64,
+    /// 反向代理缓冲区大小（字节）。
     pub reverse_proxy_buffer_size: usize,
-    // API TLS configuration
+    /// 是否启用 API TLS。
     pub api_tls: bool,
+    /// API TLS 域名。
     pub api_domain: Option<String>,
-    // ACME configuration
+    /// 是否启用 ACME。
     pub acme_enabled: bool,
+    /// ACME 目录地址。
     pub acme_server_url: String,
+    /// ACME 证书存储目录。
     pub acme_cert_dir: String,
+    /// 是否自动续期。
     pub acme_auto_renew: bool,
+    /// 续期检查间隔（小时）。
     pub acme_renewal_check_interval: u64,
+    /// 到期前多少天触发续期。
     pub acme_renewal_days_before_expiry: u64,
+    /// ACME 注册邮箱。
     pub acme_email: Option<String>,
+    /// 是否已同意 ACME 服务条款。
     pub acme_tos_agreed: bool,
 }
 

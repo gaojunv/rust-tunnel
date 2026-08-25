@@ -17,6 +17,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// 创建 `ApiError`。
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -67,11 +68,13 @@ impl ApiError {
     }
 
     #[must_use]
+    /// 返回 HTTP 状态码。
     pub fn status(&self) -> StatusCode {
         self.status
     }
 
     #[must_use]
+    /// 返回错误消息。
     pub fn message(&self) -> &str {
         &self.message
     }

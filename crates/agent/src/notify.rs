@@ -10,17 +10,23 @@
 pub struct AgentNotification {
     /// 判别字段：`turn_done` / `turn_error` / `approval_needed` / `elicitation_needed`。
     pub event: &'static str,
+    /// 会话标识。
     pub session_id: String,
+    /// 工作区标识。
     pub workspace_id: String,
+    /// 错误/提示消息，turn_error/elicitation_needed 时有值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// 工具名，approval_needed 时有值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
+    /// 工具调用摘要，approval_needed 时有值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 }
 
 impl AgentNotification {
+    /// 构造回合完成通知。
     #[must_use]
     pub fn turn_done(session_id: &str, workspace_id: &str) -> Self {
         Self {
@@ -33,6 +39,7 @@ impl AgentNotification {
         }
     }
 
+    /// 构造回合错误通知。
     #[must_use]
     pub fn turn_error(session_id: &str, workspace_id: &str, message: &str) -> Self {
         Self {
@@ -45,6 +52,7 @@ impl AgentNotification {
         }
     }
 
+    /// 构造审批等待通知。
     #[must_use]
     pub fn approval_needed(
         session_id: &str,
@@ -62,6 +70,7 @@ impl AgentNotification {
         }
     }
 
+    /// 构造表单等待通知。
     #[must_use]
     pub fn elicitation_needed(session_id: &str, workspace_id: &str, message: &str) -> Self {
         Self {

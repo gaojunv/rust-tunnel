@@ -1,3 +1,5 @@
+//! 登录、登出与健康检查 API。
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use super::{
@@ -7,6 +9,8 @@ use super::{
 use crate::auth::create_token;
 
 // Login handler
+
+/// `POST /api/login`：校验密码并签发 JWT。
 pub async fn login(
     State(state): State<ApiState>,
     Json(request): Json<LoginRequest>,
@@ -36,11 +40,13 @@ pub async fn login(
 }
 
 // Logout handler (client just discards token)
+/// `POST /api/logout`：登出（客户端丢弃 token 即可）。
 pub async fn logout() -> impl IntoResponse {
     StatusCode::OK
 }
 
 // Health check
+/// `GET /api/health`：健康检查。
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }

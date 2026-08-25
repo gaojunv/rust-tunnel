@@ -12,7 +12,9 @@ use rust_tunnel_stats::{EntityType, StatsCollector};
 /// Trojan command types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrojanCommand {
+    /// TCP 连接。
     Connect = 0x01,
+    /// UDP ASSOCIATE。
     UdpAssociate = 0x03,
 }
 
@@ -29,8 +31,11 @@ impl TrojanCommand {
 /// Trojan address types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrojanAddress {
+    /// IPv4 地址。
     IPv4(Ipv4Addr),
+    /// IPv6 地址。
     IPv6(Ipv6Addr),
+    /// 域名。
     Domain(String),
 }
 
@@ -124,8 +129,11 @@ impl std::fmt::Display for TrojanAddress {
 /// Parsed Trojan request
 #[derive(Debug, Clone)]
 pub struct TrojanRequest {
+    /// 指令类型。
     pub command: TrojanCommand,
+    /// 目标地址。
     pub address: TrojanAddress,
+    /// 目标端口。
     pub port: u16,
     /// Byte offset where payload starts in the original buffer
     pub header_len: usize,
@@ -133,8 +141,11 @@ pub struct TrojanRequest {
 
 /// Result of incremental parsing
 pub enum ParseResult {
+    /// 解析完成。
     Complete(TrojanRequest),
+    /// 数据不完整，需继续读取。
     Incomplete,
+    /// 协议非法。
     Invalid(String),
 }
 
@@ -173,9 +184,13 @@ fn is_valid_hash(s: &str) -> bool {
 /// Trojan connection context
 #[derive(Debug, Clone)]
 pub struct TrojanConnectionContext {
+    /// 目标地址（host:port）。
     pub target_addr: String,
+    /// 连接 ID。
     pub connection_id: u64,
+    /// 监听端口。
     pub port: u16,
+    /// 指令类型。
     pub command: TrojanCommand,
 }
 
@@ -248,16 +263,21 @@ pub fn parse_trojan_request(buf: &[u8]) -> ParseResult {
 /// A parsed Trojan UDP packet
 #[derive(Debug, Clone)]
 pub struct UdpPacket {
+    /// 目标地址。
     pub address: TrojanAddress,
+    /// 目标端口。
     pub port: u16,
+    /// 载荷。
     pub payload: Vec<u8>,
 }
 
 /// Result of incremental UDP packet parsing
 pub enum PacketParseResult {
-    /// Parsed packet + total bytes consumed (including header and CRLF)
+    /// 解析完成（含消耗字节数）。
     Complete(UdpPacket, usize),
+    /// 数据不完整。
     Incomplete,
+    /// 协议非法。
     Invalid(String),
 }
 

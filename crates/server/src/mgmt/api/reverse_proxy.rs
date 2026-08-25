@@ -14,15 +14,22 @@ use crate::reverse_proxy::ProxyRule;
 /// Request body for creating a proxy rule
 #[derive(Debug, Deserialize)]
 pub struct CreateProxyRuleRequest {
+    /// 规则名称。
     pub name: String,
+    /// 规则类型（http/tcp/udp/llm）。
     #[serde(rename = "type")]
     pub rule_type: String,
+    /// 监听地址（如 0.0.0.0:8080）。
     pub listen: String,
+    /// 绑定域名列表。
     #[serde(default)]
     pub domains: Vec<String>,
+    /// 路由配置。
     #[serde(default)]
     pub routes: Vec<crate::reverse_proxy::Route>,
+    /// TLS 配置（None 表示不启用）。
     pub tls: Option<crate::reverse_proxy::ProxyTlsConfig>,
+    /// 是否启用。
     #[serde(default = "default_rule_enabled")]
     pub enabled: bool,
 }
@@ -30,15 +37,22 @@ pub struct CreateProxyRuleRequest {
 /// Request body for updating a proxy rule
 #[derive(Debug, Deserialize)]
 pub struct UpdateProxyRuleRequest {
+    /// 规则名称。
     pub name: String,
+    /// 规则类型（http/tcp/udp/llm）。
     #[serde(rename = "type")]
     pub rule_type: String,
+    /// 监听地址（如 0.0.0.0:8080）。
     pub listen: String,
+    /// 绑定域名列表。
     #[serde(default)]
     pub domains: Vec<String>,
+    /// 路由配置。
     #[serde(default)]
     pub routes: Vec<crate::reverse_proxy::Route>,
+    /// TLS 配置（None 表示不启用）。
     pub tls: Option<crate::reverse_proxy::ProxyTlsConfig>,
+    /// 是否启用。
     #[serde(default = "default_rule_enabled")]
     pub enabled: bool,
 }
@@ -48,6 +62,7 @@ fn default_rule_enabled() -> bool {
 }
 
 // GET /api/proxy/rules — list all proxy rules
+/// 列出全部反代规则（GET /api/proxy/rules）。
 pub async fn list_proxy_rules(State(state): State<ApiState>) -> impl IntoResponse {
     let rules = state.server_state.proxy_state.rules.lock().await;
     let rules_vec: Vec<&ProxyRule> = rules.values().collect();
@@ -55,6 +70,7 @@ pub async fn list_proxy_rules(State(state): State<ApiState>) -> impl IntoRespons
 }
 
 // POST /api/proxy/rules — create a new proxy rule
+/// 创建反代规则（POST /api/proxy/rules）。
 pub async fn create_proxy_rule(
     State(state): State<ApiState>,
     Json(body): Json<CreateProxyRuleRequest>,
@@ -197,6 +213,7 @@ fn conflicts_from_error(e: &crate::reverse_proxy::error::ReconcileError) -> Vec<
 }
 
 // PUT /api/proxy/rules/:id — update a proxy rule
+/// 更新反代规则（PUT /api/proxy/rules/:id）。
 pub async fn update_proxy_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -341,6 +358,7 @@ pub async fn update_proxy_rule(
 }
 
 // DELETE /api/proxy/rules/:id — delete a proxy rule
+/// 删除反代规则（DELETE /api/proxy/rules/:id）。
 pub async fn delete_proxy_rule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -396,12 +414,14 @@ pub async fn delete_proxy_rule(
 }
 
 /// Get reverse proxy config
+/// 查询反代全局配置（GET /api/settings/reverse-proxy）。
 pub async fn get_reverse_proxy_config(State(state): State<ApiState>) -> impl IntoResponse {
     let dc = state.server_state.dynamic_config.read().await;
     Json(serde_json::json!(dc.reverse_proxy))
 }
 
 /// Update reverse proxy config
+/// 更新反代全局配置（PUT /api/settings/reverse-proxy）。
 pub async fn update_reverse_proxy_config(
     State(state): State<ApiState>,
     Json(payload): Json<serde_json::Value>,

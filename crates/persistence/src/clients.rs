@@ -61,6 +61,7 @@ impl Database {
     // Client registry methods
     // ============================================================
 
+    /// 插入或更新客户端注册记录（按 name 去重，更新 hostname 与 last_seen_at）。
     pub async fn upsert_client(
         &self,
         name: &str,
@@ -85,6 +86,7 @@ impl Database {
         Ok(())
     }
 
+    /// 刷新指定客户端的最后可见时间（更新 last_seen_at 为当前时间）。
     pub async fn touch_client_last_seen(&self, name: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE clients SET last_seen_at = ? WHERE name = ?")
             .bind(Utc::now())
@@ -94,6 +96,7 @@ impl Database {
         Ok(())
     }
 
+    /// 列出所有已注册的客户端记录（按名称排序）。
     pub async fn list_clients(&self) -> Result<Vec<ClientRecord>, sqlx::Error> {
         let rows = sqlx::query_as::<_, ClientRecord>(
             "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients ORDER BY name",
@@ -103,6 +106,7 @@ impl Database {
         Ok(rows)
     }
 
+    /// 按名称查询单个客户端记录，不存在则返回 None。
     pub async fn get_client(&self, name: &str) -> Result<Option<ClientRecord>, sqlx::Error> {
         sqlx::query_as::<_, ClientRecord>(
             "SELECT name, hostname, first_seen_at, last_seen_at, note FROM clients WHERE name = ?",
@@ -112,6 +116,7 @@ impl Database {
         .await
     }
 
+    /// 更新指定客户端的备注（None 表示清空备注）。
     pub async fn update_client_note(
         &self,
         name: &str,
@@ -125,6 +130,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定名称的客户端注册记录。
     pub async fn delete_client(&self, name: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM clients WHERE name = ?")
             .bind(name)

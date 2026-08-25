@@ -7,19 +7,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::control_plane::client_registry::ClientRegistry;
 
+/// 客户端视图（DB 记录 + 在线状态合并）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ClientView {
+    /// 客户端名称。
     pub name: String,
+    /// 主机名（未上报时为 None）。
     pub hostname: Option<String>,
+    /// 管理员备注。
     pub note: Option<String>,
+    /// 是否在线。
     pub online: bool,
+    /// 本次连接建立时间（离线时为 None）。
     pub connected_at: Option<DateTime<Utc>>,
+    /// 最后心跳/可见时间。
     pub last_seen_at: DateTime<Utc>,
+    /// 首次注册时间。
     pub first_seen_at: DateTime<Utc>,
+    /// 客户端版本（未上报时为 None）。
     pub client_version: Option<String>,
+    /// 被多少条反代规则引用。
     pub referenced_by_rules: u32,
 }
 
+/// 查询全部客户端（合并 DB 与在线表）。
 pub async fn list_clients_impl(reg: &ClientRegistry) -> Result<Vec<ClientView>, String> {
     let db = reg.db();
     let db_rows = db.list_clients().await.map_err(|e| e.to_string())?;
@@ -50,6 +61,7 @@ pub async fn list_clients_impl(reg: &ClientRegistry) -> Result<Vec<ClientView>, 
     Ok(out)
 }
 
+/// 删除客户端（带引用检查，踢在线连接）。
 pub async fn delete_client_impl(reg: &ClientRegistry, name: &str) -> Result<(), String> {
     let db = reg.db();
     let refs = db
@@ -73,6 +85,7 @@ pub async fn delete_client_impl(reg: &ClientRegistry, name: &str) -> Result<(), 
 // ---- Axum handlers ----
 // Use ApiState from the parent module (consistent with existing handlers)
 
+/// 列出客户端（GET /api/clients）。
 pub async fn list_clients(State(state): State<super::ApiState>) -> Response {
     let reg = match state.server_state.client_registry.as_ref() {
         Some(r) => r.clone(),
@@ -90,11 +103,14 @@ pub async fn list_clients(State(state): State<super::ApiState>) -> Response {
     }
 }
 
+/// 更新备注请求。
 #[derive(Deserialize)]
 pub struct UpdateNoteBody {
+    /// 新备注（None 表示清空）。
     pub note: Option<String>,
 }
 
+/// 更新客户端备注（PATCH /api/clients/:name）。
 pub async fn patch_client_note(
     State(state): State<super::ApiState>,
     Path(name): Path<String>,
@@ -112,6 +128,7 @@ pub async fn patch_client_note(
     }
 }
 
+/// 删除客户端（DELETE /api/clients/:name）。
 pub async fn delete_client(
     State(state): State<super::ApiState>,
     Path(name): Path<String>,
@@ -133,6 +150,7 @@ pub async fn delete_client(
     }
 }
 
+/// 踢掉在线客户端（POST /api/clients/:name/kick）。
 pub async fn kick_client(
     State(state): State<super::ApiState>,
     Path(name): Path<String>,

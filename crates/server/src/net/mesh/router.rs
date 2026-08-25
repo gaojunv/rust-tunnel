@@ -1,7 +1,7 @@
 use rust_tunnel_common::MeshRoute;
 use std::collections::HashMap;
 
-/// Mesh routing table tracking all mesh networks and their members.
+/// Mesh 路由表：跟踪所有 mesh 网络及其成员。
 pub struct MeshRouter {
     /// mesh_id -> (client_name -> MeshRoute)
     networks: HashMap<String, HashMap<String, MeshRoute>>,
@@ -14,13 +14,14 @@ impl Default for MeshRouter {
 }
 
 impl MeshRouter {
+    /// 创建空路由表。
     pub fn new() -> Self {
         Self {
             networks: HashMap::new(),
         }
     }
 
-    /// Join a client to a mesh network
+    /// 将客户端加入 mesh。
     pub fn join(&mut self, mesh_id: &str, client_name: &str) {
         self.networks
             .entry(mesh_id.to_string())
@@ -34,7 +35,7 @@ impl MeshRouter {
             });
     }
 
-    /// Remove a client from a mesh network. Returns true if the client was a member.
+    /// 将客户端移出 mesh，返回是否曾为成员。
     pub fn leave(&mut self, mesh_id: &str, client_name: &str) -> bool {
         if let Some(members) = self.networks.get_mut(mesh_id) {
             let removed = members.remove(client_name).is_some();
@@ -46,7 +47,7 @@ impl MeshRouter {
         false
     }
 
-    /// Update a client's public address
+    /// 更新客户端公网地址。
     pub fn update_address(&mut self, mesh_id: &str, client_name: &str, addr: String) -> bool {
         if let Some(members) = self.networks.get_mut(mesh_id) {
             if let Some(route) = members.get_mut(client_name) {
@@ -57,7 +58,7 @@ impl MeshRouter {
         false
     }
 
-    /// Set P2P availability for a client
+    /// 设置客户端 P2P 可达性。
     pub fn set_p2p_available(&mut self, mesh_id: &str, client_name: &str, available: bool) {
         if let Some(members) = self.networks.get_mut(mesh_id) {
             if let Some(route) = members.get_mut(client_name) {
@@ -66,7 +67,7 @@ impl MeshRouter {
         }
     }
 
-    /// Register services for a client in a mesh
+    /// 为 mesh 中的客户端注册服务列表。
     pub fn register_services(
         &mut self,
         mesh_id: &str,
@@ -80,7 +81,7 @@ impl MeshRouter {
         }
     }
 
-    /// Get all members of a mesh
+    /// 获取 mesh 的所有成员。
     pub fn get_members(&self, mesh_id: &str) -> Vec<&MeshRoute> {
         self.networks
             .get(mesh_id)
@@ -88,7 +89,7 @@ impl MeshRouter {
             .unwrap_or_default()
     }
 
-    /// Find which meshes a client belongs to
+    /// 查询客户端所属的所有 mesh。
     pub fn get_client_meshes(&self, client_name: &str) -> Vec<String> {
         self.networks
             .iter()
@@ -97,12 +98,12 @@ impl MeshRouter {
             .collect()
     }
 
-    /// Look up a specific client in a mesh
+    /// 查询 mesh 中指定客户端的路由。
     pub fn get_member(&self, mesh_id: &str, client_name: &str) -> Option<&MeshRoute> {
         self.networks.get(mesh_id)?.get(client_name)
     }
 
-    /// Remove a client from all meshes. Returns list of affected mesh IDs.
+    /// 将客户端从所有 mesh 中移除，返回受影响的 mesh 列表。
     pub fn remove_client(&mut self, client_name: &str) -> Vec<String> {
         let affected: Vec<String> = self.get_client_meshes(client_name);
         for mesh_id in &affected.clone() {
@@ -111,7 +112,7 @@ impl MeshRouter {
         affected
     }
 
-    /// List all mesh network IDs
+    /// 列出所有 mesh 网络 ID。
     pub fn list_networks(&self) -> Vec<String> {
         self.networks.keys().cloned().collect()
     }

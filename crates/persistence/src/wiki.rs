@@ -78,103 +78,170 @@ pub fn wiki_scope_ok(
 
 // ── 记录类型 ─────────────────────────────────────────────────────
 
+/// Wiki 容器记录（agent_wikis 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWikiRecord {
+    /// 容器 id（主键）。
     pub id: String,
+    /// 容器名称。
     pub name: String,
+    /// 容器简介。
     pub summary: String,
+    /// 状态（pending/processing/ready/failed）。
     pub status: String,
+    /// 版本号，每次页面变更递增。
     pub version: i64,
+    /// 页面数量。
     pub page_count: i64,
+    /// 作用域类型（global/client/workspace）。
     pub scope_type: String,
+    /// 归属客户端 id，global 时为空。
     pub client_id: String,
+    /// 归属工作区 id，非 workspace 作用域时为空。
     pub workspace_id: String,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// Wiki 文档记录（agent_wiki_docs 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWikiDocRecord {
+    /// 文档 id（主键）。
     pub id: String,
+    /// 所属容器 id。
     pub wiki_id: String,
+    /// 源文件名。
     pub filename: String,
+    /// 文件类型。
     pub file_type: String,
+    /// 内容哈希。
     pub content_hash: String,
+    /// 处理状态。
     pub status: String,
+    /// 错误信息，成功时为 None。
     pub error: Option<String>,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// Wiki 页面记录（agent_wiki_pages 表的一行，含正文）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWikiPageRecord {
+    /// 页面 id（主键）。
     pub id: String,
+    /// 所属容器 id。
     pub wiki_id: String,
+    /// 页面引用路径（`ref` 列）。
     #[sqlx(rename = "ref")]
     pub page_ref: String,
+    /// 页面标题。
     pub title: String,
+    /// 页面摘要。
     pub summary: String,
+    /// 页面正文（Markdown）。
     pub content: String,
+    /// 是否锁定（1 锁定，0 未锁定）。
     pub locked: i64,
+    /// 来源文档 id，手动页为 None。
     pub source_doc_id: Option<String>,
+    /// 被引用/使用次数。
     pub use_count: i64,
+    /// 最后使用时间，未使用为 None。
     pub last_used_at: Option<String>,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
 /// 页面列表/摘要视图（不含 `content`，对齐 `AgentSkillSummary` 节省流量）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWikiPageSummary {
+    /// 页面 id（主键）。
     pub id: String,
+    /// 所属容器 id。
     pub wiki_id: String,
+    /// 页面引用路径。
     #[sqlx(rename = "ref")]
     pub page_ref: String,
+    /// 页面标题。
     pub title: String,
+    /// 页面摘要。
     pub summary: String,
+    /// 是否锁定（1 锁定，0 未锁定）。
     pub locked: i64,
+    /// 来源文档 id，手动页为 None。
     pub source_doc_id: Option<String>,
+    /// 被引用次数。
     pub use_count: i64,
+    /// 最后使用时间，未使用为 None。
     pub last_used_at: Option<String>,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// Wiki 边记录（agent_wiki_edges 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentWikiEdgeRecord {
+    /// 所属容器 id。
     pub wiki_id: String,
+    /// 源页面 id。
     pub src_page_id: String,
+    /// 源页面引用路径。
     pub src_ref: String,
+    /// 目标引用路径（可能悬空）。
     pub dst_ref: String,
+    /// 目标页面 id，悬空时为 None。
     pub dst_page_id: Option<String>,
 }
 
 /// FTS5 检索命中（`rank` 为 `bm25` 负分或 LIKE 回退的占位）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WikiSearchHit {
+    /// 命中页面 id。
     pub page_id: String,
+    /// 所属容器 id。
     pub wiki_id: String,
     #[serde(rename = "ref")]
+    /// 页面引用路径。
     pub page_ref: String,
+    /// 页面标题。
     pub title: String,
+    /// 页面摘要。
     pub summary: String,
+    /// 高亮片段（FTS snippet 或 summary 回退）。
     pub snippet: String,
+    /// 排序分数（bm25 负分或 LIKE 占位 0.0）。
     pub rank: f64,
 }
 
 /// Graph 响应：`nodes` 为页面摘要，`edges` 为有向边（含悬空标记）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WikiGraph {
+    /// 图节点（页面摘要列表）。
     pub nodes: Vec<AgentWikiPageSummary>,
+    /// 图边列表。
     pub edges: Vec<WikiGraphEdge>,
 }
 
+/// Wiki 图边（Graph 响应中的一条有向边）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WikiGraphEdge {
+    /// 源页面 id。
     pub from: String,
+    /// 源页面引用路径。
     pub from_ref: String,
+    /// 目标页面 id，悬空时为 None。
     pub to: Option<String>,
+    /// 目标引用路径。
     pub to_ref: String,
+    /// 是否为悬空边。
     pub dangling: bool,
 }
 

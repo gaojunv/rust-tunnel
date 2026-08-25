@@ -3,69 +3,113 @@ use chrono::{DateTime, Utc};
 
 // ── Record types ──────────────────────────────────────────────
 
+/// LLM 上游提供商记录（llm_providers 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmProviderRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 提供商展示名。
     pub name: String,
+    /// 提供商类型标识（如 openai/deepseek/anthropic）。
     pub provider_type: String,
+    /// 上游 API 基地址。
     pub base_url: String,
+    /// 上游 API 密钥（密文存储）。
     pub api_key: String,
+    /// 额外配置（JSON 字符串，可空）。
     pub extra_config: Option<String>,
+    /// Anthropic 兼容基地址（可空，未配置时为 None）。
     pub anthropic_base_url: Option<String>,
+    /// 是否启用（1 启用，0 禁用）。
     pub enabled: i32,
+    /// 创建时间（SQLite datetime 字符串）。
     pub created_at: String,
+    /// 更新时间（SQLite datetime 字符串）。
     pub updated_at: String,
 }
 
+/// LLM 模型记录（llm_models 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmModelRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 所属提供商 id。
     pub provider_id: String,
+    /// 上游模型名。
     pub model_name: String,
+    /// 模型别名（供网关路由用）。
     pub alias: String,
+    /// 标签 JSON 数组字符串。
     pub tags: String,
     /// per-model 配置（JSON 字符串，如 `{"agent_context_limit":200000}`）。非敏感，不加密。
     pub extra_config: Option<String>,
+    /// 是否启用（1 启用，0 禁用）。
     pub enabled: i32,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// LLM 模型组记录（llm_model_groups 表的一行，用于故障转移路由）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmModelGroupRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 组名称（全局唯一，兼作路由别名）。
     pub name: String,
+    /// 是否启用（1 启用，0 禁用）。
     pub enabled: i32,
+    /// 创建时间。
     pub created_at: String,
+    /// 更新时间。
     pub updated_at: String,
 }
 
+/// 模型组成员关系（llm_model_group_members 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmModelGroupMemberRecord {
+    /// 所属组 id。
     pub group_id: String,
+    /// 成员模型 id。
     pub model_id: String,
+    /// 优先级（越小越优先）。
     pub priority: i32,
 }
 
 /// 组成员联查：含模型与 provider 关键字段，供路由层构建候选链。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmGroupMemberJoined {
+    /// 模型 id。
     pub model_id: String,
+    /// 优先级（越小越优先）。
     pub priority: i32,
+    /// 模型名。
     pub model_name: String,
+    /// 模型别名。
     pub alias: String,
+    /// 模型是否启用（1 启用，0 禁用）。
     pub model_enabled: i32,
+    /// 所属提供商 id。
     pub provider_id: String,
 }
 
+/// LLM 网关 API 密钥记录（llm_api_keys 表的一行）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct LlmApiKeyRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 密钥哈希（SHA256）。
     pub key_hash: String,
+    /// 密钥前缀（明文展示用）。
     pub key_prefix: String,
+    /// 密钥名称。
     pub name: String,
+    /// 是否启用（1 启用，0 禁用）。
     pub enabled: i32,
+    /// 创建时间。
     pub created_at: String,
+    /// 最后使用时间（可空，未使用过为 None）。
     pub last_used_at: Option<String>,
     /// 绑定的 RAG 知识库 id（未绑定时为 None）。
     pub kb_id: Option<String>,
@@ -74,25 +118,45 @@ pub struct LlmApiKeyRecord {
 /// 一条 LLM 网关请求的用量日志。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct LlmUsageLogRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 请求时间（UTC）。
     pub timestamp: DateTime<Utc>,
+    /// 调用方 API key id（可空，认证失败时为 None）。
     pub api_key_id: Option<String>,
+    /// 调用方 API key 名称。
     pub api_key_name: String,
+    /// 命中的提供商 id（可空）。
     pub provider_id: Option<String>,
+    /// 命中的提供商名称。
     pub provider_name: String,
+    /// 命中的模型 id（可空）。
     pub model_id: Option<String>,
+    /// 命中的模型名。
     pub model_name: String,
+    /// 客户端请求的原始模型名。
     pub requested_model: String,
+    /// 协议类型（openai/anthropic/responses）。
     pub protocol: String,
+    /// 是否流式请求（1 是，0 否）。
     pub stream: i32,
+    /// HTTP 状态码。
     pub status_code: i32,
+    /// 是否成功（1 成功，0 失败）。
     pub success: i32,
+    /// 提示词 token 数。
     pub prompt_tokens: i64,
+    /// 缓存命中 token 数。
     pub cache_hit_tokens: i64,
+    /// 缓存未命中 token 数。
     pub cache_miss_tokens: i64,
+    /// 补全 token 数。
     pub completion_tokens: i64,
+    /// 总 token 数。
     pub total_tokens: i64,
+    /// 延迟（毫秒）。
     pub latency_ms: i64,
+    /// 错误类型（可空）。
     pub error_type: Option<String>,
     /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
     pub rag_chunks_injected: Option<i64>,
@@ -103,24 +167,43 @@ pub struct LlmUsageLogRecord {
 /// 待插入的用量日志（各标识可空——认证/路由失败时部分字段缺失）。
 #[derive(Debug, Clone, Default)]
 pub struct LlmUsageInsert {
+    /// 调用方 API key id（可空）。
     pub api_key_id: Option<String>,
+    /// 调用方 API key 名称。
     pub api_key_name: String,
+    /// 命中的提供商 id（可空）。
     pub provider_id: Option<String>,
+    /// 命中的提供商名称。
     pub provider_name: String,
+    /// 命中的模型 id（可空）。
     pub model_id: Option<String>,
+    /// 命中的模型名。
     pub model_name: String,
+    /// 客户端请求的原始模型名。
     pub requested_model: String,
+    /// 协议类型。
     pub protocol: String,
+    /// 是否流式请求。
     pub stream: bool,
+    /// HTTP 状态码。
     pub status_code: i32,
+    /// 是否成功。
     pub success: bool,
+    /// 提示词 token 数。
     pub prompt_tokens: i64,
+    /// 缓存命中 token 数。
     pub cache_hit_tokens: i64,
+    /// 缓存未命中 token 数。
     pub cache_miss_tokens: i64,
+    /// 补全 token 数。
     pub completion_tokens: i64,
+    /// 总 token 数。
     pub total_tokens: i64,
+    /// 延迟（毫秒）。
     pub latency_ms: i64,
+    /// 错误类型（可空）。
     pub error_type: Option<String>,
+    /// 注入的 RAG 片段数（可空）。
     pub rag_chunks_injected: Option<i64>,
     /// 发生故障转移时记录首选（被跳过的）模型名；未转移为 None。
     pub failover_from: Option<String>,
@@ -133,24 +216,38 @@ pub struct LlmUsageAggregateRow {
     pub dimension_id: Option<String>,
     /// 维度展示名（冗余存的 *_name）。
     pub dimension_name: String,
+    /// 请求总数。
     pub requests: i64,
+    /// 成功请求数。
     pub success: i64,
+    /// 提示词 token 总数。
     pub prompt_tokens: i64,
+    /// 缓存命中 token 总数。
     pub cache_hit_tokens: i64,
+    /// 缓存未命中 token 总数。
     pub cache_miss_tokens: i64,
+    /// 补全 token 总数。
     pub completion_tokens: i64,
+    /// 总 token 数。
     pub total_tokens: i64,
 }
 
 /// 时间范围内的用量总览。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct LlmUsageSummary {
+    /// 请求总数。
     pub requests: i64,
+    /// 成功请求数。
     pub success: i64,
+    /// 提示词 token 总数。
     pub prompt_tokens: i64,
+    /// 缓存命中 token 总数。
     pub cache_hit_tokens: i64,
+    /// 缓存未命中 token 总数。
     pub cache_miss_tokens: i64,
+    /// 补全 token 总数。
     pub completion_tokens: i64,
+    /// 总 token 数。
     pub total_tokens: i64,
     /// 发生故障转移的请求数（failover_from 非空），供前端计算转移率。
     pub failover_count: i64,
@@ -159,12 +256,14 @@ pub struct LlmUsageSummary {
 // ── Provider CRUD ─────────────────────────────────────────────
 
 impl Database {
+    /// 列出所有 LLM 提供商（按创建时间排序）。
     pub async fn llm_list_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmProviderRecord>("SELECT * FROM llm_providers ORDER BY created_at")
             .fetch_all(&self.pool)
             .await
     }
 
+    /// 列出已启用的 LLM 提供商。
     pub async fn llm_list_enabled_providers(&self) -> Result<Vec<LlmProviderRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmProviderRecord>(
             "SELECT * FROM llm_providers WHERE enabled = 1 ORDER BY created_at",
@@ -173,6 +272,7 @@ impl Database {
         .await
     }
 
+    /// 按 id 查询单个提供商（不存在返回 None）。
     pub async fn llm_get_provider(
         &self,
         id: &str,
@@ -183,6 +283,7 @@ impl Database {
             .await
     }
 
+    /// 新增或更新 LLM 提供商（按 id UPSERT）。
     #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_provider(
         &self,
@@ -223,6 +324,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定提供商（级联删除关联模型）。
     pub async fn llm_delete_provider(&self, id: &str) -> Result<(), sqlx::Error> {
         // Models are cascade-deleted via FK ON DELETE CASCADE
         sqlx::query("DELETE FROM llm_providers WHERE id = ?")
@@ -232,6 +334,7 @@ impl Database {
         Ok(())
     }
 
+    /// 启用/禁用指定提供商。
     pub async fn llm_toggle_provider(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE llm_providers SET enabled = ?, updated_at = datetime('now') WHERE id = ?",
@@ -245,12 +348,14 @@ impl Database {
 
     // ── Model CRUD ───────────────────────────────────────────────
 
+    /// 列出所有 LLM 模型。
     pub async fn llm_list_models(&self) -> Result<Vec<LlmModelRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelRecord>("SELECT * FROM llm_models ORDER BY created_at")
             .fetch_all(&self.pool)
             .await
     }
 
+    /// 列出指定提供商下的所有模型。
     pub async fn llm_list_models_for_provider(
         &self,
         provider_id: &str,
@@ -271,6 +376,7 @@ impl Database {
             .await
     }
 
+    /// 按模型名或别名查找已启用模型（优先精确匹配 model_name）。
     pub async fn llm_find_model_by_name_or_alias(
         &self,
         name_or_alias: &str,
@@ -286,6 +392,7 @@ impl Database {
         .await
     }
 
+    /// 新增或更新 LLM 模型（按 id UPSERT）。
     #[allow(clippy::too_many_arguments)] // 保留：多调用点方法（79 处调用点），Opts 化成本高
     pub async fn llm_save_model(
         &self,
@@ -322,6 +429,7 @@ impl Database {
         Ok(())
     }
 
+    /// 更新指定模型的基本信息。
     pub async fn llm_update_model(
         &self,
         id: &str,
@@ -343,6 +451,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定模型。
     pub async fn llm_delete_model(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM llm_models WHERE id = ?")
             .bind(id)
@@ -353,6 +462,7 @@ impl Database {
 
     // ── API Key CRUD ─────────────────────────────────────────────
 
+    /// 列出所有网关 API 密钥。
     pub async fn llm_list_api_keys(&self) -> Result<Vec<LlmApiKeyRecord>, sqlx::Error> {
         // 显式列：`SELECT *` 会在 ALTER TABLE 追加 kb_id 后命中 sqlx 语句缓存中的
         // 旧列元数据（7 列），与 8 字段的 FromRow 错位导致越界 panic。
@@ -364,6 +474,7 @@ impl Database {
         .await
     }
 
+    /// 按哈希查找已启用的 API 密钥。
     pub async fn llm_find_api_key_by_hash(
         &self,
         hash: &str,
@@ -377,6 +488,7 @@ impl Database {
         .await
     }
 
+    /// 新增网关 API 密钥。
     pub async fn llm_save_api_key(
         &self,
         id: &str,
@@ -401,6 +513,7 @@ impl Database {
         Ok(())
     }
 
+    /// 启用/禁用指定 API 密钥。
     pub async fn llm_toggle_api_key(&self, id: &str, enabled: bool) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET enabled = ? WHERE id = ?")
             .bind(i32::from(enabled))
@@ -424,6 +537,7 @@ impl Database {
         Ok(())
     }
 
+    /// 删除指定 API 密钥。
     pub async fn llm_delete_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM llm_api_keys WHERE id = ?")
             .bind(id)
@@ -432,6 +546,7 @@ impl Database {
         Ok(())
     }
 
+    /// 更新 API 密钥的最后使用时间。
     pub async fn llm_touch_api_key(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE llm_api_keys SET last_used_at = datetime('now') WHERE id = ?")
             .bind(id)
@@ -621,6 +736,7 @@ impl Database {
 
     // ── Model groups (failover routing) ──────────────────────────
 
+    /// 创建模型组。
     pub async fn llm_create_model_group(
         &self,
         id: &str,
@@ -636,6 +752,7 @@ impl Database {
         Ok(())
     }
 
+    /// 更新模型组名称与启用状态。
     pub async fn llm_update_model_group(
         &self,
         id: &str,
@@ -670,6 +787,7 @@ impl Database {
         tx.commit().await
     }
 
+    /// 列出所有模型组。
     pub async fn llm_list_model_groups(&self) -> Result<Vec<LlmModelGroupRecord>, sqlx::Error> {
         sqlx::query_as::<_, LlmModelGroupRecord>(
             "SELECT * FROM llm_model_groups ORDER BY created_at ASC",
@@ -678,6 +796,7 @@ impl Database {
         .await
     }
 
+    /// 按 id 查询模型组。
     pub async fn llm_get_model_group(
         &self,
         id: &str,
@@ -688,6 +807,7 @@ impl Database {
             .await
     }
 
+    /// 按名称查询已启用的模型组。
     pub async fn llm_find_group_by_name(
         &self,
         name: &str,
@@ -741,6 +861,7 @@ impl Database {
         .await
     }
 
+    /// 查询模型组的成员数量。
     pub async fn llm_group_member_count(&self, group_id: &str) -> Result<i64, sqlx::Error> {
         let row: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM llm_model_group_members WHERE group_id = ?")

@@ -1,3 +1,5 @@
+//! 用户偏好（主题/语言/标题动效）持久化 API。
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -8,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ApiState;
 
+/// 偏好在 `server_settings` 中的键名。
 pub const PREFERENCES_KEY: &str = "user_preferences";
 
 const VALID_THEMES: &[&str] = &["system", "light", "dark"];
@@ -15,9 +18,13 @@ const VALID_LANGUAGES: &[&str] = &["system", "zh-CN", "en"];
 const VALID_TITLE_EFFECTS: &[&str] = &["particles", "grid-wave", "none"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 用户偏好（主题/语言/标题动效）。
 pub struct Preferences {
+    /// 主题：`system`/`light`/`dark`。
     pub theme: String,
+    /// 语言：`system`/`zh-CN`/`en`。
     pub language: String,
+    /// 标题动效：`particles`/`grid-wave`/`none`。
     pub title_effect: String,
 }
 
@@ -46,6 +53,7 @@ impl Preferences {
     }
 }
 
+/// `GET /api/preferences`：读取用户偏好（无记录时返回默认值）。
 pub async fn get_preferences(State(state): State<ApiState>) -> Response {
     let db = match state.server_state.db() {
         Some(db) => db.clone(),
@@ -63,6 +71,7 @@ pub async fn get_preferences(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// `PUT /api/preferences`：校验后持久化用户偏好。
 pub async fn put_preferences(
     State(state): State<ApiState>,
     Json(body): Json<Preferences>,

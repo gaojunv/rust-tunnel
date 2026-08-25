@@ -14,21 +14,36 @@ use super::Database;
 /// （`'["部署","linux"]'`），`scope_type` ∈ global|client|workspace。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentSkillRecord {
+    /// 主键 id（UUID）。
     pub id: String,
+    /// 技能名称（归一化后小写，用于同作用域去重）。
     pub name: String,
+    /// 技能描述（一句话用途）。
     pub description: String,
+    /// 技能正文 Markdown 全文（最大 16KB）。
     pub content: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id（global 时为空串）。
     pub client_id: String,
+    /// 所属工作区 id（非 workspace 作用域时为空串）。
     pub workspace_id: String,
+    /// 标签 JSON 数组字符串（`'["部署","linux"]'`）。
     pub tags: String,
+    /// 是否启用（1 启用，0 停用）。
     pub enabled: i32,
+    /// 来源会话 id（手动创建时为空）。
     pub source_session_id: String,
+    /// 来源触发器（manual|distill 等）。
     pub source_trigger: String,
+    /// 被调用次数（use_skill 命中累计）。
     pub use_count: i64,
+    /// 最后被调用时间（未调用过为 None）。
     pub last_used_at: Option<String>,
+    /// 创建时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间（DB datetime）。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
@@ -37,20 +52,34 @@ pub struct AgentSkillRecord {
 /// content 最大 16KB，SELECT 时排除避免大字段拖慢查询与响应体积。
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct AgentSkillSummary {
+    /// 主键 id。
     pub id: String,
+    /// 技能名称。
     pub name: String,
+    /// 技能描述。
     pub description: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
+    /// 标签 JSON 数组字符串。
     pub tags: String,
+    /// 是否启用（1 启用，0 停用）。
     pub enabled: i32,
+    /// 来源会话 id。
     pub source_session_id: String,
+    /// 来源触发器。
     pub source_trigger: String,
+    /// 被调用次数。
     pub use_count: i64,
+    /// 最后被调用时间（未调用过为 None）。
     pub last_used_at: Option<String>,
+    /// 创建时间。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub created_at: String,
+    /// 更新时间。
     #[serde(serialize_with = "ser_de_normalized_dt")]
     pub updated_at: String,
 }
@@ -59,40 +88,68 @@ pub struct AgentSkillSummary {
 const SKILL_SUMMARY_COLS: &str = "id, name, description, scope_type, client_id, workspace_id, \
      tags, enabled, source_session_id, source_trigger, use_count, last_used_at, created_at, updated_at";
 
+/// `skill_insert` 参数包：技能写入的全部字段（10 项）。
 #[derive(Debug, Clone, Default)]
 pub struct SkillInsertOpts {
+    /// 技能主键 id。
     pub id: String,
+    /// 技能名称（归一化小写）。
     pub name: String,
+    /// 技能描述。
     pub description: String,
+    /// 技能正文 Markdown。
     pub content: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
+    /// 标签 JSON 数组字符串。
     pub tags: String,
+    /// 来源会话 id（手动创建为空）。
     pub source_session_id: String,
+    /// 来源触发器（manual|distill 等）。
     pub source_trigger: String,
 }
 
+/// `skill_update` 参数包：技能更新的全部字段（7 项）。
 #[derive(Debug, Clone, Default)]
 pub struct SkillUpdateOpts {
+    /// 技能名称（归一化小写）。
     pub name: String,
+    /// 技能描述。
     pub description: String,
+    /// 技能正文 Markdown。
     pub content: String,
+    /// 标签 JSON 数组字符串。
     pub tags: String,
+    /// 作用域类型（global|client|workspace）。
     pub scope_type: String,
+    /// 所属客户端 id。
     pub client_id: String,
+    /// 所属工作区 id。
     pub workspace_id: String,
 }
 
+/// `skill_list` 查询条件：技能列表的全部过滤参数（8 项）。
 #[derive(Debug, Clone, Default)]
 pub struct SkillListFilter {
+    /// 作用域类型过滤（global|client|workspace，None 不过滤）。
     pub scope_type: Option<String>,
+    /// 客户端 id 过滤（空串等同 None）。
     pub client_id: Option<String>,
+    /// 工作区 id 过滤（空串等同 None）。
     pub workspace_id: Option<String>,
+    /// 模糊搜索关键字（匹配 name/description，None 不过滤）。
     pub q: Option<String>,
+    /// 启用状态过滤（Some(true) 仅启用，Some(false) 仅停用，None 不过滤）。
     pub enabled: Option<bool>,
+    /// 排序方式（recent|created|uses，None 取 recent）。
     pub sort: Option<String>,
+    /// 分页条数。
     pub limit: i64,
+    /// 分页偏移。
     pub offset: i64,
 }
 
@@ -122,6 +179,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 查询单条技能（含 content 全文），不存在返回 None。
     pub async fn skill_get_by_id(&self, id: &str) -> Result<Option<AgentSkillRecord>, sqlx::Error> {
         sqlx::query_as::<_, AgentSkillRecord>("SELECT * FROM agent_skills WHERE id = ?")
             .bind(id)
@@ -172,6 +230,7 @@ impl Database {
         Ok(())
     }
 
+    /// 按 id 删除技能，不存在时无副作用。
     pub async fn skill_delete(&self, id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM agent_skills WHERE id = ?")
             .bind(id)

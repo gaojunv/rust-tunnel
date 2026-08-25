@@ -1,3 +1,5 @@
+//! DNS 记录与配置管理 API。
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -11,6 +13,8 @@ use rust_tunnel_common::DnsRecord;
 // ── DNS Management Endpoints ───────────────────────────────────────
 
 // GET /api/dns/records — list all DNS records
+
+/// `GET /api/dns/records`：列出所有 DNS 记录。
 pub async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse {
     let dns_registry = match &state.server_state.dns_registry {
         Some(r) => r,
@@ -39,6 +43,7 @@ pub async fn get_dns_records(State(state): State<ApiState>) -> impl IntoResponse
 }
 
 // POST /api/dns/records — add manual DNS record
+/// `POST /api/dns/records`：新增手工 DNS 记录。
 pub async fn add_dns_record(
     State(state): State<ApiState>,
     Json(body): Json<super::dto::AddDnsRecordRequest>,
@@ -62,6 +67,7 @@ pub async fn add_dns_record(
 }
 
 // DELETE /api/dns/records/:name — delete DNS record
+/// `DELETE /api/dns/records/:name`：删除 DNS 记录。
 pub async fn delete_dns_record(
     State(state): State<ApiState>,
     Path(name): Path<String>,

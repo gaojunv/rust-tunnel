@@ -25,7 +25,7 @@ unwrap_in_result = "deny"
 
 [workspace.lints.rust]
 # 文档缺口显性化（批次 9 渐进补全）
-missing_docs = "allow" # 现状 80% 缺失，先不开启警告洪泛
+missing_docs = "warn" # 现状 80% 缺失，先不开启警告洪泛
 
 [workspace.dependencies]
 # Async runtime

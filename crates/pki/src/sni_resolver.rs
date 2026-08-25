@@ -12,6 +12,7 @@ pub struct SniCertResolver {
 }
 
 impl SniCertResolver {
+    /// 创建 SNI 解析器。
     #[must_use]
     pub fn new(manager: Arc<CertificateManager>) -> Self {
         Self { manager }

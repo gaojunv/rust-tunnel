@@ -4,8 +4,11 @@ use rust_tunnel_common::AgentCommand;
 /// 任务清单项（todo_write 工具参数）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TodoItem {
+    /// 任务描述。
     pub content: String,
-    pub status: String, // "pending" | "in_progress" | "completed"
+    /// 任务状态：pending/in_progress/completed。
+    pub status: String,
+    /// 进行中展示文案。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_form: Option<String>,
 }

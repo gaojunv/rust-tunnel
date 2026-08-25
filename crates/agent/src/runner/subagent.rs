@@ -12,6 +12,7 @@ use crate::llm::{ChatCompletionRequest, ChatMessage, LlmState};
 use crate::session::SessionRuntime;
 use crate::{roles, sse, tools, AgentState};
 
+/// 克隆子 agent 运行时。
 #[must_use]
 pub fn clone_sub_rt(rt: &SessionRuntime) -> SessionRuntime {
     SessionRuntime {

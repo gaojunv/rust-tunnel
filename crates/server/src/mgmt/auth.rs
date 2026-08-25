@@ -17,9 +17,13 @@ const JWT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 /// JWT claims
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
+    /// 主题（固定 `admin`）。
     pub sub: String,
+    /// 过期时间（UNIX 秒）。
     pub exp: usize,
+    /// 签发时间（UNIX 秒）。
     pub iat: usize,
+    /// 令牌唯一 id（`Uuid::new_v4`）。
     pub jti: String,
 }
 
@@ -30,6 +34,7 @@ impl Default for Claims {
 }
 
 impl Claims {
+    /// 创建新的 `Claims`（有效期 24 小时）。
     pub fn new() -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -47,11 +52,14 @@ impl Claims {
 /// Authentication configuration
 #[derive(Clone)]
 pub struct AuthConfig {
+    /// 管理员密码（`None` 表示未启用鉴权）。
     pub admin_password: Option<String>,
+    /// JWT 签名密钥。
     pub jwt_secret: String,
 }
 
 impl AuthConfig {
+    /// 创建 `AuthConfig`（`jwt_secret` 缺省时随机生成）。
     pub fn new(admin_password: Option<String>, jwt_secret: Option<String>) -> Self {
         let jwt_secret = jwt_secret.unwrap_or_else(|| Uuid::new_v4().to_string());
         Self {

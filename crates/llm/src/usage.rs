@@ -17,10 +17,15 @@ use rust_tunnel_persistence::{Database, LlmUsageInsert};
 /// 一次请求解析出的 token 用量。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageInfo {
+    /// 输入 token 数。
     pub prompt_tokens: i64,
+    /// 缓存命中 token 数。
     pub cache_hit_tokens: i64,
+    /// 缓存未命中 token 数。
     pub cache_miss_tokens: i64,
+    /// 输出 token 数。
     pub completion_tokens: i64,
+    /// 总 token 数。
     pub total_tokens: i64,
 }
 
@@ -141,6 +146,7 @@ pub struct UsageSseScanner {
 }
 
 impl UsageSseScanner {
+    /// 创建空扫描器。
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -241,17 +247,23 @@ impl UsageSseScanner {
 /// 记录一次请求所需的标识信息（token 用量由响应解析补齐）。
 #[derive(Debug, Clone, Default)]
 pub struct UsageContext {
+    /// 网关侧 API key id（未鉴权或鉴权失败时为 None）。
     pub api_key_id: Option<String>,
+    /// 网关侧 API key 名称。
     pub api_key_name: String,
+    /// 上游提供商 id。
     pub provider_id: Option<String>,
+    /// 上游提供商名称。
     pub provider_name: String,
+    /// 模型 id。
     pub model_id: Option<String>,
     /// 上游真实模型名。
     pub model_name: String,
     /// 客户端请求里的原始 model（别名）。
     pub requested_model: String,
-    /// "openai" / "anthropic"。
+    /// 协议标识（`openai` / `anthropic`）。
     pub protocol: String,
+    /// 是否流式请求。
     pub stream: bool,
     /// 本次请求注入的 RAG 知识库片段数（未走 RAG 时为 None）。
     pub rag_chunks_injected: Option<i64>,

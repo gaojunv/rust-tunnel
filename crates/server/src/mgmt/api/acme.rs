@@ -12,12 +12,19 @@ use super::ApiState;
 /// Request body for PUT /api/acme/config
 #[derive(Debug, Deserialize)]
 pub struct UpdateAcmeConfigRequest {
+    /// 是否启用 ACME。
     pub enabled: Option<bool>,
+    /// ACME 目录 URL。
     pub server_url: Option<String>,
+    /// 注册邮箱。
     pub email: Option<String>,
+    /// 是否自动续期。
     pub auto_renew: Option<bool>,
+    /// 续期检查间隔（秒）。
     pub renewal_check_interval: Option<u64>,
+    /// 到期前多少天触发续期。
     pub renewal_days_before_expiry: Option<u64>,
+    /// 是否已同意服务条款。
     pub tos_agreed: Option<bool>,
 }
 
@@ -31,6 +38,7 @@ pub struct CertificateRequest {
 // ── ACME Certificate Management Endpoints ──────────────────────────
 
 // GET /api/acme/certificates — list all certificates
+/// 列出全部 ACME 证书（GET /api/acme/certificates）。
 pub async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoResponse {
     let client_guard = state.server_state.acme.client.read().await;
     let client = match client_guard.as_ref() {
@@ -56,6 +64,7 @@ pub async fn list_acme_certificates(State(state): State<ApiState>) -> impl IntoR
 }
 
 // POST /api/acme/certificates/:domain — request a new certificate
+/// 为指定域名申请证书（POST /api/acme/certificates/:domain）。
 pub async fn request_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
@@ -144,6 +153,7 @@ pub async fn request_acme_certificate(
 }
 
 // GET /api/acme/certificates/:domain — get certificate details
+/// 查询单张证书详情（GET /api/acme/certificates/:domain）。
 pub async fn get_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
@@ -177,6 +187,7 @@ pub async fn get_acme_certificate(
 }
 
 // POST /api/acme/certificates/:domain/renew — manual renewal
+/// 手动续期证书（POST /api/acme/certificates/:domain/renew）。
 pub async fn renew_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
@@ -205,6 +216,7 @@ pub async fn renew_acme_certificate(
 }
 
 // GET /api/acme/status — get ACME status
+/// 查询 ACME 总览状态（GET /api/acme/status）。
 pub async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse {
     // Read enabled status from acme_full_config to stay in sync with API updates
     let full_config = state.server_state.acme.full_config.read().await;
@@ -251,6 +263,7 @@ pub async fn get_acme_status(State(state): State<ApiState>) -> impl IntoResponse
 }
 
 // GET /api/acme/config — get ACME configuration
+/// 查询 ACME 配置（GET /api/acme/config）。
 pub async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse {
     let config = state.server_state.acme.full_config.read().await;
     Json(serde_json::json!({
@@ -266,6 +279,7 @@ pub async fn get_acme_config(State(state): State<ApiState>) -> impl IntoResponse
 }
 
 // PUT /api/acme/config — update ACME configuration
+/// 更新 ACME 配置（PUT /api/acme/config）。
 pub async fn update_acme_config(
     State(state): State<ApiState>,
     Json(req): Json<UpdateAcmeConfigRequest>,
@@ -375,6 +389,7 @@ pub async fn update_acme_config(
 // ── DNS Provider Endpoints ─────────────────────────────────────────
 
 // GET /api/acme/dns-providers — get available providers and current config
+/// 查询可用 DNS 供应商及当前配置（GET /api/acme/dns-providers）。
 pub async fn get_dns_providers(State(state): State<ApiState>) -> impl IntoResponse {
     let config = state.server_state.acme.dns_provider.read().await;
     Json(serde_json::json!({
@@ -384,6 +399,7 @@ pub async fn get_dns_providers(State(state): State<ApiState>) -> impl IntoRespon
 }
 
 // PUT /api/acme/dns-providers — update DNS provider configuration
+/// 更新 DNS 供应商配置（PUT /api/acme/dns-providers）。
 pub async fn update_dns_provider(
     State(state): State<ApiState>,
     Json(req): Json<crate::acme::dns::DnsProviderConfig>,
@@ -407,6 +423,7 @@ pub async fn update_dns_provider(
 }
 
 // GET /api/acme/challenge-status/:domain — get ACME challenge status for a domain
+/// 查询 ACME 挑战状态（GET /api/acme/challenge-status/:domain）。
 pub async fn get_challenge_status(
     State(state): State<ApiState>,
     Path(domain): Path<String>,
@@ -419,6 +436,7 @@ pub async fn get_challenge_status(
 }
 
 // DELETE /api/acme/certificates/:domain — delete a certificate
+/// 删除证书（DELETE /api/acme/certificates/:domain）。
 pub async fn delete_acme_certificate(
     State(state): State<ApiState>,
     Path(domain): Path<String>,

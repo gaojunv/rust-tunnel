@@ -196,6 +196,7 @@ impl Default for TagScanner {
 }
 
 impl TagScanner {
+    /// 创建空解析器（初始为 Text 态）。
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -206,6 +207,7 @@ impl TagScanner {
         }
     }
 
+    /// 是否已解析出至少一个工具调用。
     #[must_use]
     pub fn has_tool_calls(&self) -> bool {
         !self.calls.is_empty()

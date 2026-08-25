@@ -23,16 +23,22 @@ const RATE_WINDOW: std::time::Duration = std::time::Duration::from_mins(1);
 
 // ── Entity type ──────────────────────────────────────────────────
 
+/// 统计实体类型：区分客户端、反代、Shadowsocks、Trojan 四类桶。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
+    /// 隧道客户端（control 通道对端）。
     Client,
+    /// 反向代理规则（HTTP/TCP 流量）。
     Proxy,
+    /// Shadowsocks 代理端口。
     Shadowsocks,
+    /// Trojan 代理端口。
     Trojan,
 }
 
 impl EntityType {
+    /// 返回实体类型的 snake_case 字符串（用于 DB/API 落库与展示）。
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -52,17 +58,28 @@ impl std::fmt::Display for EntityType {
 
 // ── Snapshot (memory / DB / API wire format) ─────────────────────
 
+/// 单个实体的统计快照（内存/落库/API 透传共用结构）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsSnapshot {
+    /// 实体类型（`EntityType::as_str()`）。
     pub entity_type: String,
+    /// 实体标识（如 `trojan:443`、`ss:8388`、客户端名）。
     pub entity_id: String,
+    /// 快照时间戳（对齐到分钟）。
     pub timestamp: DateTime<Utc>,
+    /// 累计入站字节数。
     pub bytes_in: i64,
+    /// 累计出站字节数。
     pub bytes_out: i64,
+    /// 入站速率（字节/秒，滑动窗口计算）。
     pub bytes_in_rate: f64,
+    /// 出站速率（字节/秒，滑动窗口计算）。
     pub bytes_out_rate: f64,
+    /// 中位 RTT（毫秒），无样本时为 None。
     pub rtt_ms: Option<f64>,
+    /// 丢包率（百分比），暂未采集时为 None。
     pub loss_pct: Option<f64>,
+    /// 当前活跃连接数。
     pub active_conns: i32,
 }
 
@@ -246,6 +263,7 @@ impl StatsCollector {
 
     // ── Tick: recalc rates (every 5 seconds) ──────────────────────
 
+    /// 重算所有实体的滑动窗口速率（每 5 秒由定时任务调用）。
     pub fn tick_rates(&self) {
         let mut map = self
             .inner
@@ -258,6 +276,7 @@ impl StatsCollector {
 
     // ── Flush: write to DB + broadcast (every 60 seconds) ─────────
 
+    /// 落库并广播当前快照（每 60 秒由定时任务调用）。
     pub async fn flush(&self) {
         let now = Utc::now();
         let snapshot_time = now
@@ -339,19 +358,29 @@ impl StatsCollector {
 
 // ── Summary response ─────────────────────────────────────────────
 
+/// 按实体类型聚合的统计摘要（`get_summary` 返回值）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StatsSummary {
+    /// 客户端聚合。
     pub clients: EntitySummary,
+    /// 反代规则聚合。
     pub proxy: EntitySummary,
+    /// Shadowsocks 聚合。
     pub shadowsocks: EntitySummary,
+    /// Trojan 聚合。
     pub trojan: EntitySummary,
 }
 
+/// 单类实体的聚合统计。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EntitySummary {
+    /// 入站字节总数。
     pub total_bytes_in: u64,
+    /// 出站字节总数。
     pub total_bytes_out: u64,
+    /// 活跃连接总数。
     pub total_conns: u64,
+    /// 实体个数。
     pub entity_count: u64,
 }
 

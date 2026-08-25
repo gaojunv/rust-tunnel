@@ -8,6 +8,7 @@ use crate::session::SessionRuntime;
 use crate::{executor, tools, AgentState};
 use rust_tunnel_common::{AgentCommand, AgentResult};
 
+/// 并发执行只读工具组（按 READONLY_CONCURRENCY 分窗）。
 pub async fn exec_readonly_group(
     agent: AgentState,
     rt: &SessionRuntime,

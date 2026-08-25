@@ -1,22 +1,26 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-/// STUN message types (RFC 5389)
+/// STUN Binding Request 消息类型（RFC 5389，0x0001）。
 pub const STUN_BINDING_REQUEST: u16 = 0x0001;
+/// STUN Binding Response 消息类型（RFC 5389，0x0101）。
 pub const STUN_BINDING_RESPONSE: u16 = 0x0101;
+/// STUN 魔数（RFC 5389 固定值 0x2112A442，用于校验与 XOR 解码）。
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 
-/// MAPPED-ADDRESS attribute (RFC 5389 Section 15.1)
+/// MAPPED-ADDRESS 属性类型（RFC 5389 Section 15.1）。
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
-/// XOR-MAPPED-ADDRESS attribute (RFC 5389 Section 15.2)
+/// XOR-MAPPED-ADDRESS 属性类型（RFC 5389 Section 15.2）。
 pub const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
-/// Parsed STUN message
+/// 解析后的 STUN 消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StunMessage {
+    /// 消息类型。
     pub msg_type: u16,
+    /// 事务 ID（12 字节，用于请求/响应匹配）。
     pub transaction_id: [u8; 12],
-    /// Parsed mapped address as "ip:port"
+    /// 解析出的映射地址（"ip:port"），未解析到时为 None。
     pub mapped_address: Option<String>,
 }
 
