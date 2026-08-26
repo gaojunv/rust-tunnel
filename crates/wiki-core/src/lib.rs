@@ -11,4 +11,9 @@
 /// Wiki `ref` 标识的规范化与校验（remote 绑定键，可选）。
 pub mod ref_id;
 
+// comrak 0.54 API 探针：只随测试编译，验证 5 个解析行为问题（见该文件头部结论）。
+// 临时用途，验证后并入 markdown.rs / link.rs 或删除。
+#[cfg(test)]
+mod comrak_probe;
+
 pub use ref_id::{RefId, MAX_REF_LEN};
