@@ -56,14 +56,14 @@ export default function AppLayout() {
           {/* 移动端底部垫高 12px 与安全区取大：ActivityBar 底栏已收进卡片内作 footer
               （不再是 fixed 栏），无需再预留 48px；本层只保留与 pt-3 对称的呼吸 +
               全面屏 iPhone 的 Home 指示条区。桌面端 md: 恢复 px-6/py-6。 */}
-          <div className="mx-auto h-full w-full max-w-[1400px] overflow-hidden px-2 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-3 md:px-6 md:py-6">
+          <div className="app-main-content mx-auto h-full w-full max-w-[1400px] overflow-hidden px-2 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))] pt-3 md:px-6 md:py-6">
             {page}
           </div>
         </main>
       ) : (
         <ScrollArea className="flex-1">
           <main>
-            <div className="mx-auto w-full max-w-[1400px] px-2 py-3 md:px-6 md:py-6">
+            <div className="app-main-content mx-auto w-full max-w-[1400px] px-2 py-3 md:px-6 md:py-6">
               {page}
             </div>
           </main>

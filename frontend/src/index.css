@@ -160,6 +160,23 @@ html body[data-scroll-locked] {
   width: 100% !important;
 }
 
+/* iOS Safari 移动端去顶部留边：有刘海/动态岛的机型视口已从刘海下方开始，
+   无需再用 env(safe-area-inset-top) 额外垫高，直接贴顶。仅 iOS 生效
+   （-webkit-touch-callout 仅 Safari 支持），安卓/桌面不受影响。 */
+@supports (-webkit-touch-callout: none) {
+  @media (max-width: 767px) {
+    header {
+      padding-top: 0 !important;
+    }
+    .mobile-menu-fab {
+      top: 0.5rem !important;
+    }
+    .app-main-content {
+      padding-top: 0 !important;
+    }
+  }
+}
+
 @layer utilities {
   /* 玻璃拟态卡片表面（配合 Card 的 border-border 使用，明暗主题均安全） */
   .glass-card {

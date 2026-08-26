@@ -115,8 +115,9 @@ export function MobileMenuFab({ onLogout }: HeaderProps) {
   return (
     // top 对齐 /agent 顶栏按钮行的垂直中心：main 容器 pt-3(12px) + AgentPage 顶栏
     // p-1.5(6px) = 按钮行从 18px 开始；size=sm 按钮 h-9(36px) 中心在 36px。
-    // 本按钮 size=icon h-10(40px)，top = 36 - 20 = 16px(1rem)。刘海屏取安全区更大值。
-    <div className="fixed right-3 top-[max(env(safe-area-inset-top,0px),1rem)] z-50 md:hidden">
+    // 本按钮 size=icon h-10(40px)，top = 36 - 20 = 16px(1rem)。刘海屏取安全区更大值；
+    // iOS Safari 下由 index.css 覆盖为 0.5rem 贴顶（视口已从刘海下方开始，无需安全区）。
+    <div className="mobile-menu-fab fixed right-3 top-[max(env(safe-area-inset-top,0px),1rem)] z-50 md:hidden">
       <MobileNavSheet onLogout={onLogout} t={t} isActive={isActive} />
     </div>
   );
